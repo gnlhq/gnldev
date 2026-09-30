@@ -199,6 +199,61 @@ export type BudgetGuard = (ctx: {
   resourceId?: string;
 }) => Promise<unknown> | unknown;
 
+/**
+ * Why a trigger definition cannot fire, or `undefined` when it can — the ONE reading for a new spec
+ * (`scheduleWorkflow`, before anything is written) and for a stored definition (the poller, and a
+ * re-registration deciding whether the stored one may be replaced). A definition in the journal is
+ * always one the poller can fire: 0.9.0 wrote the definition first and validated after, so a refused
+ * cron left an orphan behind, and `every: 0` was accepted and fired on every poll.
+ */
+function definitionProblem(def: TriggerDef, now: number): string | undefined {
+  if (typeof def.name !== 'string' || def.name === '') return `name must be the workflow's name (a non-empty string), got ${JSON.stringify(def.name)}`;
+  if (def.kind === 'at') {
+    if (typeof def.value !== 'number' || !Number.isFinite(def.value)) return `at must be a finite epoch-ms number, got ${String(def.value)}`;
+  } else if (def.kind === 'every') {
+    if (typeof def.value !== 'number' || !Number.isFinite(def.value) || def.value <= 0) {
+      return `every must be a finite period in ms greater than 0, got ${String(def.value)} (0 or less fires on every poll)`;
+    }
+  } else if (def.kind === 'cron') {
+    if (typeof def.value !== 'string') return `cron must be a 5-field string, got ${String(def.value)}`;
+    try {
+      nextCronTime(def.value, now);
+    } catch (e) {
+      return `cron '${def.value}' cannot fire: ${(e as Error).message}`;
+    }
+  } else {
+    return `unknown kind ${JSON.stringify(def.kind)}`;
+  }
+  if (!Number.isInteger(def.maxAttempts) || def.maxAttempts < 1) return `maxAttempts must be an integer of at least 1, got ${String(def.maxAttempts)}`;
+  if (def.misfire !== 'skip' && def.misfire !== 'catchup') return `misfire must be 'skip' or 'catchup', got ${JSON.stringify(def.misfire)}`;
+  return undefined;
+}
+
+/** The definition a spec stands for — refused, before any write, when it could not fire. */
+function definitionOf(spec: ScheduleSpec, id: string, owner: ReturnType<typeof triggerOwnerOf>, now: number): TriggerDef {
+  const given = (['at', 'every', 'cron'] as const).filter((k) => spec[k] != null);
+  if (given.length !== 1) {
+    throw new Error(
+      given.length === 0
+        ? `@gnldev/scheduler: trigger '${id}' — one of at | every | cron is required.`
+        : `@gnldev/scheduler: trigger '${id}' — give only one of at | every | cron (got ${given.join(' and ')}); a second one was silently ignored before.`,
+    );
+  }
+  const kind: Kind = given[0]!;
+  const def: TriggerDef = {
+    name: spec.name,
+    input: spec.input,
+    kind,
+    value: spec[kind]!,
+    maxAttempts: spec.maxAttempts ?? 5,
+    misfire: spec.misfire ?? 'skip',
+    ...owner,
+  };
+  const problem = definitionProblem(def, now);
+  if (problem) throw new Error(`@gnldev/scheduler: trigger '${id}' — ${problem}. Nothing was written.`);
+  return def;
+}
+
 function firstRunAt(spec: ScheduleSpec, now: number): number {
   if (spec.at != null) return spec.at;
   if (spec.every != null) return now + spec.every;
@@ -275,7 +330,31 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
   // A name within its owner (`ownedName`): triggers of every organization share this journal, and the
   // id defaults to the workflow's name, so the second user to schedule it got the first one's trigger.
   const id = ownedName(spec.id ?? spec.name, { resourceId: owner.resourceId, orgId: owner.orgId });
-  if ((await journal.get(DEF(id))) !== undefined) {
+  // Validated BEFORE any write, so a refused spec leaves nothing behind (0.9.0 wrote the definition
+  // first and threw after it, and the orphan then shadowed the corrected registration).
+  const def = definitionOf(spec, id, owner, now);
+  const stored = await journal.get<TriggerDef>(DEF(id));
+  const storedProblem = stored === undefined ? undefined : definitionProblem(stored, now);
+  if (stored !== undefined && storedProblem !== undefined) {
+    // A STORED definition that cannot fire (written by 0.9.0: an orphan from a refused spec, or an
+    // `every: 0`). The definition is otherwise immutable, but this one has no schedule worth keeping,
+    // and this call holds a valid one: the corrected registration wins. The fire counter is kept —
+    // it is part of the run id, and a run id that already ran would replay instead of firing.
+    const prev = await journal.get<TriggerState>(STATE(id));
+    const state: TriggerState = {
+      nextRunAt: firstRunAt(spec, now),
+      attempts: 0,
+      fireCount: prev?.fireCount ?? (await fireCountAfterLoss(journal, id)),
+      status: 'pending',
+    };
+    await journal.put(DEF(id), def);
+    await journal.put(STATE(id), state);
+    console.warn(
+      `[scheduler] invalid trigger definition replaced (trigger ${id}, workflow ${spec.name}) — the stored one could not fire (${storedProblem}); the definition from this scheduleWorkflow call was written in its place, fireCount=${state.fireCount}.`,
+    );
+    return id;
+  }
+  if (stored !== undefined) {
     /**
      * THE DEFINITION EXISTS. That used to end the function — and it was reading only half the record.
      *
@@ -314,17 +393,6 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
     return id;
   }
   // A trigger nobody has seen before: both halves are written here, and only here.
-  const kind: Kind = spec.at != null ? 'at' : spec.every != null ? 'every' : 'cron';
-  const value: number | string = spec.at ?? spec.every ?? spec.cron!;
-  const def: TriggerDef = {
-    name: spec.name,
-    input: spec.input,
-    kind,
-    value,
-    maxAttempts: spec.maxAttempts ?? 5,
-    misfire: spec.misfire ?? 'skip',
-    ...owner,
-  };
   await journal.put(DEF(id), def);
   const state: TriggerState = { nextRunAt: firstRunAt(spec, now), attempts: 0, fireCount: 0, status: 'pending' };
   await journal.put(STATE(id), state);
@@ -374,6 +442,25 @@ export async function pollScheduler(
     const def = await journal.get<TriggerDef>(DEF(id));
     const state = await journal.get<TriggerState>(STATE(id));
     if (!def || !state || state.status !== 'pending' || now < state.nextRunAt) continue;
+
+    // A stored definition that cannot fire (only 0.9.0 could write one — `scheduleWorkflow` now
+    // refuses it): firing it would run the workflow and then throw in computeNext, or fire on every
+    // poll for `every: 0`. The trigger is failed, with the reason and the way out, and the loop goes
+    // on to the next trigger instead of stopping at this one.
+    const problem = definitionProblem(def, now);
+    if (problem !== undefined) {
+      const failed: TriggerState = { ...state, status: 'failed' };
+      const won = journal.putIfMatch ? await journal.putIfMatch(STATE(id), state, failed) : (await journal.put(STATE(id), failed), true);
+      if (won) {
+        await journal.put(FAIL(id), {
+          error: `the trigger definition cannot fire: ${problem}. Call scheduleWorkflow again with a valid spec for this id; it replaces the stored definition.`,
+          at: now,
+        });
+        console.warn(`[scheduler] trigger ${id} has an invalid definition (${problem}) — marked failed, not fired.`);
+        out.failed++;
+      }
+      continue;
+    }
 
     const runId = `sched:${id}:${state.fireCount}`;
     // The fire lock, on its OWN key — see FIRE_LOCK. `runId` below is the RUN's name and is passed to

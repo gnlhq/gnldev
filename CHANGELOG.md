@@ -49,6 +49,71 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   separate round trips: two processes appending to one namespace at once can land out of order, so a
   reader may pass a record that appears a moment later. The same documented best-effort as
   `putIfMatch` without `eval`; ioredis and node-redis both have it.
+### Changed
+
+- **@gnldev/workflow: one step id used twice in one workflow is refused at build time.** A step is
+  journaled under its id, so `.then(inc).then(inc)` made the second use replay the first one's output —
+  on a FRESH run, with no error. Measured on 0.9.0: `0 → inc → inc` returned `1`; two `parallel` legs
+  sharing an id both ran but returned one field. `workflow()` now throws where the workflow is built,
+  naming the id and the way through: reuse the body under a second id, `.then(step('inc-2', inc.run))`.
+  The two arms of a `branch` (one runs per input) and a step inside a nested `asStep` workflow (its own
+  key prefix) may still reuse an id. Who is affected: a workflow that repeats a step id, whose output was
+  already wrong.
+
+### Fixed
+
+- **@gnldev/workflow: a step that returns `undefined` is replayed, not re-run.** The engine asked
+  "is there a record?" with `journal.get(key) !== undefined`, and every journal reads a stored
+  `undefined` back as `undefined`. Measured on 0.9.0 (in-memory and SQLite): a `void` step ran again on
+  every resume; with `sideEffect: true` the resume found the step's own finished claim, no readable
+  output, and threw `StepRetryBlockedError('in-flight')` for `claimTtlMs`, then asked `recover()` about a
+  step that had completed. `undefined` is now stored as `{ __gnlVoid: true }` and read back as
+  `undefined`; every other output keeps the plain shape, so 0.9.0 records replay unchanged. A
+  separate completion key was also tried: it passes the resume tests but `forkWorkflowRun` (which skips
+  `:_` keys) then re-runs the void step in the fork, and it costs a second write per void step.
+  Journals written by 0.9.0: a side-effect void step (claim + stored `undefined`) is recognised through
+  `listKeys` and replays; a plain void step re-runs once, as on 0.9.0, and is then rewritten in the new
+  shape. `isVoidStepRecord(v)` is exported for code that reads step records itself;
+  `runWorkflow().steps` in @gnldev/durable and the studio's run views show `undefined`, not the record.
+- **@gnldev/queue: `retryJob` continues the dead letter's run, so a side effect already done is not
+  fired again.** The README promises "a side effect already recorded as done is not run again". The
+  worker kept it for its own retries (same job, same `job:<id>` run) but `retryJob` re-enqueued the dead
+  letter under a new id, so `ctx.run` started a new, empty run. Measured on 0.9.0 (in-memory and
+  SQLite): a charge that landed before an outage was charged again after the operator's retry; two
+  clicks on retry charged three times. The retry is still a new record — the dead letter and its
+  markers stay for audit, and the queue's log and scan cursor are untouched — but it now carries the
+  dead letter's run id (followed through earlier retries), so `ctx.runId` is `job:<original id>` and the
+  journal replays what was done. This is what `retryDeadEvent` in @gnldev/events already did by keeping
+  the event id. Reviving the dead letter under its own id was also tried: it breaks the audit trail,
+  a double click runs it twice, and a dead letter behind the worker's scan cursor is never seen again.
+  Who is affected: a handler that relied on a retried job starting from an empty journal. The way
+  through: `retryJob(work, id, { newRun: true })`. Retry copies already made by 0.9.0 carry no link and
+  keep running under their own id; a 0.9.0 dead letter retried after the upgrade continues its run.
+- **@gnldev/scheduler: a spec that cannot fire is refused before anything is written, and a
+  corrected re-registration wins.** Measured on 0.9.0 (in-memory and SQLite): `scheduleWorkflow` with
+  `cron: '0 25 * * *'` threw after writing `sched:def:<id>`. Registering the same id with a fixed cron
+  then took the orphan-repair branch, which keeps the stored definition: every poll fired the workflow
+  under the same run id and threw in the next-time computation, and the triggers after it in the
+  journal never fired. `every: 0` (also negative, `NaN`, `Infinity`) was accepted and fired on every
+  poll. Now the whole spec is checked first — exactly one of `at | every | cron`, `every > 0`, a cron that
+  parses and matches within a year, `maxAttempts >= 1`, a known `misfire`, a workflow `name` — and a
+  refusal names the trigger and writes nothing. Journals written by 0.9.0: a stored definition that
+  cannot fire is replaced by the next valid `scheduleWorkflow` for that id (the fire counter is kept, so
+  no run id is reused), and until then the poller marks it `failed` with the reason in `sched:fail:`
+  instead of firing it, and goes on to the other triggers. A valid stored trigger is still not
+  redefined by a re-registration. Who is affected: code that passed two of `at | every | cron` (only
+  the first was used) or `maxAttempts: 0` — pass one, or `maxAttempts: 1`.
+- **@gnldev/cli: `gnl init --features otel|cache|schedule|job` writes a gnl.config.ts that parses.** On
+  0.9.0 each of those four wrote a line holding only `,` into the config object (measured: TS1136
+  "Property assignment expected" in 46 of the 90 single, pair and alternate-answer combinations), so the
+  new project's first `pnpm dev` failed. They have nothing to wire into the config and said so with an
+  empty `wiring`, which the generator turned into an empty field. `Recipe.wiring` is now optional — its
+  own doc already said "omit → nothing to wire" — and the four recipes omit it. A new test builds a
+  project for every recipe alone, every pair, and every recipe under the other init answers, and
+  requires each `gnl.config.ts` to parse; the bare project and all recipes together (both answer sets)
+  must also typecheck, in one TypeScript program with the template's compiler options. It is driven by
+  the recipe table, so a recipe added later is covered without editing the test. Existing projects are
+  not touched: delete the lone `,` line in `gnl.config.ts`.
 
 ## [0.9.0] — 2026-09-30
 

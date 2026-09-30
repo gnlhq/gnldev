@@ -71,7 +71,8 @@ describe('a job runs as its recorded owner', () => {
       next: async (_p, ctx) => { seen.push(ctx.caller); },
     }).drain();
     expect(seen).toEqual([staff('acme'), staff('acme'), staff('acme')]);
-    expect(await ownerOf(storage, `job:${again}`, 'acme')).toEqual(staff('acme'));
+    // The retry continues the dead letter's run (retry-resumes-run.test.ts), whose owner is staff.
+    expect(await ownerOf(storage, `job:${id}`, 'acme')).toEqual(staff('acme'));
   });
 
   it('caller and a different resourceId are refused: one owner per job', async () => {

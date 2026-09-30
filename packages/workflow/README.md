@@ -23,12 +23,13 @@ const out = await wf.run(1, { runId: 'w1', journal: new SqliteStorage('runs.db')
 
 ## API
 - `workflow<I>()` → builder: `.then(step)` · `.parallel([a, b])` · `.branch(pred, ifStep, elseStep)` · `.foreach(...)` · `.loop(...)`
-- `step(id, async (input, ctx) => out)` — every step journaled; a completed step is replayed, not re-run
+- `step(id, async (input, ctx) => out)` — every step journaled; a completed step is replayed, not re-run, whatever it returned (`undefined` included)
+- a step id is unique within one workflow: `.then(inc).then(inc)` throws at build time. Reuse the body under a second id: `.then(step('inc-2', inc.run))`. The two arms of a `branch` and a nested workflow (`asStep`) may reuse an id
 - `wf.run(input, { runId, journal })` — one-shot
 - `wf.runResumable(input, ctx)` — for suspending steps (`sleep` / `waitFor`); suspends with `WorkflowSuspended`, resumes on event/time.
 
 ## How it works
-Each step's output is journaled under `${runId}:wf:${stepId}` → the step doesn't rerun on replay. `parallel` sub-steps are journaled individually; `branch`/`loop` preserve deterministic replay.
+Each step's output is journaled under `${runId}:wf:${stepId}` → the step doesn't rerun on replay. An output of `undefined` is stored as `{ __gnlVoid: true }` (a stored `undefined` reads back like a missing key); `isVoidStepRecord(v)` recognises it if you read the journal yourself. `parallel` sub-steps are journaled individually; `branch`/`loop` preserve deterministic replay.
 
 ## Side-effect steps (the crash window, closed)
 

@@ -28,6 +28,12 @@ await scheduleWorkflow(journal, {
 setInterval(() => pollScheduler(journal, gnl), 30_000);
 ```
 
+Give exactly one of `at` (epoch ms), `every` (ms, greater than 0) or `cron` (5 fields, UTC). A spec that
+could not fire — a cron with hour 25, `every: 0`, two of the three — is refused before anything is
+written. Calling `scheduleWorkflow` again for an id that already exists is a no-op, so a redeploy does
+not redefine a running trigger; the exception is a stored definition that cannot fire (left by 0.9.0),
+which the next valid registration replaces. The poller fails such a definition instead of firing it.
+
 ## Triggers for an end user
 
 A trigger can work for one user in one organization. Each fire's run belongs to that user: they can see

@@ -65,14 +65,15 @@ describe('a combinator used twice gets two journal keys, not one', () => {
   });
 
   it('parallel twice over identically-named sub-steps', async () => {
-    const leg = (tag: string) => ({ id: 'leg', run: async (n: number) => n + (tag === 'x' ? 1 : 2) });
+    // Distinct leg ids: two legs sharing one id are refused at build time (void-output-replay.test.ts).
+    const leg = (tag: string) => ({ id: `leg-${tag}`, run: async (n: number) => n + (tag === 'x' ? 1 : 2) });
     const wf = workflow<number>()
       .parallel([leg('x'), leg('y')])
       .map((o: Record<string, number>) => Object.values(o)[0] ?? 0)
       .parallel([leg('x'), leg('y')]);
 
     const out: any = await run(wf, 0, 'pl-1');
-    expect(Object.keys(out)).toHaveLength(1); // both legs share the id 'leg' by construction
+    expect(out).toEqual({ 'leg-x': 2, 'leg-y': 3 }); // 0 -> {1,2} -> 1 -> {2,3}: the second parallel ran
   });
 
   it('branch twice over identically-named arms', async () => {

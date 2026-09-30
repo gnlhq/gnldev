@@ -572,6 +572,15 @@ function isFallbackMarker(v: unknown): v is { __gnlFallback: true; attempts: num
   return m.__gnlFallback === true && typeof m.attempts === 'number' && typeof m.stepId === 'string';
 }
 
+/**
+ * The record @gnldev/workflow writes for a step that completed with `undefined` (its
+ * `isVoidStepRecord`) — structural for the same one-way-dependency reason as the fallback marker.
+ * Read back as `undefined`, so a run's step list shows what the step returned, not the brand.
+ */
+function stepOutputOf(v: unknown): unknown {
+  return v && typeof v === 'object' && (v as Record<string, unknown>).__gnlVoid === true && Object.keys(v).length === 1 ? undefined : v;
+}
+
 function workflowStepKind(id: string): string {
   return id.startsWith('parallel(') ? 'parallel'
     : id.startsWith('branch(') ? 'branch'
@@ -1813,7 +1822,7 @@ export function createGnl(config: CreateGnlConfig) {
       steps.push({
         id: s.id,
         kind: workflowStepKind(s.id),
-        output: await journal.get(`${runId}:wf:${s.id}`),
+        output: stepOutputOf(await journal.get(`${runId}:wf:${s.id}`)),
         ...(fallback ? { fallback } : {}),
       });
     }

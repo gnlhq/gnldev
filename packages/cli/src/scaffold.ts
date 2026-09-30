@@ -261,9 +261,11 @@ function copyTemplate(dir: string, template: TemplateName, name: string): void {
  * as a line in this function is a question that does not belong in `gnl init`.
  */
 export function generateConfig(recipes: Recipe[], answers: InitAnswers = DEFAULT_ANSWERS): string {
-  const imports = recipes.map((r) => r.wiring.import);
-  const agentTools = recipes.filter((r) => r.wiring.place === 'agentTool').map((r) => r.wiring.code);
-  const configFields = recipes.filter((r) => r.wiring.place === 'configField').map((r) => r.wiring.code);
+  // A recipe without `wiring` has nothing to put here (a worker, a poller, a file the app imports).
+  const wirings = recipes.flatMap((r) => (r.wiring ? [r.wiring] : []));
+  const imports = wirings.map((w) => w.import);
+  const agentTools = wirings.filter((w) => w.place === 'agentTool').map((w) => w.code);
+  const configFields = wirings.filter((w) => w.place === 'configField').map((w) => w.code);
   // EVERY recipe's type extension, not just the picked ones — the config is written once and edited
   // for years. `satisfies` is an upper bound over OPTIONAL fields, so naming one the config does not
   // use costs nothing; leaving it out cost something measurable: `gnl add auth` prints an `auth,`

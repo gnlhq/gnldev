@@ -104,8 +104,12 @@ export interface Recipe {
    * things `gnl dev` mounts. Without this they would be files nobody has a way to start.
    */
   script?: { name: string; cmd: string };
-  /** How this recipe wires into gnl.config.ts (omit → nothing to wire, file is self-contained). */
-  wiring: RecipeWiring;
+  /**
+   * How this recipe wires into gnl.config.ts. OMIT it when there is nothing to wire (a worker, a poller,
+   * a file the app imports): an empty wiring is not "nothing", it is a config line holding only a comma,
+   * which is what `gnl init --features otel|cache|schedule|job` wrote into gnl.config.ts on 0.9.0.
+   */
+  wiring?: RecipeWiring;
   /** The corrected instruction `gnl add` prints (decoupled: edit the config object, NOT defineConfig). */
   humanWire: string;
   /** Honesty note about maturity / required setup, if any. */
@@ -383,12 +387,7 @@ const scheduler = createScheduler(journal, gnl, { pollMs: 30_000 });
 scheduler.start();
 console.log('→ scheduler polling every 30s');
 `,
-    wiring: {
-      // Nothing to wire into gnl.config.ts: this file READS the config and runs beside the app.
-      import: '',
-      place: 'configField',
-      code: '',
-    },
+    // No `wiring`: this file READS the config and runs beside the app (see Recipe.wiring).
     humanWire: `Nothing to add to gnl.config.ts — this runs as its own process:
   pnpm schedules
 The workflow it fires must exist in your config (\`gnl add workflow\` writes one).`,
@@ -439,7 +438,7 @@ console.log('→ worker draining the queue');
 // request arrives. Leave it out and a double-click is two jobs.
 void enqueue;
 `,
-    wiring: { import: '', place: 'configField', code: '' },
+    // No `wiring`: nothing goes into gnl.config.ts (see Recipe.wiring).
     humanWire: `Nothing to add to gnl.config.ts — this runs as its own process:
   pnpm worker
 Produce jobs with \`enqueue(storage.work, 'summarize', payload, { id })\` from anywhere.`,
@@ -619,7 +618,7 @@ export const embeddings = createCache(config.storage!.cache, 'embeddings');
 // decision about storage, not about whether the effect already happened. For that, the tool-level
 // \`idempotency\` in src/tools/ is the mechanism.
 `,
-    wiring: { import: '', place: 'configField', code: '' },
+    // No `wiring`: nothing goes into gnl.config.ts (see Recipe.wiring).
     humanWire: `Nothing to add to gnl.config.ts — import it where the expensive call happens:
   import { embeddings } from './cache.js';
   const vec = await embeddings.getOrCompute({ text }, () => embed(text));`,
@@ -661,7 +660,7 @@ export async function exportTrace(runId: string): Promise<void> {
 // sweeper that walks recent runs. There is no background exporter here on purpose: a framework that
 // ships data out by default is a framework that ships data out by surprise.
 `,
-    wiring: { import: '', place: 'configField', code: '' },
+    // No `wiring`: nothing goes into gnl.config.ts (see Recipe.wiring).
     humanWire: `Nothing to add to gnl.config.ts — call it when a run finishes:
   import { exportTrace } from './otel.js';
   await exportTrace(runId);

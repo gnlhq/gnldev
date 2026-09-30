@@ -27,6 +27,14 @@ export function isWorkflowStepKey(rest: string): boolean {
   if (rest.startsWith('_') || rest.includes(':_')) return false;
   return !rest.endsWith(':attempts');
 }
+/**
+ * A step output as @gnldev/workflow stored it, shown as the step returned it: a step that completed
+ * with `undefined` is journaled as the branded `{ __gnlVoid: true }` (workflow's `isVoidStepRecord`,
+ * matched structurally — the studio core does not import @gnldev/workflow).
+ */
+function workflowStepOutput(v: unknown): unknown {
+  return v && typeof v === 'object' && (v as Record<string, unknown>).__gnlVoid === true && Object.keys(v).length === 1 ? undefined : v;
+}
 /** Scheduler view trigger row (same shape as @gnldev/scheduler `listTriggers` — see GET /scheduler/triggers). */
 export type { TriggerInfo } from '@gnldev/scheduler';
 
@@ -5277,7 +5285,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
           seen.add(k);
           const stepId = k.slice(pre.length);
           if (!isWorkflowStepKey(stepId)) continue;
-          const output = await jget(k).catch(() => undefined);
+          const output = workflowStepOutput(await jget(k).catch(() => undefined));
           await stream.writeSSE({ event: 'step', data: JSON.stringify({ stepId, output, ts: Date.now() }) });
         }
       };
@@ -5309,7 +5317,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       const stepId = k.slice(pre.length);
       const v = await rw.get(k);
       if (stepId === '_suspend') suspend = v;
-      else if (isWorkflowStepKey(stepId)) steps.push({ stepId, output: v });
+      else if (isWorkflowStepKey(stepId)) steps.push({ stepId, output: workflowStepOutput(v) });
     }
     return c.json({ runId, steps, suspended: !!suspend, suspend });
   });

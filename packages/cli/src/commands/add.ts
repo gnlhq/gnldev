@@ -160,7 +160,7 @@ export const addCommand: Command = {
     // Not every recipe wires into the config — a worker and a scheduler are processes that READ it.
     // Printing "Add to gnl.config.ts:" over an instruction that says the opposite is the command
     // contradicting itself in two consecutive lines.
-    console.log(`\n${cyan(r.wiring.code ? 'Add to gnl.config.ts:' : 'How to run it:')}`);
+    console.log(`\n${cyan(r.wiring ? 'Add to gnl.config.ts:' : 'How to run it:')}`);
     for (const line of r.humanWire.split('\n')) console.log(`  ${line}`);
     if (r.note) console.log(`\n${dim('note: ' + r.note)}`);
     // THE DEPENDENCY GOES IN, it is not just announced. `gnl add` already writes into this

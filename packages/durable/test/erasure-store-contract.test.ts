@@ -269,7 +269,10 @@ describe.each(BACKENDS)('eraseSubject on %s', (name, make) => {
     (results[name] ??= {}).lone = after;
   });
 
-  it('an id with LIKE or glob metacharacters is a literal prefix: each target goes, each lookalike stays', async () => {
+  // Its own ceiling: on pg-mem (a SQL engine in JavaScript) this one test takes ~19s ALONE, against the
+  // suite's 30s — measured timing out in full parallel runs on a loaded machine while passing on its own.
+  // Same reasoning as the root vitest.config's testTimeout: a contention timeout is a false red.
+  it('an id with LIKE or glob metacharacters is a literal prefix: each target goes, each lookalike stays', { timeout: 120_000 }, async () => {
     const b = await make();
     const people = [...LITERAL_TARGETS, ...LITERAL_NEIGHBOURS];
     const { root } = await world(b, people);

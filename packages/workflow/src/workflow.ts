@@ -235,28 +235,76 @@ async function claim(journal: JournalLike, key: string, value: unknown): Promise
   return true;
 }
 
-// Runs a step exactly-once: if a record exists, returns it (replay); otherwise runs it and records
-// it via CAS — the loser of the race DISCARDS its own result and returns the winner's record (single
-// source of truth in multi-worker setups). This is @gnldev/durable's `frozenGet` adapted to workflow;
-// the ONLY difference is the record shape: existing workflow records are plain values WITHOUT a `{ v }`
-// wrapper, kept this way for backward compatibility (using frozenGet would make old records unreadable).
-// The plain shape's known limitation still holds: an `undefined` output cannot be distinguished from
-// "no record" (that step re-runs on replay) — behavior unchanged.
+// ── The step record ────────────────────────────────────────────────────────────
+// A step's record is its output, stored as-is — EXCEPT `undefined`. Every backend reads a key that
+// holds `undefined` back as `undefined`, which is also what `get` answers for "no key", so a `void`
+// step (send an email, write a row) was journaled but looked unrun: it re-ran on every resume, and a
+// `sideEffect` one blocked on its own finished claim. `undefined` is therefore written as a branded
+// record and read back as `undefined`. Every other output keeps the plain shape it has always had,
+// so records written before this change replay unchanged, and readers that `get` a step key see the
+// same values as before for everything but a void step (see `isVoidStepRecord`).
+const VOID_BRAND = '__gnlVoid' as const;
+const VOID_RECORD = { [VOID_BRAND]: true } as const;
+
+/** The value written for a step output — `undefined` becomes the branded void record. */
+function toStepRecord(out: unknown): unknown {
+  return out === undefined ? VOID_RECORD : out;
+}
+
+/**
+ * True for the record that stands for a step that completed with `undefined`. Exported so a reader
+ * outside the engine (an inspector, a UI) can show it as `undefined` rather than as the brand.
+ */
+export function isVoidStepRecord(v: unknown): boolean {
+  return !!v && typeof v === 'object' && (v as Record<string, unknown>)[VOID_BRAND] === true && Object.keys(v).length === 1;
+}
+
+/** A step's completion, told apart from its value: `undefined` = no record; `{ output }` = completed. */
+async function readStepRecord(journal: JournalLike, key: string): Promise<{ output: unknown } | undefined> {
+  const v = await journal.get(key);
+  if (v === undefined) return undefined;
+  return { output: isVoidStepRecord(v) ? undefined : v };
+}
+
+/**
+ * A void output journaled by 0.9.0 or earlier: the key EXISTS but holds a raw `undefined`, which `get`
+ * cannot tell from absence. Only `listKeys` can see it, so it is asked only where a record was
+ * expected and none was readable — never on the fresh-step path.
+ */
+async function isLegacyVoidRecord(journal: JournalLike, key: string): Promise<boolean> {
+  if (!journal.listKeys) return false;
+  return (await journal.listKeys(key)).includes(key);
+}
+
+/**
+ * Journals `out` first-writer-wins and returns the output that won. The loser of a race DISCARDS its
+ * own result and returns the winner's (single source of truth across workers). A winner that is a
+ * 0.9.0 void record is rewritten in the new shape, so the next resume replays it.
+ */
+async function recordStepOutput(journal: JournalLike, key: string, out: unknown): Promise<unknown> {
+  if (await claim(journal, key, toStepRecord(out))) return out;
+  const winner = await readStepRecord(journal, key);
+  if (winner) return winner.output;
+  if (await isLegacyVoidRecord(journal, key)) {
+    await journal.put(key, VOID_RECORD);
+    return undefined;
+  }
+  return out;
+}
+
+// Runs a step exactly-once: if a record exists, returns it (replay); otherwise runs it and records it
+// via CAS. This is @gnldev/durable's `frozenGet` adapted to workflow; the difference is the record
+// shape — workflow records stay plain values (no `{ v }` wrapper) so existing records remain readable,
+// with the one exception of `undefined` described above.
 async function runStep(s: Step, input: any, ctx: StepCtx): Promise<any> {
   const key = `${ctx.runId}:wf:${ctx.keyPrefix ?? ''}${s.id}`;
-  const cached = await ctx.journal.get(key);
-  if (cached !== undefined) return cached;
+  const cached = await readStepRecord(ctx.journal, key);
+  if (cached) return cached.output;
   // FAZ-1: the step's journal key doubles as its idempotencyKey — single source of truth, injected
   // into ctx so the step body can hand it to external APIs (see StepCtx.idempotencyKey).
   const ctx2: StepCtx = { ...ctx, idempotencyKey: key };
   if (s.durability?.sideEffect) return runSideEffectStep(s, s.durability, input, ctx2, key);
-  const out = await s.run(input, ctx2);
-  if (await claim(ctx.journal, key, out)) return out;
-  // Race lost: the winner's record is the single source of truth. If the winner wrote `undefined`
-  // (indistinguishable in the plain shape) we fall back to our own output — both results are products
-  // of the same step anyway.
-  const winner = await ctx.journal.get(key);
-  return winner === undefined ? out : winner;
+  return recordStepOutput(ctx.journal, key, await s.run(input, ctx2));
 }
 
 /** The storage's clock when it has one (multi-worker skew safety — run-lock's H2 posture), else local. */
@@ -321,8 +369,13 @@ async function runSideEffectStep(
   let mine: StepClaimRecord = { startedAt: await clockOf(journal) };
   if (!(await claim(journal, claimKey, mine))) {
     // A claim already exists: crash-resume, a clean suspend, or a concurrent worker.
-    const done = await journal.get(key);
-    if (done !== undefined) return done; // completed between the cache check and here
+    const done = await readStepRecord(journal, key);
+    if (done) return done.output; // completed between the cache check and here
+    if (await isLegacyVoidRecord(journal, key)) {
+      // Completed under 0.9.0 with `undefined`: its claim is a finished attempt's, not a live one.
+      await journal.put(key, VOID_RECORD);
+      return undefined;
+    }
     const cur = await journal.get<StepClaimRecord>(claimKey); // RAW record — the CAS operand
     const at = await clockOf(journal);
     if (!cur) {
@@ -335,8 +388,8 @@ async function runSideEffectStep(
       // A clean suspend: re-running on resume is the step's documented contract (suspendWorkflow) — adopt and run.
       mine = { startedAt: at };
       await adoptClaim(journal, claimKey, cur, mine, s.id, key, { ageMs: at - cur.startedAt, claimTtlMs: ttl });
-      const landed = await journal.get(key);
-      if (landed !== undefined) return landed; // a sibling completed between our reads — replay, don't re-fire
+      const landed = await readStepRecord(journal, key);
+      if (landed) return landed.output; // a sibling completed between our reads — replay, don't re-fire
     } else if (!cur.failed && at - cur.startedAt < ttl) {
       throw new StepRetryBlockedError(s.id, { key, state: 'in-flight', ageMs: at - cur.startedAt, claimTtlMs: ttl });
     } else {
@@ -347,25 +400,18 @@ async function runSideEffectStep(
       }
       const r = await d.recover(input, { idempotencyKey: key });
       assertRecoverShape(r, s.id);
-      if (r.done) {
-        if (await claim(journal, key, r.output)) return r.output;
-        const winner = await journal.get(key);
-        return winner === undefined ? r.output : winner;
-      }
+      if (r.done) return recordStepOutput(journal, key, r.output);
       // The effect never landed → adopt the claim (atomically — two resumes must not both re-run) and execute.
       mine = { startedAt: at };
       await adoptClaim(journal, claimKey, cur, mine, s.id, key, { ageMs: at - cur.startedAt, claimTtlMs: ttl });
       // A sibling resume's recover({done:true}) writes the OUTPUT without touching the claim — one
       // last point-read closes that window before re-firing (heyet: Deniz'in çift-recover senaryosu).
-      const landed = await journal.get(key);
-      if (landed !== undefined) return landed;
+      const landed = await readStepRecord(journal, key);
+      if (landed) return landed.output;
     }
   }
   try {
-    const out = await s.run(input, ctx);
-    if (await claim(journal, key, out)) return out;
-    const winner = await journal.get(key);
-    return winner === undefined ? out : winner;
+    return await recordStepOutput(journal, key, await s.run(input, ctx));
   } catch (e) {
     // Stamp what we KNOW onto the claim so the resume needn't wait out the TTL: a clean suspend is
     // safe to re-run; a throw means "not in flight, effect uncertain". Best-effort CAS against OUR
@@ -390,8 +436,33 @@ async function runSideEffectStep(
   }
 }
 
+/**
+ * A step's journal key is its id, so one id used twice in one workflow makes the second use replay
+ * the first one's output — on a FRESH run, with no error. Refused where the workflow is built.
+ * Scoped places are unaffected: the two arms of a branch (only one runs per input) and a nested
+ * workflow (its own keyPrefix) may reuse an id.
+ */
+function assertUniqueStepIds(ids: string[]): void {
+  const seen = new Set<string>();
+  for (const id of ids) {
+    if (seen.has(id)) {
+      throw new Error(
+        `@gnldev/workflow: step id '${id}' is used twice in one workflow. Every step is journaled under its id, so the second use would replay the first one's output instead of running. Give each use its own id: step('${id}-2', ${safeIdent(id)}.run) (pass ${safeIdent(id)}.durability as the third argument if it has one).`,
+      );
+    }
+    seen.add(id);
+  }
+}
+
+/** The step id as it most likely appears as a variable name in the caller's code, for the error text. */
+function safeIdent(id: string): string {
+  return /^[A-Za-z_$][\w$]*$/.test(id) ? id : 'yourStep';
+}
+
 export class Workflow<I = any, O = any> {
-  constructor(private readonly steps: Step[]) {}
+  constructor(private readonly steps: Step[]) {
+    assertUniqueStepIds(steps.map((s) => s.id));
+  }
 
   /** Add a sequential step (previous output becomes this step's input). */
   then<NO>(s: Step<O, NO>): Workflow<I, NO> {
@@ -407,6 +478,9 @@ export class Workflow<I = any, O = any> {
 
   /** Parallel steps (all receive the same input; output is `{ [stepId]: output }`). Each sub-step is journaled separately. */
   parallel(steps: Step<O, any>[], id?: string): Workflow<I, Record<string, any>> {
+    // Legs share one journal namespace AND one output record keyed by leg id — a repeated id would
+    // collide in both.
+    assertUniqueStepIds(steps.map((s) => s.id));
     // Position-unique, like `.map` above. A default derived only from CONTENT collides with itself:
     // two `.parallel` over the same sub-steps produced one journal key, so the second never ran and
     // the workflow returned the first one's output — silently.

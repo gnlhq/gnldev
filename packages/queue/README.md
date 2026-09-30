@@ -59,6 +59,9 @@ createWorker(storage, {
 - `ctx.journal` and `ctx.storage` are scoped to the job's organization. Build the organization's
   `createGnl` from `ctx.storage`.
 - `retryJob` and `ctx.enqueue(type, payload)` keep the owner and the organization.
+- `retryJob(work, id)` adds a new job record (the dead letter stays, for audit) that **continues the dead
+  letter's run**: `ctx.runId` is the original `job:<id>`, so a side effect the run already recorded as done
+  is replayed, not fired again. For a fresh run on purpose: `retryJob(work, id, { newRun: true })`.
   Passing `ctx.storage.work` to `enqueue` is refused, since no worker polls that store.
 - An explicit `id` is a name **within its owner**: two organizations (or two users) using `weekly-report`
   get two jobs. `enqueue` returns the stored id; use that one with `retryJob` and `listJobs`. A system
