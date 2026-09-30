@@ -11,5 +11,7 @@ export { SemanticMemory } from './semantic-memory.js';
 export type { SemanticMemoryOptions } from './semantic-memory.js';
 export { chunkText, chunkDocuments } from './chunk.js';
 export type { ChunkOptions, Chunk } from './chunk.js';
+export { ingestDocuments, deleteDocuments } from './ingest.js';
+export type { IngestResult } from './ingest.js';
 export { GraphRag } from './graph-rag.js';
 export type { GraphRagOptions } from './graph-rag.js';

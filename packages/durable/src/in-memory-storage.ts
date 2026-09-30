@@ -3,6 +3,7 @@
 // Correctness matters, not perf (naive filter/sort). Date.now/Math.random are free to use here (runtime code).
 import { cosineSimilarity } from 'ai';
 import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from './storage.js';
+import { recallPartition, inRecallPartition } from './storage.js';
 import { InMemoryJournal } from './journal.js';
 import { stableStringify } from './hash.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix } from './organization.js';
@@ -176,9 +177,10 @@ class InMemoryMemoryStore implements MemoryStore {
     if (!hasNorm(query)) return [];
     const byThread = new Map<string, MessageRecord[]>();
     if (opts.scope === 'resource' && opts.resourceId) {
+      const partition = recallPartition(threadId);
       for (const [tid, rows] of this.messages) {
         const t = this.threads.get(tid);
-        if (t && !t.deletedAt && t.resourceId === opts.resourceId) byThread.set(tid, rows);
+        if (t && !t.deletedAt && t.resourceId === opts.resourceId && inRecallPartition(partition, tid)) byThread.set(tid, rows);
       }
     } else {
       byThread.set(threadId, this.messages.get(threadId) ?? []);

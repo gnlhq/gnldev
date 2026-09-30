@@ -14,6 +14,7 @@ import { tool, stepCountIs } from 'ai';
 import { z } from 'zod';
 import { runDurable } from '../src/run.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
+import { BasicMemory } from '../src/memory.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 import { spawnFixtureEnv } from './fixtures/watchdog.js';
 
@@ -130,6 +131,18 @@ describe('REAL multi-process races (same SQLite journal, two OS processes)', () 
       await s.close();
       // Not "roughly" — EXACT. A single lost update anywhere fails this line.
       expect(counters).toEqual({ n: 500, cost: 250 });
+    });
+  });
+
+  it('journal memory: 2 × 50 concurrent appends to one thread from two processes → all 100 messages kept', { timeout: 60_000 }, async () => {
+    await withDir(async (dir) => {
+      const { a, b } = await runPair('mem-append', dir);
+      expect(a.ok && b.ok).toBe(true);
+      const s = new SqliteStorage(join(dir, 'runs.db'));
+      const msgs = await new BasicMemory(s.runs).getMessages('race-thread');
+      await s.close();
+      expect(msgs).toHaveLength(100);
+      expect(new Set(msgs.map((m: { content: string }) => m.content)).size).toBe(100);
     });
   });
 

@@ -546,14 +546,14 @@ rather than guessing what to strip.
 ### 7.4 RAG — answering from a document archive
 
 ```ts
-import { chunkDocuments, indexDocuments, PostgresVectorStore, createRagTool, GraphRag } from '@gnldev/rag';
+import { ingestDocuments, PostgresVectorStore, createRagTool, GraphRag } from '@gnldev/rag';
 
-// 1) Split documents into chunks (chunk: breaking long text into small, searchable pieces):
-// `shared: true` — every end user may read it; a user's own document gets `owner: '<user id>'` instead.
-const chunks = chunkDocuments([{ id: 'handbook', text: longText, shared: true }], { strategy: 'markdown' });
-// 2) Write to a persistent vector store (pgvector: Postgres's embedding search extension):
+// 1) A persistent vector store (pgvector: Postgres's embedding search extension):
 const store = new PostgresVectorStore({ connectionString: PG_URL });
-await indexDocuments(store, embed, chunks);
+// 2) Split the document into chunks (small, searchable pieces), embed them and write them. Run it
+//    again after an edit: the document's old chunks go first, so a shorter version leaves none behind.
+// `shared: true` — every end user may read it; a user's own document gets `owner: '<user id>'` instead.
+await ingestDocuments(store, embed, [{ id: 'handbook', text: longText, shared: true }], { strategy: 'markdown' });
 // 3) Give it to the agent as a tool:
 tools: { knowledgeBase: createRagTool({ store, embed, topK: 4 }) }
 ```

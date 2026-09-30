@@ -126,17 +126,24 @@ export function chunkText(text: string, opts?: ChunkOptions): Chunk[] {
 }
 
 /**
- * Split documents → VectorDoc list ready for `indexDocuments`. Chunk id is `<docId>#<i>`
- * (deterministic → re-indexing upserts to the same ids, no duplicate records); metadata
- * is inherited + a `{ source, chunk }` trail is added (and a `heading` breadcrumb in markdown);
- * `namespace`, `owner` and `shared` are inherited as they are.
+ * Split documents → VectorDoc list ready for `indexDocuments`. Chunk id is `<docId>#<i>`, or the
+ * document's own id when it fits in one chunk. Metadata is inherited + a `{ source, chunk }` trail is
+ * added to EVERY chunk (and a `heading` breadcrumb in markdown); `namespace`, `owner` and `shared` are
+ * inherited as they are.
+ *
+ * Deterministic ids do NOT make re-indexing an edited document safe on their own: when the new text
+ * yields fewer chunks, `indexDocuments` (upsert) leaves the old tail chunks in place. Use
+ * `ingestDocuments`, which removes a document's chunks by `source` before writing its new ones. That is
+ * also why the single-chunk case carries `source` now: without it, a one-chunk version could not be
+ * found and removed when the document grew again.
  */
 export function chunkDocuments(docs: VectorDoc[], opts?: ChunkOptions): VectorDoc[] {
   const out: VectorDoc[] = [];
   for (const doc of docs) {
     const chunks = chunkText(doc.text, opts);
     if (chunks.length <= 1) {
-      out.push(doc); // not split → original id/metadata as-is (no pointless #0 derivation)
+      // Not split → the document's own id and text (no pointless #0 derivation), with the trail.
+      out.push({ ...doc, metadata: { ...doc.metadata, source: doc.id, chunk: 0 } });
       continue;
     }
     chunks.forEach((c, i) => {

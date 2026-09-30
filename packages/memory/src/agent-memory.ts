@@ -664,8 +664,13 @@ export class AgentMemory {
     const overfetch = Math.max(topK * 20, 100);
     const hits = await this.om.omVectors.store.query(qEmbedding!, overfetch, ...(this.omVectorNs ? [{ namespace: this.omVectorNs }] : []));
     const obsById = new Map((await this.store.getObservations(threadId)).map((o) => [o.id, o as Observation]));
+    // The namespace check is the partition: a root memory's query is not narrowed (the port cannot ask
+    // for "no namespace"), so an organization's vector for a thread of the same bare id, carrying the
+    // same per-thread `obsId`, would rank here and answer with the root's unrelated observation. ADR-0001:
+    // in the root scope, every organization's rows are hidden. A view strips the namespace it applied,
+    // so an organization's own hits read `undefined` against its `undefined` label.
     const scoped = hits
-      .filter((h) => h.metadata?.threadId === threadId && h.score >= threshold)
+      .filter((h) => h.namespace === this.omVectorNs && h.metadata?.threadId === threadId && h.score >= threshold)
       .sort((a, b) => b.score - a.score)
       .slice(0, topK);
     const out: OmRecallMatch[] = [];

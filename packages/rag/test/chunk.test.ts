@@ -78,7 +78,7 @@ describe('chunkDocuments', () => {
     expect(out.map((d) => d.id)).toEqual(['doc1#0', 'doc1#1', 'doc2']); // short doc not split, as-is
     expect(out[0]!.metadata).toEqual({ lang: 'tr', source: 'doc1', chunk: 0 });
     expect(out[1]!.metadata).toEqual({ lang: 'tr', source: 'doc1', chunk: 1 });
-    expect(out[2]!.metadata).toBeUndefined();
+    expect(out[2]!.metadata).toEqual({ source: 'doc2', chunk: 0 }); // one chunk carries the trail too
   });
 
   it('end-to-end with indexDocuments: chunks land in the store and are queryable', async () => {

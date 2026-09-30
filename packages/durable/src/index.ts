@@ -21,7 +21,7 @@ export type {
   RunStatus,
   RunOutcomeRecord,
 } from './journal.js';
-export { BasicMemory, PROVENANCE_RECENT_CAP, messagePreview, memKey, MEM_LEAVES, OM_LEAVES, OM_VECTOR_SOURCE, type OmLeaf } from './memory.js';
+export { BasicMemory, appendToJournalLog, PROVENANCE_RECENT_CAP, messagePreview, memKey, MEM_LEAVES, OM_LEAVES, OM_VECTOR_SOURCE, type OmLeaf } from './memory.js';
 export type { Memory, MemoryContextProvenance, RecalledMessageRef, MemLeaf } from './memory.js';
 export { getRunCost, toTraceSpans } from './cost.js';
 // Sibling packages (@gnldev/otel's span builder) read the same journal records and hit the same
@@ -153,6 +153,7 @@ export { runNetwork, getNetworkTrace, netKeys } from './network.js';
 export type { NetworkResult, NetworkStep, NetworkTarget, RouteDecision, RunNetworkOptions } from './network.js';
 export { withOrg, orgScopeOf, orgPrefix, isPlatformKey, assertOrgRegistered, assertNoRunsInFlight, ORG_RECORD_PRE, ADOPTABLE_RESERVED_PREFIXES, ENGINE_META_KEYS } from './organization.js';
 export { withOrgStorage, orgStorageScopeOf, scopeConfigToOrg } from './org-storage.js';
+export { recallPartition, inRecallPartition, type RecallPartition } from './storage.js';
 export { withSubjectJournal, withSubjectMemory, type SubjectViewOptions, type SubjectMemoryOptions } from './subject-view.js';
 export { threadOwnerOf, admitThreadRun, threadOwnerKey, assignThreadOwner, type ThreadOwnership } from './thread-owner.js';
 export { ownedName, ownerOfName, assertSystemName, ownedPrefix, ownerIdProblem, assertOwnerId, OwnerIdError, RESERVED_OWNER_PREFIXES } from './owned-name.js';

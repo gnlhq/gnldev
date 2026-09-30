@@ -11,6 +11,7 @@
 // declare the port, and by integration-real.test.ts against a real server, where Postgres gets its
 // coverage back for real rather than through a double.
 import { it, expect } from 'vitest';
+import { withOrgStorage, workingMemoryScope } from '../src/index.js';
 import type { Storage, MessageRecord, ThreadRecord } from '../src/index.js';
 
 const msg = (threadId: string, seq: number, text: string, embedding?: number[]): MessageRecord => ({
@@ -97,6 +98,47 @@ export function memoryConformance(make: () => Storage, caps: { serialisesAppends
       expect(r1.map((m) => m.text)).toEqual(['cats']);
       const r2 = await b.memory!.recall('t1', [1, 0], { topK: 2, scope: 'resource', resourceId: 'u1' });
       expect(r2.map((m) => m.text).sort()).toEqual(['cats', 'felines']);
+    });
+
+    // ADR-0001: "In the root scope, every organization's rows are hidden." A resource id names a user
+    // of ONE scope; the same id in two scopes is two people. Resource-scoped recall anchored on a root
+    // thread used to filter by resource id alone and returned `org:acme:` rows to a root end user.
+    it('MemoryStore: resource-scoped recall from a ROOT thread returns no organization rows', async () => {
+      const b = make();
+      const acme = withOrgStorage(b, 'acme').memory!;
+      await acme.upsertThread(thread('t-acme', 'u-shared', 1));
+      await acme.appendMessages('t-acme', [msg('t-acme', 0, 'ACME-SECRET', [1, 0])]);
+      await b.memory!.upsertThread(thread('t-root', 'u-shared', 1));
+      await b.memory!.appendMessages('t-root', [msg('t-root', 0, 'root own', [0.5, 0.5])]);
+      const hits = await b.memory!.recall('t-root', [1, 0], { topK: 5, scope: 'resource', resourceId: 'u-shared' });
+      expect(hits.map((m) => m.threadId)).toEqual(['t-root']);
+    });
+
+    // The mirror, at the store: an organization thread's resource recall stays inside that
+    // organization BEFORE topK is taken. The org view used to filter AFTER the store's topK, so a
+    // higher-scoring foreign row took the only slot and acme got nothing back.
+    it('MemoryStore: resource-scoped recall from an ORGANIZATION thread ranks only that organization\'s rows', async () => {
+      const b = make();
+      const acme = withOrgStorage(b, 'acme').memory!;
+      const globex = withOrgStorage(b, 'globex').memory!;
+      await globex.upsertThread(thread('t-g', 'u-shared', 1));
+      await globex.appendMessages('t-g', [msg('t-g', 0, 'GLOBEX-SECRET', [1, 0])]);
+      await b.memory!.upsertThread(thread('t-root', 'u-shared', 1));
+      await b.memory!.appendMessages('t-root', [msg('t-root', 0, 'ROOT-SECRET', [1, 0])]);
+      await acme.upsertThread(thread('t-a', 'u-shared', 1));
+      await acme.appendMessages('t-a', [msg('t-a', 0, 'acme own', [0.6, 0.4])]);
+      const raw = await b.memory!.recall('org:acme:t-a', [1, 0], { topK: 1, scope: 'resource', resourceId: 'u-shared' });
+      expect(raw.map((m) => m.text)).toEqual(['acme own']);
+      const viaView = await acme.recall('t-a', [1, 0], { topK: 1, scope: 'resource', resourceId: 'u-shared' });
+      expect(viaView.map((m) => m.text)).toEqual(['acme own']);
+    });
+
+    // Sibling: a person's working memory is keyed per scope, so the root and an organization never
+    // share one record for the same resource id. Pinned so a key change cannot merge them.
+    it('MemoryStore: resource working memory of the same user id is separate in the root and an organization', async () => {
+      const b = make();
+      await withOrgStorage(b, 'acme').memory!.setWorkingMemory(workingMemoryScope.resource('u-shared'), { secret: 'ACME' });
+      expect(await b.memory!.getWorkingMemory(workingMemoryScope.resource('u-shared'))).toBeUndefined();
     });
 
     // P1.5 (AUDIT-R2): messageRange expands EACH hit with its before/after neighbors BY SEQ

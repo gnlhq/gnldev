@@ -4,6 +4,7 @@
 // Vector is 'scan' for now (brute-force cosine; pgvector deferred — pg-mem compatibility + lean first cut).
 import { prefixUpperBound } from './organization.js';
 import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from './storage.js';
+import { recallPartition, recallPartitionSql } from './storage.js';
 import { createRequire } from 'node:module';
 import { cosineSimilarity } from 'ai';
 import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus } from './journal.js';
@@ -1406,8 +1407,9 @@ class PgMemoryStore implements MemoryStore {
   }
   async recall(threadId: string, query: number[], opts: RecallOptions): Promise<MessageRecord[]> {
     if (!hasNorm(query)) return [];
+    const part = recallPartitionSql(recallPartition(threadId), (n) => `$${n + 2}`);
     const r = opts.scope === 'resource' && opts.resourceId
-      ? await this.q(`SELECT m.* FROM gnl_messages m JOIN gnl_threads t ON t.id = m.thread_id WHERE t.resource_id = $1 AND t.deleted_at IS NULL ORDER BY m.thread_id, m.seq`, [opts.resourceId])
+      ? await this.q(`SELECT m.* FROM gnl_messages m JOIN gnl_threads t ON t.id = m.thread_id WHERE t.resource_id = $1 AND t.deleted_at IS NULL AND ${part.cond} ORDER BY m.thread_id, m.seq`, [opts.resourceId, ...part.params])
       : await this.q('SELECT * FROM gnl_messages WHERE thread_id = $1 ORDER BY seq', [threadId]);
     const byThread = new Map<string, MessageRecord[]>();
     for (const x of r.rows) { const m = this.toMsg(x); const a = byThread.get(m.threadId) ?? []; a.push(m); byThread.set(m.threadId, a); }

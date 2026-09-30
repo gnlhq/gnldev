@@ -601,14 +601,14 @@ reddeder.
 ### 7.4 RAG — doküman arşivinden cevap
 
 ```ts
-import { chunkDocuments, indexDocuments, PostgresVectorStore, createRagTool, GraphRag } from '@gnldev/rag';
+import { ingestDocuments, PostgresVectorStore, createRagTool, GraphRag } from '@gnldev/rag';
 
-// 1) Dokümanları parçala (chunk: uzun metni aranabilir küçük parçalara bölme):
-// `shared: true` — her son kullanıcı okuyabilir; bir kullanıcının kendi belgesine bunun yerine `owner: '<kullanıcı id>'` verilir.
-const parcalar = chunkDocuments([{ id: 'el-kitabi', text: uzunMetin, shared: true }], { strategy: 'markdown' });
-// 2) Kalıcı vektör arşivine yaz (pgvector: Postgres'in embedding arama eklentisi):
+// 1) Kalıcı vektör arşivi (pgvector: Postgres'in embedding arama eklentisi):
 const store = new PostgresVectorStore({ connectionString: PG_URL });
-await indexDocuments(store, embed, parcalar);
+// 2) Dokümanı parçala (aranabilir küçük parçalar), embed'le ve yaz. Düzenlemeden sonra tekrar çalıştır:
+//    önce dokümanın eski parçaları silinir, kısalan bir sürüm geride parça bırakmaz.
+// `shared: true` — her son kullanıcı okuyabilir; bir kullanıcının kendi belgesine bunun yerine `owner: '<kullanıcı id>'` verilir.
+await ingestDocuments(store, embed, [{ id: 'el-kitabi', text: uzunMetin, shared: true }], { strategy: 'markdown' });
 // 3) Ajana araç olarak ver:
 tools: { bilgiBankasi: createRagTool({ store, embed, topK: 4 }) }
 ```

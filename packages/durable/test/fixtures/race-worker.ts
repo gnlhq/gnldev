@@ -4,7 +4,7 @@
 // RESULT, not a crash), so the parent asserts on data, never on exit-code guesswork.
 //
 //   argv: <mode> <dbPath> <outDir> <workerId>
-//   modes: charge-lock | charge-claim | incr | grid | lock
+//   modes: charge-lock | charge-claim | incr | mem-append | grid | compensate | lock
 import { existsSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tool, stepCountIs } from 'ai';
@@ -12,6 +12,7 @@ import { z } from 'zod';
 import { runDurable } from '../../src/run.js';
 import { compensateRun } from '../../src/compensation.js';
 import { SqliteStorage } from '../../src/sqlite-storage.js';
+import { BasicMemory } from '../../src/memory.js';
 import { armFixtureWatchdog } from './watchdog.js';
 
 armFixtureWatchdog(); // never outlive the test that spawned this — see watchdog.ts
@@ -84,6 +85,14 @@ try {
     const K = 250;
     await barrier();
     for (let i = 0; i < K; i++) await storage.runs.incrBy!('race:ctr', { n: 1, cost: 0.5 });
+    out({ ok: true, k: K });
+  } else if (mode === 'mem-append') {
+    // Cross-process journal memory: both processes append 50 messages to ONE thread at once. An
+    // in-process queue alone keeps each process's own 50 and lets the two erase each other.
+    const K = 50;
+    const mem = new BasicMemory(storage.runs);
+    await barrier();
+    await Promise.all(Array.from({ length: K }, (_, i) => mem.append('race-thread', [{ role: 'user', content: `${workerId}-${i}` }])));
     out({ ok: true, k: K });
   } else if (mode === 'grid') {
     // Cross-process putIfAbsent proof: both processes sweep the SAME N keys — every key must have

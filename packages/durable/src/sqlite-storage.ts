@@ -4,6 +4,7 @@
 // vectors = 'scan' (brute-force cosine; no pgvector). node:sqlite (loaded at runtime via createRequire).
 import { prefixUpperBound } from './organization.js';
 import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from './storage.js';
+import { recallPartition, recallPartitionSql } from './storage.js';
 import { createRequire } from 'node:module';
 import { statSync, existsSync } from 'node:fs';
 import { cosineSimilarity } from 'ai';
@@ -1155,10 +1156,11 @@ class SqliteMemoryStore implements MemoryStore {
     if (!hasNorm(query)) return [];
     let rows: any[];
     if (opts.scope === 'resource' && opts.resourceId) {
+      const part = recallPartitionSql(recallPartition(threadId), () => '?');
       rows = this.db.prepare(
         `SELECT m.* FROM gnl_messages m JOIN gnl_threads t ON t.id = m.thread_id
-         WHERE t.resource_id = ? AND t.deleted_at IS NULL ORDER BY m.thread_id, m.seq`,
-      ).all(opts.resourceId);
+         WHERE t.resource_id = ? AND t.deleted_at IS NULL AND ${part.cond} ORDER BY m.thread_id, m.seq`,
+      ).all(opts.resourceId, ...(part.params as (string | number)[]));
     } else {
       rows = this.db.prepare('SELECT * FROM gnl_messages WHERE thread_id = ? ORDER BY seq').all(threadId);
     }

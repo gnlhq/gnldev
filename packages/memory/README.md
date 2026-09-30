@@ -20,7 +20,10 @@ await runDurable({ runId, journal, model, memory: mem, threadId: 'th-1', resourc
 
 ## 4 tracks (all common agent-memory features + a durable twist)
 - **Rich recall** — `topK` + `messageRange` (context around the hit) + `threshold` + metadata `filter` +
-  **`scope:'resource'`** (cross-thread).
+  **`scope:'resource'`** (cross-thread). Cross-thread stays inside one scope: a root thread recalls
+  only root threads, an organization's thread only that organization's — the same user id in two
+  scopes is two people. To search one organization's threads from outside it, recall through
+  `withOrgStorage(storage, orgId)`.
 - **Schema working memory** — zod/template WM + the `updateWorkingMemory` tool (deep-merge, `null` =
   delete) + `readOnly`. The tool is wrapped with `durableTool` → the merge is journaled.
   `scope: 'thread'` (default) keeps it per thread, `scope: 'resource'` per person. The two live in
@@ -103,7 +106,9 @@ in place); a thread id that begins `thread:`, `resource:` or `res:` is ambiguous
   transaction that writes the rows, serialised per thread, and must write the batch all-or-nothing —
   a half-written batch can leave a `tool-call` without its `tool-result`. Rows that DO carry `seq`
   are written exactly there and keep the idempotent CAS form (`cloneThread`, transcript import); a
-  batch that mixes the two throws.
+  batch that mixes the two throws. `recall` with `scope: 'resource'` must rank only the threads in
+  the anchor thread's partition, before `topK`: `recallPartition`/`inRecallPartition` from
+  `@gnldev/durable` give the rule.
 
 ## Lite alternative
 For anyone who just wants simple topK recall, `SemanticMemory` in `@gnldev/rag` is lighter; it uses the same

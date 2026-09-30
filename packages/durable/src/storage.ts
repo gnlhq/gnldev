@@ -147,6 +147,49 @@ export interface RecallOptions {
 }
 
 /**
+ * Which threads a resource-scoped `recall` anchored on `threadId` may rank: the anchor's partition.
+ *
+ * Organization rows live physically in the root store under `org:<id>:` (`withOrgStorage`), and a
+ * resource id is not unique across partitions. So the partition comes from the ANCHOR, the one id
+ * that says which scope is asking:
+ *
+ *   - `root` — an anchor with no organization prefix: every thread NOT under `org:`.
+ *   - `org`  — an anchor under `org:<id>:`: the threads under that same `prefix`.
+ *   - `only` — an anchor that starts with `org:` but names no organization (`org:x`, which
+ *              `withOrgStorage` never writes): the anchor thread alone, since no partition can be named.
+ *
+ * One function for the three adapters, so the rule cannot drift between them the way the filter
+ * matcher once did.
+ */
+export type RecallPartition = { kind: 'root' } | { kind: 'org'; prefix: string } | { kind: 'only'; threadId: string };
+const ORG_THREAD_PREFIX = 'org:';
+export function recallPartition(threadId: string): RecallPartition {
+  if (!threadId.startsWith(ORG_THREAD_PREFIX)) return { kind: 'root' };
+  const end = threadId.indexOf(':', ORG_THREAD_PREFIX.length);
+  return end > ORG_THREAD_PREFIX.length ? { kind: 'org', prefix: threadId.slice(0, end + 1) } : { kind: 'only', threadId };
+}
+/** Whether thread `candidate` is inside `partition` — the in-process twin of the SQL adapters' condition. */
+export function inRecallPartition(partition: RecallPartition, candidate: string): boolean {
+  switch (partition.kind) {
+    case 'root': return !candidate.startsWith(ORG_THREAD_PREFIX);
+    case 'org': return candidate.startsWith(partition.prefix);
+    case 'only': return candidate === partition.threadId;
+  }
+}
+/**
+ * The SQL condition on `t.id` for `partition`, for the two SQL adapters. `substr` rather than LIKE: an
+ * organization id may contain `_` or `%`, which LIKE reads as wildcards. `ph(n)` renders the n-th
+ * extra placeholder in the adapter's own syntax (`?` or `$k`).
+ */
+export function recallPartitionSql(partition: RecallPartition, ph: (n: number) => string): { cond: string; params: unknown[] } {
+  switch (partition.kind) {
+    case 'root': return { cond: `substr(t.id, 1, 4) <> 'org:'`, params: [] };
+    case 'org': return { cond: `substr(t.id, 1, ${ph(0)}) = ${ph(1)}`, params: [partition.prefix.length, partition.prefix] };
+    case 'only': return { cond: `t.id = ${ph(0)}`, params: [partition.threadId] };
+  }
+}
+
+/**
  * P1.5 metadata filter matcher shared by in-memory/sqlite/postgres-storage's
  * `MemoryStore.recall` (previously three independent copies of a plain exact-equality matcher — unified
  * here so the operator set can't drift between adapters). ALL top-level fields in `filter` must match
@@ -309,7 +352,16 @@ export interface MemoryStore {
   appendMessagesOnce?: (threadId: string, rows: MessageAppend[], batchKey: string) => Promise<boolean>;
   /** Thread messages — PAGINATED (NO blob loading). */
   getMessages(threadId: string, q?: ListQuery): Promise<Page<MessageRecord>>;
-  /** Vector recall (thread or resource scope). */
+  /**
+   * Vector recall (thread or resource scope).
+   *
+   * `scope: 'resource'` ranks the user's threads IN THE ANCHOR THREAD'S PARTITION only — see
+   * `recallPartition`. A resource id names a user of one scope: `u-1` in the root and `u-1` in
+   * organization acme are two people, and the root's recall must not return `org:acme:` rows (ADR-0001:
+   * "In the root scope, every organization's rows are hidden"). The partition is applied BEFORE `topK`,
+   * so a foreign row can never take a slot. To search one organization's threads, recall through that
+   * organization's view: `withOrgStorage(storage, orgId).memory.recall(...)`.
+   */
   recall(threadId: string, queryEmbedding: number[], opts: RecallOptions): Promise<MessageRecord[]>;
 
   /** `scopeId` is a `workingMemoryScope` key. */

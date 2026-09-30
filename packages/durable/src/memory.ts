@@ -210,6 +210,52 @@ export function memKey(threadId: string, leaf: MemLeaf): string {
   return `mem:${threadId}:${leaf}`;
 }
 
+/** Per journal object, per key: the tail of the in-process queue of appends. See `appendToJournalLog`. */
+const logQueues = new WeakMap<object, Map<string, Promise<void>>>();
+
+/**
+ * Appends `entries` to the array stored at `key`, losing nothing to a concurrent append.
+ *
+ * A journal holds a thread's log as ONE value, so an append is read → extend → write, and two
+ * appends that both read before either writes erase one of them. Measured: 10 concurrent appends to
+ * one thread kept 1; two processes × 50 kept 2 of 100. `AgentMemory` never had this because its store
+ * assigns a message's position inside a write it serialises per thread; this is the same guarantee
+ * built from what a `Journal` offers:
+ *
+ *   - an in-process queue per journal and key, so appends from one process never contend at all
+ *     (measured: 100 concurrent appends, 0 retries);
+ *   - a compare-and-set write — `putIfAbsent` for the first entry, `putIfMatch` after — retried on a
+ *     lost race with the fresh value, so a second PROCESS cannot erase a write either (2 × 50 → 100).
+ *     The retry cannot starve: each round, one writer's compare succeeds.
+ *
+ * Neither half alone was enough: the queue alone kept 57 of 100 across two processes, and
+ * compare-and-set alone cost 4950 retries (2.4 s on SQLite) for 100 appends from one process.
+ *
+ * A journal without `putIfMatch`/`putIfAbsent` gets the queue alone: safe within one process, not
+ * across several. Every first-party journal implements both.
+ */
+export async function appendToJournalLog(journal: Journal, key: string, entries: readonly unknown[]): Promise<void> {
+  let queues = logQueues.get(journal);
+  if (!queues) { queues = new Map(); logQueues.set(journal, queues); }
+  const prior = queues.get(key) ?? Promise.resolve();
+  const run = prior.then(() => casAppend(journal, key, entries));
+  const tail = run.then(() => undefined, () => undefined); // a failed append must not stall the next one
+  queues.set(key, tail);
+  void tail.finally(() => { if (queues!.get(key) === tail) queues!.delete(key); });
+  return run;
+}
+
+async function casAppend(journal: Journal, key: string, entries: readonly unknown[]): Promise<void> {
+  const cas = typeof journal.putIfMatch === 'function' && typeof journal.putIfAbsent === 'function';
+  for (;;) {
+    const current = await journal.get<unknown[]>(key);
+    const next = [...(current ?? []), ...entries];
+    if (!cas) return journal.put(key, next);
+    const won = current === undefined ? await journal.putIfAbsent!(key, next) : await journal.putIfMatch!(key, current, next);
+    if (won) return;
+  }
+}
+
 export class BasicMemory implements Memory {
   constructor(private readonly journal: Journal) {}
 
@@ -218,8 +264,7 @@ export class BasicMemory implements Memory {
   }
 
   async append(threadId: string, messages: any[]): Promise<void> {
-    const current = await this.getMessages(threadId);
-    await this.journal.put(memKey(threadId, 'messages'), [...current, ...messages]);
+    await appendToJournalLog(this.journal, memKey(threadId, 'messages'), messages);
   }
 
   async getWorkingMemory(threadId: string): Promise<string | undefined> {

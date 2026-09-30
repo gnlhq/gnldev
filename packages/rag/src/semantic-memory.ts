@@ -3,7 +3,7 @@
 // vector search. Durable/replayable: the recall result falls into runDurable's input journaling
 // (frozen on resume); embeddings persist in the journal. (Most semantic-recall implementations don't come with these guarantees.)
 import { cosineSimilarity } from 'ai';
-import { matchFilter, memKey, assertThreadId } from '@gnldev/durable';
+import { matchFilter, memKey, assertThreadId, appendToJournalLog } from '@gnldev/durable';
 import type { Memory, Journal } from '@gnldev/durable';
 import type { Embed } from './vector-store.js';
 
@@ -114,14 +114,21 @@ export class SemanticMemory implements Memory {
     return [...recalled, ...recent.map((e) => e.message)];
   }
 
+  /**
+   * Embeds first, then appends through `appendToJournalLog` (@gnldev/durable). This loaded the log,
+   * awaited every embedding, and wrote the log back, so concurrent turns on one thread erased each
+   * other — measured, 10 concurrent appends kept 1. Embedding outside the serialised write keeps the
+   * slow network call from holding up every other turn on the thread.
+   */
   async append(threadId: string, messages: any[]): Promise<void> {
-    const log = await this.load(threadId);
+    const key = this.key(threadId);
+    const entries: LogEntry[] = [];
     for (const message of messages) {
       const text = messageText(message);
       const embedding = text ? await this.embed(text) : undefined;
-      log.push({ message, text, embedding, metadata: message?.metadata });
+      entries.push({ message, text, embedding, metadata: message?.metadata });
     }
-    await this.journal.put(this.key(threadId), log);
+    await appendToJournalLog(this.journal, key, entries);
   }
 
   // Built by @gnldev/durable's own memKey rather than by hand. Writing the same string here looked

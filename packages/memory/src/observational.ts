@@ -88,6 +88,8 @@ export interface OmVectorMatch {
   id: string;
   text: string;
   metadata?: Record<string, unknown>;
+  /** The partition the match lives in, as the store reports it (`@gnldev/durable` `VectorMatch.namespace`). */
+  namespace?: string;
   score: number;
 }
 

@@ -218,7 +218,9 @@ function scopedMemory(memory: MemoryStore, p: string): MemoryStore {
     } : {}),
     getMessages: (threadId, q) => drainOwned((qq) => memory.getMessages(add(p, threadId), qq), outMsg, q),
     // `recall` returns rows from OTHER threads under `scope: 'resource'`, so it filters rather than
-    // maps — see `outMsg`. Not paginated, so it drops in place rather than draining.
+    // maps — see `outMsg`. Not paginated, so it drops in place rather than draining. The store itself
+    // now ranks only this organization's threads (`recallPartition`, anchored on the prefixed id), so
+    // the filter here is a second line, not the one that decides what fills `topK`.
     recall: async (threadId, queryEmbedding, opts) =>
       (await memory.recall(add(p, threadId), queryEmbedding, opts))
         .map(outMsg).filter((r): r is MessageRecord => r !== undefined),

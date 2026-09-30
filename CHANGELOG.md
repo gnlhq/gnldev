@@ -114,6 +114,63 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   must also typecheck, in one TypeScript program with the template's compiler options. It is driven by
   the recipe table, so a recipe added later is covered without editing the test. Existing projects are
   not touched: delete the lone `,` line in `gnl.config.ts`.
+### Security
+
+- **A root-scope end user no longer recalls an organization's messages** (ADR-0001: "In the root scope,
+  every organization's rows are hidden"). Measured on 0.9.0: with `memoryPreset(s, 'recall')` and one
+  identity provider that returns the same user id with and without `orgId`, the unbound user's turn
+  carried acme's message into the prompt — on `createRestApi` without `org`, and on the standalone chat
+  door. `MemoryStore.recall` with `scope: 'resource'` filtered by resource id alone, and organization
+  rows live in the root store under `org:<id>:`. All three stores (in-memory, SQLite, Postgres) now rank
+  only the threads in the anchor thread's partition, before `topK` (`recallPartition` in
+  @gnldev/durable). This also fixes the other direction's short page: an organization's recall with
+  `topK: 1` came back empty when another organization's row scored higher, because the org view
+  filtered after the store had picked. Who is affected: anyone serving root-scope and organization users
+  from one store. Way through, for a caller that wants one organization's threads from the root:
+  `withOrgStorage(storage, orgId).memory.recall(...)`. Custom `MemoryStore` adapters should apply
+  `inRecallPartition` in their resource branch.
+- **Root observational memory no longer ranks by an organization's observation vectors.**
+  `AgentMemory.recallObservationsSemantic` on a root memory queried every namespace; an organization's
+  vector for a thread with the same bare id carried the same per-thread `obsId` (`obs-0`) and answered
+  with the root's unrelated observation. Hits outside the memory's own namespace are now dropped.
+  `OmVectorMatch` gains an optional `namespace`.
+
+### Fixed
+
+- **Concurrent turns on one thread no longer lose messages in the journal-kept memories**
+  (`BasicMemory` in @gnldev/durable, `SemanticMemory` in @gnldev/rag). Both read the thread's log,
+  awaited, and wrote it back. Measured on 0.9.0: 10 concurrent appends kept 1; two processes appending
+  50 each to one SQLite journal kept 2 of 100. `AgentMemory` was already safe, because its store assigns
+  positions inside a write serialised per thread. The journal equivalent is new and exported:
+  `appendToJournalLog(journal, key, entries)` — an in-process queue per key plus a compare-and-set write
+  (`putIfAbsent`/`putIfMatch`), retried on a lost race. Measured after: 2, 10 and 100 concurrent appends
+  keep all; 2 × 50 across processes keeps 100; two Postgres pools × 100 keep 100. The queue alone kept
+  57 of 100 across processes; compare-and-set alone cost 4950 retries for 100 appends in one process.
+  `SemanticMemory` now embeds before the write, not inside it. Who is affected: anyone using either
+  class with more than one turn in flight per thread. Nothing to change; a custom `Journal` without
+  `putIfMatch`/`putIfAbsent` is safe within one process only, and adding those two methods makes it
+  safe across processes.
+- **Re-indexing an edited document no longer leaves its old chunks retrievable** (@gnldev/rag).
+  `chunkDocuments` promised "re-indexing upserts to the same ids, no duplicate records"; that held only
+  while the chunk count stayed the same. Measured on 0.9.0: a 5-chunk document edited to 2 chunks left
+  chunks #2-#4 of the old text in search results; edited to one chunk, all five `#i` stayed beside the
+  new bare id, which carried no `source`, so nothing could find it later. New: `ingestDocuments(store,
+  embed, docs, chunkOptions?)` chunks, embeds, deletes each document's chunks in its namespace
+  (`metadata.source === id`, or the bare id), then upserts; `deleteDocuments(store, ids, { namespace? })`
+  removes documents the same way. Measured after, on the rag and durable in-memory stores, SQLite and
+  real pgvector: shrink, grow, same size, many↔one and delete all leave exactly the current chunks, and a
+  root re-ingest does not touch an organization's document of the same id. `indexDocuments` stays
+  upsert-only. Who is affected: anyone re-indexing documents that change. Way through for a store
+  without `delete`: `indexDocuments(store, embed, chunkDocuments(docs))`, as before (the error says so).
+  A document may not be called `observational-memory`, the `source` observational memory stamps on its
+  vectors (the error names the fix: another id).
+- **Breaking (0.x): a document that fits in one chunk now carries `metadata: { source, chunk: 0 }`**
+  from `chunkDocuments`, like every other chunk; it keeps its bare id. A metadata equality filter on
+  other keys is unaffected. Needed so the one-chunk version of a document can be found and removed.
+- **`PostgresVectorStore.delete` before any write no longer creates a one-number vector table.** On a fresh
+  database a `delete` created `embedding vector(1)`, and every upsert after it failed ("expected 1
+  dimensions, not 3") — found through `ingestDocuments`, whose first step is a delete. It now reads the
+  vector size of an existing table, and deletes nothing when there is no table.
 
 ## [0.9.0] — 2026-09-30
 

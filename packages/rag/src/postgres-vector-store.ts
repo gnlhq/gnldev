@@ -204,7 +204,17 @@ export class PostgresVectorStore implements VectorStore {
   async delete(where: DeleteWhere): Promise<number> {
     const w = vectorDeletePlan(where); // no condition (`{}`, `{ ids: [] }`, `{ filter: {} }`) → nothing
     if (!w) return 0;
-    await this.ensureReady(this.dimension ?? 1);
+    if (!this.ready && this.dimension === undefined) {
+      // No vector seen yet, so no dimension to create the table with. This used `?? 1`, which on a
+      // fresh database created `embedding vector(1)`, and every upsert after it failed ("expected 1
+      // dimensions, not 3") — measured the first time a delete came before any write, which is what
+      // `ingestDocuments` does on its first run. Ask the table instead; no table means nothing to delete.
+      const dim = await this.existingDimension();
+      if (dim === undefined) return 0;
+      await this.ensureReady(dim);
+    } else {
+      await this.ensureReady(this.dimension!);
+    }
     const params: unknown[] = [];
     const conds: string[] = [];
     if (w.ids) {
@@ -229,6 +239,16 @@ export class PostgresVectorStore implements VectorStore {
       params,
     );
     return res.rows.length;
+  }
+
+  /** The `embedding` column's dimension of an existing table (pgvector keeps it in `atttypmod`), or `undefined` when there is no table. */
+  private async existingDimension(): Promise<number | undefined> {
+    const res = await this.pool.query(
+      `SELECT a.atttypmod AS dim FROM pg_attribute a WHERE a.attrelid = to_regclass($1) AND a.attname = 'embedding'`,
+      [this.table],
+    );
+    const dim = Number(res.rows[0]?.dim);
+    return Number.isInteger(dim) && dim > 0 ? dim : undefined;
   }
 
   async close(): Promise<void> {

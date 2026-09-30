@@ -27,9 +27,18 @@ await runDurable({ runId: 'r1', journal, model, tools: { searchPolicy }, prompt:
 ## API
 - `InMemoryVectorStore` · `indexDocuments(store, embed, docs)` · `VectorStore` interface (plug in your own
   backend)
+- `ingestDocuments(store, embed, docs, chunkOptions?)` — chunk, embed and write whole documents so each
+  document's stored chunks are exactly its current ones: its old chunks (`metadata.source === id`, or
+  the bare id) are deleted in its namespace first. Use it for anything you re-index after an edit;
+  `indexDocuments` only upserts, so an edit that yields fewer chunks leaves the old tail retrievable.
+  `deleteDocuments(store, ids, { namespace? })` removes documents the same way. Both need `store.delete`.
+- `chunkDocuments(docs, opts?)` — ids `<docId>#<i>` (the bare id for a one-chunk document); every chunk
+  carries `metadata: { source: docId, chunk }`.
 - `createRagTool({ store, embed, topK?, namespace?, filter?, rerank?, rerankTopK?, description? })` → AI SDK tool
 - `llmReranker({ model })` → `Reranker`
-- `SemanticMemory` — vector-based recall (memory integration)
+- `SemanticMemory` — vector-based recall (memory integration). Concurrent turns on one thread keep
+  every message: appends go through `appendToJournalLog` (@gnldev/durable), which is safe across
+  processes on any journal with `putIfMatch`/`putIfAbsent` (every first-party one).
 
 ## General documents and each user's own
 
