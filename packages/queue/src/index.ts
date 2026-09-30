@@ -355,7 +355,8 @@ export function createWorker(
   // point are terminal (done/fail)" → subsequent polls never re-scan earlier pages (5.1: starvation +
   // O(n)-per-poll fix). If a job is still pending (awaiting retry / locked) the cursor does NOT PASS
   // it → exactly-once/retry semantics are preserved. Old (cursor-less) queues also flow from the
-  // start (cursor=undefined).
+  // start (cursor=undefined), and so does a cursor 0.9 persisted (a row offset — see WorkStore.list:
+  // the cursor is a record's position now, so an erasure or a slow producer clock cannot move it).
   const QCURSOR = 'qcursor';
 
   async function runOnce(): Promise<boolean> {

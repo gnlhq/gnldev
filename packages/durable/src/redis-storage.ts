@@ -26,6 +26,7 @@ import type { AdoptIntoOrgResult,
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, WorkStore, CacheStore, MetaStore, LogRecord,
 } from './storage.js';
+import { decodeLogCursor, encodeLogCursor, compareLogPosition } from './storage.js';
 
 const SCHEMA_VERSION = '1';
 
@@ -123,6 +124,9 @@ const RJ = 'rj:';     // RunJournal entries (value envelope)
 const CTR = 'ctr:';   // incrBy/getCounters counter hashes (H8a) — own sub-namespace, swept by deletePrefix
 const WL = 'wl:';     // WorkStore append-log
 const WK = 'wk:';     // WorkStore KV + ack markers
+// WorkStore per-namespace sequence (`WorkStore.list`). Its own space so no `wl:`/`wk:` sweep deletes
+// it: a counter that restarts after an erasure would number new records BEHIND a persisted cursor.
+const WSEQ = 'wseq:';
 const CACHE = 'cache:';
 const META = 'meta:';
 // H8b: per-run last-activity ZSET — a SINGLE key (score=last write epoch ms, member=runId).
@@ -259,6 +263,26 @@ function isSuspended(p: { kind: string } | null, value: unknown): boolean {
 // H1 CAS Lua script: if GET==ARGV[1] then SET ARGV[2] → 1, else 0. The Redis script runs atomically →
 // this closes the race window between putIfMatch's JS-side comparison and the SET.
 const CAS_LUA = `if redis.call('GET',KEYS[1])==ARGV[1] then redis.call('SET',KEYS[1],ARGV[2]) return 1 else return 0 end`;
+
+/**
+ * `WorkStore.append` as one script: an existing id is left alone (first write wins, no number spent);
+ * otherwise the namespace's next sequence is taken and the record written under it, `<seq>|<record>`.
+ * One script, so no reader can see n+1 before n exists. KEYS[1] = counter, KEYS[2] = record.
+ */
+const WORK_APPEND_LUA = `-- gnl:work-append
+if redis.call('EXISTS',KEYS[2])==1 then return 0 end
+local s=redis.call('INCR',KEYS[1])
+redis.call('SET',KEYS[2],s..'|'..ARGV[1])
+return s`;
+
+/** A stored work-log value: `<seq>|<record>` since sequences, a bare record (seq 0) before them. */
+function readWorkValue<T>(v: string): LogRecord<T> & { seq: number } {
+  const bar = v.indexOf('|');
+  const head = bar > 0 && v[0] !== '{' ? v.slice(0, bar) : '';
+  const seq = /^\d+$/.test(head) ? Number(head) : 0;
+  const rec = deserialize<LogRecord<T>>(seq ? v.slice(bar + 1) : v);
+  return { id: rec.id, payload: rec.payload, ts: rec.ts, seq };
+}
 
 /**
  * P1.6b applyBatch Lua script: claim (putIfAbsent semantics) + HINCRBYFLOAT counters + SET puts, as ONE
@@ -801,10 +825,27 @@ class RedisWorkStore implements WorkStore {
   private logNs = (ns: string) => `${this.pfx}${WL}${encNs(ns)}:`;
   private kvKey = (key: string) => `${this.pfx}${WK}${key}`;
 
+  private seqKey = (ns: string) => `${this.pfx}${WSEQ}${encNs(ns)}`;
+
+  /**
+   * Idempotent (the same (ns,id) is written once, first write wins) and sequenced (`WorkStore.list`).
+   * Without `eval` the counter and the record are separate round trips: two processes appending to one
+   * namespace can then take numbers in one order and land in the other, so a reader may pass a record
+   * that appears a moment later behind it. The same documented best-effort as `putIfMatch` without
+   * `eval`; ioredis and node-redis both have it.
+   */
   async append(ns: string, payload: unknown, id?: string): Promise<string> {
     const eid = id ?? `${ns}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-    // idempotent: SET NX → the same (ns,id) is not written a second time (first-write-wins).
-    await this.client.set(this.logNs(ns) + eid, serialize({ id: eid, payload, ts: Date.now() }), 'NX');
+    const rec = serialize({ id: eid, payload, ts: Date.now() });
+    const key = this.logNs(ns) + eid;
+    if (this.client.eval) {
+      await this.client.eval(WORK_APPEND_LUA, 2, this.seqKey(ns), key, rec);
+      return eid;
+    }
+    if ((await this.client.get(key)) !== null) return eid;
+    const seq = Number((await this.client.get(this.seqKey(ns))) ?? 0) + 1;
+    await this.client.set(this.seqKey(ns), String(seq));
+    await this.client.set(key, `${seq}|${rec}`, 'NX');
     return eid;
   }
   async list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>> {
@@ -817,13 +858,21 @@ class RedisWorkStore implements WorkStore {
     // to escape only their variable tail; see globEscape). See `encNs`.
     const keys = await scanAll(this.client, globEscape(this.logNs(ns)) + '*');
     const values = await bulkGet(this.client, keys);
-    const rows: LogRecord<T>[] = [];
+    const rows: Array<LogRecord<T> & { seq: number }> = [];
     for (const s of values) {
-      if (s != null) rows.push(deserialize<LogRecord<T>>(s));
+      if (s != null) rows.push(readWorkValue<T>(s));
     }
-    rows.sort((a, b) => (a.ts - b.ts) || cmpStr(a.id, b.id));
-    const { start, limit } = offset(q);
-    return pageOf(rows, start, limit);
+    // Keyset on the store-assigned sequence, not the producer's clock (`WorkStore.list`).
+    rows.sort(compareLogPosition);
+    const after = decodeLogCursor(q?.cursor);
+    const from = after ? rows.filter((r) => compareLogPosition(r, after) > 0) : rows;
+    const limit = q?.limit ?? 50;
+    const page = from.slice(0, limit);
+    const last = page[page.length - 1];
+    return {
+      items: page.map((r) => ({ id: r.id, payload: r.payload, ts: r.ts })),
+      nextCursor: from.length > limit && last ? encodeLogCursor(last) : undefined,
+    };
   }
   async get<T = unknown>(key: string): Promise<T | undefined> {
     const s = await this.client.get(this.kvKey(key));

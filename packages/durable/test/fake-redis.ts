@@ -156,6 +156,16 @@ export class FakeRedis implements RedisLike {
       for (const z of desc.zadds ?? []) await this.zadd(z.key, z.score, z.member); // H8b activity touch parity
       return 1;
     }
+    // WorkStore.append (WORK_APPEND_LUA, marker `gnl:work-append`): KEYS = [counter, record], ARGV = [record].
+    // Existing record → 0 and no number taken; else INCR the counter and write `<seq>|<record>`.
+    if (script.includes('gnl:work-append')) {
+      const [seqKey, recKey, rec] = [String(args[0]), String(args[1]), String(args[2])];
+      if (this.live(recKey)) return 0;
+      const n = Number(this.live(seqKey)?.val ?? 0) + 1;
+      this.store.set(seqKey, { val: String(n) });
+      this.store.set(recKey, { val: `${n}|${rec}` });
+      return n;
+    }
     // H1 CAS mimic (putIfMatch, CAS_LUA): GET KEYS[1] == ARGV[1] → SET KEYS[1]=ARGV[2] → 1, else 0.
     // No await between GET-compare-SET in single-threaded JS → stays faithful to real Redis script atomicity.
     const key = String(args[0]);

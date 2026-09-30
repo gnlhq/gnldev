@@ -9,6 +9,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Erasing one person stopped everyone else's queue and events; a producer with a slow clock was
+  never read.** `WorkStore.list` handed out a row OFFSET into a log ordered by the producer's
+  `Date.now()`, and `@gnldev/queue` (`qcursor`) and `@gnldev/events` (`evtcursor:*`) persist that cursor
+  as "everything before here is done". Measured on 0.9.0: after
+  `eraseSubject(storage, 'ayse', { erasers: [jobEraser(storage), eventEraser(storage.work!)] })` removed
+  300 of ayse's finished jobs, none of carol's 10 later jobs ran and none of her events were delivered
+  (in-memory and SQLite; same code path on Postgres and Redis). On SQLite, Postgres and Redis a job or
+  event from a producer whose clock was 5s behind was sorted before the cursor and never read. On a
+  live Postgres, 8 producers on separate connections against one paging reader: 6 of 800 records
+  passed over. Now every store numbers a namespace's records itself (`seq`, per namespace, never
+  reused — an erasure leaves a gap) and the cursor is the last record's position. A record is visible
+  only after every lower number is (SQL: the counter row is locked until commit; Redis: one Lua script),
+  so a reader cannot pass one still in flight. The same scenarios, plus a middle-of-log erasure, a whole-
+  log erasure, four skewed producers, a worker restart and `adoptIntoOrg` into a non-empty log, pass on
+  every bundled store and on live Postgres and Redis. `list` also stops counting the whole namespace on
+  every page: reading 10 000 records in pages of 50 on an in-memory SQLite went from 920 ms to 85 ms
+  (median of 10). The price is on the write side: an append now takes the counter and the row in one
+  write transaction — 10 000 appends in memory 650 ms → 1 900 ms; on a file database, where the
+  fsync dominates, 2 000 appends 3.5 s → 3.9 s.
+
+### Changed
+
+- **Upgrading a SQL work store adds a column and a table, and nothing else moves.** SQLite and
+  Postgres add `gnl_work_log.seq` (default 0), the index `gnl_work_log_seq` and the table
+  `gnl_work_seq` at startup, like the earlier additive columns. Existing rows keep `seq` 0 and their old
+  `(ts, id)` order, ahead of every new record. Redis stores new records as `<seq>|<record>` and reads the
+  old bare form as `seq` 0; the counters live under `<keyPrefix>wseq:`, a space no sweep deletes.
+- **A cursor persisted by 0.9 (a row offset) restarts at the head of the log**, once. The worker and each
+  consumer then skip finished records by their markers (`qdone`, `evtack:`), so nothing runs twice and
+  nothing is skipped, and they write a new cursor after the first full page. The cost is one re-read of
+  the markers of a log's existing records. Anyone paging `WorkStore.list` directly: a cursor is still
+  opaque — pass back what you were given.
+- **A custom `WorkStore`** must keep the same promise to work with the queue and events: a cursor that
+  deletions and producer clocks cannot move. The contract is written on `WorkStore.list`.
+- **`RedisStorage` without `eval`** (a custom client) takes the sequence and writes the record in
+  separate round trips: two processes appending to one namespace at once can land out of order, so a
+  reader may pass a record that appears a moment later. The same documented best-effort as
+  `putIfMatch` without `eval`; ioredis and node-redis both have it.
+
 ## [0.9.0] — 2026-09-30
 
 **The paid package (@gnldev/auth-ee) stops trusting four things it trusted on 0.8.0.** Each was

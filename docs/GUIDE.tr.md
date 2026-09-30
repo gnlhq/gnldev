@@ -280,13 +280,16 @@ pgvector tablosu değil ve olmayacak — motor içi ANN araması için `@gnldev/
 
 **⑧ `gnl_work_log` — kuyruk/olay defteri.** Kolonlar: `ns (namespace — hangi kuyruk/konu,
 örn. 'evt:siparis'), id (kayıt kimliği; ns+id birincil anahtar → aynı olay iki kez EKLENEMEZ =
-idempotent yayın), payload (içerik), ts`. *Ne zaman?* `@gnldev/queue` iş ekleyince, `@gnldev/events`
+idempotent yayın), payload (içerik), ts (üreticinin saati, bilgi amaçlı), seq (deponun verdiği
+konum; kuyruk işçisi ve her tüketici `seq` sırasıyla okur)`. *Ne zaman?* `@gnldev/queue` iş ekleyince, `@gnldev/events`
 olay yayınlayınca. Yalnız-ekle çalışır — ve **framework'te onu budayan hiçbir şey yok**. `sweepLog`
 budamaz: o bir `Journal` alır ve `appendLog` tabanlı namespace'leri (örneğin denetim defterini)
 süpürür; bu tabloya sahip olan `WorkStore` ise bambaşka bir depodur. `WorkStore` arayüzünde hiçbir
 silme operasyonu yoktur, yani bir kuyruk ya da konu sınırsız büyür. Elde olan bir süpürge değil, bir
 tavandır: `emit(..., { maxDepth })`, konu verilen derinliğe ulaşınca yayını reddeder. Satırları geri
-kazanmak operatörün işidir (tabloya doğrudan `DELETE`).
+kazanmak operatörün işidir (tabloya doğrudan `DELETE`). Satır silmek işçiyi ya da bir tüketiciyi
+bozmaz: kaldıkları yeri satır sayısıyla değil bir kaydın `seq`'iyle tutarlar ve bir `seq` iki kez
+verilmez — her namespace'in sayacı `gnl_work_seq`'te durur ve onu hiçbir şey silmez.
 
 **⑨ `gnl_work_kv` — kuyruk yönetim notları.** Serbest anahtar-değer: işlerin durumu, zamanlayıcı
 tanımları ve en önemlisi **teslim işaretleri** (ack marker: "X olayını Y tüketicisi aldı" —

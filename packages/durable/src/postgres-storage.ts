@@ -9,7 +9,7 @@ import { cosineSimilarity } from 'ai';
 import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus } from './journal.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
-import { matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision } from './storage.js';
+import { decodeLogCursor, encodeLogCursor, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision } from './storage.js';
 import type { AdoptIntoOrgResult,
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -134,8 +134,14 @@ const DDL = [
   // their own is unlabelled, and an unlabelled row is visible to no end user.
   `ALTER TABLE gnl_vectors ADD COLUMN IF NOT EXISTS owner TEXT`,
   `ALTER TABLE gnl_vectors ADD COLUMN IF NOT EXISTS shared BOOLEAN`,
-  `CREATE TABLE IF NOT EXISTS gnl_work_log (ns TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, ts BIGINT NOT NULL, PRIMARY KEY (ns, id))`,
+  `CREATE TABLE IF NOT EXISTS gnl_work_log (ns TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, ts BIGINT NOT NULL, seq BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (ns, id))`,
   `CREATE INDEX IF NOT EXISTS gnl_work_log_ns ON gnl_work_log (ns, ts)`,
+  // The store-assigned position `WorkStore.list` pages by (see the port). Same shape as the columns
+  // above; no backfill, and 0 is right: a row written before sequences keeps its `(ts, id)` order,
+  // ahead of every sequenced row. The index comes after the ALTER so an existing table has the column.
+  `ALTER TABLE gnl_work_log ADD COLUMN IF NOT EXISTS seq BIGINT NOT NULL DEFAULT 0`,
+  `CREATE INDEX IF NOT EXISTS gnl_work_log_seq ON gnl_work_log (ns, seq, ts, id)`,
+  `CREATE TABLE IF NOT EXISTS gnl_work_seq (ns TEXT PRIMARY KEY, seq BIGINT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS gnl_work_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS gnl_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at BIGINT)`,
 ];
@@ -373,7 +379,7 @@ export class PostgresStorage implements Storage {
       this.memory = new PgMemoryStore(q, tx, () => this.advisoryLocks);
     }
     this.vectors = new PgVectorStore(q, tx);
-    this.work = new PgWorkStore(q, this.prefixShape);
+    this.work = new PgWorkStore(q, tx, this.prefixShape);
     this.cache = new PgCacheStore(q);
     this.meta = new PgMetaStore(q);
   }
@@ -550,7 +556,19 @@ export class PostgresStorage implements Storage {
         for (const { k } of rows) {
           if (isPlatformKey(k)) { skipped.add(k.split(':')[0]!); continue; }
           n += Number((await q(`SELECT COUNT(*) AS c FROM ${table} WHERE ${col} = $1`, [k])).rows[0].c);
-          if (!dryRun) await q(`UPDATE ${table} SET ${col} = $1 WHERE ${col} = $2`, [prefix + k, k]);
+          if (dryRun) continue;
+          if (table === 'gnl_work_log') {
+            // APPENDED to the organization's log, so numbered after everything it already holds (see
+            // the SQLite twin, and `WorkStore.list`).
+            const m = (await q('SELECT COALESCE(MAX(seq), 0) AS m FROM gnl_work_log WHERE ns = $1', [prefix + k])).rows[0].m;
+            const c = (await q('SELECT seq FROM gnl_work_seq WHERE ns = $1', [prefix + k])).rows[0]?.seq ?? 0;
+            const base = Math.max(Number(m), Number(c)) + 1;
+            const top = (await q('SELECT COALESCE(MAX(seq), 0) AS t FROM gnl_work_log WHERE ns = $1', [k])).rows[0].t;
+            await q('UPDATE gnl_work_log SET ns = $1, seq = seq + $2 WHERE ns = $3', [prefix + k, base, k]);
+            await q(`INSERT INTO gnl_work_seq (ns, seq) VALUES ($1, $2) ON CONFLICT (ns) DO UPDATE SET seq = GREATEST(gnl_work_seq.seq, $2)`, [prefix + k, base + Number(top)]);
+          } else {
+            await q(`UPDATE ${table} SET ${col} = $1 WHERE ${col} = $2`, [prefix + k, k]);
+          }
         }
         bump(store, n);
       }
@@ -1511,21 +1529,65 @@ class PgVectorStore implements VectorStore {
   }
 }
 
+/** Takes the namespace's next `WorkStore` sequence ($1 = ns) and returns it as `seq`. See `PgWorkStore.append`. */
+const NEXT_WORK_SEQ = `INSERT INTO gnl_work_seq (ns, seq) VALUES ($1, 1) ON CONFLICT (ns) DO UPDATE SET seq = gnl_work_seq.seq + 1 RETURNING seq`;
+
 class PgWorkStore implements WorkStore {
   /** `shape` is shared BY REFERENCE with the journal (see PrefixShape): the prefix comparison below
    *  needs the same collation clause the probe settled on, or a range scan can miss rows on a
    *  non-C collation — the exact failure the journal's deletePrefix already guards against. */
-  constructor(private q: Q, private shape: PrefixShape) {}
+  constructor(private q: Q, private tx: Tx, private shape: PrefixShape) {}
+  /** `false` once the engine has refused a data-modifying CTE (pg-mem does; Postgres has since 9.1). */
+  private cteDml = true;
+  /**
+   * One statement: take the namespace's next sequence and insert under it. The counter row stays
+   * locked until this statement commits, so the next append to the namespace WAITS for it — a reader
+   * can never see n+1 while n is still in flight and then persist a cursor past n (`WorkStore.list`).
+   * A plain sequence (BIGSERIAL) would hand out numbers without that ordering: measured on a live
+   * server, 8 producers against a paging reader passed over 6 of 800 records with the old `ts` order.
+   * `gnl_work_seq` rather than `MAX(seq)` of the log: erasing the newest records would hand their
+   * numbers out again, behind a cursor that has already passed them. adoptIntoOrg, the one other
+   * writer of `seq`, moves its counter along with the rows. An append of an id that already
+   * exists spends a number and writes nothing; gaps are fine, reuse is not.
+   */
   async append(ns: string, payload: unknown, id?: string): Promise<string> {
     const eid = id ?? `${ns}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-    await this.q(`INSERT INTO gnl_work_log (ns, id, payload, ts) VALUES ($1,$2,$3,$4) ON CONFLICT (ns, id) DO NOTHING`, [ns, eid, serialize(payload), Date.now()]);
+    const params = [ns, eid, serialize(payload), Date.now()];
+    if (this.cteDml) {
+      try {
+        await this.q(`WITH s AS (${NEXT_WORK_SEQ}) INSERT INTO gnl_work_log (ns, id, payload, ts, seq) SELECT $1, $2, $3, $4, s.seq FROM s ON CONFLICT (ns, id) DO NOTHING`, params);
+        return eid;
+      } catch (e) {
+        if (!/not supported/i.test(String((e as Error)?.message ?? e))) throw e;
+        this.cteDml = false;
+      }
+    }
+    // The same two writes in one transaction: the counter row's lock is held until COMMIT, which is
+    // the ordering the single statement gives. A pool without transactions cannot keep that promise,
+    // so it is refused (`atomic`) rather than quietly degraded to two autocommits.
+    await this.tx(async (q) => {
+      const { seq } = (await q(NEXT_WORK_SEQ, params.slice(0, 1))).rows[0] as { seq: string | number };
+      await q('INSERT INTO gnl_work_log (ns, id, payload, ts, seq) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (ns, id) DO NOTHING', [...params, Number(seq)]);
+    }, { atomic: true });
     return eid;
   }
+  /** Keyset on `(seq, ts, id)` from the cursor's position (`WorkStore.list`); one extra row says "more". */
   async list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>> {
-    const { start, limit } = offset(q);
-    const total = Number((await this.q('SELECT COUNT(*) AS n FROM gnl_work_log WHERE ns = $1', [ns])).rows[0].n);
-    const r = await this.q('SELECT id, payload, ts FROM gnl_work_log WHERE ns = $1 ORDER BY ts, id LIMIT $2 OFFSET $3', [ns, limit, start]);
-    return pageOf(r.rows.map((x) => ({ id: x.id, payload: deserialize<T>(x.payload), ts: Number(x.ts) })), start, limit, total);
+    const limit = q?.limit ?? 50;
+    const after = decodeLogCursor(q?.cursor);
+    const r = after
+      // `(seq, ts, id) > ($2, $3, $4)` spelled out (pg-mem has no row comparison); the leading
+      // `seq >= $2` is the same condition's index range, so the planner does not have to derive it.
+      ? await this.q('SELECT id, payload, ts, seq FROM gnl_work_log WHERE ns = $1 AND seq >= $2 AND (seq > $2 OR ts > $3 OR (ts = $3 AND id > $4)) ORDER BY seq, ts, id LIMIT $5', [ns, after.seq, after.ts, after.id, limit + 1])
+      : await this.q('SELECT id, payload, ts, seq FROM gnl_work_log WHERE ns = $1 ORDER BY seq, ts, id LIMIT $2', [ns, limit + 1]);
+    const rows = r.rows.map((x) => ({ id: x.id as string, payload: x.payload as string, ts: Number(x.ts), seq: Number(x.seq) }));
+    const more = rows.length > limit;
+    if (more) rows.pop();
+    const last = rows[rows.length - 1];
+    return {
+      items: rows.map((x) => ({ id: x.id, payload: deserialize<T>(x.payload), ts: x.ts })),
+      nextCursor: more && last ? encodeLogCursor(last) : undefined,
+    };
   }
   async get<T = unknown>(key: string): Promise<T | undefined> {
     const r = await this.q('SELECT value FROM gnl_work_kv WHERE key = $1', [key]);

@@ -303,7 +303,10 @@ describe.each(BACKENDS)('eraseSubject on %s', (name, make) => {
     expect(await work.deleteIdPrefix!('~o~acme:nobody:')).toBe(0);
     (results[name] ??= {}).primitive = { n, left };
   });
-});
+  // pg-mem cannot run WorkStore.append as one statement (no data-modifying CTE), so every append of
+  // the seeding takes a transaction there — measured ~7s → ~30s for the LIKE/glob scenario on pg-mem
+  // alone. Real Postgres runs the one statement. A ceiling for the emulator, not a slower store.
+}, 120_000);
 
 // ── Scenario 4: what AgentMemory keeps (M-1/M-2 of the 0.7.0 release panel) ──────────────────────
 // The person's threads and messages, their own working memory (`workingMemoryScope.resource`), a

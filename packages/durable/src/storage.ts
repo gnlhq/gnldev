@@ -24,6 +24,10 @@ import { assertOwnerId, isWellFormed, OwnerIdError } from './owned-name.js';
  * requests shifts the window under the reader. Saying otherwise made the weaker guarantee look like
  * the stronger one — the reason the claim is written the other way round now is that a keyset cursor
  * is a change we intend to make, and the opacity above is what keeps it from being a breaking one.
+ *
+ * `WorkStore.list` is the first list that made it: its cursor is persisted by the queue and the
+ * events consumer, so a window that shifts under the reader lost work (see `WorkStore.list`). The
+ * other lists are still offsets.
  */
 export interface Page<T> {
   items: T[];
@@ -648,10 +652,60 @@ export interface LogRecord<T = unknown> {
   ts: number;
 }
 
+/**
+ * Where a record sits in its work log: `seq` is assigned by the store at append time and only grows
+ * within a namespace. Records written by 0.9 or earlier have no sequence (`seq` 0) and keep their old
+ * `(ts, id)` order, all of them ahead of every sequenced record. The triple is unique because `id` is.
+ */
+export interface LogPosition {
+  seq: number;
+  ts: number;
+  id: string;
+}
+
+const LOG_CURSOR = /^w1:(\d+):(-?\d+):([\s\S]*)$/;
+
+/** The opaque `nextCursor` of `WorkStore.list`: the position of the last record handed out. */
+export function encodeLogCursor(p: LogPosition): string {
+  return `w1:${p.seq}:${p.ts}:${p.id}`;
+}
+
+/**
+ * The position a `WorkStore.list` cursor names, or `undefined` for "from the head" — which is also
+ * what a cursor this store never issued means (a 0.9 row offset such as `'300'`). Reading an offset
+ * as a position would skip or repeat an arbitrary stretch of the log; restarting cannot skip.
+ */
+export function decodeLogCursor(cursor: string | undefined): LogPosition | undefined {
+  const m = cursor ? LOG_CURSOR.exec(cursor) : null;
+  return m ? { seq: Number(m[1]), ts: Number(m[2]), id: m[3]! } : undefined;
+}
+
+/** Orders two log positions: sequence, then (for records written by 0.9 or earlier) producer time, then id. */
+export function compareLogPosition(a: LogPosition, b: LogPosition): number {
+  return a.seq - b.seq || a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
 export interface WorkStore {
   /** Idempotent append to an append-only log (same id → a single record). Returns eventId/jobId. */
   append(ns: string, payload: unknown, id?: string): Promise<string>;
-  /** List a log namespace — PAGINATED. */
+  /**
+   * List a log namespace — PAGINATED, in append order.
+   *
+   * THE CURSOR IS A POSITION, NOT A COUNT. @gnldev/queue (`qcursor`) and @gnldev/events
+   * (`evtcursor:*`) persist `nextCursor` and resume from it in every process, so it means "every record
+   * before this one has been handled". Two things may therefore never move a record across it:
+   *   · a deletion (`deleteIdPrefix`, `deletePrefix`) of records BEHIND it. The cursor used to be a row
+   *     offset: erasing 300 of one person's jobs shifted everyone else's rows 300 places under a cursor
+   *     that stayed put, and their pending jobs never ran;
+   *   · the producer's clock. Records used to be ordered by the writer's `Date.now()`, so a producer 5s
+   *     behind wrote BEFORE the cursor and was never read.
+   * Every bundled store orders by a store-assigned per-namespace sequence (`LogPosition`), which only
+   * grows — deletions leave gaps, never reuse — and hands out the cursor as the last record's position.
+   * A write becomes visible in sequence order (SQL: the counter row is locked until commit; Redis: one
+   * script), so a reader never sees position n+1 while n can still appear. A cursor the store did not
+   * issue (a 0.9 row offset) restarts at the head: the queue and the consumer skip finished records by
+   * their markers, so that costs one re-scan and nothing runs twice.
+   */
   list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>>;
   /** Work-scope KV (markers like qdone/qfail/qatt, sched:def — NOT in RunJournal). */
   get<T = unknown>(key: string): Promise<T | undefined>;

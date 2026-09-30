@@ -7,7 +7,7 @@ import { InMemoryJournal } from './journal.js';
 import { stableStringify } from './hash.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix } from './organization.js';
 import type { JournalEntry, RunSummary } from './journal.js';
-import { matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision } from './storage.js';
+import { decodeLogCursor, encodeLogCursor, compareLogPosition, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision } from './storage.js';
 import type {
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -20,7 +20,7 @@ function genId(prefix: string): string {
 }
 
 /**
- * Offset-cursor pagination.
+ * Offset-cursor pagination (every list here except `WorkStore.list`, which is keyed — see the port).
  *
  * The note here used to say "real storages use a keyset cursor". They do not — postgres, sqlite and
  * redis all read the cursor as a row offset, exactly like this one. The line described an intention
@@ -285,16 +285,43 @@ class InMemoryWorkStore implements WorkStore {
   /** @internal — see Storage.adoptIntoOrg. */
   _rekey(f: (k: string) => string | undefined): number { return rekeyMap(this.logs, f) + rekeyMap(this.kv, f); }
 
-  private logs = new Map<string, LogRecord[]>();
+  /** Each namespace's records in append (= `seq`) order. */
+  private logs = new Map<string, Array<LogRecord & { seq: number }>>();
+  /** The last sequence handed out per namespace. Survives deletions on purpose: see `WorkStore.list`. */
+  private seqs = new Map<string, number>();
   private kv = new Map<string, unknown>();
   async append(ns: string, payload: unknown, id?: string): Promise<string> {
     const log = this.logs.get(ns) ?? [];
     const eid = id ?? genId(ns);
-    if (!log.some((r) => r.id === eid)) { log.push({ id: eid, payload, ts: Date.now() }); this.logs.set(ns, log); }
+    if (!log.some((r) => r.id === eid)) {
+      // max(...) with the log's tail too: `_rekey` (adoptIntoOrg) moves a log under a new name, and the
+      // new name's counter must not start below the records it now holds.
+      const seq = Math.max(this.seqs.get(ns) ?? 0, log[log.length - 1]?.seq ?? 0) + 1;
+      this.seqs.set(ns, seq);
+      log.push({ id: eid, payload, ts: Date.now(), seq });
+      this.logs.set(ns, log);
+    }
     return eid;
   }
+  /** Keyset on the store-assigned sequence (`WorkStore.list`): a deletion behind the cursor cannot move it. */
   async list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>> {
-    return paginate((this.logs.get(ns) ?? []) as LogRecord<T>[], q);
+    const log = this.logs.get(ns) ?? [];
+    const after = decodeLogCursor(q?.cursor);
+    const limit = q?.limit ?? 50;
+    let start = 0;
+    if (after) {
+      let hi = log.length; // first index whose position is past `after` (the log is sorted by seq)
+      while (start < hi) {
+        const mid = (start + hi) >>> 1;
+        if (compareLogPosition(log[mid]!, after) <= 0) start = mid + 1; else hi = mid;
+      }
+    }
+    const slice = log.slice(start, start + limit);
+    const last = slice[slice.length - 1];
+    return {
+      items: slice.map((r) => ({ id: r.id, payload: r.payload as T, ts: r.ts })),
+      nextCursor: start + limit < log.length && last ? encodeLogCursor(last) : undefined,
+    };
   }
   async get<T = unknown>(key: string) { return this.kv.has(key) ? (this.kv.get(key) as T) : undefined; }
   async put(key: string, value: unknown) { this.kv.set(key, value); }

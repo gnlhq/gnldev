@@ -287,13 +287,17 @@ use `@gnldev/rag`'s `PostgresVectorStore`, which owns its own `vector(dim)` tabl
 
 **⑧ `gnl_work_log` — queue/event log.** Columns: `ns (namespace — which queue/topic, e.g.,
 'evt:order'), id (record id; ns+id is the primary key → the same event CANNOT be inserted twice
-= idempotent publishing), payload (content), ts`. *When?* When `@gnldev/queue` adds a job, when
+= idempotent publishing), payload (content), ts (the producer's clock, informational), seq (the
+position the store assigns; the queue worker and every consumer read in `seq` order)`. *When?* When `@gnldev/queue` adds a job, when
 `@gnldev/events` publishes an event. Append-only — and **nothing in the framework prunes it**.
 `sweepLog` does not: it takes a `Journal` and sweeps `appendLog`-based namespaces (the audit log,
 for instance), which is a different store from the `WorkStore` that owns this table. The `WorkStore`
 interface has no delete operation at all, so a queue or topic grows without bound. What is available
 is a ceiling rather than a broom: `emit(..., { maxDepth })` refuses to publish once a topic reaches
-the given depth. Reclaiming rows is an operator job (a direct `DELETE` against the table).
+the given depth. Reclaiming rows is an operator job (a direct `DELETE` against the table). Deleting
+rows does not disturb the worker or a consumer: they resume from a record's `seq`, not from a row
+count, and a `seq` is never handed out twice — each namespace's counter lives in `gnl_work_seq`, which
+nothing deletes.
 
 **⑨ `gnl_work_kv` — queue management notes.** Free-form key-value: job status, scheduler
 definitions, and most importantly **ack markers** (ack marker: "consumer Y received event X" —

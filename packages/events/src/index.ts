@@ -376,7 +376,9 @@ export function createConsumer(
   // events before this are a fully-scanned page for this consumer" → subsequent polls won't list
   // previously (fully processed) pages again (5.1: fixes starvation + O(n)-per-poll at 50+ events).
   // Fan-out is unaffected: each consumer keeps its own cursor + its own ackOnce marker based on its
-  // `opts.name`. Old (cursor-less) event logs also stream from the start (cursor=undefined).
+  // `opts.name`. Old (cursor-less) event logs also stream from the start (cursor=undefined), and so
+  // does a cursor 0.9 persisted (a row offset — see WorkStore.list: the cursor is a record's position
+  // now, so an erasure or a slow producer clock cannot move it).
   const cursorKey = cursorKeyOf(topic, opts.name);
   const rescanKey = rescanKeyOf(topic, opts.name);
 
