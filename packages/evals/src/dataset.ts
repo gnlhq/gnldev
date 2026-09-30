@@ -11,12 +11,22 @@
 // exactly, at any concurrency.
 import { durableProcessorStep } from '@gnldev/durable';
 import type { Journal } from '@gnldev/durable';
-import type { Scorer, ScoreResult } from './scorer.js';
+import { assertDistinctScorerNames, inputText, type Scorer, type ScoreResult } from './scorer.js';
 
 export interface DatasetCase {
   id: string;
+  /**
+   * What the runner is called with — and, as text, the scorers' `sample.input` (the question
+   * `answerRelevancy`/`completeness` judge against): a string as is, `{ prompt }`/`{ messages }` as the
+   * prompt or last user turn, anything else as JSON.
+   */
   input: any;
   expected?: string;
+  /**
+   * Reference context for `faithfulness`/`hallucination`/`contextPrecision` (`sample.context`). Used when
+   * the runner returns none; a runner that RETRIEVED its context should return it instead (see `EvalRunner`).
+   */
+  context?: string | string[];
   metadata?: Record<string, unknown>;
 }
 
@@ -25,7 +35,11 @@ export interface Dataset {
   cases: DatasetCase[];
 }
 
-export type EvalRunner = (input: any, ctx: { runId: string; caseId: string }) => Promise<{ output: string } | string>;
+/**
+ * Runs one case. Return the output, or `{ output, context }` when the agent retrieved context the
+ * context-reading scorers should judge against — that context wins over the case's own `context`.
+ */
+export type EvalRunner = (input: any, ctx: { runId: string; caseId: string }) => Promise<{ output: string; context?: string | string[] } | string>;
 
 export interface EvalCaseResult {
   caseId: string;
@@ -124,6 +138,7 @@ async function runPool<T, R>(items: T[], concurrency: number, worker: (item: T, 
 
 export async function evalDataset(opts: EvalDatasetOptions): Promise<EvalDatasetResult> {
   const { dataset, run, scorers, journal, itemTimeoutMs, signal } = opts;
+  assertDistinctScorerNames(scorers, 'evalDataset');
   const scope = opts.scope ?? dataset.id;
   const maxAttempts = 1 + Math.max(0, opts.maxRetries ?? 0);
   const concurrency = opts.concurrency ?? 1;
@@ -132,10 +147,16 @@ export async function evalDataset(opts: EvalDatasetOptions): Promise<EvalDataset
     const runId = `eval:${scope}:${c.id}`;
     const r = await run(c.input, { runId, caseId: c.id });
     const output = typeof r === 'string' ? r : r.output;
+    const context = (typeof r === 'string' ? undefined : r.context) ?? c.context;
+    const input = inputText(c.input);
     const scores: Record<string, ScoreResult> = {};
     // runId is threaded into the sample so journal-backed scorers (e.g. trajectory.ts's
-    // TrajectoryScorerFor) can be dropped into `scorers` with no extra wiring (P1.1).
-    for (const s of scorers) scores[s.name] = await s.score({ output, expected: c.expected, runId });
+    // TrajectoryScorerFor) can be dropped into `scorers` with no extra wiring (P1.1). `input` and
+    // `context` are threaded for the same reason: five of the built-in judges read them, and the sample
+    // used to carry neither — answerRelevancy/completeness/faithfulness/hallucination/contextPrecision
+    // scored 0 through this runner whatever the agent answered.
+    const sample = { output, expected: c.expected, runId, ...(input !== undefined ? { input } : {}), ...(context !== undefined ? { context } : {}) };
+    for (const s of scorers) scores[s.name] = await s.score(sample);
     return { caseId: c.id, output, scores };
   };
 

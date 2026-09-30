@@ -211,6 +211,59 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   an invited `null`, hashes that call differently when it replays after the upgrade. That is a console
   warning, or a `DivergenceError` under `replay: 'strict'`. Finish such runs before upgrading, or
   resume them without `replay: 'strict'`.
+### Changed
+
+- **A server with no auth answers only the names that mean this machine (DNS rebinding).** The
+  providerless gate in `@gnldev/auth` refused cross-site writes by reading `Sec-Fetch-Site`, and after a
+  DNS rebind that header says `same-origin`, truthfully: the page at `http://evil.example:4747` has had
+  `evil.example` pointed at `127.0.0.1`, so its requests go to your server as its own. Measured over a
+  real loopback socket on 0.9.0: such a page purged Studio's runs (`POST /api/retention/sweep`), ran an
+  agent on the REST API under `gnl dev` (a model call on your key), and READ `GET /api/runs` — prompts
+  and tool arguments; 55 Studio routes answered it 2xx. `makeGate` now refuses, on every method, a
+  request whose `Host` is not `localhost`, a `*.localhost` name, an IP address, or a name you listed —
+  403 with code `host_not_allowed` and the host it saw. After the fix the same sweep leaves only the
+  routes that answer anybody with auth on (UI shell, health, `/capabilities`, API description).
+  **Who is affected:** a server with no auth provider, or with only a `{ read, write }` pair, reached by
+  a name other than those — a custom dev hostname, an ngrok/cloudflared tunnel, Codespaces port
+  forwarding, a Docker service name, or a deliberately open (`allowOpenAccess`) server behind a proxy.
+  LAN IP addresses, `127.0.0.1`, `[::1]` and Docker's published `localhost:<port>` are unaffected, and a
+  provider that binds an identity (`roleAuth`, `@gnldev/auth-ee`) is unaffected. **Way through, one
+  line:** `allowedHosts: ['mybox.test', '.ngrok-free.app']` on `createRestApi` / `createStudioApp` /
+  `makeGate` (leading dot: every name under it; `true`: every name), or
+  `GNL_ALLOWED_HOSTS=mybox.test,.ngrok-free.app` in the environment — read by the gate itself, so
+  `gnl dev`, `gnl studio` and your own server all take it. The 403 names both. See
+  [`docs/errors/host_not_allowed.md`](./docs/errors/host_not_allowed.md).
+- **A valid licence no longer takes away what the free tier gives an application or an end user.**
+  With a licence, `createEnterpriseAuth` still authenticates through its `fallback` (the free
+  `roleAuth`), but `createRbac()`'s default map had no `client` or `end-user` entry. Measured through
+  `@gnldev/server` on 0.9.0: the same `client` token and end-user token that free `roleAuth` served (run
+  200, `GET /runs` 200) got 403 `permission denied: agents:run` with a valid licence — and 200 again once
+  the licence expired. A conformance walk of every free role × every permission the hosts ask (84 pairs:
+  4 roles × 21 checks) found 22 pairs the licence took away; it now finds none. `@gnldev/auth` exports
+  `FREE_ROLE_GRANTS` (what `roleAuth` grants, as permission patterns — checked to answer exactly what
+  `roleAuth` does), and `@gnldev/auth-ee` exports `DEFAULT_ROLE_GRANTS`, built from it plus `member` and
+  `platform-admin`. **Who is affected:** licensed deployments whose fallback or user store carries
+  `client` or `end-user` principals, on the default map — they now get what the free tier gives them
+  (every read, `agents:run`, `workflow:run`, `run:cancel`). A deployment passing its own map to
+  `createRbac` is unchanged: a map still replaces the defaults. **Way through:** to add a role without
+  restating the defaults, `createRbac({ ...DEFAULT_ROLE_GRANTS, support: ['runs:read'] })`; to keep the
+  0.9.0 narrowing, pass the map you want without the spread.
+- **`@gnldev/evals`: the runners give scorers the question and the context.** `answerRelevancy`,
+  `completeness`, `faithfulness`, `hallucination` and `contextPrecision` read `sample.input` or
+  `sample.context`, and `evalDataset` and `scoreRun` built the sample from `{ output, expected, runId }`
+  only. Measured on 0.9.0 with a judge answering `SCORE: 0.9`: `evalDataset` scored `answer-relevancy` 0
+  ("input required"); `scoreRun` scored all four judges 0 and called the judge model zero times — whatever
+  the agent answered. Now `evalDataset` passes each case's `input` (as text) and `context` (a new optional
+  `DatasetCase` field, or the runner's `{ output, context }`, which wins); `scoreRun` reads the question
+  from the run's journaled input and takes `context` (a value, or a function of the run's journal
+  entries), plus an `input` override; the result carries the `input` it used. **Who is affected:** anyone
+  scoring through these runners — scores for those five judges change from a constant 0 to a real
+  judgement. **Breaking:** two scorers with the same name in one call now throw, naming both. They used to
+  collapse into one: the result, the aggregate and the journal memo (`eval:<name>`) are keyed by name, and
+  `scoreRun` answered the second of two default-named `llmJudge` rubrics with the first one's 0.9 without
+  asking its model. Keying by position was rejected: the memo is read on the next run, so reordering the
+  list would hand each scorer another's stored score. **Way through:** `llmJudge({ name: 'polite', ... })`,
+  `faithfulness({ model, name: 'faithful-v2' })`, or `{ ...contains('x'), name: 'has-x' }`.
 
 ## [0.9.0] — 2026-09-30
 

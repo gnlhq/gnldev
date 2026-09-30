@@ -207,6 +207,7 @@ everyone else.
 | `AuthProvider` | `authenticate(request)` → a `Principal` or `null`, then `authorize(principal, request, ctx)` → `{ allow }` |
 | `roleAuth` | The bundled provider above |
 | `CLIENT_WRITES` | The exact set of writes a `client` (and an end user) may perform — read it rather than guessing |
+| `FREE_ROLE_GRANTS` | What `roleAuth` grants each role, as permission patterns (`admin: ['*']`, `client`/`end-user`: `*:read` + `CLIENT_WRITES`, `viewer: ['*:read']`). `@gnldev/auth-ee`'s default RBAC map starts from it |
 | `signSubjectToken` / `verifyJwt` | Sign an end user's token in your backend; the verifier every GNL token goes through. `verifyJwt`'s `onClaims` receives the claims once signature and time checks pass, for a caller that needs more than the `Principal` (e.g. `iat`/`jti` for revocation). `claimMap` renames the claims read into the `Principal` when your issuer uses other names (default: `id` ← `sub`, `roles` ← `roles`, `orgId` ← `orgId`) |
 | `subjectTokenEndpoint` | Your app's refresh route: session → fresh short-lived token |
 | `actorIdOf` | The name identity comparisons use: a user's own id, `operator:<id>` for staff |
@@ -216,7 +217,8 @@ everyone else.
 | `PLATFORM_ADMIN_ROLE` / `isPlatformAdmin` | The reserved cross-organization grant `superAdmin` carries |
 | `callerKind` / `isPrincipalKind` / `PRINCIPAL_KINDS` | What a caller is (see above), read fail-closed |
 | `assertAssignablePrivileges` | The ceiling for user management: no one hands out a grant they do not hold |
-| `makeGate` | Turns a provider into a gate a host can apply to routes |
+| `makeGate` | Turns a provider into a gate a host can apply to routes. Without a provider that binds an identity it also refuses cross-site writes, and any request addressed by a `Host` that is not `localhost`, `*.localhost`, an IP address or listed in `allowedHosts` / `GNL_ALLOWED_HOSTS` — 403 [`host_not_allowed`](../../docs/errors/host_not_allowed.md), the DNS-rebinding shape |
+| `isHostAllowed` / `hostnameOf` / `parseAllowedHosts` / `hostNotAllowedMessage` | That host rule, for a host that serves a route outside the gate |
 | `principalOf` | Reads the principal a gate resolved for a request |
 | `normalizeAuth` / `fromReadWrite` | Accepts the older `{ read, write }` predicate pair and adapts it to the provider interface |
 | `AuthProvider.onDecision` / `AccessDecision` | Optional. Called once per request, after the host answered, with what the caller GOT: `{ principal, kind, orgId, path, method, action, permission, allowed, reason, detail, status }`. See below |

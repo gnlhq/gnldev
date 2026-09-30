@@ -67,6 +67,21 @@ auth entirely, so its admin API was open no matter what you had configured.
 **If you run `gnl dev` inside a container**, add `--host 0.0.0.0`; without it the port is no longer
 reachable from the host.
 
+**Without auth, the server answers only the names that mean this machine** — `localhost`, `*.localhost`
+and any IP address (so `http://192.168.1.20:4747` from your phone, and Docker's published
+`localhost:<port>`, need nothing). Any other name answers 403 `host_not_allowed`: that is the shape of a
+DNS-rebinding page, which could otherwise read your runs and drive the API through your own browser. If
+the name is yours — a custom dev hostname, a tunnel, Codespaces — list it in one line:
+
+```bash
+GNL_ALLOWED_HOSTS=mybox.test gnl dev
+GNL_ALLOWED_HOSTS=.ngrok-free.app,.trycloudflare.com gnl dev   # leading dot: every name under it
+GNL_ALLOWED_HOSTS=.app.github.dev gnl studio                   # Codespaces port forwarding
+```
+
+`*` answers every name. With auth configured the check does not run — see
+[`host_not_allowed`](../../docs/errors/host_not_allowed.md).
+
 ## Inspect (read-only)
 These need a `gnl.config.ts` with `storage` (recommended, e.g. `SqliteStorage`) or a raw `journal` —
 same rule `gnl dev`/`gnl studio` already follow: no storage/journal configured → a clear error, nothing silent.

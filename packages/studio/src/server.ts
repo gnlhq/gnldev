@@ -803,6 +803,14 @@ export interface StudioApiOptions {
    */
   allowOpenAccess?: boolean;
   /**
+   * Host names this surface also answers when it has NO auth provider, besides `localhost`,
+   * `*.localhost` and any IP address. Other names are refused 403 `host_not_allowed` — a DNS-rebinding
+   * page's shape. Leading dot = the domain and every name under it (`'.ngrok-free.app'`); `true` =
+   * every name. `GNL_ALLOWED_HOSTS` (comma-separated, or `*`) adds to it. Ignored with an
+   * identity-binding provider. See @gnldev/auth `GateOptions.allowedHosts`.
+   */
+  allowedHosts?: readonly string[] | true;
+  /**
    * Opt-in multi-org support (v1 = READ-ONLY audit): if an org resolves (default: the `x-gnl-org`
    * header), the entire read surface (runs/state/diff/trace/metrics/threads) is scoped to that org via
    * WithOrg. A request without an org runs in the shared space.
@@ -932,7 +940,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // (otherwise makeGate throws at setup), and outside production it's warned once. Since the org middleware
   // needs the identity-bound org (Principal.orgId), the gate is set up HERE, before the middleware.
   const authProvider = normalizeAuth(auth);
-  const { allow, allowP, deny, settle } = makeGate(authProvider, { allowOpenAccess: opts.allowOpenAccess });
+  const { allow, allowP, deny, settle } = makeGate(authProvider, { allowOpenAccess: opts.allowOpenAccess, ...(opts.allowedHosts !== undefined ? { allowedHosts: opts.allowedHosts } : {}) });
   /**
    * THE OUTCOME, reported once per request when it has been answered (@gnldev/auth `onDecision`) —
    * registered FIRST, so it sees the answer of every middleware below as well as every route. The

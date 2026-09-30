@@ -34,8 +34,18 @@ const r = await evalDataset({
   (`faithfulness`/`hallucination`/`contextPrecision`) read `sample.context` (string | string[]); the ones
   that need a question (`answerRelevancy`/`completeness`) read `sample.input` — if it's missing they don't
   silently return 1, they return 0 + a clear reason.
-- `scoreRun(journal, runId, scorers) → ScoreRunResult`
-- `evalDataset({ journal, dataset, run, scorers }) → EvalDatasetResult` (resumable)
+- `scoreRun(journal, runId, scorers, { context?, input?, expected? }) → ScoreRunResult` — `sample.input`
+  is the run's own journaled input (its prompt, or the last user turn of its messages) unless you pass
+  `input`. `context` is not derived for you — a run's tool results are not all retrieval context — so pass
+  it, or pass a function that picks it from the run's journal entries (e.g. your retrieval tool's results).
+- `evalDataset({ journal, dataset, run, scorers }) → EvalDatasetResult` (resumable). Each case's `input` is
+  also the scorers' `sample.input` (a string as is; `{ prompt }`/`{ messages }` as the prompt or last user
+  turn; anything else as JSON). A case may carry `context`; a runner that retrieved its own returns
+  `{ output, context }`, which wins.
+- Scorer names must be unique within one call: a score is kept under its scorer's name (result, aggregate,
+  journal memo), so both runners throw on a duplicate, naming both. Give one a `name`
+  (`llmJudge({ name: 'polite', ... })`, `faithfulness({ model, name })`) or rename any scorer with a spread:
+  `{ ...contains('x'), name: 'has-x' }`.
 
 ## How it works
 Since scores are written to the journal, the eval suite is idempotent; long suites continue after a crash,

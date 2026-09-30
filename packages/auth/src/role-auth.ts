@@ -47,6 +47,32 @@ export const CLIENT_WRITES: ReadonlySet<string> = new Set([
 export const END_USER_ROLE = 'end-user';
 
 /**
+ * What `roleAuth` grants each of its roles, written as permission patterns (`resource:action`, `*` a
+ * wildcard) — the form an RBAC provider evaluates. `roleAuth.authorize` below is the enforcement; this
+ * is the same rule as data, so the paid tier can START from it instead of restating it.
+ *
+ * It exists because restating it went wrong: @gnldev/auth-ee's default RBAC map listed viewer, member,
+ * admin and platform-admin, and not `client` or `end-user`. With a valid licence the free provider
+ * becomes the identity chain's fallback, so the same application credential and the same end-user token
+ * reached the paid tier — and were refused `agents:run` and every read that roleAuth allows them.
+ * @gnldev/auth-ee's `DEFAULT_ROLE_GRANTS` now spreads this map, and its conformance test walks every role
+ * here against every permission a host asks for (and checks this map answers exactly what roleAuth does).
+ *
+ *   admin               everything (`*`)
+ *   client, end-user    every read, and the writes in `CLIENT_WRITES`
+ *   viewer              every read
+ *
+ * `platform-admin` is absent on purpose: here it is a SCOPE grant carried beside `admin` (see scope.ts),
+ * and on its own it grants roleAuth nothing.
+ */
+export const FREE_ROLE_GRANTS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  admin: Object.freeze(['*']),
+  [CLIENT_ROLE]: Object.freeze(['*:read', ...CLIENT_WRITES]),
+  [END_USER_ROLE]: Object.freeze(['*:read', ...CLIENT_WRITES]),
+  viewer: Object.freeze(['*:read']),
+});
+
+/**
  * Who may verify an end user's token, and where that user lives.
  *
  * The application signs a short-lived token for its logged-in user (`signSubjectToken`) and hands it to

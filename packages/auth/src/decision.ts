@@ -134,8 +134,16 @@ export async function settleDecision(
 export const AUTH_ERROR_CODES = {
   /** 500 — the host's `onDecision` hook failed, so the response was withheld rather than sent unrecorded. */
   decisionNotRecorded: 'decision_not_recorded',
+  /**
+   * 403 — a surface with no identity to authenticate was asked under a name that is not loopback, not
+   * an IP address and not listed in `allowedHosts` / `GNL_ALLOWED_HOSTS` (the DNS-rebinding shape).
+   */
+  hostNotAllowed: 'host_not_allowed',
 } as const;
-export const AUTH_ERROR_STATUS: Record<string, number> = { [AUTH_ERROR_CODES.decisionNotRecorded]: 500 };
+export const AUTH_ERROR_STATUS: Record<string, number> = {
+  [AUTH_ERROR_CODES.decisionNotRecorded]: 500,
+  [AUTH_ERROR_CODES.hostNotAllowed]: 403,
+};
 
 /**
  * The answer a host gives when `onDecision` failed: the request is not delivered unrecorded. `extra`

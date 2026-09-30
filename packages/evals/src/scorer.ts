@@ -107,3 +107,80 @@ export function embeddingSimilarity(
     },
   };
 }
+
+/**
+ * A score is known by its scorer's NAME everywhere a runner keeps it: the result record
+ * (`scores[name]`), the dataset aggregate, and the journal memo (`eval:<name>`). Two scorers with one
+ * name therefore became one — measured, `scoreRun` answered the second of two default-named `llmJudge`
+ * rubrics with the first one's memoized score and never asked its model.
+ *
+ * Refused rather than keyed by position: a position is not an identity across runs, and the memo is
+ * read on the NEXT run — reordering the scorer list would hand each scorer another's stored score,
+ * silently. A name is what a reader of the result looks up, so it has to be unique.
+ */
+export function assertDistinctScorerNames(scorers: readonly Scorer[], runner: string): void {
+  const seen = new Map<string, number>();
+  scorers.forEach((s, i) => {
+    const first = seen.get(s.name);
+    if (first !== undefined) {
+      throw new Error(
+        `@gnldev/evals ${runner}: scorers[${first}] and scorers[${i}] are both named '${s.name}', and a score is ` +
+        `kept under its scorer's name (result, aggregate, journal memo), so one would overwrite the other. ` +
+        `Give one a name: pass \`name\` to the factory (llmJudge({ name: 'polite', ... }), faithfulness({ model, name })), ` +
+        `or rename any scorer with a spread: { ...contains('x'), name: 'has-x' }.`,
+      );
+    }
+    seen.set(s.name, i);
+  });
+}
+
+/** Text of one message content: a string, or the `text` parts of a content array. */
+function contentText(content: unknown): string | undefined {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const text = content
+      .filter((p) => p && typeof p === 'object' && (p as { type?: unknown }).type === 'text')
+      .map((p) => String((p as { text?: unknown }).text ?? ''))
+      .join('');
+    return text.length > 0 ? text : undefined;
+  }
+  return undefined;
+}
+
+/** The last user turn of a message list. */
+function lastUserText(messages: unknown[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as { role?: unknown; content?: unknown } | undefined;
+    if (m && m.role === 'user') return contentText(m.content);
+  }
+  return undefined;
+}
+
+/**
+ * The QUESTION a sample's `input` stands for, as text — what `answerRelevancy`/`completeness` judge the
+ * output against.
+ *
+ *   string                         → itself
+ *   { prompt } / { messages }      → the prompt, or the last user turn (a run's journaled input has
+ *                                    this shape, and so does a typical runner input object)
+ *   a message array                → its last user turn
+ *   anything else                  → JSON (a structured case input still reaches the judge whole)
+ */
+export function inputText(input: unknown): string | undefined {
+  if (input == null) return undefined;
+  if (typeof input === 'string') return input;
+  if (Array.isArray(input)) return lastUserText(input) ?? JSON.stringify(input);
+  if (typeof input === 'object') {
+    const { prompt, messages } = input as { prompt?: unknown; messages?: unknown };
+    if (typeof prompt === 'string') return prompt;
+    const fromPrompt = Array.isArray(prompt) ? lastUserText(prompt) : undefined;
+    if (fromPrompt !== undefined) return fromPrompt;
+    const fromMessages = Array.isArray(messages) ? lastUserText(messages) : undefined;
+    if (fromMessages !== undefined) return fromMessages;
+  }
+  try {
+    return JSON.stringify(input);
+  } catch {
+    return undefined;
+  }
+}

@@ -16,7 +16,7 @@ export {
 } from './scorers.js';
 export type { JudgeScorerOptions, ToneConsistencyOptions } from './scorers.js';
 export { scoreRun } from './score-run.js';
-export type { ScoreRunResult } from './score-run.js';
+export type { ScoreRunResult, ScoreRunOptions } from './score-run.js';
 export { evalDataset } from './dataset.js';
 export type { Dataset, DatasetCase, EvalRunner, EvalCaseResult, EvalDatasetResult, EvalDatasetOptions } from './dataset.js';
 export { createDatasetsManager } from './datasets-manager.js';

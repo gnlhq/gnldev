@@ -265,6 +265,14 @@ export interface RestApiOptions {
    */
   allowOpenAccess?: boolean;
   /**
+   * Host names this surface also answers when it has NO auth provider, besides `localhost`,
+   * `*.localhost` and any IP address. Other names are refused 403 `host_not_allowed` — a DNS-rebinding
+   * page's shape. Leading dot = the domain and every name under it (`'.ngrok-free.app'`); `true` =
+   * every name. `GNL_ALLOWED_HOSTS` (comma-separated, or `*`) adds to it. Ignored with an
+   * identity-binding provider. See @gnldev/auth `GateOptions.allowedHosts`.
+   */
+  allowedHosts?: readonly string[] | true;
+  /**
    * Opt-in multi-organization support: each request descends into that organization's journal (withOrg)
    * → runs, memory, and exactly-once guarantees are isolated per organization. The resolved organization
    * is injected into requestContext as `org` (visible to dynamic agents). The registry is lazily built
@@ -714,7 +722,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
   // Opt-in auth gate: endpoints are open without a provider; in production this is only possible with
   // allowOpenAccess: true (otherwise makeGate throws at setup), outside production a single warning is issued on the first request.
   const authProvider = normalizeAuth(opts.auth);
-  const { allow, allowP, deny } = makeGate(authProvider, { allowOpenAccess: opts.allowOpenAccess });
+  const { allow, allowP, deny } = makeGate(authProvider, { allowOpenAccess: opts.allowOpenAccess, ...(opts.allowedHosts !== undefined ? { allowedHosts: opts.allowedHosts } : {}) });
   /**
    * Record why this request is refused, and answer it — the response may hide the reason (a foreign
    * run reads as a 404); the record must not. `withDecisions` reports it once the request is answered.

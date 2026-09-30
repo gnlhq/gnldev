@@ -5,9 +5,9 @@
 // ours — the same coupling the factories dropped when they stopped returning a Hono app. Everything
 // the gate reads (method, path, headers, query) is on `Request`; nothing was lost by narrowing.
 import type { AuthProvider, Decision, Principal } from './types.js';
-import { isCrossSiteStateChange } from './same-site.js';
+import { isCrossSiteStateChange, isHostAllowed, hostnameOf, parseAllowedHosts } from './same-site.js';
 import { bindsIdentity } from './adapter.js';
-import { notePrincipal, noteVerdict, settleDecision } from './decision.js';
+import { notePrincipal, noteVerdict, settleDecision, AUTH_ERROR_CODES } from './decision.js';
 
 export interface Gate {
   /** Is access allowed? true if there's no provider (opt-in: gate not set up → open; see makeGate in production). */
@@ -38,6 +38,8 @@ export interface Gate {
 // could pick the same key. A WeakMap cannot collide and cannot leak — the entry dies with the request.
 const principals = new WeakMap<Request, Principal>();
 const decisions = new WeakMap<Request, Decision>();
+/** Requests refused by the host rule, with the hostname they named — `deny()` answers them with it. */
+const hostRefusals = new WeakMap<Request, string>();
 
 /**
  * The principal authenticated during allow() (within the same request). Hosts derive the organization
@@ -54,6 +56,34 @@ export interface GateOptions {
    * explicitly set to true (audit #2).
    */
   allowOpenAccess?: boolean;
+  /**
+   * Host names a surface with NO identity to authenticate (no provider, or a `{read,write}` pair) also
+   * answers, besides `localhost`, `*.localhost` and any IP address — which it always answers. Any other
+   * name is refused 403 `host_not_allowed`: that is what a DNS-rebinding page sends, and it could
+   * otherwise read runs and drive writes through the browser of whoever visits it.
+   *
+   * List the names you really use: a custom dev hostname (`'mybox.test'`), a tunnel or Codespaces
+   * domain with a leading dot for every name under it (`'.ngrok-free.app'`, `'.trycloudflare.com'`,
+   * `'.app.github.dev'`), a Docker service name (`'api'`). `true` answers every name — for a server
+   * behind a proxy that sets its own Host. The `GNL_ALLOWED_HOSTS` environment variable
+   * (comma-separated, or `*`) is read when the gate is built and adds to this list, so `gnl dev`,
+   * `gnl studio` and your own server all take it with no code change.
+   *
+   * Ignored when the provider binds an identity: the bearer token is the defence there, and a rebound
+   * page cannot read it.
+   */
+  allowedHosts?: readonly string[] | true;
+}
+
+/** The sentence a host-rule refusal carries: what happened, and the one line that lets the name in. */
+export function hostNotAllowedMessage(hostname: string): string {
+  return (
+    `this server has no auth provider, so it answers only requests addressed to it as localhost or by an ` +
+    `IP address, and this one was addressed to "${hostname}" (the shape of a DNS-rebinding page). ` +
+    `If that name is yours — a LAN hostname, a tunnel, Codespaces, a Docker service — list it: ` +
+    `allowedHosts: ['${hostname}'] in the createRestApi / createStudioApp options, or ` +
+    `GNL_ALLOWED_HOSTS=${hostname} in the environment (gnl dev, gnl studio). See docs/errors/host_not_allowed.md.`
+  );
 }
 
 /**
@@ -80,6 +110,35 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
   // Non-production providerless gate: warn ONCE on the first request (no silent openness), then open.
   let warnedOpen = false;
   let warnedCrossSite = false;
+  let warnedHost = false;
+  // Read ONCE, here: every host (createRestApi, createStudioApp, `gnl dev`, `gnl studio`, a project's
+  // own server) builds its gate through this function, so the variable reaches all of them with no
+  // plumbing — `gnl dev` builds its hosts from the PROJECT's installed packages and could not pass an
+  // option through them anyway.
+  const fromEnv = parseAllowedHosts(process.env.GNL_ALLOWED_HOSTS);
+  const allowedHosts: readonly string[] | true =
+    opts?.allowedHosts === true || fromEnv === true ? true : [...(opts?.allowedHosts ?? []), ...fromEnv];
+
+  /**
+   * Was this request addressed by a name somebody else could point here — against a surface with no
+   * identity to ride? Checked on EVERY method, reads included: after a DNS rebind the page is
+   * same-origin, so it can read what it is answered. Same identity condition as the cross-site check
+   * below, and for the same reason. A request with no Host header is not a browser request over
+   * HTTP/1.1 (an in-process `app.fetch`, or HTTP/2, which a browser speaks only over TLS, where a
+   * rebound name fails the certificate before any request is sent), so there is nothing to check.
+   */
+  function hostWithoutIdentity(req: Request): boolean {
+    if (bindsIdentity(provider)) return false;
+    const host = req.headers.get('host');
+    if (!host || isHostAllowed(host, allowedHosts)) return false;
+    const name = hostnameOf(host);
+    hostRefusals.set(req, name);
+    if (!warnedHost) {
+      warnedHost = true;
+      console.warn(`@gnldev/auth: refused a request addressed to "${name}". ${hostNotAllowedMessage(name)}`);
+    }
+    return true;
+  }
 
   /**
    * The providerless decision, in ONE place.
@@ -136,7 +195,7 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
   }
   return {
     async allow(req, action, resource) {
-      if (crossSiteWithoutIdentity(req)) return false;
+      if (hostWithoutIdentity(req) || crossSiteWithoutIdentity(req)) return false;
       if (!provider) return openSurfaceAllows(req);
       const principal = await provider.authenticate(req);
       if (principal) principals.set(req, principal);
@@ -152,7 +211,7 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
       return decision.allow;
     },
     async allowP(req, permission) {
-      if (crossSiteWithoutIdentity(req)) return false;
+      if (hostWithoutIdentity(req) || crossSiteWithoutIdentity(req)) return false;
       if (!provider) return openSurfaceAllows(req);
       const principal = await provider.authenticate(req);
       if (principal) principals.set(req, principal);
@@ -164,6 +223,13 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
       return decision.allow;
     },
     deny(req, action) {
+      const refusedHost = hostRefusals.get(req);
+      if (refusedHost !== undefined) {
+        return Response.json(
+          { error: hostNotAllowedMessage(refusedHost), code: AUTH_ERROR_CODES.hostNotAllowed, host: refusedHost },
+          { status: 403 },
+        );
+      }
       const d = decisions.get(req);
       const denied = d && d.allow === false ? d : undefined;
       const status = denied?.status ?? (action === 'write' ? 403 : 401);

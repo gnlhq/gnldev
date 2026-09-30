@@ -111,6 +111,7 @@ for `{ reader }`:
 | `events` | the **Dead-letter** view — quarantined `@gnldev/events` deliveries (see below) |
 | `org` | multi-organization mode |
 | `auth: { read, write }`, `allowOpenAccess` | the auth gate (see the note above) |
+| `allowedHosts` | names a providerless Studio answers besides `localhost`, `*.localhost` and IP addresses; others get 403 [`host_not_allowed`](../../docs/errors/host_not_allowed.md) (DNS rebinding). `GNL_ALLOWED_HOSTS` adds to it |
 | `users` | the Users view (a paid surface — the contract is here, the implementation is in `@gnldev/auth-ee`) |
 | `userErasure` | `DELETE /users/:id` erasing the person's data with the entry (see below) |
 | `apiBase` | *(`createStudioApp`/`createStudioAdmin` only)* the prefix the UI fetches against |

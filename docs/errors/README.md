@@ -101,12 +101,13 @@ Refusals the route layer makes on its own, before or around the run — `EDGE_ER
 
 ## The decision record — `@gnldev/auth`
 
-Written by a host (the REST API, Studio, the chat and AG-UI routes) whose auth provider records every
-decision through `onDecision` — `AUTH_ERROR_CODES` in `@gnldev/auth`.
+Written by a host (the REST API, Studio, the chat and AG-UI routes) from `@gnldev/auth`'s gate —
+`AUTH_ERROR_CODES` in `@gnldev/auth`.
 
 | Code | Status | In one line |
 | --- | --- | --- |
 | [`decision_not_recorded`](./decision_not_recorded.md) | 500 | The decision could not be recorded, so the response was withheld. |
+| [`host_not_allowed`](./host_not_allowed.md) | 403 | No auth, and the request named a host that is not loopback, an IP, or listed in `allowedHosts`. |
 
 ## The operator console — Studio's own refusals
 
