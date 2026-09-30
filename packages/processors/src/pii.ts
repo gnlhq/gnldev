@@ -14,11 +14,21 @@ export interface PiiRedactorOptions {
   on?: 'input' | 'output' | 'both';
   /**
    * Also redact the tool execute result (processToolResult hook) — default: false.
-   * known limitation: tool output (external API/DB/file result) was being written to the journal as
-   * PLAIN TEXT; it may contain PII. Left as opt-in so existing piiRedactor users' behavior does NOT
-   * CHANGE — this option only masks tool output when explicitly set to `true`.
+   * Tool output (external API/DB/file result) is otherwise written to the journal as-is; it may
+   * contain PII. Opt-in, so a piiRedactor without it behaves exactly as before.
+   *
+   * A string result is redacted as text. A structured result (object/array) is WALKED: every string
+   * leaf and every key goes through the same patterns; numbers, booleans and null stay what they are
+   * (the patterns are text patterns — `phone` masks a bare 7–15 digit run in text, and as a JSON number
+   * that is an epoch-ms timestamp or an id far more often than a phone). A cyclic back-reference becomes
+   * `'[Circular]'`; a `Date` (anything with `toJSON`) is walked as the JSON the journal would store.
+   *
+   * FAILS CLOSED: a value the walk cannot finish (a getter or `toJSON` that throws, a structure deep
+   * enough to overflow the stack) is replaced by a `[REDACTED_TOOL_RESULT: …]` marker, never journaled
+   * raw. The marker names the way through: `{ skipTools: ['toolName'] }` journals that tool's output as
+   * it returned — for a tool you know carries no PII, or whose output cannot be walked.
    */
-  redactToolResults?: boolean;
+  redactToolResults?: boolean | { skipTools?: string[] };
   /**
    * Extra patterns, for the identifiers the five built-in types cannot name.
    *
@@ -119,6 +129,79 @@ function countRedactions(
   return { total, types: hitTypes };
 }
 
+/**
+ * Redacts a structured value by walking it — never by re-parsing text, which is what failed open.
+ *
+ * Each string leaf and each key goes through `redact`; numbers, booleans, null and bigint are kept
+ * as they are. The shape follows what `JSON.stringify` (and so the journal) would store: `toJSON` is
+ * honoured (a `Date` becomes its ISO text, then is redacted as text), own enumerable keys only,
+ * functions/symbols/undefined dropped from objects and nulled in arrays. Two deviations, both so the
+ * walk FINISHES where serialisation would throw: a cyclic back-reference becomes `'[Circular]'`, and
+ * a bigint is kept. A key masked into one already present gets `#2`, `#3`… instead of overwriting it.
+ *
+ * Throws whatever a getter or `toJSON` throws (or a RangeError on a structure too deep to recurse);
+ * the caller turns that into a marker. It never returns a partially-walked original.
+ */
+function redactStructured(
+  value: unknown,
+  redact: (text: string) => { text: string; total: number; types: string[] },
+): { value: unknown; total: number; types: string[]; paths: string[] } {
+  let total = 0;
+  const hit = new Set<string>();
+  const paths: string[] = [];
+  const ancestors = new Set<object>();
+  const record = (r: { total: number; types: string[] }, path: string) => {
+    if (r.total === 0) return;
+    total += r.total;
+    for (const t of r.types) hit.add(t);
+    paths.push(path);
+  };
+  const text = (s: string, path: string): string => {
+    const r = redact(s);
+    record(r, path);
+    return r.text;
+  };
+  const dropped = (v: unknown) => v === undefined || typeof v === 'function' || typeof v === 'symbol';
+
+  const walk = (input: unknown, key: string, path: string): unknown => {
+    let v = input;
+    if (v !== null && typeof v === 'object' && typeof (v as { toJSON?: unknown }).toJSON === 'function') {
+      v = (v as { toJSON: (k: string) => unknown }).toJSON(key);
+    }
+    if (typeof v === 'string') return text(v, path);
+    if (v === null || typeof v !== 'object') return v;
+    if (ancestors.has(v)) return '[Circular]';
+    ancestors.add(v);
+    try {
+      if (Array.isArray(v)) {
+        return v.map((item, i) => {
+          const w = walk(item, String(i), `${path}[${i}]`);
+          return dropped(w) ? null : w;
+        });
+      }
+      const out = new Map<string, unknown>();
+      for (const k of Object.keys(v)) {
+        // Paths name the MASKED key: a report must not carry the PII it reports on.
+        const masked = redact(k);
+        const name = masked.text;
+        const at = /^[A-Za-z_$][\w$]*$/.test(name) ? `${path}.${name}` : `${path}[${JSON.stringify(name)}]`;
+        const item = walk((v as Record<string, unknown>)[k], k, at);
+        if (dropped(item)) continue;
+        record(masked, at);
+        let unique = name;
+        for (let n = 2; out.has(unique); n++) unique = `${name}#${n}`;
+        out.set(unique, item);
+      }
+      // fromEntries defines own properties, so a `__proto__` key stays data instead of a prototype.
+      return Object.fromEntries(out);
+    } finally {
+      ancestors.delete(v);
+    }
+  };
+  const out = walk(value, '', '$');
+  return { value: out, total, types: [...hit], paths };
+}
+
 /** Aggregates redactions across ALL text fields of a ProcessorInput/ProcessorOutput (system/prompt/messages
  *  are counted separately — same granularity as redactMessages, which redacts each message/part INDEPENDENTLY). */
 function countInputRedactions(
@@ -208,43 +291,45 @@ export function piiRedactor(opts: PiiRedactorOptions = {}): Processor {
     };
   }
 
-  // AUDIT TASK: opt-in hook so tool output doesn't write plain PII to the journal. String output is
-  // redacted directly; object output is redacted via the JSON.stringify → redact → JSON.parse chain —
-  // if stringify/parse fails (circular structure or JSON broken by redaction), the original output is
-  // NOT TOUCHED (same "deterministic, pure transform only" principle as processInput/processOutput;
-  // the raw value still gets written to the journal, but at least the framework doesn't silently
-  // corrupt data).
+  // Opt-in hook so tool output doesn't write plain PII to the journal. It used to redact an object as
+  // JSON TEXT (stringify → redact → parse) and return the ORIGINAL when the parse failed — which it
+  // did for any JSON number `phone` matched (epoch ms, ids, 41.0082376), so the email beside the
+  // timestamp went to the journal in plaintext, unreported. The value is now walked
+  // (`redactStructured`), and anything the walk cannot finish is replaced, never passed through.
   if (opts.redactToolResults) {
+    const skip = new Set(typeof opts.redactToolResults === 'object' ? opts.redactToolResults.skipTools ?? [] : []);
+    const redactText = (text: string) => applyRedactions(text, types, mask, { extra, validate });
     // durable-tool.ts ALWAYS awaits THIS HOOK (`await proc.processToolResult(...)`) →
     // making it async doesn't break the existing contract (existing tests already await it too).
     proc.processToolResult = async (res: ProcessorToolResult, ctx: ProcessorCtx) => {
-      const { output } = res;
+      const { output, toolName } = res;
+      if (skip.has(toolName)) return { output };
       // `string[]`, not `PiiType[]`: a custom pattern's name belongs in the audit report too, or the
       // report would say fewer types were hit than the redaction actually masked.
-      const report = (r: { total: number; types: string[] }) => {
-        if (r.total > 0) void recordProcessorReport(ctx, 'pii-redactor', 'tool', { redactedCount: r.total, types: r.types });
+      const report = async (findings: { redactedCount: number; types: string[]; [k: string]: unknown }) => {
+        if (findings.redactedCount > 0 || findings.failedClosed) await recordProcessorReport(ctx, 'pii-redactor', 'tool', findings);
       };
       if (typeof output === 'string') {
-        report(countRedactions(output, types, mask, extra, validate));
-        return { output: redactString(output, types, mask, extra, validate) };
+        const r = redactText(output);
+        await report({ redactedCount: r.total, types: r.types });
+        return { output: r.text };
       }
-      if (output !== null && typeof output === 'object') {
-        let json: string;
-        try {
-          json = JSON.stringify(output);
-        } catch {
-          return { output }; // circular structure etc. → cannot serialize, NOT TOUCHED
-        }
-        const redacted = redactString(json, types, mask, extra, validate);
-        try {
-          const parsed = JSON.parse(redacted);
-          report(countRedactions(json, types, mask, extra, validate));
-          return { output: parsed };
-        } catch {
-          return { output }; // redaction broke the JSON → original returned UNTOUCHED
-        }
+      if (output === null || typeof output !== 'object') return { output }; // number/boolean/bigint/undefined: no text to mask
+      let walked: ReturnType<typeof redactStructured>;
+      try {
+        walked = redactStructured(output, redactText);
+      } catch (err) {
+        // The error's MESSAGE is repeated nowhere: a throwing getter's message is tool data too.
+        const reason = err instanceof Error ? err.name : typeof err;
+        await report({ redactedCount: 0, types: [], failedClosed: true, reason });
+        console.warn(`@gnldev/processors: piiRedactor could not walk the output of tool '${toolName}' (${reason}); replaced with a marker, not journaled.`);
+        return {
+          output: `[REDACTED_TOOL_RESULT: piiRedactor could not walk this value (${reason}), so it was not journaled. ` +
+            `To journal this tool's output unredacted, pass piiRedactor({ redactToolResults: { skipTools: ['${toolName}'] } })]`,
+        };
       }
-      return { output }; // number/boolean/null/undefined → cannot contain PII
+      await report({ redactedCount: walked.total, types: walked.types, paths: walked.paths });
+      return { output: walked.value };
     };
   }
 

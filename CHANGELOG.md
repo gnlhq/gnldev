@@ -171,6 +171,46 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   database a `delete` created `embedding vector(1)`, and every upsert after it failed ("expected 1
   dimensions, not 3") — found through `ingestDocuments`, whose first step is a delete. It now reads the
   vector size of an existing table, and deletes nothing when there is no table.
+- **`piiRedactor({ redactToolResults: true })` no longer journals an object tool result unredacted.**
+  An object was masked as JSON text (stringify, mask, parse). `phone` masks a bare 7–15 digit run, so
+  any JSON number of that length (an epoch-ms timestamp, a numeric id, `41.0082376`) turned into
+  `[REDACTED_PHONE]` inside the JSON, the parse failed, and the original object was returned. Measured
+  with a tool returning `{ email, createdAt: 1727712000000 }`: the email was in the journal in plaintext,
+  and no audit report was written. The same happened for a cyclic object. The value is now walked:
+  every string value and every key is masked, numbers, booleans and null are kept, a `Date` becomes its
+  ISO text, and a cyclic reference becomes `'[Circular]'`. Two keys that mask to the same text are kept
+  as `[REDACTED_EMAIL]` and `[REDACTED_EMAIL]#2`. If the walk cannot finish (a getter or `toJSON`
+  throws, or the value is nested too deep), the output is replaced by a `[REDACTED_TOOL_RESULT: …]`
+  marker, never journaled raw. The marker names the way through: `redactToolResults: { skipTools:
+  ['toolName'] }` journals that tool's output as it returned. The audit report for an object result
+  now lists the masked `paths`. **Who is affected:** anyone with `redactToolResults: true` whose tools
+  return objects. Object results that used to pass through now come back masked; a cyclic result that
+  used to come back as the same object now comes back as a masked copy. A number is not matched against
+  the patterns (it never was: the parse failed first), so a phone number stored as a JSON number is not
+  masked; return it as a string, or map it before returning.
+- **`schemaCompat` / `applyToolCompat` no longer switch off a tool's input validation.** The patched
+  tool's `inputSchema` was a bare `jsonSchema(js)` with no validator, so on every model a rule matched
+  (OpenAI, groq, Gemini, Claude) the AI SDK validated nothing. Measured on an OpenAI model with
+  `schemaCompat: true`: `{ to: 'not-an-email', count: -7 }` reached `execute()`, and `.default('low')`
+  never filled `priority`, so `execute()` got a different value, and the journal a different
+  `argsHash`, than with compat off. The patched tool now validates with the tool's own schema, so zod
+  checks, `.default()` and `.transform()` run again. The fallback-chain path had the opposite fault: it
+  kept the zod validator verbatim, which refused the `null` the OpenAI rule tells the model to send for
+  an optional field. Both paths now read that `null` (at a key the schema does not require and does not
+  allow to be `null`) as the key left out. Both paths run the rules through one function in
+  `@gnldev/tool-schema`, `shapeToolDefinitions`. `keepToolValidation` is new and exported. The chain
+  path now also passes the model to each rule's `transform`, as the plain path always did. Separately,
+  the OpenAI rule closed every object, including a `z.record`: the model was told a map takes no keys.
+  An object declared open (`z.record`, `.catchall()`, `z.looseObject`, `additionalProperties: true`) now
+  stays open. **Who is affected:** anyone with `schemaCompat` on, or calling `applyToolCompat`
+  directly. Tool calls with invalid input now fail validation instead of running, as they do without
+  compat. A tool with `strict: true` and an open object is now refused by OpenAI at request time; declare
+  the keys with `z.object`. Apart from open objects, the schema sent for a plain model is unchanged,
+  so the model request hash of a run started before the upgrade still matches. The tool `argsHash` may
+  not: a run started on 0.9.0 with compat on, whose tool call used a `.default()`, a `.transform()` or
+  an invited `null`, hashes that call differently when it replays after the upgrade. That is a console
+  warning, or a `DivergenceError` under `replay: 'strict'`. Finish such runs before upgrading, or
+  resume them without `replay: 'strict'`.
 
 ## [0.9.0] — 2026-09-30
 

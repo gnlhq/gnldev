@@ -27,7 +27,12 @@ await runDurable({
 ## API
 - `piiRedactor(opts?)` · `moderationProcessor(opts?)` · `toolFilter(opts?)` — `piiRedactor({ redactToolResults: true })`
   also masks what a tool returned before it is journaled (off by default: tool output from an API,
-  database or file is stored as-is unless you turn this on)
+  database or file is stored as-is unless you turn this on). A string is masked as text; an object or
+  array is walked, so every string value and every key is masked while numbers stay numbers (the
+  patterns are text patterns: `phone` would read an epoch-ms timestamp as a phone). A cyclic reference
+  becomes `'[Circular]'`. A value the walk cannot finish (a throwing getter or `toJSON`) is **replaced by
+  a `[REDACTED_TOOL_RESULT: …]` marker, never journaled raw**; `redactToolResults: { skipTools: ['name'] }`
+  journals that tool's output as it returned. The audit report lists the paths it masked.
 - `tokenLimit(...)` · `promptInjectionDetector(...)` · `outputLimit(...)`
 - `piiTextRedactor(opts?) → (text: string) => string` — the same masking as `piiRedactor`, as a plain
   string function, for text that never passes through a processor at all. A `Processor` only sees

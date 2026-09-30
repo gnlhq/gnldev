@@ -197,7 +197,7 @@ describe('piiRedactor', () => {
     expect(res.output).toBe('mail [REDACTED_EMAIL]');
   });
 
-  it('redactToolResults: true — masks an object tool output via JSON.stringify→redact→parse', async () => {
+  it('redactToolResults: true — masks an object tool output (string leaves)', async () => {
     const p = piiRedactor({ redactToolResults: true });
     const res = await p.processToolResult!(
       { toolName: 't', toolCallId: 'c2', input: {}, output: { email: 'a@b.com', note: 'ok' } },
@@ -206,15 +206,16 @@ describe('piiRedactor', () => {
     expect(res.output).toEqual({ email: '[REDACTED_EMAIL]', note: 'ok' });
   });
 
-  it('redactToolResults: true — circular structure cannot be serialized, original output is untouched', async () => {
+  // This used to pin the fail-open: a circular output came back as the same object, unredacted.
+  it('redactToolResults: true — a circular structure is walked; the back-reference becomes a marker', async () => {
     const p = piiRedactor({ redactToolResults: true });
-    const circular: any = { a: 1 };
+    const circular: any = { a: 1, mail: 'a@b.com' };
     circular.self = circular;
     const res = await p.processToolResult!(
       { toolName: 't', toolCallId: 'c3', input: {}, output: circular },
       ctx,
     );
-    expect(res.output).toBe(circular);
+    expect(res.output).toEqual({ a: 1, mail: '[REDACTED_EMAIL]', self: '[Circular]' });
   });
 
   it('redactToolResults: true — does not touch number/null output', async () => {

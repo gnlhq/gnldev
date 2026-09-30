@@ -3194,20 +3194,9 @@ async function runDurableInner(args: RunDurableArgs, admission: { admitted: bool
   if (procCtx && effectiveTools) effectiveTools = await applyToolProcessors(processors!, procCtx, effectiveTools, rest);
 
   // 8.8 Tool-schema compat (opt-in): provider-specific tool-schema transformation. PURE + BEFORE the model
-  // call + BEFORE durableTools wraps it → doesn't touch the journal, argsHash/toolCallId/replay unaffected.
-  // Lazy import: if unused, @gnldev/tool-schema is never loaded (keeps the durable core thin).
-  if (schemaCompat && effectiveTools) {
-    const { applyToolCompat, defaultRules, detectModel } = await import('@gnldev/tool-schema');
-    const rules = schemaCompat === true ? defaultRules : schemaCompat;
-    // A fallback chain shapes per CANDIDATE, at the moment one is chosen, rather than once here for
-    // whichever model the proxy claims to be. Transforming here for a chain would bake in one
-    // provider's rules and hand them to whoever actually answers — and the providers genuinely
-    // disagree (OpenAI's strict mode requires `additionalProperties: false`; Gemini rejects the
-    // keyword), so no single shape serves them all. See setChainToolShaper.
-    if (!setChainToolShaper(model, (toolsJson: any[], candidate: unknown) => shapeJsonTools(toolsJson, candidate, rules as any[], detectModel))) {
-      effectiveTools = applyToolCompat(effectiveTools, model, rules);
-    }
-  }
+  // call + BEFORE durableTools wraps it → doesn't touch the journal; argsHash is unaffected because the
+  // tool still validates with its own schema (see applySchemaCompat).
+  if (schemaCompat && effectiveTools) effectiveTools = await applySchemaCompat(schemaCompat, model, effectiveTools);
 
   const stepHookFailure: StepHookFailure = {};
   const options: any = {
@@ -3438,34 +3427,31 @@ export async function resumeRun(
 }
 
 /**
- * Applies the schemaCompat rules to the AI SDK's already-converted tool list, for ONE candidate.
+ * schemaCompat for one run — shared by runDurable and streamDurable. Every schema decision is made
+ * in @gnldev/tool-schema; this only picks WHERE the rules run.
  *
- * By the time a fallback picks a model the tools have been converted, which is why the transform
- * appeared to be un-redoable. It is not: what the SDK hands `doGenerate` is
- * `[{ type, name, description, inputSchema }]` with `inputSchema` a plain JSON Schema — the exact
- * shape these rules take and return. So each candidate gets a schema built for it instead of one
- * built for whichever candidate happened to be first.
+ * A fallback chain shapes per CANDIDATE, at the moment one is chosen (`shapeToolDefinitions` on the
+ * wire), rather than once here for whichever model the proxy claims to be: providers disagree
+ * (OpenAI's strict mode requires `additionalProperties: false`; Gemini rejects the keyword), so no
+ * single shape serves a mixed chain. See setChainToolShaper. A plain model is shaped here, once.
  *
- * Copied before transforming: the rules mutate in place, and the caller's array is reused across
- * attempts, so transforming it directly would leave the second candidate reading the first's result.
+ * On both paths the tool keeps validating with its OWN schema. The two used to disagree: the plain
+ * path replaced a zod inputSchema with an unvalidated `jsonSchema(js)` (invalid input reached
+ * execute(), `.default()` never ran), and the chain path kept zod verbatim, which then refused the
+ * `null` the OpenAI rule had just told the model to send for an optional field. Lazy import: if
+ * unused, @gnldev/tool-schema is never loaded (keeps the durable core thin).
  */
-function shapeJsonTools(
-  tools: any[],
-  candidate: unknown,
-  rules: any[],
-  detectModel: (m: unknown) => any,
-): any[] {
-  const info = detectModel(candidate);
-  const active = rules.filter((r) => { try { return r.shouldApply(info); } catch { return false; } });
-  if (active.length === 0) return tools;
-  return tools.map((t) => {
-    if (!t?.inputSchema || typeof t.inputSchema !== 'object') return t;
-    let schema = structuredClone(t.inputSchema);
-    for (const r of active) {
-      try { schema = r.transform(schema) ?? schema; } catch { /* a broken rule must not break the call */ }
-    }
-    return { ...t, inputSchema: schema };
-  });
+async function applySchemaCompat(
+  schemaCompat: true | ToolSchemaRuleLike[],
+  model: unknown,
+  tools: Record<string, any>,
+): Promise<Record<string, any>> {
+  const { applyToolCompat, shapeToolDefinitions, keepToolValidation, defaultRules } = await import('@gnldev/tool-schema');
+  const rules = schemaCompat === true ? defaultRules : schemaCompat;
+  if (setChainToolShaper(model, (definitions: any[], candidate: unknown) => shapeToolDefinitions(definitions, candidate, rules))) {
+    return keepToolValidation(tools);
+  }
+  return applyToolCompat(tools, model, rules);
 }
 
 /**
@@ -3703,18 +3689,7 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
   if (procCtx && effectiveTools) effectiveTools = await applyToolProcessors(processors!, procCtx, effectiveTools, rest);
 
   // 8.8 Tool-schema compat (opt-in): see runDurableInner — pure, before the model call + before durableTools.
-  if (schemaCompat && effectiveTools) {
-    const { applyToolCompat, defaultRules, detectModel } = await import('@gnldev/tool-schema');
-    const rules = schemaCompat === true ? defaultRules : schemaCompat;
-    // A fallback chain shapes per CANDIDATE, at the moment one is chosen, rather than once here for
-    // whichever model the proxy claims to be. Transforming here for a chain would bake in one
-    // provider's rules and hand them to whoever actually answers — and the providers genuinely
-    // disagree (OpenAI's strict mode requires `additionalProperties: false`; Gemini rejects the
-    // keyword), so no single shape serves them all. See setChainToolShaper.
-    if (!setChainToolShaper(model, (toolsJson: any[], candidate: unknown) => shapeJsonTools(toolsJson, candidate, rules as any[], detectModel))) {
-      effectiveTools = applyToolCompat(effectiveTools, model, rules);
-    }
-  }
+  if (schemaCompat && effectiveTools) effectiveTools = await applySchemaCompat(schemaCompat, model, effectiveTools);
 
   const stepHookFailure: StepHookFailure = {};
   const options: any = {

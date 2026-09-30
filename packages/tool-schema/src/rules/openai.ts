@@ -3,7 +3,8 @@ import { walk, stripStringFormats } from './util.js';
 
 /**
  * OpenAI (and groq) strict / structured-output compatibility:
- * every object node gets `additionalProperties:false` + all properties become `required`, and a
+ * every object node gets `additionalProperties:false` (unless the author declared it open — a record
+ *    stays a record) + all properties become `required`, and a
  *    Property that WAS optional is widened to accept `null` so it stays optional in effect — strict
  *    Mode has no other way to express it (see `allowNull`)
  * unsupported string `format`/`pattern` → moved into the description
@@ -150,7 +151,16 @@ export const openaiStrict: ToolSchemaRule = {
       // beats one nothing can satisfy.
       const composes = Array.isArray((n as any).allOf);
       if (isObject && !composes && !inUnmergedAllOf.has(n as object)) {
-        n.additionalProperties = false;
+        // An object the author declared OPEN (`z.record`, `.catchall()`, `z.looseObject`, or
+        // `additionalProperties: true`) stays open. Closing it told the model a map takes no keys at
+        // all — measured on `z.record(z.string(), z.number())`: `additionalProperties: {type:'number'}`
+        // became `false` — while OpenAI accepts open objects on every tool that does not set
+        // `strict: true`, which is the default. Under `strict: true` OpenAI refuses the schema at
+        // request time: loud, and fixed by declaring the keys, instead of a map that silently accepts
+        // nothing.
+        const open = n.additionalProperties === true
+          || (n.additionalProperties !== null && typeof n.additionalProperties === 'object');
+        if (!open) n.additionalProperties = false;
         if (n.properties && typeof n.properties === 'object') {
           // Which keys were optional BEFORE this rule makes everything required — read first,
           // because the next statement destroys the answer.
