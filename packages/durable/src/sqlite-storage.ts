@@ -4,7 +4,7 @@
 // vectors = 'scan' (brute-force cosine; no pgvector). node:sqlite (loaded at runtime via createRequire).
 import { prefixUpperBound } from './organization.js';
 import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from './storage.js';
-import { recallPartition, recallPartitionSql } from './storage.js';
+import { memoryPartitionOf, memoryPartitionSql, type MemoryPartitionOption } from './storage.js';
 import { createRequire } from 'node:module';
 import { statSync, existsSync } from 'node:fs';
 import { cosineSimilarity } from 'ai';
@@ -999,10 +999,11 @@ class SqliteMemoryStore implements MemoryStore {
     const r = this.db.prepare('SELECT * FROM gnl_threads WHERE id = ? AND deleted_at IS NULL').get(id);
     return r ? this.rowToThread(r) : undefined;
   }
-  async listThreads(q: { resourceId?: string } & ListQuery): Promise<Page<ThreadRecord>> {
+  async listThreads(q: { resourceId?: string } & ListQuery & MemoryPartitionOption): Promise<Page<ThreadRecord>> {
     const { start, limit } = offset(q);
-    const where = q.resourceId != null ? 'deleted_at IS NULL AND resource_id = ?' : 'deleted_at IS NULL';
-    const params = q.resourceId != null ? [q.resourceId] : [];
+    const part = memoryPartitionSql(memoryPartitionOf(q), 'id', () => '?');
+    const where = `deleted_at IS NULL AND ${part.cond}${q.resourceId != null ? ' AND resource_id = ?' : ''}`;
+    const params = [...(part.params as string[]), ...(q.resourceId != null ? [q.resourceId] : [])];
     const total = (this.db.prepare(`SELECT COUNT(*) AS n FROM gnl_threads WHERE ${where}`).get(...params) as { n: number }).n;
     const rows = this.db.prepare(`SELECT * FROM gnl_threads WHERE ${where} ORDER BY updated_at DESC, id LIMIT ? OFFSET ?`)
       .all(...params, limit, start);
@@ -1153,7 +1154,7 @@ class SqliteMemoryStore implements MemoryStore {
     if (!hasNorm(query)) return [];
     let rows: any[];
     if (opts.scope === 'resource' && opts.resourceId) {
-      const part = recallPartitionSql(recallPartition(threadId), () => '?');
+      const part = memoryPartitionSql(memoryPartitionOf(opts), 't.id', () => '?');
       rows = this.db.prepare(
         `SELECT m.* FROM gnl_messages m JOIN gnl_threads t ON t.id = m.thread_id
          WHERE t.resource_id = ? AND t.deleted_at IS NULL AND ${part.cond} ORDER BY m.thread_id, m.seq`,

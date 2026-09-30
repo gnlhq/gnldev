@@ -28,12 +28,17 @@ await runDurable({ runId: 'r1', journal, model, tools: { searchPolicy }, prompt:
 - `InMemoryVectorStore` · `indexDocuments(store, embed, docs)` · `VectorStore` interface (plug in your own
   backend)
 - `ingestDocuments(store, embed, docs, chunkOptions?)` — chunk, embed and write whole documents so each
-  document's stored chunks are exactly its current ones: its old chunks (`metadata.source === id`, or
-  the bare id) are deleted in its namespace first. Use it for anything you re-index after an edit;
-  `indexDocuments` only upserts, so an edit that yields fewer chunks leaves the old tail retrievable.
+  document's stored chunks are exactly its current ones: its old chunks (by the reserved trail
+  `metadata.__gnlDoc === id`, its one-chunk id, or the 0.9.0 `<id>#<n>` + `source`/`chunk` shape) are
+  deleted in its partition first. Your own metadata — `source` included — is never used to find them.
+  Without a `namespace` on a root store, the store must declare `deleteOutsideOrganizations` (so the
+  delete cannot reach an organization's document of the same id); otherwise it is refused. Use it for
+  anything you re-index after an edit; `indexDocuments` only upserts, so an edit that yields fewer chunks leaves the old tail retrievable.
   `deleteDocuments(store, ids, { namespace? })` removes documents the same way. Both need `store.delete`.
 - `chunkDocuments(docs, opts?)` — ids `<docId>#<i>` (the bare id for a one-chunk document); every chunk
-  carries `metadata: { source: docId, chunk }`.
+  carries the trail `metadata: { __gnlDoc: docId, __gnlChunk: i }` beside your own metadata, which is
+  left as it was. `%` and `#` in a document id are escaped in chunk ids, so no document id is another's
+  chunk id.
 - `createRagTool({ store, embed, topK?, namespace?, filter?, rerank?, rerankTopK?, description? })` → AI SDK tool
 - `llmReranker({ model })` → `Reranker`
 - `SemanticMemory` — vector-based recall (memory integration). Concurrent turns on one thread keep

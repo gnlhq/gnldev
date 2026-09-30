@@ -204,23 +204,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   class with more than one turn in flight per thread. Nothing to change; a custom `Journal` without
   `putIfMatch`/`putIfAbsent` is safe within one process only, and adding those two methods makes it
   safe across processes.
+  The log is stored as a list of already-serialised parts (`{ gnlLog: 1, parts }`), so the compare is
+  between strings. The first version compared `serialize(what it read)` with the stored bytes; superjson
+  does not give an `Error` back byte-for-byte, so after one message holding an Error every compare lost
+  and the retry loop never yielded — the process froze (SQLite, measured). Retries now yield and stop
+  after `JOURNAL_LOG_MAX_ATTEMPTS` (64) with `JournalLogContentionError`. Reading is `readJournalLog(journal,
+  key)`; a 0.9.0 log (a bare array) is read as-is and converted on its next append. Measured
+  (`BasicMemory.append` × 1000, median of 10, interleaved): in-memory 1723 → 2889 ops/s, SQLite file
+  631 → 831 ops/s against 0.9.0. Way through for code that read the key with `journal.get`:
+  `readJournalLog(journal, key)`.
 - **Re-indexing an edited document no longer leaves its old chunks retrievable** (@gnldev/rag).
   `chunkDocuments` promised "re-indexing upserts to the same ids, no duplicate records"; that held only
   while the chunk count stayed the same. Measured on 0.9.0: a 5-chunk document edited to 2 chunks left
   chunks #2-#4 of the old text in search results; edited to one chunk, all five `#i` stayed beside the
-  new bare id, which carried no `source`, so nothing could find it later. New: `ingestDocuments(store,
-  embed, docs, chunkOptions?)` chunks, embeds, deletes each document's chunks in its namespace
-  (`metadata.source === id`, or the bare id), then upserts; `deleteDocuments(store, ids, { namespace? })`
-  removes documents the same way. Measured after, on the rag and durable in-memory stores, SQLite and
-  real pgvector: shrink, grow, same size, many↔one and delete all leave exactly the current chunks, and a
-  root re-ingest does not touch an organization's document of the same id. `indexDocuments` stays
-  upsert-only. Who is affected: anyone re-indexing documents that change. Way through for a store
-  without `delete`: `indexDocuments(store, embed, chunkDocuments(docs))`, as before (the error says so).
-  A document may not be called `observational-memory`, the `source` observational memory stamps on its
-  vectors (the error names the fix: another id).
-- **Breaking (0.x): a document that fits in one chunk now carries `metadata: { source, chunk: 0 }`**
-  from `chunkDocuments`, like every other chunk; it keeps its bare id. A metadata equality filter on
-  other keys is unaffected. Needed so the one-chunk version of a document can be found and removed.
+  new bare id. New: `ingestDocuments(store, embed, docs, chunkOptions?)` chunks, embeds, deletes each
+  document's chunks in its partition, then upserts; `deleteDocuments(store, ids, { namespace? })` removes
+  documents the same way. A document's chunks are found by a reserved trail (`metadata.__gnlDoc`), by
+  its one-chunk id, and — for vectors written by 0.9.0 — by the exact 0.9.0 shape (`<id>#<n>` carrying
+  `source: id, chunk: n`), so the first re-ingest after upgrading removes the old chunks too. Nothing is
+  found through the user's own metadata: `deleteDocuments(['handbook'])` no longer deletes records the
+  user labelled `source: 'handbook'`, and a document may now be called `observational-memory`. Measured
+  after, on the rag and durable in-memory stores, SQLite and real pgvector: shrink, grow, same size,
+  many↔one and delete all leave exactly the current chunks. `indexDocuments` stays upsert-only. Way
+  through for a store without `delete`: `indexDocuments(store, embed, chunkDocuments(docs))`.
+- **A root `ingestDocuments`/`deleteDocuments` no longer deletes an organization's document of the same
+  id** (@gnldev/rag). On a vector store that does not declare `deleteOutsideOrganizations`, a root
+  re-ingest of `handbook` deleted acme's `handbook` (review panel: 1 → 0). Such a call is now refused
+  before anything is embedded, written or deleted (the same rule erasure applies). Way through: give the
+  documents a `namespace`, or make the store honour `outsideOrganizations` and declare
+  `deleteOutsideOrganizations: true`. An organization's view (`withOrgStorage(...).vectors`) is unaffected.
+- **Breaking (0.x): `chunkDocuments` stamps its trail as `metadata.__gnlDoc` / `__gnlChunk`, and no longer
+  writes `source` or `chunk`.** The user's own `source` and `chunk` survive chunking; before, every chunk
+  of a multi-chunk document overwrote them. Chunk ids escape `%` and `#` in the document id (`guide#1` is
+  stored as `guide%231`), so no document's id is another's chunk id — measured before: ingesting `guide`
+  overwrote a separate document called `guide#1`. Ids without those two characters are unchanged. Way
+  through: read `metadata.__gnlDoc` where you read `metadata.source` for a chunk's document, and
+  re-ingest with `ingestDocuments` once to replace 0.9.0 chunks.
 - **`PostgresVectorStore.delete` before any write no longer creates a one-number vector table.** On a fresh
   database a `delete` created `embedding vector(1)`, and every upsert after it failed ("expected 1
   dimensions, not 3") — found through `ingestDocuments`, whose first step is a delete. It now reads the
@@ -273,14 +292,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   identity provider that returns the same user id with and without `orgId`, the unbound user's turn
   carried acme's message into the prompt — on `createRestApi` without `org`, and on the standalone chat
   door. `MemoryStore.recall` with `scope: 'resource'` filtered by resource id alone, and organization
-  rows live in the root store under `org:<id>:`. All three stores (in-memory, SQLite, Postgres) now rank
-  only the threads in the anchor thread's partition, before `topK` (`recallPartition` in
-  @gnldev/durable). This also fixes the other direction's short page: an organization's recall with
-  `topK: 1` came back empty when another organization's row scored higher, because the org view
-  filtered after the store had picked. Who is affected: anyone serving root-scope and organization users
-  from one store. Way through, for a caller that wants one organization's threads from the root:
-  `withOrgStorage(storage, orgId).memory.recall(...)`. Custom `MemoryStore` adapters should apply
-  `inRecallPartition` in their resource branch.
+  rows live in the root store under `org:<id>:`. The partition of a memory scan now comes from the
+  store object the caller holds, never from a thread id: a store's own `recall` and `listThreads` cover
+  the root's rows only, and `withOrgStorage`'s view asks for its organization through a code-only option
+  (`MEMORY_PARTITION`, a Symbol key no request body can carry). A first version read the partition off
+  the anchor thread id, so a root user who named its thread `org:acme:fresh` got acme's secret again
+  (review panel, through REST). Also: the root store's `listThreads` no longer lists `org:*` threads,
+  and an organization's recall with `topK: 1` no longer comes back empty when another organization's row
+  scored higher. Who is affected: anyone serving root-scope and organization users from one store, and
+  root Studio/tooling that listed every organization's threads — list them through
+  `withOrgStorage(storage, orgId)`. Custom `MemoryStore` adapters apply `memoryPartitionOf(opts)` /
+  `inMemoryPartition` in `recall`'s resource branch and in `listThreads`.
+- **Breaking (0.x): the root scope can no longer name a thread whose id starts with `org:`.** Such an id
+  is an organization's physical thread id: served, `org:acme:t` read acme's thread and `org:acme:new`
+  created a root user's conversation inside acme. A root-scope `AgentMemory` throws
+  `ReservedThreadIdError` for it on every thread method, and `createRestApi` answers `400
+  thread_id_reserved` before anything runs (the standalone chat and AG-UI doors fail closed through the
+  memory). An organization's memory is unaffected: its view prefixes every id. Way through: use a thread
+  id that does not start with `org:`, or work inside the organization with `withOrgStorage(storage,
+  orgId)`.
 - **Root observational memory no longer ranks by an organization's observation vectors.**
   `AgentMemory.recallObservationsSemantic` on a root memory queried every namespace; an organization's
   vector for a thread with the same bare id carried the same per-thread `obsId` (`obs-0`) and answered

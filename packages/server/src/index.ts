@@ -3,7 +3,7 @@
 import { Hono, type Context } from 'hono';
 import { toFetchHandler, type FetchHandler } from './handler.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, cancelAgentRun, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext } from '@gnldev/durable';
+import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, cancelAgentRun, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, isOrganizationThreadId, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext } from '@gnldev/durable';
 import type { CreateGnlConfig, Journal, JournalReader, BudgetLimit, UsageCostCache, RunLimits, ResolvedWorkIdentity, WorkScopeKind, StreamSurface as DurableStreamSurface, StreamSurfaceInput } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, callerKind, subjectIdProblem, actorIdOf, engineCallerOf, markRefusal, settleDecision, decisionNotRecorded, type AuthProvider, type ReadWriteAuth, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
 // P0.4 @gnldev/workflow is zero-dependency (see its package.json) — depending on it
@@ -949,12 +949,31 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
    * refuse every new conversation. Same permissiveness as the read route, same wording on refusal:
    * it reveals neither the real owner nor whether the thread exists.
    */
+  /**
+   * A root-scope request that names a thread in the organizations' reserved space (`org:`), refused
+   * before anything reads or writes it — for every caller kind, since the root scope cannot name an
+   * organization's rows whoever asks (ADR-0001). The id is the client's to choose, and organization
+   * threads sit in the root store as `org:<id>:<threadId>`: served, `org:acme:t` would read acme's
+   * thread, and `org:acme:fresh` would put a root user's conversation inside acme. An organization's
+   * request is not checked: its view prefixes whatever id it sends. The root-scope `AgentMemory`
+   * refuses the same ids (`ReservedThreadIdError`); this is the door's clean 400 in front of it.
+   */
+  function reservedThreadRefused(c: Context, s: Instance, threadId: unknown): Response | undefined {
+    if (s.orgId !== undefined || typeof threadId !== 'string' || !isOrganizationThreadId(threadId)) return undefined;
+    return c.json({
+      error: `thread id '${threadId}' starts with 'org:', which is reserved for organizations' threads; use a thread id that does not start with 'org:'`,
+      code: EDGE_ERROR_CODES.threadIdReserved,
+      detail: { threadId },
+    }, 400);
+  }
+
   async function threadOwnershipDenied(
     c: Context,
     s: Instance,
     threadId: unknown,
     subject: string | undefined,
   ): Promise<Response | undefined> {
+    { const reserved = reservedThreadRefused(c, s, threadId); if (reserved) return reserved; }
     if (typeof threadId !== 'string' || !threadId || !subject) return undefined;
     const raw = rawOf(s);
     // The thread's owner RECORD, asked the way every door asks it (@gnldev/durable `threadOwnerOf`):
@@ -2375,6 +2394,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     if (!memory?.getMessages) return c.json([]);
     { const denied = clientSubjectDenied(c); if (denied) return denied; }
     const threadId = decodeURIComponent(c.req.param('id'));
+    { const reserved = reservedThreadRefused(c, s, threadId); if (reserved) return reserved; }
     // STRICT: beklenti çağıranın BEYANI değil KİMLİĞİ. Beyan tek başına bir kontrol değildir —
     // saldırgan kurbanın adını yazınca eşleşme sağlanıyordu, yani kapı kendi anahtarını dağıtıyordu.
     const expected = boundSubjectOf(c) ?? c.req.query('resourceId');

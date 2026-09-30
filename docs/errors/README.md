@@ -98,6 +98,7 @@ Refusals the route layer makes on its own, before or around the run — `EDGE_ER
 | [`a2a_timestamp_invalid`](./a2a_timestamp_invalid.md) | 401 | Outside the ±300s replay window — usually clock skew. |
 | [`a2a_signature_invalid`](./a2a_signature_invalid.md) | 401 | The HMAC did not verify over the bytes received. |
 | [`body_consumed_upstream`](./body_consumed_upstream.md) | 500 | A body parser mounted ahead of the handler drained the request. |
+| [`thread_id_reserved`](./thread_id_reserved.md) | 400 | A root-scope request named a thread under `org:`, the organizations' reserved id space. |
 
 ## The decision record — `@gnldev/auth`
 

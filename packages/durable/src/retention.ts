@@ -5,7 +5,7 @@
 import { runKeys, summarizeRun, nestedAgentRunId, runIdOfKey } from './journal.js';
 import { identityOnlyInput } from './run.js';
 import { workKeyHash } from './hash.js';
-import { MEM_LEAVES, OM_LEAVES } from './memory.js';
+import { MEM_LEAVES, OM_LEAVES, readJournalLog } from './memory.js';
 import type { Memory } from './memory.js';
 import { threadOwnerOf, threadOwnerKey } from './thread-owner.js';
 import type { WorkScopeKind } from './hash.js';
@@ -455,13 +455,13 @@ function xidShape(rest: string, value: unknown): 'own' | 'foreign' {
  * deleted. A store that does not know the flag reads `{ owner, outsideOrganizations: true }` as "the
  * owner everywhere" and takes the same id's documents in every organization — other people.
  */
-export function assertDeletesOutsideOrganizations(vectors: Pick<VectorStore, 'deleteOutsideOrganizations'>, who: string): void {
+export function assertDeletesOutsideOrganizations(vectors: Pick<VectorStore, 'deleteOutsideOrganizations'>, who: string, orElse?: string): void {
   if (vectors.deleteOutsideOrganizations === true) return;
   throw new Error(
-    `${who} was asked to erase documents outside organizations only (outsideOrganizations), but the vector store ` +
+    `${who} was asked to delete documents outside organizations only (outsideOrganizations), but the vector store ` +
       'does not declare deleteOutsideOrganizations. Nothing was deleted: an adapter that ignores the flag would also ' +
-      'delete this person\'s namesakes in every organization. Make the adapter honour ' +
-      'VectorDeleteWhere.outsideOrganizations and set deleteOutsideOrganizations: true.',
+      'delete the same documents inside every organization — other people\'s. Make the adapter honour ' +
+      'VectorDeleteWhere.outsideOrganizations and set deleteOutsideOrganizations: true.' + (orElse ? ` ${orElse}` : ''),
   );
 }
 
@@ -1260,7 +1260,7 @@ export async function sweepThreads(journal: Journal, opts: ThreadSweepOptions): 
   const result: ThreadSweepResult = { scanned: 0, purged: [], keptNoTs: 0, orphanThreadState: [] };
   for (const threadId of threadIds) {
     result.scanned++;
-    const messages = (await journal.get<any[]>(`${MEM_PREFIX}${threadId}:messages`)) ?? [];
+    const messages = await readJournalLog<any>(journal, `${MEM_PREFIX}${threadId}:messages`);
     const stamps = messages.map(readMessageTs).filter((t): t is number => t !== undefined);
     if (stamps.length === 0) {
       result.keptNoTs++; // age can't be measured → safe side: preserve

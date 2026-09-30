@@ -10,7 +10,7 @@
 // in-process queue, and a compare-and-set (`putIfAbsent`/`putIfMatch`) so a second PROCESS cannot
 // erase a write either (the cross-process proof is in multi-process-race.test.ts).
 import { describe, it, expect } from 'vitest';
-import { BasicMemory, InMemoryJournal, appendToJournalLog, withOrg, type Journal } from '../src/index.js';
+import { BasicMemory, InMemoryJournal, appendToJournalLog, readJournalLog, withOrg, type Journal } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 
 const journals: [string, () => Journal][] = [
@@ -76,6 +76,6 @@ describe('appendToJournalLog without compare-and-set', () => {
     const inner = new InMemoryJournal();
     const j = slowGet({ get: (k) => inner.get(k), put: (k, v) => inner.put(k, v) });
     await Promise.all(Array.from({ length: 10 }, (_, i) => appendToJournalLog(j, 'log', [i])));
-    expect(await j.get<number[]>('log')).toHaveLength(10);
+    expect(await readJournalLog(j, 'log')).toHaveLength(10);
   });
 });

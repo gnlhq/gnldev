@@ -1,6 +1,6 @@
 // Chunking helpers — the common `document.chunk()` shape (code-first, class-free).
 // `chunkText` splits raw text into chunks; `chunkDocuments` splits VectorDocs and produces a new
-// VectorDoc list ready for `indexDocuments` (id: `<source>#<i>`, metadata inherited + source trail).
+// VectorDoc list ready for `indexDocuments` (id: `<docId>#<i>`, metadata inherited + a reserved `__gnlDoc` trail).
 // Strategies:
 // 'recursive' (default): splits preferring paragraph → line → sentence → word boundaries
 //     (the general-purpose strategy with the highest semantic coherence).
@@ -126,31 +126,53 @@ export function chunkText(text: string, opts?: ChunkOptions): Chunk[] {
 }
 
 /**
+ * The metadata keys a chunk carries to say which document it belongs to, and where in it.
+ *
+ * Reserved, so they never share a key with the user's own metadata. The trail used to be
+ * `source`/`chunk`, which is also what people call their own provenance field: every chunk of a
+ * document overwrote the user's `source`, and deleting the document `handbook` deleted every record
+ * the user had labelled `source: 'handbook'` — records that were never chunks at all.
+ */
+export const DOC_TRAIL_KEY = '__gnlDoc';
+export const CHUNK_TRAIL_KEY = '__gnlChunk';
+
+/**
+ * A document id as it appears inside a vector id: `%` and `#` escaped, so a document's own id never
+ * contains `#`. A chunk id is `<escaped>#<i>`, and the one-chunk form is `<escaped>` alone — so no
+ * document's id is another's chunk id. Without the escape, a document named `guide#1` was stored
+ * under the id of `guide`'s second chunk, and ingesting either one overwrote or deleted the other.
+ * An id with neither character is unchanged.
+ */
+export function documentIdPart(docId: string): string {
+  return docId.replace(/%/g, '%25').replace(/#/g, '%23');
+}
+
+/**
  * Split documents → VectorDoc list ready for `indexDocuments`. Chunk id is `<docId>#<i>`, or the
- * document's own id when it fits in one chunk. Metadata is inherited + a `{ source, chunk }` trail is
- * added to EVERY chunk (and a `heading` breadcrumb in markdown); `namespace`, `owner` and `shared` are
- * inherited as they are.
+ * document's own id when it fits in one chunk, with `%`/`#` in the document id escaped (see
+ * `documentIdPart`). Every chunk carries the trail `{ __gnlDoc: docId, __gnlChunk: i }` beside the
+ * document's own metadata, which is left as it was (and a `heading` breadcrumb in markdown);
+ * `namespace`, `owner` and `shared` are inherited as they are.
  *
  * Deterministic ids do NOT make re-indexing an edited document safe on their own: when the new text
  * yields fewer chunks, `indexDocuments` (upsert) leaves the old tail chunks in place. Use
- * `ingestDocuments`, which removes a document's chunks by `source` before writing its new ones. That is
- * also why the single-chunk case carries `source` now: without it, a one-chunk version could not be
- * found and removed when the document grew again.
+ * `ingestDocuments`, which removes a document's chunks by their trail before writing its new ones.
  */
 export function chunkDocuments(docs: VectorDoc[], opts?: ChunkOptions): VectorDoc[] {
   const out: VectorDoc[] = [];
   for (const doc of docs) {
     const chunks = chunkText(doc.text, opts);
+    const idPart = documentIdPart(doc.id);
     if (chunks.length <= 1) {
-      // Not split → the document's own id and text (no pointless #0 derivation), with the trail.
-      out.push({ ...doc, metadata: { ...doc.metadata, source: doc.id, chunk: 0 } });
+      // Not split → the document's own text, under its own (escaped) id, with the trail.
+      out.push({ ...doc, id: idPart, metadata: { ...doc.metadata, [DOC_TRAIL_KEY]: doc.id, [CHUNK_TRAIL_KEY]: 0 } });
       continue;
     }
     chunks.forEach((c, i) => {
       out.push({
-        id: `${doc.id}#${i}`,
+        id: `${idPart}#${i}`,
         text: c.text,
-        metadata: { ...doc.metadata, source: doc.id, chunk: i, ...(c.heading ? { heading: c.heading } : {}) },
+        metadata: { ...doc.metadata, ...(c.heading ? { heading: c.heading } : {}), [DOC_TRAIL_KEY]: doc.id, [CHUNK_TRAIL_KEY]: i },
         // Who may read a chunk is who may read its document. Dropping these put every chunk of an
         // organization's document in the un-namespaced partition, and every chunk of a user's own
         // document out of that user's reach.

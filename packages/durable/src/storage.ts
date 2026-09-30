@@ -144,49 +144,87 @@ export interface RecallOptions {
   filter?: Record<string, unknown>;
   scope?: 'thread' | 'resource';
   resourceId?: string;
+  /** Code-only: set by an organization's view. See `MEMORY_PARTITION`. */
+  readonly [MEMORY_PARTITION]?: string;
 }
 
 /**
- * Which threads a resource-scoped `recall` anchored on `threadId` may rank: the anchor's partition.
+ * The partition a memory SCAN covers — a resource-scoped `recall`, a `listThreads` — named by WHO IS
+ * ASKING, never by an argument the request supplies.
  *
  * Organization rows live physically in the root store under `org:<id>:` (`withOrgStorage`), and a
- * resource id is not unique across partitions. So the partition comes from the ANCHOR, the one id
- * that says which scope is asking:
+ * resource id is not unique across partitions. The first fix took the partition from the anchor
+ * thread id: an id under `org:acme:` ranked acme's threads. But a thread id is the client's to choose,
+ * so a root caller who named its thread `org:acme:fresh` recalled acme's rows (measured through REST:
+ * acme's secret in the root user's prompt), and `listThreads({ resourceId })` on the root store simply
+ * listed them.
  *
- *   - `root` — an anchor with no organization prefix: every thread NOT under `org:`.
- *   - `org`  — an anchor under `org:<id>:`: the threads under that same `prefix`.
- *   - `only` — an anchor that starts with `org:` but names no organization (`org:x`, which
- *              `withOrgStorage` never writes): the anchor thread alone, since no partition can be named.
- *
- * One function for the three adapters, so the rule cannot drift between them the way the filter
- * matcher once did.
+ * So: a store's own methods cover the ROOT's rows — every thread outside `org:`. An organization's
+ * view (`withOrgStorage`) asks for its partition by passing `[MEMORY_PARTITION]: 'org:<id>:'` in the
+ * options. The key is a Symbol: code holding the view can pass it; a request body (JSON) cannot.
+ * ADR-0001: "In the root scope, every organization's rows are hidden."
  */
-export type RecallPartition = { kind: 'root' } | { kind: 'org'; prefix: string } | { kind: 'only'; threadId: string };
-const ORG_THREAD_PREFIX = 'org:';
-export function recallPartition(threadId: string): RecallPartition {
-  if (!threadId.startsWith(ORG_THREAD_PREFIX)) return { kind: 'root' };
-  const end = threadId.indexOf(':', ORG_THREAD_PREFIX.length);
-  return end > ORG_THREAD_PREFIX.length ? { kind: 'org', prefix: threadId.slice(0, end + 1) } : { kind: 'only', threadId };
+export const MEMORY_PARTITION: unique symbol = Symbol.for('@gnldev/durable.memoryPartition');
+/** The code-only option an organization's view adds to a memory scan. See `MEMORY_PARTITION`. */
+export interface MemoryPartitionOption {
+  readonly [MEMORY_PARTITION]?: string;
 }
-/** Whether thread `candidate` is inside `partition` — the in-process twin of the SQL adapters' condition. */
-export function inRecallPartition(partition: RecallPartition, candidate: string): boolean {
-  switch (partition.kind) {
-    case 'root': return !candidate.startsWith(ORG_THREAD_PREFIX);
-    case 'org': return candidate.startsWith(partition.prefix);
-    case 'only': return candidate === partition.threadId;
+export type MemoryPartition = { kind: 'root' } | { kind: 'org'; prefix: string };
+
+/** The prefix every organization's memory rows carry in the root store. */
+export const ORG_THREAD_PREFIX = 'org:';
+/** Whether `threadId` is in the organizations' reserved space — a thread the root scope can never name. */
+export function isOrganizationThreadId(threadId: string): boolean {
+  return threadId.startsWith(ORG_THREAD_PREFIX);
+}
+
+/**
+ * A root-scope caller named a thread in the organizations' reserved space. Thrown by a root-scope
+ * `AgentMemory` (and refused as `thread_id_reserved` by the REST door): such an id is an
+ * organization's physical thread id, and a root caller that could use it would read that thread, or
+ * write a thread INTO that organization's partition.
+ */
+export class ReservedThreadIdError extends Error {
+  constructor(readonly threadId: string) {
+    super(
+      `@gnldev/durable: thread id '${threadId}' starts with '${ORG_THREAD_PREFIX}', the space organizations' threads live in, ` +
+        'and this memory is the root scope\'s, which cannot name them. Use a thread id that does not start with ' +
+        `'${ORG_THREAD_PREFIX}'; to work inside an organization, build the memory over withOrgStorage(storage, orgId).`,
+    );
+    this.name = 'ReservedThreadIdError';
   }
+}
+/** Refuses a thread id a root-scope caller may not name. See `ReservedThreadIdError`. */
+export function assertRootThreadId(threadId: string): string {
+  if (isOrganizationThreadId(threadId)) throw new ReservedThreadIdError(threadId);
+  return threadId;
+}
+
+/** The partition a scan's options name: the root's unless an organization's view set `MEMORY_PARTITION`. */
+export function memoryPartitionOf(opts: MemoryPartitionOption | undefined): MemoryPartition {
+  const prefix = opts?.[MEMORY_PARTITION];
+  if (prefix === undefined) return { kind: 'root' };
+  // Written only by withOrgStorage, from a validated orgId. Anything else is a bug worth stopping on,
+  // not a reason to widen the scan.
+  if (typeof prefix !== 'string' || !/^org:[^:]+:$/.test(prefix)) {
+    throw new Error(`@gnldev/durable: invalid memory partition '${String(prefix)}' — expected 'org:<id>:'`);
+  }
+  return { kind: 'org', prefix };
+}
+/** Whether thread `id` is inside `partition` — the in-process twin of the SQL adapters' condition. */
+export function inMemoryPartition(partition: MemoryPartition, id: string): boolean {
+  return partition.kind === 'root' ? !isOrganizationThreadId(id) : id.startsWith(partition.prefix);
 }
 /**
- * The SQL condition on `t.id` for `partition`, for the two SQL adapters. `substr` rather than LIKE: an
- * organization id may contain `_` or `%`, which LIKE reads as wildcards. `ph(n)` renders the n-th
- * extra placeholder in the adapter's own syntax (`?` or `$k`).
+ * The SQL condition on thread-id column `col` for `partition`, for the two SQL adapters. A prefix
+ * compare rather than LIKE: an organization id may contain `_` or `%`, which LIKE reads as wildcards
+ * (and SQLite's LIKE ignores case, so `org:ACME:` would match `org:acme:`). The length is the
+ * prefix's own, a number, so it is written into the statement. `ph()` renders the next placeholder in
+ * the adapter's syntax (`?` or `$k`); `params` fill them in order.
  */
-export function recallPartitionSql(partition: RecallPartition, ph: (n: number) => string): { cond: string; params: unknown[] } {
-  switch (partition.kind) {
-    case 'root': return { cond: `substr(t.id, 1, 4) <> 'org:'`, params: [] };
-    case 'org': return { cond: `substr(t.id, 1, ${ph(0)}) = ${ph(1)}`, params: [partition.prefix.length, partition.prefix] };
-    case 'only': return { cond: `t.id = ${ph(0)}`, params: [partition.threadId] };
-  }
+export function memoryPartitionSql(partition: MemoryPartition, col: string, ph: () => string): { cond: string; params: unknown[] } {
+  if (partition.kind === 'root') return { cond: `substring(${col}, 1, ${ORG_THREAD_PREFIX.length}) <> '${ORG_THREAD_PREFIX}'`, params: [] };
+  return { cond: `substring(${col}, 1, ${partition.prefix.length}) = ${ph()}`, params: [partition.prefix] };
 }
 
 /**
@@ -301,7 +339,11 @@ export interface MemoryStore {
   upsertThread(rec: ThreadRecord): Promise<void>;
   getThread(id: string): Promise<ThreadRecord | undefined>;
   /** If resourceId is given, that user's threads; otherwise global (studio). PAGINATED. */
-  listThreads(q: { resourceId?: string } & ListQuery): Promise<Page<ThreadRecord>>;
+  /**
+   * Threads, newest first — in the caller's partition only, like `recall`: the root store lists no
+   * organization's thread, and an organization's view lists its own (`MEMORY_PARTITION`).
+   */
+  listThreads(q: { resourceId?: string } & ListQuery & MemoryPartitionOption): Promise<Page<ThreadRecord>>;
   /**
    * The thread, its messages, observations, batch markers and its thread-scoped working memory
    * (`workingMemoryScope.thread(id)`, and the 0.6 key `legacyWorkingMemoryScope.thread(id)` when there is one).
@@ -355,12 +397,13 @@ export interface MemoryStore {
   /**
    * Vector recall (thread or resource scope).
    *
-   * `scope: 'resource'` ranks the user's threads IN THE ANCHOR THREAD'S PARTITION only — see
-   * `recallPartition`. A resource id names a user of one scope: `u-1` in the root and `u-1` in
-   * organization acme are two people, and the root's recall must not return `org:acme:` rows (ADR-0001:
-   * "In the root scope, every organization's rows are hidden"). The partition is applied BEFORE `topK`,
-   * so a foreign row can never take a slot. To search one organization's threads, recall through that
-   * organization's view: `withOrgStorage(storage, orgId).memory.recall(...)`.
+   * `scope: 'resource'` ranks the user's threads in the CALLER'S partition only — the root's, or the
+   * organization's whose view is asking (`MEMORY_PARTITION`) — never one derived from `threadId`. A
+   * resource id names a user of one scope: `u-1` in the root and `u-1` in organization acme are two
+   * people, and the root's recall must not return `org:acme:` rows (ADR-0001: "In the root scope, every
+   * organization's rows are hidden"). The partition is applied BEFORE `topK`, so a foreign row can never
+   * take a slot. To search one organization's threads, recall through that organization's view:
+   * `withOrgStorage(storage, orgId).memory.recall(...)`.
    */
   recall(threadId: string, queryEmbedding: number[], opts: RecallOptions): Promise<MessageRecord[]>;
 

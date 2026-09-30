@@ -5,7 +5,7 @@
 // loadContext runs BEFORE persistInput, so the whole context freezes into `:input` = replayable.
 import { cosineSimilarity } from 'ai';
 import { requireCapability, durableProcessorStep, workingMemoryScope, OM_LEAVES, OM_VECTOR_SOURCE, type OmLeaf } from '@gnldev/durable';
-import { threadOwnerOf, toJournal, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, type Memory } from '@gnldev/durable';
+import { threadOwnerOf, toJournal, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, assertRootThreadId, type Memory } from '@gnldev/durable';
 import { PROVENANCE_RECENT_CAP, messagePreview } from '@gnldev/durable';
 import type { Storage, RunJournal, MemoryStore, MessageRecord, MessageAppend, ThreadRecord, RecallOptions, MemoryContextProvenance, RecalledMessageRef } from '@gnldev/durable';
 import { messageText, hasNorm, type Embed } from './keys.js';
@@ -118,6 +118,19 @@ export class AgentMemory {
     this.om = config.observationalMemory;
     this.titleGen = config.generateTitle;
     this.omVectorNs = omVectorNamespace(config.storage, this.om?.omVectors?.store);
+    this.rootScope = orgStorageScopeOf(config.storage) === undefined;
+  }
+
+  /**
+   * Whether this memory is the ROOT scope's — built over the root storage rather than an
+   * organization's view. The root store physically holds every organization's threads as
+   * `org:<id>:<threadId>`, so a root memory that accepted such an id would read that organization's
+   * thread by name, or create one inside its partition. Every method that takes a thread id passes it
+   * through `scoped` first. An organization's memory needs no check: its view prefixes every id.
+   */
+  private readonly rootScope: boolean;
+  private scoped(threadId: string): string {
+    return this.rootScope ? assertRootThreadId(threadId) : threadId;
   }
 
   /**
@@ -154,6 +167,7 @@ export class AgentMemory {
    * provider: 8 concurrent writers went from 44ms to 1624ms when the embed sat inside the lock.
    */
   async append(threadId: string, messages: any[]): Promise<void> {
+    this.scoped(threadId);
     const rows: MessageAppend[] = [];
     for (const message of messages) {
       const text = messageText(message);
@@ -305,6 +319,7 @@ export class AgentMemory {
    * lock for a network round trip per message.
    */
   async appendOnce(threadId: string, messages: any[], batchKey: string): Promise<boolean> {
+    this.scoped(threadId);
     if (!this.store.appendMessagesOnce) { await this.append(threadId, messages); return true; }
     const rows: MessageAppend[] = [];
     for (const message of messages) {
@@ -317,6 +332,7 @@ export class AgentMemory {
 
   /** Track 1: last N + query-based topK recall. */
   async getMessages(threadId: string, opts?: { query?: string; resourceId?: string; scope?: 'thread' | 'resource' }): Promise<any[]> {
+    this.scoped(threadId);
     return (await this.composeTrack1(threadId, opts)).messages;
   }
 
@@ -423,6 +439,7 @@ export class AgentMemory {
    * observations with a truncated history is out of scope here.
    */
   async truncateMessagesAfter(threadId: string, afterIndex: number): Promise<number | null> {
+    this.scoped(threadId);
     const del = this.store.deleteMessagesAfter;
     if (!del) return null;
     if (afterIndex === -1) return del.call(this.store, threadId, -1);
@@ -436,6 +453,7 @@ export class AgentMemory {
 
   /** Rich context hook (run.ts feature-detects it). */
   async loadContext(threadId: string, opts: { query?: string; resourceId?: string; incoming?: any[] }): Promise<LoadedContext> {
+    this.scoped(threadId);
     if (opts.resourceId) {
       const fu = (opts.incoming ?? []).find((m: any) => m?.role === 'user');
       await this.ensureThreadIndexed(threadId, opts.resourceId, fu ? messageText(fu) : undefined);
@@ -533,6 +551,7 @@ export class AgentMemory {
 
   /** Public compaction — callable from an async buffering worker. */
   async compact(threadId: string): Promise<void> {
+    this.scoped(threadId);
     return this.compactIfNeeded(threadId);
   }
 
@@ -625,6 +644,7 @@ export class AgentMemory {
    * carries `fromSeq`/`toSeq`/`threadId` — pre-P2 records won't). Empty/blank query → `[]`.
    */
   async recallObservations(threadId: string, query: string): Promise<OmRecallMatch[]> {
+    this.scoped(threadId);
     const q = query.trim().toLowerCase();
     if (!q) return [];
     const obs: Observation[] = await this.store.getObservations(threadId);
@@ -655,6 +675,7 @@ export class AgentMemory {
    * indexing) is silently skipped rather than fabricating a partial match.
    */
   async recallObservationsSemantic(threadId: string, query: string, opts?: { topK?: number; threshold?: number }): Promise<OmRecallMatch[]> {
+    this.scoped(threadId);
     const q = query.trim();
     if (!q) return [];
     if (!this.om?.omVectors) return this.recallObservations(threadId, query); // v1 fallback (documented — no behavior change)
@@ -691,6 +712,7 @@ export class AgentMemory {
    * follow-up if this becomes a hot path on long threads.
    */
   async expandObservation(threadId: string, fromSeq: number, toSeq: number): Promise<unknown[]> {
+    this.scoped(threadId);
     const all = await this.allMessages(threadId);
     return all.filter((m) => m.seq >= fromSeq && m.seq <= toSeq).map((m) => m.message);
   }
@@ -738,6 +760,7 @@ export class AgentMemory {
   }
 
   async applyWorkingMemoryUpdate(threadId: string, patch: any, resourceId?: string): Promise<Record<string, unknown>> {
+    this.scoped(threadId);
     const key = this.wmKey(threadId, resourceId);
     return this.withWmLock(key, async () => {
       const merged = deepMerge(await this.readWM(threadId, resourceId), patch);
@@ -747,26 +770,30 @@ export class AgentMemory {
   }
   /** The THREAD's working memory — never a person's, whatever the thread is called. */
   async getWorkingMemory(threadId: string): Promise<string | undefined> {
+    this.scoped(threadId);
     const data = await this.store.getWorkingMemory(workingMemoryScope.thread(threadId));
     if (data === undefined) return undefined;
     return typeof data === 'string' ? data : JSON.stringify(data);
   }
   async setWorkingMemory(threadId: string, value: string): Promise<void> {
+    this.scoped(threadId);
     await this.store.setWorkingMemory(workingMemoryScope.thread(threadId), value);
   }
 
   // ── Track 3: thread + resource management ─────────────────────────────────────
   async getThreadResource(threadId: string): Promise<string | undefined> {
+    this.scoped(threadId);
     return (await this.store.getThread(threadId))?.resourceId;
   }
   async createThread(input: { id?: string; resourceId: string; title?: string; metadata?: Record<string, unknown> }): Promise<ThreadRecord> {
-    const id = input.id ?? genId('th');
+    const id = this.scoped(input.id ?? genId('th'));
     const now = Date.now();
     const rec: ThreadRecord = { id, resourceId: input.resourceId, title: input.title, metadata: input.metadata, createdAt: now, updatedAt: now };
     await this.store.upsertThread(rec);
     return rec;
   }
   async getThreadById(threadId: string): Promise<ThreadRecord | undefined> {
+    this.scoped(threadId);
     return this.store.getThread(threadId);
   }
   /** A resource's threads (createdAt ASC — parity). */
@@ -781,6 +808,7 @@ export class AgentMemory {
       .sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id));
   }
   async updateThread(threadId: string, patch: { title?: string; metadata?: Record<string, unknown> }): Promise<ThreadRecord> {
+    this.scoped(threadId);
     const rec = await this.store.getThread(threadId);
     if (!rec) throw new Error(`thread '${threadId}' does not exist`);
     const next: ThreadRecord = { ...rec, ...patch, updatedAt: Date.now() };
@@ -788,10 +816,13 @@ export class AgentMemory {
     return next;
   }
   async deleteThread(threadId: string): Promise<void> {
+    this.scoped(threadId);
     await this.store.deleteThread(threadId);
   }
   /** COPY a thread (messages/WM/OM) into a new thread (common thread-clone semantics + ancestry). */
   async cloneThread(srcThreadId: string, opts: { newThreadId?: string; resourceId?: string } = {}): Promise<ThreadRecord> {
+    this.scoped(srcThreadId);
+    if (opts.newThreadId !== undefined) this.scoped(opts.newThreadId);
     const src = await this.store.getThread(srcThreadId);
     const resourceId = opts.resourceId ?? src?.resourceId ?? 'default';
     const dst = opts.newThreadId ?? genId('th');

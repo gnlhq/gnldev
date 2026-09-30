@@ -147,23 +147,6 @@ describe('a store that cannot delete', () => {
   });
 });
 
-describe('the one id ingest refuses', () => {
-  it('observational memory\'s `source` label, with the way through named', async () => {
-    const store = new InMemoryVectorStore();
-    await store.upsert([{ id: 'om:t:0:0', text: 'an observation', metadata: { source: 'observational-memory' }, embedding: [1, 1, 1] }]);
-    await expect(ingestDocuments(store, embed, [{ id: 'observational-memory', text: 'x' }])).rejects.toThrow(/Give the document another id/);
-    await ingestDocuments(store, embed, [{ id: 'observational-memory-notes', text: 'x' }]);
-    expect((await texts(store)).sort()).toEqual(['an observation', 'x']);
-  });
-});
-
-describe('chunkDocuments stamps `source` on every chunk', () => {
-  it('a document that fits in one chunk keeps its id and gains the trail', () => {
-    const [only] = chunkDocuments([{ id: 'doc', text: 'short', metadata: { lang: 'en' } }]);
-    expect(only).toEqual({ id: 'doc', text: 'short', metadata: { lang: 'en', source: 'doc', chunk: 0 } });
-  });
-});
-
 describe.skipIf(!PGV)('PostgresVectorStore delete before any write (real pgvector)', () => {
   it('does not create the table at dimension 1, so the first ingest on a fresh database works', async () => {
     const s = new PostgresVectorStore({ connectionString: PGV!, table: `gnl_ingest_fresh_${process.pid}_${Date.now()}` });

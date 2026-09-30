@@ -1,5 +1,6 @@
 import type { Journal } from './journal.js';
 import { assertThreadId } from './journal.js';
+import { serialize, deserialize } from './serialize.js';
 
 // Conversation (thread) + working memory. Journal-backed → durable & replayable by construction.
 // (Rich memory like semantic recall / observational memory lives in a separate @gnldev/memory package in the future.)
@@ -214,22 +215,79 @@ export function memKey(threadId: string, leaf: MemLeaf): string {
 const logQueues = new WeakMap<object, Map<string, Promise<void>>>();
 
 /**
- * Appends `entries` to the array stored at `key`, losing nothing to a concurrent append.
+ * How a journal log is stored: a list of parts, each one append's entries ALREADY serialised.
+ *
+ * Why strings: the cross-process half of `appendToJournalLog` is a compare-and-set, and a journal's
+ * compare is "is the stored value the serialised form of `expected`?". With the entries stored as
+ * values, `expected` was the log as READ — deserialised — and serialising it again had to produce the
+ * stored bytes exactly. superjson does not promise that: an `Error` comes back with `cause:
+ * undefined` the second time. The compare then lost on every round, the loop never yielded, and the
+ * process froze (measured: `timeout 40` exit 124 on SQLite). Strings and numbers survive every
+ * adapter's round trip unchanged, so the compare now holds by construction, whatever a message holds.
+ *
+ * It is also the cheaper shape: an append no longer rebuilds every earlier message as objects just
+ * to write them back — the earlier parts pass through as strings, and only a read decodes them.
+ *
+ * `gnlLog` marks the shape (a 0.9.0 log is a bare array, read as one part — see `readJournalLog`).
+ */
+interface JournalLogValue { gnlLog: 1; parts: string[] }
+
+function isLogValue(v: unknown): v is JournalLogValue {
+  return typeof v === 'object' && v !== null && (v as JournalLogValue).gnlLog === 1 && Array.isArray((v as JournalLogValue).parts);
+}
+
+/**
+ * A compare that keeps losing. Each lost round means another writer's append landed, so a long run of
+ * them is either a very hot key or a store whose compare can never succeed; in both cases a named
+ * failure beats spinning. `appendToJournalLog` gives up after `JOURNAL_LOG_MAX_ATTEMPTS`.
+ */
+export class JournalLogContentionError extends Error {
+  constructor(readonly key: string, readonly attempts: number) {
+    super(
+      `@gnldev/durable: the append to '${key}' lost its compare-and-set ${attempts} times in a row and was not written. ` +
+      'Another writer kept changing the log, or the journal\'s putIfMatch never matches what its get returned. ' +
+      'Nothing was lost; retry the append, and if it repeats, check the journal adapter\'s putIfMatch.',
+    );
+    this.name = 'JournalLogContentionError';
+  }
+}
+
+/** The retry bound for one append. Each lost round is another writer's win, so this is ~that many concurrent writers. */
+export const JOURNAL_LOG_MAX_ATTEMPTS = 64;
+
+/**
+ * Reads a log written by `appendToJournalLog`, in append order. Also reads a 0.9.0 log (a bare array).
+ * Every reader of such a key goes through here — memory classes and the thread sweep alike — so the
+ * stored shape is known in one place.
+ */
+export async function readJournalLog<T = unknown>(journal: Pick<Journal, 'get'>, key: string): Promise<T[]> {
+  return decodeLog<T>(await journal.get<unknown>(key));
+}
+
+function decodeLog<T>(stored: unknown): T[] {
+  if (stored === undefined || stored === null) return [];
+  if (Array.isArray(stored)) return stored as T[]; // 0.9.0: the entries themselves
+  if (!isLogValue(stored)) return [];
+  const out: T[] = [];
+  for (const part of stored.parts) out.push(...deserialize<T[]>(part));
+  return out;
+}
+
+/**
+ * Appends `entries` to the log stored at `key`, losing nothing to a concurrent append, and always
+ * finishing: it either writes or throws.
  *
  * A journal holds a thread's log as ONE value, so an append is read → extend → write, and two
  * appends that both read before either writes erase one of them. Measured: 10 concurrent appends to
- * one thread kept 1; two processes × 50 kept 2 of 100. `AgentMemory` never had this because its store
- * assigns a message's position inside a write it serialises per thread; this is the same guarantee
- * built from what a `Journal` offers:
+ * one thread kept 1; two processes × 50 kept 2 of 100. The guarantee is built from what a `Journal`
+ * offers:
  *
- *   - an in-process queue per journal and key, so appends from one process never contend at all
- *     (measured: 100 concurrent appends, 0 retries);
+ *   - an in-process queue per journal and key, so appends from one process never contend at all;
  *   - a compare-and-set write — `putIfAbsent` for the first entry, `putIfMatch` after — retried on a
- *     lost race with the fresh value, so a second PROCESS cannot erase a write either (2 × 50 → 100).
- *     The retry cannot starve: each round, one writer's compare succeeds.
- *
- * Neither half alone was enough: the queue alone kept 57 of 100 across two processes, and
- * compare-and-set alone cost 4950 retries (2.4 s on SQLite) for 100 appends from one process.
+ *     lost race with the fresh value, so a second PROCESS cannot erase a write either. The compared
+ *     value is strings only (see `JournalLogValue`), so a lost compare always means another writer
+ *     won; retries yield to the event loop and stop at `JOURNAL_LOG_MAX_ATTEMPTS` with
+ *     `JournalLogContentionError`.
  *
  * A journal without `putIfMatch`/`putIfAbsent` gets the queue alone: safe within one process, not
  * across several. Every first-party journal implements both.
@@ -238,29 +296,54 @@ export async function appendToJournalLog(journal: Journal, key: string, entries:
   let queues = logQueues.get(journal);
   if (!queues) { queues = new Map(); logQueues.set(journal, queues); }
   const prior = queues.get(key) ?? Promise.resolve();
-  const run = prior.then(() => casAppend(journal, key, entries));
+  const part = serialize(entries); // once, outside the retry loop
+  const run = prior.then(() => casAppend(journal, key, part));
   const tail = run.then(() => undefined, () => undefined); // a failed append must not stall the next one
   queues.set(key, tail);
   void tail.finally(() => { if (queues!.get(key) === tail) queues!.delete(key); });
   return run;
 }
 
-async function casAppend(journal: Journal, key: string, entries: readonly unknown[]): Promise<void> {
+const yieldToLoop = () => new Promise<void>((r) => setTimeout(r, 0));
+
+async function casAppend(journal: Journal, key: string, part: string): Promise<void> {
   const cas = typeof journal.putIfMatch === 'function' && typeof journal.putIfAbsent === 'function';
-  for (;;) {
-    const current = await journal.get<unknown[]>(key);
-    const next = [...(current ?? []), ...entries];
+  for (let attempt = 1; ; attempt++) {
+    const current = await journal.get<unknown>(key);
+    const next: JournalLogValue = { gnlLog: 1, parts: [...priorParts(current), part] };
     if (!cas) return journal.put(key, next);
-    const won = current === undefined ? await journal.putIfAbsent!(key, next) : await journal.putIfMatch!(key, current, next);
-    if (won) return;
+    if (current === undefined ? await journal.putIfAbsent!(key, next) : await journal.putIfMatch!(key, current, next)) return;
+    if (Array.isArray(current) && (await upgradedInPlace(journal, key, current, next))) return;
+    if (attempt >= JOURNAL_LOG_MAX_ATTEMPTS) throw new JournalLogContentionError(key, attempt);
+    await yieldToLoop();
   }
+}
+
+function priorParts(current: unknown): string[] {
+  if (current === undefined || current === null) return [];
+  if (Array.isArray(current)) return current.length ? [serialize(current)] : []; // a 0.9.0 log becomes one part
+  return isLogValue(current) ? current.parts : [];
+}
+
+/**
+ * The one case a string compare cannot cover: the FIRST append to a 0.9.0 log, whose stored value is
+ * still the entries themselves. If that array does not round-trip (an Error inside), `putIfMatch`
+ * can never match it. When a re-read shows the key unchanged — nobody else wrote between our reads,
+ * so the compare failed on the round trip, not on a race — the upgrade is written with a plain `put`.
+ * The window this leaves is one upgrade per such log, between the re-read and the put.
+ */
+async function upgradedInPlace(journal: Journal, key: string, read: unknown[], next: JournalLogValue): Promise<boolean> {
+  const again = await journal.get<unknown>(key);
+  if (!Array.isArray(again) || serialize(again) !== serialize(read)) return false; // someone did write: retry normally
+  await journal.put(key, next);
+  return true;
 }
 
 export class BasicMemory implements Memory {
   constructor(private readonly journal: Journal) {}
 
   async getMessages(threadId: string): Promise<any[]> {
-    return (await this.journal.get<any[]>(memKey(threadId, 'messages'))) ?? [];
+    return readJournalLog<any>(this.journal, memKey(threadId, 'messages'));
   }
 
   async append(threadId: string, messages: any[]): Promise<void> {

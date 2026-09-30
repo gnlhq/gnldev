@@ -69,16 +69,16 @@ describe('chunkText — character', () => {
 });
 
 describe('chunkDocuments', () => {
-  it('chunk ids are deterministic (`id#i`); metadata is inherited + source/chunk trail', () => {
+  it('chunk ids are deterministic (`id#i`); metadata is inherited + the reserved __gnlDoc/__gnlChunk trail', () => {
     const docs = [
       { id: 'doc1', text: `${PARA(300)}\n\n${PARA(300, 'b')}`, metadata: { lang: 'tr' } },
       { id: 'doc2', text: 'short text' },
     ];
     const out = chunkDocuments(docs, { size: 350, overlap: 0 });
     expect(out.map((d) => d.id)).toEqual(['doc1#0', 'doc1#1', 'doc2']); // short doc not split, as-is
-    expect(out[0]!.metadata).toEqual({ lang: 'tr', source: 'doc1', chunk: 0 });
-    expect(out[1]!.metadata).toEqual({ lang: 'tr', source: 'doc1', chunk: 1 });
-    expect(out[2]!.metadata).toEqual({ source: 'doc2', chunk: 0 }); // one chunk carries the trail too
+    expect(out[0]!.metadata).toEqual({ lang: 'tr', __gnlDoc: 'doc1', __gnlChunk: 0 });
+    expect(out[1]!.metadata).toEqual({ lang: 'tr', __gnlDoc: 'doc1', __gnlChunk: 1 });
+    expect(out[2]!.metadata).toEqual({ __gnlDoc: 'doc2', __gnlChunk: 0 }); // one chunk carries the trail too
   });
 
   it('end-to-end with indexDocuments: chunks land in the store and are queryable', async () => {
@@ -92,6 +92,6 @@ describe('chunkDocuments', () => {
     await indexDocuments(store, embed, docs);
     const hits = await store.query(await embed('bbbb'), 1);
     expect(hits[0]!.id).toBe('kb#1'); // b-dense chunk
-    expect((hits[0]!.metadata as any).source).toBe('kb');
+    expect((hits[0]!.metadata as any).__gnlDoc).toBe('kb');
   });
 });

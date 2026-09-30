@@ -3,7 +3,7 @@
 // vector search. Durable/replayable: the recall result falls into runDurable's input journaling
 // (frozen on resume); embeddings persist in the journal. (Most semantic-recall implementations don't come with these guarantees.)
 import { cosineSimilarity } from 'ai';
-import { matchFilter, memKey, assertThreadId, appendToJournalLog } from '@gnldev/durable';
+import { matchFilter, memKey, assertThreadId, appendToJournalLog, readJournalLog } from '@gnldev/durable';
 import type { Memory, Journal } from '@gnldev/durable';
 import type { Embed } from './vector-store.js';
 
@@ -76,7 +76,7 @@ export class SemanticMemory implements Memory {
     return `sem:${threadId}:log`;
   }
   private async load(threadId: string): Promise<LogEntry[]> {
-    return (await this.journal.get<LogEntry[]>(this.key(threadId))) ?? [];
+    return readJournalLog<LogEntry>(this.journal, this.key(threadId));
   }
 
   async getMessages(threadId: string, opts?: SemanticGetMessagesOptions): Promise<any[]> {

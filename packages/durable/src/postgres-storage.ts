@@ -4,7 +4,7 @@
 // Vector is 'scan' for now (brute-force cosine; pgvector deferred — pg-mem compatibility + lean first cut).
 import { prefixUpperBound } from './organization.js';
 import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from './storage.js';
-import { recallPartition, recallPartitionSql } from './storage.js';
+import { memoryPartitionOf, memoryPartitionSql, type MemoryPartitionOption } from './storage.js';
 import { createRequire } from 'node:module';
 import { cosineSimilarity } from 'ai';
 import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus } from './journal.js';
@@ -1240,10 +1240,12 @@ class PgMemoryStore implements MemoryStore {
     const r = await this.q('SELECT * FROM gnl_threads WHERE id = $1 AND deleted_at IS NULL', [id]);
     return r.rows[0] ? this.toThread(r.rows[0]) : undefined;
   }
-  async listThreads(q: { resourceId?: string } & ListQuery): Promise<Page<ThreadRecord>> {
+  async listThreads(q: { resourceId?: string } & ListQuery & MemoryPartitionOption): Promise<Page<ThreadRecord>> {
     const { start, limit } = offset(q);
-    const where = q.resourceId != null ? 'deleted_at IS NULL AND resource_id = $1' : 'deleted_at IS NULL';
-    const base = q.resourceId != null ? [q.resourceId] : [];
+    let n = 0;
+    const part = memoryPartitionSql(memoryPartitionOf(q), 'id', () => `$${++n}`);
+    const where = `deleted_at IS NULL AND ${part.cond}${q.resourceId != null ? ` AND resource_id = $${++n}` : ''}`;
+    const base = [...part.params, ...(q.resourceId != null ? [q.resourceId] : [])];
     const total = Number((await this.q(`SELECT COUNT(*) AS n FROM gnl_threads WHERE ${where}`, base)).rows[0].n);
     const r = await this.q(`SELECT * FROM gnl_threads WHERE ${where} ORDER BY updated_at DESC, id LIMIT $${base.length + 1} OFFSET $${base.length + 2}`, [...base, limit, start]);
     return pageOf(r.rows.map((x) => this.toThread(x)), start, limit, total);
@@ -1412,7 +1414,8 @@ class PgMemoryStore implements MemoryStore {
   }
   async recall(threadId: string, query: number[], opts: RecallOptions): Promise<MessageRecord[]> {
     if (!hasNorm(query)) return [];
-    const part = recallPartitionSql(recallPartition(threadId), (n) => `$${n + 2}`);
+    let n = 1;
+    const part = memoryPartitionSql(memoryPartitionOf(opts), 't.id', () => `$${++n}`);
     const r = opts.scope === 'resource' && opts.resourceId
       ? await this.q(`SELECT m.* FROM gnl_messages m JOIN gnl_threads t ON t.id = m.thread_id WHERE t.resource_id = $1 AND t.deleted_at IS NULL AND ${part.cond} ORDER BY m.thread_id, m.seq`, [opts.resourceId, ...part.params])
       : await this.q('SELECT * FROM gnl_messages WHERE thread_id = $1 ORDER BY seq', [threadId]);

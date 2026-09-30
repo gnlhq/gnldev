@@ -5,8 +5,8 @@
 // #2-#4 of the OLD text retrievable; edited down to one chunk, every `#i` survived beside the new bare
 // id. `ingestDocuments` gives the write the document's shape: remove what the document had, then
 // write what it has now.
-import { OM_VECTOR_SOURCE } from '@gnldev/durable';
-import { chunkDocuments, type ChunkOptions } from './chunk.js';
+import { assertDeletesOutsideOrganizations, orgStorageScopeOf } from '@gnldev/durable';
+import { chunkDocuments, documentIdPart, DOC_TRAIL_KEY, type ChunkOptions } from './chunk.js';
 import type { DeleteWhere, Embed, VectorDoc, VectorItem, VectorStore } from './vector-store.js';
 
 export interface IngestResult {
@@ -27,45 +27,64 @@ function requireDelete(store: VectorStore, fn: string): asserts store is VectorS
 }
 
 /**
- * The partition a document's chunks live in, as a delete condition. A document without a namespace
- * is the root's: `outsideOrganizations` keeps a root re-ingest of `doc` from deleting an
- * organization's `doc` (whose chunks carry the same `source`), on a store that honours it. Through an
- * organization's view (`withOrgStorage(...).vectors`) the view forces its own namespace, and the flag
- * would contradict it, so it is left out there — such a view does not declare it.
+ * The partition a document's chunks live in, as a delete condition — decided before anything is
+ * embedded, written or deleted.
+ *
+ *   - a document with a `namespace`: that namespace;
+ *   - through an organization's view (`withOrgStorage(...).vectors`): nothing to add, the view forces
+ *     its own namespace (and would contradict `outsideOrganizations`);
+ *   - otherwise the document is the root's, and the delete must stay outside every organization. A
+ *     store that does not declare `deleteOutsideOrganizations` cannot be trusted with that, so it is
+ *     refused (the same rule erasure applies): measured, a root re-ingest of `handbook` on such a
+ *     store deleted acme's `handbook` (1 → 0).
  */
-function partitionOf(store: VectorStore, namespace: string | undefined): Pick<DeleteWhere, 'namespace' | 'outsideOrganizations'> {
+function partitionOf(store: VectorStore, namespace: string | undefined, fn: string): Pick<DeleteWhere, 'namespace' | 'outsideOrganizations'> {
   if (namespace !== undefined) return { namespace };
-  return store.deleteOutsideOrganizations === true ? { outsideOrganizations: true } : {};
+  if (orgStorageScopeOf(store) !== undefined) return {};
+  assertDeletesOutsideOrganizations(store, `@gnldev/rag: ${fn} (a document with no namespace)`, 'Or give the documents a `namespace`, which keeps the delete inside it.');
+  return { outsideOrganizations: true };
 }
 
-function assertOwnId(id: string, fn: string): void {
-  // `source` is shared metadata: observational memory labels every observation vector
-  // `source: 'observational-memory'` in the same store. A document with that id would take them all.
-  if (id === OM_VECTOR_SOURCE) {
-    throw new Error(`@gnldev/rag: ${fn} cannot use the document id '${OM_VECTOR_SOURCE}' — observational memory's vectors carry that \`source\`, and replacing the document would delete them. Give the document another id.`);
+/**
+ * Deletes every chunk of document `id` in `part`, and nothing else:
+ *
+ *   - by trail (`__gnlDoc === id`) — every chunk `chunkDocuments` writes;
+ *   - by the document's own one-chunk id — the id a one-chunk version has always been stored under,
+ *     trail or not (0.9.0 stamped none on it);
+ *   - 0.9.0's multi-chunk shape, `<id>#<n>` carrying `source: id, chunk: n`, one position at a time
+ *     until a gap. The id AND both labels must match, so a record the user merely labelled
+ *     `source: id` is left alone.
+ *
+ * Nothing here reads the user's metadata keys on their own, which is also why observational memory's
+ * vectors (`source: 'observational-memory'`, no trail) no longer need a reserved document id.
+ */
+async function removeDocument(store: VectorStore & { delete: NonNullable<VectorStore['delete']> }, id: string, part: Pick<DeleteWhere, 'namespace' | 'outsideOrganizations'>): Promise<number> {
+  let removed = await store.delete({ filter: { [DOC_TRAIL_KEY]: id }, ...part });
+  removed += await store.delete({ ids: [documentIdPart(id)], ...part });
+  for (let n = 0; ; n++) {
+    const legacy = await store.delete({ ids: [`${id}#${n}`], filter: { source: id, chunk: n }, ...part });
+    if (legacy === 0) break;
+    removed += legacy;
   }
-}
-
-async function removeDocument(store: VectorStore & { delete: NonNullable<VectorStore['delete']> }, id: string, namespace: string | undefined): Promise<number> {
-  const part = partitionOf(store, namespace);
-  // By trail: every chunk `chunkDocuments` wrote for this document. By id: a single-chunk version
-  // indexed before the trail was stamped, which has none.
-  return (await store.delete({ filter: { source: id }, ...part })) + (await store.delete({ ids: [id], ...part }));
+  return removed;
 }
 
 /**
  * Chunks, embeds and indexes `docs` so each document's stored chunks are exactly its current ones.
  *
- * Per document: its chunks are embedded first, then every chunk it had (`metadata.source === id`, or
- * the bare `id`) is deleted in its namespace, then the new chunks are upserted. Embedding first means a
- * failing embed leaves the previous version in place; between the delete and the upsert a query can
- * see the document missing, never half old and half new.
+ * Per document: its chunks are embedded first, then every chunk it had (see `removeDocument`) is
+ * deleted in its partition, then the new chunks are upserted. Embedding first means a failing embed
+ * leaves the previous version in place; between the delete and the upsert a query can see the
+ * document missing, never half old and half new.
  *
- * Needs `store.delete`. Without it this throws, naming the upsert-only way through.
+ * Needs `store.delete`. Without it this throws, naming the upsert-only way through. A document with no
+ * `namespace` written to a root store also needs the store to declare `deleteOutsideOrganizations`;
+ * without it this throws before anything changes — give the documents a `namespace`, or make the
+ * store honour the flag.
  */
 export async function ingestDocuments(store: VectorStore, embed: Embed, docs: VectorDoc[], opts?: ChunkOptions): Promise<IngestResult> {
   requireDelete(store, 'ingestDocuments');
-  for (const d of docs) assertOwnId(d.id, 'ingestDocuments');
+  const parts = docs.map((d) => partitionOf(store, d.namespace, 'ingestDocuments'));
   const perDoc: VectorItem[][] = [];
   for (const doc of docs) {
     const chunks = chunkDocuments([doc], opts);
@@ -74,7 +93,7 @@ export async function ingestDocuments(store: VectorStore, embed: Embed, docs: Ve
   let removed = 0;
   let indexed = 0;
   for (let i = 0; i < docs.length; i++) {
-    removed += await removeDocument(store, docs[i]!.id, docs[i]!.namespace);
+    removed += await removeDocument(store, docs[i]!.id, parts[i]!);
     if (perDoc[i]!.length) await store.upsert(perDoc[i]!);
     indexed += perDoc[i]!.length;
   }
@@ -83,13 +102,13 @@ export async function ingestDocuments(store: VectorStore, embed: Embed, docs: Ve
 
 /**
  * Removes documents indexed by `ingestDocuments` (or by `indexDocuments` over `chunkDocuments`), every
- * chunk of each, from one namespace — the root's when `namespace` is omitted. Returns the number of
- * chunks removed.
+ * chunk of each, from one namespace — the root's when `namespace` is omitted, under the same
+ * partition rule as `ingestDocuments`. Returns the number of chunks removed.
  */
 export async function deleteDocuments(store: VectorStore, ids: string[], opts?: { namespace?: string }): Promise<number> {
   requireDelete(store, 'deleteDocuments');
-  for (const id of ids) assertOwnId(id, 'deleteDocuments');
+  const part = partitionOf(store, opts?.namespace, 'deleteDocuments');
   let removed = 0;
-  for (const id of ids) removed += await removeDocument(store, id, opts?.namespace);
+  for (const id of ids) removed += await removeDocument(store, id, part);
   return removed;
 }

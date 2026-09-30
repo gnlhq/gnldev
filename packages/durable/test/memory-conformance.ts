@@ -127,8 +127,10 @@ export function memoryConformance(make: () => Storage, caps: { serialisesAppends
       await b.memory!.appendMessages('t-root', [msg('t-root', 0, 'ROOT-SECRET', [1, 0])]);
       await acme.upsertThread(thread('t-a', 'u-shared', 1));
       await acme.appendMessages('t-a', [msg('t-a', 0, 'acme own', [0.6, 0.4])]);
+      // The root store, even handed acme's physical thread id, is the root's scope: the partition is
+      // who asks, never a thread id (a client-chosen `org:acme:…` id used to open acme's rows).
       const raw = await b.memory!.recall('org:acme:t-a', [1, 0], { topK: 1, scope: 'resource', resourceId: 'u-shared' });
-      expect(raw.map((m) => m.text)).toEqual(['acme own']);
+      expect(raw.map((m) => m.text)).toEqual(['ROOT-SECRET']);
       const viaView = await acme.recall('t-a', [1, 0], { topK: 1, scope: 'resource', resourceId: 'u-shared' });
       expect(viaView.map((m) => m.text)).toEqual(['acme own']);
     });

@@ -3,7 +3,7 @@
 // Correctness matters, not perf (naive filter/sort). Date.now/Math.random are free to use here (runtime code).
 import { cosineSimilarity } from 'ai';
 import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from './storage.js';
-import { recallPartition, inRecallPartition } from './storage.js';
+import { memoryPartitionOf, inMemoryPartition, type MemoryPartitionOption } from './storage.js';
 import { InMemoryJournal } from './journal.js';
 import { stableStringify } from './hash.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix } from './organization.js';
@@ -112,9 +112,10 @@ class InMemoryMemoryStore implements MemoryStore {
     const t = this.threads.get(id);
     return t && !t.deletedAt ? { ...t } : undefined;
   }
-  async listThreads(q: { resourceId?: string } & ListQuery): Promise<Page<ThreadRecord>> {
+  async listThreads(q: { resourceId?: string } & ListQuery & MemoryPartitionOption): Promise<Page<ThreadRecord>> {
+    const partition = memoryPartitionOf(q);
     const all = [...this.threads.values()]
-      .filter((t) => !t.deletedAt && (q.resourceId == null || t.resourceId === q.resourceId))
+      .filter((t) => !t.deletedAt && (q.resourceId == null || t.resourceId === q.resourceId) && inMemoryPartition(partition, t.id))
       .sort((a, b) => b.updatedAt - a.updatedAt);
     return paginate(all, q);
   }
@@ -177,10 +178,10 @@ class InMemoryMemoryStore implements MemoryStore {
     if (!hasNorm(query)) return [];
     const byThread = new Map<string, MessageRecord[]>();
     if (opts.scope === 'resource' && opts.resourceId) {
-      const partition = recallPartition(threadId);
+      const partition = memoryPartitionOf(opts);
       for (const [tid, rows] of this.messages) {
         const t = this.threads.get(tid);
-        if (t && !t.deletedAt && t.resourceId === opts.resourceId && inRecallPartition(partition, tid)) byThread.set(tid, rows);
+        if (t && !t.deletedAt && t.resourceId === opts.resourceId && inMemoryPartition(partition, tid)) byThread.set(tid, rows);
       }
     } else {
       byThread.set(threadId, this.messages.get(threadId) ?? []);

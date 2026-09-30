@@ -22,7 +22,7 @@
  * edit cannot move one without seeing the other.
  */
 import { ORG_SCOPE, orgPrefix, orgScopeOf, withOrg } from './organization.js';
-import { toJournal, orgVectorId, workingMemoryScope } from './storage.js';
+import { toJournal, orgVectorId, workingMemoryScope, MEMORY_PARTITION } from './storage.js';
 import { asReaderJournal, type Journal, type JournalReader } from './journal.js';
 import type {
   CacheStore, CapabilityMatrix, ListQuery, LogRecord, MemoryStore, MessageRecord, MessageAppend, MetaStore,
@@ -193,7 +193,9 @@ function scopedMemory(memory: MemoryStore, p: string): MemoryStore {
     // Drained rather than filtered in place — see `drainOwned`. Filtering one source page produced an
     // EMPTY page for this organization whenever another organization's rows happened to sort first,
     // which stops a client that paginates until empty.
-    listThreads: (q) => drainOwned((qq) => memory.listThreads({ ...q, ...qq }), outThread, q),
+    // The store scans this organization's partition only (`MEMORY_PARTITION`); the drain stays as the
+    // second line that strips the prefix and drops anything that is not ours.
+    listThreads: (q) => drainOwned((qq) => memory.listThreads({ ...q, ...qq, [MEMORY_PARTITION]: p }), outThread, q),
     // The thread's working memory is keyed `org:<id>:thread:<threadId>` (this wrapper prefixes the
     // whole scope key), while the store's own deleteThread removes `thread:org:<id>:<threadId>`. Measured
     // before this line: an organization member's thread went and its working memory stayed.
@@ -219,10 +221,10 @@ function scopedMemory(memory: MemoryStore, p: string): MemoryStore {
     getMessages: (threadId, q) => drainOwned((qq) => memory.getMessages(add(p, threadId), qq), outMsg, q),
     // `recall` returns rows from OTHER threads under `scope: 'resource'`, so it filters rather than
     // maps — see `outMsg`. Not paginated, so it drops in place rather than draining. The store itself
-    // now ranks only this organization's threads (`recallPartition`, anchored on the prefixed id), so
-    // the filter here is a second line, not the one that decides what fills `topK`.
+    // ranks only this organization's threads — the partition this view names (`MEMORY_PARTITION`), not
+    // one read off the thread id — so the filter here is a second line, not what fills `topK`.
     recall: async (threadId, queryEmbedding, opts) =>
-      (await memory.recall(add(p, threadId), queryEmbedding, opts))
+      (await memory.recall(add(p, threadId), queryEmbedding, { ...opts, [MEMORY_PARTITION]: p }))
         .map(outMsg).filter((r): r is MessageRecord => r !== undefined),
     getWorkingMemory: (scopeId) => memory.getWorkingMemory(add(p, scopeId)),
     setWorkingMemory: (scopeId, data) => memory.setWorkingMemory(add(p, scopeId), data),

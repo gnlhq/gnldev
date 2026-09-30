@@ -51,6 +51,8 @@ export const EDGE_ERROR_CODES = {
   a2aSignatureInvalid: 'a2a_signature_invalid',
   /** 500 — a body parser upstream of the handler already drained the request (`node.ts`). */
   bodyConsumedUpstream: 'body_consumed_upstream',
+  /** 400 — a root-scope request named a thread under `org:`, the organizations' reserved id space. */
+  threadIdReserved: 'thread_id_reserved',
 } as const;
 
 export type EdgeErrorCode = (typeof EDGE_ERROR_CODES)[keyof typeof EDGE_ERROR_CODES];
@@ -68,4 +70,5 @@ export const EDGE_ERROR_STATUS: Record<string, number> = {
   a2a_timestamp_invalid: 401,
   a2a_signature_invalid: 401,
   body_consumed_upstream: 500,
+  thread_id_reserved: 400,
 };
