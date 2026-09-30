@@ -9,6 +9,86 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Upgrading a SQL work store adds a column and a table, and nothing else moves.** SQLite and
+  Postgres add `gnl_work_log.seq` (default 0), the index `gnl_work_log_seq` and the table
+  `gnl_work_seq` at startup, like the earlier additive columns. Existing rows keep `seq` 0 and their old
+  `(ts, id)` order, ahead of every new record. Redis stores new records as `<seq>|<record>` and reads the
+  old bare form as `seq` 0; the counters live under `<keyPrefix>wseq:`, a space no sweep deletes.
+- **A cursor persisted by 0.9 (a row offset) restarts at the head of the log**, once. The worker and each
+  consumer then skip finished records by their markers (`qdone`, `evtack:`), so nothing runs twice and
+  nothing is skipped, and they write a new cursor after the first full page. The cost is one re-read of
+  the markers of a log's existing records. Anyone paging `WorkStore.list` directly: a cursor is still
+  opaque — pass back what you were given.
+- **A custom `WorkStore`** must keep the same promise to work with the queue and events: a cursor that
+  deletions and producer clocks cannot move. The contract is written on `WorkStore.list`.
+- **`RedisStorage` without `eval`** (a custom client) takes the sequence and writes the record in
+  separate round trips: two processes appending to one namespace at once can land out of order, so a
+  reader may pass a record that appears a moment later. The same documented best-effort as
+  `putIfMatch` without `eval`; ioredis and node-redis both have it.
+
+- **@gnldev/workflow: one step id used twice in one workflow is refused at build time.** A step is
+  journaled under its id, so `.then(inc).then(inc)` made the second use replay the first one's output —
+  on a FRESH run, with no error. Measured on 0.9.0: `0 → inc → inc` returned `1`; two `parallel` legs
+  sharing an id both ran but returned one field. `workflow()` now throws where the workflow is built,
+  naming the id and the way through: reuse the body under a second id, `.then(step('inc-2', inc.run))`.
+  The two arms of a `branch` (one runs per input) and a step inside a nested `asStep` workflow (its own
+  key prefix) may still reuse an id. Who is affected: a workflow that repeats a step id, whose output was
+  already wrong.
+
+- **A server with no auth answers only the names that mean this machine (DNS rebinding).** The
+  providerless gate in `@gnldev/auth` refused cross-site writes by reading `Sec-Fetch-Site`, and after a
+  DNS rebind that header says `same-origin`, truthfully: the page at `http://evil.example:4747` has had
+  `evil.example` pointed at `127.0.0.1`, so its requests go to your server as its own. Measured over a
+  real loopback socket on 0.9.0: such a page purged Studio's runs (`POST /api/retention/sweep`), ran an
+  agent on the REST API under `gnl dev` (a model call on your key), and READ `GET /api/runs` — prompts
+  and tool arguments; 55 Studio routes answered it 2xx. `makeGate` now refuses, on every method, a
+  request whose `Host` is not `localhost`, a `*.localhost` name, an IP address, or a name you listed —
+  403 with code `host_not_allowed` and the host it saw. After the fix the same sweep leaves only the
+  routes that answer anybody with auth on (UI shell, health, `/capabilities`, API description).
+  **Who is affected:** a server with no auth provider, or with only a `{ read, write }` pair, reached by
+  a name other than those — a custom dev hostname, an ngrok/cloudflared tunnel, Codespaces port
+  forwarding, a Docker service name, or a deliberately open (`allowOpenAccess`) server behind a proxy.
+  LAN IP addresses, `127.0.0.1`, `[::1]` and Docker's published `localhost:<port>` are unaffected, and a
+  provider that binds an identity (`roleAuth`, `@gnldev/auth-ee`) is unaffected. **Way through, one
+  line:** `allowedHosts: ['mybox.test', '.ngrok-free.app']` on `createRestApi` / `createStudioApp` /
+  `makeGate` (leading dot: every name under it; `true`: every name), or
+  `GNL_ALLOWED_HOSTS=mybox.test,.ngrok-free.app` in the environment — read by the gate itself, so
+  `gnl dev`, `gnl studio` and your own server all take it. The 403 names both. See
+  [`docs/errors/host_not_allowed.md`](./docs/errors/host_not_allowed.md).
+- **A valid licence no longer takes away what the free tier gives an application or an end user.**
+  With a licence, `createEnterpriseAuth` still authenticates through its `fallback` (the free
+  `roleAuth`), but `createRbac()`'s default map had no `client` or `end-user` entry. Measured through
+  `@gnldev/server` on 0.9.0: the same `client` token and end-user token that free `roleAuth` served (run
+  200, `GET /runs` 200) got 403 `permission denied: agents:run` with a valid licence — and 200 again once
+  the licence expired. A conformance walk of every free role × every permission the hosts ask (84 pairs:
+  4 roles × 21 checks) found 22 pairs the licence took away; it now finds none. `@gnldev/auth` exports
+  `FREE_ROLE_GRANTS` (what `roleAuth` grants, as permission patterns — checked to answer exactly what
+  `roleAuth` does), and `@gnldev/auth-ee` exports `DEFAULT_ROLE_GRANTS`, built from it plus `member` and
+  `platform-admin`. **Who is affected:** licensed deployments whose fallback or user store carries
+  `client` or `end-user` principals, on the default map — they now get what the free tier gives them
+  (every read, `agents:run`, `workflow:run`, `run:cancel`). A deployment passing its own map to
+  `createRbac` is unchanged: a map still replaces the defaults. **Way through:** to add a role without
+  restating the defaults, `createRbac({ ...DEFAULT_ROLE_GRANTS, support: ['runs:read'] })`; to keep the
+  0.9.0 narrowing, pass the map you want without the spread.
+- **`@gnldev/evals`: the runners give scorers the question and the context.** `answerRelevancy`,
+  `completeness`, `faithfulness`, `hallucination` and `contextPrecision` read `sample.input` or
+  `sample.context`, and `evalDataset` and `scoreRun` built the sample from `{ output, expected, runId }`
+  only. Measured on 0.9.0 with a judge answering `SCORE: 0.9`: `evalDataset` scored `answer-relevancy` 0
+  ("input required"); `scoreRun` scored all four judges 0 and called the judge model zero times — whatever
+  the agent answered. Now `evalDataset` passes each case's `input` (as text) and `context` (a new optional
+  `DatasetCase` field, or the runner's `{ output, context }`, which wins); `scoreRun` reads the question
+  from the run's journaled input and takes `context` (a value, or a function of the run's journal
+  entries), plus an `input` override; the result carries the `input` it used. **Who is affected:** anyone
+  scoring through these runners — scores for those five judges change from a constant 0 to a real
+  judgement. **Breaking:** two scorers with the same name in one call now throw, naming both. They used to
+  collapse into one: the result, the aggregate and the journal memo (`eval:<name>`) are keyed by name, and
+  `scoreRun` answered the second of two default-named `llmJudge` rubrics with the first one's 0.9 without
+  asking its model. Keying by position was rejected: the memo is read on the next run, so reordering the
+  list would hand each scorer another's stored score. **Way through:** `llmJudge({ name: 'polite', ... })`,
+  `faithfulness({ model, name: 'faithful-v2' })`, or `{ ...contains('x'), name: 'has-x' }`.
+
 ### Fixed
 
 - **Erasing one person stopped everyone else's queue and events; a producer with a slow clock was
@@ -30,37 +110,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (median of 10). The price is on the write side: an append now takes the counter and the row in one
   write transaction — 10 000 appends in memory 650 ms → 1 900 ms; on a file database, where the
   fsync dominates, 2 000 appends 3.5 s → 3.9 s.
-
-### Changed
-
-- **Upgrading a SQL work store adds a column and a table, and nothing else moves.** SQLite and
-  Postgres add `gnl_work_log.seq` (default 0), the index `gnl_work_log_seq` and the table
-  `gnl_work_seq` at startup, like the earlier additive columns. Existing rows keep `seq` 0 and their old
-  `(ts, id)` order, ahead of every new record. Redis stores new records as `<seq>|<record>` and reads the
-  old bare form as `seq` 0; the counters live under `<keyPrefix>wseq:`, a space no sweep deletes.
-- **A cursor persisted by 0.9 (a row offset) restarts at the head of the log**, once. The worker and each
-  consumer then skip finished records by their markers (`qdone`, `evtack:`), so nothing runs twice and
-  nothing is skipped, and they write a new cursor after the first full page. The cost is one re-read of
-  the markers of a log's existing records. Anyone paging `WorkStore.list` directly: a cursor is still
-  opaque — pass back what you were given.
-- **A custom `WorkStore`** must keep the same promise to work with the queue and events: a cursor that
-  deletions and producer clocks cannot move. The contract is written on `WorkStore.list`.
-- **`RedisStorage` without `eval`** (a custom client) takes the sequence and writes the record in
-  separate round trips: two processes appending to one namespace at once can land out of order, so a
-  reader may pass a record that appears a moment later. The same documented best-effort as
-  `putIfMatch` without `eval`; ioredis and node-redis both have it.
-### Changed
-
-- **@gnldev/workflow: one step id used twice in one workflow is refused at build time.** A step is
-  journaled under its id, so `.then(inc).then(inc)` made the second use replay the first one's output —
-  on a FRESH run, with no error. Measured on 0.9.0: `0 → inc → inc` returned `1`; two `parallel` legs
-  sharing an id both ran but returned one field. `workflow()` now throws where the workflow is built,
-  naming the id and the way through: reuse the body under a second id, `.then(step('inc-2', inc.run))`.
-  The two arms of a `branch` (one runs per input) and a step inside a nested `asStep` workflow (its own
-  key prefix) may still reuse an id. Who is affected: a workflow that repeats a step id, whose output was
-  already wrong.
-
-### Fixed
 
 - **@gnldev/workflow: a step that returns `undefined` is replayed, not re-run.** The engine asked
   "is there a record?" with `journal.get(key) !== undefined`, and every journal reads a stored
@@ -114,28 +163,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   must also typecheck, in one TypeScript program with the template's compiler options. It is driven by
   the recipe table, so a recipe added later is covered without editing the test. Existing projects are
   not touched: delete the lone `,` line in `gnl.config.ts`.
-### Security
-
-- **A root-scope end user no longer recalls an organization's messages** (ADR-0001: "In the root scope,
-  every organization's rows are hidden"). Measured on 0.9.0: with `memoryPreset(s, 'recall')` and one
-  identity provider that returns the same user id with and without `orgId`, the unbound user's turn
-  carried acme's message into the prompt — on `createRestApi` without `org`, and on the standalone chat
-  door. `MemoryStore.recall` with `scope: 'resource'` filtered by resource id alone, and organization
-  rows live in the root store under `org:<id>:`. All three stores (in-memory, SQLite, Postgres) now rank
-  only the threads in the anchor thread's partition, before `topK` (`recallPartition` in
-  @gnldev/durable). This also fixes the other direction's short page: an organization's recall with
-  `topK: 1` came back empty when another organization's row scored higher, because the org view
-  filtered after the store had picked. Who is affected: anyone serving root-scope and organization users
-  from one store. Way through, for a caller that wants one organization's threads from the root:
-  `withOrgStorage(storage, orgId).memory.recall(...)`. Custom `MemoryStore` adapters should apply
-  `inRecallPartition` in their resource branch.
-- **Root observational memory no longer ranks by an organization's observation vectors.**
-  `AgentMemory.recallObservationsSemantic` on a root memory queried every namespace; an organization's
-  vector for a thread with the same bare id carried the same per-thread `obsId` (`obs-0`) and answered
-  with the root's unrelated observation. Hits outside the memory's own namespace are now dropped.
-  `OmVectorMatch` gains an optional `namespace`.
-
-### Fixed
 
 - **Concurrent turns on one thread no longer lose messages in the journal-kept memories**
   (`BasicMemory` in @gnldev/durable, `SemanticMemory` in @gnldev/rag). Both read the thread's log,
@@ -211,59 +238,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   an invited `null`, hashes that call differently when it replays after the upgrade. That is a console
   warning, or a `DivergenceError` under `replay: 'strict'`. Finish such runs before upgrading, or
   resume them without `replay: 'strict'`.
-### Changed
 
-- **A server with no auth answers only the names that mean this machine (DNS rebinding).** The
-  providerless gate in `@gnldev/auth` refused cross-site writes by reading `Sec-Fetch-Site`, and after a
-  DNS rebind that header says `same-origin`, truthfully: the page at `http://evil.example:4747` has had
-  `evil.example` pointed at `127.0.0.1`, so its requests go to your server as its own. Measured over a
-  real loopback socket on 0.9.0: such a page purged Studio's runs (`POST /api/retention/sweep`), ran an
-  agent on the REST API under `gnl dev` (a model call on your key), and READ `GET /api/runs` — prompts
-  and tool arguments; 55 Studio routes answered it 2xx. `makeGate` now refuses, on every method, a
-  request whose `Host` is not `localhost`, a `*.localhost` name, an IP address, or a name you listed —
-  403 with code `host_not_allowed` and the host it saw. After the fix the same sweep leaves only the
-  routes that answer anybody with auth on (UI shell, health, `/capabilities`, API description).
-  **Who is affected:** a server with no auth provider, or with only a `{ read, write }` pair, reached by
-  a name other than those — a custom dev hostname, an ngrok/cloudflared tunnel, Codespaces port
-  forwarding, a Docker service name, or a deliberately open (`allowOpenAccess`) server behind a proxy.
-  LAN IP addresses, `127.0.0.1`, `[::1]` and Docker's published `localhost:<port>` are unaffected, and a
-  provider that binds an identity (`roleAuth`, `@gnldev/auth-ee`) is unaffected. **Way through, one
-  line:** `allowedHosts: ['mybox.test', '.ngrok-free.app']` on `createRestApi` / `createStudioApp` /
-  `makeGate` (leading dot: every name under it; `true`: every name), or
-  `GNL_ALLOWED_HOSTS=mybox.test,.ngrok-free.app` in the environment — read by the gate itself, so
-  `gnl dev`, `gnl studio` and your own server all take it. The 403 names both. See
-  [`docs/errors/host_not_allowed.md`](./docs/errors/host_not_allowed.md).
-- **A valid licence no longer takes away what the free tier gives an application or an end user.**
-  With a licence, `createEnterpriseAuth` still authenticates through its `fallback` (the free
-  `roleAuth`), but `createRbac()`'s default map had no `client` or `end-user` entry. Measured through
-  `@gnldev/server` on 0.9.0: the same `client` token and end-user token that free `roleAuth` served (run
-  200, `GET /runs` 200) got 403 `permission denied: agents:run` with a valid licence — and 200 again once
-  the licence expired. A conformance walk of every free role × every permission the hosts ask (84 pairs:
-  4 roles × 21 checks) found 22 pairs the licence took away; it now finds none. `@gnldev/auth` exports
-  `FREE_ROLE_GRANTS` (what `roleAuth` grants, as permission patterns — checked to answer exactly what
-  `roleAuth` does), and `@gnldev/auth-ee` exports `DEFAULT_ROLE_GRANTS`, built from it plus `member` and
-  `platform-admin`. **Who is affected:** licensed deployments whose fallback or user store carries
-  `client` or `end-user` principals, on the default map — they now get what the free tier gives them
-  (every read, `agents:run`, `workflow:run`, `run:cancel`). A deployment passing its own map to
-  `createRbac` is unchanged: a map still replaces the defaults. **Way through:** to add a role without
-  restating the defaults, `createRbac({ ...DEFAULT_ROLE_GRANTS, support: ['runs:read'] })`; to keep the
-  0.9.0 narrowing, pass the map you want without the spread.
-- **`@gnldev/evals`: the runners give scorers the question and the context.** `answerRelevancy`,
-  `completeness`, `faithfulness`, `hallucination` and `contextPrecision` read `sample.input` or
-  `sample.context`, and `evalDataset` and `scoreRun` built the sample from `{ output, expected, runId }`
-  only. Measured on 0.9.0 with a judge answering `SCORE: 0.9`: `evalDataset` scored `answer-relevancy` 0
-  ("input required"); `scoreRun` scored all four judges 0 and called the judge model zero times — whatever
-  the agent answered. Now `evalDataset` passes each case's `input` (as text) and `context` (a new optional
-  `DatasetCase` field, or the runner's `{ output, context }`, which wins); `scoreRun` reads the question
-  from the run's journaled input and takes `context` (a value, or a function of the run's journal
-  entries), plus an `input` override; the result carries the `input` it used. **Who is affected:** anyone
-  scoring through these runners — scores for those five judges change from a constant 0 to a real
-  judgement. **Breaking:** two scorers with the same name in one call now throw, naming both. They used to
-  collapse into one: the result, the aggregate and the journal memo (`eval:<name>`) are keyed by name, and
-  `scoreRun` answered the second of two default-named `llmJudge` rubrics with the first one's 0.9 without
-  asking its model. Keying by position was rejected: the memo is read on the next run, so reordering the
-  list would hand each scorer another's stored score. **Way through:** `llmJudge({ name: 'polite', ... })`,
-  `faithfulness({ model, name: 'faithful-v2' })`, or `{ ...contains('x'), name: 'has-x' }`.
+### Security
+
+- **A root-scope end user no longer recalls an organization's messages** (ADR-0001: "In the root scope,
+  every organization's rows are hidden"). Measured on 0.9.0: with `memoryPreset(s, 'recall')` and one
+  identity provider that returns the same user id with and without `orgId`, the unbound user's turn
+  carried acme's message into the prompt — on `createRestApi` without `org`, and on the standalone chat
+  door. `MemoryStore.recall` with `scope: 'resource'` filtered by resource id alone, and organization
+  rows live in the root store under `org:<id>:`. All three stores (in-memory, SQLite, Postgres) now rank
+  only the threads in the anchor thread's partition, before `topK` (`recallPartition` in
+  @gnldev/durable). This also fixes the other direction's short page: an organization's recall with
+  `topK: 1` came back empty when another organization's row scored higher, because the org view
+  filtered after the store had picked. Who is affected: anyone serving root-scope and organization users
+  from one store. Way through, for a caller that wants one organization's threads from the root:
+  `withOrgStorage(storage, orgId).memory.recall(...)`. Custom `MemoryStore` adapters should apply
+  `inRecallPartition` in their resource branch.
+- **Root observational memory no longer ranks by an organization's observation vectors.**
+  `AgentMemory.recallObservationsSemantic` on a root memory queried every namespace; an organization's
+  vector for a thread with the same bare id carried the same per-thread `obsId` (`obs-0`) and answered
+  with the root's unrelated observation. Hits outside the memory's own namespace are now dropped.
+  `OmVectorMatch` gains an optional `namespace`.
 
 ## [0.9.0] — 2026-09-30
 
