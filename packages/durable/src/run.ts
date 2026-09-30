@@ -3430,8 +3430,8 @@ export async function resumeRun(
  * schemaCompat for one run — shared by runDurable and streamDurable. Every schema decision is made
  * in @gnldev/tool-schema; this only picks WHERE the rules run.
  *
- * A fallback chain shapes per CANDIDATE, at the moment one is chosen (`shapeToolDefinitions` on the
- * wire), rather than once here for whichever model the proxy claims to be: providers disagree
+ * A fallback chain shapes per CANDIDATE, at the moment one is chosen (`chainToolCompat`'s `shape` on
+ * the wire), rather than once here for whichever model the proxy claims to be: providers disagree
  * (OpenAI's strict mode requires `additionalProperties: false`; Gemini rejects the keyword), so no
  * single shape serves a mixed chain. See setChainToolShaper. A plain model is shaped here, once.
  *
@@ -3446,11 +3446,12 @@ async function applySchemaCompat(
   model: unknown,
   tools: Record<string, any>,
 ): Promise<Record<string, any>> {
-  const { applyToolCompat, shapeToolDefinitions, keepToolValidation, defaultRules } = await import('@gnldev/tool-schema');
+  const { applyToolCompat, chainToolCompat, defaultRules } = await import('@gnldev/tool-schema');
   const rules = schemaCompat === true ? defaultRules : schemaCompat;
-  if (setChainToolShaper(model, (definitions: any[], candidate: unknown) => shapeToolDefinitions(definitions, candidate, rules))) {
-    return keepToolValidation(tools);
-  }
+  // One object owns both halves on the chain path: what each candidate is sent, and the validators
+  // that read an invited null back through the record of what it was sent.
+  const chain = chainToolCompat(tools, rules);
+  if (setChainToolShaper(model, chain.shape)) return chain.tools;
   return applyToolCompat(tools, model, rules);
 }
 

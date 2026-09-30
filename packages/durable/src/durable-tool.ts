@@ -1862,11 +1862,25 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // here let a crash loop launder the counter — one crash between two throws reset it to 1.
         // 'suspended' is deliberately excluded: an approved resume is the FIRST attempt of that call.
         const prevAttempts = record && (record.status === 'failed' || record.status === 'running') ? (record.attempts ?? 1) : 0;
+        // The error text is tool data like any output: the processors that see the output see this
+        // too (`processToolError`), before it is journaled. The thrown error is rethrown untouched.
+        let journaledError = String(error?.message ?? error);
+        if (ctx.toolResultProcessors?.length) {
+          const procCtx = createProcessorCtx(ctx.journal, ctx.runId);
+          try {
+            for (const proc of ctx.toolResultProcessors) {
+              if (proc.processToolError) journaledError = (await proc.processToolError({ toolName, toolCallId, input, error: journaledError }, procCtx)).error;
+            }
+          } catch {
+            // Fail closed: a redactor that could not finish must not leave the raw text behind it.
+            journaledError = `[tool error withheld: a processToolError hook threw while processing the error of '${toolName}']`;
+          }
+        }
         await writeToolTerminal(
           ctx, key,
           // Stamp `sideEffect` so this failed ATTEMPT counts toward maxToolCalls (its
           // effect may have posted before the throw) and seedFromHistory can reconstruct the same count.
-          { status: 'failed', error: String(error?.message ?? error), attempts: prevAttempts + 1, sideEffect },
+          { status: 'failed', error: journaledError, attempts: prevAttempts + 1, sideEffect },
           toolCallId, toolName, hash,
         );
         // Release the duplicate marker this call claimed before executing. It was claimed to stop a

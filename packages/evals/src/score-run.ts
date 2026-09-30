@@ -1,6 +1,6 @@
-import { durableProcessorStep, runKeys } from '@gnldev/durable';
+import { memoizeScoring, runKeys, scoreSample, assertDistinctScorerNames, inputText } from '@gnldev/durable';
 import type { JournalReader, Journal, JournalEntry } from '@gnldev/durable';
-import { assertDistinctScorerNames, inputText, type Scorer, type ScoreResult, type ScoreSample } from './scorer.js';
+import type { Scorer, ScoreResult, ScoreSample } from './scorer.js';
 
 export interface ScoreRunResult {
   runId: string;
@@ -13,7 +13,11 @@ export interface ScoreRunResult {
 export interface ScoreRunOptions {
   /** Reference value for `exactMatch`/`contains`-style scorers. */
   expected?: string;
-  /** Memoize each score in the journal (default true when the journal is writable). */
+  /**
+   * Memoize each score in the journal (default true when the journal is writable). A memo is replayed
+   * only for the same sample (output, question, expected, context): score the run again with another
+   * `expected`, or after an upgrade that completed the sample, and the scorer runs again.
+   */
   memo?: boolean;
   /**
    * The question, as `sample.input`. Default: the run's own journaled input — its prompt, or the last
@@ -40,7 +44,7 @@ function extractFinalText(entries: JournalEntry[]): string {
 /**
  * Scores a run from its JOURNAL TRACE (post-execution, deterministic). Same journal → same
  * output → same score for rule-based scorers. If the journal is writable, each scorer result is
- * memoized under `${runId}:proc:eval:${name}` → even llmJudge returns the SAME score on resume
+ * memoized under `${runId}:proc:eval:${name}` → even llmJudge returns the SAME score on resume, for the same sample
  * (something most eval frameworks don't have: journal-based replayable scoring). Can be disabled with `memo:false`.
  */
 export async function scoreRun(
@@ -49,7 +53,7 @@ export async function scoreRun(
   scorers: Scorer[],
   opts: ScoreRunOptions = {},
 ): Promise<ScoreRunResult> {
-  assertDistinctScorerNames(scorers, 'scoreRun');
+  assertDistinctScorerNames(scorers, '@gnldev/evals scoreRun');
   const entries = await reader.readRun(runId);
   const output = extractFinalText(entries);
   const j = reader as Partial<Journal>;
@@ -60,18 +64,14 @@ export async function scoreRun(
   const context = typeof opts.context === 'function' ? opts.context(entries) : opts.context;
   // runId is included so trajectory-style scorers (see trajectory.ts's trajectoryScorerFor) can look
   // this run's decision sequence back up without any extra wiring at the call site (P1.1).
-  const sample: ScoreSample = {
-    output, expected: opts.expected, runId,
-    ...(input !== undefined ? { input } : {}),
-    ...(context !== undefined ? { context } : {}),
-  };
+  const sample: ScoreSample = scoreSample({ output, input, expected: opts.expected, context, runId });
 
   const canMemo = opts.memo !== false && typeof j.get === 'function' && typeof j.put === 'function';
 
   const scores: Record<string, ScoreResult> = {};
   for (const s of scorers) {
     scores[s.name] = canMemo
-      ? await durableProcessorStep(j as Journal, runId, `eval:${s.name}`, () => s.score(sample))
+      ? await memoizeScoring(j as Journal, runId, `eval:${s.name}`, sample, () => s.score(sample))
       : await s.score(sample);
   }
   return { runId, output, ...(input !== undefined ? { input } : {}), scores };

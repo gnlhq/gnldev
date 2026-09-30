@@ -14,7 +14,7 @@ import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { z as z4 } from 'zod4';
 import { tool, jsonSchema, asSchema } from 'ai';
-import { applyToolCompat, defaultRules } from '../src/index.js';
+import { applyToolCompat, shapeToolDefinitions, defaultRules, type ToolSchemaRule } from '../src/index.js';
 
 const OPENAI = { provider: 'openai.chat', modelId: 'gpt-4o' };
 const GEMINI = { provider: 'google.generative-ai', modelId: 'gemini-1.5-pro' };
@@ -119,5 +119,113 @@ describe('z.record under the OpenAI rule', () => {
   it('a plain object is still closed', () => {
     const js = patched(z.object({ o: z.object({ a: z.string() }) })).jsonSchema as any;
     expect(js.properties.o.additionalProperties).toBe(false);
+  });
+});
+
+// Round 2. Invariant (K1): a value a well-behaved model sends under the schema it was TOLD validates
+// as the original reads it. The reading of an invited null used to be written by hand, separately
+// from the rule that invites it, and guessed from the ORIGINAL schema — and that guess only descended
+// into a union with exactly one non-null branch. So inside a discriminatedUnion or a z.union of
+// objects, the null the model was told to send was refused (measured: `{ kind: 'a', note: null }`
+// failed validation although the schema sent said `note: string | null`). The rule now records each
+// node it widens, and the inverse reads those records off the schema that was sent.
+describe('the null the OpenAI rule invites, inside unions', () => {
+  const act = z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('a'), note: z.string().optional() }),
+    z.object({ kind: z.literal('b'), n: z.number().optional() }),
+  ]);
+
+  it('discriminated union: the branch the value is in reads null as absent', async () => {
+    const told = JSON.stringify(patched(z.object({ act })).jsonSchema);
+    expect(told).toContain('null');
+    expect(await check(z.object({ act }), { act: { kind: 'a', note: null } })).toEqual({ success: true, value: { act: { kind: 'a' } } });
+    expect(await check(z.object({ act }), { act: { kind: 'b', n: null } })).toEqual({ success: true, value: { act: { kind: 'b' } } });
+  });
+
+  it('plain z.union of objects: the value\'s own keys pick the branch', async () => {
+    const q = z.union([z.object({ a: z.string(), x: z.string().optional() }), z.object({ b: z.number(), y: z.number().optional() })]);
+    expect(await check(z.object({ q }), { q: { b: 1, y: null } })).toEqual({ success: true, value: { q: { b: 1 } } });
+    expect(await check(z.object({ q }), { q: { a: 's', x: null } })).toEqual({ success: true, value: { q: { a: 's' } } });
+  });
+
+  it('nested unions: a union inside a union branch', async () => {
+    const inner = z.union([z.object({ c: z.string(), note: z.string().optional() }), z.object({ d: z.number() })]);
+    const outer = z.discriminatedUnion('kind', [z.object({ kind: z.literal('x'), inner }), z.object({ kind: z.literal('y') })]);
+    expect(await check(z.object({ outer }), { outer: { kind: 'x', inner: { c: 'k', note: null } } }))
+      .toEqual({ success: true, value: { outer: { kind: 'x', inner: { c: 'k' } } } });
+  });
+
+  it('an array of unions: each item reads its own branch', async () => {
+    const list = z.array(act);
+    expect(await check(z.object({ list }), { list: [{ kind: 'a', note: null }, { kind: 'b', n: 3 }, { kind: 'b', n: null }] }))
+      .toEqual({ success: true, value: { list: [{ kind: 'a' }, { kind: 'b', n: 3 }, { kind: 'b' }] } });
+  });
+
+  it('a null the author allowed in one branch stays null there', async () => {
+    const u = z.union([z.object({ a: z.string(), note: z.string().nullable() }), z.object({ b: z.number(), note: z.string().optional() })]);
+    expect(await check(z.object({ u }), { u: { a: 's', note: null } })).toEqual({ success: true, value: { u: { a: 's', note: null } } });
+  });
+
+  it('a null at a key no branch widened is still an error', async () => {
+    expect((await check(z.object({ act }), { act: null })).success).toBe(false);
+    expect((await check(z.object({ act }), { act: { kind: null } })).success).toBe(false);
+  });
+});
+
+// The same invariant for rules this package does not ship: a custom rule that widens a node says so
+// through the context the pipeline hands it, and the inverse reads that record — nothing about the
+// custom rule has to be known here.
+describe('a custom rule records what it widens', () => {
+  const makeNullable: ToolSchemaRule = {
+    name: 'nullable-limit',
+    shouldApply: () => true,
+    transform(schema, _model, ctx) {
+      const limit = schema.properties?.limit;
+      if (limit) {
+        limit.type = [limit.type, 'null'];
+        schema.required = [...(schema.required ?? []), 'limit'];
+        ctx?.nullMeansAbsent(limit);
+      }
+      return schema;
+    },
+  };
+
+  it('its null is read as absent, and .default() then fills the key', async () => {
+    const t = tool({ description: 'd', inputSchema: z.object({ q: z.string(), limit: z.number().default(10) }), execute: async () => 'ok' });
+    const s = asSchema(applyToolCompat({ t }, 'custom/model', [makeNullable]).t.inputSchema as any);
+    expect(await s.validate!({ q: 'x', limit: null })).toEqual({ success: true, value: { q: 'x', limit: 10 } });
+  });
+});
+
+// Invariant (K3, the narrowing names its way through): `strict: true` plus an open object is a schema
+// OpenAI refuses at request time — with no GNL message. The OpenAI rule leaves an open object open
+// (closing it told the model a map takes no keys), so under strict it now refuses the tool itself,
+// before the model is called, naming both ways through.
+describe('strict: true with an open object under the OpenAI rule', () => {
+  const rec = (inputSchema: any) => ({ description: 'm', strict: true, inputSchema, execute: async (a: unknown) => a });
+
+  it('applyToolCompat refuses it, naming both ways through', () => {
+    expect(() => applyToolCompat({ rec: rec(z.object({ tags: z.record(z.string(), z.number()) })) }, OPENAI, defaultRules))
+      .toThrow(/tool 'rec'.*strict: true.*declare the keys with z\.object, or drop strict/s);
+  });
+
+  it('the same for catchall and a loose object', () => {
+    expect(() => applyToolCompat({ rec: rec(z.object({ a: z.string() }).catchall(z.string())) }, OPENAI, defaultRules)).toThrow(/drop strict/);
+    expect(() => applyToolCompat({ rec: rec(z.object({ a: z.string() }).passthrough()) }, OPENAI, defaultRules)).toThrow(/drop strict/);
+  });
+
+  it('shapeToolDefinitions (the chain path) refuses it the same way', () => {
+    const defs = [{ type: 'function', name: 'rec', strict: true, inputSchema: { type: 'object', properties: { tags: { type: 'object', additionalProperties: { type: 'number' } } }, required: ['tags'] } }];
+    expect(() => shapeToolDefinitions(defs, OPENAI, defaultRules)).toThrow(/tool 'rec'.*drop strict/s);
+  });
+
+  it('the ways through work: no strict, or declared keys', () => {
+    const open = { ...rec(z.object({ tags: z.record(z.string(), z.number()) })), strict: undefined };
+    expect(() => applyToolCompat({ open }, OPENAI, defaultRules)).not.toThrow();
+    expect(() => applyToolCompat({ rec: rec(z.object({ tags: z.object({ a: z.number() }) })) }, OPENAI, defaultRules)).not.toThrow();
+  });
+
+  it('other providers are not affected by the OpenAI refusal', () => {
+    expect(() => applyToolCompat({ rec: rec(z.object({ tags: z.record(z.string(), z.number()) })) }, GEMINI, defaultRules)).not.toThrow();
   });
 });

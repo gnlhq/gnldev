@@ -1,7 +1,7 @@
 import { recordProcessorReport } from '@gnldev/durable';
-import type { Processor, ProcessorCtx, ProcessorInput, ProcessorOutput, ProcessorToolResult } from '@gnldev/durable';
+import type { Processor, ProcessorCtx, ProcessorInput, ProcessorOutput, ProcessorToolResult, ProcessorToolError } from '@gnldev/durable';
 import {
-  redactString, redactMessages, applyRedactions, PII_PATTERNS,
+  redactString, redactMessages, applyRedactions, compileRedactions, PII_PATTERNS,
   type PiiType, type PiiPattern,
 } from './redact.js';
 
@@ -130,14 +130,69 @@ function countRedactions(
 }
 
 /**
+ * A label for a thrown value that the value cannot choose. `err.name` is the thrower's text — an Error
+ * whose name is the email put the email into the marker and the console warning — so only built-in
+ * constructors are named, by identity, and everything else is `Error` or `non-Error`.
+ */
+function thrownLabel(err: unknown): string {
+  if (err instanceof RangeError) return 'RangeError'; // the stack overflow of a structure too deep to walk
+  if (err instanceof TypeError) return 'TypeError';
+  if (err instanceof Error) return 'Error';
+  return 'non-Error';
+}
+
+/** Buffer, typed arrays, DataView: bytes, which no text pattern can read — see `redactStructured`. */
+const isBinary = (v: object): boolean => ArrayBuffer.isView(v) || v instanceof ArrayBuffer;
+
+/**
+ * The primitive inside a `new String/Number/Boolean(…)`, as JSON.stringify unwraps it; `undefined`
+ * for anything else. The tag is only a cheap filter (it can be forged with `Symbol.toStringTag`); the
+ * `valueOf` brand check is what decides, and a forged tag is walked as the object it really is.
+ */
+function unbox(v: object): string | number | boolean | undefined {
+  const tag = Object.prototype.toString.call(v);
+  try {
+    if (tag === '[object String]') return String.prototype.valueOf.call(v);
+    if (tag === '[object Number]') return Number.prototype.valueOf.call(v);
+    if (tag === '[object Boolean]') return Boolean.prototype.valueOf.call(v);
+  } catch {
+    // not really boxed: the tag lied
+  }
+  return undefined;
+}
+
+/** A path segment chain, turned into `$.a[0]["k"]` text only for a path that is reported. */
+type PathNode = { up: PathNode | undefined; seg: string | number } | undefined;
+function pathText(p: PathNode): string {
+  const segs: (string | number)[] = [];
+  for (let n = p; n; n = n.up) segs.push(n.seg);
+  let out = '$';
+  for (let i = segs.length - 1; i >= 0; i--) {
+    const s = segs[i]!;
+    out += typeof s === 'number' ? `[${s}]` : /^[A-Za-z_$][\w$]*$/.test(s) ? `.${s}` : `[${JSON.stringify(s)}]`;
+  }
+  return out;
+}
+
+/**
  * Redacts a structured value by walking it — never by re-parsing text, which is what failed open.
  *
- * Each string leaf and each key goes through `redact`; numbers, booleans, null and bigint are kept
- * as they are. The shape follows what `JSON.stringify` (and so the journal) would store: `toJSON` is
- * honoured (a `Date` becomes its ISO text, then is redacted as text), own enumerable keys only,
- * functions/symbols/undefined dropped from objects and nulled in arrays. Two deviations, both so the
- * walk FINISHES where serialisation would throw: a cyclic back-reference becomes `'[Circular]'`, and
- * a bigint is kept. A key masked into one already present gets `#2`, `#3`… instead of overwriting it.
+ * INVARIANT: the value returned holds no text the patterns did not see. The journal stores it with
+ * superjson, so the walk follows what superjson would store, node by node:
+ *   - a string, a key, and a boxed `new String(…)` (unwrapped, as JSON.stringify does) go through
+ *     `redact`; numbers, booleans, null and bigint are kept; boxed Number/Boolean become primitives;
+ *   - `toJSON` is honoured (a `Date` becomes its ISO text, then is redacted as text; what toJSON
+ *     returns is walked by these same rules, so a toJSON returning a boxed String is unwrapped too);
+ *   - an array, a Map and a Set are walked into a new array/Map/Set (superjson keeps Map and Set with
+ *     their contents, so turning them into `{}` lost data); any other object by its own enumerable
+ *     keys, functions/symbols/undefined dropped from objects and nulled in arrays;
+ *   - binary data — a Buffer, a typed array, a DataView, an ArrayBuffer — is WITHHELD: replaced by a
+ *     marker naming the way through, and its path reported. It is checked BEFORE toJSON, because a
+ *     Buffer's toJSON hands over its bytes as numbers, and a typed array's keys are indices holding
+ *     numbers: either way the email reached the journal as bytes, which no text pattern can read.
+ * Two deviations from serialisation, both so the walk FINISHES where it would throw: a cyclic
+ * back-reference becomes `'[Circular]'`, and a bigint is kept. A key masked into one already present
+ * gets `#2`, `#3`… instead of overwriting it.
  *
  * Throws whatever a getter or `toJSON` throws (or a RangeError on a structure too deep to recurse);
  * the caller turns that into a marker. It never returns a partially-walked original.
@@ -145,61 +200,99 @@ function countRedactions(
 function redactStructured(
   value: unknown,
   redact: (text: string) => { text: string; total: number; types: string[] },
-): { value: unknown; total: number; types: string[]; paths: string[] } {
+  withheldMarker: string,
+): { value: unknown; total: number; types: string[]; paths: string[]; withheld: string[] } {
   let total = 0;
   const hit = new Set<string>();
   const paths: string[] = [];
+  const withheld: string[] = [];
   const ancestors = new Set<object>();
-  const record = (r: { total: number; types: string[] }, path: string) => {
+  // Keys repeat on every row of a result set; each distinct key is redacted once per walk.
+  const keyCache = new Map<string, { text: string; total: number; types: string[] }>();
+  const record = (r: { total: number; types: string[] }, path: PathNode) => {
     if (r.total === 0) return;
     total += r.total;
     for (const t of r.types) hit.add(t);
-    paths.push(path);
+    paths.push(pathText(path));
   };
-  const text = (s: string, path: string): string => {
+  const text = (s: string, path: PathNode): string => {
     const r = redact(s);
     record(r, path);
     return r.text;
   };
+  const redactKey = (k: string) => {
+    let r = keyCache.get(k);
+    if (!r) { r = redact(k); keyCache.set(k, r); }
+    return r;
+  };
+  const withhold = (path: PathNode): string => {
+    withheld.push(pathText(path));
+    return withheldMarker;
+  };
   const dropped = (v: unknown) => v === undefined || typeof v === 'function' || typeof v === 'symbol';
 
-  const walk = (input: unknown, key: string, path: string): unknown => {
+  const walk = (input: unknown, key: string, path: PathNode): unknown => {
     let v = input;
-    if (v !== null && typeof v === 'object' && typeof (v as { toJSON?: unknown }).toJSON === 'function') {
-      v = (v as { toJSON: (k: string) => unknown }).toJSON(key);
-    }
     if (typeof v === 'string') return text(v, path);
     if (v === null || typeof v !== 'object') return v;
+    if (isBinary(v)) return withhold(path);
+    if (typeof (v as { toJSON?: unknown }).toJSON === 'function') {
+      v = (v as { toJSON: (k: string) => unknown }).toJSON(key);
+      if (typeof v === 'string') return text(v, path);
+      if (v === null || typeof v !== 'object') return v;
+      if (isBinary(v)) return withhold(path);
+    }
+    const prim = unbox(v);
+    if (prim !== undefined) return typeof prim === 'string' ? text(prim, path) : prim;
     if (ancestors.has(v)) return '[Circular]';
     ancestors.add(v);
     try {
       if (Array.isArray(v)) {
         return v.map((item, i) => {
-          const w = walk(item, String(i), `${path}[${i}]`);
+          const w = walk(item, String(i), { up: path, seg: i });
           return dropped(w) ? null : w;
         });
       }
-      const out = new Map<string, unknown>();
+      if (v instanceof Map) {
+        const out = new Map<unknown, unknown>();
+        let i = 0;
+        for (const [k, item] of v) {
+          const at: PathNode = { up: path, seg: i++ };
+          const wk = typeof k === 'string' ? text(k, at) : walk(k, '', at);
+          let unique = wk;
+          for (let n = 2; typeof wk === 'string' && out.has(unique); n++) unique = `${wk}#${n}`;
+          out.set(unique, walk(item, typeof k === 'string' ? k : '', at));
+        }
+        return out;
+      }
+      if (v instanceof Set) {
+        const out = new Set<unknown>();
+        let i = 0;
+        for (const item of v) out.add(walk(item, '', { up: path, seg: i++ }));
+        return out;
+      }
+      const out: Record<string, unknown> = {};
       for (const k of Object.keys(v)) {
         // Paths name the MASKED key: a report must not carry the PII it reports on.
-        const masked = redact(k);
+        const masked = redactKey(k);
         const name = masked.text;
-        const at = /^[A-Za-z_$][\w$]*$/.test(name) ? `${path}.${name}` : `${path}[${JSON.stringify(name)}]`;
+        const at: PathNode = { up: path, seg: name };
         const item = walk((v as Record<string, unknown>)[k], k, at);
         if (dropped(item)) continue;
         record(masked, at);
         let unique = name;
-        for (let n = 2; out.has(unique); n++) unique = `${name}#${n}`;
-        out.set(unique, item);
+        for (let n = 2; Object.prototype.hasOwnProperty.call(out, unique); n++) unique = `${name}#${n}`;
+        // defineProperty, so a `__proto__` key stays data instead of setting the prototype.
+        if (unique === '__proto__') Object.defineProperty(out, unique, { value: item, enumerable: true, writable: true, configurable: true });
+        else out[unique] = item;
       }
-      // fromEntries defines own properties, so a `__proto__` key stays data instead of a prototype.
-      return Object.fromEntries(out);
+      return out;
     } finally {
       ancestors.delete(v);
     }
   };
-  const out = walk(value, '', '$');
-  return { value: out, total, types: [...hit], paths };
+  const out = walk(value, '', undefined);
+  return { value: out, total, types: [...hit], paths, withheld };
 }
 
 /** Aggregates redactions across ALL text fields of a ProcessorInput/ProcessorOutput (system/prompt/messages
@@ -298,38 +391,57 @@ export function piiRedactor(opts: PiiRedactorOptions = {}): Processor {
   // (`redactStructured`), and anything the walk cannot finish is replaced, never passed through.
   if (opts.redactToolResults) {
     const skip = new Set(typeof opts.redactToolResults === 'object' ? opts.redactToolResults.skipTools ?? [] : []);
-    const redactText = (text: string) => applyRedactions(text, types, mask, { extra, validate });
+    const redactText = compileRedactions(types, mask, { extra, validate });
+    const wayThrough = (toolName: string) =>
+      `To journal this tool's output unredacted, pass piiRedactor({ redactToolResults: { skipTools: ['${toolName}'] } })`;
+    // `string[]`, not `PiiType[]`: a custom pattern's name belongs in the audit report too, or the
+    // report would say fewer types were hit than the redaction actually masked.
+    const report = async (ctx: ProcessorCtx, findings: { redactedCount: number; types: string[]; [k: string]: unknown }) => {
+      if (findings.redactedCount > 0 || findings.failedClosed || (findings.withheld as unknown[] | undefined)?.length) {
+        await recordProcessorReport(ctx, 'pii-redactor', 'tool', findings);
+      }
+    };
     // durable-tool.ts ALWAYS awaits THIS HOOK (`await proc.processToolResult(...)`) →
     // making it async doesn't break the existing contract (existing tests already await it too).
     proc.processToolResult = async (res: ProcessorToolResult, ctx: ProcessorCtx) => {
       const { output, toolName } = res;
       if (skip.has(toolName)) return { output };
-      // `string[]`, not `PiiType[]`: a custom pattern's name belongs in the audit report too, or the
-      // report would say fewer types were hit than the redaction actually masked.
-      const report = async (findings: { redactedCount: number; types: string[]; [k: string]: unknown }) => {
-        if (findings.redactedCount > 0 || findings.failedClosed) await recordProcessorReport(ctx, 'pii-redactor', 'tool', findings);
-      };
       if (typeof output === 'string') {
         const r = redactText(output);
-        await report({ redactedCount: r.total, types: r.types });
+        await report(ctx, { redactedCount: r.total, types: r.types });
         return { output: r.text };
       }
       if (output === null || typeof output !== 'object') return { output }; // number/boolean/bigint/undefined: no text to mask
+      const binaryMarker = `[REDACTED_TOOL_RESULT: binary data is not walked, so it was not journaled. ${wayThrough(toolName)}]`;
       let walked: ReturnType<typeof redactStructured>;
       try {
-        walked = redactStructured(output, redactText);
+        walked = redactStructured(output, redactText, binaryMarker);
       } catch (err) {
-        // The error's MESSAGE is repeated nowhere: a throwing getter's message is tool data too.
-        const reason = err instanceof Error ? err.name : typeof err;
-        await report({ redactedCount: 0, types: [], failedClosed: true, reason });
+        // Neither the error's MESSAGE nor its NAME is repeated: both are the thrower's text, and a
+        // throwing getter's text is tool data too (an Error named after the email leaked it here).
+        const reason = thrownLabel(err);
+        await report(ctx, { redactedCount: 0, types: [], failedClosed: true, reason });
         console.warn(`@gnldev/processors: piiRedactor could not walk the output of tool '${toolName}' (${reason}); replaced with a marker, not journaled.`);
-        return {
-          output: `[REDACTED_TOOL_RESULT: piiRedactor could not walk this value (${reason}), so it was not journaled. ` +
-            `To journal this tool's output unredacted, pass piiRedactor({ redactToolResults: { skipTools: ['${toolName}'] } })]`,
-        };
+        return { output: `[REDACTED_TOOL_RESULT: piiRedactor could not walk this value (${reason}), so it was not journaled. ${wayThrough(toolName)}]` };
       }
-      await report({ redactedCount: walked.total, types: walked.types, paths: walked.paths });
+      if (walked.withheld.length) {
+        console.warn(`@gnldev/processors: piiRedactor withheld binary data in the output of tool '${toolName}' at ${walked.withheld.join(', ')}; replaced with a marker, not journaled.`);
+      }
+      await report(ctx, {
+        redactedCount: walked.total, types: walked.types, paths: walked.paths,
+        ...(walked.withheld.length ? { withheld: walked.withheld } : {}),
+      });
       return { output: walked.value };
+    };
+    // The same promise on the ERROR path: a tool that throws `Error('no account for ayse@acme.com')`
+    // had its message journaled as `{status:'failed', error}` with no processor consulted. The text
+    // is redacted like any string output; the thrown error itself is untouched (retry policies and
+    // the caller still see it as thrown).
+    proc.processToolError = async (res: ProcessorToolError, ctx: ProcessorCtx) => {
+      if (skip.has(res.toolName)) return { error: res.error };
+      const r = redactText(res.error);
+      await report(ctx, { redactedCount: r.total, types: r.types, error: true });
+      return { error: r.text };
     };
   }
 

@@ -43,13 +43,19 @@ const r = await evalDataset({
   turn; anything else as JSON). A case may carry `context`; a runner that retrieved its own returns
   `{ output, context }`, which wins.
 - Scorer names must be unique within one call: a score is kept under its scorer's name (result, aggregate,
-  journal memo), so both runners throw on a duplicate, naming both. Give one a `name`
+  journal memo), so both runners — and an agent's `scorers` in `createGnl`, at construction — throw on a
+  duplicate, naming both. Give one a `name`
   (`llmJudge({ name: 'polite', ... })`, `faithfulness({ model, name })`) or rename any scorer with a spread:
   `{ ...contains('x'), name: 'has-x' }`.
 
 ## How it works
 Since scores are written to the journal, the eval suite is idempotent; long suites continue after a crash,
-and the same input produces the same score.
+and the same input produces the same score. A memo is replayed only for what it was computed on: a score
+for the same sample (output, question, expected, context), a dataset case for the same case and the same
+scorer names. Anything else — another `expected`, a scorer added to the suite, a score memoized by 0.9.0
+before the runners passed the question — is computed again and replaces the record. The sample rules
+(`scoreSample`, `inputText`, `assertDistinctScorerNames`, `memoizeScoring`) live in `@gnldev/durable`, so all
+three runners share them.
 
 ## License
 

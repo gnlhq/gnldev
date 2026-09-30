@@ -24,7 +24,7 @@ describe('registry: runtime scorers (C4)', () => {
     expect(r1.scores.len.score).toBe('final answer'.length);
     expect(scorerRuns).toBe(1);
     // journal-memoized: same key schema as scoreRun
-    expect(await journal.get('sc-1:proc:eval:len')).toEqual({ v: { score: 12 } });
+    expect(await journal.get('sc-1:proc:eval:len')).toEqual({ v: { score: 12 }, basis: expect.any(String) });
 
     const r2: any = await gnl.run('a', { runId: 'sc-1', prompt: 'x' }); // replay
     expect(r2.scores.len.score).toBe(12);

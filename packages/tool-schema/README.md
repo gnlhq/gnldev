@@ -40,9 +40,10 @@ const safe = applyToolCompat(tools, detectModel(modelId), defaultRules);
 | `detectModel` | Model id → which provider family it belongs to |
 | `applyToolCompat` | Applies the matching rules to a tool set |
 | `shapeToolDefinitions` | The same rules on the AI SDK's converted tool list, for a model chosen at call time (what `@gnldev/durable` uses per fallback candidate) |
-| `keepToolValidation` | The tool-level half of `shapeToolDefinitions`: same schema sent, validator reads an invited `null` as "absent" |
+| `chainToolCompat` | Both halves for a model chosen at call time: `shape` (per candidate) and `tools` whose validators read an invited `null` back through what that candidate was sent |
+| `ToolSchemaError` | A rule's refusal (e.g. `strict: true` with an open object under OpenAI); it propagates instead of skipping the rule |
 | `defaultRules` | The bundled rule set (OpenAI / Gemini / Anthropic) |
-| `ToolSchemaRule` | The rule interface — add your own for a provider not covered here |
+| `ToolSchemaRule` | The rule interface — add your own for a provider not covered here. `transform(schema, model, ctx)`: a rule that widens a node to accept `null` as "not supplied" calls `ctx.nullMeansAbsent(node)` |
 
 Rules are ordinary objects, so a provider the default set does not know about is a rule you write
 rather than a fork you maintain.
@@ -72,12 +73,14 @@ wants. Keys that were genuinely required are left alone.
 When the model takes up that offer and sends `cc: null`, the tool reads it as `cc` left out: a `null`
 at a key your schema does not require, and does not allow to be `null`, is removed before your
 validator runs. A field you declared `.nullable()` keeps its `null`; a `null` at a required key is
-still an error.
+still an error. The reading comes from the rule's own record of the nodes it widened, read off the
+schema that was sent, so it holds inside unions (a `z.discriminatedUnion`, a `z.union` of objects,
+arrays of either) and for a rule of your own that records through `ctx.nullMeansAbsent`.
 
 An object you declared **open** (`z.record`, `.catchall()`, `z.looseObject`) stays open; every other
 object gets `additionalProperties: false`. OpenAI accepts an open object on any tool that does not set
-`strict: true`. Under `strict: true` it refuses one at request time; declare the keys with `z.object`
-to fix that.
+`strict: true`. Under `strict: true` OpenAI refuses one, so the rule throws a `ToolSchemaError` before
+the model is called: declare the keys with `z.object`, or drop `strict` from the tool.
 
 An `enum` gets `null` added to its **values** too, and a `const` is wrapped in `anyOf` rather than
 widened in place — in both cases changing only `type` would leave a node whose type admits `null`

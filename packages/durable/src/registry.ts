@@ -16,7 +16,7 @@ import { RunBusyError, runBusyMessage, RunSweptError, RunInputMismatchError, Run
 import { admitThreadRun } from './thread-owner.js';
 import { user, staff, callerOf, callerFromResourceId, userIdOf, resolveCaller, identityOf, runIdentity, admitRun, type Caller, type RunIdentity } from './run-identity.js';
 import { recordIdemConflict } from './idem-ledger.js';
-import { durableProcessorStep } from './processor.js';
+import { scoreSample, assertDistinctScorerNames, memoizeScoring } from './scoring.js';
 import { recordRunScores } from './metrics.js';
 import { assertSuiteConsistent } from './suite-consistency.js';
 import { createSuggestions, validateSuggestionsConfig } from './suggestions.js';
@@ -229,13 +229,16 @@ function shouldSampleScorers(runId: string, rate: number): boolean {
 /**
  * Structural compatibility with @gnldev/evals's Scorer (a reverse import would be circular). Runtime
  * scoring: when a run completes, each scorer is memoized under `${runId}:proc:eval:${name}` →
- * EXACTLY-ONCE (even llmJudge doesn't rerun on resume/repeat calls, the same score is returned).
+ * EXACTLY-ONCE for the same sample (even llmJudge doesn't rerun on resume/repeat calls, the same score
+ * is returned; a memo computed on another sample — e.g. by 0.9.0, without the question — is redone).
+ * Names must be distinct per agent: createGnl refuses two scorers with one name.
  * Same key schema as scoreRun — studio /runs/:id/score sees the same records.
  */
 export interface ScorerLike {
   name: string;
   /**
-   * Runtime scoring sample: `output` = the agent's final text, `input` = the run prompt (if given as a string).
+   * Runtime scoring sample: `output` = the agent's final text, `input` = the question — the prompt, or
+   * the last user turn when the run was started with `messages` (built by `scoreSample`, as in evals).
    * NOTE: RAG context (`context`) is NOT AVAILABLE here — scorers that require context (faithfulness,
    * hallucination, contextPrecision) always return 0 in registry scorers; use them with `scoreRun`,
    * which builds a custom sample.
@@ -903,6 +906,11 @@ export function createGnl(config: CreateGnlConfig) {
     validateSuggestionsConfig(config.suggestions, journal);
     suggestionsApi = createSuggestions(journal, config.suggestions);
   }
+  // A score is kept under its scorer's name (result, memo, metrics), so two with one name collapse
+  // into one — refused here, at construction, like the two evals runners refuse it per call.
+  for (const [agentName, a] of Object.entries(config.agents ?? {})) {
+    if (a?.scorers?.length) assertDistinctScorerNames(a.scorers, `createGnl agent '${agentName}'`);
+  }
   function agent(name: string): AgentConfig {
     const a = config.agents?.[name];
     if (!a) throw new Error(`agent '${name}' is not registered`);
@@ -1143,12 +1151,13 @@ export function createGnl(config: CreateGnlConfig) {
     // decision is deterministic per runId so resume/replay can't flip it (see shouldSampleScorers).
     if (a.scorers?.length && result.interrupts.length === 0 && shouldSampleScorers(runId, effectiveScorerRate(a))) {
       const scores: Record<string, unknown> = {};
-      // input = the run prompt (if a string): so question-requiring scorers like answerRelevancy/completeness
-      // can also work in the registry (otherwise they'd silently always return 0). RAG context isn't available here — see ScorerLike.
-      const sample: { output: string; input?: string } = { output: (result as any).text ?? '' };
-      if (typeof opts.prompt === 'string' && opts.prompt) sample.input = opts.prompt;
+      // The sample and the memo follow the rules every scoring runner shares (scoring.ts): the
+      // question is the prompt OR the last user turn of `messages` (a run started with messages used
+      // to give answerRelevancy none), and a memo is replayed only for the sample it was computed on.
+      // RAG context isn't available here — see ScorerLike.
+      const sample = scoreSample({ output: (result as any).text ?? '', input: opts.messages ?? opts.prompt });
       for (const s of a.scorers) {
-        scores[s.name] = await durableProcessorStep(journal, runId, `eval:${s.name}`, () => s.score(sample));
+        scores[s.name] = await memoizeScoring(journal, runId, `eval:${s.name}`, sample, () => s.score(sample));
       }
       (result as any).scores = scores;
       // P2-skor a SECOND, ADDITIVE metrics pass — recordRunMetrics (run.ts's

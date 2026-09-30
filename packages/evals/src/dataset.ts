@@ -6,12 +6,12 @@
 // P1.4 concurrency/timeout/retry. `concurrency` defaults to 1 — EXACTLY the
 // previous sequential `for` loop's behaviour (same order, same one-at-a-time journal writes). Raising
 // it runs cases through a small in-house promise pool; per-case journal memoization is UNAFFECTED
-// because each case's `durableProcessorStep` key (`case:${c.id}`) is disjoint — concurrent cases never
+// because each case's `memoizeScoring` key (`case:${c.id}`) is disjoint — concurrent cases never
 // contend on the same journal key, so "a completed case is skipped on the next run" still holds
 // exactly, at any concurrency.
-import { durableProcessorStep } from '@gnldev/durable';
+import { memoizeScoring, scoreSample, assertDistinctScorerNames } from '@gnldev/durable';
 import type { Journal } from '@gnldev/durable';
-import { assertDistinctScorerNames, inputText, type Scorer, type ScoreResult } from './scorer.js';
+import type { Scorer, ScoreResult } from './scorer.js';
 
 export interface DatasetCase {
   id: string;
@@ -138,7 +138,7 @@ async function runPool<T, R>(items: T[], concurrency: number, worker: (item: T, 
 
 export async function evalDataset(opts: EvalDatasetOptions): Promise<EvalDatasetResult> {
   const { dataset, run, scorers, journal, itemTimeoutMs, signal } = opts;
-  assertDistinctScorerNames(scorers, 'evalDataset');
+  assertDistinctScorerNames(scorers, '@gnldev/evals evalDataset');
   const scope = opts.scope ?? dataset.id;
   const maxAttempts = 1 + Math.max(0, opts.maxRetries ?? 0);
   const concurrency = opts.concurrency ?? 1;
@@ -148,20 +148,19 @@ export async function evalDataset(opts: EvalDatasetOptions): Promise<EvalDataset
     const r = await run(c.input, { runId, caseId: c.id });
     const output = typeof r === 'string' ? r : r.output;
     const context = (typeof r === 'string' ? undefined : r.context) ?? c.context;
-    const input = inputText(c.input);
     const scores: Record<string, ScoreResult> = {};
     // runId is threaded into the sample so journal-backed scorers (e.g. trajectory.ts's
     // TrajectoryScorerFor) can be dropped into `scorers` with no extra wiring (P1.1). `input` and
     // `context` are threaded for the same reason: five of the built-in judges read them, and the sample
     // used to carry neither — answerRelevancy/completeness/faithfulness/hallucination/contextPrecision
     // scored 0 through this runner whatever the agent answered.
-    const sample = { output, expected: c.expected, runId, ...(input !== undefined ? { input } : {}), ...(context !== undefined ? { context } : {}) };
+    const sample = scoreSample({ output, input: c.input, expected: c.expected, context, runId });
     for (const s of scorers) scores[s.name] = await s.score(sample);
     return { caseId: c.id, output, scores };
   };
 
   // Retries (P1.4) happen INSIDE evalCase, before journal memoization ever sees the result: a case
-  // only reaches durableProcessorStep once it has either succeeded or exhausted maxAttempts, and
+  // only reaches memoizeScoring once it has either succeeded or exhausted maxAttempts, and
   // either way that final outcome (success or failure) is what gets memoized/skipped on resume —
   // exactly like every other case result.
   const evalCase = async (c: DatasetCase): Promise<EvalCaseResult> => {
@@ -178,9 +177,15 @@ export async function evalDataset(opts: EvalDatasetOptions): Promise<EvalDataset
     return { caseId: c.id, output: '', scores: {}, error };
   };
 
+  // A case's memo stands for THIS case scored by THESE scorers. Keyed by the case id alone, a suite
+  // re-run with a scorer added replayed the old record — the new scorer never ran and averaged as 0 —
+  // and a suite scored by 0.9.0 (whose samples carried no question) replayed its judges' 0s.
+  const scorerNames = scorers.map((s) => s.name);
   const worker = async (c: DatasetCase): Promise<EvalCaseResult> =>
     // resumable: a completed case returns from the journal (run + scoring do not run again).
-    journal ? await durableProcessorStep(journal, `evalds:${scope}`, `case:${c.id}`, () => evalCase(c)) : await evalCase(c);
+    journal
+      ? await memoizeScoring(journal, `evalds:${scope}`, `case:${c.id}`, { case: c, scorers: scorerNames }, () => evalCase(c))
+      : await evalCase(c);
 
   const cases = await runPool(dataset.cases, concurrency, worker, signal);
 

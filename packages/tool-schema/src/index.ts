@@ -9,9 +9,10 @@
 //   runDurable({ ..., schemaCompat: [mine] })                 // fully your own set
 //
 // Correctness: rules are PURE; run before the model call, never touch the journal.
-export type { JsonSchema, ModelInfo, ToolSchemaRule } from './types.js';
+export type { JsonSchema, ModelInfo, ToolSchemaRule, ShapeContext } from './types.js';
 export { detectModel } from './detect.js';
-export { applyToolCompat, shapeToolDefinitions, keepToolValidation } from './apply.js';
+export { applyToolCompat, shapeToolDefinitions, chainToolCompat } from './apply.js';
+export { ToolSchemaError } from './errors.js';
 export { defaultRules } from './defaults.js';
 export { openaiStrict } from './rules/openai.js';
 export { gemini } from './rules/gemini.js';

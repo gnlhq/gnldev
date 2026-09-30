@@ -55,6 +55,8 @@ export { assertSuiteConsistent, versionsEqual } from './suite-consistency.js';
 export type { AssertSuiteConsistentOptions } from './suite-consistency.js';
 export { StepTimeoutError, withTimeout } from './timeout.js';
 export { argsHash, stableStringify } from './hash.js';
+export { scoreSample, inputText, assertDistinctScorerNames, memoizeScoring } from './scoring.js';
+export type { ScoreSampleFields } from './scoring.js';
 // The run-identity primitive (docs/RUNID-WORKKEY-HEYET-KARARI.md §3-§4). Exported on its own, ahead
 // of any call path that accepts a workKey: package #1 ships the derivation and the reservation so the
 // registry gate (#3) has something already covered by collision vectors to build on.
@@ -128,7 +130,7 @@ export { readRunOutcome, recordRunOutcome, runStarted, runCanceled, isRunFailure
 export { acquireLease, releaseLease, readLease } from './lease.js';
 export type { Lease } from './lease.js';
 export type { RunIncident } from './incidents.js';
-export type { Processor, ProcessorInput, ProcessorOutput, ProcessorCtx, ProcessorToolResult, ProcessorReport, ProcessorStepInput, ProcessorStepOverride, ProcessorStepOutput } from './processor.js';
+export type { Processor, ProcessorInput, ProcessorOutput, ProcessorCtx, ProcessorToolResult, ProcessorToolError, ProcessorReport, ProcessorStepInput, ProcessorStepOverride, ProcessorStepOutput } from './processor.js';
 export { createAgentTool, runSubAgent } from './agent-tool.js';
 export type { AgentToolConfig } from './agent-tool.js';
 export { createGnl, agentVisibleToOrg, sealRequestContext, serverIdentityOf, GNL_RESOURCE_ID_KEY, GNL_ORG_ID_KEY, GNL_THREAD_ID_KEY, GNL_STAFF_KEY } from './registry.js';

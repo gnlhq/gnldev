@@ -107,3 +107,58 @@ describe('schemaCompat keeps tool validation — fallback chain (the other path)
     expect(seen).toEqual([]);
   });
 });
+
+// Round 2 (K1): the inverse of the OpenAI rule is the rule's own record of what it widened, on both
+// paths. Before, both guessed from the original schema and refused the invited null inside a union.
+describe('schemaCompat — the invited null inside a union, on both paths', () => {
+  const actTool = (seen: unknown[]) => tool({
+    description: 'act',
+    inputSchema: z.object({
+      act: z.discriminatedUnion('kind', [
+        z.object({ kind: z.literal('a'), note: z.string().optional() }),
+        z.object({ kind: z.literal('b'), n: z.number().optional() }),
+      ]),
+    }),
+    execute: async (args: any) => { seen.push(args); return 'ok'; },
+  });
+  const sending = (provider: string, input: unknown, fail = false): any => {
+    const m = modelSending(provider, input as Record<string, unknown>, { fail });
+    const inner = m.doGenerate;
+    m.doGenerate = async (o: any) => {
+      const r = await inner(o);
+      if (r.content[0]?.type === 'tool-call') r.content[0].toolName = 'act';
+      return r;
+    };
+    return m;
+  };
+
+  it('plain model', async () => {
+    const seen: unknown[] = [];
+    await runDurable({ runId: 'u-plain', journal: new InMemoryJournal(), prompt: 'go', model: sending('openai.chat', { act: { kind: 'a', note: null } }), tools: { act: actTool(seen) }, schemaCompat: true, stopWhen: stepCountIs(3) } as any);
+    expect(seen).toEqual([{ act: { kind: 'a' } }]);
+  });
+
+  it('fallback chain, OpenAI answering after failover', async () => {
+    const seen: unknown[] = [];
+    const journal = new InMemoryJournal();
+    const model = withModelFallback([
+      { spec: 'anthropic/claude-x', model: sending('anthropic', {}, true) },
+      { spec: 'openai/gpt-4o', model: sending('openai.chat', { act: { kind: 'b', n: null } }) },
+    ], journal, 'u-chain');
+    await runDurable({ runId: 'u-chain', journal, prompt: 'go', model, tools: { act: actTool(seen) }, schemaCompat: true, stopWhen: stepCountIs(3) } as any);
+    expect(seen).toEqual([{ act: { kind: 'b' } }]);
+  });
+});
+
+// Round 2 (K3): `strict: true` + an open object is refused by GNL, with the way through, before OpenAI
+// refuses it with no GNL message.
+describe('schemaCompat — strict: true with an open object', () => {
+  it('the run fails before the model is called, naming the tool and the way through', async () => {
+    let calls = 0;
+    const model: any = { ...modelSending('openai.chat', {}), doGenerate: async () => { calls++; throw new Error('should not be called'); } };
+    const rec = { description: 'm', strict: true, inputSchema: z.object({ tags: z.record(z.string(), z.number()) }), execute: async (a: unknown) => a };
+    await expect(runDurable({ runId: 'strict-open', journal: new InMemoryJournal(), prompt: 'go', model, tools: { rec }, schemaCompat: true } as any))
+      .rejects.toThrow(/tool 'rec'.*declare the keys with z\.object, or drop strict/s);
+    expect(calls).toBe(0);
+  });
+});

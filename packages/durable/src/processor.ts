@@ -82,6 +82,16 @@ export interface Processor {
    */
   processToolResult?(res: ProcessorToolResult, ctx: ProcessorCtx): Promise<{ output: unknown }> | { output: unknown };
   /**
+   * The error-path twin of `processToolResult`: called when a tool's execute THROWS, with the text
+   * about to be journaled as `{ status: 'failed', error }`, BEFORE it is written. The returned `error`
+   * is what the journal stores. A redactor that covers tool output needs this too — a tool that
+   * throws `Error('no account for ayse@acme.com')` put the address in the journal with no processor
+   * consulted. Only the journaled TEXT changes: the thrown error itself propagates as thrown, so a
+   * retry policy or the caller still sees the original class. A hook that throws is not trusted with
+   * a fallback — the journal gets a fixed "withheld" text instead of the unredacted one.
+   */
+  processToolError?(res: ProcessorToolError, ctx: ProcessorCtx): Promise<{ error: string }> | { error: string };
+  /**
    * P2-step called before EVERY model
    * step INSIDE the tool loop (bridged to the AI SDK's `prepareStep`) — unlike `processInput`, which
    * runs once per runDurable call. May override this step's messages/system/activeTools/model
@@ -208,6 +218,14 @@ export interface ProcessorToolResult {
   toolCallId: string;
   input: unknown;
   output: unknown;
+}
+
+/** Tool-error context passed to processToolError: `error` is the text the journal would store. */
+export interface ProcessorToolError {
+  toolName: string;
+  toolCallId: string;
+  input: unknown;
+  error: string;
 }
 
 /** Thrown when a processor blocks content (moderation block) → the run stops. */

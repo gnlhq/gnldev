@@ -182,7 +182,17 @@ export function replaceValidated(
   replacement: string,
   test?: (match: string) => boolean,
 ): { text: string; count: number } {
-  const g = globalize(re);
+  return scan(s, globalize(re), replacement, test);
+}
+
+/** `replaceValidated` on an already-global regex — compiled once by `compileRedactions`, reused per call. */
+function scan(
+  s: string,
+  g: RegExp,
+  replacement: string,
+  test?: (match: string) => boolean,
+): { text: string; count: number } {
+  g.lastIndex = 0; // shared across calls: a scan that threw half-way must not leave the next one mid-text
   let out = '';
   let last = 0;
   let count = 0;
@@ -194,7 +204,7 @@ export function replaceValidated(
     last = m.index + m[0].length;
     count++;
   }
-  return { text: out + s.slice(last), count };
+  return count === 0 ? { text: s, count } : { text: out + s.slice(last), count };
 }
 
 export const patternMask = (p: PiiPattern): string => p.mask ?? `[REDACTED_${p.name.toUpperCase()}]`;
@@ -204,6 +214,8 @@ export interface RedactOptions {
   /** Run the checksums in `PII_VALIDATORS` and each pattern's own `test`. Default: true. */
   validate?: boolean;
 }
+
+export interface RedactResult { text: string; total: number; types: string[] }
 
 /**
  * The ONE place patterns are applied. `redactString` reads the text off it and the audit report reads
@@ -215,30 +227,56 @@ export function applyRedactions(
   types: PiiType[],
   mask: (t: PiiType) => string,
   opts: RedactOptions = {},
-): { text: string; total: number; types: string[] } {
-  const extra = opts.extra ?? [];
+): RedactResult {
+  return compileRedactions(types, mask, opts)(s);
+}
+
+/**
+ * `applyRedactions` with the setup done once, for a caller that redacts many strings with one
+ * configuration — the tool-result walker runs it on every key and leaf of a structure.
+ *
+ * Measured on a ~1MB, 7000-row tool result: calling `applyRedactions` per leaf rebuilt every RegExp
+ * (`globalize`) and the mask text for each of ~42k strings, and the walk took ~95ms. Two things are
+ * done once here instead: the regexes are compiled and the masks computed. And one per call is
+ * skipped: every built-in pattern needs a digit or an `@` somewhere in its match (email has a
+ * literal `@`; card, ssn, ip, phone and iban all need `\d`), so a string holding neither cannot match
+ * a built-in and is not scanned for one. Custom patterns are always scanned — nothing is known about
+ * their shape.
+ */
+export function compileRedactions(
+  types: PiiType[],
+  mask: (t: PiiType) => string,
+  opts: RedactOptions = {},
+): (s: string) => RedactResult {
   const validate = opts.validate !== false;
-  let out = s;
-  let total = 0;
-  const hit: string[] = [];
-
-  const step = (name: string, re: RegExp, replacement: string, test?: (m: string) => boolean) => {
-    const { text, count } = replaceValidated(out, re, replacement, validate ? test : undefined);
-    out = text;
-    if (count > 0) { hit.push(name); total += count; }
-  };
-
+  type Step = { name: string; re: RegExp; replacement: string; test?: (m: string) => boolean };
   // Custom patterns run FIRST, and that order is load-bearing rather than cosmetic: the built-in
   // `phone` is greedy enough to swallow a national id or an ISO date (measured), so a caller-supplied
   // pattern that ran after it would find its text already masked — under the wrong name.
-  for (const p of extra) step(p.name, p.pattern, patternMask(p), p.test);
+  const custom: Step[] = (opts.extra ?? []).map((p) => ({
+    name: p.name, re: globalize(p.pattern), replacement: patternMask(p), test: validate ? p.test : undefined,
+  }));
   // iban first, then creditCard/ssn/ip BEFORE phone (the phone pattern can also catch them).
-  for (const t of ORDER) {
-    if (!types.includes(t)) continue;
-    step(t, PII_PATTERNS[t], mask(t), PII_VALIDATORS[t]);
-  }
-  return { text: out, total, types: hit };
+  const builtin: Step[] = ORDER.filter((t) => types.includes(t)).map((t) => ({
+    name: t, re: globalize(PII_PATTERNS[t]), replacement: mask(t), test: validate ? PII_VALIDATORS[t] : undefined,
+  }));
+  const run = (steps: Step[], acc: RedactResult) => {
+    for (const st of steps) {
+      const { text, count } = scan(acc.text, st.re, st.replacement, st.test);
+      acc.text = text;
+      if (count > 0) { acc.types.push(st.name); acc.total += count; }
+    }
+  };
+  return (s: string): RedactResult => {
+    const acc: RedactResult = { text: s, total: 0, types: [] };
+    run(custom, acc);
+    if (BUILTIN_CAN_MATCH.test(acc.text)) run(builtin, acc);
+    return acc;
+  };
 }
+
+/** Every built-in pattern's match contains one of these (see `compileRedactions`). Keep in step with PII_PATTERNS. */
+const BUILTIN_CAN_MATCH = /[0-9@]/;
 
 export function redactString(
   s: string,

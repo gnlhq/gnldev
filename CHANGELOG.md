@@ -101,7 +101,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `scoreRun` answered the second of two default-named `llmJudge` rubrics with the first one's 0.9 without
   asking its model. Keying by position was rejected: the memo is read on the next run, so reordering the
   list would hand each scorer another's stored score. **Way through:** `llmJudge({ name: 'polite', ... })`,
-  `faithfulness({ model, name: 'faithful-v2' })`, or `{ ...contains('x'), name: 'has-x' }`.
+  `faithfulness({ model, name: 'faithful-v2' })`, or `{ ...contains('x'), name: 'has-x' }`. The same two
+  rules now hold for an agent's `scorers` in `createGnl` (@gnldev/durable): a run started with `messages`
+  gives the scorer its last user turn as `input` (it gave none), and two scorers with one name are refused
+  when `createGnl` is called. One implementation serves all three runners, exported from
+  `@gnldev/durable`: `scoreSample`, `inputText`, `assertDistinctScorerNames`, `memoizeScoring`. **A memo
+  is replayed only for what it was computed on:** a score record (`<runId>:proc:eval:<name>`, still
+  `{ v }`, now with a `basis` hash of the sample) for the same sample, a dataset case for the same case and
+  scorer names. So scores memoized by 0.9.0 without the question are computed again on the first
+  `scoreRun`/run after the upgrade, instead of replaying their 0 — that costs one judge call per such
+  score; `scoreRun(..., { memo: false })` never reads a memo. A suite re-run with a scorer added runs its
+  cases again (the added scorer used to be missing and averaged as 0).
 
 ### Fixed
 
@@ -260,7 +270,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   return objects. Object results that used to pass through now come back masked; a cyclic result that
   used to come back as the same object now comes back as a masked copy. A number is not matched against
   the patterns (it never was: the parse failed first), so a phone number stored as a JSON number is not
-  masked; return it as a string, or map it before returning.
+  masked; return it as a string, or map it before returning. The walk follows what the journal
+  (superjson) stores: a boxed `new String(email)` is unwrapped and masked as text (it used to come back
+  as `{"0":"a","1":"y",…}`, one character per key, unmasked); a `Map` and a `Set` are walked and kept
+  (they used to become `{}`); binary data (a `Buffer`, a typed array, a `DataView`) is replaced by a
+  marker at its path, because its bytes reached the journal as numbers. The fail-closed marker names a
+  fixed error class, never the thrown error's own `name`. A tool that THROWS is covered too: the error
+  text journaled as `{ status: 'failed', error }` is masked, through a new optional `Processor` hook,
+  `processToolError` (@gnldev/durable); the thrown error itself is rethrown untouched. On a ~1MB,
+  7000-row result the walk takes ~19ms (it took ~95ms before the patterns were compiled once per
+  redactor).
 - **`schemaCompat` / `applyToolCompat` no longer switch off a tool's input validation.** The patched
   tool's `inputSchema` was a bare `jsonSchema(js)` with no validator, so on every model a rule matched
   (OpenAI, groq, Gemini, Claude) the AI SDK validated nothing. Measured on an OpenAI model with
@@ -271,14 +290,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   kept the zod validator verbatim, which refused the `null` the OpenAI rule tells the model to send for
   an optional field. Both paths now read that `null` (at a key the schema does not require and does not
   allow to be `null`) as the key left out. Both paths run the rules through one function in
-  `@gnldev/tool-schema`, `shapeToolDefinitions`. `keepToolValidation` is new and exported. The chain
+  `@gnldev/tool-schema`, `shapeToolDefinitions`; `chainToolCompat` is new and exported. The chain
   path now also passes the model to each rule's `transform`, as the plain path always did. Separately,
   the OpenAI rule closed every object, including a `z.record`: the model was told a map takes no keys.
   An object declared open (`z.record`, `.catchall()`, `z.looseObject`, `additionalProperties: true`) now
   stays open. **Who is affected:** anyone with `schemaCompat` on, or calling `applyToolCompat`
   directly. Tool calls with invalid input now fail validation instead of running, as they do without
-  compat. A tool with `strict: true` and an open object is now refused by OpenAI at request time; declare
-  the keys with `z.object`. Apart from open objects, the schema sent for a plain model is unchanged,
+  compat. A tool with `strict: true` and an open object is now refused before the model is called, with
+  a `ToolSchemaError` naming the tool: declare the keys with `z.object`, or drop `strict`. The reading of
+  an invited `null` is the rule's own record of what it widened (`transform(schema, model, ctx)`,
+  `ctx.nullMeansAbsent(node)`), so it holds inside a `z.discriminatedUnion`, a `z.union` of objects and
+  arrays of either — measured before: `{ kind: 'a', note: null }` was refused in a discriminated union. A
+  custom rule that widens a node to accept `null` records it the same way; one that does not is read as
+  before it existed (its `null` fails the tool's validation). Apart from open objects, the schema sent for a plain model is unchanged,
   so the model request hash of a run started before the upgrade still matches. The tool `argsHash` may
   not: a run started on 0.9.0 with compat on, whose tool call used a `.default()`, a `.transform()` or
   an invited `null`, hashes that call differently when it replays after the upgrade. That is a console

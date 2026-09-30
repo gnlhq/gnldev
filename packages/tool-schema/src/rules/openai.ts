@@ -1,4 +1,5 @@
-import type { ToolSchemaRule, JsonSchema } from '../types.js';
+import type { ToolSchemaRule, JsonSchema, ShapeContext } from '../types.js';
+import { ToolSchemaError } from '../errors.js';
 import { walk, stripStringFormats } from './util.js';
 
 /**
@@ -50,8 +51,8 @@ import { walk, stripStringFormats } from './util.js';
  * `enum`, `const`, `oneOf` or `allOf`, none of which can express nullability without changing what
  * they mean. A node with no type constraint at all already permits null and is left untouched.
  */
-function allowNull(prop: any): any {
-  if (!prop || typeof prop !== 'object') return prop;
+function allowNull(prop: any): { node: any; widened: boolean } {
+  if (!prop || typeof prop !== 'object') return { node: prop, widened: false };
 
   // `const` FIRST, and that order is the fix rather than a detail. A `const` node normally carries a
   // `type` too (zod emits `z.literal('yes')` as `{type:'string', const:'yes'}`), so the type branch
@@ -60,27 +61,33 @@ function allowNull(prop: any): any {
   // Nothing satisfies that, which is the same unsatisfiable-node bug this rule fixes for `enum`,
   // surviving one branch away from it. A single permitted value cannot be widened in place the way an
   // enum's list can, so the node is wrapped instead.
-  if (prop.const !== undefined) return { anyOf: [prop, { type: 'null' }] };
+  if (prop.const !== undefined) return prop.const === null ? { node: prop, widened: false } : { node: { anyOf: [prop, { type: 'null' }] }, widened: true };
 
   if (Array.isArray(prop.type) || typeof prop.type === 'string' || Array.isArray(prop.enum)) {
     // An `enum` restricts the VALUE set, so widening `type` alone would leave a node whose type
     // admits null while its enum still forbids it — unsatisfiable, which is the bug being fixed
     // rather than a narrower version of it. Zod emits `.enum([...]).optional()` in exactly this
     // shape (`{type:'string', enum:[...]}`), so it is the common case, not a corner.
-    if (Array.isArray(prop.enum) && !prop.enum.includes(null)) prop.enum = [...prop.enum, null];
+    const typeHadNull = prop.type === 'null' || (Array.isArray(prop.type) && prop.type.includes('null'));
+    const enumHadNull = Array.isArray(prop.enum) && prop.enum.includes(null);
+    // Already admitted null (the author wrote `.nullable()`): nothing was widened, and a null there is
+    // the author's null, not "not supplied" — it must not be recorded.
+    const admitted = Array.isArray(prop.enum) ? enumHadNull : typeHadNull;
+    if (Array.isArray(prop.enum) && !enumHadNull) prop.enum = [...prop.enum, null];
     if (Array.isArray(prop.type)) {
       if (!prop.type.includes('null')) prop.type = [...prop.type, 'null'];
     } else if (typeof prop.type === 'string' && prop.type !== 'null') {
       prop.type = [prop.type, 'null'];
     }
-    return prop;
+    return { node: prop, widened: !admitted };
   }
   if (Array.isArray(prop.anyOf)) {
-    if (!prop.anyOf.some((s: any) => s?.type === 'null')) prop.anyOf = [...prop.anyOf, { type: 'null' }];
-    return prop;
+    if (prop.anyOf.some((s: any) => s?.type === 'null')) return { node: prop, widened: false };
+    prop.anyOf = [...prop.anyOf, { type: 'null' }];
+    return { node: prop, widened: true };
   }
   const constrained = prop.$ref !== undefined || Array.isArray(prop.oneOf) || Array.isArray(prop.allOf);
-  return constrained ? { anyOf: [prop, { type: 'null' }] } : prop;
+  return constrained ? { node: { anyOf: [prop, { type: 'null' }] }, widened: true } : { node: prop, widened: false };
 }
 
 /**
@@ -126,7 +133,7 @@ export const openaiStrict: ToolSchemaRule = {
   name: 'openai-strict',
   shouldApply: (m) =>
     m.provider.includes('openai') || m.modelId.includes('openai') || m.provider.includes('groq'),
-  transform(schema: JsonSchema) {
+  transform(schema: JsonSchema, _model, ctx?: ShapeContext) {
     // Two passes, because the second needs an answer the first has to produce: which object nodes are
     // BRANCHES of an `allOf` that could not be merged. `walk` visits a branch on its own and cannot
     // say what contains it, and a branch is exactly where `additionalProperties: false` is fatal —
@@ -161,12 +168,25 @@ export const openaiStrict: ToolSchemaRule = {
         const open = n.additionalProperties === true
           || (n.additionalProperties !== null && typeof n.additionalProperties === 'object');
         if (!open) n.additionalProperties = false;
+        else if (ctx?.strict === true) {
+          // A narrowing names its way through: sent as it is, OpenAI refuses the request with its own
+          // message and nothing pointing here (measured: no GNL message at all).
+          throw new ToolSchemaError(
+            'strict: true with an object declared open (z.record, .catchall(), a loose object or additionalProperties) — ' +
+            'OpenAI strict mode refuses open objects: declare the keys with z.object, or drop strict from the tool.',
+          );
+        }
         if (n.properties && typeof n.properties === 'object') {
           // Which keys were optional BEFORE this rule makes everything required — read first,
           // because the next statement destroys the answer.
           const optional = new Set(Object.keys(n.properties));
           for (const k of Array.isArray(n.required) ? n.required : []) optional.delete(k);
-          for (const k of optional) (n.properties as any)[k] = allowNull((n.properties as any)[k]);
+          for (const k of optional) {
+            const { node, widened } = allowNull((n.properties as any)[k]);
+            (n.properties as any)[k] = node;
+            // The record the validator reads back: a null here is "not supplied" (see validate.ts).
+            if (widened) ctx?.nullMeansAbsent(node);
+          }
           n.required = Object.keys(n.properties);
         }
       }

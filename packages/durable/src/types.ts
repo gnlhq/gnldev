@@ -251,6 +251,14 @@ export interface ToolSchemaRuleLike {
   name: string;
   /** Does this rule apply to the given model? */
   shouldApply(model: { provider: string; modelId: string }): boolean;
-  /** Transform the JSON Schema (may mutate in place and return the same object). */
-  transform(schema: Record<string, any>, model: { provider: string; modelId: string }): Record<string, any>;
+  /**
+   * Transform the JSON Schema (may mutate in place and return the same object). `ctx` mirrors
+   * tool-schema's `ShapeContext`: `nullMeansAbsent(node)` records a node widened to accept null as
+   * "not supplied", and `strict` is the tool's own strict flag.
+   */
+  transform(
+    schema: Record<string, any>,
+    model: { provider: string; modelId: string },
+    ctx?: { nullMeansAbsent(node: Record<string, any>): void; strict?: boolean },
+  ): Record<string, any>;
 }

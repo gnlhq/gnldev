@@ -32,7 +32,10 @@ await runDurable({
   patterns are text patterns: `phone` would read an epoch-ms timestamp as a phone). A cyclic reference
   becomes `'[Circular]'`. A value the walk cannot finish (a throwing getter or `toJSON`) is **replaced by
   a `[REDACTED_TOOL_RESULT: …]` marker, never journaled raw**; `redactToolResults: { skipTools: ['name'] }`
-  journals that tool's output as it returned. The audit report lists the paths it masked.
+  journals that tool's output as it returned. The audit report lists the paths it masked. The walk
+  follows what the journal (superjson) stores: a boxed `new String(…)` is masked as text, a `Map`/`Set`
+  is walked and kept, and binary data (`Buffer`, typed arrays) is replaced by a marker at its path. A
+  tool that throws has its journaled error text masked too (the `processToolError` hook).
 - `tokenLimit(...)` · `promptInjectionDetector(...)` · `outputLimit(...)`
 - `piiTextRedactor(opts?) → (text: string) => string` — the same masking as `piiRedactor`, as a plain
   string function, for text that never passes through a processor at all. A `Processor` only sees

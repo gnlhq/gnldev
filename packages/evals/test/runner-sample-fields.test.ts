@@ -185,3 +185,41 @@ describe('two scorers with one name are refused, naming both and the fix', () =>
     expect(d.aggregate).toEqual({ 'has-a': 1, 'has-z': 0 });
   });
 });
+
+// Round 2 (K2): a memoized score is replayed only for the sample it was computed on. 0.9.0 memoized the
+// judges' 0 ("input required") under `eval:<name>`; keyed by name alone, scoreRun replayed that 0 after
+// the upgrade, for every run scored before it (measured by the review: judgeCalls=0, score 0).
+describe('memoized scores from before the sample was complete are not replayed', () => {
+  it('scoreRun: a 0.9.0 memo (no basis) is recomputed with the question, then replayed', async () => {
+    const journal = new InMemoryJournal();
+    await runDurable({ runId: 'run-e', journal, model: echoModel(), prompt: 'What is the capital of France?' });
+    await journal.put('run-e:proc:eval:answer-relevancy', { v: { score: 0, reason: 'input required' } });
+    const j = judge();
+    const first = await scoreRun(journal, 'run-e', [answerRelevancy({ model: j as any })]);
+    expect(first.scores['answer-relevancy']!.score).toBe(0.9);
+    expect(j.prompts).toHaveLength(1);
+    const again = await scoreRun(journal, 'run-e', [answerRelevancy({ model: j as any })]);
+    expect(again.scores['answer-relevancy']!.score).toBe(0.9);
+    expect(j.prompts).toHaveLength(1); // exactly-once for the same sample
+  });
+
+  it('scoreRun: another `expected` for an already-scored run is scored again, not answered from the memo', async () => {
+    const journal = new InMemoryJournal();
+    await runDurable({ runId: 'run-x', journal, model: echoModel(), prompt: 'abc' });
+    expect((await scoreRun(journal, 'run-x', [contains()], { expected: 'zzz' })).scores.contains!.score).toBe(0);
+    expect((await scoreRun(journal, 'run-x', [contains()], { expected: 'abc' })).scores.contains!.score).toBe(1);
+  });
+
+  it('evalDataset: a case memoized under another scorer list is run again, so the new scorer is scored', async () => {
+    const journal = new InMemoryJournal();
+    const dataset = { id: 'ds-m', cases: [{ id: 'c1', input: 'q', expected: 'a' }] };
+    let runs = 0;
+    const run = async () => { runs++; return 'ab'; };
+    await evalDataset({ dataset, run, scorers: [contains('a')], journal });
+    const second = await evalDataset({ dataset, run, scorers: [contains('a'), { ...contains('b'), name: 'has-b' }], journal });
+    expect(second.cases[0]!.scores['has-b']?.score).toBe(1);
+    expect(runs).toBe(2);
+    await evalDataset({ dataset, run, scorers: [contains('a'), { ...contains('b'), name: 'has-b' }], journal });
+    expect(runs).toBe(2); // same case, same scorers: resumed from the journal
+  });
+});
