@@ -5,7 +5,7 @@ import { Hono, type Context } from 'hono';
 import { sseResponse } from './sse.js';
 
 import { STUDIO_ERROR_CODES } from './error-codes.js';
-import { ORG_RECORD_PRE, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, eraseSubject, subjectRuns, toJournal } from '@gnldev/durable';
+import { ORG_RECORD_PRE, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, eraseSubject, subjectRuns, toJournal, decodeStepRecord } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
 import type { JournalReader, Journal, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
@@ -26,14 +26,6 @@ import { pipeAgentStream } from './sse.js';
 export function isWorkflowStepKey(rest: string): boolean {
   if (rest.startsWith('_') || rest.includes(':_')) return false;
   return !rest.endsWith(':attempts');
-}
-/**
- * A step output as @gnldev/workflow stored it, shown as the step returned it: a step that completed
- * with `undefined` is journaled as the branded `{ __gnlVoid: true }` (workflow's `isVoidStepRecord`,
- * matched structurally — the studio core does not import @gnldev/workflow).
- */
-function workflowStepOutput(v: unknown): unknown {
-  return v && typeof v === 'object' && (v as Record<string, unknown>).__gnlVoid === true && Object.keys(v).length === 1 ? undefined : v;
 }
 /** Scheduler view trigger row (same shape as @gnldev/scheduler `listTriggers` — see GET /scheduler/triggers). */
 export type { TriggerInfo } from '@gnldev/scheduler';
@@ -1548,7 +1540,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       output = await wf.run(input, ctx);
     }
     const steps: { id: string; kind: string; output: unknown }[] = [];
-    for (const s of wf.build()) steps.push({ id: s.id, kind: 'agent', output: await ctx.journal.get(`${runId}:wf:${s.id}`) });
+    for (const s of wf.build()) steps.push({ id: s.id, kind: 'agent', output: decodeStepRecord(await ctx.journal.get(`${runId}:wf:${s.id}`)) });
     return { runId, output, suspended, paused, canceled, ...(dryRun ? { dryRun: true } : {}), stepId, reason, steps };
   }
 
@@ -5293,7 +5285,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
           seen.add(k);
           const stepId = k.slice(pre.length);
           if (!isWorkflowStepKey(stepId)) continue;
-          const output = workflowStepOutput(await jget(k).catch(() => undefined));
+          const output = decodeStepRecord(await jget(k).catch(() => undefined));
           await stream.writeSSE({ event: 'step', data: JSON.stringify({ stepId, output, ts: Date.now() }) });
         }
       };
@@ -5325,7 +5317,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       const stepId = k.slice(pre.length);
       const v = await rw.get(k);
       if (stepId === '_suspend') suspend = v;
-      else if (isWorkflowStepKey(stepId)) steps.push({ stepId, output: workflowStepOutput(v) });
+      else if (isWorkflowStepKey(stepId)) steps.push({ stepId, output: decodeStepRecord(v) });
     }
     return c.json({ runId, steps, suspended: !!suspend, suspend });
   });

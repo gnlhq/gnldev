@@ -9,47 +9,96 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Changed
+### Breaking
 
-- **Upgrading a work store adds columns and a table, and the write stays 0.9's.** SQLite and Postgres
-  add `gnl_work_log.seq` (0 = not numbered yet), the index `gnl_work_log_seq` and the table
-  `gnl_work_seq` at startup, like the earlier additive columns; Postgres also adds `gnl_work_log.ord`
-  and the sequence `gnl_work_log_ord` (a column default: the order records were appended in). The
-  append is 0.9's statement; the first `list` of a namespace numbers its unnumbered records after every
-  numbered one — existing rows once, then whatever a writer of either version added since — in append
-  order (SQLite: `rowid`; Postgres: `ord`, then `(ts, id)` for rows older than it). Redis numbers a
-  record at append (one script) and writes the number as the first field of the same superjson record
-  0.9 wrote, so a 0.9 reader still parses it; a record without one is numbered by the next `list`. The
-  counters live under `<keyPrefix>wseq:`, a space no sweep deletes.
-- **A cursor persisted by 0.9 (a row offset) restarts at the head of the log**, once. The worker and each
-  consumer then skip finished records by their markers (`qdone`, `evtack:`), so nothing runs twice and
-  nothing is skipped, and they write a new cursor after the first full page. The cost is one re-read of
-  the markers of a log's existing records. Anyone paging `WorkStore.list` directly: a cursor is still
-  opaque — pass back what you were given.
-- **A custom `WorkStore`** must keep the same promise to work with the queue and events: a cursor that
-  deletions, producer clocks and the writer's version cannot move. The contract is written on
-  `WorkStore.list`.
-- **`RedisStorage` without `eval`** (a custom client) takes a number and writes the record in separate
-  round trips, at append and when `list` numbers a record: two processes doing that to one namespace at
-  once can land out of order, so a reader may pass a record that appears a moment later. The same
-  documented best-effort as `putIfMatch` without `eval`; ioredis and node-redis both have it.
-- **@gnldev/scheduler: `scheduleWorkflow` refuses a different spec for an id that is already
-  scheduled.** It used to answer "already scheduled" and change nothing: measured, a trigger 0.9 stored
-  as `{ at }` (fired, done) and registered again as `{ every: 1000 }` never fired again, and a changed
-  cron kept the old one with no word. The same spec again is still a no-op, so calling it on every boot
-  is still safe. Who is affected: code that registers an existing id with a changed spec — a redeploy
-  that edited a schedule, or `at: Date.now() + x` on every call. The way through, in the spec:
-  `ifExists: 'replace'` applies it (next time from the new spec, attempts reset, a fire count no run has
-  used), `ifExists: 'keep'` keeps the stored trigger (0.9's behaviour); or use a new id.
+Migration notes, one line each; the full entries under Security, Fixed and Changed have the measurement
+and who is affected.
 
-- **@gnldev/workflow: one step id used twice in one workflow is refused at build time.** A step is
-  journaled under its id, so `.then(inc).then(inc)` made the second use replay the first one's output —
-  on a FRESH run, with no error. Measured on 0.9.0: `0 → inc → inc` returned `1`; two `parallel` legs
-  sharing an id both ran but returned one field. `workflow()` now throws where the workflow is built,
-  naming the id and the way through: reuse the body under a second id, `.then(step('inc-2', inc.run))`.
-  The two arms of a `branch` (one runs per input) and a step inside a nested `asStep` workflow (its own
-  key prefix) may still reuse an id. Who is affected: a workflow that repeats a step id, whose output was
-  already wrong.
+- **Workflow step uses that share a journal key throw where the workflow is built** — a repeated id,
+  a top-level `pay:check` beside `asStep('pay')` with an inner `check`, a step named like a retry's
+  `<id>:attempts`, or `_suspend` / `_canceled` / `_input` / `_resume:*`. Rename one:
+  `step('inc-2', inc.run)`, or `asStep('pay-2', child)` for a nested workflow.
+- **A workflow step's record changed shape for two kinds of output**: `undefined` is stored as
+  `{ __gnlStepRecord: 'void' }`, and an output that has a `__gnlStepRecord` key is stored wrapped. Code
+  that reads `<runId>:wf:<step>` keys itself: read through `decodeStepRecord(v)` from @gnldev/durable.
+  0.9.0 journals read unchanged; a journal written now is not for 0.9.0 (downgrades are unsupported).
+- **A server with no auth (or a `{ read, write }` pair) answers only `localhost`, `*.localhost`, IP
+  addresses and the names you list** — `allowedHosts: ['mybox.test', '.ngrok-free.app']` on
+  `createRestApi` / `createStudioApp`, or `GNL_ALLOWED_HOSTS=mybox.test,.ngrok-free.app`. An
+  `allowedHosts` entry that can never match now throws at startup, naming the fix.
+- **A standalone door with no `identify` does the same, and refuses cross-site writes** — the same
+  `allowedHosts` option on `createChatRoute` / `createAguiRoute` / `createMcpServer`, or
+  `GNL_ALLOWED_HOSTS`; for a page on another site, pass `identify`.
+- **The root scope cannot name a thread whose id starts with `org:`** (`ReservedThreadIdError`; `400
+  thread_id_reserved` on the REST API): use another thread id, or work inside the organization with
+  `withOrgStorage(storage, orgId)`.
+- **A root-scope `recall` and `listThreads` no longer reach organization rows**: to read one
+  organization's threads from the root, `withOrgStorage(storage, orgId).memory`. A custom `MemoryStore`
+  applies `memoryPartitionOf(opts)` / `inMemoryPartition` in `recall`'s resource branch and in
+  `listThreads`.
+- **A root `ingestDocuments` / `deleteDocuments` on a vector store that does not declare
+  `deleteOutsideOrganizations` is refused**: give the documents a `namespace`, or make the store honour
+  `outsideOrganizations` and declare `deleteOutsideOrganizations: true`.
+- **`chunkDocuments` records a chunk's document as `metadata.__gnlDoc` / `__gnlChunk`, no longer as
+  `source` / `chunk`, and escapes `%` and `#` in chunk ids**: read `metadata.__gnlDoc` where you read
+  `metadata.source`, and re-ingest once with `ingestDocuments` to replace 0.9.0 chunks.
+- **The journal-kept memory log (`BasicMemory`, `SemanticMemory`) is stored as `{ gnlLog: 1, parts }`**:
+  code that read the key with `journal.get` reads it with `readJournalLog(journal, key)` (a 0.9.0 log
+  still reads).
+- **`scheduleWorkflow` refuses a spec that cannot fire** before writing it: pass exactly one of
+  `at | every | cron`, `every > 0`, `maxAttempts >= 1`.
+- **`scheduleWorkflow` refuses a different spec for an id that is already scheduled**: pass
+  `ifExists: 'replace'` to apply it, `ifExists: 'keep'` for 0.9.0's behaviour, or use a new id.
+- **`Recipe.wiring` is optional** (@gnldev/cli, type-level): code that reads `recipe.wiring.code` reads
+  `recipe.wiring?.code`.
+- **Two scorers with one name in one `evalDataset` / `scoreRun` call, or in one agent's `scorers` in
+  `createGnl`, throw**: name them — `llmJudge({ name: 'polite', ... })`, or
+  `{ ...contains('x'), name: 'has-x' }`.
+- **`schemaCompat` validates tool input again**, so a run started on 0.9.0 with compat on whose tool call
+  used a `.default()`, a `.transform()` or an invited `null` hashes that call differently on replay:
+  finish such runs before upgrading, or resume them without `replay: 'strict'`. A `strict: true` tool
+  with an open object throws `ToolSchemaError` before the model is called: declare its keys with
+  `z.object`, or drop `strict`.
+- **With a licence, `client` and `end-user` roles get the free tier's grants** (including a role an IdP
+  names so): to keep 0.9.0's narrowing, pass your own map to `createRbac(...)` without the spread, or
+  `createRbac({ ...DEFAULT_ROLE_GRANTS, client: [] })`.
+- **`retryJob` continues the dead letter's durable run**: to start from an empty journal as before,
+  `retryJob(work, id, { newRun: true })`.
+- **`piiRedactor({ redactToolResults: true })` masks object tool results** it used to pass through, and
+  the error text of a tool that throws: to journal one tool's output as returned,
+  `redactToolResults: { skipTools: ['toolName'] }`.
+- **A custom `WorkStore`** must hand out a cursor that deletions, producer clocks and the writer's
+  version cannot move (see Changed); the bundled stores do.
+
+### Added
+
+- @gnldev/auth: `FREE_ROLE_GRANTS`, `hostNotAllowedMessage`, `hostnameOf`, `isHostAllowed`,
+  `parseAllowedHosts`, `crossSiteRefusedMessage`, `openDoorGuard` (+ types `OpenDoorGuardOptions`,
+  `OpenDoorRefusal`, `HostRuleAuth`), `GateOptions.allowedHosts`, and the error codes
+  `host_not_allowed` and `cross_site_refused` in `AUTH_ERROR_CODES`.
+- @gnldev/auth-ee: `DEFAULT_ROLE_GRANTS`.
+- @gnldev/server, @gnldev/studio: the `allowedHosts` option on `createRestApi` and `createStudioApp`;
+  the error code `thread_id_reserved` in `EDGE_ERROR_CODES`.
+- @gnldev/chat-adapter, @gnldev/agui, @gnldev/mcp: the `allowedHosts` option on `createChatRoute`,
+  `createAguiRoute` and `createMcpServer`.
+- @gnldev/durable: `appendToJournalLog`, `readJournalLog`, `JournalLogContentionError`,
+  `JOURNAL_LOG_MAX_ATTEMPTS`; `MEMORY_PARTITION`, `memoryPartitionOf`, `inMemoryPartition`,
+  `isOrganizationThreadId`, `assertRootThreadId`, `ReservedThreadIdError`, `ORG_THREAD_PREFIX` (+ types
+  `MemoryPartition`, `MemoryPartitionOption`); `assertDeletesOutsideOrganizations`; `encodeStepRecord`,
+  `decodeStepRecord`; `scoreSample`, `inputText`, `assertDistinctScorerNames`, `memoizeScoring` (+ type
+  `ScoreSampleFields`); the optional `Processor` hook `processToolError` (+ type `ProcessorToolError`).
+- @gnldev/memory: `OmVectorMatch.namespace` (optional).
+- @gnldev/rag: `ingestDocuments`, `deleteDocuments` (+ type `IngestResult`), `documentIdPart`,
+  `DOC_TRAIL_KEY`, `CHUNK_TRAIL_KEY`.
+- @gnldev/tool-schema: `shapeToolDefinitions`, `chainToolCompat`, `ToolSchemaError`, and the type
+  `ShapeContext` (a rule's `transform` receives it as a third argument).
+- @gnldev/workflow: `isVoidStepRecord`.
+- @gnldev/evals: `DatasetCase.context`; `scoreRun`'s `context` and `input` options (type
+  `ScoreRunOptions` is now exported).
+- @gnldev/queue: `retryJob(work, id, { newRun: true })`.
+- @gnldev/scheduler: `ScheduleSpec.ifExists` (`'refuse'` by default, `'replace'`, `'keep'`).
+
+### Security
 
 - **A server with no auth answers only the names that mean this machine (DNS rebinding).** The
   providerless gate in `@gnldev/auth` refused cross-site writes by reading `Sec-Fetch-Site`, and after a
@@ -70,48 +119,92 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `makeGate` (leading dot: every name under it; `true`: every name), or
   `GNL_ALLOWED_HOSTS=mybox.test,.ngrok-free.app` in the environment — read by the gate itself, so
   `gnl dev`, `gnl studio` and your own server all take it. The 403 names both. See
-  [`docs/errors/host_not_allowed.md`](./docs/errors/host_not_allowed.md).
-- **A valid licence no longer takes away what the free tier gives an application or an end user.**
-  With a licence, `createEnterpriseAuth` still authenticates through its `fallback` (the free
-  `roleAuth`), but `createRbac()`'s default map had no `client` or `end-user` entry. Measured through
-  `@gnldev/server` on 0.9.0: the same `client` token and end-user token that free `roleAuth` served (run
-  200, `GET /runs` 200) got 403 `permission denied: agents:run` with a valid licence — and 200 again once
-  the licence expired. A conformance walk of every free role × every permission the hosts ask (84 pairs:
-  4 roles × 21 checks) found 22 pairs the licence took away; it now finds none. `@gnldev/auth` exports
-  `FREE_ROLE_GRANTS` (what `roleAuth` grants, as permission patterns — checked to answer exactly what
-  `roleAuth` does), and `@gnldev/auth-ee` exports `DEFAULT_ROLE_GRANTS`, built from it plus `member` and
-  `platform-admin`. **Who is affected:** licensed deployments whose fallback or user store carries
-  `client` or `end-user` principals, on the default map — they now get what the free tier gives them
-  (every read, `agents:run`, `workflow:run`, `run:cancel`). A deployment passing its own map to
-  `createRbac` is unchanged: a map still replaces the defaults. **Way through:** to add a role without
-  restating the defaults, `createRbac({ ...DEFAULT_ROLE_GRANTS, support: ['runs:read'] })`; to keep the
-  0.9.0 narrowing, pass the map you want without the spread.
-- **`@gnldev/evals`: the runners give scorers the question and the context.** `answerRelevancy`,
-  `completeness`, `faithfulness`, `hallucination` and `contextPrecision` read `sample.input` or
-  `sample.context`, and `evalDataset` and `scoreRun` built the sample from `{ output, expected, runId }`
-  only. Measured on 0.9.0 with a judge answering `SCORE: 0.9`: `evalDataset` scored `answer-relevancy` 0
-  ("input required"); `scoreRun` scored all four judges 0 and called the judge model zero times — whatever
-  the agent answered. Now `evalDataset` passes each case's `input` (as text) and `context` (a new optional
-  `DatasetCase` field, or the runner's `{ output, context }`, which wins); `scoreRun` reads the question
-  from the run's journaled input and takes `context` (a value, or a function of the run's journal
-  entries), plus an `input` override; the result carries the `input` it used. **Who is affected:** anyone
-  scoring through these runners — scores for those five judges change from a constant 0 to a real
-  judgement. **Breaking:** two scorers with the same name in one call now throw, naming both. They used to
-  collapse into one: the result, the aggregate and the journal memo (`eval:<name>`) are keyed by name, and
-  `scoreRun` answered the second of two default-named `llmJudge` rubrics with the first one's 0.9 without
-  asking its model. Keying by position was rejected: the memo is read on the next run, so reordering the
-  list would hand each scorer another's stored score. **Way through:** `llmJudge({ name: 'polite', ... })`,
-  `faithfulness({ model, name: 'faithful-v2' })`, or `{ ...contains('x'), name: 'has-x' }`. The same two
-  rules now hold for an agent's `scorers` in `createGnl` (@gnldev/durable): a run started with `messages`
-  gives the scorer its last user turn as `input` (it gave none), and two scorers with one name are refused
-  when `createGnl` is called. One implementation serves all three runners, exported from
-  `@gnldev/durable`: `scoreSample`, `inputText`, `assertDistinctScorerNames`, `memoizeScoring`. **A memo
-  is replayed only for what it was computed on:** a score record (`<runId>:proc:eval:<name>`, still
-  `{ v }`, now with a `basis` hash of the sample) for the same sample, a dataset case for the same case and
-  scorer names. So scores memoized by 0.9.0 without the question are computed again on the first
-  `scoreRun`/run after the upgrade, instead of replaying their 0 — that costs one judge call per such
-  score; `scoreRun(..., { memo: false })` never reads a memo. A suite re-run with a scorer added runs its
-  cases again (the added scorer used to be missing and averaged as 0).
+  [`docs/errors/host_not_allowed.md`](./docs/errors/host_not_allowed.md). An entry may be written
+  `'.ngrok-free.app'` or `'*.ngrok-free.app'` (the same thing), `'mybox.test'`, `'mybox.test:4111'` or
+  `'http://mybox.test:4111'`; one that can never match a Host header (`'*'`, a wildcard mid-name, a
+  space) throws at startup, naming the fix. `GNL_ALLOWED_HOSTS` is read per request, so a value that
+  dotenv loads after the app module applies. A `{ read, write }` pair is refused the same way (a
+  predicate is opaque, and a rebound page is same-origin, so it may send any header) and its 403 says
+  so, naming a second way through: `auth: roleAuth({ admin: { token } })`. For a tunnel name the 403
+  suggests the leading-dot domain.
+- **A standalone chat, AG-UI or MCP door with no `identify` refuses what a REST API with no auth
+  refuses.** `createChatRoute`, `createAguiRoute` and `createMcpServer` over HTTP had neither of the
+  gate's two providerless checks. Measured on a real loopback socket with the quickstart shape (no
+  `identify`): a cross-site `text/plain` POST — a plain `<form>` on any website, no CORS preflight — ran
+  the model and appended the page's text to a conversation; a DNS-rebound page (`Host: evil.example`,
+  `Sec-Fetch-Site: same-origin`) replayed a run and read the thread's earlier messages back. Without
+  `identify`, each door now refuses a request addressed by a name other than `localhost`, a
+  `*.localhost` name or an IP address (403 `host_not_allowed`; a JSON-RPC error on MCP) and a
+  state-changing request a page on another site sent (403 `cross_site_refused`), before anything runs.
+  After the fix the same probe gets 403, 403, 403 and one model call (the developer's own). The
+  functions are the gate's own (`openDoorGuard` in @gnldev/auth). **Who is affected:** a door with no
+  `identify` reached by another name (a tunnel, Codespaces, a Docker service) or called by a page on
+  another site. `localhost`, `127.0.0.1`, a LAN IP, a UI on another localhost port, stdio MCP and
+  in-process calls are unchanged; a door with `identify` (including `identify: () => undefined`) is
+  unchanged. **Way through, one line:** `allowedHosts: ['.ngrok-free.app']` in the door's options, or
+  `GNL_ALLOWED_HOSTS=.ngrok-free.app`; for another site calling the door, `identify`. See
+  [`docs/errors/cross_site_refused.md`](./docs/errors/cross_site_refused.md).
+- **`piiRedactor({ redactToolResults: true })` no longer journals an object tool result unredacted.**
+  An object was masked as JSON text (stringify, mask, parse). `phone` masks a bare 7–15 digit run, so
+  any JSON number of that length (an epoch-ms timestamp, a numeric id, `41.0082376`) turned into
+  `[REDACTED_PHONE]` inside the JSON, the parse failed, and the original object was returned. Measured
+  with a tool returning `{ email, createdAt: 1727712000000 }`: the email was in the journal in plaintext,
+  and no audit report was written. The same happened for a cyclic object. The value is now walked:
+  every string value and every key is masked, numbers, booleans and null are kept, a `Date` becomes its
+  ISO text, and a cyclic reference becomes `'[Circular]'`. Two keys that mask to the same text are kept
+  as `[REDACTED_EMAIL]` and `[REDACTED_EMAIL]#2`. If the walk cannot finish (a getter or `toJSON`
+  throws, or the value is nested too deep), the output is replaced by a `[REDACTED_TOOL_RESULT: …]`
+  marker, never journaled raw. The marker names the way through: `redactToolResults: { skipTools:
+  ['toolName'] }` journals that tool's output as it returned. The audit report for an object result
+  now lists the masked `paths`. **Who is affected:** anyone with `redactToolResults: true` whose tools
+  return objects. Object results that used to pass through now come back masked; a cyclic result that
+  used to come back as the same object now comes back as a masked copy. A number is not matched against
+  the patterns (it never was: the parse failed first), so a phone number stored as a JSON number is not
+  masked; return it as a string, or map it before returning. The walk follows what the journal
+  (superjson) stores: a boxed `new String(email)` is unwrapped and masked as text (it used to come back
+  as `{"0":"a","1":"y",…}`, one character per key, unmasked); a `Map` and a `Set` are walked and kept
+  (they used to become `{}`); binary data (a `Buffer`, a typed array, a `DataView`) is replaced by a
+  marker at its path, because its bytes reached the journal as numbers. The fail-closed marker names a
+  fixed error class, never the thrown error's own `name`. A tool that THROWS is covered too: the error
+  text journaled as `{ status: 'failed', error }` is masked, through a new optional `Processor` hook,
+  `processToolError` (@gnldev/durable); the thrown error itself is rethrown untouched. On a ~1MB,
+  7000-row result the walk takes ~19ms (it took ~95ms before the patterns were compiled once per
+  redactor).
+- **A root-scope end user no longer recalls an organization's messages** (ADR-0001: "In the root scope,
+  every organization's rows are hidden"). Measured on 0.9.0: with `memoryPreset(s, 'recall')` and one
+  identity provider that returns the same user id with and without `orgId`, the unbound user's turn
+  carried acme's message into the prompt — on `createRestApi` without `org`, and on the standalone chat
+  door. `MemoryStore.recall` with `scope: 'resource'` filtered by resource id alone, and organization
+  rows live in the root store under `org:<id>:`. The partition of a memory scan now comes from the
+  store object the caller holds, never from a thread id: a store's own `recall` and `listThreads` cover
+  the root's rows only, and `withOrgStorage`'s view asks for its organization through a code-only option
+  (`MEMORY_PARTITION`, a Symbol key no request body can carry). A first version read the partition off
+  the anchor thread id, so a root user who named its thread `org:acme:fresh` got acme's secret again
+  (review panel, through REST). Also: the root store's `listThreads` no longer lists `org:*` threads,
+  and an organization's recall with `topK: 1` no longer comes back empty when another organization's row
+  scored higher. Who is affected: anyone serving root-scope and organization users from one store, and
+  root Studio/tooling that listed every organization's threads — list them through
+  `withOrgStorage(storage, orgId)`. Custom `MemoryStore` adapters apply `memoryPartitionOf(opts)` /
+  `inMemoryPartition` in `recall`'s resource branch and in `listThreads`.
+- **The root scope can no longer name a thread whose id starts with `org:`.** Such an id
+  is an organization's physical thread id: served, `org:acme:t` read acme's thread and `org:acme:new`
+  created a root user's conversation inside acme. A root-scope `AgentMemory` throws
+  `ReservedThreadIdError` for it on every thread method, and `createRestApi` answers `400
+  thread_id_reserved` before anything runs (the standalone chat and AG-UI doors fail closed through the
+  memory). An organization's memory is unaffected: its view prefixes every id. Way through: use a thread
+  id that does not start with `org:`, or work inside the organization with `withOrgStorage(storage,
+  orgId)`.
+- **Root observational memory no longer ranks by an organization's observation vectors.**
+  `AgentMemory.recallObservationsSemantic` on a root memory queried every namespace; an organization's
+  vector for a thread with the same bare id carried the same per-thread `obsId` (`obs-0`) and answered
+  with the root's unrelated observation. Hits outside the memory's own namespace are now dropped.
+  `OmVectorMatch` gains an optional `namespace`.
+- **A root `ingestDocuments`/`deleteDocuments` no longer deletes an organization's document of the same
+  id** (@gnldev/rag). On a vector store that does not declare `deleteOutsideOrganizations`, a root
+  re-ingest of `handbook` deleted acme's `handbook` (review panel: 1 → 0). Such a call is now refused
+  before anything is embedded, written or deleted (the same rule erasure applies). Way through: give the
+  documents a `namespace`, or make the store honour `outsideOrganizations` and declare
+  `deleteOutsideOrganizations: true`. An organization's view (`withOrgStorage(...).vectors`) is unaffected.
 
 ### Fixed
 
@@ -142,20 +235,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   which writes each record's number once: three full reads of 1 500 fresh records on Postgres 44 456 /
   83 039 / 31 975 records/s (0.9 counted the namespace on every page), SQLite 91 826 / 501 123 /
   184 051; an idle read is two statements instead of one (1.6 ms on the same server).
-
-- **@gnldev/workflow: a step that returns `undefined` is replayed, not re-run.** The engine asked
-  "is there a record?" with `journal.get(key) !== undefined`, and every journal reads a stored
-  `undefined` back as `undefined`. Measured on 0.9.0 (in-memory and SQLite): a `void` step ran again on
-  every resume; with `sideEffect: true` the resume found the step's own finished claim, no readable
-  output, and threw `StepRetryBlockedError('in-flight')` for `claimTtlMs`, then asked `recover()` about a
-  step that had completed. `undefined` is now stored as `{ __gnlVoid: true }` and read back as
-  `undefined`; every other output keeps the plain shape, so 0.9.0 records replay unchanged. A
-  separate completion key was also tried: it passes the resume tests but `forkWorkflowRun` (which skips
-  `:_` keys) then re-runs the void step in the fork, and it costs a second write per void step.
-  Journals written by 0.9.0: a side-effect void step (claim + stored `undefined`) is recognised through
-  `listKeys` and replays; a plain void step re-runs once, as on 0.9.0, and is then rewritten in the new
-  shape. `isVoidStepRecord(v)` is exported for code that reads step records itself;
-  `runWorkflow().steps` in @gnldev/durable and the studio's run views show `undefined`, not the record.
+- **@gnldev/workflow: two step uses that would share one journal key are refused where the workflow
+  is built.** A step is journaled under a key built from its id, so `.then(inc).then(inc)` made the
+  second use replay the first one's output — on a FRESH run, with no error. Measured on 0.9.0:
+  `0 → inc → inc` returned `1`; two `parallel` legs sharing an id both ran but returned one field. The
+  key is built from more than the id, and a check on ids alone missed the rest: a top-level step
+  `pay:check` and a step `check` inside `asStep('pay')` share the key `pay:check`, so the inner step
+  never ran. `workflow()` now compares the keys each step use writes — a nested workflow's
+  `<outer>:<inner>`, a retry's `<id>:attempts` and `<id>:_fallback` and its fallback's own id, a
+  `sideEffect` step's `<id>:_claim`, parallel legs, loop and foreach rounds, and the engine's own
+  `_suspend`, `_canceled`, `_input` and `_resume:*` (a step named `_canceled` cancelled its own run).
+  The error names both uses and the rename that separates them: `.then(step('inc-2', inc.run))`, or
+  `asStep('pay-2', child)` for a nested workflow — a renamed copy of an asStep, `step('pay-2', pay.run)`,
+  still writes under `pay:` and is refused too. The two arms of a `branch` (one runs per input) may
+  still reuse an id, and so may a step inside a nested workflow and outside it; an id containing `:` is
+  fine on its own. Who is affected: a workflow whose outputs were already wrong.
+- **@gnldev/workflow: a step that returns `undefined` is replayed, not re-run — and every output
+  replays as exactly what the step returned.** The engine asked "is there a record?" with
+  `journal.get(key) !== undefined`, and every journal reads a stored `undefined` back as `undefined`.
+  Measured on 0.9.0 (in-memory and SQLite): a `void` step ran again on every resume; with
+  `sideEffect: true` the resume found the step's own finished claim, no readable output, and threw
+  `StepRetryBlockedError('in-flight')` for `claimTtlMs`, then asked `recover()` about a step that had
+  completed. `undefined` is now stored as `{ __gnlStepRecord: 'void' }` and read back as `undefined`;
+  an output that itself has a `__gnlStepRecord` key is stored wrapped
+  (`{ __gnlStepRecord: 'value', value }`), so no output reads back as anything but itself.
+  Every other output keeps the plain shape, so 0.9.0 records replay unchanged. A separate completion
+  key was also tried: it passes the resume tests but `forkWorkflowRun` (which skips `:_` keys) then
+  re-runs the void step in the fork, and it costs a second write per void step. Journals written by
+  0.9.0: a side-effect void step (claim + stored `undefined`) is recognised through `listKeys` and
+  replays; a plain void step re-runs once, as on 0.9.0, and is then rewritten in the new shape.
+  `isVoidStepRecord(v)` is exported for code that reads step records itself, and @gnldev/durable
+  exports `decodeStepRecord(v)` (and `encodeStepRecord`), the one reader `runWorkflow().steps` and
+  Studio's run view, run stream and workflow playground now use — the playground showed the stored
+  record instead of `undefined`.
 - **@gnldev/queue: `retryJob` continues the dead letter's run, so a side effect already done is not
   fired again.** The README promises "a side effect already recorded as done is not run again". The
   worker kept it for its own retries (same job, same `job:<id>` run) but `retryJob` re-enqueued the dead
@@ -200,7 +312,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   must also typecheck, in one TypeScript program with the template's compiler options. It is driven by
   the recipe table, so a recipe added later is covered without editing the test. Existing projects are
   not touched: delete the lone `,` line in `gnl.config.ts`.
-
+  The generator now decides "nothing to wire" itself: a `wiring` whose `code` is blank (the 0.9 shape,
+  still allowed by `RecipeWiring`) adds no line either — found after the first fix, which changed only
+  the recipe table — and `gnl add` prints "How to run it:" for such a recipe, not "Add to gnl.config.ts:".
 - **Concurrent turns on one thread no longer lose messages in the journal-kept memories**
   (`BasicMemory` in @gnldev/durable, `SemanticMemory` in @gnldev/rag). Both read the thread's log,
   awaited, and wrote it back. Measured on 0.9.0: 10 concurrent appends kept 1; two processes appending
@@ -237,49 +351,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   after, on the rag and durable in-memory stores, SQLite and real pgvector: shrink, grow, same size,
   many↔one and delete all leave exactly the current chunks. `indexDocuments` stays upsert-only. Way
   through for a store without `delete`: `indexDocuments(store, embed, chunkDocuments(docs))`.
-- **A root `ingestDocuments`/`deleteDocuments` no longer deletes an organization's document of the same
-  id** (@gnldev/rag). On a vector store that does not declare `deleteOutsideOrganizations`, a root
-  re-ingest of `handbook` deleted acme's `handbook` (review panel: 1 → 0). Such a call is now refused
-  before anything is embedded, written or deleted (the same rule erasure applies). Way through: give the
-  documents a `namespace`, or make the store honour `outsideOrganizations` and declare
-  `deleteOutsideOrganizations: true`. An organization's view (`withOrgStorage(...).vectors`) is unaffected.
-- **Breaking (0.x): `chunkDocuments` stamps its trail as `metadata.__gnlDoc` / `__gnlChunk`, and no longer
-  writes `source` or `chunk`.** The user's own `source` and `chunk` survive chunking; before, every chunk
-  of a multi-chunk document overwrote them. Chunk ids escape `%` and `#` in the document id (`guide#1` is
-  stored as `guide%231`), so no document's id is another's chunk id — measured before: ingesting `guide`
-  overwrote a separate document called `guide#1`. Ids without those two characters are unchanged. Way
-  through: read `metadata.__gnlDoc` where you read `metadata.source` for a chunk's document, and
-  re-ingest with `ingestDocuments` once to replace 0.9.0 chunks.
 - **`PostgresVectorStore.delete` before any write no longer creates a one-number vector table.** On a fresh
   database a `delete` created `embedding vector(1)`, and every upsert after it failed ("expected 1
   dimensions, not 3") — found through `ingestDocuments`, whose first step is a delete. It now reads the
   vector size of an existing table, and deletes nothing when there is no table.
-- **`piiRedactor({ redactToolResults: true })` no longer journals an object tool result unredacted.**
-  An object was masked as JSON text (stringify, mask, parse). `phone` masks a bare 7–15 digit run, so
-  any JSON number of that length (an epoch-ms timestamp, a numeric id, `41.0082376`) turned into
-  `[REDACTED_PHONE]` inside the JSON, the parse failed, and the original object was returned. Measured
-  with a tool returning `{ email, createdAt: 1727712000000 }`: the email was in the journal in plaintext,
-  and no audit report was written. The same happened for a cyclic object. The value is now walked:
-  every string value and every key is masked, numbers, booleans and null are kept, a `Date` becomes its
-  ISO text, and a cyclic reference becomes `'[Circular]'`. Two keys that mask to the same text are kept
-  as `[REDACTED_EMAIL]` and `[REDACTED_EMAIL]#2`. If the walk cannot finish (a getter or `toJSON`
-  throws, or the value is nested too deep), the output is replaced by a `[REDACTED_TOOL_RESULT: …]`
-  marker, never journaled raw. The marker names the way through: `redactToolResults: { skipTools:
-  ['toolName'] }` journals that tool's output as it returned. The audit report for an object result
-  now lists the masked `paths`. **Who is affected:** anyone with `redactToolResults: true` whose tools
-  return objects. Object results that used to pass through now come back masked; a cyclic result that
-  used to come back as the same object now comes back as a masked copy. A number is not matched against
-  the patterns (it never was: the parse failed first), so a phone number stored as a JSON number is not
-  masked; return it as a string, or map it before returning. The walk follows what the journal
-  (superjson) stores: a boxed `new String(email)` is unwrapped and masked as text (it used to come back
-  as `{"0":"a","1":"y",…}`, one character per key, unmasked); a `Map` and a `Set` are walked and kept
-  (they used to become `{}`); binary data (a `Buffer`, a typed array, a `DataView`) is replaced by a
-  marker at its path, because its bytes reached the journal as numbers. The fail-closed marker names a
-  fixed error class, never the thrown error's own `name`. A tool that THROWS is covered too: the error
-  text journaled as `{ status: 'failed', error }` is masked, through a new optional `Processor` hook,
-  `processToolError` (@gnldev/durable); the thrown error itself is rethrown untouched. On a ~1MB,
-  7000-row result the walk takes ~19ms (it took ~95ms before the patterns were compiled once per
-  redactor).
 - **`schemaCompat` / `applyToolCompat` no longer switch off a tool's input validation.** The patched
   tool's `inputSchema` was a bare `jsonSchema(js)` with no validator, so on every model a rule matched
   (OpenAI, groq, Gemini, Claude) the AI SDK validated nothing. Measured on an OpenAI model with
@@ -308,38 +383,96 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   an invited `null`, hashes that call differently when it replays after the upgrade. That is a console
   warning, or a `DivergenceError` under `replay: 'strict'`. Finish such runs before upgrading, or
   resume them without `replay: 'strict'`.
+- **`@gnldev/evals`: the runners give scorers the question and the context.** `answerRelevancy`,
+  `completeness`, `faithfulness`, `hallucination` and `contextPrecision` read `sample.input` or
+  `sample.context`, and `evalDataset` and `scoreRun` built the sample from `{ output, expected, runId }`
+  only. Measured on 0.9.0 with a judge answering `SCORE: 0.9`: `evalDataset` scored `answer-relevancy` 0
+  ("input required"); `scoreRun` scored all four judges 0 and called the judge model zero times — whatever
+  the agent answered. Now `evalDataset` passes each case's `input` (as text) and `context` (a new optional
+  `DatasetCase` field, or the runner's `{ output, context }`, which wins); `scoreRun` reads the question
+  from the run's journaled input and takes `context` (a value, or a function of the run's journal
+  entries), plus an `input` override; the result carries the `input` it used. **Who is affected:** anyone
+  scoring through these runners — scores for those five judges change from a constant 0 to a real
+  judgement. Two scorers with the same name in one call now throw, naming both. They used to
+  collapse into one: the result, the aggregate and the journal memo (`eval:<name>`) are keyed by name, and
+  `scoreRun` answered the second of two default-named `llmJudge` rubrics with the first one's 0.9 without
+  asking its model. Keying by position was rejected: the memo is read on the next run, so reordering the
+  list would hand each scorer another's stored score. **Way through:** `llmJudge({ name: 'polite', ... })`,
+  `faithfulness({ model, name: 'faithful-v2' })`, or `{ ...contains('x'), name: 'has-x' }`. The same two
+  rules now hold for an agent's `scorers` in `createGnl` (@gnldev/durable): a run started with `messages`
+  gives the scorer its last user turn as `input` (it gave none), and two scorers with one name are refused
+  when `createGnl` is called. One implementation serves all three runners, exported from
+  `@gnldev/durable`: `scoreSample`, `inputText`, `assertDistinctScorerNames`, `memoizeScoring`. **A memo
+  is replayed only for what it was computed on:** a score record (`<runId>:proc:eval:<name>`, still
+  `{ v }`, now with a `basis` hash of the sample) for the same sample, a dataset case for the same case and
+  scorer names. A score memoized by 0.9.0 has no basis, so it is computed again once, on the first
+  `scoreRun`/run after the upgrade, instead of replaying its 0 — one judge call per such score — and
+  the new record is replayed from then on; `scoreRun(..., { memo: false })` never reads a memo. A suite re-run with a scorer added runs its
+  cases again (the added scorer used to be missing and averaged as 0).
 
-### Security
+### Changed
 
-- **A root-scope end user no longer recalls an organization's messages** (ADR-0001: "In the root scope,
-  every organization's rows are hidden"). Measured on 0.9.0: with `memoryPreset(s, 'recall')` and one
-  identity provider that returns the same user id with and without `orgId`, the unbound user's turn
-  carried acme's message into the prompt — on `createRestApi` without `org`, and on the standalone chat
-  door. `MemoryStore.recall` with `scope: 'resource'` filtered by resource id alone, and organization
-  rows live in the root store under `org:<id>:`. The partition of a memory scan now comes from the
-  store object the caller holds, never from a thread id: a store's own `recall` and `listThreads` cover
-  the root's rows only, and `withOrgStorage`'s view asks for its organization through a code-only option
-  (`MEMORY_PARTITION`, a Symbol key no request body can carry). A first version read the partition off
-  the anchor thread id, so a root user who named its thread `org:acme:fresh` got acme's secret again
-  (review panel, through REST). Also: the root store's `listThreads` no longer lists `org:*` threads,
-  and an organization's recall with `topK: 1` no longer comes back empty when another organization's row
-  scored higher. Who is affected: anyone serving root-scope and organization users from one store, and
-  root Studio/tooling that listed every organization's threads — list them through
-  `withOrgStorage(storage, orgId)`. Custom `MemoryStore` adapters apply `memoryPartitionOf(opts)` /
-  `inMemoryPartition` in `recall`'s resource branch and in `listThreads`.
-- **Breaking (0.x): the root scope can no longer name a thread whose id starts with `org:`.** Such an id
-  is an organization's physical thread id: served, `org:acme:t` read acme's thread and `org:acme:new`
-  created a root user's conversation inside acme. A root-scope `AgentMemory` throws
-  `ReservedThreadIdError` for it on every thread method, and `createRestApi` answers `400
-  thread_id_reserved` before anything runs (the standalone chat and AG-UI doors fail closed through the
-  memory). An organization's memory is unaffected: its view prefixes every id. Way through: use a thread
-  id that does not start with `org:`, or work inside the organization with `withOrgStorage(storage,
-  orgId)`.
-- **Root observational memory no longer ranks by an organization's observation vectors.**
-  `AgentMemory.recallObservationsSemantic` on a root memory queried every namespace; an organization's
-  vector for a thread with the same bare id carried the same per-thread `obsId` (`obs-0`) and answered
-  with the root's unrelated observation. Hits outside the memory's own namespace are now dropped.
-  `OmVectorMatch` gains an optional `namespace`.
+- **Upgrading a work store adds columns and a table, and the write stays 0.9's.** SQLite and Postgres
+  add `gnl_work_log.seq` (0 = not numbered yet), the index `gnl_work_log_seq` and the table
+  `gnl_work_seq` at startup, like the earlier additive columns; Postgres also adds `gnl_work_log.ord`
+  and the sequence `gnl_work_log_ord` (a column default: the order records were appended in). The
+  append is 0.9's statement; the first `list` of a namespace numbers its unnumbered records after every
+  numbered one — existing rows once, then whatever a writer of either version added since — in append
+  order (SQLite: `rowid`; Postgres: `ord`, then `(ts, id)` for rows older than it). Redis numbers a
+  record at append (one script) and writes the number as the first field of the same superjson record
+  0.9 wrote, so a 0.9 reader still parses it; a record without one is numbered by the next `list`. The
+  counters live under `<keyPrefix>wseq:`, a space no sweep deletes.
+- **A cursor persisted by 0.9 (a row offset) restarts at the head of the log**, once. The worker and each
+  consumer then skip finished records by their markers (`qdone`, `evtack:`), so nothing runs twice and
+  nothing is skipped, and they write a new cursor after the first full page. The cost is one re-read of
+  the markers of a log's existing records. Anyone paging `WorkStore.list` directly: a cursor is still
+  opaque — pass back what you were given.
+- **A custom `WorkStore`** must keep the same promise to work with the queue and events: a cursor that
+  deletions, producer clocks and the writer's version cannot move. The contract is written on
+  `WorkStore.list`.
+- **`RedisStorage` without `eval`** (a custom client) takes a number and writes the record in separate
+  round trips, at append and when `list` numbers a record: two processes doing that to one namespace at
+  once can land out of order, so a reader may pass a record that appears a moment later. The same
+  documented best-effort as `putIfMatch` without `eval`; ioredis and node-redis both have it.
+- **@gnldev/scheduler: `scheduleWorkflow` refuses a different spec for an id that is already
+  scheduled.** It used to answer "already scheduled" and change nothing: measured, a trigger 0.9 stored
+  as `{ at }` (fired, done) and registered again as `{ every: 1000 }` never fired again, and a changed
+  cron kept the old one with no word. The same spec again is still a no-op, so calling it on every boot
+  is still safe. Who is affected: code that registers an existing id with a changed spec — a redeploy
+  that edited a schedule, or `at: Date.now() + x` on every call. The way through, in the spec:
+  `ifExists: 'replace'` applies it (next time from the new spec, attempts reset, a fire count no run has
+  used), `ifExists: 'keep'` keeps the stored trigger (0.9's behaviour); or use a new id.
+- **`chunkDocuments` stamps its trail as `metadata.__gnlDoc` / `__gnlChunk`, and no longer
+  writes `source` or `chunk`.** The user's own `source` and `chunk` survive chunking; before, every chunk
+  of a multi-chunk document overwrote them. Chunk ids escape `%` and `#` in the document id (`guide#1` is
+  stored as `guide%231`), so no document's id is another's chunk id — measured before: ingesting `guide`
+  overwrote a separate document called `guide#1`. Ids without those two characters are unchanged. Way
+  through: read `metadata.__gnlDoc` where you read `metadata.source` for a chunk's document, and
+  re-ingest with `ingestDocuments` once to replace 0.9.0 chunks.
+- **A valid licence no longer takes away what the free tier gives an application or an end user.**
+  With a licence, `createEnterpriseAuth` still authenticates through its `fallback` (the free
+  `roleAuth`), but `createRbac()`'s default map had no `client` or `end-user` entry. Measured through
+  `@gnldev/server` on 0.9.0: the same `client` token and end-user token that free `roleAuth` served (run
+  200, `GET /runs` 200) got 403 `permission denied: agents:run` with a valid licence — and 200 again once
+  the licence expired. A conformance walk of every free role × every permission the hosts ask (84 pairs:
+  4 roles × 21 checks) found 22 pairs the licence took away; it now finds none. `@gnldev/auth` exports
+  `FREE_ROLE_GRANTS` (what `roleAuth` grants, as permission patterns — checked to answer exactly what
+  `roleAuth` does), and `@gnldev/auth-ee` exports `DEFAULT_ROLE_GRANTS`, built from it plus `member` and
+  `platform-admin`. **Who is affected:** licensed deployments whose fallback or user store carries
+  `client` or `end-user` principals, on the default map — they now get what the free tier gives them
+  (every read, `agents:run`, `workflow:run`, `run:cancel`). A deployment passing its own map to
+  `createRbac` is unchanged: a map still replaces the defaults. **Way through:** to add a role without
+  restating the defaults, `createRbac({ ...DEFAULT_ROLE_GRANTS, support: ['runs:read'] })`; to keep the
+  0.9.0 narrowing, pass the map you want without the spread.
+  **Also affected: an identity provider whose role is literally named `client` or `end-user`.** A role
+  is matched by its name, wherever it came from, so an SSO user carrying such a role (an Auth0/OIDC group,
+  a user-store role) now gets those grants too, where 0.9.0's default map gave it nothing. To avoid it,
+  one line: rename the role in the IdP or user store, or pass a map —
+  `createRbac({ ...DEFAULT_ROLE_GRANTS, client: [] })`. See the @gnldev/auth-ee README.
+- **A cross-site write refused by the REST or Studio gate now says why.** It answered 403
+  `{ error: 'unauthorized (admin required)' }`, which named neither the cause nor the fix; it now
+  answers 403 with `code: 'cross_site_refused'` and names the way through (an auth provider that binds
+  an identity, or serving the page from this machine's own site). The status is unchanged.
 
 ### Known limits
 

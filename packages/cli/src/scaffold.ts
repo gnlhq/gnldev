@@ -19,7 +19,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, s
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { RECIPES, FEATURE_IDS, E2E_FEATURE, recipeContents, defaultVariants, type Recipe } from './recipes.js';
+import { RECIPES, FEATURE_IDS, E2E_FEATURE, recipeContents, defaultVariants, configWiring, type Recipe } from './recipes.js';
 import { DEFAULT_ANSWERS, type InitAnswers } from './init-answers.js';
 import { IDENTITY_FILE } from './identity-file.js';
 import { hostById, APP_FILE, hostReadme, type HostMode } from './hosts.js';
@@ -261,9 +261,12 @@ function copyTemplate(dir: string, template: TemplateName, name: string): void {
  * as a line in this function is a question that does not belong in `gnl init`.
  */
 export function generateConfig(recipes: Recipe[], answers: InitAnswers = DEFAULT_ANSWERS): string {
-  // A recipe without `wiring` has nothing to put here (a worker, a poller, a file the app imports).
-  const wirings = recipes.flatMap((r) => (r.wiring ? [r.wiring] : []));
-  const imports = wirings.map((w) => w.import);
+  // A recipe without `wiring` — or with a wiring whose code is blank — has nothing to put here (a
+  // worker, a poller, a file the app imports). Decided HERE, not trusted to the recipe table: the type
+  // still allows `code: ''`, and a blank code became a field line holding only a comma. An import line
+  // is kept on its own (it may be imported for its effect); a blank one is dropped.
+  const wirings = recipes.flatMap((r) => { const w = configWiring(r); return w ? [w] : []; });
+  const imports = recipes.map((r) => r.wiring?.import.trim() ?? '').filter((i) => i !== '');
   const agentTools = wirings.filter((w) => w.place === 'agentTool').map((w) => w.code);
   const configFields = wirings.filter((w) => w.place === 'configField').map((w) => w.code);
   // EVERY recipe's type extension, not just the picked ones — the config is written once and edited

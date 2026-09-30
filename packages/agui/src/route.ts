@@ -15,7 +15,7 @@ import { Hono } from 'hono';
 import { limitBreachFromSteps, blockedFromSteps, BLOCKED_ERROR_CODES, blockedErrorCode, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, sealRequestContext, sealFieldsOf, resolveWorkIdentity } from '@gnldev/durable';
 import type { CreateGnlConfig, ResolvedWorkIdentity } from '@gnldev/durable';
 import { createGnl, scopeConfigToOrg } from '@gnldev/durable';
-import { callerOfRequest, authorizeDoorRequest, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify } from '@gnldev/auth';
+import { callerOfRequest, authorizeDoorRequest, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, openDoorGuard, type AccessDecision, type Authorize, type Identify } from '@gnldev/auth';
 import { streamSSE } from 'hono/streaming';
 // The two limit codes are READ from @gnldev/durable (`LIMIT_ERROR_CODES`) rather than spelled again
 // here. The event/data SHAPE is deliberately a copy (see the note above), but a code is not a shape:
@@ -224,6 +224,16 @@ export interface CreateAguiRouteOptions {
    * as an ownership refusal. WITHOUT it this route leaves no record. If it throws, the route answers 500.
    */
   onDecision?: (decision: AccessDecision) => void | Promise<void>;
+  /**
+   * Host names this route also answers when it has NO `identify`, besides `localhost`, `*.localhost` and
+   * any IP address — the same list, forms and meaning as `allowedHosts` on `createRestApi` (a hostname,
+   * a leading-dot domain like `'.ngrok-free.app'`, or `true` for every name); `GNL_ALLOWED_HOSTS` adds to
+   * it. Without `identify` this route has no identity to check, so it refuses what a providerless REST
+   * API refuses: a request addressed by any other name (403 `host_not_allowed` — the DNS-rebinding shape)
+   * and a state-changing request a page on another site sent (403 `cross_site_refused`). With `identify`
+   * neither check runs: who the caller is, is then the application's answer.
+   */
+  allowedHosts?: readonly string[] | true;
 }
 
 /**
@@ -274,6 +284,8 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
       'or pass `identify: (req) => principal` from your verified session. `identify: () => undefined` opts out, explicitly.',
     );
   }
+  // No `identify`: the providerless protections the REST gate applies (@gnldev/auth `openDoorGuard`).
+  const openGuard = opts.identify ? undefined : openDoorGuard({ allowedHosts: opts.allowedHosts, door: 'createAguiRoute' });
   const app = new Hono();
   // The outcome, reported once the route has answered (see `onDecision`).
   if (opts.onDecision) {
@@ -288,6 +300,11 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
     });
   }
   app.post('/agents/:name/run', async (c) => {
+    const open = openGuard?.(c.req.raw);
+    if (open) {
+      markRefusal(c.req.raw, 'policy', { detail: open.code });
+      return c.json({ error: open.error, code: open.code, ...(open.host !== undefined ? { host: open.host } : {}) }, open.status);
+    }
     const name = c.req.param('name');
     const body = (await c.req.json().catch(() => ({}))) as any;
     // WHO, resolved once and FIRST — the same reason chat-adapter states: the identity decision below

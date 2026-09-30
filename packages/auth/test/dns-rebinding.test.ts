@@ -106,7 +106,7 @@ describe('the way through: allowedHosts, or GNL_ALLOWED_HOSTS', () => {
     expect(await gate.allow(at('evil.example'), 'write')).toBe(true);
   });
 
-  it('GNL_ALLOWED_HOSTS is read when the gate is built — every host (gnl dev, gnl studio, your own server) gets it', async () => {
+  it('GNL_ALLOWED_HOSTS is read by the gate itself — every host (gnl dev, gnl studio, your own server) gets it', async () => {
     process.env.GNL_ALLOWED_HOSTS = ' mybox.test , .trycloudflare.com ';
     const gate = makeGate(undefined, { allowOpenAccess: true, allowedHosts: ['other.test'] });
     expect(await gate.allow(at('mybox.test'), 'read')).toBe(true);

@@ -51,6 +51,15 @@ export interface RecipeWiring {
   code: string;
 }
 
+/**
+ * What a recipe really puts into gnl.config.ts: its wiring when the wiring has code, else nothing.
+ * `RecipeWiring.code` is a plain string, so a recipe can say "nothing to wire" by omitting `wiring` OR by
+ * leaving `code` blank (the 0.9 shape) — every reader asks here, so both mean the same thing.
+ */
+export function configWiring(r: Pick<Recipe, 'wiring'>): RecipeWiring | undefined {
+  return r.wiring && r.wiring.code.trim() !== '' ? r.wiring : undefined;
+}
+
 export interface Recipe {
   id: string;
   /** Label shown in the `gnl init` checkbox. */

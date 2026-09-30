@@ -139,10 +139,16 @@ export const AUTH_ERROR_CODES = {
    * an IP address and not listed in `allowedHosts` / `GNL_ALLOWED_HOSTS` (the DNS-rebinding shape).
    */
   hostNotAllowed: 'host_not_allowed',
+  /**
+   * 403 — a surface with no identity to authenticate was sent a state-changing request by a page on
+   * another site (Sec-Fetch-Site: cross-site, or a foreign Origin): the cross-site request forgery shape.
+   */
+  crossSiteRefused: 'cross_site_refused',
 } as const;
 export const AUTH_ERROR_STATUS: Record<string, number> = {
   [AUTH_ERROR_CODES.decisionNotRecorded]: 500,
   [AUTH_ERROR_CODES.hostNotAllowed]: 403,
+  [AUTH_ERROR_CODES.crossSiteRefused]: 403,
 };
 
 /**

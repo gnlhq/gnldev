@@ -83,6 +83,24 @@ production it refuses to start without `identify` (`identify: () => undefined` o
   is threaded in from outside (`initialAguiConvertState`) — a SINGLE state object must be threaded
   through from start to end for an ENTIRE run (this is required for text message framing START/END).
 
+### Without `identify`: what the route refuses
+
+A route with no `identify` has no identity to check, so it refuses what a REST API with no auth refuses —
+the same two checks, from the same `@gnldev/auth` functions:
+
+- a request addressed by a name other than `localhost`, a `*.localhost` name or an IP address → 403
+  [`host_not_allowed`](../../docs/errors/host_not_allowed.md). That is what a DNS-rebinding page sends; it
+  is same-origin to the browser, so without this it could replay a run and read the thread back.
+- a state-changing request a page on another site sent (`Sec-Fetch-Site: cross-site`) → 403
+  [`cross_site_refused`](../../docs/errors/cross_site_refused.md). A plain `<form>` on any site could
+  otherwise run the model and write into a conversation.
+
+Nothing changes on this machine: `localhost`, `127.0.0.1`, a LAN IP, a UI on another localhost port and
+an in-process `fetch` are answered. A name of your own (a tunnel, Codespaces, a Docker service) is one
+line: `createAguiRoute(…, { allowedHosts: ['.ngrok-free.app'] })`, or `GNL_ALLOWED_HOSTS=.ngrok-free.app` in the
+environment. With `identify` (including `identify: () => undefined`) neither check runs — who the
+caller is, is then your answer.
+
 ## Who is calling? (`identify`)
 
 This route declares auth out of scope, and that boundary is right. What it leaves you responsible for

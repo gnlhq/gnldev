@@ -29,7 +29,7 @@ const out = await wf.run(1, { runId: 'w1', journal: new SqliteStorage('runs.db')
 - `wf.runResumable(input, ctx)` — for suspending steps (`sleep` / `waitFor`); suspends with `WorkflowSuspended`, resumes on event/time.
 
 ## How it works
-Each step's output is journaled under `${runId}:wf:${stepId}` → the step doesn't rerun on replay. An output of `undefined` is stored as `{ __gnlVoid: true }` (a stored `undefined` reads back like a missing key); `isVoidStepRecord(v)` recognises it if you read the journal yourself. `parallel` sub-steps are journaled individually; `branch`/`loop` preserve deterministic replay.
+Each step's output is journaled under `${runId}:wf:${stepId}` → the step doesn't rerun on replay. An output of `undefined` is stored as `{ __gnlStepRecord: 'void' }` (a stored `undefined` reads back like a missing key), and an output that itself has a `__gnlStepRecord` key is stored wrapped, so every output replays as exactly what the step returned. Reading step records yourself? `decodeStepRecord(v)` from `@gnldev/durable` gives back the output; `isVoidStepRecord(v)` recognises the void record. Two step uses that would share one journal key — the same id twice, a top-level `pay:check` next to `asStep('pay')` with an inner `check`, a step named like a retry's `<id>:attempts`, or one of the engine's own keys (`_suspend`, `_canceled`, `_input`, `_resume:*`) — are refused where the workflow is built, and the error names the rename that separates them. `parallel` sub-steps are journaled individually; `branch`/`loop` preserve deterministic replay.
 
 ## Side-effect steps (the crash window, closed)
 

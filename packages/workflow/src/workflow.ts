@@ -236,34 +236,61 @@ async function claim(journal: JournalLike, key: string, value: unknown): Promise
 }
 
 // ── The step record ────────────────────────────────────────────────────────────
-// A step's record is its output, stored as-is — EXCEPT `undefined`. Every backend reads a key that
-// holds `undefined` back as `undefined`, which is also what `get` answers for "no key", so a `void`
-// step (send an email, write a row) was journaled but looked unrun: it re-ran on every resume, and a
-// `sideEffect` one blocked on its own finished claim. `undefined` is therefore written as a branded
-// record and read back as `undefined`. Every other output keeps the plain shape it has always had,
-// so records written before this change replay unchanged, and readers that `get` a step key see the
-// same values as before for everything but a void step (see `isVoidStepRecord`).
-const VOID_BRAND = '__gnlVoid' as const;
-const VOID_RECORD = { [VOID_BRAND]: true } as const;
+// A step's record is its output, stored as-is — with two exceptions, both under ONE reserved key:
+//
+//   • `undefined`. Every backend reads a key holding `undefined` back as `undefined`, which is also what
+//     `get` answers for "no key", so a `void` step (send an email, write a row) was journaled but looked
+//     unrun: it re-ran on every resume, and a `sideEffect` one blocked on its own finished claim. It is
+//     written as `{ __gnlStepRecord: 'void' }`.
+//   • an output that itself carries the reserved key. It is written wrapped,
+//     `{ __gnlStepRecord: 'value', value: <output> }`, so no output a step can return reads back as
+//     anything but itself. (The first cut branded void as `{ __gnlVoid: true }` and read EVERY value of
+//     that shape as `undefined` — a step that returned that object replayed as `undefined`.)
+//
+// Every other output keeps the plain shape it has always had, so records written by 0.9.0 replay
+// unchanged, and a reader that `get`s a step key sees what the step returned.
+//
+// The same pair lives in @gnldev/durable (`encodeStepRecord` / `decodeStepRecord`), which is what
+// Studio and the durable registry read step records with. This package stays dependency-free, so it
+// keeps this copy; durable's test suite runs a table of outputs through THIS writer and THAT reader
+// (step-record-parity.test.ts), so the two cannot drift apart unnoticed.
+const STEP_RECORD_KEY = '__gnlStepRecord' as const;
+const VOID_RECORD = { [STEP_RECORD_KEY]: 'void' } as const;
 
-/** The value written for a step output — `undefined` becomes the branded void record. */
+function hasOwn(v: unknown, k: string): boolean {
+  return !!v && typeof v === 'object' && Object.prototype.hasOwnProperty.call(v, k);
+}
+
+/** The value written for a step output: `undefined` → the void record; a value carrying the key → wrapped. */
 function toStepRecord(out: unknown): unknown {
-  return out === undefined ? VOID_RECORD : out;
+  if (out === undefined) return VOID_RECORD;
+  return hasOwn(out, STEP_RECORD_KEY) ? { [STEP_RECORD_KEY]: 'value', value: out } : out;
+}
+
+/** The output a stored record stands for (the inverse of `toStepRecord`; a plain 0.9.0 value is itself). */
+function fromStepRecord(v: unknown): unknown {
+  if (!hasOwn(v, STEP_RECORD_KEY)) return v;
+  const r = v as Record<string, unknown>;
+  const keys = Object.keys(r);
+  if (r[STEP_RECORD_KEY] === 'void' && keys.length === 1) return undefined;
+  if (r[STEP_RECORD_KEY] === 'value' && keys.length === 2 && 'value' in r) return r.value;
+  return v;
 }
 
 /**
  * True for the record that stands for a step that completed with `undefined`. Exported so a reader
- * outside the engine (an inspector, a UI) can show it as `undefined` rather than as the brand.
+ * outside the engine (an inspector, a UI) can show it as `undefined` rather than as the record. No
+ * output a step returns is ever stored in this shape (see `toStepRecord`).
  */
 export function isVoidStepRecord(v: unknown): boolean {
-  return !!v && typeof v === 'object' && (v as Record<string, unknown>)[VOID_BRAND] === true && Object.keys(v).length === 1;
+  return hasOwn(v, STEP_RECORD_KEY) && (v as Record<string, unknown>)[STEP_RECORD_KEY] === 'void' && Object.keys(v as object).length === 1;
 }
 
 /** A step's completion, told apart from its value: `undefined` = no record; `{ output }` = completed. */
 async function readStepRecord(journal: JournalLike, key: string): Promise<{ output: unknown } | undefined> {
   const v = await journal.get(key);
   if (v === undefined) return undefined;
-  return { output: isVoidStepRecord(v) ? undefined : v };
+  return { output: fromStepRecord(v) };
 }
 
 /**
@@ -436,18 +463,108 @@ async function runSideEffectStep(
   }
 }
 
+// ── Which journal keys a step use writes ──────────────────────────────────────────
+// A step's journal key is its id — but not only its id. A nested workflow's steps live at
+// `<outer>:<inner>`, a retry keeps `<id>:attempts` and `<id>:_fallback`, its fallback runs under its
+// own id in the SAME namespace, a sideEffect step writes `<id>:_claim`, a parallel leg runs as
+// `<pid>/<leg>`, loop rounds as `<id>#<n>`, foreach items as `<id>[<n>]`, and the engine keeps
+// `_suspend`, `_canceled`, `_input` and `_resume:*` beside them. Two uses that reach one key make the
+// second replay the first one's output — on a FRESH run, with no error. Checking ids alone missed
+// every case where the key is built from more than the id (a top-level `pay:check` and a `check`
+// inside `asStep('pay')`), so the check is on the keys themselves, where the workflow is built.
+//
+// What a step's BODY writes beyond the key it runs under is recorded against its run function, not
+// the step object: a renamed copy — `step('sub-2', sub.run)` — runs the same body, and an asStep body
+// keeps writing under the id it was created with, whatever it is renamed to.
+interface KeyClaim {
+  key: string;
+  /** `exact`: that key. `loop`: every `<key>#<n>`. `foreach`: every `<key>[<n>]`. */
+  kind: 'exact' | 'loop' | 'foreach';
+  /** Who writes it, for the error. */
+  from: string;
+  /** The one line that separates it, for the error. */
+  fix: string;
+}
+interface BodyInfo {
+  kind: 'asStep' | 'retry' | 'composite';
+  id: string;
+  claims: () => KeyClaim[];
+}
+const BODIES = new WeakMap<Function, BodyInfo>();
+
+/** Every key one use of `s` writes when it runs under `runAs` (a parallel leg or branch arm runs under a scoped id). */
+function claimsOf(s: Step, runAs: string = s.id): KeyClaim[] {
+  const fix = `give step '${runAs}' another id`;
+  const own: KeyClaim[] = [{ key: runAs, kind: 'exact', from: `step '${runAs}'`, fix }];
+  if (s.durability?.sideEffect) own.push({ key: `${runAs}:_claim`, kind: 'exact', from: `the side-effect claim of step '${runAs}'`, fix });
+  return [...own, ...(BODIES.get(s.run)?.claims() ?? [])];
+}
+
+function claimMatches(pattern: KeyClaim, key: string): boolean {
+  const open = pattern.kind === 'loop' ? '#' : '[';
+  if (!key.startsWith(pattern.key + open)) return false;
+  const rest = key.slice(pattern.key.length + 1);
+  return pattern.kind === 'loop' ? /^\d+$/.test(rest) : /^\d+\]$/.test(rest);
+}
+
+function claimsCollide(a: KeyClaim, b: KeyClaim): boolean {
+  if (a.kind === 'exact' && b.kind === 'exact') return a.key === b.key;
+  if (a.kind === 'exact') return claimMatches(b, a.key);
+  if (b.kind === 'exact') return claimMatches(a, b.key);
+  return a.kind === b.kind && a.key === b.key;
+}
+
+const shownKey = (c: KeyClaim) => (c.kind === 'loop' ? `${c.key}#<n>` : c.kind === 'foreach' ? `${c.key}[<n>]` : c.key);
+
+/** Refuses two step uses (one group each) that reach one journal key. */
+function assertDistinctKeys(groups: KeyClaim[][]): void {
+  for (let i = 0; i < groups.length; i++) {
+    for (let j = i + 1; j < groups.length; j++) {
+      for (const a of groups[i]!) {
+        for (const b of groups[j]!) {
+          if (!claimsCollide(a, b)) continue;
+          const key = a.kind === 'exact' ? a.key : shownKey(b.kind === 'exact' ? b : a);
+          throw new Error(
+            `@gnldev/workflow: ${a.from} and ${b.from} are both journaled at '${key}', so the second would replay the first one's output instead of running. To keep both: ${b.fix}.`,
+          );
+        }
+      }
+    }
+  }
+}
+
+/** Keys the engine writes for itself in a run's `<runId>:wf:` namespace. */
+const RESERVED_KEYS = new Set(['_suspend', '_canceled', '_input']);
+const RESERVED_PREFIX = '_resume:';
+
+function assertNoReservedKey(claims: KeyClaim[]): void {
+  for (const c of claims) {
+    if (c.kind !== 'exact' || !(RESERVED_KEYS.has(c.key) || c.key.startsWith(RESERVED_PREFIX))) continue;
+    throw new Error(
+      `@gnldev/workflow: ${c.from} would be journaled at '${c.key}', a key the engine keeps its own record under — '_suspend', '_canceled', '_input' and every '_resume:<waitId>' are reserved. To keep it: ${c.fix}.`,
+    );
+  }
+}
+
 /**
- * A step's journal key is its id, so one id used twice in one workflow makes the second use replay
- * the first one's output — on a FRESH run, with no error. Refused where the workflow is built.
- * Scoped places are unaffected: the two arms of a branch (only one runs per input) and a nested
- * workflow (its own keyPrefix) may reuse an id.
+ * One step id used twice in one workflow — the commonest form of the collision above, kept as its own
+ * message because its way through depends on what the step is: a renamed copy of an asStep or a retry
+ * would still write the original's nested keys or counter.
  */
-function assertUniqueStepIds(ids: string[]): void {
+function assertUniqueStepIds(steps: Step[]): void {
   const seen = new Set<string>();
-  for (const id of ids) {
+  for (const s of steps) {
+    const id = s.id;
     if (seen.has(id)) {
+      const body = BODIES.get(s.run);
+      const fix =
+        body?.kind === 'asStep'
+          ? `asStep('${id}-2', <the same workflow>) — not step('${id}-2', ${safeIdent(id)}.run), whose nested steps would still be journaled under '${body.id}:'`
+          : body?.kind === 'retry'
+            ? `retry(step('${id}-2', <the retried step>.run), <the same policy>) — a renamed copy of the retry itself keeps its attempt counter at '${body.id}:attempts'`
+            : `step('${id}-2', ${safeIdent(id)}.run) (pass ${safeIdent(id)}.durability as the third argument if it has one)`;
       throw new Error(
-        `@gnldev/workflow: step id '${id}' is used twice in one workflow. Every step is journaled under its id, so the second use would replay the first one's output instead of running. Give each use its own id: step('${id}-2', ${safeIdent(id)}.run) (pass ${safeIdent(id)}.durability as the third argument if it has one).`,
+        `@gnldev/workflow: step id '${id}' is used twice in one workflow. Every step is journaled under its id, so the second use would replay the first one's output instead of running. Give each use its own id: ${fix}.`,
       );
     }
     seen.add(id);
@@ -461,7 +578,10 @@ function safeIdent(id: string): string {
 
 export class Workflow<I = any, O = any> {
   constructor(private readonly steps: Step[]) {
-    assertUniqueStepIds(steps.map((s) => s.id));
+    assertUniqueStepIds(steps);
+    const groups = steps.map((s) => claimsOf(s));
+    assertNoReservedKey(groups.flat());
+    assertDistinctKeys(groups);
   }
 
   /** Add a sequential step (previous output becomes this step's input). */
@@ -480,11 +600,14 @@ export class Workflow<I = any, O = any> {
   parallel(steps: Step<O, any>[], id?: string): Workflow<I, Record<string, any>> {
     // Legs share one journal namespace AND one output record keyed by leg id — a repeated id would
     // collide in both.
-    assertUniqueStepIds(steps.map((s) => s.id));
+    assertUniqueStepIds(steps);
     // Position-unique, like `.map` above. A default derived only from CONTENT collides with itself:
     // two `.parallel` over the same sub-steps produced one journal key, so the second never ran and
     // the workflow returned the first one's output — silently.
     const pid = id ?? `parallel#${this.steps.length}(${steps.map((s) => s.id).join('+')})`;
+    // The legs run in the same run, concurrently — no two of them may reach one key either.
+    const legClaims = () => steps.map((s) => claimsOf(s, `${pid}/${s.id}`));
+    assertDistinctKeys(legClaims());
     const composite: Step<O, Record<string, any>> = {
       id: pid,
       run: async (input, ctx) => {
@@ -499,6 +622,7 @@ export class Workflow<I = any, O = any> {
         return Object.fromEntries(entries);
       },
     };
+    BODIES.set(composite.run, { kind: 'composite', id: pid, claims: () => legClaims().flat() });
     return new Workflow<I, Record<string, any>>([...this.steps, composite]);
   }
 
@@ -515,6 +639,9 @@ export class Workflow<I = any, O = any> {
         return runStep({ id: `${bid}/${arm.id}`, run: arm.run, ...(arm.durability ? { durability: arm.durability } : {}) }, input, ctx);
       },
     };
+    // Only one arm runs per input, so the arms are not checked against each other — only against the
+    // rest of the workflow.
+    BODIES.set(composite.run, { kind: 'composite', id: bid, claims: () => [...claimsOf(ifStep, `${bid}/${ifStep.id}`), ...claimsOf(elseStep, `${bid}/${elseStep.id}`)] });
     return new Workflow<I, NO>([...this.steps, composite]);
   }
 
@@ -541,6 +668,7 @@ export class Workflow<I = any, O = any> {
         return out;
       },
     };
+    BODIES.set(composite.run, { kind: 'composite', id: fid, claims: () => [{ key: fid, kind: 'foreach', from: `the items of foreach '${fid}'`, fix: `give foreach '${fid}' another id` }] });
     return new Workflow<I, OT[]>([...this.steps, composite]);
   }
 
@@ -563,6 +691,7 @@ export class Workflow<I = any, O = any> {
         return cur;
       },
     };
+    BODIES.set(composite.run, { kind: 'composite', id, claims: () => [{ key: id, kind: 'loop', from: `the rounds of loop '${id}'`, fix: `give loop '${id}' another id` }] });
     return new Workflow<I, O>([...this.steps, composite]);
   }
 
@@ -1018,7 +1147,7 @@ async function bumpAttempts(journal: JournalLike, key: string, used: number): Pr
  */
 export function retry<I = any, O = any>(s: Step<I, O>, policy: RetryPolicy<I, O>): Step<I, O> {
   if (!(policy.attempts >= 1)) throw new Error(`@gnldev/workflow: retry('${s.id}') requires attempts >= 1`);
-  return {
+  const retried: Step<I, O> = {
     id: s.id,
     // FAZ-1: the wrapper carries the wrapped step's durability — a sideEffect step keeps its
     // write-ahead claim under retry (the claim then covers the whole attempt sequence: one claim,
@@ -1078,6 +1207,22 @@ export function retry<I = any, O = any>(s: Step<I, O>, policy: RetryPolicy<I, O>
       throw new RetryExhaustedError(s.id, policy.attempts, lastErr);
     },
   };
+  // The counter, the marker and the fallback's own record are written by the body, under `s.id` — the
+  // id this retry was created with, whatever a renamed copy is later called.
+  const fix = `give step '${s.id}' another id`;
+  BODIES.set(retried.run, {
+    kind: 'retry',
+    id: s.id,
+    claims: () => [
+      ...(BODIES.get(s.run)?.claims() ?? []),
+      { key: `${s.id}:attempts`, kind: 'exact', from: `retry('${s.id}')'s attempt counter`, fix },
+      { key: `${s.id}:_fallback`, kind: 'exact', from: `retry('${s.id}')'s fallback marker`, fix },
+      ...(policy.fallback
+        ? claimsOf(policy.fallback).map((c) => ({ ...c, from: `${c.from} (the fallback of retry('${s.id}'))`, fix: `give the fallback '${policy.fallback!.id}' another id` }))
+        : []),
+    ],
+  });
+  return retried;
 }
 
 /** Start an empty workflow builder. */
@@ -1093,8 +1238,20 @@ export function workflow<I = any>(): Workflow<I, I> {
  *   outer.then(asStep('payment', paymentWf))   // inner: ${runId}:wf:payment:checkFunds ...
  */
 export function asStep<I = any, O = any>(id: string, wf: Workflow<I, O>): Step<I, O> {
-  return {
+  const nested: Step<I, O> = {
     id,
     run: (input, ctx) => wf.run(input as I, { ...ctx, keyPrefix: `${ctx.keyPrefix ?? ''}${id}:` }),
   };
+  BODIES.set(nested.run, {
+    kind: 'asStep',
+    id,
+    claims: () =>
+      wf.build().flatMap((inner) => claimsOf(inner)).map((c) => ({
+        key: `${id}:${c.key}`,
+        kind: c.kind,
+        from: `${c.from} inside asStep('${id}')`,
+        fix: `give the nested workflow its own id: asStep('${id}-2', <the same workflow>)`,
+      })),
+  });
+  return nested;
 }

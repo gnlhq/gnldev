@@ -4,9 +4,20 @@
 
 ## What happened
 
-The server has no auth provider (or only a `{ read, write }` predicate pair, which has no identity), and
-the request was addressed to it by a name that is not `localhost`, not a `*.localhost` name, not an IP
-address and not listed in `allowedHosts` or `GNL_ALLOWED_HOSTS`. The body names the host it saw:
+The surface has no identity to authenticate, and the request was addressed to it by a name that is not
+`localhost`, not a `*.localhost` name, not an IP address and not listed in `allowedHosts` or
+`GNL_ALLOWED_HOSTS`. "No identity" is one of three things, and the message says which:
+
+- a REST API or Studio with **no auth provider** — `"this server has no auth provider, …"`;
+- one whose auth is a **`{ read, write }` predicate pair** (or a provider with `bindsIdentity: false`) —
+  `"this server's auth names no identity (a { read, write } pair, …)"`. The pair is refused too, even
+  when its predicates check a token: a predicate is opaque, and a rebound page is same-origin, so it may
+  send any header it likes — an `Authorization` header included. Nothing can tell a predicate that checks
+  a secret from one that checks that a header is present;
+- a standalone door — `createChatRoute`, `createAguiRoute`, or `createMcpServer` over HTTP — with **no
+  `identify`** — `"this createChatRoute door has no \`identify\`, …"` (on MCP, a JSON-RPC error).
+
+The body names the host it saw:
 
 ```json
 { "error": "this server has no auth provider, …", "code": "host_not_allowed", "host": "mybox.test" }
@@ -14,7 +25,7 @@ address and not listed in `allowedHosts` or `GNL_ALLOWED_HOSTS`. The body names 
 
 It applies to reads as well as writes, and to every route that asks the auth gate — the whole REST API,
 and Studio's API except the pages that answer anybody even with auth on (the UI shell, health,
-`/capabilities`, the API description).
+`/capabilities`, the API description) — and to every request a door without `identify` receives.
 
 ## Why the framework refuses
 
@@ -44,10 +55,30 @@ If the name is yours, list it — one line either way:
 | A tunnel (ngrok, cloudflared) | `allowedHosts: ['.ngrok-free.app']` | `GNL_ALLOWED_HOSTS=.ngrok-free.app,.trycloudflare.com` |
 | GitHub Codespaces port forwarding | `allowedHosts: ['.app.github.dev']` | `GNL_ALLOWED_HOSTS=.app.github.dev` |
 | A Docker / Compose service name | `allowedHosts: ['api']` | `GNL_ALLOWED_HOSTS=api` |
+| A container reaching the host (`host.docker.internal`) | `allowedHosts: ['host.docker.internal']` | `GNL_ALLOWED_HOSTS=host.docker.internal` |
 | A proxy that sets its own `Host` | `allowedHosts: true` | `GNL_ALLOWED_HOSTS=*` |
 
-A leading dot means the domain and every name under it. The option and the variable add up. A LAN IP
+On a standalone door the option goes in its own options: `createChatRoute(config, { allowedHosts })`,
+`createAguiRoute(config, { allowedHosts })`, `createMcpServer({ …, allowedHosts })`.
+
+**The forms an entry takes.** A leading dot means the domain and every name under it:
+`'.ngrok-free.app'` answers `abc123.ngrok-free.app` and `ngrok-free.app`. `'*.ngrok-free.app'` is read as
+the same thing. A tunnel hands out a new name each session, so list its domain, not today's name — the
+403 suggests the leading-dot form when it recognises a tunnel. A URL or a port is read as its hostname:
+`'http://mybox.test:4111'` and `'mybox.test:4111'` both mean `mybox.test`. An entry that could never match
+a `Host` header — `'*'` (use `true`), a wildcard in the middle of a name (`'api.*.example.com'`: write
+`'.example.com'`), a space — is refused where the server or door is built, with the fix in the error; in
+`GNL_ALLOWED_HOSTS` it is skipped with a warning naming it. The option and the variable add up.
+
+**When `GNL_ALLOWED_HOSTS` is read.** On every request (memoised on its value), so a value loaded by
+dotenv after the module that builds the server still applies — no restart order to get right. A LAN IP
 address, Docker's published `localhost:<port>`, and `127.0.0.1` need nothing.
 
 Or configure auth (`gnl add auth`, or `auth: roleAuth({ … })`): a surface that authenticates its callers
 answers any name — and a surface a tunnel exposes to the internet should authenticate its callers anyway.
+With a `{ read, write }` pair whose predicates check a token, that is the way to keep your token check and
+answer any name: `auth: roleAuth({ admin: { token: process.env.API_TOKEN! } })`. On a door, `identify`
+does the same: `identify: (req) => principal`, from a verified token.
+
+A state-changing request that a page on **another site** sent is refused by the other half of the same
+protection — see [`cross_site_refused`](./cross_site_refused.md).

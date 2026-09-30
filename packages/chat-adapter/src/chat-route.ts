@@ -11,7 +11,7 @@ import { convertToModelMessages } from 'ai';
 import type { UIMessage } from 'ai';
 import { createGnl, scopeConfigToOrg, RunThreadMismatchError, blockedErrorCode, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, upstreamFailure, sealRequestContext, sealFieldsOf, resolveWorkIdentity } from '@gnldev/durable';
 import type { CreateGnlConfig } from '@gnldev/durable';
-import { callerOfRequest, authorizeDoorRequest, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify } from '@gnldev/auth';
+import { callerOfRequest, authorizeDoorRequest, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, openDoorGuard, type AccessDecision, type Authorize, type Identify } from '@gnldev/auth';
 import { toUIMessageStreamResponse } from './ui-stream.js';
 
 export interface CreateChatRouteOptions {
@@ -59,6 +59,17 @@ export interface CreateChatRouteOptions {
    * as an ownership refusal. WITHOUT it this route leaves no record. If it throws, the route answers 500.
    */
   onDecision?: (decision: AccessDecision) => void | Promise<void>;
+  /**
+   * Host names this route also answers when it has NO `identify`, besides `localhost`, `*.localhost` and
+   * any IP address — the same list, forms and meaning as `allowedHosts` on `createRestApi` (a hostname,
+   * a leading-dot domain like `'.ngrok-free.app'`, or `true` for every name); `GNL_ALLOWED_HOSTS` adds to
+   * it. Without `identify` this route has no identity to check, so it refuses what a providerless REST
+   * API refuses: a request addressed by any other name (403 `host_not_allowed` — the DNS-rebinding shape,
+   * where the rebound page could read a thread back) and a state-changing request a page on another site
+   * sent (403 `cross_site_refused`). With `identify` neither check runs: who the caller is, is then the
+   * application's answer.
+   */
+  allowedHosts?: readonly string[] | true;
   /**
    * FAZ-2 — per-run concurrency lock, ON by default (`{ ttlMs: 300_000 }`). Two CONCURRENT requests
    * with the same runId (double-click, two tabs, a retry racing the original) used to BOTH execute;
@@ -225,6 +236,8 @@ export function createChatRoute(
       'or pass `identify: (req) => principal` from your verified session. `identify: () => undefined` opts out, explicitly.',
     );
   }
+  // No `identify`: the providerless protections the REST gate applies (@gnldev/auth `openDoorGuard`).
+  const openGuard = opts.identify ? undefined : openDoorGuard({ allowedHosts: opts.allowedHosts, door: 'createChatRoute' });
   const app = new Hono();
   // The outcome, reported once the route has answered (see `onDecision`).
   if (opts.onDecision) {
@@ -239,6 +252,11 @@ export function createChatRoute(
     });
   }
   app.post('/agents/:name/chat', async (c) => {
+    const open = openGuard?.(c.req.raw);
+    if (open) {
+      markRefusal(c.req.raw, 'policy', { detail: open.code });
+      return c.json({ error: open.error, code: open.code, ...(open.host !== undefined ? { host: open.host } : {}) }, open.status);
+    }
     const name = c.req.param('name');
     const body = (await c.req.json().catch(() => ({}))) as {
       id?: string;

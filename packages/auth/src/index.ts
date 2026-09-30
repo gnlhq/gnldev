@@ -8,12 +8,14 @@ export type { Principal, PrincipalKind, AuthContext, Decision, AuthCapabilities,
 // The outcome a host reports to `AuthProvider.onDecision`: what the caller got, not what `authorize` said first.
 export { markRefusal, markCredentialRejected, credentialRejected, CREDENTIAL_REJECTED, outcomeOf, settleDecision, decisionNotRecorded, AUTH_ERROR_CODES, AUTH_ERROR_STATUS } from './decision.js';
 export { roleAuth, CLIENT_ROLE, CLIENT_WRITES, END_USER_ROLE, FREE_ROLE_GRANTS, type EndUserTokens } from './role-auth.js';
-export { makeGate, principalOf, hostNotAllowedMessage, type Gate, type GateOptions } from './gate.js';
+export { makeGate, principalOf, hostNotAllowedMessage, type Gate, type GateOptions, type HostRuleAuth } from './gate.js';
 export { fromReadWrite, normalizeAuth, bindsIdentity, type ReadWriteAuth } from './adapter.js';
 export { safeEqual } from './safe-equal.js';
 // One JWT verifier for the free `endUsers` class and every @gnldev/auth-ee SSO provider.
 export { verifyJwt, jwtFromRequest, b64uDecode, declaredKind, signSubjectToken, MIN_SUBJECT_SECRET_BYTES, MAX_SUBJECT_TTL_SEC, MAX_REVOCABLE_SUBJECT_TTL_SEC, type JwtVerifyOptions } from './jwt.js';
-export { isCrossSiteStateChange, isHostAllowed, hostnameOf, parseAllowedHosts } from './same-site.js';
+export { isCrossSiteStateChange, crossSiteRefusedMessage, isHostAllowed, hostnameOf, parseAllowedHosts } from './same-site.js';
+// The providerless protections for a standalone door (chat, AG-UI, MCP over HTTP) with no `identify`.
+export { openDoorGuard, type OpenDoorGuardOptions, type OpenDoorRefusal } from './open-door.js';
 export { subjectTokenEndpoint, sessionTokenId, type SubjectSession } from './token-endpoint.js';
 // The one reading a standalone door (chat, AG-UI, MCP) makes of a request: `identify`, then `engineCallerOf`.
 export { callerOfRequest, authorizeDoorRequest, AGENTS_RUN, APPLICATION_NAMES_NO_USER, CREDENTIAL_NOT_ACCEPTED, type RequestCaller, type Authorize } from './door.js';

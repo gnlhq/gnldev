@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 let wfAnonCounter = 0; // runWorkflow's anon-fallback uniqueness within a process — see the warn below
 import type { ToolSchemaRuleLike } from './types.js';
+import { decodeStepRecord } from './step-record.js';
 import { stepCountIs, tool as aiTool, jsonSchema } from 'ai';
 import { runDurable, streamDurable, assertRunIdSafe } from './run.js';
 import type { StreamBreach } from './run.js';
@@ -573,15 +574,6 @@ function isFallbackMarker(v: unknown): v is { __gnlFallback: true; attempts: num
   if (!v || typeof v !== 'object') return false;
   const m = v as Record<string, unknown>;
   return m.__gnlFallback === true && typeof m.attempts === 'number' && typeof m.stepId === 'string';
-}
-
-/**
- * The record @gnldev/workflow writes for a step that completed with `undefined` (its
- * `isVoidStepRecord`) — structural for the same one-way-dependency reason as the fallback marker.
- * Read back as `undefined`, so a run's step list shows what the step returned, not the brand.
- */
-function stepOutputOf(v: unknown): unknown {
-  return v && typeof v === 'object' && (v as Record<string, unknown>).__gnlVoid === true && Object.keys(v).length === 1 ? undefined : v;
 }
 
 function workflowStepKind(id: string): string {
@@ -1831,7 +1823,7 @@ export function createGnl(config: CreateGnlConfig) {
       steps.push({
         id: s.id,
         kind: workflowStepKind(s.id),
-        output: stepOutputOf(await journal.get(`${runId}:wf:${s.id}`)),
+        output: decodeStepRecord(await journal.get(`${runId}:wf:${s.id}`)),
         ...(fallback ? { fallback } : {}),
       });
     }

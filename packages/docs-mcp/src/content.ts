@@ -228,7 +228,7 @@ await runDurable({ runId, journal, model, tools, prompt });`,
     install: `import { roleAuth, type Cred } from '@gnldev/auth';
 import { createRestApi } from '@gnldev/server';
 import { createStudioApp } from '@gnldev/studio';`,
-    apis: [`roleAuth({ admin?, viewer? }) — AuthProvider | undefined (opt-in)`, `AuthProvider — authenticate(c), authorize(principal, c, ctx)`, `Principal — { id?, roles, orgId?, permissions? }`, `makeGate — converts an AuthProvider into a Hono gate`],
+    apis: [`roleAuth({ admin?, viewer? }) — AuthProvider | undefined (opt-in)`, `AuthProvider — authenticate(c), authorize(principal, c, ctx)`, `Principal — { id?, roles, orgId?, permissions? }`, `makeGate — converts an AuthProvider into a Hono gate`, `Host rule — with no provider (or only a { read, write } pair) the REST API and Studio answer only localhost, *.localhost, IP addresses and the names you list: allowedHosts: ['mybox.test', '.ngrok-free.app'] (a leading dot or '*.': every name under it; true: every name) or GNL_ALLOWED_HOSTS=mybox.test,.ngrok-free.app; anything else is 403 host_not_allowed (DNS rebinding). A provider that binds an identity (roleAuth) answers any name`, `Cross-site writes — with no identity, a state-changing request a page on another site sent is 403 cross_site_refused; a standalone chat / AG-UI / MCP door without identify applies both checks too (allowedHosts on createChatRoute / createAguiRoute / createMcpServer)`],
     example: `// In production, refuse to start rather than fall back to a token that is public knowledge.
 const required = (name: string) => {
   const v = process.env[name];
@@ -601,17 +601,19 @@ const r = await gnl.runNetwork('desk', { runId: 'n1', task: 'research and draft 
     oneLiner: `Deterministic chunking, a persistent pgvector store, and GraphRAG; exactly-once RAG inside durable.`,
     tier: `core`,
     package: `@gnldev/rag`,
-    install: `import { chunkDocuments, indexDocuments, PostgresVectorStore, GraphRag, createRagTool } from '@gnldev/rag';`,
+    install: `import { ingestDocuments, deleteDocuments, chunkDocuments, PostgresVectorStore, GraphRag, createRagTool } from '@gnldev/rag';`,
     apis: [
-      `chunkText / chunkDocuments — recursive/markdown/character strategies, size/overlap, deterministic <docId>#<i> ids`,
+      `ingestDocuments(store, embed, docs, chunkOptions?) — chunk, embed, remove each document's previous chunks, write the new ones: re-indexing an edited document leaves exactly its current chunks (use this, not chunkDocuments + indexDocuments, for documents that change; needs a store with delete)`,
+      `deleteDocuments(store, ids, { namespace? }) — remove documents, every chunk of them`,
+      `chunkText / chunkDocuments — recursive/markdown/character strategies, size/overlap, deterministic <docId>#<i> ids; indexDocuments(store, embed, chunks) only upserts, so a document that shrinks keeps its old tail chunks`,
       `PostgresVectorStore — a persistent pgvector store (pool or connectionString, dimension?, index: hnsw|ivfflat|none)`,
       `GraphRag — a similarity-graph VectorStore (threshold/hops/decay/seeds), a drop-in for createRagTool`,
       `createRagTool({ store, embed, topK?, rerank? }) — journaled inside durable, so retrieval is exactly-once; a run with a resourceId is answered from shared docs + that user's own`,
     ],
     example: `// label each doc: shared: true (everyone's) or owner: '<user id>' (one end user's); unlabelled = no end user sees it
-const chunks = chunkDocuments(docs, { strategy: 'markdown', size: 1200, overlap: 120 });
 const store = new PostgresVectorStore({ connectionString: process.env.DATABASE_URL, index: 'hnsw' });
-await indexDocuments(store, embed, chunks);
+// Run it again whenever a document changes: its old chunks are removed, so nothing stale is retrieved.
+await ingestDocuments(store, embed, docs, { strategy: 'markdown', size: 1200, overlap: 120 });
 const gnl = createGnl({ storage, agents: { asst: { model, tools: { search: createRagTool({ store, embed, topK: 5 }) } } } });`,
   },
   {

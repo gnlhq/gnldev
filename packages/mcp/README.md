@@ -370,6 +370,24 @@ A complete, runnable version of this — with a test that asserts every claim on
 
 It takes a transport you built and connects to it; it opens no socket and validates no credential. Whatever authenticates the caller — the SDK's auth middleware on a streamable-HTTP transport, a reverse proxy, mTLS — is yours to put in front, and `identify` is how its result reaches the dedup key. `gnl studio` refuses to serve an unauthenticated surface off loopback because it owns the `listen()` call; this package never binds, so it cannot refuse a bind. What it can do, and now does, is refuse to pretend a client-chosen string identifies a caller.
 
+### Without `identify`: what the server refuses over HTTP
+
+A server with no `identify` has no identity to check, so over HTTP it refuses what a REST API with no auth refuses —
+the same two checks, from the same `@gnldev/auth` functions:
+
+- a request addressed by a name other than `localhost`, a `*.localhost` name or an IP address → a JSON-RPC error
+  [`host_not_allowed`](../../docs/errors/host_not_allowed.md). That is what a DNS-rebinding page sends; it
+  is same-origin to the browser, so it can speak the streamable-HTTP transport, call a tool and read
+  the answer.
+- a message a page on another site sent (`Sec-Fetch-Site: cross-site`) →
+  [`cross_site_refused`](../../docs/errors/cross_site_refused.md).
+
+Nothing changes on this machine: `localhost`, `127.0.0.1`, a LAN IP, a UI on another localhost port and
+an in-process `fetch` are answered. A name of your own (a tunnel, Codespaces, a Docker service) is one
+line: `createMcpServer({ …, allowedHosts: ['.ngrok-free.app'] })`, or `GNL_ALLOWED_HOSTS=.ngrok-free.app` in the
+environment. Over stdio, or called in process without a request, nothing is checked. With `identify` neither check runs — who the
+caller is, is then your answer.
+
 ## Running MCP safely (`mcpFirewall`)
 
 **Threat model.** MCP tool definitions (`name`/`description`/`inputSchema`) are **untrusted data coming from the server** — market data points to 30+ CVEs in the last 60 days:

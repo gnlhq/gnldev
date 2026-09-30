@@ -26,7 +26,7 @@
 // label for the work, unique only within one caller.
 import { durableTool, resolveWorkIdentity, sealRequestContext, sealFieldsOf, blockedErrorCode, withOrg, admitRun, UNKNOWN, runIdentity, toolContextFor } from '@gnldev/durable';
 import type { Journal, WorkScope, RequestContext, Caller, GnlToolContext } from '@gnldev/durable';
-import { callerOfRequest, actorIdOf, type Identify, type Principal } from '@gnldev/auth';
+import { callerOfRequest, actorIdOf, openDoorGuard, type Identify, type Principal } from '@gnldev/auth';
 import { asSchema } from 'ai';
 import type { McpToolDef } from './index.js';
 import { createRateWindow, type RateWindow } from './rate-window.js';
@@ -194,6 +194,17 @@ export interface McpServerOptions {
    *  addresses work owned by the installation rather than by a person. Read @gnldev/durable's note on
    *  WorkScope before choosing 'org' — the two mistakes do not cost the same. */
   workScope?: WorkScope['kind'];
+  /**
+   * Host names this server also answers over HTTP when it has NO `identify`, besides `localhost`,
+   * `*.localhost` and any IP address — the same list, forms and meaning as `allowedHosts` on
+   * `createRestApi` (a hostname, a leading-dot domain like `'.ngrok-free.app'`, or `true` for every name);
+   * `GNL_ALLOWED_HOSTS` adds to it. Without `identify` a message that arrived in an HTTP request
+   * (`caller.request`) addressed by any other name is refused (`host_not_allowed` — a DNS-rebound page is
+   * same-origin, so it can speak the streamable-HTTP transport), and so is one a page on another site
+   * sent (`cross_site_refused`). Over stdio, or called in process with no request, nothing changes. With
+   * `identify` neither check runs: who the caller is, is then the application's answer.
+   */
+  allowedHosts?: readonly string[] | true;
 }
 
 export interface McpServer {
@@ -406,8 +417,14 @@ export function createMcpServer(opts: McpServerOptions): McpServer {
   // shows and the call refuses (or worse, the reverse) is the shape this package has already been wrong
   // in twice. Both doors below call this and nothing else.
   type Prepared = { caller: McpCallerContext; principal: Principal | undefined; runsAs: Caller; tools: Record<string, McpServerToolDef>; context: RequestContext };
+  // No `identify`: the providerless protections the REST gate applies, for a message that came over HTTP.
+  const openGuard = opts.identify ? undefined : openDoorGuard({ allowedHosts: opts.allowedHosts, door: 'createMcpServer' });
   async function prepare(caller: McpCallerContext | undefined, named: string | undefined): Promise<Prepared | { refused: string }> {
     const c = caller ?? {};
+    // A protocol-level refusal, THROWN (a JSON-RPC error the client shows) rather than a tool result the
+    // model reads or an empty list that would hide every tool from a developer with no reason given.
+    const open = c.request ? openGuard?.(c.request) : undefined;
+    if (open) throw Object.assign(new Error(`${open.code}: ${open.error}`), { code: open.code, status: open.status });
     let principal: Principal | undefined;
     let runsAs: Caller = UNKNOWN;
     if (opts.identify) {

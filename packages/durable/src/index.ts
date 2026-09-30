@@ -138,6 +138,8 @@ export { createGnl, agentVisibleToOrg, sealRequestContext, serverIdentityOf, GNL
 // before they call one (gates, cancel registry, `X-Gnl-Run-Id`). See resolveWorkIdentity's own note
 // on why this is exported rather than re-derived per adapter.
 export { resolveWorkIdentity } from './registry.js';
+// How @gnldev/workflow stores a step's output: read a `<runId>:wf:<step>` record back as what the step returned.
+export { encodeStepRecord, decodeStepRecord } from './step-record.js';
 // The stamped `<runId>:input` record that says WHOSE run this is — exported for the same reason
 // resolveWorkIdentity is. Its own note names three doors that do not go through `persistInput` and
 // predicts a fourth being added by copying the `claim(...)`, unstamped. @gnldev/mcp is that fourth

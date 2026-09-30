@@ -54,6 +54,19 @@ export function isCrossSiteStateChange(req: Request): boolean {
   }
 }
 
+/**
+ * The sentence a cross-site refusal carries. `way` is the one line that lets a page on another site in:
+ * for the REST and Studio gate an auth provider, for a door an `identify`.
+ */
+export function crossSiteRefusedMessage(way: string): string {
+  return (
+    'a page on another site sent a state-changing request to a surface with no identity to authenticate, which is ' +
+    'the shape of cross-site request forgery (Sec-Fetch-Site: cross-site, or an Origin naming another host). ' +
+    'A page on this machine\'s own sites (localhost and its ports) is not refused. If another site is meant to call ' +
+    `this surface, give it an identity to check: ${way}. See docs/errors/cross_site_refused.md.`
+  );
+}
+
 // ── Which NAME was this request addressed to? ─────────────────────────────────────────────────────
 //
 // The check above answers "did another site cause this", and after a DNS rebind it answers no,
@@ -77,12 +90,17 @@ export function isCrossSiteStateChange(req: Request): boolean {
 /**
  * The hostname in a Host header: lowercased, port and IPv6 brackets removed, one trailing dot removed
  * (`localhost.` is the same name as `localhost` to a resolver, so it must be the same name here).
+ *
+ * A bracketed IPv6 literal may be followed by `:<port>` and nothing else. Anything after the `]` used
+ * to be dropped, so `[::1]evil.com` and `[::1]:x@evil` read as `[::1]`; they are returned whole now,
+ * and whole they are no address and no listed name.
  */
 export function hostnameOf(hostHeader: string): string {
   let h = hostHeader.trim().toLowerCase();
   if (h.startsWith('[')) {
     const end = h.indexOf(']');
-    return end === -1 ? h : h.slice(0, end + 1);
+    if (end === -1) return h;
+    return /^(:\d*)?$/.test(h.slice(end + 1)) ? h.slice(0, end + 1) : h;
   }
   const colon = h.lastIndexOf(':');
   if (colon !== -1 && /^\d*$/.test(h.slice(colon + 1))) h = h.slice(0, colon);
@@ -95,26 +113,81 @@ function isIpLiteral(hostname: string): boolean {
   return !!m && m.slice(1, 5).every((o) => Number(o) <= 255);
 }
 
+/** A DNS name made of non-empty labels (`..localhost` and `.localhost` are not names a browser sends). */
+function isDnsName(name: string): boolean {
+  return /^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/.test(name);
+}
+
+/**
+ * One `allowedHosts` / `GNL_ALLOWED_HOSTS` entry, in the form `isHostAllowed` compares: a hostname, or a
+ * leading-dot domain. Accepts what developers write — `'mybox.test'`, `'.ngrok-free.app'`,
+ * `'*.ngrok-free.app'` (read as the leading-dot form), `'mybox.test:4111'`, `'http://mybox.test:4111/'` —
+ * and answers `{ problem }` for an entry that could never match a Host header, with the fix.
+ */
+export function allowedHostEntry(raw: string): { entry: string } | { problem: string } {
+  let e = raw.trim().toLowerCase();
+  if (e === '*') return { problem: 'for every name, pass allowedHosts: true (or GNL_ALLOWED_HOSTS=*)' };
+  if (/^[a-z][a-z0-9+.-]*:\/\//.test(e)) {
+    try {
+      e = new URL(e).hostname;
+    } catch {
+      return { problem: "write a host name ('mybox.test'), a leading-dot domain ('.ngrok-free.app'), or a URL ('http://mybox.test:4111')" };
+    }
+  }
+  if (e.startsWith('*.')) e = e.slice(1);
+  if (e.includes('*')) {
+    const rest = e.slice(e.lastIndexOf('*') + 1).replace(/^\.+/, '');
+    return { problem: `a wildcard is understood only as a leading '*.' — for every name under ${rest || 'a domain'} write '.${rest || 'example.com'}'` };
+  }
+  const dot = e.startsWith('.');
+  const name = hostnameOf(dot ? e.slice(1) : e);
+  if (!(isDnsName(name) || isIpLiteral(name))) {
+    return { problem: "write a host name ('mybox.test'), a leading-dot domain ('.ngrok-free.app'), or a URL ('http://mybox.test:4111')" };
+  }
+  return { entry: dot ? `.${name}` : name };
+}
+
 /**
  * Is a request whose Host header is `hostHeader` addressed to this machine by a name nobody else controls?
  *
- * `allowed` entries are hostnames (`mybox.test`), or a leading-dot domain (`.ngrok-free.app`) meaning
- * that name and every name under it. `true` answers every name.
+ * `allowed` entries are hostnames (`mybox.test`), or a leading-dot domain (`.ngrok-free.app`, also
+ * written `*.ngrok-free.app`) meaning that name and every name under it; a URL or a `:port` is read as
+ * its hostname. An entry that is none of these matches nothing. `true` answers every name.
  */
 export function isHostAllowed(hostHeader: string, allowed: readonly string[] | true): boolean {
   if (allowed === true) return true;
   const name = hostnameOf(hostHeader);
-  if (name === 'localhost' || name.endsWith('.localhost') || isIpLiteral(name)) return true;
+  if (isIpLiteral(name)) return true;
+  if (!isDnsName(name)) return false;
+  if (name === 'localhost' || name.endsWith('.localhost')) return true;
   for (const raw of allowed) {
-    const entry = hostnameOf(raw);
+    const parsed = allowedHostEntry(raw);
+    if (!('entry' in parsed)) continue;
+    const entry = parsed.entry;
     if (entry.startsWith('.') ? name === entry.slice(1) || name.endsWith(entry) : name === entry) return true;
   }
   return false;
 }
 
-/** `GNL_ALLOWED_HOSTS`: comma-separated names (same forms as `allowedHosts`), or `*` for every name. */
-export function parseAllowedHosts(raw: string | undefined): string[] | true {
-  if (!raw) return [];
+/** `GNL_ALLOWED_HOSTS`, with the entries that can never match set apart (a gate warns about those). */
+export function readAllowedHosts(raw: string | undefined): { hosts: string[] | true; invalid: string[] } {
+  if (!raw) return { hosts: [], invalid: [] };
   const list = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
-  return list.includes('*') ? true : list;
+  if (list.includes('*')) return { hosts: true, invalid: [] };
+  const hosts: string[] = [];
+  const invalid: string[] = [];
+  for (const item of list) {
+    const parsed = allowedHostEntry(item);
+    if ('entry' in parsed) hosts.push(parsed.entry);
+    else invalid.push(item);
+  }
+  return { hosts, invalid };
+}
+
+/**
+ * `GNL_ALLOWED_HOSTS`: comma-separated names (same forms as `allowedHosts`), or `*` for every name.
+ * Entries are normalised (`*.x` → `.x`, a URL or `:port` → its hostname); one that can never match is dropped.
+ */
+export function parseAllowedHosts(raw: string | undefined): string[] | true {
+  return readAllowedHosts(raw).hosts;
 }

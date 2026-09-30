@@ -5,9 +5,12 @@
 // ours — the same coupling the factories dropped when they stopped returning a Hono app. Everything
 // the gate reads (method, path, headers, query) is on `Request`; nothing was lost by narrowing.
 import type { AuthProvider, Decision, Principal } from './types.js';
-import { isCrossSiteStateChange, isHostAllowed, hostnameOf, parseAllowedHosts } from './same-site.js';
+import { isCrossSiteStateChange, isHostAllowed, hostnameOf, allowedHostEntry, readAllowedHosts, crossSiteRefusedMessage } from './same-site.js';
 import { bindsIdentity } from './adapter.js';
 import { notePrincipal, noteVerdict, settleDecision, AUTH_ERROR_CODES } from './decision.js';
+
+/** The way through a cross-site refusal on REST / Studio. */
+const CROSS_SITE_WAY = "configure an auth provider that binds an identity — auth: roleAuth({ admin: { token } }) — or serve the page from this machine's own site (a dev-server proxy to the API)";
 
 export interface Gate {
   /** Is access allowed? true if there's no provider (opt-in: gate not set up → open; see makeGate in production). */
@@ -39,7 +42,9 @@ export interface Gate {
 const principals = new WeakMap<Request, Principal>();
 const decisions = new WeakMap<Request, Decision>();
 /** Requests refused by the host rule, with the hostname they named — `deny()` answers them with it. */
-const hostRefusals = new WeakMap<Request, string>();
+const hostRefusals = new WeakMap<Request, { name: string; auth: HostRuleAuth }>();
+/** Requests refused as a cross-site state change — `deny()` answers them with `cross_site_refused`. */
+const crossSiteRefusals = new WeakSet<Request>();
 
 /**
  * The principal authenticated during allow() (within the same request). Hosts derive the organization
@@ -64,10 +69,13 @@ export interface GateOptions {
    *
    * List the names you really use: a custom dev hostname (`'mybox.test'`), a tunnel or Codespaces
    * domain with a leading dot for every name under it (`'.ngrok-free.app'`, `'.trycloudflare.com'`,
-   * `'.app.github.dev'`), a Docker service name (`'api'`). `true` answers every name — for a server
-   * behind a proxy that sets its own Host. The `GNL_ALLOWED_HOSTS` environment variable
-   * (comma-separated, or `*`) is read when the gate is built and adds to this list, so `gnl dev`,
-   * `gnl studio` and your own server all take it with no code change.
+   * `'.app.github.dev'`; `'*.ngrok-free.app'` means the same), a Docker service name (`'api'`). A URL or
+   * a `:port` is read as its hostname. An entry that could never match a Host header (`'*'`, a wildcard
+   * mid-name, a space) throws where the gate is built, naming the fix. `true` answers every name — for a
+   * server behind a proxy that sets its own Host. The `GNL_ALLOWED_HOSTS` environment variable
+   * (comma-separated, or `*`) adds to this list and is read when a request is answered, so `gnl dev`,
+   * `gnl studio` and your own server all take it with no code change — also when it is loaded (dotenv)
+   * after the module that builds the server.
    *
    * Ignored when the provider binds an identity: the bearer token is the defence there, and a rebound
    * page cannot read it.
@@ -75,15 +83,76 @@ export interface GateOptions {
   allowedHosts?: readonly string[] | true;
 }
 
-/** The sentence a host-rule refusal carries: what happened, and the one line that lets the name in. */
-export function hostNotAllowedMessage(hostname: string): string {
+/** What a surface refusing by the host rule has for auth: nothing, or a `{ read, write }` pair (no identity). */
+export type HostRuleAuth = 'none' | 'read-write';
+
+/**
+ * Name suffixes of tunnels and hosted dev environments that hand out a NEW name per session: for these the
+ * useful entry is the leading-dot domain, not the name in front of the developer today.
+ */
+const SESSION_NAME_DOMAINS = ['ngrok-free.app', 'ngrok-free.dev', 'ngrok.app', 'ngrok.io', 'trycloudflare.com', 'app.github.dev', 'githubpreview.dev', 'gitpod.io', 'loca.lt', 'devtunnels.ms', 'ts.net'];
+
+/**
+ * The sentence a host-rule refusal carries: what is true about this surface, what happened, and the one
+ * line that lets the name in.
+ *
+ * `opts.auth` says why the rule applies — no auth at all, or a `{ read, write }` pair, whose predicates
+ * name no identity (a pair is refused too: a predicate is opaque, and a rebound page is same-origin, so it
+ * may send any header, a token-shaped one included). `opts.door` is set by a standalone door with no
+ * `identify` (`'createChatRoute'`), and names where its `allowedHosts` goes.
+ */
+export function hostNotAllowedMessage(hostname: string, opts: { auth?: HostRuleAuth; door?: string } = {}): string {
+  const suffix = SESSION_NAME_DOMAINS.find((d) => hostname.endsWith(`.${d}`));
+  const entry = suffix ? `.${suffix}` : hostname;
+  const where = opts.door ? `the ${opts.door} options` : 'the createRestApi / createStudioApp options';
+  const what = opts.door
+    ? `this ${opts.door} door has no \`identify\`, so it answers only requests addressed to it as localhost or by an IP address`
+    : opts.auth === 'read-write'
+      ? `this server's auth names no identity (a { read, write } pair, or a provider with bindsIdentity: false) — so, like a server with no auth, it answers only requests addressed to it as localhost or by an IP address`
+      : `this server has no auth provider, so it answers only requests addressed to it as localhost or by an IP address`;
   return (
-    `this server has no auth provider, so it answers only requests addressed to it as localhost or by an ` +
-    `IP address, and this one was addressed to "${hostname}" (the shape of a DNS-rebinding page). ` +
+    `${what}, and this one was addressed to "${hostname}" (the shape of a DNS-rebinding page). ` +
     `If that name is yours — a LAN hostname, a tunnel, Codespaces, a Docker service — list it: ` +
-    `allowedHosts: ['${hostname}'] in the createRestApi / createStudioApp options, or ` +
-    `GNL_ALLOWED_HOSTS=${hostname} in the environment (gnl dev, gnl studio). See docs/errors/host_not_allowed.md.`
+    `allowedHosts: ['${entry}'] in ${where}, or GNL_ALLOWED_HOSTS=${entry} in the environment (gnl dev, gnl studio; read on every request)` +
+    (suffix ? `; the leading dot means '${suffix}' and every name under it, which a new tunnel name each session needs` : '') +
+    '.' +
+    (opts.auth === 'read-write'
+      ? ` Or authenticate with a provider that binds an identity — auth: roleAuth({ admin: { token } }) — which answers any name, because a rebound page cannot read its token.`
+      : '') +
+    ` See docs/errors/host_not_allowed.md.`
   );
+}
+
+/**
+ * The host-rule allow-list of one surface: the option, validated where the surface is built (an entry
+ * that could never match throws, naming the fix), plus `GNL_ALLOWED_HOSTS`, read when a request is
+ * answered. ONE implementation for every surface without an identity — the REST and Studio gate
+ * (`makeGate`) and the standalone doors (`openDoorGuard`).
+ */
+export function hostAllowList(allowedHosts: readonly string[] | true | undefined): () => readonly string[] | true {
+  const fromOption: readonly string[] | true =
+    allowedHosts === true
+      ? true
+      : (allowedHosts ?? []).map((raw) => {
+          const parsed = allowedHostEntry(raw);
+          if ('entry' in parsed) return parsed.entry;
+          throw new TypeError(`@gnldev/auth: allowedHosts entry ${JSON.stringify(raw)} can never match a Host header: ${parsed.problem}.`);
+        });
+  let lastRaw: string | undefined;
+  let lastHosts: string[] | true = [];
+  return () => {
+    if (fromOption === true) return true;
+    const raw = process.env.GNL_ALLOWED_HOSTS;
+    if (raw !== lastRaw) {
+      lastRaw = raw;
+      const { hosts, invalid } = readAllowedHosts(raw);
+      lastHosts = hosts;
+      if (invalid.length) {
+        console.warn(`@gnldev/auth: GNL_ALLOWED_HOSTS entries that can never match a Host header were skipped: ${invalid.map((i) => JSON.stringify(i)).join(', ')}. Write a host name ('mybox.test'), a leading-dot domain ('.ngrok-free.app'), or a URL ('http://mybox.test:4111').`);
+      }
+    }
+    return lastHosts === true ? true : [...fromOption, ...lastHosts];
+  };
 }
 
 /**
@@ -111,13 +180,13 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
   let warnedOpen = false;
   let warnedCrossSite = false;
   let warnedHost = false;
-  // Read ONCE, here: every host (createRestApi, createStudioApp, `gnl dev`, `gnl studio`, a project's
-  // own server) builds its gate through this function, so the variable reaches all of them with no
-  // plumbing — `gnl dev` builds its hosts from the PROJECT's installed packages and could not pass an
-  // option through them anyway.
-  const fromEnv = parseAllowedHosts(process.env.GNL_ALLOWED_HOSTS);
-  const allowedHosts: readonly string[] | true =
-    opts?.allowedHosts === true || fromEnv === true ? true : [...(opts?.allowedHosts ?? []), ...fromEnv];
+  // Every host (createRestApi, createStudioApp, `gnl dev`, `gnl studio`, a project's own server) builds
+  // its gate through this function, so GNL_ALLOWED_HOSTS reaches all of them with no plumbing — `gnl dev`
+  // builds its hosts from the PROJECT's installed packages and could not pass an option through them
+  // anyway. It is read per request (memoised on its value): read once at build, a variable that dotenv
+  // loaded after the app module was silently ignored.
+  const allowedHosts = hostAllowList(opts?.allowedHosts);
+  const hostRuleAuth: HostRuleAuth = provider ? 'read-write' : 'none';
 
   /**
    * Was this request addressed by a name somebody else could point here — against a surface with no
@@ -130,12 +199,12 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
   function hostWithoutIdentity(req: Request): boolean {
     if (bindsIdentity(provider)) return false;
     const host = req.headers.get('host');
-    if (!host || isHostAllowed(host, allowedHosts)) return false;
+    if (!host || isHostAllowed(host, allowedHosts())) return false;
     const name = hostnameOf(host);
-    hostRefusals.set(req, name);
+    hostRefusals.set(req, { name, auth: hostRuleAuth });
     if (!warnedHost) {
       warnedHost = true;
-      console.warn(`@gnldev/auth: refused a request addressed to "${name}". ${hostNotAllowedMessage(name)}`);
+      console.warn(`@gnldev/auth: refused a request addressed to "${name}". ${hostNotAllowedMessage(name, { auth: hostRuleAuth })}`);
     }
     return true;
   }
@@ -164,6 +233,7 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
    */
   function crossSiteWithoutIdentity(req: Request): boolean {
     if (bindsIdentity(provider) || !isCrossSiteStateChange(req)) return false;
+    crossSiteRefusals.add(req);
     if (!warnedCrossSite) {
       warnedCrossSite = true;
       console.warn(
@@ -226,7 +296,13 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
       const refusedHost = hostRefusals.get(req);
       if (refusedHost !== undefined) {
         return Response.json(
-          { error: hostNotAllowedMessage(refusedHost), code: AUTH_ERROR_CODES.hostNotAllowed, host: refusedHost },
+          { error: hostNotAllowedMessage(refusedHost.name, { auth: refusedHost.auth }), code: AUTH_ERROR_CODES.hostNotAllowed, host: refusedHost.name },
+          { status: 403 },
+        );
+      }
+      if (crossSiteRefusals.has(req)) {
+        return Response.json(
+          { error: crossSiteRefusedMessage(CROSS_SITE_WAY), code: AUTH_ERROR_CODES.crossSiteRefused },
           { status: 403 },
         );
       }
