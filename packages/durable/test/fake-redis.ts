@@ -157,13 +157,29 @@ export class FakeRedis implements RedisLike {
       return 1;
     }
     // WorkStore.append (WORK_APPEND_LUA, marker `gnl:work-append`): KEYS = [counter, record], ARGV = [record].
-    // Existing record → 0 and no number taken; else INCR the counter and write `<seq>|<record>`.
+    // Existing record → 0 and no number taken; else INCR the counter and write the record numbered.
     if (script.includes('gnl:work-append')) {
       const [seqKey, recKey, rec] = [String(args[0]), String(args[1]), String(args[2])];
       if (this.live(recKey)) return 0;
       const n = Number(this.live(seqKey)?.val ?? 0) + 1;
       this.store.set(seqKey, { val: String(n) });
-      this.store.set(recKey, { val: `${n}|${rec}` });
+      this.store.set(recKey, { val: `{"json":{"seq":${n},${rec.slice('{"json":{'.length)}` });
+      return n;
+    }
+    // WorkStore.list numbering (WORK_NUMBER_LUA, marker `gnl:work-number`): KEYS = [counter, ...records].
+    // Each record still in 0.9's bare form takes the next number, written as the record's first field;
+    // a numbered or missing record is skipped. No await between reads and writes → atomic like the script.
+    if (script.includes('gnl:work-number')) {
+      const [seqKey, ...recKeys] = args.slice(0, numKeys).map(String);
+      let n = 0;
+      for (const k of recKeys) {
+        const v = this.live(k)?.val;
+        if (v === undefined || !v.startsWith('{"json":{') || v.startsWith('{"json":{"seq":')) continue;
+        const s = Number(this.live(seqKey!)?.val ?? 0) + 1;
+        this.store.set(seqKey!, { val: String(s) });
+        this.store.set(k, { val: `{"json":{"seq":${s},${v.slice('{"json":{'.length)}` });
+        n++;
+      }
       return n;
     }
     // H1 CAS mimic (putIfMatch, CAS_LUA): GET KEYS[1] == ARGV[1] → SET KEYS[1]=ARGV[2] → 1, else 0.

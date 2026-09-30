@@ -29,10 +29,26 @@ setInterval(() => pollScheduler(journal, gnl), 30_000);
 ```
 
 Give exactly one of `at` (epoch ms), `every` (ms, greater than 0) or `cron` (5 fields, UTC). A spec that
-could not fire — a cron with hour 25, `every: 0`, two of the three — is refused before anything is
-written. Calling `scheduleWorkflow` again for an id that already exists is a no-op, so a redeploy does
-not redefine a running trigger; the exception is a stored definition that cannot fire (left by 0.9.0),
-which the next valid registration replaces. The poller fails such a definition instead of firing it.
+could not fire — a cron with hour 25, `every: 0`, two of the three, `0 0 30 2 *` (there is no 30
+February) — is refused before anything is written. Whether a cron can fire does not depend on the date
+you ask: `0 0 29 2 *` fires on every leap day, four (across 2100, eight) years apart.
+
+Calling `scheduleWorkflow` again with the same spec for the same id is a no-op, so every boot can call
+it. A different spec for an id that already exists is refused, naming both, until you say which one you
+want:
+
+```ts
+import { scheduleWorkflow } from '@gnldev/scheduler';
+import { InMemoryJournal } from '@gnldev/durable';
+const journal = new InMemoryJournal();
+
+await scheduleWorkflow(journal, { id: 'nightly', name: 'report', cron: '0 4 * * *', ifExists: 'replace' });
+```
+
+`'replace'` applies the new spec (next time from it, attempts reset, a fire count no run has used);
+`'keep'` leaves the stored trigger as it is; or use a new id. A stored definition that cannot fire (left
+by 0.9.0) is replaced by the next valid registration whatever `ifExists` says, and the poller fails it
+instead of firing it.
 
 ## Triggers for an end user
 

@@ -159,10 +159,11 @@ describe.each(journals)('journals written by 0.9.0 — %s', (_n, mk) => {
     expect(r.runIds).toEqual(['sched:zero:7']); // not :0 — that run id may already have completed
   });
 
-  it('a VALID stored trigger is still not redefined by a re-registration (unchanged behaviour)', async () => {
+  it('a VALID stored trigger is not redefined silently: a different spec is refused, and `keep` leaves it', async () => {
     const j = mk();
     await scheduleWorkflow(j, { id: 't', every: 1000, name: 'w' }, T0);
-    await scheduleWorkflow(j, { id: 't', every: 5000, name: 'w' }, T0);
+    await expect(scheduleWorkflow(j, { id: 't', every: 5000, name: 'w' }, T0)).rejects.toThrow(/already scheduled/);
+    await scheduleWorkflow(j, { id: 't', every: 5000, name: 'w', ifExists: 'keep' }, T0);
     expect((await listTriggers(j))[0]).toMatchObject({ value: 1000 });
   });
 });

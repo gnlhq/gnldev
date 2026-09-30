@@ -281,7 +281,9 @@ pgvector tablosu değil ve olmayacak — motor içi ANN araması için `@gnldev/
 **⑧ `gnl_work_log` — kuyruk/olay defteri.** Kolonlar: `ns (namespace — hangi kuyruk/konu,
 örn. 'evt:siparis'), id (kayıt kimliği; ns+id birincil anahtar → aynı olay iki kez EKLENEMEZ =
 idempotent yayın), payload (içerik), ts (üreticinin saati, bilgi amaçlı), seq (deponun verdiği
-konum; kuyruk işçisi ve her tüketici `seq` sırasıyla okur)`. *Ne zaman?* `@gnldev/queue` iş ekleyince, `@gnldev/events`
+konum — kayıt ilk okunana kadar 0; ilk okuma onu kendinden önce numaralanan her kayıttan sonra
+numaralar; kuyruk işçisi ve her tüketici `seq` sırasıyla okur), ord (yalnız Postgres: kayıtların
+eklendiği sıra; numarasız kayıtlar bu sırayla numaralanır)`. *Ne zaman?* `@gnldev/queue` iş ekleyince, `@gnldev/events`
 olay yayınlayınca. Yalnız-ekle çalışır — ve **framework'te onu budayan hiçbir şey yok**. `sweepLog`
 budamaz: o bir `Journal` alır ve `appendLog` tabanlı namespace'leri (örneğin denetim defterini)
 süpürür; bu tabloya sahip olan `WorkStore` ise bambaşka bir depodur. `WorkStore` arayüzünde hiçbir

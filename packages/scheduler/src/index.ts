@@ -2,9 +2,9 @@
 // Keeps triggers in the journal (definition immutable, state mutable). The poll loop (now=Date.now())
 // fires due triggers exactly-once (acquireRunLock + per-fireCount runId). The workflow run carries its
 // own durable guarantee. Time = DATA (nextRunAt in the journal) → resolve-then-freeze, replay-safe.
-import { acquireRunLock, createPollLoop, orgPrefix, ownedName, ownedPrefix, ownerOfName, user, staff, UNKNOWN } from '@gnldev/durable';
+import { acquireRunLock, createPollLoop, orgPrefix, ownedName, ownedPrefix, ownerOfName, stableStringify, user, staff, UNKNOWN } from '@gnldev/durable';
 import type { Journal, Caller } from '@gnldev/durable';
-import { nextCronTime } from './cron.js';
+import { cronNeverFires, nextCronTime } from './cron.js';
 import { assertRootJournal } from './root-journal.js';
 
 export { nextCronTime, parseField } from './cron.js';
@@ -63,6 +63,15 @@ export interface ScheduleSpec {
    * 'catchup' — fire each missed occurrence in sequence (one per poll), none are skipped.
    */
   misfire?: MisfirePolicy;
+  /**
+   * What to do when this id is already scheduled with a DIFFERENT spec (the same spec again is always
+   * a no-op — that is what makes calling this on every boot safe):
+   * 'refuse'  (default) — throw, naming both specs; nothing is changed.
+   * 'replace' — the stored trigger takes this spec: next time from it, attempts reset, and a fire
+   *             counter that no run has used (so no run id is reused and replayed).
+   * 'keep'    — leave the stored trigger as it is (0.9 did this for every re-registration, silently).
+   */
+  ifExists?: 'refuse' | 'replace' | 'keep';
 }
 
 export type Kind = 'at' | 'every' | 'cron';
@@ -206,7 +215,7 @@ export type BudgetGuard = (ctx: {
  * always one the poller can fire: 0.9.0 wrote the definition first and validated after, so a refused
  * cron left an orphan behind, and `every: 0` was accepted and fired on every poll.
  */
-function definitionProblem(def: TriggerDef, now: number): string | undefined {
+function definitionProblem(def: TriggerDef): string | undefined {
   if (typeof def.name !== 'string' || def.name === '') return `name must be the workflow's name (a non-empty string), got ${JSON.stringify(def.name)}`;
   if (def.kind === 'at') {
     if (typeof def.value !== 'number' || !Number.isFinite(def.value)) return `at must be a finite epoch-ms number, got ${String(def.value)}`;
@@ -216,11 +225,15 @@ function definitionProblem(def: TriggerDef, now: number): string | undefined {
     }
   } else if (def.kind === 'cron') {
     if (typeof def.value !== 'string') return `cron must be a 5-field string, got ${String(def.value)}`;
+    // Whether the cron can EVER fire, never "within a year of now": the same spec must get the same
+    // answer on every date, here and in the poller (see cronNeverFires).
+    let never: string | undefined;
     try {
-      nextCronTime(def.value, now);
+      never = cronNeverFires(def.value);
     } catch (e) {
-      return `cron '${def.value}' cannot fire: ${(e as Error).message}`;
+      return `cron '${def.value}' is not valid: ${(e as Error).message}`;
     }
+    if (never) return `cron '${def.value}' can never fire: ${never}`;
   } else {
     return `unknown kind ${JSON.stringify(def.kind)}`;
   }
@@ -230,7 +243,7 @@ function definitionProblem(def: TriggerDef, now: number): string | undefined {
 }
 
 /** The definition a spec stands for — refused, before any write, when it could not fire. */
-function definitionOf(spec: ScheduleSpec, id: string, owner: ReturnType<typeof triggerOwnerOf>, now: number): TriggerDef {
+function definitionOf(spec: ScheduleSpec, id: string, owner: ReturnType<typeof triggerOwnerOf>): TriggerDef {
   const given = (['at', 'every', 'cron'] as const).filter((k) => spec[k] != null);
   if (given.length !== 1) {
     throw new Error(
@@ -249,9 +262,22 @@ function definitionOf(spec: ScheduleSpec, id: string, owner: ReturnType<typeof t
     misfire: spec.misfire ?? 'skip',
     ...owner,
   };
-  const problem = definitionProblem(def, now);
+  const problem = definitionProblem(def);
   if (problem) throw new Error(`@gnldev/scheduler: trigger '${id}' — ${problem}. Nothing was written.`);
   return def;
+}
+
+/**
+ * Which parts of two definitions differ, by NAME. Never the stored values: the id may be a guess by a
+ * caller who does not own the trigger (an ownerless id is shared), and the stored input is the owner's
+ * data. Measured: printing both specs put another caller's trigger input into the refusal.
+ */
+function definitionDiff(stored: TriggerDef, given: TriggerDef): string {
+  const fields = (['name', 'input', 'maxAttempts', 'misfire', 'resourceId', 'orgId', 'ownerKind'] as const)
+    .filter((k) => stableStringify(stored[k] ?? null) !== stableStringify(given[k] ?? null));
+  const schedule = stored.kind !== given.kind ? `the schedule (${stored.kind} → ${given.kind})`
+    : stableStringify(stored.value) !== stableStringify(given.value) ? `the ${given.kind} value` : undefined;
+  return [...(schedule ? [schedule] : []), ...fields].join(', ');
 }
 
 function firstRunAt(spec: ScheduleSpec, now: number): number {
@@ -316,7 +342,11 @@ async function fireCountAfterLoss(journal: Journal, id: string): Promise<number>
   return highest + 1;
 }
 
-/** Schedules a workflow (at | every | cron). Idempotent: repeating with the same id = no-op. Returns the id. */
+/**
+ * Schedules a workflow (at | every | cron). Returns the id. Idempotent: the same spec under the same id
+ * again is a no-op. A DIFFERENT spec under an id already scheduled is refused unless `ifExists` says
+ * otherwise (see `ScheduleSpec.ifExists`).
+ */
 export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, now: number = Date.now()): Promise<string> {
   assertRootJournal(journal, 'scheduleWorkflow');
   const owner = triggerOwnerOf(input);
@@ -332,25 +362,42 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
   const id = ownedName(spec.id ?? spec.name, { resourceId: owner.resourceId, orgId: owner.orgId });
   // Validated BEFORE any write, so a refused spec leaves nothing behind (0.9.0 wrote the definition
   // first and threw after it, and the orphan then shadowed the corrected registration).
-  const def = definitionOf(spec, id, owner, now);
+  const def = definitionOf(spec, id, owner);
+  const ifExists = spec.ifExists ?? 'refuse';
+  if (ifExists !== 'refuse' && ifExists !== 'replace' && ifExists !== 'keep') {
+    throw new Error(`@gnldev/scheduler: trigger '${id}' — ifExists must be 'refuse', 'replace' or 'keep', got ${JSON.stringify(ifExists)}. Nothing was written.`);
+  }
   const stored = await journal.get<TriggerDef>(DEF(id));
-  const storedProblem = stored === undefined ? undefined : definitionProblem(stored, now);
-  if (stored !== undefined && storedProblem !== undefined) {
-    // A STORED definition that cannot fire (written by 0.9.0: an orphan from a refused spec, or an
-    // `every: 0`). The definition is otherwise immutable, but this one has no schedule worth keeping,
-    // and this call holds a valid one: the corrected registration wins. The fire counter is kept —
-    // it is part of the run id, and a run id that already ran would replay instead of firing.
+  const storedProblem = stored === undefined ? undefined : definitionProblem(stored);
+  // "Already scheduled" is an answer only for the SAME spec. For a different one it was the silent
+  // failure: 0.9 stored `{ at }`, the host now passes `{ every }`, and the one-shot that had already
+  // fired stayed done forever while every boot was told all was well.
+  const changed = stored !== undefined && storedProblem === undefined && stableStringify(stored) !== stableStringify(def);
+  if (changed && ifExists === 'refuse') {
+    throw new Error(
+      `@gnldev/scheduler: trigger '${id}' is already scheduled with a different spec (differs in ${definitionDiff(stored, def)}). `
+      + `Nothing was changed. Pass ifExists: 'replace' to apply this spec, ifExists: 'keep' to leave the stored one, or use a new id.`,
+    );
+  }
+  if (stored !== undefined && (storedProblem !== undefined || (changed && ifExists === 'replace'))) {
+    // Replaced: a stored definition that cannot fire (written by 0.9.0 — an orphan from a refused spec,
+    // or an `every: 0`) whatever `ifExists` says, since it has no schedule worth keeping; or a valid
+    // one the caller asked to replace. The fire counter moves to one no run has used: it is part of
+    // the run id, and a run id that already ran replays its recorded answer instead of firing. (A
+    // one-shot that fired is `done` with its counter unmoved, so the stored count alone is not enough.)
     const prev = await journal.get<TriggerState>(STATE(id));
     const state: TriggerState = {
       nextRunAt: firstRunAt(spec, now),
       attempts: 0,
-      fireCount: prev?.fireCount ?? (await fireCountAfterLoss(journal, id)),
+      fireCount: Math.max(prev?.fireCount ?? 0, await fireCountAfterLoss(journal, id)),
       status: 'pending',
     };
     await journal.put(DEF(id), def);
     await journal.put(STATE(id), state);
     console.warn(
-      `[scheduler] invalid trigger definition replaced (trigger ${id}, workflow ${spec.name}) — the stored one could not fire (${storedProblem}); the definition from this scheduleWorkflow call was written in its place, fireCount=${state.fireCount}.`,
+      storedProblem !== undefined
+        ? `[scheduler] invalid trigger definition replaced (trigger ${id}, workflow ${spec.name}) — the stored one could not fire (${storedProblem}); the definition from this scheduleWorkflow call was written in its place, fireCount=${state.fireCount}.`
+        : `[scheduler] trigger ${id} replaced (ifExists: 'replace') — it differed in ${definitionDiff(stored, def)}; nextRunAt=${state.nextRunAt}, fireCount=${state.fireCount}.`,
     );
     return id;
   }
@@ -371,8 +418,9 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
      * a def that has already lost its state has no honest "next time" either. Hosts already call this
      * on every boot (that is the idempotency promise), so the trigger for the repair is free.
      *
-     * DEF + STATE BOTH PRESENT: nothing is written, not even the definition. A running trigger's
-     * schedule is not silently redefined by a redeploy — that is today's behaviour and it stays.
+     * DEF + STATE BOTH PRESENT: nothing is written, not even the definition — this is the same spec
+     * again, or a different one with `ifExists: 'keep'`. A running trigger's schedule is never
+     * redefined silently: a different spec was refused above unless the caller said which it wanted.
      */
     if ((await journal.get(STATE(id))) === undefined) {
       const state: TriggerState = {
@@ -447,7 +495,7 @@ export async function pollScheduler(
     // refuses it): firing it would run the workflow and then throw in computeNext, or fire on every
     // poll for `every: 0`. The trigger is failed, with the reason and the way out, and the loop goes
     // on to the next trigger instead of stopping at this one.
-    const problem = definitionProblem(def, now);
+    const problem = definitionProblem(def);
     if (problem !== undefined) {
       const failed: TriggerState = { ...state, status: 'failed' };
       const won = journal.putIfMatch ? await journal.putIfMatch(STATE(id), state, failed) : (await journal.put(STATE(id), failed), true);

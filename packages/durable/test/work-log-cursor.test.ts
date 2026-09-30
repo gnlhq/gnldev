@@ -228,7 +228,10 @@ describe.skipIf(!RUN)('WorkStore.list cursor — live backends', () => {
 });
 
 describe('UPGRADE — a SQLite database written by 0.9 (no `seq` column, rows ordered by the producer clock)', () => {
-  it('opens, keeps every row readable in the old order, and appends after them', async () => {
+  // Rows written before sequences are numbered by the first read in the order they were INSERTED
+  // (`rowid`), which is 0.9's `(ts, id)` order except where producer clocks disagreed — the case that
+  // order got wrong. Every row is read exactly once, and a new one after all of them.
+  it('opens, keeps every row readable once (in insertion order), and appends after them', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gnl-wlog-'));
     const file = join(dir, 'old.db');
     try {
@@ -241,10 +244,11 @@ describe('UPGRADE — a SQLite database written by 0.9 (no `seq` column, rows or
       old.close();
 
       const s = new SqliteStorage(file);
-      expect((await readFrom(s.work, 'qjob', undefined, 7)).ids).toEqual(range('old-', 60));
+      const inserted = range('old-', 60).reverse();
+      expect((await readFrom(s.work, 'qjob', undefined, 7)).ids).toEqual(inserted);
       const { persisted } = await readFrom(s.work, 'qjob', undefined);
       await s.work.append('qjob', { v: 1 }, 'new-0000');
-      expect((await readFrom(s.work, 'qjob', persisted)).ids).toEqual([...range('old-', 10, 50), 'new-0000']);
+      expect((await readFrom(s.work, 'qjob', persisted)).ids).toEqual([...inserted.slice(50), 'new-0000']);
       expect((await s.checkSchema()).ok).toBe(true);
       await s.close();
     } finally {
@@ -298,18 +302,40 @@ describe('UPGRADE — a Postgres database written by 0.9', () => {
 });
 
 describe('SIBLING — adoptIntoOrg moves a log into an organization that already has one', () => {
-  const sql: Array<[string, () => SqliteStorage | PostgresStorage]> = [
+  // Every bundled store. The first cut covered SQLite and pg-mem only; measured then: the in-memory
+  // store REPLACED the organization's log with the moved one (60 records gone, 5 behind the cursor),
+  // and Redis did not move `wl:` logs at all — the organization's reader never saw the adopted records.
+  const all: Array<[string, () => Storage]> = [
+    ['in-memory', () => new InMemoryStorage()],
     ['sqlite', () => new SqliteStorage(':memory:')],
     ['postgres (pg-mem)', () => { const { Pool } = newDb().adapters.createPg(); return new PostgresStorage({ pool: new Pool() }); }],
+    ['redis (fake)', () => new RedisStorage({ client: makeFakeRedis() as never })],
   ];
-  it.each(sql)('%s: the moved records land after the organization\'s persisted cursor', async (_name, make) => {
+  it.each(all)('%s: the moved records land after the organization\'s persisted cursor, and its own records survive', async (_name, make) => {
     const s = make();
-    await append(s.work, 'evt:t', range('root-', 5));
-    await append(s.work, 'org:acme:evt:t', range('org-', 60));
-    const { persisted } = await readFrom(s.work, 'org:acme:evt:t', undefined);
-    await s.adoptIntoOrg('acme', { allowUnregistered: true });
-    expect((await readFrom(s.work, 'org:acme:evt:t', persisted)).ids).toEqual([...range('org-', 10, 50), ...range('root-', 5)]);
-    await s.work.append('org:acme:evt:t', { v: 1 }, 'after');
-    expect((await readFrom(s.work, 'org:acme:evt:t', persisted)).ids.at(-1)).toBe('after');
+    await append(s.work!, 'evt:t', range('root-', 5));
+    await append(s.work!, 'org:acme:evt:t', range('org-', 60));
+    const { persisted } = await readFrom(s.work!, 'org:acme:evt:t', undefined);
+    await s.adoptIntoOrg!('acme', { allowUnregistered: true });
+    expect((await readFrom(s.work!, 'org:acme:evt:t', persisted)).ids).toEqual([...range('org-', 10, 50), ...range('root-', 5)]);
+    expect((await readFrom(s.work!, 'org:acme:evt:t', undefined)).ids).toHaveLength(65);
+    expect((await readFrom(s.work!, 'evt:t', undefined)).ids).toEqual([]);
+    await s.work!.append('org:acme:evt:t', { v: 1 }, 'after');
+    expect((await readFrom(s.work!, 'org:acme:evt:t', persisted)).ids.at(-1)).toBe('after');
+  });
+  it.each(all)('%s: SIBLING — the organization\'s log was erased (its numbers are spent, no record left): the moved records still land after the cursor', async (_name, make) => {
+    const s = make();
+    await append(s.work!, 'org:acme:evt:t', range('old-', 60));
+    const { persisted } = await readFrom(s.work!, 'org:acme:evt:t', undefined);
+    await s.work!.deletePrefix!('org:acme:evt:t');
+    await append(s.work!, 'evt:t', range('root-', 5));
+    await s.adoptIntoOrg!('acme', { allowUnregistered: true });
+    expect((await readFrom(s.work!, 'org:acme:evt:t', persisted)).ids).toEqual(range('root-', 5));
+  });
+  it.each(all)('%s: SIBLING — a log with no organization counterpart moves whole, in its order', async (_name, make) => {
+    const s = make();
+    await append(s.work!, 'qjob', range('j-', 70));
+    await s.adoptIntoOrg!('acme', { allowUnregistered: true });
+    expect((await readFrom(s.work!, 'org:acme:qjob', undefined, 9)).ids).toEqual(range('j-', 70));
   });
 });

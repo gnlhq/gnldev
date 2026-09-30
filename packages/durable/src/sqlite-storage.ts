@@ -12,7 +12,7 @@ import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus } from '.
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix } from './organization.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
-import { decodeLogCursor, encodeLogCursor, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision } from './storage.js';
+import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision } from './storage.js';
 import type {
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -316,10 +316,11 @@ export class SqliteStorage implements Storage {
       }
     }
     // `gnl_work_log.seq`: the store-assigned position `WorkStore.list` pages by (see the port). Same
-    // additive shape as the columns above. No backfill, and 0 is the right value: a row written before
-    // sequences existed keeps its old `(ts, id)` order, ahead of every sequenced row — which is where it
-    // already was, since it was written first. The index cannot live in DDL: on an existing database
-    // DDL runs before this ALTER, and an index on a missing column fails the whole boot.
+    // additive shape as the columns above. No backfill: 0 means "not numbered yet", which is what a row
+    // written before sequences is, and what a 0.9 process still running on this file keeps writing —
+    // the first `list` numbers them in insertion order (see `numberNew`). The index cannot live in DDL:
+    // on an existing database DDL runs before this ALTER, and an index on a missing column fails the
+    // whole boot.
     const wcols = this.db.prepare(`PRAGMA table_info(gnl_work_log)`).all() as { name: string }[];
     if (!wcols.some((c) => c.name === 'seq')) {
       try {
@@ -410,15 +411,11 @@ export class SqliteStorage implements Storage {
           n += this.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${col} = ?`).get(k).c as number;
           if (dryRun) continue;
           if (table === 'gnl_work_log') {
-            // The moved records are APPENDED to the organization's log, so they are numbered after
-            // everything it already holds: kept at their old sequence, they would sit behind a cursor
-            // the organization's consumer has already persisted there (`WorkStore.list`).
-            const base = this.db.prepare(
-              'SELECT MAX(COALESCE((SELECT MAX(seq) FROM gnl_work_log WHERE ns = ?), 0), COALESCE((SELECT seq FROM gnl_work_seq WHERE ns = ?), 0)) AS b',
-            ).get(prefix + k, prefix + k).b as number;
-            this.db.prepare('UPDATE gnl_work_log SET ns = ?, seq = seq + ? WHERE ns = ?').run(prefix + k, base + 1, k);
-            this.db.prepare(`INSERT INTO gnl_work_seq (ns, seq) SELECT ?, MAX(seq) FROM gnl_work_log WHERE ns = ?
-              ON CONFLICT(ns) DO UPDATE SET seq = MAX(gnl_work_seq.seq, excluded.seq)`).run(prefix + k, prefix + k);
+            // The moved records are APPENDED to the organization's log: they become unnumbered, and the
+            // next `list` numbers them after everything the organization's log already holds — after
+            // any cursor its consumer has persisted (`WorkStore.list`). Kept at their old numbers they
+            // would sit behind it.
+            this.db.prepare('UPDATE gnl_work_log SET ns = ?, seq = 0 WHERE ns = ?').run(prefix + k, k);
           } else {
             this.db.prepare(`UPDATE ${table} SET ${col} = ? WHERE ${col} = ?`).run(prefix + k, k);
           }
@@ -579,7 +576,7 @@ CREATE TABLE IF NOT EXISTS gnl_work_seq (ns TEXT PRIMARY KEY, seq INTEGER NOT NU
 CREATE TABLE IF NOT EXISTS gnl_work_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS gnl_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER);
 `;
-/** `WorkStore.list`'s keyset, in its ORDER BY order. Created after the `seq` migration, not in DDL. */
+/** `WorkStore.list`'s keyset, in its ORDER BY order (and `seq = 0` for the unnumbered). Created after the `seq` migration, not in DDL. */
 const WORK_LOG_SEQ_INDEX = 'CREATE INDEX IF NOT EXISTS gnl_work_log_seq ON gnl_work_log (ns, seq, ts, id)';
 
 // ── RunJournal ──────────────────────────────────────────────────────────────────
@@ -1288,38 +1285,57 @@ class SqliteVectorStore implements VectorStore {
 class SqliteWorkStore implements WorkStore {
   constructor(private db: any) {}
   /**
-   * The sequence and the row in one write transaction, so no other connection can take n+1 and commit
-   * before n exists (`WorkStore.list`). `gnl_work_seq` rather than `MAX(seq)` of the log: erasing the
-   * newest records would hand their numbers out again, BEHIND a cursor that has already passed them.
-   * adoptIntoOrg, the one other writer of `seq`, moves its counter along with the rows.
-   * An existing id takes no number: the append is idempotent, and so is the counter.
+   * 0.9's statement, unchanged: the record is written UNNUMBERED (`seq` 0) and numbered by the first
+   * `list` that sees it (`numberNew`). Numbering here instead made the write a transaction and, worse,
+   * left a 0.9 process on the same file writing rows the new order put behind every cursor (measured
+   * in a rolling deploy: "pending 3" forever). Idempotent: an existing id is left alone.
    */
   async append(ns: string, payload: unknown, id?: string): Promise<string> {
     const eid = id ?? `${ns}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    this.db.prepare(`INSERT INTO gnl_work_log (ns, id, payload, ts) VALUES (?, ?, ?, ?) ON CONFLICT(ns, id) DO NOTHING`)
+      .run(ns, eid, serialize(payload), Date.now());
+    return eid;
+  }
+  /**
+   * Numbers the namespace's committed unnumbered records in the order they were inserted (`rowid`: a
+   * new row's is above every existing one's, and SQLite commits one writer at a time), after every
+   * number handed out so far (`WorkStore.list`). Not `(ts, id)`: two records one producer appends in
+   * the same millisecond would be ordered by their random id suffixes. One write transaction: SQLite admits one writer, so no other
+   * connection can number — or commit a record — between reading the counter and writing the numbers.
+   * A record committed after this reads it is numbered by a later call, with a larger number: it can
+   * never land behind a cursor, whoever wrote it. `gnl_work_seq` rather than `MAX(seq)`: erasing the
+   * newest records would hand their numbers out again, behind a cursor that has passed them.
+   * Bounded per call; the rest are numbered by the next one, and until then they are simply not listed.
+   * Synchronous throughout (no await), so this connection cannot interleave another write into it.
+   */
+  private numberNew(ns: string, max: number): void {
+    if (!this.db.prepare('SELECT 1 FROM gnl_work_log WHERE ns = ? AND seq = 0 LIMIT 1').get(ns)) return;
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      if (!this.db.prepare('SELECT 1 FROM gnl_work_log WHERE ns = ? AND id = ?').get(ns, eid)) {
-        const { seq } = this.db.prepare(
-          'INSERT INTO gnl_work_seq (ns, seq) VALUES (?, 1) ON CONFLICT(ns) DO UPDATE SET seq = seq + 1 RETURNING seq',
-        ).get(ns) as { seq: number };
-        this.db.prepare('INSERT INTO gnl_work_log (ns, id, payload, ts, seq) VALUES (?, ?, ?, ?, ?)')
-          .run(ns, eid, serialize(payload), Date.now(), seq);
+      const ids = (this.db.prepare('SELECT id FROM gnl_work_log WHERE ns = ? AND seq = 0 ORDER BY rowid LIMIT ?')
+        .all(ns, max) as { id: string }[]).map((r) => r.id);
+      if (ids.length) {
+        const { seq: top } = this.db.prepare(
+          'INSERT INTO gnl_work_seq (ns, seq) VALUES (?, ?) ON CONFLICT(ns) DO UPDATE SET seq = seq + excluded.seq RETURNING seq',
+        ).get(ns, ids.length) as { seq: number };
+        const set = this.db.prepare('UPDATE gnl_work_log SET seq = ? WHERE ns = ? AND id = ? AND seq = 0');
+        ids.forEach((id, i) => set.run(top - ids.length + 1 + i, ns, id));
       }
       this.db.exec('COMMIT');
     } catch (e) {
       this.db.exec('ROLLBACK');
       throw e;
     }
-    return eid;
   }
   /** Keyset on `(seq, ts, id)` from the cursor's position (`WorkStore.list`); one extra row says "more". */
   async list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>> {
     const limit = q?.limit ?? 50;
+    this.numberNew(ns, Math.max(NUMBER_BATCH, limit + 1));
     const after = decodeLogCursor(q?.cursor);
     const rows = (after
-      ? this.db.prepare('SELECT id, payload, ts, seq FROM gnl_work_log WHERE ns = ? AND (seq, ts, id) > (?, ?, ?) ORDER BY seq, ts, id LIMIT ?')
+      ? this.db.prepare('SELECT id, payload, ts, seq FROM gnl_work_log WHERE ns = ? AND seq > 0 AND (seq, ts, id) > (?, ?, ?) ORDER BY seq, ts, id LIMIT ?')
         .all(ns, after.seq, after.ts, after.id, limit + 1)
-      : this.db.prepare('SELECT id, payload, ts, seq FROM gnl_work_log WHERE ns = ? ORDER BY seq, ts, id LIMIT ?')
+      : this.db.prepare('SELECT id, payload, ts, seq FROM gnl_work_log WHERE ns = ? AND seq > 0 ORDER BY seq, ts, id LIMIT ?')
         .all(ns, limit + 1)) as { id: string; payload: string; ts: number; seq: number }[];
     const more = rows.length > limit;
     if (more) rows.pop();

@@ -73,7 +73,10 @@ describe('scheduleWorkflow — yetim durum onarımı', () => {
     const before = await j.get('sched:state:t');
 
     const put = vi.spyOn(j, 'put');
-    const id = await scheduleWorkflow(j, { id: 't', name: 'wf', every: 999 }, 500_000);
+    // A different spec with `ifExists: 'keep'` (without it, a different spec is refused — see
+    // trigger-validity-over-time.test.ts); the same spec again takes the same no-write path.
+    const id = await scheduleWorkflow(j, { id: 't', name: 'wf', every: 999, ifExists: 'keep' }, 500_000);
+    await scheduleWorkflow(j, { id: 't', name: 'wf', every: 60_000 }, 500_000);
 
     expect(id).toBe('t');
     expect(put).not.toHaveBeenCalled(); // ne def, ne state — tanım hâlâ değişmez

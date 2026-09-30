@@ -705,9 +705,10 @@ export interface LogRecord<T = unknown> {
 }
 
 /**
- * Where a record sits in its work log: `seq` is assigned by the store at append time and only grows
- * within a namespace. Records written by 0.9 or earlier have no sequence (`seq` 0) and keep their old
- * `(ts, id)` order, all of them ahead of every sequenced record. The triple is unique because `id` is.
+ * Where a record sits in its work log: `seq` is assigned by the store (see `WorkStore.list` for when)
+ * and only grows within a namespace; `seq` 0 means "not numbered yet", and `list` hands out no such
+ * record. `ts` and `id` only break ties the numbering never produces; the triple is unique because
+ * `id` is.
  */
 export interface LogPosition {
   seq: number;
@@ -716,6 +717,13 @@ export interface LogPosition {
 }
 
 const LOG_CURSOR = /^w1:(\d+):(-?\d+):([\s\S]*)$/;
+
+/**
+ * How many unnumbered records one `WorkStore.list` numbers (SQL, Redis), at least. A backlog larger
+ * than this — the first read of a log written entirely by 0.9 — is numbered over successive reads,
+ * oldest first; a record not numbered yet is not listed yet, and cannot be passed over for it.
+ */
+export const NUMBER_BATCH = 1000;
 
 /** The opaque `nextCursor` of `WorkStore.list`: the position of the last record handed out. */
 export function encodeLogCursor(p: LogPosition): string {
@@ -732,7 +740,7 @@ export function decodeLogCursor(cursor: string | undefined): LogPosition | undef
   return m ? { seq: Number(m[1]), ts: Number(m[2]), id: m[3]! } : undefined;
 }
 
-/** Orders two log positions: sequence, then (for records written by 0.9 or earlier) producer time, then id. */
+/** Orders two log positions: sequence, then producer time, then id (the order unnumbered records are numbered in). */
 export function compareLogPosition(a: LogPosition, b: LogPosition): number {
   return a.seq - b.seq || a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 }
@@ -751,12 +759,19 @@ export interface WorkStore {
    *     that stayed put, and their pending jobs never ran;
    *   · the producer's clock. Records used to be ordered by the writer's `Date.now()`, so a producer 5s
    *     behind wrote BEFORE the cursor and was never read.
+   *   · the version of the process that wrote it. During a rolling deploy a 0.9 process keeps writing
+   *     with its own statement (SQL) or value format (Redis), which knows nothing of positions.
    * Every bundled store orders by a store-assigned per-namespace sequence (`LogPosition`), which only
    * grows — deletions leave gaps, never reuse — and hands out the cursor as the last record's position.
-   * A write becomes visible in sequence order (SQL: the counter row is locked until commit; Redis: one
-   * script), so a reader never sees position n+1 while n can still appear. A cursor the store did not
-   * issue (a 0.9 row offset) restarts at the head: the queue and the consumer skip finished records by
-   * their markers, so that costs one re-scan and nothing runs twice.
+   * The SQL and Redis stores number a record when a reader FIRST SEES it, not when it is written: the
+   * write is the same one 0.9 made, and `list` numbers every committed unnumbered record after all
+   * numbered ones before it reads a page, with the numbering serialised per namespace (SQL: the counter
+   * row is locked until commit; Redis: one script). A record still being written is invisible to that
+   * numbering and gets a later number when it is seen — so no writer, of any version, can put a record
+   * behind a cursor, and a store needs no cooperation from writers to keep this. (The in-memory store
+   * has one writer and numbers at append.) A cursor the store did not issue (a 0.9 row offset) restarts
+   * at the head: the queue and the consumer skip finished records by their markers, so that costs one
+   * re-scan and nothing runs twice.
    */
   list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>>;
   /** Work-scope KV (markers like qdone/qfail/qatt, sched:def — NOT in RunJournal). */

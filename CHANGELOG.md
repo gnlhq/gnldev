@@ -11,22 +11,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- **Upgrading a SQL work store adds a column and a table, and nothing else moves.** SQLite and
-  Postgres add `gnl_work_log.seq` (default 0), the index `gnl_work_log_seq` and the table
-  `gnl_work_seq` at startup, like the earlier additive columns. Existing rows keep `seq` 0 and their old
-  `(ts, id)` order, ahead of every new record. Redis stores new records as `<seq>|<record>` and reads the
-  old bare form as `seq` 0; the counters live under `<keyPrefix>wseq:`, a space no sweep deletes.
+- **Upgrading a work store adds columns and a table, and the write stays 0.9's.** SQLite and Postgres
+  add `gnl_work_log.seq` (0 = not numbered yet), the index `gnl_work_log_seq` and the table
+  `gnl_work_seq` at startup, like the earlier additive columns; Postgres also adds `gnl_work_log.ord`
+  and the sequence `gnl_work_log_ord` (a column default: the order records were appended in). The
+  append is 0.9's statement; the first `list` of a namespace numbers its unnumbered records after every
+  numbered one — existing rows once, then whatever a writer of either version added since — in append
+  order (SQLite: `rowid`; Postgres: `ord`, then `(ts, id)` for rows older than it). Redis numbers a
+  record at append (one script) and writes the number as the first field of the same superjson record
+  0.9 wrote, so a 0.9 reader still parses it; a record without one is numbered by the next `list`. The
+  counters live under `<keyPrefix>wseq:`, a space no sweep deletes.
 - **A cursor persisted by 0.9 (a row offset) restarts at the head of the log**, once. The worker and each
   consumer then skip finished records by their markers (`qdone`, `evtack:`), so nothing runs twice and
   nothing is skipped, and they write a new cursor after the first full page. The cost is one re-read of
   the markers of a log's existing records. Anyone paging `WorkStore.list` directly: a cursor is still
   opaque — pass back what you were given.
 - **A custom `WorkStore`** must keep the same promise to work with the queue and events: a cursor that
-  deletions and producer clocks cannot move. The contract is written on `WorkStore.list`.
-- **`RedisStorage` without `eval`** (a custom client) takes the sequence and writes the record in
-  separate round trips: two processes appending to one namespace at once can land out of order, so a
-  reader may pass a record that appears a moment later. The same documented best-effort as
-  `putIfMatch` without `eval`; ioredis and node-redis both have it.
+  deletions, producer clocks and the writer's version cannot move. The contract is written on
+  `WorkStore.list`.
+- **`RedisStorage` without `eval`** (a custom client) takes a number and writes the record in separate
+  round trips, at append and when `list` numbers a record: two processes doing that to one namespace at
+  once can land out of order, so a reader may pass a record that appears a moment later. The same
+  documented best-effort as `putIfMatch` without `eval`; ioredis and node-redis both have it.
+- **@gnldev/scheduler: `scheduleWorkflow` refuses a different spec for an id that is already
+  scheduled.** It used to answer "already scheduled" and change nothing: measured, a trigger 0.9 stored
+  as `{ at }` (fired, done) and registered again as `{ every: 1000 }` never fired again, and a changed
+  cron kept the old one with no word. The same spec again is still a no-op, so calling it on every boot
+  is still safe. Who is affected: code that registers an existing id with a changed spec — a redeploy
+  that edited a schedule, or `at: Date.now() + x` on every call. The way through, in the spec:
+  `ifExists: 'replace'` applies it (next time from the new spec, attempts reset, a fire count no run has
+  used), `ifExists: 'keep'` keeps the stored trigger (0.9's behaviour); or use a new id.
 
 - **@gnldev/workflow: one step id used twice in one workflow is refused at build time.** A step is
   journaled under its id, so `.then(inc).then(inc)` made the second use replay the first one's output —
@@ -101,15 +115,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   event from a producer whose clock was 5s behind was sorted before the cursor and never read. On a
   live Postgres, 8 producers on separate connections against one paging reader: 6 of 800 records
   passed over. Now every store numbers a namespace's records itself (`seq`, per namespace, never
-  reused — an erasure leaves a gap) and the cursor is the last record's position. A record is visible
-  only after every lower number is (SQL: the counter row is locked until commit; Redis: one Lua script),
-  so a reader cannot pass one still in flight. The same scenarios, plus a middle-of-log erasure, a whole-
-  log erasure, four skewed producers, a worker restart and `adoptIntoOrg` into a non-empty log, pass on
-  every bundled store and on live Postgres and Redis. `list` also stops counting the whole namespace on
-  every page: reading 10 000 records in pages of 50 on an in-memory SQLite went from 920 ms to 85 ms
-  (median of 10). The price is on the write side: an append now takes the counter and the row in one
-  write transaction — 10 000 appends in memory 650 ms → 1 900 ms; on a file database, where the
-  fsync dominates, 2 000 appends 3.5 s → 3.9 s.
+  reused — an erasure leaves a gap) and the cursor is the last record's position. The SQL stores number
+  a record when a reader first sees it, not when it is written: `list` numbers every committed
+  unnumbered record after all numbered ones, holding the namespace's counter row until commit, so a
+  record still in flight gets a later number and no reader can pass it — whichever version wrote it (a
+  0.9 process in a rolling deploy keeps writing unnumbered rows; see *Known limits*). Redis numbers at
+  append in one Lua script, and a reader pages only up to the counter it read before its SCAN, which is
+  not a snapshot. The same scenarios, plus a middle-of-log erasure, a whole-log erasure, four skewed
+  producers, a worker restart, `adoptIntoOrg` into a non-empty or erased log, and 0.9.0's own INSERT
+  and value format interleaved with this version's, pass on every bundled store and on live Postgres
+  and Redis. A first cut numbered at append, holding the counter row until commit: on a live Postgres
+  8 producers fell from 9 227 appends/s (0.9) to 2 846, because the queue is one namespace. Measured
+  now, interleaved rounds (median of 10, range), 0.9.0 / first cut / this: 8 Postgres producers 9 386 /
+  2 533 / 9 060 appends/s; one Postgres producer 2 062 / 1 687 / 2 043; SQLite file 2 108 / 1 868 /
+  2 125; enqueue + drain 150 jobs on Postgres 93 / 88 / 88 jobs/s. The cost moved to the first read,
+  which writes each record's number once: three full reads of 1 500 fresh records on Postgres 44 456 /
+  83 039 / 31 975 records/s (0.9 counted the namespace on every page), SQLite 91 826 / 501 123 /
+  184 051; an idle read is two statements instead of one (1.6 ms on the same server).
 
 - **@gnldev/workflow: a step that returns `undefined` is replayed, not re-run.** The engine asked
   "is there a record?" with `journal.get(key) !== undefined`, and every journal reads a stored
@@ -145,8 +167,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   under the same run id and threw in the next-time computation, and the triggers after it in the
   journal never fired. `every: 0` (also negative, `NaN`, `Infinity`) was accepted and fired on every
   poll. Now the whole spec is checked first — exactly one of `at | every | cron`, `every > 0`, a cron that
-  parses and matches within a year, `maxAttempts >= 1`, a known `misfire`, a workflow `name` — and a
-  refusal names the trigger and writes nothing. Journals written by 0.9.0: a stored definition that
+  parses and can ever fire, `maxAttempts >= 1`, a known `misfire`, a workflow `name` — and a
+  refusal names the trigger and writes nothing. "Can ever fire" is read from the expression, never from
+  the date: a first cut asked "is there a match within a year of now", so `0 0 29 2 *` (every leap day)
+  was refused on 2026-01-01, accepted on 2027-03-01, and then failed by the poller at 2028-02-29 00:00
+  without firing, because the next leap day is four years on. Now it is accepted on every date and
+  fires on 2028-02-29, then 2032-02-29; `0 0 30 2 *` is refused on every date. The next-time search
+  walks days over eight years (29 Feb 2096 → 29 Feb 2104) instead of minutes over one. Journals written by 0.9.0: a stored definition that
   cannot fire is replaced by the next valid `scheduleWorkflow` for that id (the fire counter is kept, so
   no run id is reused), and until then the poller marks it `failed` with the reason in `sched:fail:`
   instead of firing it, and goes on to the other triggers. A valid stored trigger is still not
@@ -259,6 +286,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   vector for a thread with the same bare id carried the same per-thread `obsId` (`obs-0`) and answered
   with the root's unrelated observation. Hits outside the memory's own namespace are now dropped.
   `OmVectorMatch` gains an optional `namespace`.
+
+### Known limits
+
+- **A rolling deploy with a 0.9 process on the same database.** What holds: a job or event a 0.9 process
+  appends is run or delivered by this version's worker or consumer, on every bundled store (it is
+  numbered when this version first reads it; measured with 0.9.0's own statements on SQLite, Postgres
+  and Redis), and a 0.9 reader parses every Redis record this version writes. What does not: a 0.9
+  WORKER or CONSUMER keeps 0.9's own guarantees — its row-offset cursor still skips work after an
+  erasure or behind a slow producer clock, and the two versions overwrite each other's `qcursor` /
+  `evtcursor:<topic>:<name>` (each reads the other's as "start from the head", so this costs a re-scan,
+  not a lost record). The safe direction: stop the 0.9 workers and consumers first, then roll the
+  producers. If a 0.9 worker ran after an erasure and its jobs look stuck, delete its cursor so the new
+  worker re-reads from the head (markers skip what is done): the `gnl_work_kv` rows `qcursor` and
+  `evtcursor:*` (`org:<id>:`-prefixed for an organization), or the Redis keys `<keyPrefix>wk:qcursor`
+  and `<keyPrefix>wk:evtcursor:*`.
+- **`adoptIntoOrg` into an organization that already has a queue or a consumer cursor.** The moved log
+  lands after the organization's records, but the root `qcursor` / `evtcursor:*` is a key like any
+  other: SQLite and Postgres refuse the adoption on the duplicate key; the in-memory and Redis stores
+  overwrite the organization's cursor with the root one, which can leave the organization's unhandled
+  records behind it. Delete one of the two cursors (see above) before adopting.
 
 ## [0.9.0] — 2026-09-30
 

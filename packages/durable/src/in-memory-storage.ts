@@ -284,8 +284,38 @@ class InMemoryVectorStore implements VectorStore {
 
 // ── WorkStore (append-log + KV + CAS ack) ─────────────────────────────────────
 class InMemoryWorkStore implements WorkStore {
-  /** @internal — see Storage.adoptIntoOrg. */
-  _rekey(f: (k: string) => string | undefined): number { return rekeyMap(this.logs, f) + rekeyMap(this.kv, f); }
+  /**
+   * @internal — see Storage.adoptIntoOrg. A moved log is APPENDED to the log already under its new
+   * name and numbered after that log's last number, so it lands after any cursor the organization's
+   * consumer has persisted. It used to be `rekeyMap`: the moved log REPLACED the organization's (its
+   * records gone) and kept its own low numbers, behind that cursor.
+   */
+  _rekey(f: (k: string) => string | undefined): number {
+    let n = 0;
+    for (const [ns, recs] of [...this.logs]) {
+      const to = f(ns);
+      if (to === undefined || to === ns) continue;
+      const target = this.logs.get(to) ?? [];
+      let seq = Math.max(this.seqs.get(to) ?? 0, target[target.length - 1]?.seq ?? 0);
+      for (const r of recs) target.push({ ...r, seq: ++seq });
+      this.seqs.set(to, seq);
+      this.logs.set(to, target);
+      this.logs.delete(ns);
+      n++;
+    }
+    return n + rekeyMap(this.kv, f);
+  }
+  /** @internal — an id a moved log shares with the log it would join (adoptIntoOrg refuses, as SQL's key does). */
+  _logCollision(f: (k: string) => string | undefined): string | undefined {
+    for (const [ns, recs] of this.logs) {
+      const to = f(ns);
+      if (to === undefined || to === ns) continue;
+      const taken = new Set((this.logs.get(to) ?? []).map((r) => r.id));
+      const hit = recs.find((r) => taken.has(r.id));
+      if (hit) return `${to}/${hit.id}`;
+    }
+    return undefined;
+  }
 
   /** Each namespace's records in append (= `seq`) order. */
   private logs = new Map<string, Array<LogRecord & { seq: number }>>();
@@ -429,6 +459,10 @@ export class InMemoryStorage implements Storage {
 
     // Vectors are checked first, before anything moves: a rename onto a taken id refuses the adoption.
     const vectors = this.vectors._stamp(prefix.slice(0, -1), true);
+    // So is a work-log record whose id the organization's log already holds. The rule is spelled out
+    // rather than passing `rename`, whose counters belong to the adoption, not to this question.
+    const clash = this.work._logCollision((k) => (k.startsWith('org:') || isPlatformKey(k) ? undefined : prefix + k));
+    if (clash) throw new Error(`@gnldev/durable: adoptIntoOrg would move a work-log record onto '${clash}', which the organization's log already holds. Nothing was moved.`);
     if (dryRun) {
       const moved = {
         runs: count([...this.runs.journal.keys()]),

@@ -26,7 +26,7 @@ import type { AdoptIntoOrgResult,
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, WorkStore, CacheStore, MetaStore, LogRecord,
 } from './storage.js';
-import { decodeLogCursor, encodeLogCursor, compareLogPosition } from './storage.js';
+import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, compareLogPosition } from './storage.js';
 
 const SCHEMA_VERSION = '1';
 
@@ -207,6 +207,10 @@ function globEscape(s: string): string {
 function encNs(ns: string): string {
   return ns.replace(/%/g, '%25').replace(/:/g, '%3A');
 }
+/** `encNs` undone (adoptIntoOrg reads a namespace back out of a key). */
+function decNs(enc: string): string {
+  return enc.replace(/%3A/g, ':').replace(/%25/g, '%');
+}
 /** Collect all matching keys by rolling SCAN forward until cursor '0' (NOT KEYS → doesn't block in prod).
  * Redis SCAN's guarantee is at-least-once: the same key CAN come back MULTIPLE TIMES during a rehash →
  *  dedupe with a Set (otherwise readRun produces duplicate entries, listRuns produces double counts). */
@@ -265,23 +269,56 @@ function isSuspended(p: { kind: string } | null, value: unknown): boolean {
 const CAS_LUA = `if redis.call('GET',KEYS[1])==ARGV[1] then redis.call('SET',KEYS[1],ARGV[2]) return 1 else return 0 end`;
 
 /**
+ * A work-log record's value is 0.9's record — `serialize({ id, payload, ts })`, which always starts
+ * `{"json":{"id":` — with its number inserted as the first field, `"seq":<n>,`. This version writes it
+ * numbered (WORK_APPEND_LUA); a 0.9 process writes it bare and the next `list` numbers it. Both forms
+ * are a plain superjson record, so a 0.9 reader parses every value (it ignores the extra field); the
+ * first cut of sequences wrote `<seq>|<record>` and a 0.9 reader threw a SyntaxError on every record.
+ * The superjson `meta` paths are keyed by name, so a field added in front moves none.
+ */
+const REC_HEAD = '{"json":{';
+const NUMBERED_HEAD = '{"json":{"seq":';
+
+/**
+ * Numbers work-log records that have no number yet (`WorkStore.list`), in the order given: KEYS[1] =
+ * the namespace's counter, KEYS[2..] = records. A record already numbered (by another reader) or gone
+ * is skipped. One script, so a number and its record appear together and in counter order.
+ */
+const WORK_NUMBER_LUA = `-- gnl:work-number
+local n=0
+for i=2,#KEYS do
+  local v=redis.call('GET',KEYS[i])
+  if v and string.sub(v,1,${REC_HEAD.length})=='${REC_HEAD}' and string.sub(v,1,${NUMBERED_HEAD.length})~='${NUMBERED_HEAD}' then
+    local s=redis.call('INCR',KEYS[1])
+    redis.call('SET',KEYS[i],'${NUMBERED_HEAD}'..s..','..string.sub(v,${REC_HEAD.length + 1}))
+    n=n+1
+  end
+end
+return n`;
+
+/**
  * `WorkStore.append` as one script: an existing id is left alone (first write wins, no number spent);
- * otherwise the namespace's next sequence is taken and the record written under it, `<seq>|<record>`.
- * One script, so no reader can see n+1 before n exists. KEYS[1] = counter, KEYS[2] = record.
+ * otherwise the namespace's next number is taken and the record written with it, in the numbered form
+ * above. One script, so no reader can see n+1 before n exists — and records keep their append order,
+ * which `(ts, id)` does not (two appends in one millisecond would be ordered by their random ids).
+ * KEYS[1] = counter, KEYS[2] = record, ARGV[1] = the bare record.
  */
 const WORK_APPEND_LUA = `-- gnl:work-append
 if redis.call('EXISTS',KEYS[2])==1 then return 0 end
 local s=redis.call('INCR',KEYS[1])
-redis.call('SET',KEYS[2],s..'|'..ARGV[1])
+redis.call('SET',KEYS[2],'${NUMBERED_HEAD}'..s..','..string.sub(ARGV[1],${REC_HEAD.length + 1}))
 return s`;
 
-/** A stored work-log value: `<seq>|<record>` since sequences, a bare record (seq 0) before them. */
+/** A stored work-log value: its record, and its number (0 = not numbered yet). */
 function readWorkValue<T>(v: string): LogRecord<T> & { seq: number } {
-  const bar = v.indexOf('|');
-  const head = bar > 0 && v[0] !== '{' ? v.slice(0, bar) : '';
-  const seq = /^\d+$/.test(head) ? Number(head) : 0;
-  const rec = deserialize<LogRecord<T>>(seq ? v.slice(bar + 1) : v);
-  return { id: rec.id, payload: rec.payload, ts: rec.ts, seq };
+  const rec = deserialize<LogRecord<T> & { seq?: unknown }>(v);
+  return { id: rec.id, payload: rec.payload, ts: rec.ts, seq: typeof rec.seq === 'number' ? rec.seq : 0 };
+}
+
+/** `value` numbered `seq` — the string WORK_NUMBER_LUA writes, for a client without `eval`. */
+function numberedValue(value: string, seq: number): string | undefined {
+  if (!value.startsWith(REC_HEAD) || value.startsWith(NUMBERED_HEAD)) return undefined;
+  return `${NUMBERED_HEAD}${seq},${value.slice(REC_HEAD.length)}`;
 }
 
 /**
@@ -828,11 +865,13 @@ class RedisWorkStore implements WorkStore {
   private seqKey = (ns: string) => `${this.pfx}${WSEQ}${encNs(ns)}`;
 
   /**
-   * Idempotent (the same (ns,id) is written once, first write wins) and sequenced (`WorkStore.list`).
-   * Without `eval` the counter and the record are separate round trips: two processes appending to one
-   * namespace can then take numbers in one order and land in the other, so a reader may pass a record
-   * that appears a moment later behind it. The same documented best-effort as `putIfMatch` without
-   * `eval`; ioredis and node-redis both have it.
+   * Idempotent (the same (ns,id) is written once, first write wins) and numbered at write
+   * (WORK_APPEND_LUA) in a form a 0.9 reader still parses. A record written by a 0.9 process in a rolling
+   * deploy carries no number; the first `list` that sees it numbers it (`_number`). Without `eval` the
+   * counter and the record are separate round trips, so two processes appending to one namespace can
+   * take numbers in one order and land in the other — a reader may then pass a record that appears a
+   * moment later behind it. The same documented best-effort as `putIfMatch` without `eval`; ioredis and
+   * node-redis both have it.
    */
   async append(ns: string, payload: unknown, id?: string): Promise<string> {
     const eid = id ?? `${ns}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -845,10 +884,17 @@ class RedisWorkStore implements WorkStore {
     if ((await this.client.get(key)) !== null) return eid;
     const seq = Number((await this.client.get(this.seqKey(ns))) ?? 0) + 1;
     await this.client.set(this.seqKey(ns), String(seq));
-    await this.client.set(key, `${seq}|${rec}`, 'NX');
+    await this.client.set(key, numberedValue(rec, seq)!, 'NX');
     return eid;
   }
-  async list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>> {
+
+  /** Every record of `ns` with its key, and the namespace's counter as read BEFORE the scan. */
+  private async readLog<T>(ns: string): Promise<{ top: number; rows: Array<LogRecord<T> & { seq: number; key: string; raw: string }> }> {
+    // The counter first. SCAN is not a snapshot: a key created during it may be missed while a later
+    // one is returned. A record numbered at or below `top` was numbered — so it existed — before the
+    // scan began, and SCAN returns every key present for its whole duration; one above `top` may have
+    // a lower-numbered neighbour this scan missed, so it waits for the next read.
+    const top = Number((await this.client.get(this.seqKey(ns))) ?? 0);
     // TWO escapes, in this order, doing two different jobs. `encNs` (inside logNs) makes the pattern
     // address exactly ONE namespace; globEscape then stops a `*`/`?`/`[` in the key text from
     // widening the match. This line used to run only the second one, on the raw `ns` — which is why
@@ -858,12 +904,45 @@ class RedisWorkStore implements WorkStore {
     // to escape only their variable tail; see globEscape). See `encNs`.
     const keys = await scanAll(this.client, globEscape(this.logNs(ns)) + '*');
     const values = await bulkGet(this.client, keys);
-    const rows: Array<LogRecord<T> & { seq: number }> = [];
-    for (const s of values) {
-      if (s != null) rows.push(readWorkValue<T>(s));
+    const rows: Array<LogRecord<T> & { seq: number; key: string; raw: string }> = [];
+    values.forEach((raw, i) => { if (raw != null) rows.push({ ...readWorkValue<T>(raw), key: keys[i]!, raw }); });
+    return { top, rows };
+  }
+
+  /**
+   * Numbers `rows` (unnumbered records, in the order to number them) after every number handed out so
+   * far. Without `eval` the counter and each record are separate round trips: two readers numbering at
+   * once can then give one record two numbers in turn or take numbers out of order, so a reader may
+   * pass a record — the same documented best-effort as `putIfMatch` without `eval`; ioredis and
+   * node-redis both have it. @internal — also used by adoptIntoOrg.
+   */
+  async _number(ns: string, rows: Array<{ key: string; raw: string }>): Promise<void> {
+    for (let i = 0; i < rows.length; i += NUMBER_BATCH) {
+      const chunk = rows.slice(i, i + NUMBER_BATCH);
+      if (this.client.eval) {
+        await this.client.eval(WORK_NUMBER_LUA, chunk.length + 1, this.seqKey(ns), ...chunk.map((r) => r.key));
+        continue;
+      }
+      for (const r of chunk) {
+        const seq = Number((await this.client.get(this.seqKey(ns))) ?? 0) + 1;
+        const v = numberedValue(r.raw, seq);
+        if (v === undefined) continue;
+        await this.client.set(this.seqKey(ns), String(seq));
+        await this.client.set(r.key, v);
+      }
     }
-    // Keyset on the store-assigned sequence, not the producer's clock (`WorkStore.list`).
-    rows.sort(compareLogPosition);
+  }
+
+  async list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>> {
+    let log = await this.readLog<T>(ns);
+    const fresh = log.rows.filter((r) => r.seq === 0).sort(compareLogPosition);
+    if (fresh.length) {
+      // Numbered, then read again: this read's own numbers are above the `top` it started from.
+      await this._number(ns, fresh);
+      log = await this.readLog<T>(ns);
+    }
+    // Keyset on the store-assigned number, not the producer's clock (`WorkStore.list`).
+    const rows = log.rows.filter((r) => r.seq > 0 && r.seq <= log.top).sort(compareLogPosition);
     const after = decodeLogCursor(q?.cursor);
     const from = after ? rows.filter((r) => compareLogPosition(r, after) > 0) : rows;
     const limit = q?.limit ?? 50;
@@ -1068,6 +1147,51 @@ export class RedisStorage implements Storage {
       } while (String(cursor) !== '0');
       return out;
     };
+
+    // Work LOGS first, and checked before anything moves. They were not moved at all before: the
+    // organization's reader never saw an adopted log, and the root records sat outside every org.
+    // A record moves to the organization's namespace UNNUMBERED (0.9's bare form), so the next `list`
+    // numbers it after everything that log already holds — after any cursor its consumer persisted
+    // (`WorkStore.list`). An id the organization's log already has refuses the adoption before any
+    // write, as the SQL stores' primary key does; `set NX` would silently drop one of the two.
+    const wlBase = this.pfx + WL;
+    const logMoves = new Map<string, Array<{ src: string; dst: string }>>(); // by the organization's namespace
+    let logN = 0;
+    for (const k of await scanAll(globEscape(wlBase) + '*')) {
+      const rest = k.slice(wlBase.length);
+      const colon = rest.indexOf(':');
+      if (colon < 0) continue;
+      const logNs = decNs(rest.slice(0, colon));
+      if (logNs.startsWith('org:')) { alreadyScoped++; continue; }
+      if (isPlatformKey(logNs)) { skipped.add(logNs.split(':')[0]!); continue; }
+      logN++;
+      const to = prefix + logNs;
+      logMoves.set(to, [...(logMoves.get(to) ?? []), { src: k, dst: `${wlBase}${encNs(to)}:${rest.slice(colon + 1)}` }]);
+    }
+    if (!dryRun) {
+      for (const moves of logMoves.values()) {
+        for (const { dst } of moves) {
+          if ((await this.client.get(dst)) !== null) {
+            throw new Error(`@gnldev/durable: adoptIntoOrg would move a work-log record onto '${dst}', which the organization's log already holds. Nothing was moved.`);
+          }
+        }
+      }
+      for (const [to, moves] of logMoves) {
+        const recs: Array<LogRecord & { seq: number; key: string; raw: string }> = [];
+        for (const { src, dst } of moves) {
+          const v = await this.client.get(src);
+          if (v === null) continue;
+          const rec = readWorkValue(v);
+          recs.push({ ...rec, key: dst, raw: serialize({ id: rec.id, payload: rec.payload, ts: rec.ts }) });
+        }
+        // In their old order, written bare and numbered after the organization's last number.
+        recs.sort(compareLogPosition);
+        for (const r of recs) await this.client.set(r.key, r.raw);
+        await (this.work as RedisWorkStore)._number(to, recs);
+        for (const { src } of moves) await this.client.del(src);
+      }
+    }
+    moved.work = logN;
 
     // [redis sub-namespace, store name, is it a hash]
     const SPACES: Array<[string, string, boolean]> = [[RJ, 'runs', false], [CTR, 'runs', true], [WK, 'work', false], [META, 'meta', false]];
