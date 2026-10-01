@@ -39,6 +39,13 @@ and who is affected.
 - **The root scope cannot name a thread whose id starts with `org:`** (`ReservedThreadIdError`; `400
   thread_id_reserved` on the REST API): use another thread id, or work inside the organization with
   `withOrgStorage(storage, orgId)`.
+- **The root scope's run reads no longer reach an organization's runs** — `GET /runs`, `GET /runs/:id`
+  and every run view and export on the REST API and in Studio, served with no organization: to read
+  one organization's runs, name it (`x-gnl-org: acme` as a platform admin, with the `org` option), or in
+  code `withOrg(journal, 'acme')` / `withOrgStorage(storage, 'acme')`. A root journal you hand out
+  yourself hides them with `withRootScope(journal)`.
+- **0.9 root threads whose id starts with `org:`** are unreachable from the root scope:
+  `migrateReservedRootThreads(storage)` (@gnldev/memory) moves them to `legacy-<id>`.
 - **A root-scope `recall` and `listThreads` no longer reach organization rows**: to read one
   organization's threads from the root, `withOrgStorage(storage, orgId).memory`. A custom `MemoryStore`
   applies `memoryPartitionOf(opts)` / `inMemoryPartition` in `recall`'s resource branch and in
@@ -95,11 +102,13 @@ and who is affected.
   `createChatRoute`, `createAguiRoute` and `createMcpServer`; @gnldev/mcp: `MCP_REFUSED` (`-32000`).
 - @gnldev/durable: `appendToJournalLog`, `readJournalLog`, `JournalLogContentionError`,
   `JOURNAL_LOG_MAX_ATTEMPTS`; `MEMORY_PARTITION`, `memoryPartitionOf`, `inMemoryPartition`,
-  `isOrganizationThreadId`, `assertRootThreadId`, `ReservedThreadIdError`, `ORG_THREAD_PREFIX` (+ types
-  `MemoryPartition`, `MemoryPartitionOption`); `assertDeletesOutsideOrganizations`; `encodeStepRecord`,
+  `assertRootThreadId`, `ReservedThreadIdError` (+ types `MemoryPartition`, `MemoryPartitionOption`);
+  `isOrganizationKey`, `orgSpaceSql`, `ORG_KEY_PREFIX`, `withRootScope`; `findReservedRootThreads` (+ type
+  `ReservedRootThread`); `assertDeletesOutsideOrganizations`; `encodeStepRecord`,
   `decodeStepRecord`; `scoreSample`, `inputText`, `assertDistinctScorerNames`, `memoizeScoring` (+ type
   `ScoreSampleFields`); the optional `Processor` hook `processToolError` (+ type `ProcessorToolError`).
-- @gnldev/memory: `OmVectorMatch.namespace` (optional).
+- @gnldev/memory: `OmVectorMatch.namespace` (optional); `migrateReservedRootThreads` (+ types
+  `MigrateReservedRootThreadsOptions`, `MigrateReservedRootThreadsReport`).
 - @gnldev/rag: `ingestDocuments`, `deleteDocuments` (+ type `IngestResult`), `documentIdPart`,
   `DOC_TRAIL_KEY`, `CHUNK_TRAIL_KEY`.
 - @gnldev/tool-schema: `shapeToolDefinitions`, `chainToolCompat`, `ToolSchemaError`, and the type
@@ -111,6 +120,21 @@ and who is affected.
 - @gnldev/scheduler: `ScheduleSpec.ifExists` (`'refuse'` by default, `'replace'`, `'keep'`).
 
 ### Security
+
+- **The root scope read every organization's runs.** ADR-0001 says "in the root scope, every
+  organization's rows are hidden", and memory held it; runs did not. An organization's run sits in the
+  root journal as `org:<id>:<runId>`, and the root scope read through the raw journal. Measured through
+  REST (review panel): a root-scope `GET /runs` listed `org:acme:r-acme`, and
+  `GET /runs/org%3Aacme%3Ar-acme` returned acme's journal — its prompt and the model's answer; Studio
+  answered the same on `/runs`, `/runs/:id`, `/runs/:id/state`, `/runs/:id/regression/:other` and
+  `/metrics`. Both now read the root scope through `withRootScope` (@gnldev/durable), the one owner of
+  the rule for runs: `get`, `getMany`, `listKeys`, `readRun`, `readRunStats`, `listRuns`,
+  `listRunsPaged` and `listStaleRuns` answer as if no `org:` row existed (`countRunsByStatus` resolves
+  `undefined` once an organization holds a row, so callers fall back to the filtered listing).
+  **Who is affected:** a deployment with organizations whose operators read runs at the root.
+  **Way through:** the organization's scope — a platform admin names it with `x-gnl-org` (the `org`
+  option on); code uses `withOrg` / `withOrgStorage`. Root management defined over every organization
+  (Studio's retention sweep and run purge) still reaches every organization's rows.
 
 - **A server with no auth answers only the names that mean this machine (DNS rebinding).** The
   providerless gate in `@gnldev/auth` refused cross-site writes by reading `Sec-Fetch-Site`, and after a
@@ -250,6 +274,33 @@ and who is affected.
   An `Origin` of `localhost`, `*.localhost`, `127.x.x.x` or `[::1]` (any port) is now this machine: no
   site on the internet can carry one, and the browser writes it. Every other origin, `null` included,
   is still cross-site; the message now says exactly which pages pass.
+- **An organization whose id holds a character outside the BMP saw none of its own threads** (SQLite,
+  Postgres). The partition condition wrote the prefix's JS length — UTF-16 code units — into SQL
+  `substring`, which counts characters: for `🚀team`, 11 against a 10-character prefix, so `listThreads`
+  and a resource `recall` matched nothing. The length is now counted in characters and bound, through
+  the one SQL owner of the organization rule (`orgSpaceSql`).
+- **The organization rule had eight spellings, and two had drifted.** SQLite's `adoptIntoOrg` used
+  `LIKE 'org:%'`, which ignores case, so a root key `ORG:x` counted as already scoped and was never
+  moved; `purgeOrganization(journal, '')` and `purgeOrganizationWork(work, '')` built `org::` by hand,
+  skipped the id check, and reported success. Every `org:<id>:` is now built by `orgPrefix` (which
+  refuses `''` and `:`) and every "is this an organization's" asked through `isOrganizationKey` /
+  `orgSpaceSql` — in erasure, retention, subject views, the four adopters, compensation and durable-tool
+  keys, the queue and events depth indexes, the REST in-flight map and Studio's organization listing.
+- **An organization's memory view behind a wrapper store came back empty, silently.** `MEMORY_PARTITION`
+  is a Symbol key, and a wrapper that rebuilds the options (field by field, JSON, an RPC hop) drops it:
+  the store scanned the root, and the view kept none of it. The view now warns once per store when no
+  store read the partition it passed, naming the fix (forward `{ ...q }`, read `memoryPartitionOf`).
+- **`eraseSubject` without an organization said nothing about a person's 0.9 root threads named
+  `org:…`.** It now lists those the root certainly owns in `unreachedThreads` (`findReservedRootThreads`).
+- **`WorkStore.list` on Postgres threw under REPEATABLE READ or SERIALIZABLE.** With either as the
+  database's `default_transaction_isolation`, two readers numbering one namespace collided on its
+  counter row and one failed with 40001 (measured: 74 of 120 `list` calls). Numbering now runs at READ
+  COMMITTED, which its statement is written for, from the first such failure on.
+- **A SQLite `WorkStore.list` waited behind another process's write transaction**, and threw "database
+  is locked" after 15 s; a WAL read never waited in 0.9. Numbering new records tries the write lock
+  once, briefly; while another connection holds it, `list` returns the records already numbered and the
+  new ones are numbered by a later read — after every number handed out by then, so never behind a cursor.
+
 - **Erasing one person stopped everyone else's queue and events; a producer with a slow clock was
   never read.** `WorkStore.list` handed out a row OFFSET into a log ordered by the producer's
   `Date.now()`, and `@gnldev/queue` (`qcursor`) and `@gnldev/events` (`evtcursor:*`) persist that cursor
@@ -553,6 +604,13 @@ and who is affected.
   worker re-reads from the head (markers skip what is done): the `gnl_work_kv` rows `qcursor` and
   `evtcursor:*` (`org:<id>:`-prefixed for an organization), or the Redis keys `<keyPrefix>wk:qcursor`
   and `<keyPrefix>wk:evtcursor:*`.
+- **A 0.9 root thread shaped like an existing organization's (`org:acme:x`), with no owner record
+  either way,** cannot be told from that organization's own thread: until it is moved, the organization
+  reads it. `findReservedRootThreads` / `migrateReservedRootThreads` list it as undecided; name it in
+  `threadIds` to move it.
+- **Redis numbers a 0.9 producer's records in producer-clock order** (`ts`, then id): a bare SET keeps
+  no insertion order. SQLite and Postgres use insertion order. Either way such a record is numbered
+  above every number handed out, so it never lands behind a cursor.
 - **`adoptIntoOrg` into an organization that already has a queue or a consumer cursor.** The moved log
   lands after the organization's records, but the root `qcursor` / `evtcursor:*` is a key like any
   other: SQLite and Postgres refuse the adoption on the duplicate key; the in-memory and Redis stores

@@ -6,7 +6,7 @@ import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from '
 import { memoryPartitionOf, inMemoryPartition, type MemoryPartitionOption } from './storage.js';
 import { InMemoryJournal } from './journal.js';
 import { stableStringify } from './hash.js';
-import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix } from './organization.js';
+import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
 import type { JournalEntry, RunSummary } from './journal.js';
 import { decodeLogCursor, encodeLogCursor, compareLogPosition, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision } from './storage.js';
 import type {
@@ -450,7 +450,7 @@ export class InMemoryStorage implements Storage {
     const skipped = new Set<string>();
     let alreadyScoped = 0;
     const rename = (k: string): string | undefined => {
-      if (k.startsWith('org:')) { alreadyScoped++; return undefined; }
+      if (isOrganizationKey(k)) { alreadyScoped++; return undefined; }
       if (isPlatformKey(k) || ENGINE_META_KEYS.includes(k)) { skipped.add(k.split(':')[0]!); return undefined; }
       return prefix + k;
     };
@@ -462,7 +462,7 @@ export class InMemoryStorage implements Storage {
     const vectors = this.vectors._stamp(prefix.slice(0, -1), true);
     // So is a work-log record whose id the organization's log already holds. The rule is spelled out
     // rather than passing `rename`, whose counters belong to the adoption, not to this question.
-    const clash = this.work._logCollision((k) => (k.startsWith('org:') || isPlatformKey(k) ? undefined : prefix + k));
+    const clash = this.work._logCollision((k) => (isOrganizationKey(k) || isPlatformKey(k) ? undefined : prefix + k));
     if (clash) throw new Error(`@gnldev/durable: adoptIntoOrg would move a work-log record onto '${clash}', which the organization's log already holds. Nothing was moved.`);
     if (dryRun) {
       const moved = {

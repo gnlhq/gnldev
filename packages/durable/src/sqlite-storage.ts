@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 import { statSync, existsSync } from 'node:fs';
 import { cosineSimilarity } from 'ai';
 import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus } from './journal.js';
-import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix } from './organization.js';
+import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, orgSpaceSql } from './organization.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
 import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision } from './storage.js';
@@ -75,6 +75,14 @@ const SCHEMA_VERSION = '1';
  * Worst case for a caller is therefore ~20s (the last attempt may start just under the ceiling and
  * then burn its own 5s busy_timeout) — after which the error is THROWN, never swallowed.
  */
+/** The connection's `busy_timeout`, set first at construction (see the constructor). */
+const BUSY_TIMEOUT_MS = 5000;
+/**
+ * How long a READER waits for the write lock to number new work-log records before it lists only what
+ * is already numbered (`SqliteWorkStore.numberNew`). Short on purpose: a read must not stall behind
+ * another process's write transaction.
+ */
+const NUMBER_LOCK_WAIT_MS = 25;
 const BUSY_MAX_ATTEMPTS = 10;       // TOTAL executions of the statement (1 initial + 9 retries)
 const BUSY_MAX_ELAPSED_MS = 15_000; // hard ceiling; counts the engine's OWN busy_timeout waits too
 const BUSY_MAX_DELAY_MS = 100;      // backoff: 1,2,4,8,16,32,64,100,100 ms, each +0..100% jitter
@@ -230,7 +238,7 @@ export class SqliteStorage implements Storage {
     // "database is locked". Setting the wait first makes every subsequent init statement (WAL switch,
     // DDL, migration) simply WAIT OUT a concurrent booter instead of dying.
     try {
-      this.db.exec('PRAGMA busy_timeout = 5000');
+      this.db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     } catch {
       // memory: / old sqlite: unsupported pragma → default (0) — single-process behavior is unchanged
     }
@@ -399,12 +407,18 @@ export class SqliteStorage implements Storage {
         `SELECT a.id AS id FROM gnl_vectors a JOIN gnl_vectors b ON b.id = ? || ':' || a.id WHERE a.namespace IS NULL LIMIT 1`,
       ).get(ns) as { id: string } | undefined;
       if (clash) throw vectorAdoptCollision(clash.id);
+      // `orgSpaceSql`, never `LIKE 'org:%'`: SQLite's LIKE ignores case, so a root key `ORG:x` was counted
+      // as already scoped and never moved — the same rule, spelled once (organization.ts).
+      const inOrg = (col: string) => orgSpaceSql(col, () => '?');
+      const outOrg = (col: string) => orgSpaceSql(col, () => '?', { outside: true });
       for (const [table, col, store] of KEYED) {
-        alreadyScoped += this.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${col} LIKE 'org:%'`).get().c as number;
+        const scopedQ = inOrg(col);
+        alreadyScoped += this.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${scopedQ.cond}`).get(...scopedQ.params).c as number;
         // Row by row rather than one UPDATE, because which reserved keys are the PLATFORM's is a rule
         // in TypeScript (`isPlatformKey`), not something SQL can express — and a blanket UPDATE here
         // would move `__org__:acme` to `org:acme:__org__:acme` and stop every organization resolving.
-        const rows = this.db.prepare(`SELECT DISTINCT ${col} AS k FROM ${table} WHERE ${col} NOT LIKE 'org:%'`).all() as { k: string }[];
+        const rootQ = outOrg(col);
+        const rows = this.db.prepare(`SELECT DISTINCT ${col} AS k FROM ${table} WHERE ${rootQ.cond}`).all(...rootQ.params) as { k: string }[];
         let n = 0;
         for (const { k } of rows) {
           if (isPlatformKey(k)) { skipped.add(k.split(':')[0]!); continue; }
@@ -425,9 +439,11 @@ export class SqliteStorage implements Storage {
       // `gnl_meta` minus the engine's own rows — see ENGINE_META_KEYS for why moving `schema_version`
       // would leave the deployment looking unversioned on its next boot.
       const holes = ENGINE_META_KEYS.map(() => '?').join(',');
-      const metaTodo = this.db.prepare(`SELECT COUNT(*) AS c FROM gnl_meta WHERE k NOT LIKE 'org:%' AND k NOT IN (${holes})`).get(...ENGINE_META_KEYS).c as number;
-      alreadyScoped += this.db.prepare(`SELECT COUNT(*) AS c FROM gnl_meta WHERE k LIKE 'org:%'`).get().c as number;
-      if (!dryRun && metaTodo) this.db.prepare(`UPDATE gnl_meta SET k = ? || k WHERE k NOT LIKE 'org:%' AND k NOT IN (${holes})`).run(prefix, ...ENGINE_META_KEYS);
+      const metaRoot = outOrg('k');
+      const metaIn = inOrg('k');
+      const metaTodo = this.db.prepare(`SELECT COUNT(*) AS c FROM gnl_meta WHERE ${metaRoot.cond} AND k NOT IN (${holes})`).get(...metaRoot.params, ...ENGINE_META_KEYS).c as number;
+      alreadyScoped += this.db.prepare(`SELECT COUNT(*) AS c FROM gnl_meta WHERE ${metaIn.cond}`).get(...metaIn.params).c as number;
+      if (!dryRun && metaTodo) this.db.prepare(`UPDATE gnl_meta SET k = ? || k WHERE ${metaRoot.cond} AND k NOT IN (${holes})`).run(prefix, ...metaRoot.params, ...ENGINE_META_KEYS);
       bump('meta', metaTodo);
 
       const vecs = this.db.prepare(`SELECT COUNT(*) AS c FROM gnl_vectors WHERE namespace IS NULL`).get().c as number;
@@ -1308,10 +1324,18 @@ class SqliteWorkStore implements WorkStore {
    * newest records would hand their numbers out again, behind a cursor that has passed them.
    * Bounded per call; the rest are numbered by the next one, and until then they are simply not listed.
    * Synchronous throughout (no await), so this connection cannot interleave another write into it.
+   *
+   * A READER DOES NOT WAIT FOR THE LOCK. Numbering takes SQLite's one write lock, and a reader that
+   * waited for it stalled behind another process's write transaction — then threw "database is locked"
+   * after the busy budget (measured: 15 s; a WAL read never waited in 0.9). So the lock is tried once,
+   * with a short wait (`NUMBER_LOCK_WAIT_MS`); when another connection holds it, this call numbers
+   * nothing and lists what is already numbered. The new records are numbered by a later read, after
+   * every number handed out by then — so they still never land behind a cursor, they are only listed a
+   * read later.
    */
   private numberNew(ns: string, max: number): void {
     if (!this.db.prepare('SELECT 1 FROM gnl_work_log WHERE ns = ? AND seq = 0 LIMIT 1').get(ns)) return;
-    this.db.exec('BEGIN IMMEDIATE');
+    if (!this.tryWriteLock()) return;
     try {
       const ids = (this.db.prepare('SELECT id FROM gnl_work_log WHERE ns = ? AND seq = 0 ORDER BY rowid LIMIT ?')
         .all(ns, max) as { id: string }[]).map((r) => r.id);
@@ -1326,6 +1350,24 @@ class SqliteWorkStore implements WorkStore {
     } catch (e) {
       this.db.exec('ROLLBACK');
       throw e;
+    }
+  }
+  /**
+   * `BEGIN IMMEDIATE`, waiting at most `NUMBER_LOCK_WAIT_MS` and never retried: true when this
+   * connection now holds the write lock, false when another connection does. On the raw connection,
+   * not through the busy retry, which exists to WAIT — the one thing a reader must not do here.
+   */
+  private tryWriteLock(): boolean {
+    const raw = (this.db as { inner?: { exec(sql: string): unknown } }).inner ?? this.db;
+    raw.exec(`PRAGMA busy_timeout = ${NUMBER_LOCK_WAIT_MS}`);
+    try {
+      raw.exec('BEGIN IMMEDIATE');
+      return true;
+    } catch (e) {
+      if (isBusyError(e)) return false;
+      throw e;
+    } finally {
+      raw.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     }
   }
   /** Keyset on `(seq, ts, id)` from the cursor's position (`WorkStore.list`); one extra row says "more". */

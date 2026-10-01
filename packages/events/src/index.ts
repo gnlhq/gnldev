@@ -323,7 +323,7 @@ const ackKey = (topic: string, consumer: string, id: string) => markerKey('evtac
 const attKey = (topic: string, consumer: string, id: string) => markerKey('evtatt', topic, consumer, id);
 const deadKey = (topic: string, consumer: string, id: string) => markerKey('evtdead', topic, consumer, id);
 /** A topic's per-organization depth index (see `emit`'s `maxDepth`); under `org:<id>:` for an organization's. */
-const depthNsOf = (topic: string, orgId: string | undefined) => (orgId === undefined ? `evtdepth:${enc(topic)}` : `org:${orgId}:evtdepth:${enc(topic)}`);
+const depthNsOf = (topic: string, orgId: string | undefined) => (orgId === undefined ? `evtdepth:${enc(topic)}` : `${orgPrefix(orgId)}evtdepth:${enc(topic)}`);
 
 /** A topic is a system name: it may not wear the owned-name marker (see `markerKey`). */
 function assertTopic(topic: string): void {

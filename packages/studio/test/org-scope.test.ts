@@ -20,8 +20,8 @@ describe('@gnldev/studio org scope (read-only)', () => {
     expect(acme.map((r: any) => r.runId)).toEqual(['r-acme']);
 
     const shared = await (await call(app, '/runs')).json();
-    // The shared view is the raw journal: the acme-prefixed key also shows up as runId 'org:acme:r-acme'
-    expect(shared.map((r: any) => r.runId)).toContain('r-shared');
+    // The root scope hides every organization's runs (ADR-0001): acme's is not listed as 'org:acme:r-acme'.
+    expect(shared.map((r: any) => r.runId)).toEqual(['r-shared']);
   });
 
   it('API-01: GET /runs?limit= in an org context does not crash and stays isolated (countRunsByStatus is not bridged per-org)', async () => {

@@ -18,7 +18,7 @@ import type { AdoptIntoOrgResult,
 } from './storage.js';
 // P2-migrate schema introspection/migration façade — see migrate.ts's header.
 import { tablesFromDDL } from './migrate.js';
-import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix } from './organization.js';
+import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, orgSpaceSql } from './organization.js';
 import type { SchemaCheckResult, SchemaMigrationResult, MissingColumn } from './migrate.js';
 
 type QueryResult = { rows: any[]; rowCount?: number | null };
@@ -355,7 +355,7 @@ export class PostgresStorage implements Storage {
     // with the capability probe reporting everything fine.
     //
     // `BEGIN` runs BEFORE `fn`, so refusing there writes nothing; there is no half-done state.
-    const tx = async <T>(fn: (q: Q) => Promise<T>, opts?: { atomic?: true }): Promise<T> => {
+    const tx = async <T>(fn: (q: Q) => Promise<T>, opts?: TxOptions): Promise<T> => {
       await this.ensureReady();
       if (typeof this._pool.connect !== 'function') {
         if (opts?.atomic) throw new Error(NO_TX_MSG);
@@ -365,7 +365,7 @@ export class PostgresStorage implements Storage {
       let inTx = false;
       let destroy = false;
       try {
-        try { await client.query('BEGIN'); inTx = true; } catch (e) { if (opts?.atomic) throw new Error(NO_TX_MSG, { cause: e }); /* else: transaction not supported → proceed unwrapped */ }
+        try { await client.query(opts?.readCommitted ? 'BEGIN ISOLATION LEVEL READ COMMITTED' : 'BEGIN'); inTx = true; } catch (e) { if (opts?.atomic) throw new Error(NO_TX_MSG, { cause: e }); /* else: transaction not supported → proceed unwrapped */ }
         const out = await fn((s, p) => client.query(s, p));
         if (inTx) await client.query('COMMIT');
         return out;
@@ -560,9 +560,13 @@ export class PostgresStorage implements Storage {
         `SELECT a.id AS id FROM gnl_vectors a JOIN gnl_vectors b ON b.id = $1 || ':' || a.id WHERE a.namespace IS NULL LIMIT 1`, [ns],
       )).rows[0] as { id: string } | undefined;
       if (clash) throw vectorAdoptCollision(clash.id);
+      // The organization-space rule is `orgSpaceSql`'s (organization.ts), not a `LIKE` restated here.
+      const space = (col: string, outside = false) => { let n = 0; return orgSpaceSql(col, () => `$${++n}`, { outside }); };
       for (const [table, col, store] of KEYED) {
-        alreadyScoped += Number((await q(`SELECT COUNT(*) AS c FROM ${table} WHERE ${col} LIKE 'org:%'`)).rows[0].c);
-        const rows = (await q(`SELECT DISTINCT ${col} AS k FROM ${table} WHERE ${col} NOT LIKE 'org:%'`)).rows as { k: string }[];
+        const inQ = space(col);
+        alreadyScoped += Number((await q(`SELECT COUNT(*) AS c FROM ${table} WHERE ${inQ.cond}`, inQ.params)).rows[0].c);
+        const rootQ = space(col, true);
+        const rows = (await q(`SELECT DISTINCT ${col} AS k FROM ${table} WHERE ${rootQ.cond}`, rootQ.params)).rows as { k: string }[];
         let n = 0;
         for (const { k } of rows) {
           if (isPlatformKey(k)) { skipped.add(k.split(':')[0]!); continue; }
@@ -579,8 +583,10 @@ export class PostgresStorage implements Storage {
         bump(store, n);
       }
       // gnl_meta minus the engine's own rows — see ENGINE_META_KEYS.
-      const metaRows = (await q(`SELECT k FROM gnl_meta WHERE k NOT LIKE 'org:%'`)).rows as { k: string }[];
-      alreadyScoped += Number((await q(`SELECT COUNT(*) AS c FROM gnl_meta WHERE k LIKE 'org:%'`)).rows[0].c);
+      const metaRoot = space('k', true);
+      const metaIn = space('k');
+      const metaRows = (await q(`SELECT k FROM gnl_meta WHERE ${metaRoot.cond}`, metaRoot.params)).rows as { k: string }[];
+      alreadyScoped += Number((await q(`SELECT COUNT(*) AS c FROM gnl_meta WHERE ${metaIn.cond}`, metaIn.params)).rows[0].c);
       let metaN = 0;
       for (const { k } of metaRows) {
         if (ENGINE_META_KEYS.includes(k) || isPlatformKey(k)) { skipped.add(k); continue; }
@@ -690,7 +696,13 @@ const inserted1 = (r: QueryResult) => (r.rowCount ?? r.rows.length) === 1;
  * comments say "closes the crash window" and "in a single transaction", and that was true only when a
  * transaction could actually be opened.
  */
-type Tx = <T>(fn: (q: Q) => Promise<T>, opts?: { atomic?: true }) => Promise<T>;
+/**
+ * `atomic`: the caller's correctness depends on the transaction (see the helper). `readCommitted`: run
+ * it at READ COMMITTED whatever the database's `default_transaction_isolation` says — for a statement
+ * written for that level's semantics (`PgWorkStore.numberNew`).
+ */
+type TxOptions = { atomic?: true; readCommitted?: true };
+type Tx = <T>(fn: (q: Q) => Promise<T>, opts?: TxOptions) => Promise<T>;
 
 class PgRunJournal implements RunJournal {
   constructor(private q: Q, private tx: Tx, private shape: PrefixShape) {}
@@ -1565,6 +1577,8 @@ class PgWorkStore implements WorkStore {
   constructor(private q: Q, private tx: Tx, private shape: PrefixShape) {}
   /** `false` once the engine has refused `NUMBER_NEW_SQL` (pg-mem: no data-modifying CTE, no window functions). */
   private cteDml = true;
+  /** `true` once the database's default isolation has refused the numbering statement (40001): see `numberNew`. */
+  private readCommitted = false;
   /**
    * 0.9's statement, unchanged: the record is written UNNUMBERED (`seq` 0) and numbered by the first
    * `list` that sees it. Numbering at append made every append to a namespace wait on that
@@ -1590,9 +1604,22 @@ class PgWorkStore implements WorkStore {
   private async numberNew(ns: string, max: number): Promise<void> {
     if (this.cteDml) {
       try {
-        await this.q(NUMBER_NEW_SQL, [ns, max]);
+        if (this.readCommitted) await this.tx((q) => q(NUMBER_NEW_SQL, [ns, max]), { readCommitted: true });
+        else await this.q(NUMBER_NEW_SQL, [ns, max]);
         return;
       } catch (e) {
+        // 40001 (serialization failure): the database defaults to REPEATABLE READ or SERIALIZABLE, and
+        // another reader numbered this namespace meanwhile. The statement is written for READ
+        // COMMITTED — its lock on the counter row orders the numberings, and the re-check of `seq = 0`
+        // reads the row's newest version — so it is run at that level from now on, starting with this
+        // call. Measured before: 74 of 120 `list` calls threw under REPEATABLE READ. The failed
+        // statement applied nothing, so running it again cannot number anything twice.
+        // Not gated on the flag: a concurrent call on this store may have sent the plain statement before it was set.
+        if ((e as { code?: unknown })?.code === '40001') {
+          this.readCommitted = true;
+          await this.tx((q) => q(NUMBER_NEW_SQL, [ns, max]), { readCommitted: true });
+          return;
+        }
         // pg-mem's own words for a data-modifying CTE and a window function; real Postgres has both.
         if (!/not supported|not implemented|failed to parse/i.test(String((e as Error)?.message ?? e))) throw e;
         this.cteDml = false;

@@ -5,7 +5,7 @@ import { Hono, type Context } from 'hono';
 import { sseResponse } from './sse.js';
 
 import { STUDIO_ERROR_CODES } from './error-codes.js';
-import { ORG_RECORD_PRE, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, eraseSubject, subjectRuns, toJournal, decodeStepRecord } from '@gnldev/durable';
+import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, eraseSubject, subjectRuns, toJournal, decodeStepRecord } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
 import type { JournalReader, Journal, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
@@ -1239,9 +1239,12 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // even if opts.org isn't given (a contract from types.ts — see the middleware below).
   const orgALS = new AsyncLocalStorage<string>();
   const orgViews = new Map<string, JournalReader>();
+  // The ROOT scope's reader hides every organization's rows (ADR-0001; `withRootScope`). Root
+  // management defined over every organization — the retention sweep, a run purge — takes `rawReader`.
+  const rootView = withRootScope(rawReader as unknown as Journal & JournalReader) as unknown as JournalReader;
   function scopedNow (): JournalReader {
     const org = orgALS.getStore();
-    if (!org) return rawReader;
+    if (!org) return rootView;
     let v = orgViews.get(org);
     if (!v) {
       v = withOrg(rawReader as unknown as Journal, org) as unknown as JournalReader;
@@ -2502,14 +2505,13 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
 
   // Organizations: listed from `org:<id>:` prefixes + usage/cost + budget status (opts.budgets).
   // A SINGLE notification to opts.alerts.webhook on budget overrun (first-write-wins __alert__ marker).
-  const ORG_KEY_PRE = 'org:';
   const listOrganizations = async (c: Context) => {
     if (!(await allowP(c.req.raw, 'money:read'))) return deny(c.req.raw, 'read');
     if (!writable || typeof rw.listKeys !== 'function') return c.json({ organizations: [] });
     // The scan always happens on the ROOT journal (org: prefixes aren't visible in the org-scoped view);
     // an identity-bound org sees ONLY itself — the global list is open only to unbound (operator) identities.
     const rootRw = rawReader as Partial<Journal> & JournalReader;
-    const keys = await rootRw.listKeys!(ORG_KEY_PRE).catch(() => [] as string[]);
+    const keys = await rootRw.listKeys!(ORG_KEY_PREFIX).catch(() => [] as string[]);
     // The ALS-resolved org counts too, not just the identity-bound one. `opts.org.resolve` / `x-gnl-org`
     // put the caller's organization in the ALS without touching the principal, and reading only
     // `principalOf(...).orgId` here meant that supported setup got EVERY organization's records back.
@@ -2518,7 +2520,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const bound = principalOf(c.req.raw)?.orgId ?? orgALS.getStore();
     // Merge DISCOVERED orgs (with org:<id>: prefixed data) with EXPLICITLY REGISTERED ones (__org__:<id>) →
     // a newly created org with no runs yet also shows up in the list.
-    const discovered = keys.map((k) => { const j = k.indexOf(':', ORG_KEY_PRE.length); return j > ORG_KEY_PRE.length ? k.slice(ORG_KEY_PRE.length, j) : ''; }).filter(Boolean);
+    const discovered = keys.map((k) => { const j = k.indexOf(':', ORG_KEY_PREFIX.length); return j > ORG_KEY_PREFIX.length ? k.slice(ORG_KEY_PREFIX.length, j) : ''; }).filter(Boolean);
     // listKeys also returns tombstones (put(__org__:id, null) — see DELETE /organizations); the codebase's
     // general convention is `get(...) != null` = "exists" (see ~line 972, ~1029). A deleted org would
     // otherwise stay in the list (the "0 records deleted but still shows on screen" bug) → skip records with a null value.
@@ -2730,7 +2732,9 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   async function orgExists(id: string): Promise<boolean> {
     const rootRw = rawReader as Partial<Journal> & JournalReader;
     if ((await rootRw.get?.(ORG_PRE + id)) != null) return true; // explicitly registered
-    const keys = await rootRw.listKeys?.(`${ORG_KEY_PRE}${id}:`).catch(() => [] as string[]);
+    let prefix: string;
+    try { prefix = orgPrefix(id); } catch { return false; } // no organization can have this id
+    const keys = await rootRw.listKeys?.(prefix).catch(() => [] as string[]);
     return !!keys?.length; // or an org with (implicit) data
   }
 
@@ -3534,13 +3538,15 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     // Measured: two unrelated users' threads, one click. 409 rather than 404: the row is really
     // there, it just is not a run, and telling the operator "not found" about something they can
     // see on screen is its own kind of lie.
-    if (typeof isRealRun === 'function' && !(await isRealRun(rw as unknown as Journal, id))) {
+    // `rawReader`, not `rw`: at the root `rw` hides organizations' runs, and a purge by a platform admin
+    // names a run by its physical id, an organization's included.
+    if (typeof isRealRun === 'function' && !(await isRealRun(rawReader as unknown as Journal, id))) {
       return c.json({
         error: `'${id}' is a run row that no run ever wrote — it has no '${id}:input'. Purging it would delete every key under '${id}:', which is not a run's keyspace. See \`gnl doctor\`.`,
         code: STUDIO_ERROR_CODES.runNotARun,
       }, 409);
     }
-    const deleted = await purgeRun(rw as unknown as Journal, id);
+    const deleted = await purgeRun(rawReader as unknown as Journal, id);
     await audit(c, 'run.purge', id, { deleted });
     return c.json({ ok: true, deleted });
   });
@@ -3621,7 +3627,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     // yeniden koşmasını engelliyor (silme, iz bırakmadan yapılırsa ayrı bir sorun doğurur).
     const suspendedTtlMs = body.suspendedTtlMs ?? opts.retention?.suspendedTtlMs;
     const tombstones = body.tombstones ?? opts.retention?.tombstones;
-    const result = await sweepRuns(rw as any, {
+    // `rawReader`: the sweep is defined over every organization's runs (see the platform-admin check above).
+    const result = await sweepRuns(rawReader as any, {
       olderThanMs, keepSuspended,
       ...(suspendedTtlMs != null ? { suspendedTtlMs } : {}),
       ...(tombstones != null ? { tombstones } : {}),

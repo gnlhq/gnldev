@@ -9,6 +9,7 @@
 import type { Journal, JournalEntry, RunSummary, JournalReader, RunStatus } from './journal.js';
 import { VectorOwnerConflictError } from './errors.js';
 import { assertOwnerId, isWellFormed, OwnerIdError } from './owned-name.js';
+import { ORG_KEY_PREFIX, isOrganizationKey, orgSpaceSql, prefixSql } from './organization.js';
 
 // ── Common ──────────────────────────────────────────────────────────────────
 
@@ -171,13 +172,6 @@ export interface MemoryPartitionOption {
 }
 export type MemoryPartition = { kind: 'root' } | { kind: 'org'; prefix: string };
 
-/** The prefix every organization's memory rows carry in the root store. */
-export const ORG_THREAD_PREFIX = 'org:';
-/** Whether `threadId` is in the organizations' reserved space — a thread the root scope can never name. */
-export function isOrganizationThreadId(threadId: string): boolean {
-  return threadId.startsWith(ORG_THREAD_PREFIX);
-}
-
 /**
  * A root-scope caller named a thread in the organizations' reserved space. Thrown by a root-scope
  * `AgentMemory` (and refused as `thread_id_reserved` by the REST door): such an id is an
@@ -187,44 +181,64 @@ export function isOrganizationThreadId(threadId: string): boolean {
 export class ReservedThreadIdError extends Error {
   constructor(readonly threadId: string) {
     super(
-      `@gnldev/durable: thread id '${threadId}' starts with '${ORG_THREAD_PREFIX}', the space organizations' threads live in, ` +
+      `@gnldev/durable: thread id '${threadId}' starts with '${ORG_KEY_PREFIX}', the space organizations' threads live in, ` +
         'and this memory is the root scope\'s, which cannot name them. Use a thread id that does not start with ' +
-        `'${ORG_THREAD_PREFIX}'; to work inside an organization, build the memory over withOrgStorage(storage, orgId).`,
+        `'${ORG_KEY_PREFIX}'; to work inside an organization, build the memory over withOrgStorage(storage, orgId). ` +
+        'A thread 0.9 let the root create under that name is moved out with migrateReservedRootThreads (@gnldev/memory).',
     );
     this.name = 'ReservedThreadIdError';
   }
 }
 /** Refuses a thread id a root-scope caller may not name. See `ReservedThreadIdError`. */
 export function assertRootThreadId(threadId: string): string {
-  if (isOrganizationThreadId(threadId)) throw new ReservedThreadIdError(threadId);
+  if (isOrganizationKey(threadId)) throw new ReservedThreadIdError(threadId);
   return threadId;
 }
 
-/** The partition a scan's options name: the root's unless an organization's view set `MEMORY_PARTITION`. */
+/** How often each partition has been read by a store — see `partitionReadCount`. */
+const partitionSeen = new Map<string, number>();
+
+/**
+ * The partition a scan's options name: the root's unless an organization's view set `MEMORY_PARTITION`.
+ *
+ * `org:` alone (the whole reserved space) is accepted too, for the code that must find threads 0.9 let
+ * the root create under that name (`reservedRootThreads`) — never set by an organization's view.
+ */
 export function memoryPartitionOf(opts: MemoryPartitionOption | undefined): MemoryPartition {
   const prefix = opts?.[MEMORY_PARTITION];
   if (prefix === undefined) return { kind: 'root' };
   // Written only by withOrgStorage, from a validated orgId. Anything else is a bug worth stopping on,
   // not a reason to widen the scan.
-  if (typeof prefix !== 'string' || !/^org:[^:]+:$/.test(prefix)) {
+  if (typeof prefix !== 'string' || !/^org:([^:]+:)?$/.test(prefix)) {
     throw new Error(`@gnldev/durable: invalid memory partition '${String(prefix)}' — expected 'org:<id>:'`);
   }
+  partitionSeen.set(prefix, (partitionSeen.get(prefix) ?? 0) + 1);
   return { kind: 'org', prefix };
 }
+
+/**
+ * How many times any store has read partition `prefix` — the organization's view reads this before and
+ * after a scan. If no store read it meanwhile, the option did not reach the store: a wrapper between
+ * the view and the store rebuilt the options without the Symbol, and the store scanned the ROOT's rows.
+ * Code-only and in-process, like the option itself.
+ */
+export function partitionReadCount(prefix: string): number {
+  return partitionSeen.get(prefix) ?? 0;
+}
+
 /** Whether thread `id` is inside `partition` — the in-process twin of the SQL adapters' condition. */
 export function inMemoryPartition(partition: MemoryPartition, id: string): boolean {
-  return partition.kind === 'root' ? !isOrganizationThreadId(id) : id.startsWith(partition.prefix);
+  return partition.kind === 'root' ? !isOrganizationKey(id) : id.startsWith(partition.prefix);
 }
 /**
- * The SQL condition on thread-id column `col` for `partition`, for the two SQL adapters. A prefix
- * compare rather than LIKE: an organization id may contain `_` or `%`, which LIKE reads as wildcards
- * (and SQLite's LIKE ignores case, so `org:ACME:` would match `org:acme:`). The length is the
- * prefix's own, a number, so it is written into the statement. `ph()` renders the next placeholder in
- * the adapter's syntax (`?` or `$k`); `params` fill them in order.
+ * The SQL condition on thread-id column `col` for `partition`, for the two SQL adapters — the same
+ * rule as `orgSpaceSql` (the prefix is bound, and the database measures it: see that function for why
+ * neither `LIKE` nor a length computed in JS). `ph()` renders the next placeholder in the adapter's
+ * syntax (`?` or `$k`); `params` fill them in order.
  */
 export function memoryPartitionSql(partition: MemoryPartition, col: string, ph: () => string): { cond: string; params: unknown[] } {
-  if (partition.kind === 'root') return { cond: `substring(${col}, 1, ${ORG_THREAD_PREFIX.length}) <> '${ORG_THREAD_PREFIX}'`, params: [] };
-  return { cond: `substring(${col}, 1, ${partition.prefix.length}) = ${ph()}`, params: [partition.prefix] };
+  if (partition.kind === 'root') return orgSpaceSql(col, ph, { outside: true });
+  return prefixSql(col, partition.prefix, ph);
 }
 
 /**
@@ -665,13 +679,12 @@ export function vectorDeletePlan(where: VectorDeleteWhere): VectorDeleteWhere | 
  * `org:acme` (`orgPrefix` without its colon), so a namespace that starts `org:` is an organization's —
  * the same reading `purgeResource` gives a run id. Written once for the stores that filter in code
  * (`vectorInOrganization`) and once for the stores that filter in SQL (the fragment below); the
- * contract test holds the six stores to one answer.
+ * contract test holds the six stores to one answer. The rule is `isOrganizationKey`'s (organization.ts).
  */
-const ORG_NAMESPACE = 'org:';
 
 /** Is this an organization's namespace? No namespace is nobody's organization. */
 export function vectorInOrganization(namespace: string | null | undefined): boolean {
-  return typeof namespace === 'string' && namespace.startsWith(ORG_NAMESPACE);
+  return typeof namespace === 'string' && isOrganizationKey(namespace);
 }
 
 /**
@@ -679,7 +692,7 @@ export function vectorInOrganization(namespace: string | null | undefined): bool
  * SQLite's LIKE ignores ASCII case, so `ORG:x` would be an organization there and nowhere else. (Not
  * `substr` or `left`: pg-mem has neither.) `NULL` is spelled out because a comparison with it is never true.
  */
-export const VECTOR_OUTSIDE_ORGANIZATIONS_SQL = `(namespace IS NULL OR substring(namespace, 1, ${ORG_NAMESPACE.length}) <> '${ORG_NAMESPACE}')`;
+export const VECTOR_OUTSIDE_ORGANIZATIONS_SQL = `(namespace IS NULL OR substring(namespace, 1, ${ORG_KEY_PREFIX.length}) <> '${ORG_KEY_PREFIX}')`;
 
 /**
  * Which stored documents a delete plan (`vectorDeletePlan`) takes: every given condition must hold.

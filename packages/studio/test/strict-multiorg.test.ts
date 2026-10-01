@@ -70,9 +70,10 @@ describe('@gnldev/studio strict multi-org (EE ON)', () => {
 
     // create a new org → 200
     expect((await call(app, '/organizations', { method: 'POST', headers: JH('plat'), body: JSON.stringify({ id: 'initech' }) })).status).toBe(200);
-    // and it can also read root-scoped data (both orgs' prefixed runs)
+    // The root scope hides every organization's runs (ADR-0001); the platform admin reads one by naming it.
     const runs = await (await call(app, '/runs', { headers: H('plat') })).json();
-    expect(runs.length).toBe(2);
+    expect(runs.length).toBe(0);
+    expect((await (await call(app, '/runs', { headers: { ...H('plat'), 'x-gnl-org': 'acme' } })).json()).length).toBe(1);
   });
 
   it('(3) FAIL-CLOSED: an org-less identity WITHOUT a platform grant is denied (was the all-seeing operator)', async () => {
@@ -140,8 +141,9 @@ describe('@gnldev/studio free tier + organizations: the platform scope must be D
 
   it('the same identity declared as superAdmin sees & manages everything', async () => {
     const app = await freeApp(roleAuth({ superAdmin: { token: 'op' } }));
-    // reads the whole root journal (both organizations' prefixed runs)
-    expect((await (await call(app, '/runs', { headers: H('op') })).json()).length).toBe(2);
+    // The root scope hides every organization's runs (ADR-0001); it reads one organization's by naming it.
+    expect((await (await call(app, '/runs', { headers: H('op') })).json()).length).toBe(0);
+    expect((await (await call(app, '/runs', { headers: { ...H('op'), 'x-gnl-org': 'acme' } })).json()).length).toBe(1);
     // and can create an organization
     expect((await call(app, '/organizations', { method: 'POST', headers: JH('op'), body: JSON.stringify({ id: 'x' }) })).status).toBe(200);
   });

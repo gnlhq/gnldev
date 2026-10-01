@@ -113,15 +113,17 @@ describe('GET /metrics for an organization-scoped caller', () => {
     expect(JSON.stringify(globex.body), 'globex\'s metrics carry acme\'s token count').not.toContain('1453');
   });
 
-  // The operator's view aggregates every organization, so it must NOT match either one alone —
-  // otherwise "per-org numbers" could be satisfied by a single shared answer handed to everybody.
-  it('while the operator sees more than any single organization', async () => {
+  // The ROOT scope hides every organization's rows (ADR-0001), runs and their metrics included: the
+  // operator's root view carries neither organization's numbers. It reads one by naming it.
+  it('while the operator\'s root view carries no organization\'s numbers, and names one to read it', async () => {
     const api = await mkApi();
     const ops = await metrics(api, AS.ops);
-    const acme = await metrics(api, AS.acme);
-
-    expect(ops.body?.total, 'the operator view is scoped to one organization').toBe(2);
-    expect(ops.body?.tokens, 'the operator total is not the sum of both organizations').toBe(1453 + 2754);
+    expect(ops.body?.total, 'the root view counted an organization\'s runs').toBe(0);
+    expect(JSON.stringify(ops.body)).not.toContain('1453');
+    expect(JSON.stringify(ops.body)).not.toContain('2754');
+    const opsInAcme = await metrics(api, { ...AS.ops, 'x-gnl-org': 'acme' });
+    expect(opsInAcme.body?.total).toBe(1);
+    expect(opsInAcme.body?.tokens).toBe(1453);
   });
 });
 

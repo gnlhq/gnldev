@@ -152,6 +152,46 @@ export function isPlatformKey(key: string): boolean {
 }
 
 /**
+ * Where every organization's rows live in the root store: `org:<id>:…`. The ONE spelling of the
+ * reserved space — `orgPrefix` builds an organization's key under it, `isOrganizationKey` and
+ * `orgSpaceSql` ask whether a key is in it. Read through those, never restated: eight restatements
+ * (`startsWith('org:')`, `LIKE 'org:%'`, two local constants) had drifted by the time they were
+ * counted — SQLite's `LIKE` ignores case, so its adopt treated a root key `ORG:x` as already scoped and
+ * never moved it.
+ */
+export const ORG_KEY_PREFIX = 'org:';
+
+/**
+ * Whether `id` — a journal key, a run id, a thread id, a work namespace — is in the organizations'
+ * reserved space. Case-sensitive, and the same answer `orgSpaceSql` gives in SQL.
+ */
+export function isOrganizationKey(id: string): boolean {
+  return id.startsWith(ORG_KEY_PREFIX);
+}
+
+/**
+ * The SQL twin of `isOrganizationKey` (and of `id.startsWith(orgPrefix(orgId))` with `orgId`): a
+ * condition on column `col` for the two SQL adapters. `ph()` renders the next placeholder in the
+ * adapter's syntax (`?` or `$k`); `params` fill them in order. `outside: true` negates it.
+ *
+ * NOT `LIKE`: an organization id may hold `_` or `%`, and SQLite's `LIKE` ignores case. And the
+ * length is counted in CHARACTERS (code points), which is what SQL `substring` counts on SQLite and
+ * Postgres — not `prefix.length`, which counts UTF-16 code units: for an id outside the BMP (`🚀team`)
+ * that compared one character too many and the organization listed NOTHING of its own (measured on
+ * SQLite and Postgres). Bound rather than measured by the database because pg-mem has no `length()`.
+ */
+export function orgSpaceSql(col: string, ph: () => string, opts: { orgId?: string; outside?: boolean } = {}): { cond: string; params: unknown[] } {
+  return prefixSql(col, opts.orgId === undefined ? ORG_KEY_PREFIX : orgPrefix(opts.orgId), ph, opts.outside === true);
+}
+
+/** `col` starts (or, with `negate`, does not start) with the bound `prefix` — characters, compared exactly. */
+export function prefixSql(col: string, prefix: string, ph: () => string, negate = false): { cond: string; params: unknown[] } {
+  const n = ph();
+  const p = ph();
+  return { cond: `substring(${col}, 1, ${n}) ${negate ? '<>' : '='} ${p}`, params: [Array.from(prefix).length, prefix] };
+}
+
+/**
  * The key prefix for an organization, and the single place an organization id is validated.
  *
  * EXPORTED so `withOrgStorage` shares this guard rather than computing its own prefix. Six ports
@@ -162,7 +202,7 @@ export function orgPrefix(orgId: string): string {
   if (!orgId || orgId.includes(':')) {
     throw new Error(`@gnldev/durable: invalid orgId '${orgId}' — must be non-empty and must not contain ':'`);
   }
-  return `org:${orgId}:`; // the 'org:' journal prefix
+  return `${ORG_KEY_PREFIX}${orgId}:`;
 }
 
 /**
@@ -211,7 +251,52 @@ export function orgScopeOf(journal: unknown): string | undefined {
   return typeof v === 'string' ? v : undefined;
 }
 
-export function withOrg(journal: Journal, orgId: string): Journal & Partial<JournalReader> {
+/**
+ * One page of `listRunsPaged` over a source that also holds rows the caller may not see.
+ *
+ * The underlying `listRunsPaged` has NO concept of an organization — keys are prefixed BEFORE reaching
+ * it, so its index mixes every organization's runs (and the root's) in ONE keyspace. A single
+ * underlying page cannot just be filtered and returned: that under-fills the requested `limit`, or —
+ * combined with the underlying `nextCursor` — skips this caller's runs that fell in a page dominated by
+ * others (the "filter after slicing" bug the P0.3 filter contract exists to avoid). So this WALKS the
+ * source's pages forward (relying on the numeric cursor-as-offset convention every adapter's
+ * `offset()`/`paginate()` helper uses), keeping what `keep` maps, until `limit` is reached or the source
+ * is exhausted. Honest cost: a caller holding a small slice of a large shared keyspace pays for walking
+ * the rest. Shared by `withOrg` (an organization's runs) and `withRootScope` (the root's).
+ */
+async function walkRunPages(
+  reader: Partial<JournalReader>,
+  journal: unknown,
+  q: Parameters<NonNullable<JournalReader['listRunsPaged']>>[0],
+  keep: (r: RunSummary) => RunSummary | undefined,
+): Promise<{ items: RunSummary[]; nextCursor?: string }> {
+  const limit = q?.limit ?? 50;
+  const chunk = Math.max(limit, 50); // read the underlying (mixed) store in reasonably sized chunks
+  let pos = q?.cursor ? Number(q.cursor) || 0 : 0;
+  const items: RunSummary[] = [];
+  let nextCursor: string | undefined;
+  for (;;) {
+    const page = await reader.listRunsPaged!.call(journal, { ...q, cursor: String(pos), limit: chunk });
+    let consumed = 0;
+    for (const r of page.items) {
+      consumed++;
+      const mine = keep(r);
+      if (mine) {
+        items.push(mine);
+        if (items.length >= limit) { nextCursor = String(pos + consumed); break; }
+      }
+    }
+    if (items.length >= limit) break;
+    if (!page.nextCursor) { nextCursor = undefined; break; } // underlying store exhausted
+    pos += page.items.length;
+  }
+  return { items, ...(nextCursor !== undefined ? { nextCursor } : {}) };
+}
+
+export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<JournalReader> {
+  // An organization's view of the root scope's view is the organization's view of the root: the root
+  // view hides `org:` keys, and every key this view reads is one.
+  const journal = rootScopeParentOf(scopedFrom) ?? scopedFrom;
   // Refuse to scope a journal that is ALREADY scoped. Nesting produces `org:acme:org:globex:<key>`:
   // the marker says 'globex' and the data sits inside acme, so acme can list, read and DELETE it —
   // measured, including `acme.deletePrefix('')` sweeping globex's rows. That is the exact opposite of
@@ -326,46 +411,9 @@ export function withOrg(journal: Journal, orgId: string): Journal & Partial<Jour
         .filter((r) => r.runId.startsWith(prefix))
         .map((r) => ({ ...r, runId: r.runId.slice(prefix.length) }));
   }
-  /**
-   * P0.3 the underlying `listRunsPaged` has NO concept of "this organization" —
-   * keys are prefixed BEFORE reaching it (see get/put above), so its own gnl_runs-style index mixes
-   * EVERY organization's runs in ONE keyspace. Unlike the unpaged `listRuns` bridge just above (which
-   * can safely filter-then-strip because it always reads EVERYTHING, no slicing involved), a single
-   * underlying PAGE can't just be filtered-then-returned: doing so would either under-fill the caller's
-   * requested `limit` (silently returning fewer items than exist) or — if combined with the underlying
-   * page's own `nextCursor` — skip over this organization's runs that happened to fall in an
-   * underlying page dominated by OTHER organizations (exactly the "filter after slicing" bug the
-   * whole P0.3 filter contract exists to avoid). So this WALKS the underlying store's pages forward
-   * (relying on the numeric cursor-as-offset convention every adapter's `offset()`/`paginate()` helper
-   * already uses — see sqlite/postgres/redis/in-memory-storage.ts), accumulating only this
-   * organization's (prefix-stripped) runs, until either `limit` is reached or the underlying store is
-   * exhausted. Honest cost: an organization holding a small slice of a large shared keyspace pays for
-   * walking through every OTHER organization's runs along the way — a real Postgres/SQL fix would push
-   * an explicit key-prefix filter into RunJournal.listRuns itself (out of scope for P0.3).
-   */
+  // Paged: walked, not filtered per page — see `walkRunPages`.
   if (typeof reader.listRunsPaged === 'function') {
-    out.listRunsPaged = async (q) => {
-      const limit = q?.limit ?? 50;
-      const chunk = Math.max(limit, 50); // read the underlying (mixed-org) store in reasonably sized chunks
-      let pos = q?.cursor ? Number(q.cursor) || 0 : 0;
-      const items: RunSummary[] = [];
-      let nextCursor: string | undefined;
-      for (;;) {
-        const page = await reader.listRunsPaged!.call(journal, { ...q, cursor: String(pos), limit: chunk });
-        let consumed = 0;
-        for (const r of page.items) {
-          consumed++;
-          if (r.runId.startsWith(prefix)) {
-            items.push({ ...r, runId: r.runId.slice(prefix.length) });
-            if (items.length >= limit) { nextCursor = String(pos + consumed); break; }
-          }
-        }
-        if (items.length >= limit) break;
-        if (!page.nextCursor) { nextCursor = undefined; break; } // underlying store exhausted
-        pos += page.items.length;
-      }
-      return { items, nextCursor };
-    };
+    out.listRunsPaged = (q) => walkRunPages(reader, journal, q, (r) => (r.runId.startsWith(prefix) ? { ...r, runId: r.runId.slice(prefix.length) } : undefined));
   }
   // H8c (run size statistics): runId is prefixed, the result (entries/bytes) is independent of the
   // organization — returned as-is. If not bridged, retention/budget's stats path would silently disappear in the org view.
@@ -373,6 +421,86 @@ export function withOrg(journal: Journal, orgId: string): Journal & Partial<Jour
     out.readRunStats = (runId: string) => reader.readRunStats!.call(journal, prefix + runId);
   }
   return out;
+}
+
+/** The journal a `withRootScope` view hides organizations' rows of. */
+const ROOT_SCOPE_OF = Symbol.for('@gnldev/durable.rootScopeOf');
+
+/** The journal behind a `withRootScope` view, or undefined if `journal` is not one. */
+function rootScopeParentOf(journal: unknown): Journal | undefined {
+  return (journal as Record<symbol, Journal> | null | undefined)?.[ROOT_SCOPE_OF];
+}
+
+/**
+ * The ROOT scope's reader: the same journal, with every organization's rows hidden from its reads.
+ *
+ * ADR-0001: "In the root scope, every organization's rows are hidden." Memory held that from the
+ * store's own methods (`MEMORY_PARTITION`); runs did not. An organization's run sits physically in the
+ * root journal as `org:<id>:<runId>`, and the root scope read through the raw journal — so Studio's and
+ * the REST API's `GET /runs` at the root listed `org:acme:r-acme`, and `GET /runs/org:acme:r-acme`
+ * returned acme's journal (measured: the model's answer, the prompt). This is the one owner of that
+ * rule for runs; a door hands it out wherever it serves the root scope.
+ *
+ * READS ONLY. `get`, `getMany`, `getCounters`, `listKeys`, `readRun`, `readRunStats`, `listRuns`,
+ * `listRunsPaged` and `listStaleRuns` answer as if no `org:` key existed (`isOrganizationKey`);
+ * `countRunsByStatus` answers only while no organization holds a row — it counts every organization's
+ * runs and takes no filter — and otherwise resolves `undefined` (a caller falls back to `listRuns`, as
+ * it does under `withOrg`). Writes pass through unchanged: a
+ * root caller cannot name an `org:` run in the first place (`assertRunId`), and root management that is
+ * DEFINED over every organization — a retention sweep, a platform admin's purge — takes the raw journal
+ * on purpose.
+ *
+ * THE WAY THROUGH, for an operator who must read an organization's runs: that organization's scope.
+ * `withOrg(view, orgId)` scopes the journal underneath (it does not stack on the hiding), and a door
+ * serves it to a platform admin who names the organization (`x-gnl-org`).
+ */
+export function withRootScope<J extends Partial<Journal> & Partial<JournalReader>>(journal: J): J {
+  if (rootScopeParentOf(journal) !== undefined) return journal;
+  const org = orgScopeOf(journal);
+  if (org !== undefined) {
+    throw new Error(`@gnldev/durable: withRootScope was handed organization '${org}''s journal. It hides organizations' rows from the ROOT journal; an organization's view already holds only its own.`);
+  }
+  const j = journal as Partial<Journal> & Partial<JournalReader>;
+  const hidden = isOrganizationKey;
+  const overrides: Record<PropertyKey, unknown> = {
+    [ROOT_SCOPE_OF]: journal,
+    get: j.get && (async (key: string) => (hidden(key) ? undefined : j.get!(key))),
+    getMany: j.getMany && (async (keys: string[]) => {
+      const shown = keys.filter((k) => !hidden(k));
+      const got = shown.length ? await j.getMany!(shown) : [];
+      let i = 0;
+      return keys.map((k) => (hidden(k) ? undefined : got[i++]));
+    }),
+    getCounters: j.getCounters && (async (key: string) => (hidden(key) ? undefined : j.getCounters!(key))),
+    listKeys: j.listKeys && (async (p: string, o?: unknown) =>
+      (hidden(p) ? [] : (await (j.listKeys as (pp: string, oo?: unknown) => Promise<string[]>)(p, o)).filter((k) => !hidden(k)))),
+    readRun: j.readRun && (async (runId: string) => (hidden(runId) ? [] : j.readRun!(runId))),
+    readRunStats: j.readRunStats && (async (runId: string) => (hidden(runId) ? { entries: 0, bytes: 0 } : j.readRunStats!(runId))),
+    listRuns: j.listRuns && (async () =>
+      (await listRunsArray({ listRuns: (q) => (j.listRuns as (qq?: unknown) => Promise<unknown>).call(journal, q) }))
+        .filter((r) => !hidden(r.runId))),
+    listRunsPaged: j.listRunsPaged
+      && ((q?: Parameters<NonNullable<JournalReader['listRunsPaged']>>[0]) => walkRunPages(j, journal, q, (r) => (hidden(r.runId) ? undefined : r))),
+    listStaleRuns: j.listStaleRuns && (async (cutoffTs: number, o?: { includeSuspended?: boolean }) =>
+      (await j.listStaleRuns!(cutoffTs, o)).filter((runId) => !hidden(runId))),
+    // Counted by the store only while no organization holds a row: then the store's count IS the
+    // root's. Once one does, `undefined` — the store's aggregate takes no filter — and a caller falls
+    // back to `listRuns`, as under `withOrg`. One indexed probe, so a single-tenant deployment keeps
+    // the cheap count. A reader that cannot list keys cannot be probed, and keeps its count: a number,
+    // never a row, and the push-down paging that depends on it (Studio's `GET /runs?limit=`).
+    countRunsByStatus: j.countRunsByStatus && (async () => {
+      if (typeof j.listKeys === 'function' && (await j.listKeys(ORG_KEY_PREFIX, { limit: 1 })).length > 0) return undefined;
+      return j.countRunsByStatus!();
+    }),
+  };
+  return new Proxy(journal, {
+    get(t, prop) {
+      if (Object.prototype.hasOwnProperty.call(overrides, prop)) return overrides[prop];
+      const v = Reflect.get(t, prop, t);
+      return typeof v === 'function' ? v.bind(t) : v;
+    },
+    has: (t, prop) => (Object.prototype.hasOwnProperty.call(overrides, prop) ? overrides[prop] !== undefined : Reflect.has(t, prop)),
+  });
 }
 
 /**

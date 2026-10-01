@@ -22,7 +22,7 @@
  * edit cannot move one without seeing the other.
  */
 import { ORG_SCOPE, orgPrefix, orgScopeOf, withOrg } from './organization.js';
-import { toJournal, orgVectorId, workingMemoryScope, MEMORY_PARTITION } from './storage.js';
+import { toJournal, orgVectorId, workingMemoryScope, MEMORY_PARTITION, partitionReadCount } from './storage.js';
 import { asReaderJournal, type Journal, type JournalReader } from './journal.js';
 import type {
   CacheStore, CapabilityMatrix, ListQuery, LogRecord, MemoryStore, MessageRecord, MessageAppend, MetaStore,
@@ -143,6 +143,38 @@ function scopedRuns(runs: RunJournal, p: string, orgId: string): RunJournal {
   } as unknown as RunJournal;
 }
 
+/** Stores already told that the partition did not reach them — the warning is once per store. */
+const toldDroppedPartition = new WeakSet<object>();
+
+/**
+ * Runs one partitioned scan and says so, once per store, when the partition never reached a store.
+ *
+ * `MEMORY_PARTITION` is a Symbol key so that no request body can carry it — and for the same reason a
+ * wrapper that REBUILDS the options (`{ resourceId: q.resourceId, limit: q.limit }`, a JSON round
+ * trip, an RPC hop) silently drops it. The store then scans the ROOT's rows, this view keeps none of
+ * them, and the organization's own threads come back empty: no leak, no error (measured, review panel
+ * A "pass-through"). Fail-closed is right; silent is not.
+ *
+ * Detected from the one place that can see it: a store reads the partition through `memoryPartitionOf`,
+ * which counts each read. No read of this partition during the call means no store saw it. A warning
+ * rather than a refusal, because a store written before the option existed (0.9) never reads it and
+ * returns every partition's rows, which this view then filters correctly.
+ */
+async function partitioned<T>(memory: MemoryStore, p: string, scan: () => Promise<T>): Promise<T> {
+  const before = partitionReadCount(p);
+  const out = await scan();
+  if (partitionReadCount(p) === before && !toldDroppedPartition.has(memory)) {
+    toldDroppedPartition.add(memory);
+    console.warn(
+      `@gnldev/durable: an organization's memory view passed MEMORY_PARTITION ('${p}') and no store read it, so the ` +
+        "scan covered the ROOT's threads and this organization saw none of its own. A custom or wrapper MemoryStore " +
+        'must forward the options object it is given — `{ ...q }` keeps the Symbol key; rebuilding it field by field ' +
+        'or through JSON drops it — and read the partition with memoryPartitionOf(opts). This warning is shown once per store.',
+    );
+  }
+  return out;
+}
+
 function scopedMemory(memory: MemoryStore, p: string): MemoryStore {
   /**
    * Puts a message row into the underlying store's terms; `outMsg` is the exact inverse.
@@ -195,7 +227,7 @@ function scopedMemory(memory: MemoryStore, p: string): MemoryStore {
     // which stops a client that paginates until empty.
     // The store scans this organization's partition only (`MEMORY_PARTITION`); the drain stays as the
     // second line that strips the prefix and drops anything that is not ours.
-    listThreads: (q) => drainOwned((qq) => memory.listThreads({ ...q, ...qq, [MEMORY_PARTITION]: p }), outThread, q),
+    listThreads: (q) => drainOwned((qq) => partitioned(memory, p, () => memory.listThreads({ ...q, ...qq, [MEMORY_PARTITION]: p })), outThread, q),
     // The thread's working memory is keyed `org:<id>:thread:<threadId>` (this wrapper prefixes the
     // whole scope key), while the store's own deleteThread removes `thread:org:<id>:<threadId>`. Measured
     // before this line: an organization member's thread went and its working memory stayed.
@@ -223,9 +255,12 @@ function scopedMemory(memory: MemoryStore, p: string): MemoryStore {
     // maps — see `outMsg`. Not paginated, so it drops in place rather than draining. The store itself
     // ranks only this organization's threads — the partition this view names (`MEMORY_PARTITION`), not
     // one read off the thread id — so the filter here is a second line, not what fills `topK`.
-    recall: async (threadId, queryEmbedding, opts) =>
-      (await memory.recall(add(p, threadId), queryEmbedding, { ...opts, [MEMORY_PARTITION]: p }))
-        .map(outMsg).filter((r): r is MessageRecord => r !== undefined),
+    recall: async (threadId, queryEmbedding, opts) => {
+      const scan = () => memory.recall(add(p, threadId), queryEmbedding, { ...opts, [MEMORY_PARTITION]: p });
+      // Only a resource-scoped recall with a usable query scans by partition; a thread recall reads one thread.
+      const scans = opts?.scope === 'resource' && !!opts.resourceId && queryEmbedding.some((x) => x !== 0);
+      return (await (scans ? partitioned(memory, p, scan) : scan())).map(outMsg).filter((r): r is MessageRecord => r !== undefined);
+    },
     getWorkingMemory: (scopeId) => memory.getWorkingMemory(add(p, scopeId)),
     setWorkingMemory: (scopeId, data) => memory.setWorkingMemory(add(p, scopeId), data),
     deleteWorkingMemory: (scopeId) => memory.deleteWorkingMemory(add(p, scopeId)),
@@ -241,7 +276,7 @@ function scopedMemory(memory: MemoryStore, p: string): MemoryStore {
   return scoped;
 }
 
-function scopedVectors(vectors: VectorStore, p: string): VectorStore {
+function scopedVectors(vectors: VectorStore, p: string, orgId: string): VectorStore {
   // The vector port is namespaced rather than key-prefixed, because `query` ranks: an id prefix could
   // only be applied after the store had already chosen its top K globally. See `VectorStore.query`.
   //
@@ -267,7 +302,7 @@ function scopedVectors(vectors: VectorStore, p: string): VectorStore {
   // Marked like the storage it belongs to, so `orgStorageScopeOf(vectors)` answers too. @gnldev/memory
   // reads it: an organization's observational memory labels its vectors itself only when the store it
   // was handed is NOT already this organization's view.
-  Object.defineProperty(scoped, STORAGE_SCOPE, { value: p.slice('org:'.length, -1), enumerable: false });
+  Object.defineProperty(scoped, STORAGE_SCOPE, { value: orgId, enumerable: false });
   return scoped;
 }
 
@@ -286,7 +321,7 @@ export function orgVectorDelete(vectors: Pick<VectorStore, 'delete'>, orgId: str
   return scopedVectorDelete(vectors, orgPrefix(orgId).slice(0, -1));
 }
 
-function scopedWork(work: WorkStore, p: string): WorkStore {
+function scopedWork(work: WorkStore, p: string, orgId: string): WorkStore {
   const scoped: WorkStore = {
     append: (ns, payload, id) => work.append(add(p, ns), payload, id),
     list: <T = unknown>(ns: string, q?: ListQuery) => work.list<T>(add(p, ns), q) as Promise<Page<LogRecord<T>>>,
@@ -302,7 +337,7 @@ function scopedWork(work: WorkStore, p: string): WorkStore {
   }
   // Marked like the storage it belongs to, so `orgStorageScopeOf(work)` answers too. @gnldev/queue
   // reads it: a job appended here lands under `org:<id>:qjob`, where no worker polls.
-  Object.defineProperty(scoped, STORAGE_SCOPE, { value: p.slice('org:'.length, -1), enumerable: false });
+  Object.defineProperty(scoped, STORAGE_SCOPE, { value: orgId, enumerable: false });
   return scoped;
 }
 
@@ -349,8 +384,8 @@ export function withOrgStorage(storage: Storage, orgId: string): Storage {
     runs: scopedRuns(storage.runs, p, orgId),
     meta: scopedMeta(storage.meta, p),
     ...(storage.memory ? { memory: scopedMemory(storage.memory, p) } : {}),
-    ...(storage.vectors ? { vectors: scopedVectors(storage.vectors, p) } : {}),
-    ...(storage.work ? { work: scopedWork(storage.work, p) } : {}),
+    ...(storage.vectors ? { vectors: scopedVectors(storage.vectors, p, orgId) } : {}),
+    ...(storage.work ? { work: scopedWork(storage.work, p, orgId) } : {}),
     ...(storage.cache ? { cache: scopedCache(storage.cache, p) } : {}),
   };
   // Enumerable for the same reason `withOrg`'s marker is: a scope you cannot see is a scope nobody

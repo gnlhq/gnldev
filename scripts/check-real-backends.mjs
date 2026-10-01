@@ -142,6 +142,10 @@ try {
       'packages/durable/test/vector-store-contract.test.ts',
       // Owned names on a real Postgres, where a lone surrogate would become U+FFFD.
       'packages/durable/test/owned-name-namespaces.test.ts',
+      // An organization id outside the BMP on a real Postgres (pg-mem's substring counts UTF-16 units).
+      'packages/durable/test/memory-partition-edges.test.ts',
+      // Work-log numbering under REPEATABLE READ / SERIALIZABLE defaults, which pg-mem does not have.
+      'packages/durable/test/work-log-numbering-readers.test.ts',
       // The EE user directory: seats, concurrent writes and the create rollback on a real Postgres,
       // where transactions and row locks are real (pg-mem does neither), against the journal store.
       // packages/auth-ee is the paid tier and is withheld from the public snapshot, which is not

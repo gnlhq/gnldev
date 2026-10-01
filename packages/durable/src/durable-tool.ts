@@ -5,7 +5,7 @@ import { stampFormat, upgradeFormat } from './format.js';
 import { DivergenceError, RetryLimitExceededError, RunBusyError, SideEffectRetryBlockedError, IdempotencyOwnerMismatchError } from './errors.js';
 import { claim, ctxGet, runKeys } from './journal.js';
 import { userIdOf, ownerFields, fieldsOwner, decideRunAccess, toolContextFor, closeLegacyResourceId } from './run-identity.js';
-import { orgScopeOf } from './organization.js';
+import { orgScopeOf, orgPrefix } from './organization.js';
 import { CompensatedRunError, runCompensated } from './compensation.js';
 import { recordIncident } from './incidents.js';
 import { markRunTainted, readRunTaint } from './taint.js';
@@ -546,7 +546,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // users the format does change, which is acceptable only because nothing is published yet;
       // after 1.0 the same change would need a migration window.
       const orgScope = orgScopeOf(ctx.journal);
-      const orgPart = orgScope ? `org:${orgScope}:` : '';
+      const orgPart = orgScope === undefined ? '' : orgPrefix(orgScope);
       const idempotencyKey = mode !== 'args'
         ? `${orgPart}${ctx.runId}:${toolCallId}`
         : effWindow === 'cross-run'

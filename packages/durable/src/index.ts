@@ -155,13 +155,13 @@ export type { ProtectionRow, ProtectionMark, ProtectionSource, ProtectionContext
 // Dynamic multi-agent routing (Supervisor/`.network()` parity) — decisions are CAS-frozen.
 export { runNetwork, getNetworkTrace, netKeys } from './network.js';
 export type { NetworkResult, NetworkStep, NetworkTarget, RouteDecision, RunNetworkOptions } from './network.js';
-export { withOrg, orgScopeOf, orgPrefix, isPlatformKey, assertOrgRegistered, assertNoRunsInFlight, ORG_RECORD_PRE, ADOPTABLE_RESERVED_PREFIXES, ENGINE_META_KEYS } from './organization.js';
+export { withOrg, withRootScope, orgScopeOf, orgPrefix, isOrganizationKey, orgSpaceSql, ORG_KEY_PREFIX, isPlatformKey, assertOrgRegistered, assertNoRunsInFlight, ORG_RECORD_PRE, ADOPTABLE_RESERVED_PREFIXES, ENGINE_META_KEYS } from './organization.js';
 export { withOrgStorage, orgStorageScopeOf, scopeConfigToOrg } from './org-storage.js';
-export { MEMORY_PARTITION, memoryPartitionOf, inMemoryPartition, isOrganizationThreadId, assertRootThreadId, ReservedThreadIdError, ORG_THREAD_PREFIX, type MemoryPartition, type MemoryPartitionOption } from './storage.js';
+export { MEMORY_PARTITION, memoryPartitionOf, inMemoryPartition, assertRootThreadId, ReservedThreadIdError, type MemoryPartition, type MemoryPartitionOption } from './storage.js';
 export { withSubjectJournal, withSubjectMemory, type SubjectViewOptions, type SubjectMemoryOptions } from './subject-view.js';
 export { threadOwnerOf, admitThreadRun, threadOwnerKey, assignThreadOwner, type ThreadOwnership } from './thread-owner.js';
 export { ownedName, ownerOfName, assertSystemName, ownedPrefix, ownerIdProblem, assertOwnerId, OwnerIdError, RESERVED_OWNER_PREFIXES } from './owned-name.js';
-export { eraseSubject, subjectRuns, assertRootWorkForErasure, type EraseOptions, type EraseReport, type SubjectEraser, type SubjectRun } from './erase.js';
+export { eraseSubject, subjectRuns, assertRootWorkForErasure, findReservedRootThreads, type ReservedRootThread, type EraseOptions, type EraseReport, type SubjectEraser, type SubjectRun } from './erase.js';
 export { assertDeletesOutsideOrganizations, orgPurgedKey, purgeRun, isRealRun, purgeThread, purgeResource, purgeBatch, purgeOrganization, purgeOrganizationWork, sweepRuns, sweepLog, sweepThreads, listOrphanThreadState, createRetentionSweeper } from './retention.js';
 export type { LogSweepTarget, RetentionSweeperOptions, RetentionSweepSummary, RetentionSweeper } from './retention.js';
 export { recordIdemConflict, readIdemLedger } from './idem-ledger.js';

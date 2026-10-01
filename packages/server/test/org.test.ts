@@ -41,7 +41,7 @@ describe('@gnldev/server org', () => {
     expect(counter.calls).toBe(2); // the model was NOT called again (within-org exactly-once)
   });
 
-  it('GET /runs is isolated per org; an org-less request sees the shared space', async () => {
+  it('GET /runs is isolated per org; an org-less request sees the shared space, and no organization\'s run', async () => {
     const api = createRestApi(
       { journal: new InMemoryJournal(), agents: { a: { model: mkModel('ok') } } },
       { org: {} },
@@ -51,10 +51,10 @@ describe('@gnldev/server org', () => {
 
     const acmeRuns = await (await call(api, '/runs', { headers: { 'x-gnl-org': 'acme' } })).json();
     expect(acmeRuns.map((r: any) => r.runId)).toEqual(['r-acme']); // an org only sees its own runs
-    // Org-less view = raw journal (admin): its own runs + org runs appear PREFIXED
+    // Org-less view = the root scope, which hides every organization's runs (ADR-0001) — acme's no
+    // longer appears there as 'org:acme:r-acme'. The way to read it is acme's scope, above.
     const sharedIds = (await (await call(api, '/runs')).json()).map((r: any) => r.runId);
-    expect(sharedIds).toContain('r-shared');
-    expect(sharedIds).toContain('org:acme:r-acme');
+    expect(sharedIds).toEqual(['r-shared']);
   });
 
   it('HARDENING: a multi-org deployment WARNS ONCE (not silently) when an org-less request falls to the shared scope', async () => {

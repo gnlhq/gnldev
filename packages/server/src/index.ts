@@ -3,7 +3,7 @@
 import { Hono, type Context } from 'hono';
 import { toFetchHandler, type FetchHandler } from './handler.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, cancelAgentRun, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, isOrganizationThreadId, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext } from '@gnldev/durable';
+import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, cancelAgentRun, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, isOrganizationKey, orgPrefix, withRootScope, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext } from '@gnldev/durable';
 import type { CreateGnlConfig, Journal, JournalReader, BudgetLimit, UsageCostCache, RunLimits, ResolvedWorkIdentity, WorkScopeKind, StreamSurface as DurableStreamSurface, StreamSurfaceInput } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, callerKind, subjectIdProblem, actorIdOf, engineCallerOf, markRefusal, settleDecision, decisionNotRecorded, type AuthProvider, type ReadWriteAuth, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
 // P0.4 @gnldev/workflow is zero-dependency (see its package.json) — depending on it
@@ -697,7 +697,9 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       "organization's journal — or set `memory: false`.",
     );
   }
-  const defaultInstance = { gnl: createGnl(config), journal: baseJournal, orgId: undefined as string | undefined };
+  // The ROOT scope reads through `withRootScope`: every organization's runs are hidden from it (ADR-0001),
+  // as its memory store already hides their threads. Platform-level records keep `baseJournal`, raw.
+  const defaultInstance = { gnl: createGnl(config), journal: withRootScope(baseJournal), orgId: undefined as string | undefined };
   const names = Object.keys(config.agents ?? {});
   const workflowNames = Object.keys(config.workflows ?? {});
   const app = new Hono();
@@ -959,7 +961,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
    * refuses the same ids (`ReservedThreadIdError`); this is the door's clean 400 in front of it.
    */
   function reservedThreadRefused(c: Context, s: Instance, threadId: unknown): Response | undefined {
-    if (s.orgId !== undefined || typeof threadId !== 'string' || !isOrganizationThreadId(threadId)) return undefined;
+    if (s.orgId !== undefined || typeof threadId !== 'string' || !isOrganizationKey(threadId)) return undefined;
     return c.json({
       error: `thread id '${threadId}' starts with 'org:', which is reserved for organizations' threads; use a thread id that does not start with 'org:'`,
       code: EDGE_ERROR_CODES.threadIdReserved,
@@ -1350,7 +1352,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
    * for the honest multi-worker limitation.
    */
   const inflight = new Map<string, Set<AbortController>>();
-  const inflightKey = (s: Instance, runId: string): string => (s.orgId ? `org:${s.orgId}:${runId}` : runId);
+  const inflightKey = (s: Instance, runId: string): string => (s.orgId ? `${orgPrefix(s.orgId)}${runId}` : runId);
   function registerInflight(key: string, ctrl: AbortController): void {
     let set = inflight.get(key);
     if (!set) { set = new Set(); inflight.set(key, set); }

@@ -29,8 +29,8 @@ import type { Journal, JournalReader, RunSummary } from './journal.js';
 import type { Memory } from './memory.js';
 import { recordOwner, userIdOf, type SubjectViewBrand } from './run-identity.js';
 import { threadOwnerOf } from './thread-owner.js';
+import { isOrganizationKey } from './organization.js';
 
-const ORG_PREFIX = 'org:';
 /** @gnldev/workflow's run registry: one `wfrun:<runId>` row per workflow run. */
 const WF_REGISTRY = 'wfrun:';
 
@@ -63,7 +63,7 @@ function view<T extends object>(target: T, overrides: Record<PropertyKey, unknow
 
 export function withSubjectJournal<J extends Journal & Partial<JournalReader>>(journal: J, subject: string, opts: SubjectViewOptions = {}): J & SubjectViewBrand {
   if (!subject) throw new Error('@gnldev/durable: withSubjectJournal needs a non-empty subject');
-  const foreignKey = (key: string) => opts.root === true && key.startsWith(ORG_PREFIX);
+  const foreignKey = (key: string) => opts.root === true && isOrganizationKey(key);
   // ONE owner lookup per run for the view's lifetime (a view is built per request): the key rule
   // below asks about every ':'-prefix of every key, and a 400-key listing used to cost 400×N reads.
   // The record's owner is read by `recordOwner` (run-identity.ts) — the same reading, `_v` rule
@@ -135,7 +135,7 @@ export function withSubjectJournal<J extends Journal & Partial<JournalReader>>(j
 export function withSubjectMemory<M extends Memory>(memory: M, subject: string, opts: SubjectMemoryOptions): M {
   if (!subject) throw new Error('@gnldev/durable: withSubjectMemory needs a non-empty subject');
   if (!opts?.journal) throw new Error('@gnldev/durable: withSubjectMemory needs the raw journal that holds the thread owner records (`{ journal }`)');
-  const foreign = (threadId: string) => opts.root === true && threadId.startsWith(ORG_PREFIX);
+  const foreign = (threadId: string) => opts.root === true && isOrganizationKey(threadId);
   // ONE question for reading, listing, the engine's gate and erasure: `threadOwnerOf` (thread-owner.ts).
   // Unreadable is not this user's (a view fails closed; the gate, which writes, propagates instead).
   const mine = async (threadId: string): Promise<boolean> => {

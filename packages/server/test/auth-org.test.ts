@@ -110,8 +110,10 @@ describe('@gnldev/server auth↔org', () => {
     // A bound viewer requesting a different organization gets 403.
     expect((await call(api, '/runs', { headers: { authorization: 'Bearer viw', 'x-gnl-org': 'globex' } })).status).toBe(403);
 
-    // An unbound admin sees the root view (all prefixed keys) — the existing operator behavior.
+    // An unbound admin is served the root scope, which hides every organization's runs (ADR-0001). The
+    // way to read one is that organization's scope: the `org` option plus a platform grant
+    // (root-scope-hides-org-runs.test.ts).
     const adm = await (await call(api, '/runs', { headers: { authorization: 'Bearer adm' } })).json();
-    expect(adm.map((r: any) => r.runId).sort()).toEqual(['org:acme:r-acme', 'org:globex:r-globex']);
+    expect(adm.map((r: any) => r.runId)).toEqual([]);
   });
 });

@@ -20,6 +20,7 @@ import { USAGE_KEY, usageCountedKey } from './budget.js';
 import type { OrganizationUsage } from './budget.js';
 import type { LogItem } from './durable-log.js';
 import { createPollLoop } from './polling.js';
+import { orgPrefix, isOrganizationKey } from './organization.js';
 import type { PollLoop } from './polling.js';
 
 function requireDelete(journal: Journal): NonNullable<Journal['deletePrefix']> {
@@ -524,7 +525,7 @@ export async function purgeResource(
     const page = await paged.call(journal, { resourceId, limit: 200, ...(cursor ? { cursor } : {}) })
       .catch(() => ({ items: [] as Array<{ runId: string; threadId?: string }>, nextCursor: undefined as string | undefined }));
     for (const r of page.items) {
-      if (opts.outsideOrganizations && r.runId.startsWith('org:')) continue;
+      if (opts.outsideOrganizations && isOrganizationKey(r.runId)) continue;
       if (r.threadId) threads.add(r.threadId);
       runIds.push(r.runId);
     }
@@ -706,19 +707,19 @@ export async function purgeThread(journal: Journal, threadId: string): Promise<n
  * with a success would recreate exactly that problem in a quieter form.
  */
 export async function purgeOrganizationWork(work: WorkStore, orgId: string): Promise<number> {
-  if (orgId.includes(':')) throw new Error(`@gnldev/durable: purgeOrganizationWork('${orgId}') — org id must not contain ':' (it would break the org:<id>: prefix boundary)`);
+  const prefix = orgPrefix(orgId); // refuses '' (which would sweep `org::`) and a ':'-bearing id
   if (typeof work.deletePrefix !== 'function') {
     throw new Error(
       "@gnldev/durable: this WorkStore does not implement `deletePrefix`, so an organization's queue and event records cannot be erased through it (the first-party in-memory/sqlite/postgres/redis adapters all do). Sweep those tables directly, or the erasure is incomplete.",
     );
   }
-  return work.deletePrefix(`org:${orgId}:`);
+  return work.deletePrefix(prefix);
 }
 
 export async function purgeOrganization(journal: Journal, orgId: string, now = Date.now()): Promise<number> {
-  if (orgId.includes(':')) throw new Error(`@gnldev/durable: purgeOrganization('${orgId}') — org id must not contain ':' (it would break the org:<id>: prefix boundary)`);
+  const prefix = orgPrefix(orgId); // refuses '' (which would sweep `org::`) and a ':'-bearing id
   const del = requireDelete(journal);
-  const n = await del(`org:${orgId}:`);
+  const n = await del(prefix);
   // A boundary marker, because the audit log is NOT org-prefixed and therefore survives this.
   //
   // Org ids are strings a human chooses — 'acme', a company slug — so the same id being handed to a

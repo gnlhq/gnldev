@@ -18,7 +18,7 @@
 import { createRequire } from 'node:module';
 import { runIdOfKey, parseJournalKey, deriveRunStatus } from './journal.js';
 import { stableStringify } from './hash.js';
-import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix } from './organization.js';
+import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
 import { ReplicationNotAcknowledgedError } from './errors.js';
@@ -933,6 +933,14 @@ class RedisWorkStore implements WorkStore {
     }
   }
 
+  /**
+   * Keyset on the store-assigned number (`WorkStore.list`). This version numbers a record AT APPEND
+   * (the Lua script), so its records are in append order. A record a 0.9 process wrote is a bare SET
+   * with no number, and Redis keeps no insertion order for keys, so such records are numbered here in
+   * PRODUCER-CLOCK order (`ts`, then `id`) — where SQLite and Postgres use the order they were inserted
+   * in. Either way each is numbered above every number handed out so far, so it never lands behind a
+   * persisted cursor; what differs is only the order among the 0.9 records of one read.
+   */
   async list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>> {
     let log = await this.readLog<T>(ns);
     const fresh = log.rows.filter((r) => r.seq === 0).sort(compareLogPosition);
@@ -1162,7 +1170,7 @@ export class RedisStorage implements Storage {
       const colon = rest.indexOf(':');
       if (colon < 0) continue;
       const logNs = decNs(rest.slice(0, colon));
-      if (logNs.startsWith('org:')) { alreadyScoped++; continue; }
+      if (isOrganizationKey(logNs)) { alreadyScoped++; continue; }
       if (isPlatformKey(logNs)) { skipped.add(logNs.split(':')[0]!); continue; }
       logN++;
       const to = prefix + logNs;
@@ -1201,7 +1209,7 @@ export class RedisStorage implements Storage {
       let n = 0;
       for (const k of keys) {
         const bare = k.slice(full.length);
-        if (bare.startsWith('org:')) { alreadyScoped++; continue; }
+        if (isOrganizationKey(bare)) { alreadyScoped++; continue; }
         if (isPlatformKey(bare) || (space === META && ENGINE_META_KEYS.includes(bare))) { skipped.add(bare.split(':')[0]!); continue; }
         n++;
         if (dryRun) continue;

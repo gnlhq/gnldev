@@ -23,7 +23,7 @@
 //    reverting it while unwinding ONE run could invalidate OTHER runs that legitimately deduped onto
 //    it. Sub-agent (agent:*) nested runs are also not recursed in v1 (documented; v1.1).
 import { claim, parseJournalKey, runKeys } from './journal.js';
-import { orgScopeOf } from './organization.js';
+import { orgScopeOf, orgPrefix } from './organization.js';
 import { upgradeFormat } from './format.js';
 import type { Journal, JournalReader, ToolJournalRecord } from './journal.js';
 import type { AnyTool } from './types.js';
@@ -84,7 +84,7 @@ const compKey = (runId: string, suffix: string): string => `${runId}:comp:${suff
  */
 function orgPart(journal: Journal): string {
   const org = orgScopeOf(journal);
-  return org ? `org:${org}:` : '';
+  return org === undefined ? '' : orgPrefix(org);
 }
 
 /** True once the run has been condemned by compensateRun (tombstone present). Load-bearing read:

@@ -110,7 +110,15 @@ in place); a thread id that begins `thread:`, `resource:` or `res:` is ambiguous
   batch that mixes the two throws. `recall` with `scope: 'resource'` and `listThreads` must cover only
   the caller's partition — the root's rows (no `org:` id) unless an organization's view passed
   `[MEMORY_PARTITION]: 'org:<id>:'` — applied before `topK`/paging, and never read off the thread id:
-  `memoryPartitionOf`/`inMemoryPartition` from `@gnldev/durable` give the rule.
+  `memoryPartitionOf`/`inMemoryPartition` from `@gnldev/durable` give the rule. A store that WRAPS
+  another (logging, metrics, an RPC hop) must forward the options object it is given — `{ ...q }`
+  keeps the Symbol key; rebuilding it field by field or through JSON drops it, and the organization's
+  view then sees none of its own threads (it warns once per store when no store read the partition).
+- **Threads 0.9 let the root create under `org:`:** the root scope can no longer name such an id, and
+  one shaped like an organization's (`org:acme:support`) is read by that organization.
+  `migrateReservedRootThreads(storage)` moves the root's to `legacy-<id>` (messages, working memory,
+  observations, owner record); `{ dryRun: true }` reports first, and a thread that may be the
+  organization's own is listed as `undecided` and moved only when named in `threadIds`.
 
 ## Lite alternative
 For anyone who just wants simple topK recall, `SemanticMemory` in `@gnldev/rag` is lighter; it uses the same

@@ -121,7 +121,7 @@ function jobOwnerOf(opts: EnqueueOptions): JobOwner & { ownerKind?: 'staff' } {
  * `purgeOrganizationWork` takes it with the organization; an owned record's id is the job's owned id,
  * so a person's erasure takes it too.
  */
-const depthNs = (orgId: string | undefined) => (orgId === undefined ? 'qdepth' : `org:${orgId}:qdepth`);
+const depthNs = (orgId: string | undefined) => (orgId === undefined ? 'qdepth' : `${orgPrefix(orgId)}qdepth`);
 
 
 export type JobHandler = (payload: any, ctx: JobCtx) => Promise<any>;
