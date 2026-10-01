@@ -23,6 +23,13 @@ and who is affected.
   `listAllThreads()` on a hand-written memory.
 - **The hand-written Studio memory adapters are gone** — `gnl studio` and @gnldev/cli's `devStudioMemory`
   hand Studio the `'chat'` preset itself (`devStudioMemory` now returns an `AgentMemory`).
+- **Studio's `orgScoped: true` is gone; a host store serves organizations only as a function of the
+  organization** — on `memory`, `workflowStore`, `queue`, `events`, `cache` and `vectors`. Write
+  `queue: ({ orgId }) => queueFor(orgId)` (likewise for the others; for memory, `({ orgId }) =>
+  memoryPreset(orgId ? withOrgStorage(storage, orgId) : storage)`). Studio calls it once per organization
+  (`orgId` undefined for the root operator) and keeps the result. An object, with or without the old
+  field, serves the root operator and single-tenant deployments and is refused to an organization (403
+  `org_scope_refused`, naming the function form); in TypeScript the field is a compile error.
 - **`EDGE_ERROR_CODES.threadIdReserved` is gone from @gnldev/server** — the code is
   `RESERVED_ID_ERROR_CODES.ReservedThreadIdError` in @gnldev/durable (same string, `thread_id_reserved`,
   same 400), and `reservedIdFailure(e)` renders it.
@@ -218,6 +225,16 @@ and who is affected.
 
 ### Security
 
+- **Studio served an organization from a store that belonged to another when the host set `orgScoped: true`.**
+  The flag was the host's word that its one object honoured the organization it was handed; Studio could
+  not check it, and for `memory` it could not be true — a `Memory` is handed a thread id and nothing else.
+  Measured on the previous build, one memory object with the flag, caller bound to globex: `GET
+  /threads/acme-t/messages` → 200 with acme's messages, `DELETE /threads/acme-t` → acme's thread gone. The
+  same object without `ctx` filtering on `queue`/`events`/`cache`/`vectors`/`workflowStore` answered
+  globex with acme's rows. After: the flag does not exist, an object is refused to every organization
+  (403 `org_scope_refused`), and an organization's request is served only from the store the host's
+  function returned for that organization. Way through: pass the option as `({ orgId }) => store`.
+  Unchanged: single-tenant deployments and the root operator, served from the object as before.
 - **A provider that names identities and serves anonymous reads answered a DNS-rebound page.** The
   REST/Studio gate asked "does this surface carry an identity?" of the provider (a configuration
   question) and skipped the host rule for every request, while the doors asked it of the request. Measured

@@ -117,6 +117,30 @@ for `{ reader }`:
 | `userErasure` | `DELETE /users/:id` erasing the person's data with the entry (see below) |
 | `apiBase` | *(`createStudioApp`/`createStudioAdmin` only)* the prefix the UI fetches against |
 
+**Host stores and organizations.** `memory`, `workflowStore`, `queue`, `events`, `cache` and
+`vectors` are your objects, with your storage behind them. Each takes an object or a function of the
+calling organization (`StudioScopedOption`):
+
+```ts
+import { createStudioApp } from '@gnldev/studio';
+import { withOrgStorage } from '@gnldev/durable';
+import { memoryPreset } from '@gnldev/memory';
+
+createStudioApp({
+  reader: journal,
+  org: {},
+  // Called once per organization (orgId undefined for the root operator), then kept.
+  memory: ({ orgId }) => memoryPreset(orgId ? withOrgStorage(storage, orgId) : storage),
+});
+```
+
+An **object** is one store for the whole deployment: it serves a single-tenant deployment and the
+root operator, and a caller acting as an organization is refused with 403
+[`org_scope_refused`](../../docs/errors/org_scope_refused.md). A **function** is called once per
+organization (`orgId` undefined for the root operator) and each organization is served only from
+the store returned for it. There is no flag that lets one object serve organizations — a store
+Studio obtained for the organization is the only way.
+
 Also exported: `bearerAuth(token)` · `basicAuth({ user, pass })` · `roleAuth(...)` ·
 `PERMISSION_CATALOG` · `ROLE_PERMISSION_PRESETS` · `pipeAgentStream` · `interruptsFromSteps`.
 
@@ -182,12 +206,12 @@ import { listDeadEvents, retryDeadEvent } from '@gnldev/events';
 createStudioApp({
   reader: journal,
   events: {
-    orgScoped: true,                                   // required before an org-scoped caller is served
     topics: () => [{ topic: 'refunds', consumers: ['refunder'] }],
     listDead: (topic, consumer) => listDeadEvents(storage.work!, topic, consumer),
     release: (topic, consumer, id) => retryDeadEvent(storage.work!, topic, consumer, id),
   },
 });
+// With organizations, pass a function instead: `events: ({ orgId }) => ({ ...same, over orgId's WorkStore })`.
 ```
 
 - `topics` (optional) is the inventory the view is pointed at; without it the view asks for a topic

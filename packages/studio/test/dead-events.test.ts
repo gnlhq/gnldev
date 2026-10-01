@@ -602,7 +602,6 @@ describe('the coalescing key cannot be forged from the query string', () => {
       reader: new InMemoryJournal(),
       // Echoes back whichever pair it was asked for, so a substituted answer is visible in the rows.
       events: {
-        orgScoped: true,
         listDead: async (t: string, c: string) => {
           if (++started === 1) await held; // hold the FIRST scan open; the second arrives mid-flight
           return rowsFor(t, c);
@@ -648,7 +647,6 @@ describe('the coalescing key cannot be forged from the query string', () => {
     const app = createStudioApi({
       reader: new InMemoryJournal(),
       events: {
-        orgScoped: true,
         listDead: async (t: string, c: string) => {
           if (++started === 1) await held;
           return rowsFor(t, c);
@@ -756,7 +754,7 @@ describe('the admission budget’s key', () => {
   it('is NOT the organization: an id-less principal is queued, not refused', async () => {
     const app = createStudioApi({
       reader: new InMemoryJournal(),
-      events: { ...slowEvents(20), orgScoped: true } as never,
+      events: (() => slowEvents(20)) as never,
       auth: identityAuth(),
     });
 
@@ -783,14 +781,13 @@ describe('the admission budget’s key', () => {
     const app = createStudioApi({
       reader: new InMemoryJournal(),
       org: {},
-      events: {
-        orgScoped: true,
+      events: () => ({
         listDead: async (t: string, c: string, ctx?: { orgId?: string }) => {
           seen.push(String(ctx?.orgId));
           await new Promise((r) => setTimeout(r, 30));
           return rowsFor(t, c);
         },
-      },
+      }),
     } as never);
     const ask = (org: string) => call(app as never, '/dead-events?topic=orders&consumer=billing',
       { headers: { 'x-gnl-org': org } });
@@ -865,7 +862,6 @@ describe('the scan queue', () => {
  */
 describe('Retry-After', () => {
   const scanFor = (byOrg: Record<string, number>) => ({
-    orgScoped: true,
     listDead: async (_t: string, _c: string, ctx?: { orgId?: string }) => {
       await new Promise((r) => setTimeout(r, byOrg[ctx?.orgId ?? ''] ?? 5));
       return [];
@@ -933,7 +929,7 @@ describe('Retry-After', () => {
     const app = createStudioApi({
       reader: new InMemoryJournal(),
       deadEventScan: { queueWaitMs: 7_000 },
-      events: scanFor({ acme: 1_500, globex: 30 }),
+      events: () => scanFor({ acme: 1_500, globex: 30 }),
       auth: identityAuth(),
     });
     const acme = (p: string) => as(app, 'acme/alice', p);
@@ -1265,9 +1261,6 @@ describe('the Retry-After estimate survives unrelated callers', () => {
   it('a bucket TOUCHED during the noise outlives the strangers that arrived before it', async () => {
     const gates = new Map<string, () => void>();
     const events = {
-      // Org-bound identities reach this host, so it must claim its own organization boundary — the
-      // same declaration every other org-scoped fixture in this file makes.
-      orgScoped: true,
       listDead: async (topic: string) => {
         if (topic === 'held') await new Promise<void>((r) => gates.set('held', r));
         return [];
@@ -1278,7 +1271,8 @@ describe('the Retry-After estimate survives unrelated callers', () => {
       // The fallback a bucket with NO measurement gets: 9 s. A measured bucket here scans in ~0 ms and
       // is clamped up to 1 s — so the two answers are far apart and neither can be read as noise.
       deadEventScan: { queueWaitMs: 9_000 },
-      events,
+      // Org-bound identities reach this host, so it is passed as a function of the organization.
+      events: () => events,
       auth: identityAuth() as never,
     });
     const as = (tok: string, path: string) => call(app, path, { headers: { authorization: `Bearer ${tok}` } });

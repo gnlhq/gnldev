@@ -123,14 +123,14 @@ const VERDICTS: Record<string, { verdict: Verdict; why: string }> = {
   'PATCH /users/:id': { verdict: 'org-scoped', why: 'an org admin manages its own users' },
   'DELETE /users/:id': { verdict: 'org-scoped', why: 'an org admin manages its own users' },
   'POST /users/:id/revoke': { verdict: 'org-scoped', why: 'an org admin manages its own users' },
-  'GET /jobs': { verdict: 'org-scoped', why: 'refused unless the host queue declares orgScoped' },
-  'POST /jobs/:id/retry': { verdict: 'org-scoped', why: 'refused unless the host queue declares orgScoped' },
-  'GET /dead-events': { verdict: 'org-scoped', why: 'quarantined payloads are org data; refused unless the host events object declares orgScoped' },
-  'GET /dead-events/topics': { verdict: 'org-scoped', why: 'which topics and consumers exist is org data; refused unless the host events object declares orgScoped' },
-  'POST /dead-events/release': { verdict: 'org-scoped', why: "a release re-runs that organization's handler; refused unless the host events object declares orgScoped" },
-  'GET /cache/stats': { verdict: 'org-scoped', why: 'refused unless the host cache declares orgScoped' },
-  'POST /cache/invalidate': { verdict: 'org-scoped', why: 'refused unless the host cache declares orgScoped' },
-  'POST /knowledge/search': { verdict: 'org-scoped', why: 'refused unless the host vector store declares orgScoped' },
+  'GET /jobs': { verdict: 'org-scoped', why: 'refused unless the host queue is passed per organization' },
+  'POST /jobs/:id/retry': { verdict: 'org-scoped', why: 'refused unless the host queue is passed per organization' },
+  'GET /dead-events': { verdict: 'org-scoped', why: 'quarantined payloads are org data; refused unless the host events store is passed per organization' },
+  'GET /dead-events/topics': { verdict: 'org-scoped', why: 'which topics and consumers exist is org data; refused unless the host events store is passed per organization' },
+  'POST /dead-events/release': { verdict: 'org-scoped', why: "a release re-runs that organization's handler; refused unless the host events store is passed per organization" },
+  'GET /cache/stats': { verdict: 'org-scoped', why: 'refused unless the host cache is passed per organization' },
+  'POST /cache/invalidate': { verdict: 'org-scoped', why: 'refused unless the host cache is passed per organization' },
+  'POST /knowledge/search': { verdict: 'org-scoped', why: 'refused unless the host vector store is passed per organization' },
   'POST /tools/:name/execute': { verdict: 'org-scoped', why: 'executes under the caller\'s scope' },
   'POST /datasets/:id/run': { verdict: 'org-scoped', why: 'writes run data for the caller\'s org' },
   'GET /workflows': { verdict: 'org-scoped', why: 'managed definitions are filtered by wfStoreFor' },
@@ -327,19 +327,15 @@ async function suspendRun(j: InMemoryJournal, org: string, run: string, text: st
 }
 
 /**
- * Host objects, in two configurations.
+ * Host stores, in two configurations.
  *
- * WITHOUT `orgScoped: true` (the default, and the shipped safe state) every endpoint that reaches one
- * of them is refused for an organization-bound caller, so nothing can leak through them.
+ * As plain OBJECTS (the default, and the shipped safe state) every endpoint that reaches one of them
+ * is refused for an organization-bound caller, so nothing can leak through them.
  *
- * WITH it, the host is CLAIMING it honours the organization it is handed. Three call sites hand one
- * over — `vectors.search(q, topK, {orgId})`, `cache.invalidate(key, {orgId})`, `queue.retry(id, {orgId})`
- * — and these fixtures honour it, so a leak there would be the server's fault and the probe would say so.
- *
- * The rest are handed NOTHING: `queue.listJobs()` and `cache.stats()` take no argument, and the whole
- * `StudioWorkflowStore` interface (`list`/`get`/`set`/`delete`) has no context parameter at all. A host
- * that opts in cannot filter on those routes however much it wants to. That is not a fixture
- * limitation — it is the shape of the interface, and it is asserted as a finding further down.
+ * PER ORGANIZATION (`optIn`), each is passed as a function of the organization, and every store the
+ * function returns answers for the organization it was built for. A leak there would be the server's
+ * fault — serving one organization from a store obtained for another — and the probe would say so.
+ * Methods still receive `ctx`, and the WRITE controls below read it: it is what the store is told.
  */
 /** Every host call, with the organization studio told it about. The control for WRITE routes. */
 const hostCalls: Array<{ what: string; orgId?: string }> = [];
@@ -351,53 +347,54 @@ const rec = <T>(what: string, ctx: { orgId?: string } | undefined, v: T): T => {
 };
 
 function hostObjects(optIn: boolean) {
-  const flag = optIn ? { orgScoped: true } : {};
-  const mine = (orgId: string | undefined) => (orgId === 'acme' ? MARKER : 'GLOBEX-OWN');
   const defs = new Map([['acme-workflow', {
     name: 'acme-workflow', description: MARKER, steps: [{ id: 's1', agentName: 'w', prompt: MARKER }],
   }]]);
+  /** The stores, answering for `bound` when built for one organization, else for whatever `ctx` says. */
+  const stores = (bound: { orgId?: string } | null) => {
+    const org = (ctx?: { orgId?: string }) => (bound ? bound.orgId : ctx?.orgId);
+    const mine = (ctx?: { orgId?: string }) => (org(ctx) === 'acme' ? MARKER : 'GLOBEX-OWN');
+    return {
+      queue: {
+        listJobs: (ctx?: { orgId?: string }) => [{ id: 'j1', type: mine(ctx), status: 'done', attempts: 1 }],
+        retry: (_id: string, ctx?: { orgId?: string }) => rec('queue.retry', ctx, mine(ctx)),
+      },
+      events: {
+        topics: (ctx?: { orgId?: string }) => [{ topic: mine(ctx), consumers: ['acme-consumer'] }],
+        listDead: (topic: string, consumer: string, ctx?: { orgId?: string }) => [{
+          id: 'e1', topic, consumer, status: 'quarantined' as const,
+          error: mine(ctx), attempts: 8, at: 1, payload: { note: mine(ctx) },
+        }],
+        release: (_t: string, _c: string, _id: string, ctx?: { orgId?: string }) => rec('events.release', ctx, true),
+      },
+      cache: {
+        stats: (ctx?: { orgId?: string }) => ({ hits: org(ctx) === 'acme' ? 1 : 0, misses: 0, hitRate: 1, size: 1 }),
+        invalidate: (_k: unknown, ctx?: { orgId?: string }) => rec('cache.invalidate', ctx, org(ctx) === 'acme' ? 1 : 0),
+      },
+      vectors: {
+        search: (_q: string, _k: number, ctx?: { orgId?: string }) => [{ id: 'v1', text: mine(ctx), score: 1 }],
+      },
+      workflowStore: {
+        list: (ctx?: { orgId?: string }) => (org(ctx) === 'acme' ? [...defs.values()] : []),
+        get: (n: string, ctx?: { orgId?: string }) => (org(ctx) === 'acme' ? defs.get(n) : undefined),
+        set: (_d: unknown, ctx?: { orgId?: string }) => rec('workflowStore.set', ctx, undefined),
+        delete: (_n: string, ctx?: { orgId?: string }) => rec('workflowStore.delete', ctx, undefined),
+      },
+    };
+  };
+  type Kind = keyof ReturnType<typeof stores>;
+  const kinds: Kind[] = ['queue', 'events', 'cache', 'vectors', 'workflowStore'];
+  const shared = { queue: { listJobs: () => [{ id: 'j1', type: MARKER, status: 'done', attempts: 1 }] } };
   return {
-    queue: {
-      ...flag,
-      listJobs: (ctx?: { orgId?: string }) => [{ id: 'j1', type: mine(ctx?.orgId), status: 'done', attempts: 1 }],
-      retry: (_id: string, ctx?: { orgId?: string }) => rec('queue.retry', ctx, mine(ctx?.orgId)),
-    },
-    // The events dead-letter. All three entry points take a ctx, so an opted-in host CAN honour it —
-    // unlike `queue.listJobs`/`cache.stats`, which were shipped taking no argument at all.
-    events: {
-      ...flag,
-      topics: (ctx?: { orgId?: string }) => [{ topic: mine(ctx?.orgId), consumers: ['acme-consumer'] }],
-      listDead: (topic: string, consumer: string, ctx?: { orgId?: string }) => [{
-        id: 'e1', topic, consumer, status: 'quarantined' as const,
-        error: mine(ctx?.orgId), attempts: 8, at: 1, payload: { note: mine(ctx?.orgId) },
-      }],
-      release: (_t: string, _c: string, _id: string, ctx?: { orgId?: string }) => rec('events.release', ctx, true),
-    },
-    cache: {
-      ...flag,
-      stats: (ctx?: { orgId?: string }) => ({ hits: ctx?.orgId === 'acme' ? 1 : 0, misses: 0, hitRate: 1, size: 1 }),
-      invalidate: (_k: unknown, ctx?: { orgId?: string }) => rec('cache.invalidate', ctx, ctx?.orgId === 'acme' ? 1 : 0),
-    },
-    vectors: {
-      ...flag,
-      search: (_q: string, _k: number, ctx?: { orgId?: string }) => [{ id: 'v1', text: mine(ctx?.orgId), score: 1 }],
-    },
-    workflowStore: {
-      ...flag,
-      list: (ctx?: { orgId?: string }) => (ctx?.orgId === 'acme' ? [...defs.values()] : []),
-      get: (n: string, ctx?: { orgId?: string }) => (ctx?.orgId === 'acme' ? defs.get(n) : undefined),
-      set: (_d: unknown, ctx?: { orgId?: string }) => rec('workflowStore.set', ctx, undefined),
-      delete: (_n: string, ctx?: { orgId?: string }) => rec('workflowStore.delete', ctx, undefined),
-    },
+    ...(optIn
+      ? Object.fromEntries(kinds.map((k) => [k, (scope: { orgId?: string }) => stores(scope)[k]]))
+      : stores(null)),
     /**
-     * A host that OPTS IN and then ignores the argument. Studio cannot detect this and does not try —
-     * `orgScoped` is a claim, not a verifiable fact — so it is kept as a separate fixture rather than
-     * folded into the one above, and the block below asserts the difference explicitly.
+     * A host whose function IGNORES the organization and hands back one shared store. Studio cannot
+     * detect this and does not try — it obtained a store "for" each organization and the host gave it
+     * the same one — so it is kept as a separate fixture and the block below asserts the difference.
      */
-    __dishonest: {
-      queue: { ...flag, listJobs: () => [{ id: 'j1', type: MARKER, status: 'done', attempts: 1 }] },
-      workflowStore: { ...flag, list: () => [...defs.values()], get: (n: string) => defs.get(n), set: () => {}, delete: () => {} },
-    },
+    __dishonest: { queue: () => shared.queue },
   } as Record<string, unknown>;
 }
 
@@ -473,7 +470,8 @@ async function makeApi(optIn = false) {
       run: async (_id: string, _o?: unknown, ctx?: { orgId?: string }) => rec('datasets.run', ctx, { ok: true, results: [] }),
     },
     // A FACTORY, not an object: it is handed the org-scoped reader, so threads isolate. A `memory`
-    // object is refused unless it declares `orgScoped: true` — see the block at the end of this file.
+    // object is refused to organizations; `memory` as a function of the organization is served — see
+    // the block at the end of this file.
     memoryFactory: mem,
     gnl: {
       // Agents carry `orgs`, because `GET /agents` filters with `agentVisibleToOrg`. A fixture whose
@@ -1191,21 +1189,16 @@ describe('the ownership control — acme must SEE what globex must not', () => {
 });
 
 /**
- * `orgScoped: true` is now a promise the host CAN keep — it used to be unkeepable on eleven routes.
+ * A host store reaches organizations only as a function of the organization.
  *
- * The refusal for an unscopeable host object was always correct and the default always safe. But its
- * documented escape hatch — set `orgScoped: true`, "an explicit claim, in the host's own code, that it
- * honours the organization it is handed" — was hollow on most of the surface it unlocked. Only THREE
- * call sites handed one over (`vectors.search`, `cache.invalidate`, `queue.retry`); `queue.listJobs()`
- * and `cache.stats()` took no argument, and `StudioWorkflowStore` had no context parameter anywhere.
- * A host doing exactly what the message said served every tenant, because it was never told who asked.
- *
- * All six now take a `ctx`, and `wfStoreFor` binds it at the single accessor so no call site can drop
- * it. This block was the pinned set; it now asserts the closure, and — because the argument stays
- * ADVISORY by design — keeps the residual visible: a host that opts in and ignores the argument still
- * leaks, and nothing here can tell.
+ * There used to be a second way: `orgScoped: true` on one object, "an explicit claim, in the host's own
+ * code, that it honours the organization it is handed". Nothing could check the claim — the `ctx` is
+ * advisory — and for `memory`, which is never handed the organization, it was measured false. It is
+ * gone; the function form gives Studio a store obtained FOR the caller's organization. The residual
+ * stays visible: a function that ignores the organization and returns one shared store still leaks,
+ * and nothing here can tell.
  */
-describe('an opting-in host is told which organization is asking', () => {
+describe('a host store passed per organization', () => {
   /**
    * Refused outright while the host has not opted in — the shipped default, and it is safe.
    *
@@ -1225,18 +1218,18 @@ describe('an opting-in host is told which organization is asking', () => {
   /** The routes whose host method received no organization at all before the interfaces were threaded. */
   const WAS_UNKEEPABLE = ['GET /jobs', 'GET /workflows', 'GET /workflows/:name/def'];
 
-  it('with no opt-in, they are refused', async () => {
+  it('as plain objects, they are refused', async () => {
     const { api } = await makeApi(false);
     for (const key of REFUSED_WITHOUT_OPTIN) {
       const [method, ...rest] = key.split(' ');
       const { status } = await drive(api, { method: method!, path: rest.join(' ') }, AS.globex);
-      expect(status, `${key} served an org-bound caller without the host opting in`).toBe(403);
+      expect(status, `${key} served an org-bound caller from a plain object`).toBe(403);
     }
   }, 30_000);
 
   // `GET /workflows` is the exception, and correctly so: refusing the whole listing would take the
   // CODE-defined workflows away over an unrelated option, so it answers 200 with the managed
-  // definitions filtered out. That filtering is what the opt-in disables.
+  // definitions filtered out. That filtering is what the function form lifts.
   it('except GET /workflows, which answers 200 with the managed definitions removed', async () => {
     const { api } = await makeApi(false);
     const { status, body } = await drive(api, { method: 'GET', path: '/workflows' }, AS.globex);
@@ -1245,7 +1238,7 @@ describe('an opting-in host is told which organization is asking', () => {
     expect(body, 'a managed definition survived for a caller the store cannot scope').not.toContain(MARKER);
   }, 30_000);
 
-  it('with the opt-in, an honouring host isolates them — this is the finding closed', async () => {
+  it('per organization, each organization reaches only its own store — this is the finding closed', async () => {
     const { api } = await makeApi(true);
     const leaking: string[] = [];
     for (const key of WAS_UNKEEPABLE) {
@@ -1276,7 +1269,7 @@ describe('an opting-in host is told which organization is asking', () => {
     expect(body, 'the owning organization was served nothing — the leak control above is vacuous').toContain(MARKER);
   }, 30_000);
 
-  it('but a host that opts in and IGNORES the argument still leaks, and studio cannot tell', async () => {
+  it('but a function that IGNORES the organization still leaks, and studio cannot tell', async () => {
     const journal = await seeded();
     const dishonest = (hostObjects(true) as { __dishonest: Record<string, unknown> }).__dishonest;
     const api = createStudioApi({
@@ -1285,7 +1278,7 @@ describe('an opting-in host is told which organization is asking', () => {
     } as never) as unknown as (r: Request) => Promise<Response>;
 
     const { body } = await drive(api, { method: 'GET', path: '/jobs' }, AS.globex);
-    expect(body, 'the claim became verifiable — say so and tighten the refusal').toContain(MARKER);
+    expect(body, 'a shared store became detectable — say so and tighten the refusal').toContain(MARKER);
   }, 30_000);
 
   it('while the three call sites that always passed an orgId still isolate correctly', async () => {
@@ -1298,52 +1291,52 @@ describe('an opting-in host is told which organization is asking', () => {
 });
 
 /**
- * `memory` now has the SAME `orgScoped: true` opt-out as its four siblings.
+ * `memory` follows the SAME rule as its five siblings: an object is refused to an organization, a
+ * function of the organization is served.
  *
- * This block recorded the opposite as a finding: the conversation store's scoping was
- * `memoryIsOrgScoped = !memory` — the mere PRESENCE of a `memory` object, regardless of what it
- * claimed — so a host that had genuinely made its memory organization-aware had no way to say so and
- * its org-bound callers were refused every thread route permanently. `memoryFactory` was the only way
- * out, which is a different object model rather than a claim about the object you already have.
- * Inverted rather than deleted: the finding was written down, and then it was fixed.
+ * It used to accept `orgScoped: true` like the others, and for `memory` the claim could not be kept —
+ * `Memory`'s methods take a thread id and nothing else. Measured with the flag set: globex read acme's
+ * messages and deleted acme's thread (host-store-org-form.test.ts pins that).
  */
-describe('the conversation store honours the orgScoped claim', () => {
+describe('the conversation store is served per organization, never on a claim', () => {
   const THREAD_ROUTES = ['GET /threads', 'GET /threads/:id/messages', 'GET /threads/:id/working-memory'];
 
-  it('a memory object that declares orgScoped: true is served, not refused', async () => {
+  it('a memory passed as a function of the organization is served, not refused', async () => {
     const journal = await seeded();
     const api = createStudioApi({
       reader: journal, auth: authProvider, org: {},
-      memory: { orgScoped: true, listAllThreads: () => [{ id: 't', title: 'GLOBEX-OWN' }], getMessages: () => [] },
+      memory: () => ({ listAllThreads: () => [{ id: 't', title: 'GLOBEX-OWN' }], getMessages: () => [] }),
     } as never) as unknown as (r: Request) => Promise<Response>;
 
     for (const key of THREAD_ROUTES) {
       const [method, ...rest] = key.split(' ');
       const { status } = await drive(api, { method: method!, path: rest.join(' ') }, AS.acme);
-      expect(status, `${key} still refuses a memory that claims to be org-scoped`).not.toBe(403);
+      expect(status, `${key} refused a memory given per organization`).not.toBe(403);
     }
   }, 30_000);
 
-  it('and one that makes no claim is still refused — the default has not moved', async () => {
-    const journal = await seeded();
-    const api = createStudioApi({
-      reader: journal, auth: authProvider, org: {},
-      memory: { listAllThreads: () => [{ id: 't', title: MARKER }], getMessages: () => [] },
-    } as never) as unknown as (r: Request) => Promise<Response>;
+  it('and an object is refused — with or without the old claim', async () => {
+    for (const claim of [{}, { orgScoped: true }]) {
+      const journal = await seeded();
+      const api = createStudioApi({
+        reader: journal, auth: authProvider, org: {},
+        memory: { ...claim, listAllThreads: () => [{ id: 't', title: MARKER }], getMessages: () => [] },
+      } as never) as unknown as (r: Request) => Promise<Response>;
 
-    for (const key of THREAD_ROUTES) {
-      const [method, ...rest] = key.split(' ');
-      const { status } = await drive(api, { method: method!, path: rest.join(' ') }, AS.acme);
-      expect(status, `${key} served an unscopeable conversation store to an org-bound caller`).toBe(403);
+      for (const key of THREAD_ROUTES) {
+        const [method, ...rest] = key.split(' ');
+        const { status } = await drive(api, { method: method!, path: rest.join(' ') }, AS.acme);
+        expect(status, `${key} served an unscopeable conversation store to an org-bound caller`).toBe(403);
+      }
     }
   }, 30_000);
 
-  it('whereas the four sibling objects honour exactly that claim', async () => {
+  it('whereas the sibling stores passed per organization are served', async () => {
     const { api } = await makeApi(true);
     for (const key of ['GET /jobs', 'GET /cache/stats']) {
       const [method, ...rest] = key.split(' ');
       const { status } = await drive(api, { method: method!, path: rest.join(' ') }, AS.acme);
-      expect(status, `${key} ignored orgScoped on its host object`).toBeLessThan(400);
+      expect(status, `${key} refused a store given per organization`).toBeLessThan(400);
     }
   }, 30_000);
 });

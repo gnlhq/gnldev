@@ -19,3 +19,14 @@ your prefix is structurally another tenant's. There is no safe partial answer.
   your deployment uses), then retry.
 - If the operator genuinely needs cross-org access, that is a platform-admin capability — grant it
   through your auth provider rather than widening a single request.
+- If the error says the request reaches `memory`, `queue`, `events`, `cache`, `vectors` or
+  `workflowStore`: that store was passed to Studio as one object, which serves only the root operator
+  and single-tenant deployments. Pass it as a function of the organization, called once per
+  organization:
+
+  ```ts
+  createStudioApp({ /* ... */ memory: ({ orgId }) => memoryPreset(orgId ? withOrgStorage(storage, orgId) : storage) });
+  ```
+
+  There is no flag that lets one object serve organizations — `orgScoped: true` was removed
+  because Studio could not check it.

@@ -237,10 +237,10 @@ describe('Studio refuses an application credential', () => {
  */
 describe('knowledge search is gated on the data permission, not the configuration one', () => {
   /** A vectors host that would hand back corpus text if the gate let the caller through. */
-  // `orgScoped: true`: the host declaring its own boundary, so the org machinery is satisfied and this
-  // block measures the PERMISSION and nothing else. Without it the route refuses for org reasons and
-  // both personas look identical.
-  const vectors = { orgScoped: true, search: async () => [{ text: 'CORPUS-METNI', score: 1 }] } as never;
+  // A store per organization (the function form), so the org machinery is satisfied and this block
+  // measures the PERMISSION and nothing else. Without it the route refuses for org reasons and both
+  // personas look identical.
+  const vectors = (() => ({ search: async () => [{ text: 'CORPUS-METNI', score: 1 }] })) as never;
   const searchApi = () => {
     const j = new InMemoryJournal();
     const auth = {

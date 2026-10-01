@@ -215,26 +215,50 @@ export interface StudioAgentRunner {
  * a rename on either side is a compile error. @gnldev/memory's `AgentMemory` satisfies it as-is, and
  * so do `BasicMemory` and rag's `SemanticMemory` (which have no thread listing — the page shows none).
  */
-export type StudioMemory = Pick<Memory, 'getMessages' | 'getWorkingMemory' | 'listThreads' | 'listAllThreads' | 'updateThread' | 'deleteThread' | 'truncateMessagesAfter'> & {
-  /**
-   * The host's claim that this object keeps its own organization boundary. Without it, a caller acting
-   * as an organization is REFUSED on the thread routes (403 `org_scope_refused`).
-   *
-   * Unlike its siblings, a memory is never handed the calling organization — `Memory`'s methods take a
-   * thread id and nothing else — so the claim is only true for an object that finds the organization
-   * itself. The usual way to scope it is not a claim at all: pass `memory` as a function of the
-   * organization (`StudioMemoryOption`), and give each organization its own storage view.
-   */
-  orgScoped?: boolean;
-};
+export type StudioMemory = Pick<Memory, 'getMessages' | 'getWorkingMemory' | 'listThreads' | 'listAllThreads' | 'updateThread' | 'deleteThread' | 'truncateMessagesAfter'>;
 
 /**
- * `memory` as an object, or as a function that returns the calling organization's memory
- * (`orgId` undefined for the root/operator scope). The function form is how an organization's
- * conversations reach Studio honestly: `({ orgId }) => memoryPreset(orgId ? withOrgStorage(storage, orgId) : storage)`
- * — the storage view prefixes every thread id, so one organization cannot name another's thread.
+ * A host-supplied store, as an object or as a function of the calling organization.
+ *
+ * The OBJECT form is one store for the whole deployment: it serves the root/operator scope and a
+ * single-tenant deployment, and an organization-scoped caller is refused (403 `org_scope_refused`).
+ * The FUNCTION form is how an organization's data reaches Studio: Studio calls it once per
+ * organization (`orgId` undefined for the root/operator scope), caches the result, and serves each
+ * organization's requests only from the store it obtained for that organization.
+ *
+ * There is deliberately no third way. Every one of these stores used to accept `orgScoped: true` — the
+ * host's word that its ONE object honoured the organization it was handed — and that word could not be
+ * checked: `memory` is never handed the organization at all (measured: with the flag set, globex read
+ * and deleted acme's thread), and the others receive it as a `ctx` argument nothing obliges them to
+ * read. A store Studio obtained FOR an organization needs no such promise.
  */
-export type StudioMemoryOption = StudioMemory | ((scope: { orgId?: string }) => StudioMemory);
+export type StudioScopedOption<T> = T | ((scope: { orgId?: string }) => T);
+
+/**
+ * `memory` as an object, or as a function that returns the calling organization's memory (see
+ * `StudioScopedOption`). The function form is how an organization's conversations reach Studio:
+ * `({ orgId }) => memoryPreset(orgId ? withOrgStorage(storage, orgId) : storage)` — the storage view
+ * prefixes every thread id, so one organization cannot name another's thread.
+ */
+export type StudioMemoryOption = StudioScopedOption<StudioMemory>;
+
+/**
+ * Resolves a `StudioScopedOption`: the object itself, or — for the function form — the store the
+ * function returns for that organization, built once per organization and kept. A factory that throws
+ * caches nothing, so the next request asks again; it never falls back to another organization's store.
+ */
+function perOrg<T>(opt: StudioScopedOption<T> | undefined): (orgId: string | undefined) => T | undefined {
+  if (typeof opt !== 'function') return () => opt;
+  const factory = opt as (scope: { orgId?: string }) => T;
+  const built = new Map<string | undefined, T>();
+  return (orgId) => {
+    const key = orgId || undefined;
+    if (built.has(key)) return built.get(key);
+    const store = factory(key ? { orgId: key } : {});
+    built.set(key, store);
+    return store;
+  };
+}
 
 /** Introspection for a single workflow (Workflows view). */
 export interface WorkflowMeta {
@@ -287,32 +311,10 @@ export interface ManagedAgentRecord {
 /** Managed workflow store — if not given, a writable journal is used automatically. */
 export interface StudioWorkflowStore {
   /**
-   * The host's explicit claim that this object keeps its own organization boundary — that it honours
-   * the `ctx.orgId` it is handed on every call.
-   *
-   * Studio cannot verify it and does not try: this is somebody else's object with its own storage
-   * behind it. Without the claim, a caller acting as an organization is REFUSED on the routes that
-   * reach this object (403 `org_scope_refused`), because serving them would hand one organization another
-   * organization's data. An operator with no organization scope is unaffected either way.
-   *
-   * DECLARED here, not just read. Every refusal message tells the host to "set `orgScoped: true` on
-   * it", and the field existed nowhere in the types — so a host following that instruction got
-   * `TS2353: 'orgScoped' does not exist in type ...` and the documented fix could not be written down
-   * in TypeScript at all. It was read through a cast in three places, which is what hid it.
-   */
-  orgScoped?: boolean;
-  /**
-   * Every method takes the calling organization, and `createStudioApp` always supplies it (see
-   * `wfStoreFor`). It had NO context parameter at all, which made the refusal's documented escape
-   * hatch — declare `orgScoped: true` once your object honours the `orgId` it is handed — an
-   * unkeepable promise here: a host that set the flag was never told who was asking, so it served
-   * every organization from one store. Measured, with the flag set: `GET /workflows` returned another
-   * organization's definition including its prompt template, and `GET /workflows/:name` its steps.
-   *
-   * Optional, so a host implementation that ignores it still satisfies the interface — a function of
-   * fewer parameters is assignable to one declaring more. That keeps existing hosts compiling, and it
-   * is also why the flag has to stay an explicit claim rather than something inferred: nothing here can
-   * tell whether the argument was read.
+   * Every method is handed the calling organization (`wfStoreFor` binds it), as information. It is
+   * not what lets this store serve organizations: one object serves the root/operator scope, and
+   * organizations need `workflowStore` as a function of the organization (`StudioScopedOption`).
+   * Optional, so a host implementation that ignores it still satisfies the interface.
    */
   list (ctx?: StudioCallbackCtx): Promise<WorkflowDef[]> | WorkflowDef[];
   get (name: string, ctx?: StudioCallbackCtx): Promise<WorkflowDef | undefined> | WorkflowDef | undefined;
@@ -375,23 +377,8 @@ export interface StudioMcpServer {
 /** Queue/Jobs view: summary of background jobs (fed by @gnldev/queue listJobs). */
 export interface StudioJob { id: string; type: string; status: string; attempts: number; }
 export interface StudioQueue {
-  /**
-   * The host's explicit claim that this object keeps its own organization boundary — that it honours
-   * the `ctx.orgId` it is handed on every call.
-   *
-   * Studio cannot verify it and does not try: this is somebody else's object with its own storage
-   * behind it. Without the claim, a caller acting as an organization is REFUSED on the routes that
-   * reach this object (403 `org_scope_refused`), because serving them would hand one organization another
-   * organization's data. An operator with no organization scope is unaffected either way.
-   *
-   * DECLARED here, not just read. Every refusal message tells the host to "set `orgScoped: true` on
-   * it", and the field existed nowhere in the types — so a host following that instruction got
-   * `TS2353: 'orgScoped' does not exist in type ...` and the documented fix could not be written down
-   * in TypeScript at all. It was read through a cast in three places, which is what hid it.
-   */
-  orgScoped?: boolean;
-  /** `ctx.orgId` is the calling organization — supplied on every call, so `orgScoped: true` on this
-   *  object is a promise the host can actually keep. It used to be handed nothing at all. */
+  /** `ctx.orgId` is the calling organization — supplied on every call, as information (see
+   *  `StudioScopedOption` for how a queue serves organizations). */
   listJobs (ctx?: StudioCallbackCtx): Promise<StudioJob[]> | StudioJob[];
   /**
    * If given, `POST /jobs/:id/retry` works (the host typically wraps @gnldev/queue's `retryJob(work, id)`):
@@ -469,13 +456,6 @@ export interface StudioEventTopic { topic: string; consumers: string[] }
  */
 export interface StudioEvents {
   /**
-   * The host's explicit claim that this object keeps its own organization boundary — that it honours
-   * the `ctx.orgId` it is handed on every call. Same contract, and the same default refusal, as
-   * `StudioQueue.orgScoped`: studio cannot verify it and will not serve an organization-scoped caller
-   * a store that has no organization boundary.
-   */
-  orgScoped?: boolean;
-  /**
    * Which topics and consumers exist. Optional, but without it the view has nothing to address:
    * `listDead` needs a topic AND a consumer, and an operator who has to remember both by heart is
    * back at the Node REPL this view exists to replace. Omit it and the view falls back to free text.
@@ -517,21 +497,6 @@ export interface StudioCacheStats { hits: number; misses: number; hitRate: numbe
 /** Cache view contract — studio has no DEPENDENCY on @gnldev/cache; the host wraps its own cache instance
  *  (same pattern as Queue/Vectors: optional, duck-typed interface). */
 export interface StudioCache {
-  /**
-   * The host's explicit claim that this object keeps its own organization boundary — that it honours
-   * the `ctx.orgId` it is handed on every call.
-   *
-   * Studio cannot verify it and does not try: this is somebody else's object with its own storage
-   * behind it. Without the claim, a caller acting as an organization is REFUSED on the routes that
-   * reach this object (403 `org_scope_refused`), because serving them would hand one organization another
-   * organization's data. An operator with no organization scope is unaffected either way.
-   *
-   * DECLARED here, not just read. Every refusal message tells the host to "set `orgScoped: true` on
-   * it", and the field existed nowhere in the types — so a host following that instruction got
-   * `TS2353: 'orgScoped' does not exist in type ...` and the documented fix could not be written down
-   * in TypeScript at all. It was read through a cast in three places, which is what hid it.
-   */
-  orgScoped?: boolean;
   /** `ctx.orgId` is the calling organization — supplied on every call, for the same reason as
    *  `StudioQueue.listJobs`: the sibling `invalidate()` was given one and this was not. */
   stats (ctx?: StudioCallbackCtx): Promise<StudioCacheStats> | StudioCacheStats;
@@ -546,21 +511,6 @@ export interface StudioCache {
 /** Knowledge view: vector store search (the host app wraps its own embed+store). */
 export interface StudioVectorMatch { id: string; text: string; score: number; metadata?: Record<string, unknown>; }
 export interface StudioVectors {
-  /**
-   * The host's explicit claim that this object keeps its own organization boundary — that it honours
-   * the `ctx.orgId` it is handed on every call.
-   *
-   * Studio cannot verify it and does not try: this is somebody else's object with its own storage
-   * behind it. Without the claim, a caller acting as an organization is REFUSED on the routes that
-   * reach this object (403 `org_scope_refused`), because serving them would hand one organization another
-   * organization's data. An operator with no organization scope is unaffected either way.
-   *
-   * DECLARED here, not just read. Every refusal message tells the host to "set `orgScoped: true` on
-   * it", and the field existed nowhere in the types — so a host following that instruction got
-   * `TS2353: 'orgScoped' does not exist in type ...` and the documented fix could not be written down
-   * in TypeScript at all. It was read through a cast in three places, which is what hid it.
-   */
-  orgScoped?: boolean;
   search (query: string, topK?: number, ctx?: StudioCallbackCtx): Promise<StudioVectorMatch[]> | StudioVectorMatch[];
 }
 
@@ -748,10 +698,10 @@ export interface StudioApiOptions {
   mcp?: StudioMcpServer[];
   /** true → the A2A Networks view (agent-to-agent call edges are extracted from the journal). */
   a2a?: boolean;
-  /** If given, the Queue/Jobs view works. */
-  queue?: StudioQueue;
-  /** If given, the Dead-letter view works (@gnldev/events quarantine list + release). */
-  events?: StudioEvents;
+  /** If given, the Queue/Jobs view works. An object, or a function of the calling organization (see `StudioScopedOption`). */
+  queue?: StudioScopedOption<StudioQueue>;
+  /** If given, the Dead-letter view works (@gnldev/events quarantine list + release). An object, or a function of the calling organization (see `StudioScopedOption`). */
+  events?: StudioScopedOption<StudioEvents>;
   /**
    * Bounds on `GET /dead-events`, the most expensive read this API serves (a whole topic log, one
    * `get` per event — 1 470 ms for 20 000 events, measured on SQLite). Both have defaults; a host
@@ -789,12 +739,12 @@ export interface StudioApiOptions {
      */
     maxAbandonedScans?: number;
   };
-  /** If given, the Cache view works (@gnldev/cache hit/miss ratio + manual invalidate). */
-  cache?: StudioCache;
+  /** If given, the Cache view works (@gnldev/cache hit/miss ratio + manual invalidate). An object, or a function of the calling organization (see `StudioScopedOption`). */
+  cache?: StudioScopedOption<StudioCache>;
   /** If given, the Knowledge (vector search) view works. */
-  vectors?: StudioVectors;
-  /** Managed workflow store — if not given, a writable journal is used (create/edit/delete). */
-  workflowStore?: StudioWorkflowStore;
+  vectors?: StudioScopedOption<StudioVectors>;
+  /** Managed workflow store — if not given, a writable journal is used (create/edit/delete). An object, or a function of the calling organization (see `StudioScopedOption`). */
+  workflowStore?: StudioScopedOption<StudioWorkflowStore>;
   /**
    * Optional user management (a PAID feature — the contract lives here, the implementation lives in
    * @gnldev/auth-ee `createJournalUserStore`). If given, the Studio "Users" view + /users endpoints are enabled.
@@ -1067,6 +1017,12 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (p?.orgId) return false;
     return !orgIsolationActive || isPlatformAdmin(p);
   };
+  /** The one-line way through for an organization refused the conversation store. */
+  const MEMORY_FIX = 'pass `memory` as a function of the organization — `memory: ({ orgId }) => yourMemoryFor(orgId)`, '
+    + 'built once per organization — or pass `memoryFactory`, which receives the org-scoped journal';
+  /** The same, for the other host stores. */
+  const hostFix = (what: string): string =>
+    `pass \`${what}\` as a function of the organization — \`${what}: ({ orgId }) => yours(orgId)\`, built once per organization`;
   /**
    * Refuses a thread request from an org-bound caller when thread storage cannot be scoped.
    *
@@ -1082,14 +1038,13 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     // Said once here as well as at boot: the boot warning fires on `multiOrganizationEnabled`, which a
     // `roleAuth` provider binding `orgId` to an identity does NOT set — so the config most likely to hit
     // this refusal was the one least likely to be warned about it.
-    warnRefusal('memory', 'pass `memoryFactory` instead — it receives the org-scoped journal — or set '
-      + '`orgScoped: true` on your `memory` object if it already keeps its own organization boundary');
+    warnRefusal('memory', MEMORY_FIX);
     markRefusal(c.req.raw, 'organization', { detail: 'org_scope_refused' });
     return c.json({
       code: 'org_scope_refused', // see requireScopedHost — a scope refusal is not a bad token
       error: 'this request reaches the conversation store, which has no organization boundary in this ' +
-        'deployment because `memory` was passed directly. Pass `memoryFactory` ' +
-        'instead — it receives the org-scoped journal — or use an unscoped operator identity.',
+        `deployment because \`memory\` was passed as one object. To serve it, ${MEMORY_FIX}, or use an ` +
+        'unscoped operator identity.',
     }, 403);
   };
 
@@ -1111,34 +1066,44 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    * (The journal-derived workflow store is fine — measured, it isolates correctly, because it is built
    * from the ALS-aware reader. Only the host-supplied one is unscopeable.)
    *
-   * Three of those entry points originally received nothing at all — `cache.stats()`, `queue.listJobs()`
-   * and every method of `StudioWorkflowStore` — which made the opt-in below a promise the host could
-   * not keep: it set the flag, was never told who was asking, and served every organization from one store.
-   * They all take a `ctx` now, and `wfStoreFor` binds it so no call site can drop it. The flag itself
-   * was also undeclared on the interfaces, so a host doing exactly what the refusal message says got
-   * `TS2353` — it is a real field on all five now.
+   * Every entry point takes a `ctx` (`wfStoreFor` binds it so no call site can drop it), but that is
+   * information for the store, not what makes it safe to serve an organization.
    *
    * If handing over a store that cannot be scoped is grounds to refuse threads, it is grounds to refuse
-   * these. A host that HAS made its object org-aware says so by setting `orgScoped: true` on it — an
-   * explicit claim, in the host's own code, the same shape as `allowOpenAccess`. Refusing by default is
-   * the only side of this that fails safe: the cost of a wrong refusal is a config line, and the cost of
-   * a wrong service is one organization reading another's data.
+   * these. A host that keeps a store per organization passes the option as a function of the
+   * organization (`StudioScopedOption`), and Studio asks it for the caller's store. There used to be a
+   * second way — `orgScoped: true` on the one object, the host's word that it honoured the `ctx.orgId`
+   * it was handed — and it was removed: nothing could check the word, and for `memory`, which is never
+   * handed the organization, it was measured false (globex read and deleted acme's thread). Refusing an
+   * object by default is the only side of this that fails safe: the cost of a wrong refusal is a config
+   * line, and the cost of a wrong service is one organization reading another's data.
    */
   const unscopeableHosts: Array<{ what: string; obj: unknown; fix: string }> = [
-    { what: 'vectors', obj: vectors, fix: 'set `orgScoped: true` on it once it honours the `orgId` it is handed' },
-    { what: 'cache', obj: cache, fix: 'set `orgScoped: true` on it once it honours the `orgId` it is handed' },
-    { what: 'queue', obj: queue, fix: 'set `orgScoped: true` on it once it honours the `orgId` it is handed' },
+    { what: 'vectors', obj: vectors, fix: hostFix('vectors') },
+    { what: 'cache', obj: cache, fix: hostFix('cache') },
+    { what: 'queue', obj: queue, fix: hostFix('queue') },
     // Same shape as `queue`, and the same reason: the host wraps its own WorkStore, and a released
     // dead-letter event is delivered by whatever consumer owns it — releasing another organization's
     // quarantined event re-runs that organization's handler.
-    { what: 'events', obj: events, fix: 'set `orgScoped: true` on it once it honours the `orgId` it is handed' },
+    { what: 'events', obj: events, fix: hostFix('events') },
     { what: 'workflowStore', obj: _wfStoreOpt, fix: 'omit `workflowStore` to use the journal-derived store, which IS org-scoped, '
-      + 'or set `orgScoped: true` on yours once it honours the `orgId` its methods are handed' },
+      + `or ${hostFix('workflowStore')}` },
   ];
 
   /** The organization this caller is acting as, if any. Identity first — a header is not an identity. */
   const callerOrgScope = (c: Context): string | undefined =>
     principalOf(c.req.raw)?.orgId ?? orgALS.getStore();
+
+  /**
+   * The store a request reaches — the object, or the caller's own store from the function form. The
+   * organization is `callerOrgScope`, the same reading `requireScopedHost` refuses on, so the refusal
+   * and the resolution cannot disagree about who is asking. Routes call this AFTER the refusal check,
+   * except where the object's shape decides the answer (`retry`/`release`/`invalidate` → 501), which
+   * resolves for the caller's own organization and touches no data.
+   */
+  const hostStores = { vectors: perOrg(vectors), cache: perOrg(cache), queue: perOrg(queue), events: perOrg(events) };
+  const hostFor = <K extends keyof typeof hostStores>(c: Context, what: K): ReturnType<(typeof hostStores)[K]> =>
+    hostStores[what](callerOrgScope(c)) as ReturnType<(typeof hostStores)[K]>;
 
   /**
    * Can THIS caller reach `what`? A predicate, not a Response, because `GET /capabilities` has to answer
@@ -1155,7 +1120,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   const hostReachable = (c: Context, what: string): boolean => {
     const entry = unscopeableHosts.find((e) => e.what === what);
     if (!entry?.obj) return true; // not configured — the route answers its own way
-    if ((entry.obj as { orgScoped?: boolean }).orgScoped === true) return true; // the host claims it
+    if (typeof entry.obj === 'function') return true; // Studio obtains the caller's own store from it
     return !callerOrgScope(c); // single-org / operator: nothing to isolate from
   };
 
@@ -1466,14 +1431,9 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    * organization's, built once per organization. The organization is read the way `requireScopedMemory`
    * reads it, so the refusal and the resolution cannot disagree about who is asking.
    */
-  const memoryByOrg = new Map<string, StudioMemory>();
-  const memoryFor = (c: Context): StudioMemory | undefined => {
-    if (typeof memory !== 'function') return fixedMemory;
-    const orgId = principalOf(c.req.raw)?.orgId ?? orgALS.getStore();
-    let m = memoryByOrg.get(orgId ?? '');
-    if (!m) { m = memory(orgId ? { orgId } : {}); memoryByOrg.set(orgId ?? '', m); }
-    return m;
-  };
+  const memoryOf = perOrg(memory);
+  const memoryFor = (c: Context): StudioMemory | undefined =>
+    typeof memory === 'function' ? memoryOf(callerOrgScope(c)) : fixedMemory;
   /**
    * Whether thread storage is organization-scoped.
    *
@@ -1486,19 +1446,15 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    * thread and `GET /threads/globex-thread/messages` returned its contents. Writes were already
    * refused by the org-write guard; reads were not.
    *
-   * `orgScoped: true` is the SAME opt-out its four siblings have, and its absence here was an
-   * oversight rather than a decision. The rule was `!memory ` — the mere PRESENCE of the object — so a
-   * host that had genuinely made its memory org-aware had no way to say so and its org-bound callers
-   * were refused every thread route permanently. The only way out was `memoryFactory`, which is a
-   * different object model, not a claim about the object you already have. Same shape as `vectors`,
-   * `cache`, `queue` and `workflowStore`: refusing by default is the safe side, and an explicit claim
-   * in the host's own code is how a host leaves it.
+   * A host whose conversations are kept per organization passes `memory` as a function of the
+   * organization, and each organization gets its own object. There is no flag to declare one object
+   * scoped: `orgScoped: true` was one, and with it set globex read and deleted acme's thread — a
+   * `Memory` is never told who is asking, so the object could not have kept the promise.
    */
-  // A function of the organization is scoped by construction: each organization gets its own object.
-  const memoryIsOrgScoped = !memory || typeof memory === 'function' || memory.orgScoped === true;
+  const memoryIsOrgScoped = !memory || typeof memory === 'function';
 
   const WF_STORE_PRE = '__studio_wf__';
-  const resolvedWfStore: StudioWorkflowStore | undefined = _wfStoreOpt ?? (
+  const wfStoreSource: StudioScopedOption<StudioWorkflowStore> | undefined = _wfStoreOpt ?? (
     writable && rw.listKeys && rw.get && rw.put
       ? {
         async list () {
@@ -1514,13 +1470,15 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       : undefined
   );
 
+  const wfStoreOf = perOrg(wfStoreSource);
+
   // Can a managed workflow run with the REAL engine? (compiler + agent.run + writable journal)
-  const canRunManaged = !!resolvedWfStore && !!compileWorkflow && !!gnl?.run && writable && !!rw.get;
+  const canRunManaged = !!wfStoreSource && !!compileWorkflow && !!gnl?.run && writable && !!rw.get;
 
   /**
    * The workflow store, for a REQUEST — `undefined` when this caller may not reach it.
    *
-   * Every route-level use goes through here rather than touching `resolvedWfStore`, because gating the
+   * Every route-level use goes through here rather than touching `wfStoreSource`, because gating the
    * sites I happened to be looking at is exactly how the hole stayed open. The refusal was added to
    * list/def/CRUD and missed the three routes that RUN a managed workflow, so an org-bound admin got
    * 403 on `GET /workflows/secret/def` and 200 on `POST /workflows/secret/run` — measured, returning
@@ -1537,8 +1495,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    * cannot drop the context even by writing the obvious thing.
    */
   const wfStoreFor = (c: Context): StudioWorkflowStore | undefined => {
-    if (!resolvedWfStore || requireScopedHost(c, 'workflowStore')) return undefined;
-    const store = resolvedWfStore;
+    if (!wfStoreSource || requireScopedHost(c, 'workflowStore')) return undefined;
+    const store = wfStoreOf(callerOrgScope(c))!;
     const ctx: StudioCallbackCtx = { orgId: callerOrgScope(c) };
     return {
       list: () => store.list(ctx),
@@ -1562,7 +1520,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    * in a position to report that the workflow is absent from it.
    */
   const wfStoreRefusal = (c: Context): Response | undefined =>
-    resolvedWfStore ? requireScopedHost(c, 'workflowStore') : undefined;
+    wfStoreSource ? requireScopedHost(c, 'workflowStore') : undefined;
 
   /** Compiles a managed WorkflowDef and runs it with the SAME engine as code workflows (parity with registry.runWorkflow).
    * P0.4 `resume` forwards typed HITL payloads to wf.runResumable (only meaningful
@@ -1795,8 +1753,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       '@gnldev/studio: `memory` was passed directly while multi-organization is enabled. That object ' +
       'owns its own store and cannot be given an organization boundary, so the thread endpoints are ' +
       'refused to organization-scoped identities rather than serving one organization another organization\'s ' +
-      'conversations. Pass `memoryFactory` instead — it receives the org-scoped journal — or set `orgScoped: true` '
-      + 'on your `memory` object if it already keeps its own organization boundary.',
+      `conversations. To serve them, ${MEMORY_FIX}.`,
     );
   }
   // The same sentence for the same problem, for every OTHER host object with it. `memory` got a boot
@@ -1812,7 +1769,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // and therefore cannot be wrong in either direction.
   if (opts.org) {
     for (const { what, obj, fix } of unscopeableHosts) {
-      if (!obj || (obj as { orgScoped?: boolean }).orgScoped === true) continue;
+      if (!obj || typeof obj === 'function') continue;
       console.warn(
         `@gnldev/studio: \`${what}\` was passed directly while multi-organization is enabled. It owns ` +
         'its own store and cannot be given an organization boundary from here, so the endpoints that ' +
@@ -1834,6 +1791,11 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    * everyone, so refused for no scope reason), and `workflowExec` depends entirely on scope yet was
    * missing from the list. Nothing here can drift, because there is only one expression per capability.
    */
+  /** A capability that depends on an optional method: asked of the caller's own store. A factory that
+   *  throws leaves the capability off rather than failing `/capabilities`. */
+  const hostHas = <K extends keyof typeof hostStores>(c: Context, what: K, method: string): boolean => {
+    try { return typeof (hostFor(c, what) as Record<string, unknown> | undefined)?.[method] === 'function'; } catch { return false; }
+  };
   const capsFor = (c: Context, reach: (what: string) => boolean, threads: boolean, unscoped: boolean) => ({
       resume: !!resume,
       compensate: !!compensate,
@@ -1855,7 +1817,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       queue: !!queue && reach('queue'),
       // "Retry" action in the Jobs view: on if the host implemented queue.retry (RBAC is also
       // enforced server-side on every request via allow(c,'write') — this is only button visibility).
-      queueManage: !!queue?.retry && reach('queue'),
+      queueManage: hostHas(c, 'queue', 'retry') && reach('queue'),
       // Dead-letter view (@gnldev/events quarantine): on if the host gave an events object. Named
       // `deadEvents` rather than `events`, because `/events` is already this API's SSE change stream
       // and a capability that reads as "the SSE stream is on" would be read that way.
@@ -1863,18 +1825,18 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       // "Release" action in the Dead-letter view: on if the host implemented events.release (RBAC is
       // also enforced server-side on every request via allow(c,'write') — this is only button
       // visibility, same pattern as queueManage/cacheManage).
-      eventsManage: !!events?.release && reach('events'),
+      eventsManage: hostHas(c, 'events', 'release') && reach('events'),
       // Cache view (@gnldev/cache hit/miss + size): on if the host gave a cache instance.
       cache: !!cache && reach('cache'),
       // Manual invalidate button: on if the host implemented cache.invalidate (RBAC is again enforced
       // server-side via allow(c,'write') — this is only button visibility, same pattern as queueManage).
-      cacheManage: !!cache?.invalidate && reach('cache'),
+      cacheManage: hostHas(c, 'cache', 'invalidate') && reach('cache'),
       // Scheduler (@gnldev/scheduler trigger introspection): the journal is READ-ONLY (see GET /scheduler/triggers),
       // it needs neither a separate opts.scheduler surface nor a running instance — writable + listKeys
       // is enough (same auto-detection pattern as audit/organizations; returns an empty list if the host doesn't use @gnldev/scheduler).
       scheduler: writable && typeof rw.listKeys === 'function',
       knowledge: !!vectors && reach('vectors'),
-      workflowManage: !!resolvedWfStore && reach('workflowStore'),
+      workflowManage: !!wfStoreSource && reach('workflowStore'),
       // Governance: approval queue (needs resume), audit + organizations (need a writable journal + listKeys).
       approvals: !!resume,
       audit: writable && typeof rw.listKeys === 'function',
@@ -4301,7 +4263,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allowP(c.req.raw, 'catalog:read'))) return deny(c.req.raw, 'read');
     if (!queue) return c.json([]);
     { const denied = requireScopedHost(c, 'queue'); if (denied) return denied; }
-    const jobs = await queue.listJobs({ orgId: callerOrg(c) });
+    const jobs = await hostFor(c, 'queue')!.listJobs({ orgId: callerOrg(c) });
     return c.json(jobs.map((j) => pickFields(j, JOB_FIELDS)));
   });
 
@@ -4311,11 +4273,12 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // DOUBLE-RUN — this protection lives on queue.retry's own side (returns null → 409).
   app.post('/jobs/:id/retry', async (c) => {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
-    if (!queue?.retry) return c.json({ error: 'job retry is not supported (queue not given or retry not implemented)' }, 501);
+    const q = hostFor(c, 'queue');
+    if (!q?.retry) return c.json({ error: 'job retry is not supported (queue not given or retry not implemented)' }, 501);
     const id = decodeURIComponent(c.req.param('id'));
     // Same reason: a job id from another organization requeues its dead-letter work.
     { const denied = requireScopedHost(c, 'queue'); if (denied) return denied; }
-    const newId = await queue.retry(id, { orgId: callerOrg(c) });
+    const newId = await q.retry(id, { orgId: callerOrg(c) });
     if (newId == null) {
       return c.json({ error: `job '${id}' not found or not in a retryable state (only failed/dead-letter jobs can be retried)` }, 409);
     }
@@ -4857,9 +4820,10 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    */
   app.get('/dead-events/topics', async (c) => {
     if (!(await allowP(c.req.raw, 'catalog:read'))) return deny(c.req.raw, 'read');
-    if (!events?.topics) return c.json([]);
+    const ev = hostFor(c, 'events');
+    if (!ev?.topics) return c.json([]);
     { const denied = requireScopedHost(c, 'events'); if (denied) return denied; }
-    const inventory = await events.topics({ orgId: callerOrg(c) });
+    const inventory = await ev.topics({ orgId: callerOrg(c) });
     // Reading an allowlisted key can THROW: `topic` may be a getter, and this is somebody else's
     // object. Measured, one that threw answered 500 `Internal Server Error` with a stack pointing into
     // `pickFields`. The dead-letter list two routes down already defends the same duck-type against
@@ -4940,6 +4904,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     }
     if (!events) return c.json([]);
     { const denied = requireScopedHost(c, 'events'); if (denied) return denied; }
+    const ev = hostFor(c, 'events')!;
     const orgId = callerOrg(c);
     // Keyed on the ORGANIZATION as well as the pair: coalescing two callers onto one scan must never
     // hand one organization the answer computed for another.
@@ -5019,7 +4984,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
               + 'was changed.');
           }
           const out = await withScanDeadline(
-            (async () => events.listDead(topic, consumer, { orgId, signal: ac.signal }))(),
+            (async () => ev.listDead(topic, consumer, { orgId, signal: ac.signal }))(),
             ac,
           );
           // ONLY a scan that actually finished is evidence of what a scan costs. In `finally` this
@@ -5113,7 +5078,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    */
   app.post('/dead-events/release', async (c) => {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
-    if (!events?.release) {
+    const ev = hostFor(c, 'events');
+    if (!ev?.release) {
       return c.json({ error: 'dead-event release is not supported (events not given or release not implemented)' }, 501);
     }
     const body = (await c.req.json().catch(() => ({}))) as { topic?: unknown; consumer?: unknown; id?: unknown };
@@ -5124,7 +5090,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     // Same reason as the queue's: releasing another organization's quarantined event re-runs that
     // organization's handler.
     { const denied = requireScopedHost(c, 'events'); if (denied) return denied; }
-    if (!(await events.release(topic, consumer, id, { orgId: callerOrg(c) }))) {
+    if (!(await ev.release(topic, consumer, id, { orgId: callerOrg(c) }))) {
       return c.json({
         error: `event '${id}' is not releasable for consumer '${consumer}' on topic '${topic}' — it was never `
           + 'quarantined, or it has since been delivered',
@@ -5139,21 +5105,22 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allowP(c.req.raw, 'catalog:read'))) return deny(c.req.raw, 'read');
     if (!cache) return c.json({ hits: 0, misses: 0, hitRate: 0, size: 0 });
     { const denied = requireScopedHost(c, 'cache'); if (denied) return denied; }
-    return c.json(await cache.stats({ orgId: callerOrg(c) }));
+    return c.json(await hostFor(c, 'cache')!.stats({ orgId: callerOrg(c) }));
   });
 
   // Manual invalidate: if body.key is given, only that key; if not (best-effort — CacheStore doesn't
   // offer key enumeration), all keys the host knows about are removed (see StudioCache.invalidate).
   app.post('/cache/invalidate', async (c) => {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
-    if (!cache?.invalidate) return c.json({ error: 'cache invalidate is not supported (cache not given or invalidate not implemented)' }, 501);
+    const ca = hostFor(c, 'cache');
+    if (!ca?.invalidate) return c.json({ error: 'cache invalidate is not supported (cache not given or invalidate not implemented)' }, 501);
     const body = (await c.req.json().catch(() => ({}))) as { key?: unknown };
     // The org travels with it. With no key AND no organization the host wipes everything it knows —
     // measured from an acme-bound admin: `{ok:true,deleted:{removed:9}}`, every organization's cache
     // gone in one call. Studio cannot scope a host's cache itself; it can stop hiding whose request it
     // was, which is what lets the host scope it.
     { const denied = requireScopedHost(c, 'cache'); if (denied) return denied; }
-    const deleted = await cache.invalidate(body.key, { orgId: callerOrg(c) });
+    const deleted = await ca.invalidate(body.key, { orgId: callerOrg(c) });
     await audit(c, 'cache.invalidate', body.key !== undefined ? String(body.key) : '*', { deleted });
     return c.json({ ok: true, deleted });
   });
@@ -5211,7 +5178,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const body = (await c.req.json().catch(() => ({}))) as { query?: string; topK?: number };
     if (!body.query?.trim()) return c.json([]);
     // The host owns the index, so only the host can filter it — but it needs to know who asked.
-    return c.json(await vectors.search(body.query, body.topK, { orgId: callerOrg(c) }));
+    return c.json(await hostFor(c, 'vectors')!.search(body.query, body.topK, { orgId: callerOrg(c) }));
   });
 
   // ── Workflows (if gnl.listWorkflows or the workflows option is given) ──────────
@@ -5615,7 +5582,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     return c.json({ ok: true, cancelled: true });
   });
 
-  // ── Workflow CRUD (managed; if resolvedWfStore exists) ─────────────────────────
+  // ── Workflow CRUD (managed; if wfStoreSource exists) ─────────────────────────
   app.get('/workflows/:name/def', async (c) => {
     if (!(await allowP(c.req.raw, 'catalog:read'))) return deny(c.req.raw, 'read');
     { const denied = requireScopedHost(c, 'workflowStore'); if (denied) return denied; }
@@ -5944,6 +5911,7 @@ export function createStudioApi (input: JournalReader | StudioApiOptions): Fetch
 export function createStudioAdmin (opts: { apiBase?: string } = {}): FetchHandler {
   return toFetchHandler(studioAdminApp(opts));
 }
+
 export function createStudioApp (input: JournalReader | StudioAppOptions): FetchHandler {
   return toFetchHandler(studioAppApp(input));
 }

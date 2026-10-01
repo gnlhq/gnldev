@@ -54,14 +54,14 @@ describe('capabilities for a caller whose org-scoped identity will be refused', 
     }
   });
 
-  it('still reports true when the host declares its object organization-aware', async () => {
+  it('still reports true when the host passes each store as a function of the organization', async () => {
     const hosts = blind();
     const app = createStudioApi({
       reader: new InMemoryJournal(), auth: boundAdmin, org: {},
       ...hosts,
-      vectors: { ...hosts.vectors, orgScoped: true },
-      cache: { ...hosts.cache, orgScoped: true },
-      queue: { ...hosts.queue, orgScoped: true },
+      vectors: () => hosts.vectors,
+      cache: () => hosts.cache,
+      queue: () => hosts.queue,
     } as never);
 
     const c = await caps(app, 'acme-adm');

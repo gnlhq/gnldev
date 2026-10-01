@@ -12,8 +12,8 @@
 //   3. the workflow store is reachable only through the per-request accessor, so the three routes that
 //      RUN a managed workflow are gated like the routes that read it — the hole that returned another
 //      tenant's prompt template verbatim from a dry run;
-//   4. `orgScoped: true` is honoured, and an unscoped operator is refused nothing (backward
-//      compatibility for every single-tenant deployment, which is all of them today).
+//   4. a store passed as a function of the organization is served, and an unscoped operator is
+//      refused nothing (backward compatibility for every single-tenant deployment).
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { InMemoryJournal } from '@gnldev/durable';
 import { roleAuth } from '@gnldev/auth';
@@ -23,19 +23,18 @@ import { call } from './call.js';
 
 const SECRET_PROMPT = 'ACME-CONFIDENTIAL-TEMPLATE {{input}}';
 
-/** Host objects with their own stores behind them. `orgScoped` is opt-in, exactly as a host sets it. */
-function hosts(orgScoped = false) {
-  const flag = orgScoped ? { orgScoped: true } : {};
+/** Host objects with their own stores behind them; `perOrg` passes each as a function of the organization. */
+function hosts(perOrg = false) {
+  const form = <T,>(obj: T) => (perOrg ? () => obj : obj);
   const defs = new Map<string, WorkflowDef>([
     ['m1', { name: 'm1', description: 'managed', steps: [{ id: 's1', agentName: 'writer', prompt: SECRET_PROMPT }] }],
   ]);
-  return {
-    queue: { ...flag, listJobs: () => [{ id: 'j1', type: 't', status: 'failed', attempts: 1 }], retry: () => 'j2' },
+  const plain = {
+    queue: { listJobs: () => [{ id: 'j1', type: 't', status: 'failed', attempts: 1 }], retry: () => 'j2' },
     // The events dead-letter — the same shape as `queue` (a host object over its own WorkStore) and
     // therefore the same refusal. It was NOT in this fixture when the three routes shipped, which is
     // why `requireScopedHost(c, 'events')` could be deleted from all three with the suite still green.
     events: {
-      ...flag,
       topics: () => [{ topic: 'orders.created', consumers: ['billing'] }],
       listDead: () => [{
         id: 'e1', topic: 'orders.created', consumer: 'billing', status: 'quarantined' as const,
@@ -43,15 +42,18 @@ function hosts(orgScoped = false) {
       }],
       release: () => true,
     },
-    cache: { ...flag, stats: () => ({ hits: 1, misses: 1, hitRate: 0.5, size: 2 }), invalidate: () => 1 },
-    vectors: { ...flag, search: () => [{ id: 'v1', text: 'ACME-CONFIDENTIAL-CHUNK', score: 1 }] },
+    cache: { stats: () => ({ hits: 1, misses: 1, hitRate: 0.5, size: 2 }), invalidate: () => 1 },
+    vectors: { search: () => [{ id: 'v1', text: 'ACME-CONFIDENTIAL-CHUNK', score: 1 }] },
     workflowStore: {
-      ...flag,
       list: () => [...defs.values()],
       get: (n: string) => defs.get(n),
       set: (d: WorkflowDef) => { defs.set(d.name, d); },
       delete: (n: string) => { defs.delete(n); },
     },
+  };
+  return {
+    queue: form(plain.queue), events: form(plain.events), cache: form(plain.cache),
+    vectors: form(plain.vectors), workflowStore: form(plain.workflowStore),
   };
 }
 
@@ -66,8 +68,8 @@ const hostMemory = () => ({
  * unscoped side would have made every write 403 for an unrelated reason and quietly turned the
  * backward-compatibility half of this file into a tautology.
  */
-function makeApp(opts: { orgScoped?: boolean; orgBound?: boolean; org?: boolean } = {}) {
-  const h = hosts(opts.orgScoped);
+function makeApp(opts: { perOrg?: boolean; orgBound?: boolean; org?: boolean } = {}) {
+  const h = hosts(opts.perOrg);
   return createStudioApi({
     reader: new InMemoryJournal(),
     auth: roleAuth({ admin: { token: 'tok', ...(opts.orgBound === false ? {} : { orgId: 'acme' }) } }) as never,
@@ -86,8 +88,8 @@ function makeApp(opts: { orgScoped?: boolean; orgBound?: boolean; org?: boolean 
 
 const AUTH = { authorization: 'Bearer tok' };
 /** The same admin token, once bound to an organization and once not. */
-const orgApp = (o: { orgScoped?: boolean } = {}) => makeApp({ ...o, orgBound: true });
-const operatorApp = (o: { orgScoped?: boolean } = {}) => makeApp({ ...o, orgBound: false });
+const orgApp = (o: { perOrg?: boolean } = {}) => makeApp({ ...o, orgBound: true });
+const operatorApp = (o: { perOrg?: boolean } = {}) => makeApp({ ...o, orgBound: false });
 const ORG = AUTH;
 const OPERATOR = AUTH;
 
@@ -150,7 +152,7 @@ describe('an organization-bound identity on an unscopeable host object', () => {
     const body = await res.json();
     expect(body.code, 'an unlabelled 403 is read by the UI as a bad token, and the caller is signed out')
       .toBe('org_scope_refused');
-    expect(String(body.error), 'the refusal does not say what to do instead').toMatch(/orgScoped|omit `workflowStore`/);
+    expect(String(body.error), 'the refusal does not say what to do instead').toMatch(/\(\{ orgId \}\) =>|omit `workflowStore`/);
   });
 
   // The leak this was written for: the refusal reached list/def/CRUD and missed the routes that RUN
@@ -235,10 +237,10 @@ describe('an unscoped operator', () => {
   });
 });
 
-describe('a host object that declares `orgScoped: true`', () => {
+describe('a host store passed as a function of the organization', () => {
   it.each(REFUSING)('%s — %s is served to the org-bound identity (%#)', async (_what, _label, send) => {
-    const res = await send(orgApp({ orgScoped: true }), ORG);
-    expect(res.status, 'the host said it honours the organization it is handed and was refused anyway')
+    const res = await send(orgApp({ perOrg: true }), ORG);
+    expect(res.status, 'the host gave a store per organization and was refused anyway')
       .not.toBe(403);
   });
 });
@@ -262,8 +264,8 @@ describe('GET /capabilities', () => {
     }
   });
 
-  it('reports them as true to an org-bound identity when the host declares `orgScoped: true`', async () => {
-    const c = await caps(orgApp({ orgScoped: true }), ORG);
+  it('reports them as true to an org-bound identity when the host passes a store per organization', async () => {
+    const c = await caps(orgApp({ perOrg: true }), ORG);
     for (const k of ['knowledge', 'queue', 'cache', 'workflowManage']) expect(c[k]).toBe(true);
   });
 
@@ -384,11 +386,11 @@ describe('the boot warning', () => {
     }
   });
 
-  it('is not printed for objects that declare `orgScoped: true`', () => {
+  it('is not printed for stores passed as a function of the organization', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     createStudioApi({ reader: new InMemoryJournal(), org: {}, ...hosts(true) } as never);
 
     expect(warn.mock.calls.flat().filter((m) => String(m).includes('are refused')),
-      'a host that claims the boundary was warned anyway').toEqual([]);
+      'a host that gave a store per organization was warned anyway').toEqual([]);
   });
 });

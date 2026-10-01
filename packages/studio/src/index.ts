@@ -20,6 +20,7 @@ export type {
   ToolListItem,
   StudioMemory,
   StudioMemoryOption,
+  StudioScopedOption,
   StudioWorkflows,
   WorkflowMeta,
   StudioScorers,

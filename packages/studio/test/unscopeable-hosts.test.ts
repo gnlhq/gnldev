@@ -15,9 +15,9 @@
 //   GET  /workflows             -> 200, another org's definition INCLUDING its prompt template
 //   DELETE /workflows/secret    -> 200, and the other org's definition is gone
 //
-// A host that HAS made its object org-aware says so by setting `orgScoped: true` on it — an explicit
-// claim, in the host's own code. Refusing by default is the only side that fails safe: a wrong refusal
-// costs a config line, a wrong service lets one tenant read another's data.
+// A host that keeps a store per organization passes it as a function of the organization, and Studio
+// asks it for the caller's store. Refusing an object by default is the only side that fails safe: a
+// wrong refusal costs a config line, a wrong service lets one tenant read another's data.
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { InMemoryJournal } from '@gnldev/durable';
 import { roleAuth } from '@gnldev/auth';
@@ -75,14 +75,14 @@ describe('host objects with no organization boundary', () => {
     expect((await res.json()).error).toMatch(/no organization boundary/);
   });
 
-  it('serves them when the host declares the object IS organization-aware', async () => {
-    // The escape hatch has to exist, or a correctly-built host is punished for someone else's problem.
-    // It is an explicit claim rather than an inference, because nothing here can verify it.
+  it('serves them when the host passes a store per organization', async () => {
+    // The way through has to exist, or a correctly-built host is punished for someone else's problem.
+    // It is the function form, not a claim: Studio obtains the caller's own store from it.
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const hosts = blindHosts();
     const app = createStudioApi({
       reader: new InMemoryJournal(), auth: boundAdmin, org: {},
-      ...hosts, vectors: { ...hosts.vectors, orgScoped: true },
+      ...hosts, vectors: () => hosts.vectors,
     } as never);
 
     const res = await as(app, '/knowledge/search', { method: 'POST', body: JSON.stringify({ query: 'x' }) });
