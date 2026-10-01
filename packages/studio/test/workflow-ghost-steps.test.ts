@@ -42,3 +42,35 @@ describe('the workflow step readers tell steps from bookkeeping', () => {
     expect(isWorkflowStepKey('attempts')).toBe(true); // a step legitimately named that
   });
 });
+
+// The rule belongs to @gnldev/workflow (`isEngineRecordKey`); the studio core keeps a written-out
+// negation because it does not import the optional peer. Round 3 found the two disagreeing: the builder
+// accepted `_cache`, `load:_x` and `tries:attempts`, and this reader hid them — the step ran and Studio
+// never showed it. Now the builder refuses exactly what the owner calls an engine record, and this pins
+// the copy to the owner.
+describe("isWorkflowStepKey is @gnldev/workflow's isEngineRecordKey, negated", () => {
+  const keys = [
+    '_suspend', '_canceled', '_input', '_resume:approval-1', '_cache', '_private',
+    'charge:_fallback', 'charge:_claim', 'load:_x', 'payment:charge:_fallback', 'a/_b:_c',
+    'charge:attempts', 'tries:attempts', 'payment:charge:attempts',
+    'charge', 'attempts', 'attempts:x', 'charge_card', 'payment:charge_card', 'payment:checkFunds',
+    'P/a', 'P/_a', 'loop#3', 'items[0]', 'items:0:price', 'x:attempts2', 'x:attempt', ':', '',
+  ];
+  it.each(keys)('%j', async (key) => {
+    const { isEngineRecordKey } = await import('@gnldev/workflow');
+    expect(isWorkflowStepKey(key)).toBe(!isEngineRecordKey(key));
+  });
+
+  it('every step a workflow can be built with is shown; every id it refuses as reserved would have been hidden', async () => {
+    const { workflow, step } = await import('@gnldev/workflow');
+    for (const id of keys.filter(Boolean)) {
+      let built = true;
+      try { workflow<number>().then(step(id, async (n: number) => n)); } catch (e) {
+        built = false;
+        // Refused for another reason than the reserved rule would be a different test's business.
+        expect(String((e as Error).message)).toMatch(/reserved/);
+      }
+      expect(built, id).toBe(isWorkflowStepKey(id));
+    }
+  });
+});

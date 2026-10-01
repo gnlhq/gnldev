@@ -17,11 +17,14 @@ import { pipeAgentStream } from './sse.js';
 /**
  * Is this `<runId>:wf:<rest>` key a STEP, or one of the engine's bookkeeping records?
  *
- * @gnldev/workflow reserves a leading `_` on any path segment for control records (`_suspend`,
- * `_canceled`, `_resume:<waitId>`, a retry's `<id>:_fallback`) and writes retry counters as
- * `<id>:attempts`. Its own fork sweep skips exactly these. The Studio readers skipped only the
- * literal `_suspend`, so a run whose retry fell back to a substitute rendered four rows for one
- * step — the output, the counter, the marker, and the substitute.
+ * The rule belongs to @gnldev/workflow: `isEngineRecordKey(rest)` decides it, and a workflow refuses at
+ * build every step whose key it calls an engine record, so this answer and the builder cannot
+ * disagree about a step. This is `!isEngineRecordKey(rest)`, written out rather than imported because
+ * the studio core does not import @gnldev/workflow (an optional peer — see `@gnldev/studio/workflow`);
+ * test/workflow-ghost-steps.test.ts runs both over the same keys so the copy cannot drift.
+ *
+ * The Studio readers once skipped only the literal `_suspend`, so a run whose retry fell back to a
+ * substitute rendered four rows for one step — the output, the counter, the marker, and the substitute.
  */
 export function isWorkflowStepKey(rest: string): boolean {
   if (rest.startsWith('_') || rest.includes(':_')) return false;
@@ -5194,8 +5197,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // NOTE on `isWorkflowStepKey`: three places below list `<runId>:wf:*` and turn each key into a row.
   // All three filtered exactly one name, `_suspend`, so every other bookkeeping key was rendered as a
   // step the workflow never had: `_canceled`, `_resume:<waitId>`, a retry's `<id>:attempts`, and a
-  // substitution marker `<id>:_fallback`. @gnldev/workflow reserves the `_` prefix for exactly this
-  // distinction and its own fork sweep already honours it (`tail.includes(':_') || endsWith(':attempts')`);
+  // substitution marker `<id>:_fallback`. @gnldev/workflow's `isEngineRecordKey` draws exactly this
+  // distinction, its fork sweep calls it, and `isWorkflowStepKey` is its negation (see there).
   // The reader did not. A run whose retry fell back showed four rows for one step.
   // Without changing the engine: start runWorkflow + poll the `<runId>:wf:*` keys. Requires listKeys+get.
   // What-if fork (workflow): copy the output of the first `upto` steps to a new runId → with the same

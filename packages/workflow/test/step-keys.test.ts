@@ -112,8 +112,12 @@ describe('KEYS — one journal key per step use', () => {
       expect(await wf.run(1, { runId: 'ok3', journal: casJournal() })).toBe(4);
     });
 
-    it('a step named "_private" (not an engine record) is fine', async () => {
-      expect(await workflow<number>().then(step('_private', async (n: number) => n)).run(5, { runId: 'ok4', journal: casJournal() })).toBe(5);
+    // Round 3: '_private' was accepted here and then hidden by Studio and skipped by the fork sweep,
+    // which treat every '_' segment as bookkeeping. One rule now (isEngineRecordKey, key-rules.test.ts):
+    // it is refused at build. An underscore anywhere else in a name is still fine.
+    it('an underscore that does not start a segment is fine', async () => {
+      const wf = workflow<number>().then(step('my_step', async (n: number) => n)).then(step('pay:charge_card', async (n: number) => n));
+      expect(await wf.run(5, { runId: 'ok4', journal: casJournal() })).toBe(5);
     });
   });
 });

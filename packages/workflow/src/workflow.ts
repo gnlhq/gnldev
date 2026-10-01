@@ -77,8 +77,9 @@ export interface StepCtx {
    * The payload lives in the JOURNAL → reading it is replay-deterministic: once the consuming step
    * completes, its output is journaled and the payload is never re-read on replay.
    * NOTE: `waitId`s share ONE per-run namespace (deliberately NOT keyPrefix-scoped — the operator
-   * resuming a run addresses a waitId without knowing which nested workflow hosts it); keep them
-   * unique across nested workflows the same way you already must for `_suspend`.
+   * resuming a run addresses a waitId without knowing which nested workflow hosts it). A workflow that
+   * uses one `waitForResume` gate twice — the same nested workflow under two `asStep`s — is refused
+   * where it is built: give the second gate its own waitId.
    */
   resumeData?<T = unknown>(waitId: string): Promise<T | undefined>;
   /**
@@ -467,11 +468,12 @@ async function runSideEffectStep(
 // A step's journal key is its id — but not only its id. A nested workflow's steps live at
 // `<outer>:<inner>`, a retry keeps `<id>:attempts` and `<id>:_fallback`, its fallback runs under its
 // own id in the SAME namespace, a sideEffect step writes `<id>:_claim`, a parallel leg runs as
-// `<pid>/<leg>`, loop rounds as `<id>#<n>`, foreach items as `<id>[<n>]`, and the engine keeps
-// `_suspend`, `_canceled`, `_input` and `_resume:*` beside them. Two uses that reach one key make the
-// second replay the first one's output — on a FRESH run, with no error. Checking ids alone missed
-// every case where the key is built from more than the id (a top-level `pay:check` and a `check`
-// inside `asStep('pay')`), so the check is on the keys themselves, where the workflow is built.
+// `<pid>/<leg>`, loop rounds as `<id>#<n>`, foreach items as `<id>[<n>]`, a `waitForResume` gate reads
+// `_resume:<waitId>`, and the engine keeps `_suspend`, `_canceled` and `_input` beside them. Two uses
+// that reach one key make the second replay the first one's output — on a FRESH run, with no error.
+// Checking ids alone missed every case where the key is built from more than the id (a top-level
+// `pay:check` and a `check` inside `asStep('pay')`), so the check is on the keys themselves, where the
+// workflow is built.
 //
 // What a step's BODY writes beyond the key it runs under is recorded against its run function, not
 // the step object: a renamed copy — `step('sub-2', sub.run)` — runs the same body, and an asStep body
@@ -480,94 +482,192 @@ interface KeyClaim {
   key: string;
   /** `exact`: that key. `loop`: every `<key>#<n>`. `foreach`: every `<key>[<n>]`. */
   kind: 'exact' | 'loop' | 'foreach';
-  /** Who writes it, for the error. */
-  from: string;
-  /** The one line that separates it, for the error. */
-  fix: string;
+  /** Who writes it, for the error (absent: `step '<key>'` — built only if an error needs it, see `fromOf`). */
+  from?: string;
+  /** The one line that separates it, for the error (absent: `give step '<key>' another id`). */
+  fix?: string;
+  /** The id the developer chose for whatever writes this key — what to rename when the key is reserved. */
+  owner: string;
+  /** The engine writes this key for its own bookkeeping (a counter, a marker, a claim, a resume payload). */
+  engine?: true;
+  /** One key per RUN, not namespaced by an enclosing `asStep` (resume payloads — see StepCtx.resumeData). */
+  runWide?: true;
+  /** What two uses of the same kind sharing the key would do, for the error (default: the second replays the first one's output). */
+  effect?: string;
 }
 interface BodyInfo {
-  kind: 'asStep' | 'retry' | 'composite';
+  kind: 'asStep' | 'retry' | 'composite' | 'wait';
   id: string;
-  claims: () => KeyClaim[];
+  /** `usedAs`: the id of the step object carrying this body — a renamed copy's, when it is one. */
+  claims: (usedAs: string) => KeyClaim[];
 }
 const BODIES = new WeakMap<Function, BodyInfo>();
 
 /** Every key one use of `s` writes when it runs under `runAs` (a parallel leg or branch arm runs under a scoped id). */
 function claimsOf(s: Step, runAs: string = s.id): KeyClaim[] {
-  const fix = `give step '${runAs}' another id`;
-  const own: KeyClaim[] = [{ key: runAs, kind: 'exact', from: `step '${runAs}'`, fix }];
-  if (s.durability?.sideEffect) own.push({ key: `${runAs}:_claim`, kind: 'exact', from: `the side-effect claim of step '${runAs}'`, fix });
-  return [...own, ...(BODIES.get(s.run)?.claims() ?? [])];
+  // The step's own key carries no text: it is the claim every step has, so its words are built only
+  // when an error needs them (`fromOf` / `fixOf`), not on every `.then`.
+  const own: KeyClaim[] = [{ key: runAs, kind: 'exact', owner: s.id }];
+  if (s.durability?.sideEffect) own.push({ key: `${runAs}:_claim`, kind: 'exact', from: `the side-effect claim of step '${runAs}'`, fix: `give step '${runAs}' another id`, owner: s.id, engine: true });
+  const body = BODIES.get(s.run);
+  if (body) for (const c of body.claims(s.id)) own.push(c);
+  return own;
 }
 
-function claimMatches(pattern: KeyClaim, key: string): boolean {
-  const open = pattern.kind === 'loop' ? '#' : '[';
-  if (!key.startsWith(pattern.key + open)) return false;
-  const rest = key.slice(pattern.key.length + 1);
-  return pattern.kind === 'loop' ? /^\d+$/.test(rest) : /^\d+\]$/.test(rest);
+/**
+ * Is this key — the part of a journal key after `<runId>:wf:` — one of the engine's own records rather
+ * than a step's output?
+ *
+ * The ONE place that decides it. The engine writes its bookkeeping under a path segment that starts
+ * with `_` (`_suspend`, `_canceled`, `_input`, `_resume:<waitId>`, `<id>:_claim`, `<id>:_fallback`) and
+ * a retry's counter at `<id>:attempts`; a workflow refuses, where it is built, every step whose key
+ * this answers `true` for, so a reader that lists `<runId>:wf:*` can use it to tell steps from
+ * bookkeeping — `forkWorkflowRun` does, and so does Studio's run view.
+ */
+export function isEngineRecordKey(rest: string): boolean {
+  return rest.startsWith('_') || rest.includes(':_') || rest.endsWith(':attempts');
 }
 
-function claimsCollide(a: KeyClaim, b: KeyClaim): boolean {
-  if (a.kind === 'exact' && b.kind === 'exact') return a.key === b.key;
-  if (a.kind === 'exact') return claimMatches(b, a.key);
-  if (b.kind === 'exact') return claimMatches(a, b.key);
-  return a.kind === b.kind && a.key === b.key;
-}
+const fromOf = (c: KeyClaim) => c.from ?? `step '${c.key}'`;
+const fixOf = (c: KeyClaim) => c.fix ?? `give step '${c.key}' another id`;
 
+/** One key a pattern claim stands for — enough to ask `isEngineRecordKey` about all of them. */
+const sampleKey = (c: KeyClaim) => (c.kind === 'loop' ? `${c.key}#0` : c.kind === 'foreach' ? `${c.key}[0]` : c.key);
 const shownKey = (c: KeyClaim) => (c.kind === 'loop' ? `${c.key}#<n>` : c.kind === 'foreach' ? `${c.key}[<n>]` : c.key);
 
-/** Refuses two step uses (one group each) that reach one journal key. */
-function assertDistinctKeys(groups: KeyClaim[][]): void {
-  for (let i = 0; i < groups.length; i++) {
-    for (let j = i + 1; j < groups.length; j++) {
-      for (const a of groups[i]!) {
-        for (const b of groups[j]!) {
-          if (!claimsCollide(a, b)) continue;
-          const key = a.kind === 'exact' ? a.key : shownKey(b.kind === 'exact' ? b : a);
-          throw new Error(
-            `@gnldev/workflow: ${a.from} and ${b.from} are both journaled at '${key}', so the second would replay the first one's output instead of running. To keep both: ${b.fix}.`,
-          );
-        }
+/** The nearest id to `id` whose keys the engine does not reserve, for the error. */
+function unreservedId(id: string): string {
+  const segs = id.split(':').map((seg) => seg.replace(/^_+/, '')).filter(Boolean);
+  if (segs.length && segs[segs.length - 1] === 'attempts') segs[segs.length - 1] = 'attempt-count';
+  return segs.join(':') || 'step';
+}
+
+/** The pattern an exact key would be one member of: `x#3` is a round of loop `x`, `f[0]` an item of foreach `f`. */
+function patternOf(key: string): { kind: 'loop' | 'foreach'; base: string } | undefined {
+  const last = key.charCodeAt(key.length - 1);
+  if (last >= 48 && last <= 57) {
+    const h = key.lastIndexOf('#');
+    if (h >= 0 && /^\d+$/.test(key.slice(h + 1))) return { kind: 'loop', base: key.slice(0, h) };
+  } else if (last === 93 /* ] */) {
+    const b = key.lastIndexOf('[');
+    if (b >= 0 && /^\d+$/.test(key.slice(b + 1, -1))) return { kind: 'foreach', base: key.slice(0, b) };
+  }
+  return undefined;
+}
+
+/**
+ * The keys the step uses so far claim, so that adding one use checks only that use's keys: an exact
+ * key is one lookup, a loop or foreach pattern is one lookup by its base, and an exact key that LOOKS
+ * like a pattern member (`x#3`, `f[0]`) is also filed under the base it would belong to.
+ *
+ * It used to compare every pair of uses again on every `.then`, which made building a workflow cubic in
+ * its length — measured, 1000 steps took over two seconds against 1 ms in 0.9.0.
+ */
+class KeyIndex {
+  // A use's claims are all checked before any is filed, so whatever these hold belongs to an EARLIER use.
+  private readonly exact = new Map<string, KeyClaim>();
+  private readonly patterns = { loop: new Map<string, KeyClaim>(), foreach: new Map<string, KeyClaim>() };
+  private readonly members = { loop: new Map<string, KeyClaim>(), foreach: new Map<string, KeyClaim>() };
+  private readonly ids = new Set<string>();
+  /** How many step uses this index holds. */
+  uses = 0;
+
+  static of(steps: Step[]): KeyIndex {
+    const idx = new KeyIndex();
+    for (const s of steps) idx.addStep(s);
+    return idx;
+  }
+
+  /** One step of the workflow: its id must be new, its keys unclaimed and not reserved. */
+  addStep(s: Step): void {
+    if (this.ids.has(s.id)) throw duplicateIdError(s);
+    const claims = claimsOf(s);
+    this.assertFree(claims);
+    for (const c of claims) {
+      if (c.engine || !isEngineRecordKey(sampleKey(c))) continue;
+      throw new Error(
+        `@gnldev/workflow: ${fromOf(c)} would be journaled at '${shownKey(c)}', a key reserved for the engine's own records — any path segment starting with '_' (as in '_suspend', '_resume:<waitId>', '<id>:_fallback') and any key ending ':attempts' (a retry's counter). Studio and forkWorkflowRun skip those keys as bookkeeping, so the step would run but never be shown or forked. To keep it: rename '${c.owner}', e.g. '${unreservedId(c.owner)}'.`,
+      );
+    }
+    this.ids.add(s.id);
+    this.insert(claims);
+  }
+
+  /** Several uses that run in one run with no ids to compare (parallel legs): keys only. */
+  addUse(claims: KeyClaim[]): void {
+    this.assertFree(claims);
+    this.insert(claims);
+  }
+
+  private assertFree(claims: KeyClaim[]): void {
+    for (const b of claims) {
+      const a = this.holderOf(b);
+      if (!a) continue;
+      const key = a.kind === 'exact' ? a.key : shownKey(b.kind === 'exact' ? b : a);
+      throw new Error(
+        `@gnldev/workflow: ${fromOf(a)} and ${fromOf(b)} are both journaled at '${key}', ${a.effect !== undefined && a.effect === b.effect ? a.effect : "so the second would replay the first one's output instead of running"}. To keep both: ${fixOf(b)}.`,
+      );
+    }
+  }
+
+  /** The claim an earlier use holds on any key `c` reaches. */
+  private holderOf(c: KeyClaim): KeyClaim | undefined {
+    if (c.kind === 'exact') {
+      const hit = this.exact.get(c.key);
+      if (hit) return hit;
+      const p = patternOf(c.key);
+      return p ? this.patterns[p.kind].get(p.base) : undefined;
+    }
+    return this.patterns[c.kind].get(c.key) ?? this.members[c.kind].get(c.key);
+  }
+
+  private insert(claims: KeyClaim[]): void {
+    this.uses++;
+    for (const c of claims) {
+      if (c.kind !== 'exact') {
+        if (!this.patterns[c.kind].has(c.key)) this.patterns[c.kind].set(c.key, c);
+        continue;
       }
+      if (this.exact.has(c.key)) continue; // the same use reaching one key twice (both arms of a branch)
+      this.exact.set(c.key, c);
+      const p = patternOf(c.key);
+      if (p && !this.members[p.kind].has(p.base)) this.members[p.kind].set(p.base, c);
     }
   }
 }
 
-/** Keys the engine writes for itself in a run's `<runId>:wf:` namespace. */
-const RESERVED_KEYS = new Set(['_suspend', '_canceled', '_input']);
-const RESERVED_PREFIX = '_resume:';
-
-function assertNoReservedKey(claims: KeyClaim[]): void {
-  for (const c of claims) {
-    if (c.kind !== 'exact' || !(RESERVED_KEYS.has(c.key) || c.key.startsWith(RESERVED_PREFIX))) continue;
-    throw new Error(
-      `@gnldev/workflow: ${c.from} would be journaled at '${c.key}', a key the engine keeps its own record under — '_suspend', '_canceled', '_input' and every '_resume:<waitId>' are reserved. To keep it: ${c.fix}.`,
-    );
-  }
+/** Refuses two step uses (one group each) that reach one journal key. */
+function assertDistinctKeys(groups: KeyClaim[][]): void {
+  const idx = new KeyIndex();
+  for (const g of groups) idx.addUse(g);
 }
 
 /**
  * One step id used twice in one workflow — the commonest form of the collision above, kept as its own
- * message because its way through depends on what the step is: a renamed copy of an asStep or a retry
- * would still write the original's nested keys or counter.
+ * message because its way through depends on what the step is: a renamed copy of an asStep, a retry
+ * or a resume gate would still write the original's nested keys, counter or waitId.
  */
+function duplicateIdError(s: Step): Error {
+  const id = s.id;
+  const body = BODIES.get(s.run);
+  const fix =
+    body?.kind === 'asStep'
+      ? `asStep('${id}-2', <the same workflow>) — not step('${id}-2', ${safeIdent(id)}.run), whose nested steps would still be journaled under '${body.id}:'`
+      : body?.kind === 'retry'
+        ? `retry(step('${id}-2', <the retried step>.run), <the same policy>) — a renamed copy of the retry itself keeps its attempt counter at '${body.id}:attempts'`
+        : body?.kind === 'wait'
+          ? `waitForResume('${id}-2') — a renamed copy, step('${id}-2', ${safeIdent(id)}.run), still waits on '${body.id}'`
+          : `step('${id}-2', ${safeIdent(id)}.run) (pass ${safeIdent(id)}.durability as the third argument if it has one)`;
+  return new Error(
+    `@gnldev/workflow: step id '${id}' is used twice in one workflow. Every step is journaled under its id, so the second use would replay the first one's output instead of running. Give each use its own id: ${fix}.`,
+  );
+}
+
 function assertUniqueStepIds(steps: Step[]): void {
   const seen = new Set<string>();
   for (const s of steps) {
-    const id = s.id;
-    if (seen.has(id)) {
-      const body = BODIES.get(s.run);
-      const fix =
-        body?.kind === 'asStep'
-          ? `asStep('${id}-2', <the same workflow>) — not step('${id}-2', ${safeIdent(id)}.run), whose nested steps would still be journaled under '${body.id}:'`
-          : body?.kind === 'retry'
-            ? `retry(step('${id}-2', <the retried step>.run), <the same policy>) — a renamed copy of the retry itself keeps its attempt counter at '${body.id}:attempts'`
-            : `step('${id}-2', ${safeIdent(id)}.run) (pass ${safeIdent(id)}.durability as the third argument if it has one)`;
-      throw new Error(
-        `@gnldev/workflow: step id '${id}' is used twice in one workflow. Every step is journaled under its id, so the second use would replay the first one's output instead of running. Give each use its own id: ${fix}.`,
-      );
-    }
-    seen.add(id);
+    if (seen.has(s.id)) throw duplicateIdError(s);
+    seen.add(s.id);
   }
 }
 
@@ -576,24 +676,41 @@ function safeIdent(id: string): string {
   return /^[A-Za-z_$][\w$]*$/.test(id) ? id : 'yourStep';
 }
 
+/** Hands a builder's key index to the workflow `extend` is constructing (synchronous, so one slot does). */
+let seed: { steps: Step[]; keys: KeyIndex } | undefined;
+
 export class Workflow<I = any, O = any> {
+  private readonly keys: KeyIndex;
+
   constructor(private readonly steps: Step[]) {
-    assertUniqueStepIds(steps);
-    const groups = steps.map((s) => claimsOf(s));
-    assertNoReservedKey(groups.flat());
-    assertDistinctKeys(groups);
+    const handed = seed?.steps === steps ? seed.keys : undefined;
+    seed = undefined;
+    this.keys = handed ?? KeyIndex.of(steps);
+  }
+
+  /**
+   * This workflow plus one step, checking only that step's keys. The index is shared with the new
+   * workflow while this one is the last to have extended it; a second extension of the same builder
+   * (`base.then(a)`, then `base.then(b)`) finds it already holding another step and starts its own.
+   */
+  private extend<NO>(s: Step): Workflow<I, NO> {
+    const keys = this.keys.uses === this.steps.length ? this.keys : KeyIndex.of(this.steps);
+    keys.addStep(s); // throws before touching the index
+    const steps = [...this.steps, s];
+    seed = { steps, keys };
+    return new Workflow<I, NO>(steps);
   }
 
   /** Add a sequential step (previous output becomes this step's input). */
   then<NO>(s: Step<O, NO>): Workflow<I, NO> {
-    return new Workflow<I, NO>([...this.steps, s]);
+    return this.extend<NO>(s);
   }
 
   /** Transform the previous output with a pure function (journaled → replay-safe). If no id is given, one is derived uniquely. */
   map<NO>(fn: (input: O) => NO | Promise<NO>, id?: string): Workflow<I, NO> {
     const mid = id ?? `map#${this.steps.length}`;
     const mapStep: Step<O, NO> = { id: mid, run: async (input) => fn(input) };
-    return new Workflow<I, NO>([...this.steps, mapStep]);
+    return this.extend<NO>(mapStep);
   }
 
   /** Parallel steps (all receive the same input; output is `{ [stepId]: output }`). Each sub-step is journaled separately. */
@@ -623,7 +740,7 @@ export class Workflow<I = any, O = any> {
       },
     };
     BODIES.set(composite.run, { kind: 'composite', id: pid, claims: () => legClaims().flat() });
-    return new Workflow<I, Record<string, any>>([...this.steps, composite]);
+    return this.extend<Record<string, any>>(composite);
   }
 
   /** Conditional branch: cond(input) ? ifStep : elseStep. */
@@ -642,7 +759,7 @@ export class Workflow<I = any, O = any> {
     // Only one arm runs per input, so the arms are not checked against each other — only against the
     // rest of the workflow.
     BODIES.set(composite.run, { kind: 'composite', id: bid, claims: () => [...claimsOf(ifStep, `${bid}/${ifStep.id}`), ...claimsOf(elseStep, `${bid}/${elseStep.id}`)] });
-    return new Workflow<I, NO>([...this.steps, composite]);
+    return this.extend<NO>(composite);
   }
 
   /** Run `run` for each item (journaled separately per item → completed ones are skipped on resume).
@@ -668,8 +785,8 @@ export class Workflow<I = any, O = any> {
         return out;
       },
     };
-    BODIES.set(composite.run, { kind: 'composite', id: fid, claims: () => [{ key: fid, kind: 'foreach', from: `the items of foreach '${fid}'`, fix: `give foreach '${fid}' another id` }] });
-    return new Workflow<I, OT[]>([...this.steps, composite]);
+    BODIES.set(composite.run, { kind: 'composite', id: fid, claims: () => [{ key: fid, kind: 'foreach', from: `the items of foreach '${fid}'`, fix: `give foreach '${fid}' another id`, owner: fid }] });
+    return this.extend<OT[]>(composite);
   }
 
   /** Repeat `run` while `cond` is true (each round journaled separately). */
@@ -691,8 +808,8 @@ export class Workflow<I = any, O = any> {
         return cur;
       },
     };
-    BODIES.set(composite.run, { kind: 'composite', id, claims: () => [{ key: id, kind: 'loop', from: `the rounds of loop '${id}'`, fix: `give loop '${id}' another id` }] });
-    return new Workflow<I, O>([...this.steps, composite]);
+    BODIES.set(composite.run, { kind: 'composite', id, claims: () => [{ key: id, kind: 'loop', from: `the rounds of loop '${id}'`, fix: `give loop '${id}' another id`, owner: id }] });
+    return this.extend<O>(composite);
   }
 
   /** Common workflow-DSL `.dowhile` semantics: run `run` at least once, repeat while `cond` stays TRUE.
@@ -885,7 +1002,7 @@ export function waitForResume<T = unknown>(
   id: string,
   opts: { validate?: (v: unknown) => T; reason?: unknown } = {},
 ): Step<any, T> {
-  return {
+  const gate: Step<any, T> = {
     id,
     run: async (_input, ctx) => {
       const v = ctx.resumeData ? await ctx.resumeData(id) : undefined;
@@ -893,6 +1010,23 @@ export function waitForResume<T = unknown>(
       return opts.validate ? opts.validate(v) : (v as T);
     },
   };
+  // The payload key is one per run, whatever nests the gate: two uses of it — the same nested workflow
+  // under two asSteps, a renamed copy — would both open on one resume.
+  BODIES.set(gate.run, {
+    kind: 'wait',
+    id,
+    claims: () => [{
+      key: `_resume:${id}`,
+      kind: 'exact',
+      from: `the resume payload of waitForResume('${id}')`,
+      fix: `give the second gate its own waitId, waitForResume('${id}-2') — waitIds are one namespace per run, not scoped by asStep, so an operator can resume a gate without knowing where it is nested`,
+      owner: id,
+      engine: true,
+      runWide: true,
+      effect: 'so one resume would open both gates',
+    }],
+  });
+  return gate;
 }
 
 // ── P0.4 — durable cancel + suspended-run registry ─────────────────────────────
@@ -966,6 +1100,7 @@ export async function forkWorkflowRun(
     }
   }
 
+  const topLevel = new Set(order);
   const prefixIds = order.slice(0, at);
   const copiedSteps: string[] = [];
   for (const id of prefixIds) {
@@ -983,11 +1118,13 @@ export async function forkWorkflowRun(
       if (marker !== undefined) await journal.put(`${dstRunId}:wf:${id}:_fallback`, marker);
     }
     // Nested sub-workflow steps live under `<runId>:wf:<id>:<inner>` — sweep them when the journal
-    // can list, skipping control keys (`_suspend`, `_resume:*`, ...) and retry counters.
+    // can list, skipping the engine's own records (`isEngineRecordKey`) and every key that belongs to
+    // ANOTHER top-level step: an id may itself contain ':' (`a:x` beside `a`), and a fork at `a:x`
+    // must re-run `a:x`, not find it copied by `a`'s sweep.
     if (journal.listKeys) {
       for (const key of await journal.listKeys(`${srcRunId}:wf:${id}:`)) {
         const tail = key.slice(`${srcRunId}:wf:`.length);
-        if (tail.includes(':_') || tail.endsWith(':attempts')) continue;
+        if (isEngineRecordKey(tail) || topLevelOwnerOf(tail, topLevel) !== id) continue;
         const v = await journal.get(key);
         if (v !== undefined) await journal.put(`${dstRunId}:wf:${tail}`, v);
       }
@@ -998,6 +1135,16 @@ export async function forkWorkflowRun(
     runId: dstRunId, status: 'forked', forkedFrom: { runId: srcRunId, fromStepId }, at: Date.now(),
   });
   return { dstRunId, copiedSteps };
+}
+
+/** The top-level step a nested key belongs to: the longest id in `ids` that is the key itself or precedes a ':' in it. */
+function topLevelOwnerOf(tail: string, ids: Set<string>): string | undefined {
+  if (ids.has(tail)) return tail;
+  for (let i = tail.lastIndexOf(':'); i > 0; i = tail.lastIndexOf(':', i - 1)) {
+    const head = tail.slice(0, i);
+    if (ids.has(head)) return head;
+  }
+  return undefined;
 }
 
 export async function cancelWorkflowRun(
@@ -1208,17 +1355,19 @@ export function retry<I = any, O = any>(s: Step<I, O>, policy: RetryPolicy<I, O>
     },
   };
   // The counter, the marker and the fallback's own record are written by the body, under `s.id` — the
-  // id this retry was created with, whatever a renamed copy is later called.
-  const fix = `give step '${s.id}' another id`;
+  // id this retry was created with, whatever a renamed copy is later called. So the way to a second
+  // use is a second retry around a renamed step, never a renamed copy of this one.
+  const fix = `retry(step('${s.id}-2', <the retried step>.run), <the same policy>) — a renamed copy of the retry itself keeps its attempt counter at '${s.id}:attempts'`;
+  const via = (usedAs: string) => (usedAs === s.id ? '' : ` (written by '${usedAs}', a renamed copy of the retry)`);
   BODIES.set(retried.run, {
     kind: 'retry',
     id: s.id,
-    claims: () => [
-      ...(BODIES.get(s.run)?.claims() ?? []),
-      { key: `${s.id}:attempts`, kind: 'exact', from: `retry('${s.id}')'s attempt counter`, fix },
-      { key: `${s.id}:_fallback`, kind: 'exact', from: `retry('${s.id}')'s fallback marker`, fix },
+    claims: (usedAs) => [
+      ...(BODIES.get(s.run)?.claims(s.id) ?? []),
+      { key: `${s.id}:attempts`, kind: 'exact', from: `retry('${s.id}')'s attempt counter${via(usedAs)}`, fix, owner: s.id, engine: true, effect: "so the second would spend the first one's attempts (and, once they are used up, never run)" },
+      { key: `${s.id}:_fallback`, kind: 'exact', from: `retry('${s.id}')'s fallback marker${via(usedAs)}`, fix, owner: s.id, engine: true, effect: "so one use's record of a fallback would be read as the other's" },
       ...(policy.fallback
-        ? claimsOf(policy.fallback).map((c) => ({ ...c, from: `${c.from} (the fallback of retry('${s.id}'))`, fix: `give the fallback '${policy.fallback!.id}' another id` }))
+        ? claimsOf(policy.fallback).map((c) => ({ ...c, from: `${fromOf(c)} (the fallback of retry('${s.id}'))`, fix: `give the fallback '${policy.fallback!.id}' another id` }))
         : []),
     ],
   });
@@ -1246,12 +1395,16 @@ export function asStep<I = any, O = any>(id: string, wf: Workflow<I, O>): Step<I
     kind: 'asStep',
     id,
     claims: () =>
-      wf.build().flatMap((inner) => claimsOf(inner)).map((c) => ({
-        key: `${id}:${c.key}`,
-        kind: c.kind,
-        from: `${c.from} inside asStep('${id}')`,
-        fix: `give the nested workflow its own id: asStep('${id}-2', <the same workflow>)`,
-      })),
+      wf.build().flatMap((inner) => claimsOf(inner)).map((c) =>
+        c.runWide
+          ? { ...c, from: `${fromOf(c)} inside asStep('${id}')` }
+          : {
+              ...c,
+              key: `${id}:${c.key}`,
+              from: `${fromOf(c)} inside asStep('${id}')`,
+              fix: `give the nested workflow its own id: asStep('${id}-2', <the same workflow>)`,
+            },
+      ),
   });
   return nested;
 }

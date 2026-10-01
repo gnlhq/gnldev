@@ -15,9 +15,13 @@ Migration notes, one line each; the full entries under Security, Fixed and Chang
 and who is affected.
 
 - **Workflow step uses that share a journal key throw where the workflow is built** — a repeated id,
-  a top-level `pay:check` beside `asStep('pay')` with an inner `check`, a step named like a retry's
-  `<id>:attempts`, or `_suspend` / `_canceled` / `_input` / `_resume:*`. Rename one:
-  `step('inc-2', inc.run)`, or `asStep('pay-2', child)` for a nested workflow.
+  a top-level `pay:check` beside `asStep('pay')` with an inner `check`, or one `waitForResume` gate used
+  twice (the same nested workflow under two `asStep`s). Rename one: `step('inc-2', inc.run)`,
+  `asStep('pay-2', child)` for a nested workflow, `waitForResume('approve-2')` for a gate.
+- **A workflow step whose key is an engine record throws where it is built** — any path segment that
+  starts with `_` (`_cache`, `load:_x`, `_suspend`) and any key ending `:attempts` (`tries:attempts`, or
+  a step `attempts` inside `asStep('pay')`). Studio hid these steps and forks did not copy them. The
+  error names a legal id (`cache`, `load:x`, `tries:attempt-count`); `isEngineRecordKey(rest)` is the rule.
 - **A workflow step's record changed shape for two kinds of output**: `undefined` is stored as
   `{ __gnlStepRecord: 'void' }`, and an output that has a `__gnlStepRecord` key is stored wrapped. Code
   that reads `<runId>:wf:<step>` keys itself: read through `decodeStepRecord(v)` from @gnldev/durable.
@@ -92,7 +96,7 @@ and who is affected.
   `DOC_TRAIL_KEY`, `CHUNK_TRAIL_KEY`.
 - @gnldev/tool-schema: `shapeToolDefinitions`, `chainToolCompat`, `ToolSchemaError`, and the type
   `ShapeContext` (a rule's `transform` receives it as a third argument).
-- @gnldev/workflow: `isVoidStepRecord`.
+- @gnldev/workflow: `isVoidStepRecord`, `isEngineRecordKey`.
 - @gnldev/evals: `DatasetCase.context`; `scoreRun`'s `context` and `input` options (type
   `ScoreRunOptions` is now exported).
 - @gnldev/queue: `retryJob(work, id, { newRun: true })`.
@@ -250,6 +254,23 @@ and who is affected.
   still writes under `pay:` and is refused too. The two arms of a `branch` (one runs per input) may
   still reuse an id, and so may a step inside a nested workflow and outside it; an id containing `:` is
   fine on its own. Who is affected: a workflow whose outputs were already wrong.
+  Which keys are the engine's is one rule, `isEngineRecordKey(rest)` (a segment starting with `_`, or
+  a key ending `:attempts`): the builder refuses a step whose key it matches, and `forkWorkflowRun` and
+  Studio's run view skip exactly those keys — before, `_cache`, `load:_x` and `tries:attempts` were
+  accepted, ran, and never showed in Studio or a fork. The check costs one lookup per key a step
+  writes; measured building 1 000 steps with `.then`, interleaved with 0.9.0 (median of 10): 0.9.0
+  2.0–3.7 ms, this 2.5–5.2 ms (1.3–1.4×); 5 000 steps 1.0–1.2×. A first cut re-compared every pair
+  of steps on each `.then` and took 2.3 s for 1 000 steps; it never shipped.
+- **@gnldev/workflow: one `waitForResume` gate used twice is refused, so one resume cannot open
+  both.** A waitId is one key per run (`_resume:<waitId>`, not scoped by `asStep`, so an operator
+  resumes it without knowing the nesting). Measured on 0.9.0 (SQLite): one nested workflow with
+  `waitForResume('approve')` as `asStep('a')` and `asStep('b')` — the resume meant for `a` completed
+  the run through `b` too. The builder now refuses it, and a renamed copy, naming
+  `waitForResume('approve-2')`; the same gate in both arms of a `branch` (one runs) is still fine.
+- **@gnldev/workflow: `forkWorkflowRun` no longer copies a later step whose id starts with an earlier
+  one's.** It swept every key under `<id>:` for a nested workflow's steps, so beside a step `a`, a
+  top-level step `a:x` was copied too — forking at `a:x` replayed it instead of running it. A swept key
+  now belongs to the longest top-level id it starts with.
 - **@gnldev/workflow: a step that returns `undefined` is replayed, not re-run — and every output
   replays as exactly what the step returned.** The engine asked "is there a record?" with
   `journal.get(key) !== undefined`, and every journal reads a stored `undefined` back as `undefined`.
