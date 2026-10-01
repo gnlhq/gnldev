@@ -5,7 +5,7 @@ import { Hono, type Context } from 'hono';
 import { sseResponse } from './sse.js';
 
 import { STUDIO_ERROR_CODES } from './error-codes.js';
-import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, reservedIdFailure, eraseSubject, subjectRuns, toJournal, decodeStepRecord } from '@gnldev/durable';
+import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, reservedIdFailure, eraseSubject, subjectRuns, toJournal, decodeStepRecord } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
 import type { JournalReader, Journal, Memory, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
@@ -3929,16 +3929,16 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       const err = e as ToolLoopDetectedError;
       return c.json({ error: err.message, code: LIMIT_ERROR_CODES.toolLoopDetected, detail: err.detail, resumable: true }, 422);
     }
-    // A `runId` re-used for a different conversation. 409 rather than the generic 400: the request is
-    // well-formed and collides with something that already exists. NO `resumable`, unlike everything
-    // else here — the others clear and the same runId then succeeds, while this one never will for this
-    // thread, so `true` would put a client in a loop. Same status, code and body as @gnldev/server's
-    // `threadMismatchResponse`, because a caller should not have to learn which host it is talking to;
-    // without it this fell through to the generic 400, which drops both the code and the `detail` that
-    // names the two threads.
-    if (e instanceof RunThreadMismatchError || (e as any)?.name === 'RunThreadMismatchError') {
-      const err = e as RunThreadMismatchError;
-      return c.json({ error: err.message, code: 'run_thread_mismatch', detail: err.detail }, 409);
+    // The engine's caller-conflict family (a runId re-used for another thread or target, another
+    // subject's run, …): the request is well-formed and collides with something that already exists.
+    // Read by `callerConflictCode`, as the fork and resume routes here and every other door do, so a
+    // new member needs no line here — this route used to name one member and answer the rest with a
+    // bare 400. NO `resumable`: the same runId never succeeds for this request, so `true` would put a
+    // client in a loop. The status comes from the one table the docs are checked against.
+    const conflict = callerConflictCode(e);
+    if (conflict) {
+      const err = e as { message?: string; detail?: unknown };
+      return c.json({ error: err.message, code: conflict, ...(err.detail !== undefined ? { detail: err.detail } : {}) }, (WIRE_ERROR_STATUS[conflict] ?? 409) as 409);
     }
     // A provider failure is not one of OURS — it matches nothing above and used to fall through to
     // the generic 400, telling the caller its request was malformed when the request was fine.

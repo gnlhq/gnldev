@@ -531,6 +531,16 @@ and who is affected.
 
 ### Fixed
 
+- **Studio's agent run and stream routes answered most caller-conflict refusals with a bare 400.** They
+  named one member of the family (`run_thread_mismatch`) and let the rest fall through to the generic
+  error, losing the code and the detail. Measured through the real engine: agent `b` driven with agent
+  `a`'s runId → 400 with no code, where @gnldev/server, AG-UI and chat answer `409 run_target_mismatch`;
+  `run_actor_mismatch` the same. They now read `callerConflictCode`, as Studio's fork and resume routes
+  and every other door already did, with the status from `WIRE_ERROR_STATUS`: 6 scenarios across both
+  routes, 6 answered with their code. An MCP tool call needs no such rule: its id is derived from the
+  tool's name and the work key, and a client cannot send one — the same key on two tools runs both, pinned
+  by a test.
+
 - **Studio's "delete messages after" answered 501 for every AgentMemory** — Studio called
   `truncateMessages`, AgentMemory has `truncateMessagesAfter`, and each side was only checked against its
   own copy of the contract; `gnl studio`'s adapter did not forward it at all. Now one contract
