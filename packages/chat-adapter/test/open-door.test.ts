@@ -54,7 +54,7 @@ describe('createChatRoute with no identify', () => {
     expect(r.status).toBe(403);
     const body = await r.json();
     expect(body.code).toBe('cross_site_refused');
-    expect(body.error).toContain('identify');
+    expect(body.error).toContain('allowCrossSite: true');
     expect(prompts).toHaveLength(0);
   });
 
@@ -103,11 +103,14 @@ describe('createChatRoute with no identify', () => {
     expect(() => setup({ allowedHosts: ['*'] })).toThrow('allowedHosts: true');
   });
 
-  it('K3: with identify the application owns the boundary — neither check runs (identify: () => undefined included)', async () => {
-    const { app, prompts } = setup({ identify: () => undefined });
+  it('K3: a request identify resolved a caller for carries an identity — neither check runs; one it resolved nobody for gets both (open-door-identity.test.ts)', async () => {
+    const { app, prompts } = setup({ identify: () => ({ kind: 'subject', id: 'u1', roles: [] }) });
     const r = await send(app, { host: 'evil.example:4111', origin: 'https://evil.example', 'sec-fetch-site': 'cross-site', 'content-type': 'text/plain' }, msg('I1', 'm', 'hi'));
     expect(r.status).toBe(200);
     await r.text();
     expect(prompts).toHaveLength(1);
+    const anon = setup({ identify: () => undefined });
+    const refused = await send(anon.app, { host: 'evil.example:4111', origin: 'https://evil.example', 'sec-fetch-site': 'cross-site', 'content-type': 'text/plain' }, msg('I2', 'm', 'hi'));
+    expect(refused.status).toBe(403);
   });
 });

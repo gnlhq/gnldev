@@ -15,7 +15,7 @@ import { Hono } from 'hono';
 import { limitBreachFromSteps, blockedFromSteps, BLOCKED_ERROR_CODES, blockedErrorCode, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, sealRequestContext, sealFieldsOf, resolveWorkIdentity } from '@gnldev/durable';
 import type { CreateGnlConfig, ResolvedWorkIdentity } from '@gnldev/durable';
 import { createGnl, scopeConfigToOrg } from '@gnldev/durable';
-import { callerOfRequest, authorizeDoorRequest, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, openDoorGuard, type AccessDecision, type Authorize, type Identify } from '@gnldev/auth';
+import { doorGate, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify } from '@gnldev/auth';
 import { streamSSE } from 'hono/streaming';
 // The two limit codes are READ from @gnldev/durable (`LIMIT_ERROR_CODES`) rather than spelled again
 // here. The event/data SHAPE is deliberately a copy (see the note above), but a code is not a shape:
@@ -225,15 +225,24 @@ export interface CreateAguiRouteOptions {
    */
   onDecision?: (decision: AccessDecision) => void | Promise<void>;
   /**
-   * Host names this route also answers when it has NO `identify`, besides `localhost`, `*.localhost` and
-   * any IP address — the same list, forms and meaning as `allowedHosts` on `createRestApi` (a hostname,
-   * a leading-dot domain like `'.ngrok-free.app'`, or `true` for every name); `GNL_ALLOWED_HOSTS` adds to
-   * it. Without `identify` this route has no identity to check, so it refuses what a providerless REST
-   * API refuses: a request addressed by any other name (403 `host_not_allowed` — the DNS-rebinding shape)
-   * and a state-changing request a page on another site sent (403 `cross_site_refused`). With `identify`
-   * neither check runs: who the caller is, is then the application's answer.
+   * Host names this route also answers for a request with no identity, besides `localhost`,
+   * `*.localhost` and any IP address — the same list, forms and meaning as `allowedHosts` on
+   * `createRestApi` (a hostname, a leading-dot domain like `'.ngrok-free.app'`, or `true` for every
+   * name); `GNL_ALLOWED_HOSTS` adds to it.
+   *
+   * A request carries an identity when `identify` resolved a principal for it. One that did not — no
+   * `identify`, or an `identify` that answered nothing — gets what a providerless REST API gets: a
+   * request addressed by any other name is refused (403 `host_not_allowed` — the DNS-rebinding shape),
+   * and so is a state-changing request a page on another site sent (403 `cross_site_refused`; see
+   * `allowCrossSite`). Having `identify` does not switch either check off; resolving a caller does.
    */
   allowedHosts?: readonly string[] | true;
+  /**
+   * `true` for a route that pages on OTHER sites are meant to call with no identity — an assistant
+   * embedded on a customer's website. Lifts the cross-site check (403 `cross_site_refused`) for a request
+   * with no identity, and nothing else: the host rule keeps `allowedHosts`.
+   */
+  allowCrossSite?: boolean;
 }
 
 /**
@@ -254,10 +263,6 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
     if (!g) orgGnls.set(org, (g = createGnl(scopeConfigToOrg(config, org).config)));
     return g;
   };
-  // Same warning, same wording and same posture as @gnldev/chat-adapter's route: in production, a route
-  // that can name nobody starts runs that are born ownerless, and an ownership gate with no owner to
-  // compare against passes. Warn once at construction — never throw, because a deployment that puts
-  // its own boundary in front of this route is not broken and must not be stopped at boot.
   // A REMOVED option fails loudly. Ignoring it would be worse than the hook it replaced: a JavaScript
   // config (or one cast past the types) that still passes it would start every run ownerless, and
   // nothing would say so.
@@ -273,19 +278,17 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
       "`{ kind: 'subject', id, orgId, roles: [] }` for an end user — so the route can tell a user from staff.",
     );
   }
-  // PRODUCTION REFUSES a route that names nobody. It used to warn and serve: every caller, with or
-  // without a credential, ran the model and left an ownerless run (measured). The recommended shape
-  // is a surface on the REST API, where the auth provider decides who the caller is. A host that
-  // really has no per-user identity says so explicitly with `identify: () => undefined`.
-  if (process.env.NODE_ENV === 'production' && !opts.identify) {
-    throw new Error(
-      '[gnl agui-route] no `identify` in production: this route has no auth of its own, so every caller would run the model ' +
-      'and leave an ownerless run. Mount it on the REST API instead — createRestApi(config, { auth, surfaces: [aguiSurface()] }) — ' +
-      'or pass `identify: (req) => principal` from your verified session. `identify: () => undefined` opts out, explicitly.',
-    );
-  }
-  // No `identify`: the providerless protections the REST gate applies (@gnldev/auth `openDoorGuard`).
-  const openGuard = opts.identify ? undefined : openDoorGuard({ allowedHosts: opts.allowedHosts, door: 'createAguiRoute' });
+  // Who is calling, the open-surface checks for a request with no identity, the role: @gnldev/auth's
+  // `doorGate`, the one preamble every door runs — the same call as @gnldev/chat-adapter's route. In
+  // production a route with no `identify` refuses to start.
+  const admit = doorGate({
+    door: 'createAguiRoute',
+    identify: opts.identify,
+    authorize: opts.authorize,
+    allowedHosts: opts.allowedHosts,
+    allowCrossSite: opts.allowCrossSite,
+    restMount: 'createRestApi(config, { auth, surfaces: [aguiSurface()] })',
+  });
   const app = new Hono();
   // The outcome, reported once the route has answered (see `onDecision`).
   if (opts.onDecision) {
@@ -300,20 +303,14 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
     });
   }
   app.post('/agents/:name/run', async (c) => {
-    const open = openGuard?.(c.req.raw);
-    if (open) {
-      markRefusal(c.req.raw, 'policy', { detail: open.code });
-      return c.json({ error: open.error, code: open.code, ...(open.host !== undefined ? { host: open.host } : {}) }, open.status);
-    }
     const name = c.req.param('name');
     const body = (await c.req.json().catch(() => ({}))) as any;
     // WHO, resolved once and FIRST — the same reason chat-adapter states: the identity decision below
     // cannot be made without the subject, and a resolver may answer differently the second time.
-    // `body.resourceId` is read by `callerOfRequest` for an APPLICATION principal only.
-    const who = await callerOfRequest(opts.identify, c.req.raw, body.resourceId);
-    if ('refused' in who) return c.json({ error: who.refused }, who.status ?? 400);
-    const denied = await authorizeDoorRequest(opts.authorize, who.principal, c.req.raw, AGENTS_RUN);
-    if (denied) return c.json({ error: denied.refused }, denied.status);
+    // `body.resourceId` is read for an APPLICATION principal only.
+    // The body is read before the refusals: reading it changes nothing, and nothing has run yet.
+    const who = await admit(c.req.raw, { named: body.resourceId, permission: AGENTS_RUN });
+    if ('refused' in who) return Response.json(who.refused.body, { status: who.refused.status });
     const caller = who.caller;
     const subject = caller.kind === 'user' ? caller.id : undefined;
     // WHICH ORGANIZATION — the principal's, never the body's. Same rule and same reason as the sibling

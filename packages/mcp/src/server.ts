@@ -24,9 +24,9 @@
 // over what the transport authenticated — and the runId is derived from it through the same
 // `resolveWorkIdentity` the HTTP surfaces use. The client's key is demoted to what it honestly is: a
 // label for the work, unique only within one caller.
-import { durableTool, resolveWorkIdentity, sealRequestContext, sealFieldsOf, blockedErrorCode, withOrg, admitRun, UNKNOWN, runIdentity, toolContextFor } from '@gnldev/durable';
+import { durableTool, resolveWorkIdentity, sealRequestContext, sealFieldsOf, blockedErrorCode, withOrg, admitRun, runIdentity, toolContextFor } from '@gnldev/durable';
 import type { Journal, WorkScope, RequestContext, Caller, GnlToolContext } from '@gnldev/durable';
-import { callerOfRequest, actorIdOf, openDoorGuard, type Identify, type Principal } from '@gnldev/auth';
+import { doorGate, actorIdOf, type Identify, type Principal } from '@gnldev/auth';
 import { asSchema } from 'ai';
 import type { McpToolDef } from './index.js';
 import { createRateWindow, type RateWindow } from './rate-window.js';
@@ -195,16 +195,24 @@ export interface McpServerOptions {
    *  WorkScope before choosing 'org' — the two mistakes do not cost the same. */
   workScope?: WorkScope['kind'];
   /**
-   * Host names this server also answers over HTTP when it has NO `identify`, besides `localhost`,
+   * Host names this server also answers over HTTP for a message with no identity, besides `localhost`,
    * `*.localhost` and any IP address — the same list, forms and meaning as `allowedHosts` on
    * `createRestApi` (a hostname, a leading-dot domain like `'.ngrok-free.app'`, or `true` for every name);
-   * `GNL_ALLOWED_HOSTS` adds to it. Without `identify` a message that arrived in an HTTP request
+   * `GNL_ALLOWED_HOSTS` adds to it. A message carries an identity when `identify` resolved a principal
+   * for it; one that did not (no `identify`, or `identify` answered nothing) and arrived in an HTTP request
    * (`caller.request`) addressed by any other name is refused (`host_not_allowed` — a DNS-rebound page is
    * same-origin, so it can speak the streamable-HTTP transport), and so is one a page on another site
-   * sent (`cross_site_refused`). Over stdio, or called in process with no request, nothing changes. With
-   * `identify` neither check runs: who the caller is, is then the application's answer.
+   * sent (`cross_site_refused`; see `allowCrossSite`). Both are JSON-RPC errors with code `-32000`
+   * (`MCP_REFUSED`) and the gnl code in `data.code`. Over stdio, or called in process with no request,
+   * nothing changes.
    */
   allowedHosts?: readonly string[] | true;
+  /**
+   * `true` for a server that pages on OTHER sites are meant to call over HTTP with no identity. Lifts the
+   * cross-site check (`cross_site_refused`) for a message with no identity, and nothing else: the host
+   * rule keeps `allowedHosts`.
+   */
+  allowCrossSite?: boolean;
 }
 
 export interface McpServer {
@@ -267,6 +275,9 @@ async function checkToolArgs(schema: any, args: Record<string, unknown>): Promis
   // 3) Plain JSON Schema / unrecognized type → validation is skipped (rationale above; old behavior).
   return { ok: true, value: args };
 }
+
+/** The JSON-RPC error code of an open-surface refusal (`host_not_allowed`, `cross_site_refused`). */
+export const MCP_REFUSED = -32000;
 
 /** A structured MCP tool error — the shape this file already uses for a failed argument check, so a
  *  refusal travels through the protocol instead of becoming a transport-level exception. */
@@ -417,27 +428,30 @@ export function createMcpServer(opts: McpServerOptions): McpServer {
   // shows and the call refuses (or worse, the reverse) is the shape this package has already been wrong
   // in twice. Both doors below call this and nothing else.
   type Prepared = { caller: McpCallerContext; principal: Principal | undefined; runsAs: Caller; tools: Record<string, McpServerToolDef>; context: RequestContext };
-  // No `identify`: the providerless protections the REST gate applies, for a message that came over HTTP.
-  const openGuard = opts.identify ? undefined : openDoorGuard({ allowedHosts: opts.allowedHosts, door: 'createMcpServer' });
+  // Who is calling, and the open-surface checks for a message with no identity: @gnldev/auth's
+  // `doorGate`, the one preamble every door runs. The checks read the headers of the HTTP request the
+  // message arrived in; over stdio, or called in process, `requestOf` carries none, so they pass.
+  const admit = doorGate({ door: 'createMcpServer', identify: opts.identify, allowedHosts: opts.allowedHosts, allowCrossSite: opts.allowCrossSite });
   async function prepare(caller: McpCallerContext | undefined, named: string | undefined): Promise<Prepared | { refused: string }> {
     const c = caller ?? {};
-    // A protocol-level refusal, THROWN (a JSON-RPC error the client shows) rather than a tool result the
-    // model reads or an empty list that would hide every tool from a developer with no reason given.
-    const open = c.request ? openGuard?.(c.request) : undefined;
-    if (open) throw Object.assign(new Error(`${open.code}: ${open.error}`), { code: open.code, status: open.status });
-    let principal: Principal | undefined;
-    let runsAs: Caller = UNKNOWN;
-    if (opts.identify) {
-      let who;
-      try {
-        who = await callerOfRequest(opts.identify, requestOf(c), named);
-      } catch (err) {
-        throw hookFailure('identify', err);
-      }
-      if ('refused' in who) return who;
-      principal = who.principal;
-      runsAs = who.caller;
+    let who;
+    try {
+      who = await admit(requestOf(c), { named });
+    } catch (err) {
+      throw hookFailure('identify', err);
     }
+    if ('refused' in who) {
+      const { code, host, error } = who.refused.body;
+      // An open-surface refusal is a protocol-level refusal, THROWN — a JSON-RPC error the client shows,
+      // rather than a tool result the model reads or an empty list that would hide every tool from a
+      // developer with no reason given. Its code is in the implementation-defined SERVER range: the SDK
+      // answers -32603 (InternalError) for an error with no numeric code, which read as a crash. -32000
+      // is what the SDK's own transport answers its DNS-rebinding refusal with; the gnl code is in `data`.
+      if (code !== undefined) throw Object.assign(new Error(`${code}: ${error}`), { code: MCP_REFUSED, data: { code, ...(host !== undefined ? { host } : {}) } });
+      return { refused: error };
+    }
+    const { principal } = who;
+    const runsAs: Caller = who.caller;
     // Sealed BEFORE the user's function sees it: the reserved keys are stripped from whatever was
     // supplied and rewritten from the caller, so the tool set cannot be built from a subject the caller
     // named. Same function @gnldev/durable seals agent contexts with.

@@ -36,10 +36,10 @@ const SAFE = new Set(['GET', 'HEAD', 'OPTIONS']);
 export function isCrossSiteStateChange(req: Request): boolean {
   if (SAFE.has(req.method.toUpperCase())) return false;
 
-  const site = req.headers.get('sec-fetch-site');
-  if (site) return site.trim().toLowerCase() === 'cross-site';
-
   const origin = req.headers.get('origin');
+  const site = req.headers.get('sec-fetch-site');
+  if (site) return site.trim().toLowerCase() === 'cross-site' && !isLoopbackOrigin(origin);
+
   if (!origin) return false;
   // `null` is an OPAQUE origin — a sandboxed iframe, a `data:` document, a `file://` page, some
   // redirect chains. It is never the app itself, so allowing it was the wrong side of the fence: the
@@ -47,6 +47,7 @@ export function isCrossSiteStateChange(req: Request): boolean {
   // browser but not of a client that omits the header. An opaque origin is not same-origin by
   // definition, so it is treated as cross-site.
   if (origin === 'null') return true;
+  if (isLoopbackOrigin(origin)) return false;
   try {
     return new URL(origin).hostname !== new URL(req.url).hostname;
   } catch {
@@ -55,15 +56,38 @@ export function isCrossSiteStateChange(req: Request): boolean {
 }
 
 /**
+ * Was the page served from this machine's loopback — `localhost`, `*.localhost`, `127.0.0.0/8` or
+ * `[::1]`, on any port? The browser writes `Origin` (no page can forge it), and it resolves these names
+ * to itself (RFC 6761) or reads them as an address, so no site on the internet can carry one.
+ *
+ * Why it is asked at all: a SPA on `http://127.0.0.1:5173` calling `http://localhost:3000` is marked
+ * `Sec-Fetch-Site: cross-site` by the browser — 127.0.0.1 and localhost are different SITES — and was
+ * refused, while the refusal said pages on this machine are not refused (measured, round-2 panel).
+ */
+function isLoopbackOrigin(origin: string | null): boolean {
+  if (!origin || origin === 'null') return false;
+  let hostname: string;
+  try {
+    hostname = new URL(origin).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true;
+  if (hostname === '[::1]') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname);
+}
+
+/**
  * The sentence a cross-site refusal carries. `way` is the one line that lets a page on another site in:
- * for the REST and Studio gate an auth provider, for a door an `identify`.
+ * for the REST and Studio gate an auth provider, for a door `allowCrossSite: true` or an `identify` that
+ * resolves the caller.
  */
 export function crossSiteRefusedMessage(way: string): string {
   return (
     'a page on another site sent a state-changing request to a surface with no identity to authenticate, which is ' +
     'the shape of cross-site request forgery (Sec-Fetch-Site: cross-site, or an Origin naming another host). ' +
-    'A page on this machine\'s own sites (localhost and its ports) is not refused. If another site is meant to call ' +
-    `this surface, give it an identity to check: ${way}. See docs/errors/cross_site_refused.md.`
+    'A page served from this machine (localhost, *.localhost, 127.0.0.1 or [::1], on any port) is not refused. ' +
+    `If another site is meant to call this surface: ${way}. See docs/errors/cross_site_refused.md.`
   );
 }
 
@@ -121,8 +145,9 @@ function isDnsName(name: string): boolean {
 /**
  * One `allowedHosts` / `GNL_ALLOWED_HOSTS` entry, in the form `isHostAllowed` compares: a hostname, or a
  * leading-dot domain. Accepts what developers write — `'mybox.test'`, `'.ngrok-free.app'`,
- * `'*.ngrok-free.app'` (read as the leading-dot form), `'mybox.test:4111'`, `'http://mybox.test:4111/'` —
- * and answers `{ problem }` for an entry that could never match a Host header, with the fix.
+ * `'*.ngrok-free.app'` (read as the leading-dot form), `'mybox.test:4111'` and `'mybox.test:*'` (a port is
+ * never compared), `'http://mybox.test:4111/'`, an IPv6 address with or without brackets (`'::1'`) — and
+ * answers `{ problem }` for an entry that could never match a Host header, with a fix no broader than it.
  */
 export function allowedHostEntry(raw: string): { entry: string } | { problem: string } {
   let e = raw.trim().toLowerCase();
@@ -135,10 +160,15 @@ export function allowedHostEntry(raw: string): { entry: string } | { problem: st
     }
   }
   if (e.startsWith('*.')) e = e.slice(1);
+  // A port is never compared (`isHostAllowed` reads the hostname), so `name:*` means `name`.
+  if (e.endsWith(':*')) e = e.slice(0, -2);
   if (e.includes('*')) {
-    const rest = e.slice(e.lastIndexOf('*') + 1).replace(/^\.+/, '');
-    return { problem: `a wildcard is understood only as a leading '*.' — for every name under ${rest || 'a domain'} write '.${rest || 'example.com'}'` };
+    // No suggestion is derived from the text after the wildcard: for 'a.*.com' that text is 'com', and
+    // '.com' would answer every .com name on the internet — far more than was written.
+    return { problem: "a wildcard is understood only as a leading '*.' (every name under one domain) — list each name you use ('api.example.com'), or the leading-dot domain you own ('.dev.example.com')" };
   }
+  // An IPv6 address written without brackets ('::1', 'fe80::1') is the bracketed literal a Host carries.
+  if (!e.startsWith('[') && /^[0-9a-f]*:[0-9a-f:.]*(%[\w.-]+)?$/.test(e) && (e.match(/:/g)?.length ?? 0) >= 2) e = `[${e}]`;
   const dot = e.startsWith('.');
   const name = hostnameOf(dot ? e.slice(1) : e);
   if (!(isDnsName(name) || isIpLiteral(name))) {

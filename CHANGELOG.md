@@ -30,9 +30,12 @@ and who is affected.
   addresses and the names you list** — `allowedHosts: ['mybox.test', '.ngrok-free.app']` on
   `createRestApi` / `createStudioApp`, or `GNL_ALLOWED_HOSTS=mybox.test,.ngrok-free.app`. An
   `allowedHosts` entry that can never match now throws at startup, naming the fix.
-- **A standalone door with no `identify` does the same, and refuses cross-site writes** — the same
+- **A standalone door does the same for every request that resolved no caller, and refuses its
+  cross-site writes** — no `identify`, or an `identify` that answered nothing for the request
+  (`identify: () => undefined` included: passing `identify` no longer switches the checks off). Same
   `allowedHosts` option on `createChatRoute` / `createAguiRoute` / `createMcpServer`, or
-  `GNL_ALLOWED_HOSTS`; for a page on another site, pass `identify`.
+  `GNL_ALLOWED_HOSTS`; for a door embedded on other sites (a public chat widget), `allowCrossSite: true`;
+  for a signed-in caller, an `identify` that resolves it from a verified token.
 - **The root scope cannot name a thread whose id starts with `org:`** (`ReservedThreadIdError`; `400
   thread_id_reserved` on the REST API): use another thread id, or work inside the organization with
   `withOrgStorage(storage, orgId)`.
@@ -64,8 +67,11 @@ and who is affected.
   with an open object throws `ToolSchemaError` before the model is called: declare its keys with
   `z.object`, or drop `strict`.
 - **With a licence, `client` and `end-user` roles get the free tier's grants** (including a role an IdP
-  names so): to keep 0.9.0's narrowing, pass your own map to `createRbac(...)` without the spread, or
-  `createRbac({ ...DEFAULT_ROLE_GRANTS, client: [] })`.
+  names so): to keep 0.9.0's narrowing, `createRbac({ client: [], 'end-user': [] })`, or your whole map
+  with `createRbac(map, { replace: true })`.
+- **`createRbac(map)` merges `map` into `DEFAULT_ROLE_GRANTS`** — a role it names gets that list, the
+  others keep theirs; it used to replace the defaults, so roles a map left out got nothing. To keep only
+  your map: `createRbac(map, { replace: true })`.
 - **`retryJob` continues the dead letter's durable run**: to start from an empty journal as before,
   `retryJob(work, id, { newRun: true })`.
 - **`piiRedactor({ redactToolResults: true })` masks object tool results** it used to pass through, and
@@ -80,11 +86,13 @@ and who is affected.
   `parseAllowedHosts`, `crossSiteRefusedMessage`, `openDoorGuard` (+ types `OpenDoorGuardOptions`,
   `OpenDoorRefusal`, `HostRuleAuth`), `GateOptions.allowedHosts`, and the error codes
   `host_not_allowed` and `cross_site_refused` in `AUTH_ERROR_CODES`.
-- @gnldev/auth-ee: `DEFAULT_ROLE_GRANTS`.
+- @gnldev/auth: `doorGate` (+ types `DoorGateOptions`, `DoorRefusal`, `DoorAdmission`), `carriesIdentity`,
+  `permissionContext`, `authErrorResponse` (+ type `AuthErrorCode`), `OpenDoorGuardOptions.allowCrossSite`.
+- @gnldev/auth-ee: `DEFAULT_ROLE_GRANTS`; `createRbac`'s second argument (`CreateRbacOptions.replace`).
 - @gnldev/server, @gnldev/studio: the `allowedHosts` option on `createRestApi` and `createStudioApp`;
   the error code `thread_id_reserved` in `EDGE_ERROR_CODES`.
-- @gnldev/chat-adapter, @gnldev/agui, @gnldev/mcp: the `allowedHosts` option on `createChatRoute`,
-  `createAguiRoute` and `createMcpServer`.
+- @gnldev/chat-adapter, @gnldev/agui, @gnldev/mcp: the `allowedHosts` and `allowCrossSite` options on
+  `createChatRoute`, `createAguiRoute` and `createMcpServer`; @gnldev/mcp: `MCP_REFUSED` (`-32000`).
 - @gnldev/durable: `appendToJournalLog`, `readJournalLog`, `JournalLogContentionError`,
   `JOURNAL_LOG_MAX_ATTEMPTS`; `MEMORY_PARTITION`, `memoryPartitionOf`, `inMemoryPartition`,
   `isOrganizationThreadId`, `assertRootThreadId`, `ReservedThreadIdError`, `ORG_THREAD_PREFIX` (+ types
@@ -125,8 +133,9 @@ and who is affected.
   `gnl dev`, `gnl studio` and your own server all take it. The 403 names both. See
   [`docs/errors/host_not_allowed.md`](./docs/errors/host_not_allowed.md). An entry may be written
   `'.ngrok-free.app'` or `'*.ngrok-free.app'` (the same thing), `'mybox.test'`, `'mybox.test:4111'` or
-  `'http://mybox.test:4111'`; one that can never match a Host header (`'*'`, a wildcard mid-name, a
-  space) throws at startup, naming the fix. `GNL_ALLOWED_HOSTS` is read per request, so a value that
+  `'http://mybox.test:4111'`, `'mybox.test:*'`, or an IPv6 address with or without brackets (`'::1'`);
+  one that can never match a Host header (`'*'`, a wildcard mid-name, a space) throws at startup, naming
+  the fix — and never a broader entry than the one written (`'a.*.com'` is not answered with `'.com'`). `GNL_ALLOWED_HOSTS` is read per request, so a value that
   dotenv loads after the app module applies. A `{ read, write }` pair is refused the same way (a
   predicate is opaque, and a rebound page is same-origin, so it may send any header) and its 403 says
   so, naming a second way through: `auth: roleAuth({ admin: { token } })`. For a tunnel name the 403
@@ -138,16 +147,37 @@ and who is affected.
   the model and appended the page's text to a conversation; a DNS-rebound page (`Host: evil.example`,
   `Sec-Fetch-Site: same-origin`) replayed a run and read the thread's earlier messages back. Without
   `identify`, each door now refuses a request addressed by a name other than `localhost`, a
-  `*.localhost` name or an IP address (403 `host_not_allowed`; a JSON-RPC error on MCP) and a
-  state-changing request a page on another site sent (403 `cross_site_refused`), before anything runs.
+  `*.localhost` name or an IP address (403 `host_not_allowed`; on MCP a JSON-RPC error `-32000` with the
+  code in `data.code` — not `-32603`, which read as a crash) and a state-changing request a page on
+  another site sent (403 `cross_site_refused`), before anything runs.
   After the fix the same probe gets 403, 403, 403 and one model call (the developer's own). The
   functions are the gate's own (`openDoorGuard` in @gnldev/auth). **Who is affected:** a door with no
   `identify` reached by another name (a tunnel, Codespaces, a Docker service) or called by a page on
   another site. `localhost`, `127.0.0.1`, a LAN IP, a UI on another localhost port, stdio MCP and
-  in-process calls are unchanged; a door with `identify` (including `identify: () => undefined`) is
-  unchanged. **Way through, one line:** `allowedHosts: ['.ngrok-free.app']` in the door's options, or
-  `GNL_ALLOWED_HOSTS=.ngrok-free.app`; for another site calling the door, `identify`. See
+  in-process calls are unchanged; so is a request `identify` resolved a caller for (the next entry says
+  why that, and not "the door has `identify`", is the condition). **Way through, one line:**
+  `allowedHosts: ['.ngrok-free.app']` in the door's options, or `GNL_ALLOWED_HOSTS=.ngrok-free.app`; for a
+  door other sites embed, `allowCrossSite: true`. See
   [`docs/errors/cross_site_refused.md`](./docs/errors/cross_site_refused.md).
+- **Passing `identify` no longer switches off a door's no-auth protections.** The doors skipped both
+  checks when they had been HANDED an `identify`, and the cross_site_refused message recommended
+  `identify: () => undefined` as the way through. Measured by the round-2 review: with that line, a
+  DNS-rebound page replayed a run and read the thread back (200, the earlier message in the body); and
+  an ordinary `identify` that answers `undefined` for a request with no token — the anonymous fallthrough
+  every widget has — let a cross-site `text/plain` form POST run the model (200, one model call). On MCP
+  the same line hid every tool (`no such tool`, an empty list), so the documented way through did not go
+  through there either. The decision now has one owner, `carriesIdentity` in @gnldev/auth, which
+  `makeGate` asks with its provider and every door asks (through `doorGate`, the one preamble the three
+  doors now share) with the principal `identify` resolved for THIS request: a request that resolved
+  nobody gets the host rule and the cross-site check. After the fix the same probes get 403
+  `host_not_allowed` and 403 `cross_site_refused`, zero model calls. **Who is affected:** a door with an
+  `identify` that answers nothing for some requests (anonymous visitors) or for all of them, reached by
+  a name other than `localhost` / an IP address, or called by a page on another site. **Way through, one
+  line:** `allowedHosts: ['chat.example.com']` (or `GNL_ALLOWED_HOSTS`) for the name the door is served
+  under; `allowCrossSite: true` for a door embedded on other sites — it lifts the cross-site check only;
+  or an `identify` that resolves the caller from a verified token. The production refusal to start no
+  longer suggests `identify: () => undefined`; it names a real `identify` (which may answer `undefined`
+  for a visitor with no session) or the REST mount.
 - **`piiRedactor({ redactToolResults: true })` no longer journals an object tool result unredacted.**
   An object was masked as JSON text (stringify, mask, parse). `phone` masks a bare 7–15 digit run, so
   any JSON number of that length (an epoch-ms timestamp, a numeric id, `41.0082376`) turned into
@@ -212,6 +242,14 @@ and who is affected.
 
 ### Fixed
 
+- **A page served from this machine on another loopback name is no longer refused as cross-site.** A
+  SPA on `http://127.0.0.1:5173` calling an API on `http://localhost:3000` is marked
+  `Sec-Fetch-Site: cross-site` by the browser (127.0.0.1 and localhost are different sites), and the REST
+  gate, Studio and the doors refused it with 403 `cross_site_refused` — while the refusal said pages on
+  this machine are not refused (measured on a real socket with `cors()` in front of `createChatRoute`).
+  An `Origin` of `localhost`, `*.localhost`, `127.x.x.x` or `[::1]` (any port) is now this machine: no
+  site on the internet can carry one, and the browser writes it. Every other origin, `null` included,
+  is still cross-site; the message now says exactly which pages pass.
 - **Erasing one person stopped everyone else's queue and events; a producer with a slow clock was
   never read.** `WorkStore.list` handed out a row OFFSET into a log ordered by the producer's
   `Date.now()`, and `@gnldev/queue` (`qcursor`) and `@gnldev/events` (`evtcursor:*`) persist that cursor
@@ -481,15 +519,21 @@ and who is affected.
   `roleAuth` does), and `@gnldev/auth-ee` exports `DEFAULT_ROLE_GRANTS`, built from it plus `member` and
   `platform-admin`. **Who is affected:** licensed deployments whose fallback or user store carries
   `client` or `end-user` principals, on the default map — they now get what the free tier gives them
-  (every read, `agents:run`, `workflow:run`, `run:cancel`). A deployment passing its own map to
-  `createRbac` is unchanged: a map still replaces the defaults. **Way through:** to add a role without
-  restating the defaults, `createRbac({ ...DEFAULT_ROLE_GRANTS, support: ['runs:read'] })`; to keep the
-  0.9.0 narrowing, pass the map you want without the spread.
+  (every read, `agents:run`, `workflow:run`, `run:cancel`). **Way through:** to keep the 0.9.0
+  narrowing, `createRbac({ client: [], 'end-user': [] })`, or your whole map with
+  `createRbac(map, { replace: true })`.
+- **`createRbac(map)` merges into `DEFAULT_ROLE_GRANTS` instead of replacing it.** A map passed to adjust
+  one role — `createRbac({ client: ['agents:run'] })` — silently took `*` away from `admin` and every
+  grant from `viewer`, `end-user`, `member` and `platform-admin`: documented, and a trap, because the line
+  reads as "change client". Now a role the map names gets exactly that list, and the roles it leaves out
+  keep their defaults. **Who is affected:** a deployment whose map relied on replacement (roles it left
+  out got nothing). **Way through, one line:** `createRbac(map, { replace: true })`, or name the role with
+  an empty list (`{ admin: [] }`).
   **Also affected: an identity provider whose role is literally named `client` or `end-user`.** A role
   is matched by its name, wherever it came from, so an SSO user carrying such a role (an Auth0/OIDC group,
   a user-store role) now gets those grants too, where 0.9.0's default map gave it nothing. To avoid it,
-  one line: rename the role in the IdP or user store, or pass a map —
-  `createRbac({ ...DEFAULT_ROLE_GRANTS, client: [] })`. See the @gnldev/auth-ee README.
+  one line: rename the role in the IdP or user store, or empty it — `createRbac({ client: [] })`. See the
+  @gnldev/auth-ee README.
 - **A cross-site write refused by the REST or Studio gate now says why.** It answered 403
   `{ error: 'unauthorized (admin required)' }`, which named neither the cause nor the fix; it now
   answers 403 with `code: 'cross_site_refused'` and names the way through (an auth provider that binds

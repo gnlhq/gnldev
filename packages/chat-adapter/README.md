@@ -59,8 +59,9 @@ const chat = useChat({
 ## Chat route (standalone)
 
 For a host that authenticates the request itself (a session cookie, a verified token) and tells the
-route who is calling through `identify`. In production it refuses to start without `identify`; pass
-`identify: () => undefined` to say, explicitly, that there is no per-user identity.
+route who is calling through `identify`. In production it refuses to start without `identify`. Your
+`identify` may answer `undefined` for a visitor with no session: that visitor is served as anonymous,
+with the checks below.
 
 ```ts
 import { createChatRoute } from '@gnldev/chat-adapter';
@@ -89,10 +90,12 @@ WHOLE conversation, so every later turn would replay turn 1 from the journal for
 derived string *is* — a name the engine hashes into an id, or the id itself — depends on whether the
 route can name the user; see [the idempotency contract](#the-idempotency-contract).
 
-### Without `identify`: what the route refuses
+### A request with no identity: what the route refuses
 
-A route with no `identify` has no identity to check, so it refuses what a REST API with no auth refuses —
-the same two checks, from the same `@gnldev/auth` functions:
+A request carries an identity when `identify` resolved a caller for it. One that did not — the route has
+no `identify`, or `identify` answered nothing for it (an anonymous visitor; `identify: () => undefined`
+for everyone) — has no identity to check, so it is refused what a REST API with no auth refuses — the
+same two checks, from the same `@gnldev/auth` functions (`doorGate`):
 
 - a request addressed by a name other than `localhost`, a `*.localhost` name or an IP address → 403
   [`host_not_allowed`](../../docs/errors/host_not_allowed.md). That is what a DNS-rebinding page sends; it
@@ -101,11 +104,13 @@ the same two checks, from the same `@gnldev/auth` functions:
   [`cross_site_refused`](../../docs/errors/cross_site_refused.md). A plain `<form>` on any site could
   otherwise run the model and write into a conversation.
 
-Nothing changes on this machine: `localhost`, `127.0.0.1`, a LAN IP, a UI on another localhost port and
-an in-process `fetch` are answered. A name of your own (a tunnel, Codespaces, a Docker service) is one
-line: `createChatRoute(…, { allowedHosts: ['.ngrok-free.app'] })`, or `GNL_ALLOWED_HOSTS=.ngrok-free.app` in the
-environment. With `identify` (including `identify: () => undefined`) neither check runs — who the
-caller is, is then your answer.
+Nothing changes on this machine: `localhost`, `127.0.0.1`, a LAN IP, a UI on another localhost port (or
+on `127.0.0.1` calling `localhost`), curl or a mobile app with no `Origin`, and an in-process `fetch` are
+answered. A name of your own (a tunnel, Codespaces, a Docker service) is one line:
+`createChatRoute(…, { allowedHosts: ['.ngrok-free.app'] })`, or `GNL_ALLOWED_HOSTS=.ngrok-free.app` in the
+environment. A widget embedded on other sites with no sign-in is one line too:
+`createChatRoute(…, { allowCrossSite: true, allowedHosts: ['chat.example.com'] })` — `allowCrossSite`
+lifts the cross-site check only. A request `identify` resolved a caller for gets neither check.
 
 ## Who is calling? (`identify`)
 
@@ -163,8 +168,9 @@ runs: it is never treated as staff and never as anonymous.
 `AuthProvider` — and **never from the request body**. The route always seals the request context too,
 so a body carrying `{"context":{"__gnl_resourceId":"VICTIM"}}` names nobody.
 
-**If `identify` answers nothing** (or `identify: () => undefined`), the caller is `unknown`. Its runs
-are closed to every user and to staff's threads. Memory has nothing to scope on, so per-user recall
+**If `identify` answers nothing** (or `identify: () => undefined`), the caller is `unknown`, and the
+request gets the host rule and the cross-site check [above](#a-request-with-no-identity-what-the-route-refuses).
+Its runs are closed to every user and to staff's threads. Memory has nothing to scope on, so per-user recall
 and `listThreads` have no subject to key by.
 
 **A credential that was presented and rejected is refused (401), not served as anonymous.** This route

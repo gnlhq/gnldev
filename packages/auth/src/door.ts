@@ -7,6 +7,8 @@ import type { AuthProvider, Principal } from './types.js';
 import { callerKind, engineCallerOf, type EngineCaller, type Identify } from './scope.js';
 import { markRefusal, notePrincipal, noteVerdict, credentialRejected, CREDENTIAL_REJECTED } from './decision.js';
 import { permissionContext } from './gate.js';
+import { carriesIdentity } from './adapter.js';
+import { openDoorGuard } from './open-door.js';
 
 /**
  * Why a door refuses an application that names no user. The sentence @gnldev/server answers an
@@ -96,4 +98,75 @@ export async function authorizeDoorRequest(
   noteVerdict(req, ctx, decision);
   if (decision.allow) return undefined;
   return { refused: decision.reason ?? `permission denied: ${permission}`, status: decision.status ?? (principal ? 403 : 401) };
+}
+
+export interface DoorGateOptions {
+  /** How the door is built, for every refusal's way through — e.g. `'createChatRoute'`. */
+  door: string;
+  /** The door's `identify`. Without it every request is anonymous. */
+  identify?: Identify;
+  /** The door's `authorize`; asked only when the door passes a `permission`. */
+  authorize?: Authorize;
+  /** The host rule's list (`makeGate`'s `allowedHosts`; GNL_ALLOWED_HOSTS adds to it). */
+  allowedHosts?: readonly string[] | true;
+  /** `true` for a door other sites are meant to embed: lifts the cross-site check only. */
+  allowCrossSite?: boolean;
+  /**
+   * The REST mount that replaces this door, e.g. `'createRestApi(config, { auth, surfaces: [chatSurface()] })'`.
+   * Given → in production a door with no `identify` refuses to start, naming it. Omitted → no such rule
+   * (an MCP server over stdio, spawned by its one client, is a legitimate door with no `identify`).
+   */
+  restMount?: string;
+}
+
+/** What a door answers when it refuses: the status and the JSON body. */
+export interface DoorRefusal {
+  status: number;
+  body: { error: string; code?: string; host?: string };
+}
+
+export type DoorAdmission = { principal: Principal | undefined; caller: EngineCaller } | { refused: DoorRefusal };
+
+/**
+ * The preamble every standalone door runs before it does anything — ONE copy, which the chat, AG-UI and
+ * MCP doors call (it was three, cloned line for line, and the clones shared a wrong rule: "the door was
+ * given `identify`, so skip the open-surface checks").
+ *
+ * Per request, in order:
+ *   1. who: `callerOfRequest` — `identify` once, then `engineCallerOf` (a rejected credential → 401, an
+ *      application naming nobody → 400);
+ *   2. the open-surface checks, unless the request carries an identity (`carriesIdentity`, the owner
+ *      `makeGate` asks too): the host rule, then the cross-site check (`allowCrossSite: true` lifts it);
+ *   3. the role, when `permission` is given and the door was handed `authorize` (`authorizeDoorRequest`).
+ * Every refusal is recorded for the door's `onDecision` (`markRefusal` / `noteVerdict`).
+ *
+ * Built once, where the door is built: an `allowedHosts` entry that can never match throws there, and so
+ * does a door with a `restMount` and no `identify` in production.
+ */
+export function doorGate(opts: DoorGateOptions): (req: Request, ask?: { named?: unknown; permission?: string }) => Promise<DoorAdmission> {
+  if (opts.restMount !== undefined && process.env.NODE_ENV === 'production' && !opts.identify) {
+    throw new Error(
+      `[gnl ${opts.door}] no \`identify\` in production: this door has no auth of its own, so every caller would run the model ` +
+        `and leave an ownerless run. Mount it on the REST API instead — ${opts.restMount} — or pass ` +
+        '`identify: (req) => principal` reading your verified session; it may answer undefined for a visitor who has none, ' +
+        'who is then served as anonymous (with the host rule and the cross-site check: allowedHosts, allowCrossSite).',
+    );
+  }
+  const guard = openDoorGuard({ door: opts.door, allowedHosts: opts.allowedHosts, allowCrossSite: opts.allowCrossSite });
+  return async (req, ask = {}) => {
+    const who = await callerOfRequest(opts.identify, req, ask.named);
+    if ('refused' in who) return { refused: { status: who.status ?? 400, body: { error: who.refused } } };
+    if (!carriesIdentity({ principal: who.principal })) {
+      const open = guard(req);
+      if (open) {
+        markRefusal(req, 'policy', { detail: open.code });
+        return { refused: { status: open.status, body: { error: open.error, code: open.code, ...(open.host !== undefined ? { host: open.host } : {}) } } };
+      }
+    }
+    if (ask.permission !== undefined) {
+      const denied = await authorizeDoorRequest(opts.authorize, who.principal, req, ask.permission);
+      if (denied) return { refused: { status: denied.status, body: { error: denied.refused } } };
+    }
+    return who;
+  };
 }

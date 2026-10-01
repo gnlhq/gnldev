@@ -145,11 +145,18 @@ export const AUTH_ERROR_CODES = {
    */
   crossSiteRefused: 'cross_site_refused',
 } as const;
+export type AuthErrorCode = (typeof AUTH_ERROR_CODES)[keyof typeof AUTH_ERROR_CODES];
+/** The HTTP status of each code — the ONE place it is written. Call sites answer through `authErrorResponse`. */
 export const AUTH_ERROR_STATUS: Record<string, number> = {
   [AUTH_ERROR_CODES.decisionNotRecorded]: 500,
   [AUTH_ERROR_CODES.hostNotAllowed]: 403,
   [AUTH_ERROR_CODES.crossSiteRefused]: 403,
 };
+
+/** The answer for an auth error code: `body` plus the code, with the status `AUTH_ERROR_STATUS` gives it. */
+export function authErrorResponse(code: AuthErrorCode, body: { error: string } & Record<string, unknown>): Response {
+  return Response.json({ ...body, code }, { status: AUTH_ERROR_STATUS[code] });
+}
 
 /**
  * The answer a host gives when `onDecision` failed: the request is not delivered unrecorded. `extra`
@@ -158,5 +165,5 @@ export const AUTH_ERROR_STATUS: Record<string, number> = {
  */
 export function decisionNotRecorded(err: unknown, extra: Record<string, unknown> = {}): Response {
   console.error('@gnldev/auth: onDecision failed — the response was withheld:', err);
-  return Response.json({ ...extra, error: 'the decision for this request could not be recorded', code: AUTH_ERROR_CODES.decisionNotRecorded }, { status: 500 });
+  return authErrorResponse(AUTH_ERROR_CODES.decisionNotRecorded, { ...extra, error: 'the decision for this request could not be recorded' });
 }

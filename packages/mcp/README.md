@@ -370,23 +370,30 @@ A complete, runnable version of this — with a test that asserts every claim on
 
 It takes a transport you built and connects to it; it opens no socket and validates no credential. Whatever authenticates the caller — the SDK's auth middleware on a streamable-HTTP transport, a reverse proxy, mTLS — is yours to put in front, and `identify` is how its result reaches the dedup key. `gnl studio` refuses to serve an unauthenticated surface off loopback because it owns the `listen()` call; this package never binds, so it cannot refuse a bind. What it can do, and now does, is refuse to pretend a client-chosen string identifies a caller.
 
-### Without `identify`: what the server refuses over HTTP
+### A message with no identity: what the server refuses over HTTP
 
-A server with no `identify` has no identity to check, so over HTTP it refuses what a REST API with no auth refuses —
-the same two checks, from the same `@gnldev/auth` functions:
+A message carries an identity when `identify` resolved a caller for it. One that did not — the server has
+no `identify`, or `identify` answered nothing for it — has no identity to check, so over HTTP it is refused
+what a REST API with no auth refuses — the same two checks, from the same `@gnldev/auth` functions (`doorGate`):
 
-- a request addressed by a name other than `localhost`, a `*.localhost` name or an IP address → a JSON-RPC error
+- a request addressed by a name other than `localhost`, a `*.localhost` name or an IP address →
   [`host_not_allowed`](../../docs/errors/host_not_allowed.md). That is what a DNS-rebinding page sends; it
   is same-origin to the browser, so it can speak the streamable-HTTP transport, call a tool and read
   the answer.
 - a message a page on another site sent (`Sec-Fetch-Site: cross-site`) →
   [`cross_site_refused`](../../docs/errors/cross_site_refused.md).
 
+Both are JSON-RPC errors in the server range, code `-32000` (`MCP_REFUSED`), with the gnl code in
+`data.code` (and the refused name in `data.host`) — not `-32603`, which reads as a crash.
+
 Nothing changes on this machine: `localhost`, `127.0.0.1`, a LAN IP, a UI on another localhost port and
 an in-process `fetch` are answered. A name of your own (a tunnel, Codespaces, a Docker service) is one
 line: `createMcpServer({ …, allowedHosts: ['.ngrok-free.app'] })`, or `GNL_ALLOWED_HOSTS=.ngrok-free.app` in the
-environment. Over stdio, or called in process without a request, nothing is checked. With `identify` neither check runs — who the
-caller is, is then your answer.
+environment. A browser client on other sites is `createMcpServer({ …, allowCrossSite: true })` — the
+cross-site check only. Over stdio, or called in process without a request, nothing is checked. A message
+`identify` resolved a caller for gets neither check. (A server WITH `identify` also hides every tool from
+a caller it resolved nobody for — see `identify` above — so on that server, the way in for a browser on
+another site is a token `identify` accepts.)
 
 ## Running MCP safely (`mcpFirewall`)
 

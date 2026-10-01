@@ -87,8 +87,10 @@ describe('(b) allowedHosts in the forms developers write', () => {
     ['', 'a host name'],
     ['.', 'a host name'],
     ['my app.test', 'a host name'],
-    ['*.*.example.com', "'.example.com'"],
-    ['api.*.example.com', "'.example.com'"],
+    // A mid-name wildcard names the forms that work, never a domain read off the text after the '*'
+    // ('a.*.com' would have suggested '.com' — see allowed-hosts-advice.test.ts).
+    ['*.*.example.com', 'list each name you use'],
+    ['api.*.example.com', 'list each name you use'],
   ])('K3: an entry that can never match (%j) is refused where the gate is built, naming the fix', (entry, fix) => {
     expect(() => gateWith([entry])).toThrow(fix);
   });

@@ -56,8 +56,8 @@ describe('createAguiRoute with no identify', () => {
     }
   });
 
-  it('K3: with identify the door does not second-guess the application', async () => {
-    const { h } = setup({ identify: () => undefined });
+  it('K3: a request identify resolved a caller for is not second-guessed (one it resolved nobody for: open-door-identity.test.ts)', async () => {
+    const { h } = setup({ identify: () => ({ kind: 'subject', id: 'u1', roles: [] }) });
     const r = await post(h, { host: 'evil.example', 'content-type': 'application/json' }, 'id1');
     expect(r.status).toBe(200);
     await r.text();

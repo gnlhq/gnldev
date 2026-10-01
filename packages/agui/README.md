@@ -22,15 +22,23 @@ npm i @gnldev/agui   # dep: @gnldev/auth, hono  ·  peer: @gnldev/durable  (no @
 import { createAguiRoute } from '@gnldev/agui';
 import { serve } from '@hono/node-server';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
+import type { Principal } from '@gnldev/auth';
+
+// Your session lookup: who this request is, as YOUR server established it.
+declare function userOf(req: Request): Promise<string | undefined>;
 
 const app = createAguiRoute({
   journal: new SqliteStorage('runs.db').runs,
   agents: { support: { model: 'anthropic/claude-opus-4-8', tools, guard, maxSteps: 8 } },
 }, {
-  // Who is calling. In production the route refuses to start without this: pass your auth
-  // (see "identify" below), or say explicitly that there is no per-user identity.
+  // Who is calling. In production the route refuses to start without this (see "identify" below).
+  // A visitor with no session is anonymous: answered on localhost / an IP and the names you list in
+  // `allowedHosts`, and only from this machine's pages unless you pass `allowCrossSite: true`.
   // With end users, prefer `aguiSurface()` on createRestApi: the API's auth decides it for you.
-  identify: () => undefined,
+  identify: async (req): Promise<Principal | undefined> => {
+    const id = await userOf(req);
+    return id ? { kind: 'subject', id, roles: [] } : undefined;
+  },
 });
 serve({ fetch: app.fetch, port: 3001 }); // POST /agents/:name/run → AG-UI SSE
 ```
@@ -67,7 +75,8 @@ spec](https://github.com/ag-ui-protocol/ag-ui) are marked with comments in `type
 the API's auth decides identity, organization and ownership:
 `createRestApi(config, { auth, surfaces: [aguiSurface()] })`. `aguiSurface({ path })` changes the
 path. The standalone `createAguiRoute` below is for a host that authenticates the request itself; in
-production it refuses to start without `identify` (`identify: () => undefined` opts out, explicitly).
+production it refuses to start without `identify` (which may answer `undefined` for a visitor with no
+session: that visitor is anonymous, with the checks below).
 
 ## API
 - `createAguiRoute(config, opts?)` — a single-endpoint Hono router from `@gnldev/durable`'s `CreateGnlConfig`:
@@ -83,10 +92,11 @@ production it refuses to start without `identify` (`identify: () => undefined` o
   is threaded in from outside (`initialAguiConvertState`) — a SINGLE state object must be threaded
   through from start to end for an ENTIRE run (this is required for text message framing START/END).
 
-### Without `identify`: what the route refuses
+### A request with no identity: what the route refuses
 
-A route with no `identify` has no identity to check, so it refuses what a REST API with no auth refuses —
-the same two checks, from the same `@gnldev/auth` functions:
+A request carries an identity when `identify` resolved a caller for it. One that did not — the route has
+no `identify`, or `identify` answered nothing for it — has no identity to check, so it is refused what a
+REST API with no auth refuses — the same two checks, from the same `@gnldev/auth` functions (`doorGate`):
 
 - a request addressed by a name other than `localhost`, a `*.localhost` name or an IP address → 403
   [`host_not_allowed`](../../docs/errors/host_not_allowed.md). That is what a DNS-rebinding page sends; it
@@ -95,11 +105,13 @@ the same two checks, from the same `@gnldev/auth` functions:
   [`cross_site_refused`](../../docs/errors/cross_site_refused.md). A plain `<form>` on any site could
   otherwise run the model and write into a conversation.
 
-Nothing changes on this machine: `localhost`, `127.0.0.1`, a LAN IP, a UI on another localhost port and
-an in-process `fetch` are answered. A name of your own (a tunnel, Codespaces, a Docker service) is one
-line: `createAguiRoute(…, { allowedHosts: ['.ngrok-free.app'] })`, or `GNL_ALLOWED_HOSTS=.ngrok-free.app` in the
-environment. With `identify` (including `identify: () => undefined`) neither check runs — who the
-caller is, is then your answer.
+Nothing changes on this machine: `localhost`, `127.0.0.1`, a LAN IP, a UI on another localhost port (or
+on `127.0.0.1` calling `localhost`), curl or a mobile app with no `Origin`, and an in-process `fetch` are
+answered. A name of your own (a tunnel, Codespaces, a Docker service) is one line:
+`createAguiRoute(…, { allowedHosts: ['.ngrok-free.app'] })`, or `GNL_ALLOWED_HOSTS=.ngrok-free.app` in the
+environment. An assistant embedded on other sites with no sign-in is one line too:
+`createAguiRoute(…, { allowCrossSite: true, allowedHosts: ['assist.example.com'] })` — `allowCrossSite`
+lifts the cross-site check only. A request `identify` resolved a caller for gets neither check.
 
 ## Who is calling? (`identify`)
 
@@ -146,8 +158,8 @@ user's gets `409 thread_owner_mismatch`, and the model never sees that history.
 
 **Read the principal from something the server trusts** — a session cookie, a verified JWT — never
 from the request body. The route always seals the request context, so a body-supplied
-`__gnl_resourceId` names nobody. `identify: () => undefined` says, explicitly, that there is no
-per-user identity: every caller is `unknown`, closed to every user's and staff's data.
+`__gnl_resourceId` names nobody. A caller `identify` answers nothing for is `unknown`, closed to every
+user's and staff's data, and its request gets the host rule and the cross-site check above.
 
 **A presented credential the provider rejected is refused with 401**, not served as anonymous — a
 revoked or deleted user's token used to answer 200 as an `unknown` caller, with an audit row saying

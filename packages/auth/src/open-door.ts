@@ -9,25 +9,32 @@
 // `text/plain` POST ran the model and appended to a thread, and a rebound page replayed a run and read
 // the thread's earlier messages back.
 //
-// A door has no provider; its `identify` is the analogue. With `identify` the application owns who the
-// caller is, as a provider does on REST — the door does not second-guess it (`identify: () => undefined`
-// is the explicit "this door has no per-user identity, on purpose"). WITHOUT `identify` it gets exactly
-// the gate's two checks, from the same functions, with the same way through (`allowedHosts` /
-// GNL_ALLOWED_HOSTS).
+// WHEN they apply is not decided here: `doorGate` (door.ts) asks `carriesIdentity` with the principal the
+// door's `identify` resolved for the request, and asks this guard only when there is none. Having an
+// `identify` is not having an identity — `identify: () => undefined`, or an `identify` that answers
+// nothing for an anonymous visitor, resolves nobody, so both checks run. The way through is the gate's
+// (`allowedHosts` / GNL_ALLOWED_HOSTS) for the host rule, and `allowCrossSite: true` — a door meant to be
+// embedded on other sites, such as a public chat widget — for the cross-site check alone.
 import { isCrossSiteStateChange, isHostAllowed, hostnameOf, crossSiteRefusedMessage } from './same-site.js';
 import { hostAllowList, hostNotAllowedMessage } from './gate.js';
-import { AUTH_ERROR_CODES } from './decision.js';
+import { AUTH_ERROR_CODES, AUTH_ERROR_STATUS } from './decision.js';
 
 export interface OpenDoorGuardOptions {
   /** The same list as `makeGate`'s `allowedHosts` (and GNL_ALLOWED_HOSTS adds to it). */
   allowedHosts?: readonly string[] | true;
+  /**
+   * `true` for a door that pages on other sites are meant to call with no identity — a chat widget
+   * embedded on a customer's website. Lifts the cross-site check only; the host rule stays.
+   */
+  allowCrossSite?: boolean;
   /** How the door is built, for the refusal's way through — e.g. `'createChatRoute'`. */
   door: string;
 }
 
 /** What a door answers when a providerless protection refuses a request. */
 export interface OpenDoorRefusal {
-  status: 403;
+  /** `AUTH_ERROR_STATUS[code]`. */
+  status: number;
   code: typeof AUTH_ERROR_CODES.hostNotAllowed | typeof AUTH_ERROR_CODES.crossSiteRefused;
   error: string;
   /** The hostname the request named — for `host_not_allowed`. */
@@ -35,9 +42,9 @@ export interface OpenDoorRefusal {
 }
 
 /**
- * The providerless protections as one function a door asks per request: `undefined` to go on, or the
- * refusal to answer with (403). Build it once, where the door is built — an `allowedHosts` entry that
- * can never match throws there, naming the fix.
+ * The providerless protections as one function a door asks per request with no identity: `undefined`
+ * to go on, or the refusal to answer with. Build it once, where the door is built — an `allowedHosts`
+ * entry that can never match throws there, naming the fix.
  */
 export function openDoorGuard(opts: OpenDoorGuardOptions): (req: Request) => OpenDoorRefusal | undefined {
   const allowed = hostAllowList(opts.allowedHosts);
@@ -53,15 +60,20 @@ export function openDoorGuard(opts: OpenDoorGuardOptions): (req: Request) => Ope
         warnedHost = true;
         console.warn(`@gnldev/auth: refused a request addressed to "${name}". ${error}`);
       }
-      return { status: 403, code: AUTH_ERROR_CODES.hostNotAllowed, error, host: name };
+      const code = AUTH_ERROR_CODES.hostNotAllowed;
+      return { status: AUTH_ERROR_STATUS[code]!, code, error, host: name };
     }
-    if (isCrossSiteStateChange(req)) {
-      const error = crossSiteRefusedMessage(`pass \`identify: (req) => principal\` in ${options} (from a verified token), or \`identify: () => undefined\` to declare, on purpose, that it has no per-user identity`);
+    if (opts.allowCrossSite !== true && isCrossSiteStateChange(req)) {
+      const error = crossSiteRefusedMessage(
+        `pass allowCrossSite: true in ${options} for a door embedded on other sites (a public chat widget; the host rule still applies), ` +
+          `or \`identify: (req) => principal\` there, reading a verified token, so the request carries an identity`,
+      );
       if (!warnedCrossSite) {
         warnedCrossSite = true;
         console.warn(`@gnldev/auth: ${error}`);
       }
-      return { status: 403, code: AUTH_ERROR_CODES.crossSiteRefused, error };
+      const code = AUTH_ERROR_CODES.crossSiteRefused;
+      return { status: AUTH_ERROR_STATUS[code]!, code, error };
     }
     return undefined;
   };

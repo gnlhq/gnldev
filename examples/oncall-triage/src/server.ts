@@ -146,9 +146,12 @@ export function buildServer(deps: ServerDeps) {
     createChatRoute(
       { gnl },
       {
-        // An internal on-call tool: every caller is an engineer, and there is no end user whose data
-        // must be kept apart. Said explicitly — in production the route refuses to start otherwise.
-        identify: () => undefined,
+        // The same provider as the approval endpoint answers who is calling: an engineer with a token is
+        // that engineer; a request with none (`pnpm start` on a laptop, no ONCALL_ADMIN) is anonymous,
+        // and the route then answers it only on localhost / an IP and only from this machine's pages —
+        // list a deployment's name with `allowedHosts` (or GNL_ALLOWED_HOSTS). In production the route
+        // refuses to start without an `identify`.
+        identify: (req) => authProvider?.authenticate(req),
         resolveThreadId: (_c, body) => body?.incidentId ?? body?.id,
         resolveRunId: (_c, body) => body?.runId,
       },

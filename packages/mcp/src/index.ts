@@ -3,7 +3,7 @@
 import { tool, jsonSchema } from 'ai';
 import { argsHash } from '@gnldev/durable';
 
-export { createMcpServer, serveMcp } from './server.js';
+export { createMcpServer, serveMcp, MCP_REFUSED } from './server.js';
 export type { McpServer, McpServerOptions, McpServerToolDef, McpCallerContext, McpToolRequestInfo, McpToolSetArg } from './server.js';
 export { mcpFirewall, composeGuards, mcpPinKey } from './firewall.js';
 export type { McpFirewallOptions, McpPinRecord } from './firewall.js';

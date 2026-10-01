@@ -11,7 +11,7 @@ import { convertToModelMessages } from 'ai';
 import type { UIMessage } from 'ai';
 import { createGnl, scopeConfigToOrg, RunThreadMismatchError, blockedErrorCode, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, upstreamFailure, sealRequestContext, sealFieldsOf, resolveWorkIdentity } from '@gnldev/durable';
 import type { CreateGnlConfig } from '@gnldev/durable';
-import { callerOfRequest, authorizeDoorRequest, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, openDoorGuard, type AccessDecision, type Authorize, type Identify } from '@gnldev/auth';
+import { doorGate, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify } from '@gnldev/auth';
 import { toUIMessageStreamResponse } from './ui-stream.js';
 
 export interface CreateChatRouteOptions {
@@ -60,16 +60,26 @@ export interface CreateChatRouteOptions {
    */
   onDecision?: (decision: AccessDecision) => void | Promise<void>;
   /**
-   * Host names this route also answers when it has NO `identify`, besides `localhost`, `*.localhost` and
-   * any IP address — the same list, forms and meaning as `allowedHosts` on `createRestApi` (a hostname,
-   * a leading-dot domain like `'.ngrok-free.app'`, or `true` for every name); `GNL_ALLOWED_HOSTS` adds to
-   * it. Without `identify` this route has no identity to check, so it refuses what a providerless REST
-   * API refuses: a request addressed by any other name (403 `host_not_allowed` — the DNS-rebinding shape,
-   * where the rebound page could read a thread back) and a state-changing request a page on another site
-   * sent (403 `cross_site_refused`). With `identify` neither check runs: who the caller is, is then the
-   * application's answer.
+   * Host names this route also answers for a request with no identity, besides `localhost`,
+   * `*.localhost` and any IP address — the same list, forms and meaning as `allowedHosts` on
+   * `createRestApi` (a hostname, a leading-dot domain like `'.ngrok-free.app'`, or `true` for every
+   * name); `GNL_ALLOWED_HOSTS` adds to it.
+   *
+   * A request carries an identity when `identify` resolved a principal for it. One that did not — no
+   * `identify`, or an `identify` that answered nothing (an anonymous visitor, `() => undefined`) — gets
+   * what a providerless REST API gets: a request addressed by any other name is refused (403
+   * `host_not_allowed` — the DNS-rebinding shape, where the rebound page could read a thread back), and
+   * so is a state-changing request a page on another site sent (403 `cross_site_refused`; see
+   * `allowCrossSite`). Having `identify` does not switch either check off; resolving a caller does.
    */
   allowedHosts?: readonly string[] | true;
+  /**
+   * `true` for a route that pages on OTHER sites are meant to call with no identity — a chat widget
+   * embedded on a customer's website. Lifts the cross-site check (403 `cross_site_refused`) for a request
+   * with no identity, and nothing else: the host rule keeps `allowedHosts`. Without it, such a page
+   * needs a request that carries an identity (`identify` resolving a verified token).
+   */
+  allowCrossSite?: boolean;
   /**
    * FAZ-2 — per-run concurrency lock, ON by default (`{ ttlMs: 300_000 }`). Two CONCURRENT requests
    * with the same runId (double-click, two tabs, a retry racing the original) used to BOTH execute;
@@ -204,12 +214,6 @@ export function createChatRoute(
     if (!g) orgGnls.set(org, (g = createGnl(scopeConfigToOrg(config, org).config)));
     return g;
   };
-  // A route that cannot name anyone, in production, said nothing about it. Every run it starts is
-  // born ownerless — and an ownership gate with no owner to compare against passes (registry.ts's
-  // ownershipDenied takes the `!owner` branch), so the protection reads as present and is not.
-  // WARN, never throw: an existing deployment that has decided its own boundary lives in front of
-  // this route is not broken, and a framework that refuses to start over a posture question would be
-  // discovered at the worst possible moment. Once, at construction, addressed and with the fix in it.
   // A REMOVED option fails loudly. Ignoring it would be worse than the hook it replaced: a JavaScript
   // config (or one cast past the types) that still passes it would start every run ownerless, and
   // nothing would say so.
@@ -225,19 +229,17 @@ export function createChatRoute(
       "`{ kind: 'subject', id, orgId, roles: [] }` for an end user — so the route can tell a user from staff.",
     );
   }
-  // PRODUCTION REFUSES a route that names nobody. It used to warn and serve: every caller, with or
-  // without a credential, ran the model and left an ownerless run (measured). The recommended shape
-  // is a surface on the REST API, where the auth provider decides who the caller is. A host that
-  // really has no per-user identity says so explicitly with `identify: () => undefined`.
-  if (process.env.NODE_ENV === 'production' && !opts.identify) {
-    throw new Error(
-      '[gnl chat-route] no `identify` in production: this route has no auth of its own, so every caller would run the model ' +
-      'and leave an ownerless run. Mount it on the REST API instead — createRestApi(config, { auth, surfaces: [chatSurface()] }) — ' +
-      'or pass `identify: (req) => principal` from your verified session. `identify: () => undefined` opts out, explicitly.',
-    );
-  }
-  // No `identify`: the providerless protections the REST gate applies (@gnldev/auth `openDoorGuard`).
-  const openGuard = opts.identify ? undefined : openDoorGuard({ allowedHosts: opts.allowedHosts, door: 'createChatRoute' });
+  // Who is calling, the open-surface checks for a request with no identity, the role: @gnldev/auth's
+  // `doorGate`, the one preamble every door runs. In production a route with no `identify` refuses to
+  // start (it used to warn and serve: every caller ran the model and left an ownerless run, measured).
+  const admit = doorGate({
+    door: 'createChatRoute',
+    identify: opts.identify,
+    authorize: opts.authorize,
+    allowedHosts: opts.allowedHosts,
+    allowCrossSite: opts.allowCrossSite,
+    restMount: 'createRestApi(config, { auth, surfaces: [chatSurface()] })',
+  });
   const app = new Hono();
   // The outcome, reported once the route has answered (see `onDecision`).
   if (opts.onDecision) {
@@ -252,11 +254,6 @@ export function createChatRoute(
     });
   }
   app.post('/agents/:name/chat', async (c) => {
-    const open = openGuard?.(c.req.raw);
-    if (open) {
-      markRefusal(c.req.raw, 'policy', { detail: open.code });
-      return c.json({ error: open.error, code: open.code, ...(open.host !== undefined ? { host: open.host } : {}) }, open.status);
-    }
     const name = c.req.param('name');
     const body = (await c.req.json().catch(() => ({}))) as {
       id?: string;
@@ -270,12 +267,10 @@ export function createChatRoute(
     const lastMsg = body.messages?.[body.messages.length - 1];
     // WHO, resolved once and FIRST: the key decision below cannot be made without the subject, and a
     // resolver that reads the request may answer differently the second time. `body.resourceId` is
-    // read by `callerOfRequest` for an APPLICATION principal only — a user or staff naming someone in
-    // the body names nobody.
-    const who = await callerOfRequest(opts.identify, c.req.raw, body.resourceId);
-    if ('refused' in who) return c.json({ error: who.refused }, who.status ?? 400);
-    const denied = await authorizeDoorRequest(opts.authorize, who.principal, c.req.raw, AGENTS_RUN);
-    if (denied) return c.json({ error: denied.refused }, denied.status);
+    // read for an APPLICATION principal only — a user or staff naming someone in the body names nobody.
+    // The body is read before the refusals: reading it changes nothing, and nothing has run yet.
+    const who = await admit(c.req.raw, { named: body.resourceId, permission: AGENTS_RUN });
+    if ('refused' in who) return Response.json(who.refused.body, { status: who.refused.status });
     const caller = who.caller;
     const subject = caller.kind === 'user' ? caller.id : undefined;
     // WHICH ORGANIZATION: the principal's, never the body's. An org is an isolation boundary, and a

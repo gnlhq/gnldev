@@ -6,11 +6,11 @@
 // the gate reads (method, path, headers, query) is on `Request`; nothing was lost by narrowing.
 import type { AuthProvider, Decision, Principal } from './types.js';
 import { isCrossSiteStateChange, isHostAllowed, hostnameOf, allowedHostEntry, readAllowedHosts, crossSiteRefusedMessage } from './same-site.js';
-import { bindsIdentity } from './adapter.js';
-import { notePrincipal, noteVerdict, settleDecision, AUTH_ERROR_CODES } from './decision.js';
+import { carriesIdentity } from './adapter.js';
+import { notePrincipal, noteVerdict, settleDecision, authErrorResponse, AUTH_ERROR_CODES } from './decision.js';
 
 /** The way through a cross-site refusal on REST / Studio. */
-const CROSS_SITE_WAY = "configure an auth provider that binds an identity — auth: roleAuth({ admin: { token } }) — or serve the page from this machine's own site (a dev-server proxy to the API)";
+const CROSS_SITE_WAY = "give it an identity to check — an auth provider that binds one, auth: roleAuth({ admin: { token } }) — or serve the page from this machine (a dev-server proxy to the API)";
 
 export interface Gate {
   /** Is access allowed? true if there's no provider (opt-in: gate not set up → open; see makeGate in production). */
@@ -98,15 +98,15 @@ const SESSION_NAME_DOMAINS = ['ngrok-free.app', 'ngrok-free.dev', 'ngrok.app', '
  *
  * `opts.auth` says why the rule applies — no auth at all, or a `{ read, write }` pair, whose predicates
  * name no identity (a pair is refused too: a predicate is opaque, and a rebound page is same-origin, so it
- * may send any header, a token-shaped one included). `opts.door` is set by a standalone door with no
- * `identify` (`'createChatRoute'`), and names where its `allowedHosts` goes.
+ * may send any header, a token-shaped one included). `opts.door` is set by a standalone door, for a request
+ * its `identify` resolved no principal for (`'createChatRoute'`), and names where its `allowedHosts` goes.
  */
 export function hostNotAllowedMessage(hostname: string, opts: { auth?: HostRuleAuth; door?: string } = {}): string {
   const suffix = SESSION_NAME_DOMAINS.find((d) => hostname.endsWith(`.${d}`));
   const entry = suffix ? `.${suffix}` : hostname;
   const where = opts.door ? `the ${opts.door} options` : 'the createRestApi / createStudioApp options';
   const what = opts.door
-    ? `this ${opts.door} door has no \`identify\`, so it answers only requests addressed to it as localhost or by an IP address`
+    ? `this request carried no identity the ${opts.door} door resolved (it has no \`identify\`, or \`identify\` answered nothing for it), so it is answered only when addressed as localhost or by an IP address`
     : opts.auth === 'read-write'
       ? `this server's auth names no identity (a { read, write } pair, or a provider with bindsIdentity: false) — so, like a server with no auth, it answers only requests addressed to it as localhost or by an IP address`
       : `this server has no auth provider, so it answers only requests addressed to it as localhost or by an IP address`;
@@ -197,7 +197,7 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
    * rebound name fails the certificate before any request is sent), so there is nothing to check.
    */
   function hostWithoutIdentity(req: Request): boolean {
-    if (bindsIdentity(provider)) return false;
+    if (carriesIdentity({ provider })) return false;
     const host = req.headers.get('host');
     if (!host || isHostAllowed(host, allowedHosts())) return false;
     const name = hostnameOf(host);
@@ -229,10 +229,11 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
    * `{read:()=>true, write:()=>true}` configured, a cross-site `POST /api/retention/sweep` was
    * ALLOWED. examples/app ships exactly that shape, so it was the published example that was open.
    *
-   * `bindsIdentity(undefined)` is false, so the providerless case is covered by the same test.
+   * `carriesIdentity({ provider: undefined })` is false, so the providerless case is covered by the same
+   * test — and it is the same function a standalone door asks (`doorGate`), with the principal it resolved.
    */
   function crossSiteWithoutIdentity(req: Request): boolean {
-    if (bindsIdentity(provider) || !isCrossSiteStateChange(req)) return false;
+    if (carriesIdentity({ provider }) || !isCrossSiteStateChange(req)) return false;
     crossSiteRefusals.add(req);
     if (!warnedCrossSite) {
       warnedCrossSite = true;
@@ -295,16 +296,10 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
     deny(req, action) {
       const refusedHost = hostRefusals.get(req);
       if (refusedHost !== undefined) {
-        return Response.json(
-          { error: hostNotAllowedMessage(refusedHost.name, { auth: refusedHost.auth }), code: AUTH_ERROR_CODES.hostNotAllowed, host: refusedHost.name },
-          { status: 403 },
-        );
+        return authErrorResponse(AUTH_ERROR_CODES.hostNotAllowed, { error: hostNotAllowedMessage(refusedHost.name, { auth: refusedHost.auth }), host: refusedHost.name });
       }
       if (crossSiteRefusals.has(req)) {
-        return Response.json(
-          { error: crossSiteRefusedMessage(CROSS_SITE_WAY), code: AUTH_ERROR_CODES.crossSiteRefused },
-          { status: 403 },
-        );
+        return authErrorResponse(AUTH_ERROR_CODES.crossSiteRefused, { error: crossSiteRefusedMessage(CROSS_SITE_WAY) });
       }
       const d = decisions.get(req);
       const denied = d && d.allow === false ? d : undefined;

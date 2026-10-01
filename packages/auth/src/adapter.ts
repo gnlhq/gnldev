@@ -1,5 +1,5 @@
 // Backward compatibility: wraps the old {read,write} predicate pair (StudioAuth / examples/app) into an AuthProvider.
-import type { AuthProvider, Decision, AuthContext } from './types.js';
+import type { AuthProvider, Decision, AuthContext, Principal } from './types.js';
 
 /** Old role-based hook: read = GET (viewer), write = POST/PUT/PATCH/DELETE (admin). */
 export interface ReadWriteAuth {
@@ -21,6 +21,24 @@ export interface ReadWriteAuth {
  */
 export function bindsIdentity(auth: AuthProvider | undefined): boolean {
   return !!auth && (auth as { bindsIdentity?: boolean }).bindsIdentity !== false;
+}
+
+/**
+ * Does this request carry an identity — so the open-surface checks (the host rule and the cross-site
+ * check) have nothing to protect and are skipped? The ONE answer, for every surface:
+ *
+ *   • the REST and Studio gate (`makeGate`) ask it with their `provider`: a provider that binds an
+ *     identity is defended by its bearer token, which neither a rebound page nor another site can read;
+ *   • a standalone door (`doorGate`) asks it with the `principal` its `identify` resolved for THIS
+ *     request. An `identify` that answered nothing resolved no identity, so the checks run — the
+ *     presence of the function says nothing about the request.
+ *
+ * Before this had one owner the doors asked "was `identify` passed?" instead, and
+ * `identify: () => undefined` (or an `identify` that answers nothing for an anonymous visitor) turned
+ * both checks off: measured, a DNS-rebound page read a thread back and a cross-site form ran the model.
+ */
+export function carriesIdentity(source: { provider?: AuthProvider; principal?: Principal | null }): boolean {
+  return bindsIdentity(source.provider) || source.principal != null;
 }
 
 /** {read,write} → AuthProvider. If there's no fn in that direction, it's unrestricted (preserves the existing `!fn || fn(c)` behavior). */

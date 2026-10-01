@@ -214,6 +214,10 @@ everyone else.
 | `Identify` | `(req) => Principal \| null \| undefined` (may be async): "who is this request", written once and handed to every door — `@gnldev/server`, `@gnldev/chat-adapter`, `@gnldev/agui`, `@gnldev/mcp`. A provider's `authenticate` is one: `(req) => auth.authenticate(req)` |
 | `engineCallerOf` | The one mapping from a principal to the engine's caller: `subject` → that user, `operator` → staff, `application` → the user it names on the request (unknown if none), nothing → unknown |
 | `callerOfRequest` | What a standalone door does with a request: `identify` once, then `engineCallerOf`. An application's user is read from the request's `resourceId` for an application only; an application naming nobody is refused (`APPLICATION_NAMES_NO_USER`) |
+| `doorGate` | The one preamble every standalone door runs (`createChatRoute`, `createAguiRoute`, `createMcpServer`): `callerOfRequest`, then — for a request with no identity — the host rule and the cross-site check (`allowedHosts`; `allowCrossSite: true` lifts the cross-site check only, for a door other sites embed), then the role (`authorize`). With `restMount`, a door with no `identify` refuses to start in production |
+| `carriesIdentity` | The one answer to "does this request carry an identity, so the open-surface checks are skipped": a provider that binds one (`makeGate`), or a principal `identify` resolved for this request (`doorGate`). An `identify` that answers nothing is no identity |
+| `permissionContext` | The context `authorize` is asked with for one permission (`allowP` and a door's `authorize`): a permission ending in `:read` is a read, everything else a write |
+| `authErrorResponse` / `AUTH_ERROR_STATUS` | The answer for an auth error code, with the status the map gives it — the one place a code's status is written |
 | `PLATFORM_ADMIN_ROLE` / `isPlatformAdmin` | The reserved cross-organization grant `superAdmin` carries |
 | `callerKind` / `isPrincipalKind` / `PRINCIPAL_KINDS` | What a caller is (see above), read fail-closed |
 | `assertAssignablePrivileges` | The ceiling for user management: no one hands out a grant they do not hold |
