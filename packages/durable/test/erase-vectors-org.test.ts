@@ -6,7 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage } from '../src/in-memory-storage.js';
 import { withOrgStorage } from '../src/org-storage.js';
-import { toJournal } from '../src/storage.js';
+import { toJournal, VECTOR_PARTITION } from '../src/storage.js';
 import { eraseSubject } from '../src/erase.js';
 import { purgeResource } from '../src/retention.js';
 import type { Storage, VectorStore } from '../src/storage.js';
@@ -94,8 +94,9 @@ describe('eraseSubject without orgId erases documents outside every organization
     const legacy: Pick<VectorStore, 'delete'> = { delete: (w) => storage.vectors!.delete!({ ...(w.owner !== undefined ? { owner: w.owner } : {}) }) };
     await expect(eraseSubject(withVectors(storage, legacy), 'bob')).rejects.toThrow(/outsideOrganizations/);
     expect(await left()).toHaveLength(4);
-    // The same kind of adapter still serves an organization's erasure: that path carries a namespace.
-    const nsAware: Pick<VectorStore, 'delete'> = { delete: (w) => storage.vectors!.delete!({ owner: w.owner!, namespace: w.namespace! }) };
+    // The same kind of adapter still serves an organization's erasure: that path carries a namespace —
+    // and the organization's grant, which an adapter in front of the root store passes on.
+    const nsAware: Pick<VectorStore, 'delete'> = { delete: (w) => storage.vectors!.delete!({ owner: w.owner!, namespace: w.namespace!, [VECTOR_PARTITION]: w[VECTOR_PARTITION] }) };
     await eraseSubject(withVectors(storage, nsAware), 'bob', { orgId: 'acme' });
     expect(await left()).toEqual(['DOC-root-bob', 'org:acme:DOC-acme-cem', 'org:globex:DOC-globex-bob']);
   });

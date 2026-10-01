@@ -18,6 +18,15 @@ async function seed(mem: MemoryStore, id: string, resourceId: string, text: stri
   await mem.appendMessages(id, [{ threadId: id, role: 'user', text, message: { role: 'user', content: text }, embedding: E, ts: 1 }]);
 }
 
+/**
+ * An organization's thread as 0.9 left it: the same physical rows its view writes (`org:<id>:<t>`), but
+ * no owner record. Written through the root port on purpose — this version's organization view writes
+ * the owner record with the thread (`withOrgStorage(...).memory.upsertThread`), which 0.9 did not.
+ */
+async function seed09Org(s: Storage, org: string, id: string, resourceId: string, text: string) {
+  await seed(s.memory!, `org:${org}:${id}`, resourceId, text);
+}
+
 const engines: [string, () => Storage][] = [
   ['InMemoryStorage', () => new InMemoryStorage()],
   ['SqliteStorage', () => new SqliteStorage(':memory:') as unknown as Storage],
@@ -37,7 +46,7 @@ describe.each(engines)('threads 0.9 let the root create under org: (%s)', (_n, m
     await toJournal(s.runs).put(threadOwnerKey('org:acme:support'), { resourceId: 'u1', at: 1 });
     await seed(s.memory!, 'org:acme:ambiguous', 'u1', 'WHOSE');
     // acme's own, as 0.9's AgentMemory left it: a thread and a message, no owner record.
-    await seed(withOrgStorage(s, 'acme').memory!, 't-acme', 'u1', 'ACME-OWN');
+    await seed09Org(s, 'acme', 't-acme', 'u1', 'ACME-OWN');
     const acme = new AgentMemory({ storage: withOrgStorage(s, 'acme'), embed, recentN: 5 });
     return { s, acme, root: new AgentMemory({ storage: s, embed, recentN: 5 }) };
   }
@@ -87,7 +96,7 @@ describe.each(engines)('threads 0.9 let the root create under org: (%s)', (_n, m
     // acme's thread out from under it (measured on the 0.9.0 fixture); it must be undecided.
     const s = make();
     await seed(s.memory!, 'org:123', 'u1', 'ROOT-SECRET-123');
-    await seed(withOrgStorage(s, 'acme').memory!, 't-acme', 'u1', 'ACME-OWN');
+    await seed09Org(s, 'acme', 't-acme', 'u1', 'ACME-OWN');
     const acme = new AgentMemory({ storage: withOrgStorage(s, 'acme'), embed, recentN: 5 });
 
     expect(await findReservedRootThreads(s)).toEqual([
@@ -121,7 +130,7 @@ describe.each(engines)('threads 0.9 let the root create under org: (%s)', (_n, m
    */
   async function backfilled09(orgSide: boolean) {
     const s = make();
-    await seed(withOrgStorage(s, 'acme').memory!, 't-run', 'u1', 'ACME-TRUN-SECRET');
+    await seed09Org(s, 'acme', 't-run', 'u1', 'ACME-TRUN-SECRET');
     if (orgSide) await withOrg(toJournal(s.runs), 'acme').put(threadOwnerKey('t-run'), { resourceId: 'u1', at: 1 });
     await toJournal(s.runs).put(threadOwnerKey('org:acme:t-run'), { resourceId: 'u1', at: 2, backfilled: true });
     return { s, acme: new AgentMemory({ storage: withOrgStorage(s, 'acme'), embed, recentN: 5 }) };
@@ -185,7 +194,7 @@ describe.each(engines)('threads 0.9 let the root create under org: (%s)', (_n, m
     await seed(s.memory!, 'org:2', 'u2', 'B');
     await seed(s.memory!, 'plain', 'u1', 'C');
     await new AgentMemory({ storage: withOrgStorage(s, 'acme'), embed }).createThread({ id: 't', resourceId: 'u1' });
-    await seed(withOrgStorage(s, 'globex').memory!, 'g', 'u1', 'D'); // 0.9-shaped: no record — undecided
+    await seed09Org(s, 'globex', 'g', 'u1', 'D'); // 0.9-shaped: no record — undecided
     expect(await findReservedRootThreads(s, { resourceId: 'u1' })).toEqual([
       { id: 'org:1', resourceId: 'u1', rootOnly: true },
       { id: 'org:globex:g', resourceId: 'u1', rootOnly: false },

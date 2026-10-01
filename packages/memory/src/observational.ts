@@ -21,6 +21,7 @@
 import { generateText, tool } from 'ai';
 import { z } from 'zod';
 import { messageText } from './keys.js';
+import type { VectorPartitionOption } from '@gnldev/durable';
 
 export interface ObservationalMemoryConfig {
   enabled?: boolean;
@@ -100,7 +101,8 @@ export interface OmVectorMatch {
 /** Structural VectorStore port — see `omVectors.store`'s doc above for why there's no filter param. */
 export interface OmVectorStore {
   upsert(items: OmVectorItem[]): Promise<void>;
-  query(embedding: number[], topK: number, opts?: { namespace?: string }): Promise<OmVectorMatch[]>;
+  /** `opts` carries the organization's grant (`VECTOR_PARTITION`) when the store is the root's. */
+  query(embedding: number[], topK: number, opts?: { namespace?: string } & VectorPartitionOption): Promise<OmVectorMatch[]>;
 }
 
 /** Approximate token count (not a real tokenizer; the char/4 heuristic). */

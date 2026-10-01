@@ -5,7 +5,7 @@
 // loadContext runs BEFORE persistInput, so the whole context freezes into `:input` = replayable.
 import { cosineSimilarity } from 'ai';
 import { requireCapability, durableProcessorStep, workingMemoryScope, OM_LEAVES, OM_VECTOR_SOURCE, OBSERVATION_VECTOR_KEY, type OmLeaf } from '@gnldev/durable';
-import { threadOwnerOf, recordThreadCreated, toJournal, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, assertRootThreadId, type Memory } from '@gnldev/durable';
+import { threadOwnerOf, toJournal, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, VECTOR_PARTITION, assertRootThreadId, type Memory } from '@gnldev/durable';
 import { PROVENANCE_RECENT_CAP, messagePreview } from '@gnldev/durable';
 import type { Storage, RunJournal, MemoryStore, MessageRecord, MessageAppend, ThreadRecord, RecallOptions, MemoryContextProvenance, RecalledMessageRef } from '@gnldev/durable';
 import { messageText, hasNorm, type Embed } from './keys.js';
@@ -642,7 +642,9 @@ export class AgentMemory {
       id: ns ? orgVectorId(ns, id) : id,
       text: o.text,
       embedding: embedding!,
-      ...(ns ? { namespace: ns } : {}),
+      // The organization's grant (`VECTOR_PARTITION`): the store is the ROOT's, which refuses an
+      // `org:` namespace from a call that does not carry one.
+      ...(ns ? { namespace: ns, [VECTOR_PARTITION]: ns } : {}),
       ...(owner !== undefined ? { owner } : {}),
       metadata: { source: OM_VECTOR_SOURCE, threadId, level, fromSeq: o.fromSeq, toSeq: o.toSeq, [OBSERVATION_VECTOR_KEY]: o.id },
     }]);
@@ -695,7 +697,7 @@ export class AgentMemory {
     const threshold = opts?.threshold ?? 0;
     const [qEmbedding] = await this.om.omVectors.embed([q]);
     const overfetch = Math.max(topK * 20, 100);
-    const hits = await this.om.omVectors.store.query(qEmbedding!, overfetch, ...(this.omVectorNs ? [{ namespace: this.omVectorNs }] : []));
+    const hits = await this.om.omVectors.store.query(qEmbedding!, overfetch, ...(this.omVectorNs ? [{ namespace: this.omVectorNs, [VECTOR_PARTITION]: this.omVectorNs }] : []));
     // An organization's memory over a store that is not the organization's view labels its vectors with
     // its namespace and asks for that namespace back — so a hit that reports none means the store does
     // not echo `namespace` (a structural custom store), not "another organization's". Filtering on it
@@ -810,18 +812,10 @@ export class AgentMemory {
     const id = this.scoped(input.id ?? genId('th'));
     const now = Date.now();
     const rec: ThreadRecord = { id, resourceId: input.resourceId, title: input.title, metadata: input.metadata, createdAt: now, updatedAt: now };
+    // An organization's thread gets its owner record from the organization's memory view itself
+    // (`withOrgStorage`'s upsertThread → `recordThreadCreated`), for this writer and every other.
     await this.store.upsertThread(rec);
-    await this.recordCreated(id, input.resourceId);
     return rec;
-  }
-
-  /**
-   * An organization's thread carries its owner record from the moment it exists, run or no run
-   * (`recordThreadCreated`): the root store holds it under the same physical id 0.9 let the root
-   * create, and the record is what says it is this organization's (`findReservedRootThreads`).
-   */
-  protected async recordCreated(threadId: string, resourceId: string): Promise<void> {
-    if (!this.rootScope) await recordThreadCreated(toJournal(this.runs), threadId, resourceId);
   }
   async getThreadById(threadId: string): Promise<ThreadRecord | undefined> {
     this.scoped(threadId);
@@ -873,7 +867,6 @@ export class AgentMemory {
     const now = Date.now();
     const rec: ThreadRecord = { id: dst, resourceId, title: src?.title, metadata: src?.metadata, parentThreadId: srcThreadId, createdAt: now, updatedAt: now };
     await this.store.upsertThread(rec);
-    await this.recordCreated(dst, resourceId);
     return rec;
   }
 

@@ -48,7 +48,7 @@ describe('scheduleWorkflow — yetim durum onarımı', () => {
 
     await scheduleWorkflow(j, { id: 't', name: 'wf', every: 60_000 }, 100_000);
 
-    expect(await j.get('sched:state:t')).toEqual({ nextRunAt: 160_000, attempts: 0, fireCount: 0, status: 'pending' });
+    expect(await j.get('sched:state:t')).toEqual({ nextRunAt: 160_000, attempts: 0, fireCount: 0, status: 'pending', of: expect.any(String) });
     const listed = await listTriggers(j);
     expect(listed).toHaveLength(1);
     expect(listed[0]).toMatchObject({ id: 't', status: 'pending', nextRunAt: 160_000 });
@@ -88,7 +88,7 @@ describe('scheduleWorkflow — yetim durum onarımı', () => {
   it('yeni bir tetikte tek satır bile değişmez (onarım yolu yalnız yetimi görür)', async () => {
     const j = new InMemoryJournal();
     await scheduleWorkflow(j, { id: 'yeni', name: 'wf', at: 1_000 }, 0);
-    expect(await j.get('sched:state:yeni')).toEqual({ nextRunAt: 1_000, attempts: 0, fireCount: 0, status: 'pending' });
+    expect(await j.get('sched:state:yeni')).toEqual({ nextRunAt: 1_000, attempts: 0, fireCount: 0, status: 'pending', of: expect.any(String) });
     expect(warn).not.toHaveBeenCalled();
   });
 

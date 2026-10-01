@@ -5,7 +5,7 @@
 // accepted the class as a `VectorStore` regardless, because a function of fewer parameters is
 // assignable to a type that declares more. Measured before the fix:
 //
-//   query(q, 5, { namespace: 'org:acme' })       -> acme-1, globex-1
+//   query(q, 5, { namespace: 'tenant:acme' })       -> acme-1, globex-1
 //   query(q, 5, { namespace: 'does-not-exist' }) -> 2 rows
 //   GraphRag.prototype.query.length = 2          vs InMemoryVectorStore = 3
 //
@@ -32,8 +32,8 @@ const SECRET = 'quarterly revenue figures';
 
 async function seedTwoTenants(store: VectorStore): Promise<void> {
   await store.upsert([
-    { id: 'acme-1', text: `ACME ${SECRET}`, namespace: 'org:acme', embedding: await embed(SECRET) },
-    { id: 'globex-1', text: `GLOBEX ${SECRET}`, namespace: 'org:globex', embedding: await embed(SECRET) },
+    { id: 'acme-1', text: `ACME ${SECRET}`, namespace: 'tenant:acme', embedding: await embed(SECRET) },
+    { id: 'globex-1', text: `GLOBEX ${SECRET}`, namespace: 'tenant:globex', embedding: await embed(SECRET) },
   ]);
 }
 
@@ -54,7 +54,7 @@ describe.each(STORES)('%s honours namespace', (_name, make) => {
     const store = make();
     await seedTwoTenants(store);
 
-    const acme = await store.query(await embed(SECRET), 5, { namespace: 'org:acme' });
+    const acme = await store.query(await embed(SECRET), 5, { namespace: 'tenant:acme' });
     expect(acme.map((m) => m.id), 'a query scoped to one tenant returned another tenant\'s row')
       .toEqual(['acme-1']);
   });
@@ -65,7 +65,7 @@ describe.each(STORES)('%s honours namespace', (_name, make) => {
     const store = make();
     await seedTwoTenants(store);
 
-    const none = await store.query(await embed(SECRET), 5, { namespace: 'org:nobody' });
+    const none = await store.query(await embed(SECRET), 5, { namespace: 'tenant:nobody' });
     expect(none, 'an unwritten namespace matched existing rows').toEqual([]);
   });
 });
@@ -91,8 +91,8 @@ describe('GraphRag builds its graph within a namespace', () => {
     // The other half — a namespace-partitioned graph must still be a graph.
     const store = new GraphRag({ threshold: 0, hops: 2, seeds: 4 });
     await store.upsert([
-      { id: 'a-1', text: 'one', namespace: 'org:acme', embedding: await embed('one') },
-      { id: 'a-2', text: 'two', namespace: 'org:acme', embedding: await embed('two') },
+      { id: 'a-1', text: 'one', namespace: 'tenant:acme', embedding: await embed('one') },
+      { id: 'a-2', text: 'two', namespace: 'tenant:acme', embedding: await embed('two') },
     ]);
     expect(store.stats().edges, 'partitioning the graph left it with no edges at all').toBeGreaterThan(0);
   });
@@ -105,7 +105,7 @@ describe('createRagTool', () => {
     const store = new InMemoryVectorStore();
     await seedTwoTenants(store);
 
-    const scoped = createRagTool({ store, embed, topK: 5, namespace: 'org:acme' });
+    const scoped = createRagTool({ store, embed, topK: 5, namespace: 'tenant:acme' });
     const hits = await scoped.execute!({ query: SECRET }, { toolCallId: 'c1', messages: [], gnl: toolContextFor(runIdentity(STAFF, 'test')) } as any);
 
     expect(hits.map((h) => h.text), 'the tool retrieved another tenant\'s document')

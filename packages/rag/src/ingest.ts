@@ -166,7 +166,10 @@ export async function ingestDocuments(store: VectorStore, embed: Embed, docs: Ve
   // an id a store cannot hold used to fail at that document's upsert, after the documents before it
   // had already been replaced.
   const chunked = docs.map((doc) => chunkDocuments([doc], opts));
-  vectorWriteBatch(chunked.flat());
+  // Checked as the store will see it: an organization's view replaces each chunk's namespace with its
+  // own, so a document's `namespace` there is never written and is not the root naming an `org:` one.
+  const viewed = orgStorageScopeOf(store) !== undefined;
+  vectorWriteBatch(viewed ? chunked.flat().map(({ namespace: _ns, ...c }) => c) : chunked.flat());
   const perDoc: VectorItem[][] = [];
   for (const chunks of chunked) {
     perDoc.push(await Promise.all(chunks.map(async (c) => ({ ...c, embedding: await embed(c.text) }))));

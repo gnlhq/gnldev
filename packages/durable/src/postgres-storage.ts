@@ -10,7 +10,7 @@ import { cosineSimilarity } from 'ai';
 import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus } from './journal.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
-import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision } from './storage.js';
+import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision } from './storage.js';
 import type { AdoptIntoOrgResult,
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -549,6 +549,7 @@ export class PostgresStorage implements Storage {
     ];
     const moved: Record<string, number> = {};
     const skipped = new Set<string>();
+    const resetPositions: string[] = [];
     let alreadyScoped = 0;
     const bump = (store: string, n: number) => { moved[store] = (moved[store] ?? 0) + n; };
 
@@ -562,6 +563,17 @@ export class PostgresStorage implements Storage {
       if (clash) throw vectorAdoptCollision(clash.id);
       // The organization-space rule is `orgSpaceSql`'s (organization.ts), not a `LIKE` restated here.
       const space = (col: string, outside = false) => { let n = 0; return orgSpaceSql(col, () => `$${++n}`, { outside }); };
+      // Work-store keys by `workKeyAdoption` (see the SQLite twin), decided before anything moves.
+      const kvRoot = space('key', true);
+      for (const { key, value } of (await q(`SELECT key, value FROM gnl_work_kv WHERE ${kvRoot.cond}`, kvRoot.params)).rows as { key: string; value: string }[]) {
+        if (isPlatformKey(key)) continue;
+        const orgHas = (await q('SELECT 1 AS x FROM gnl_work_kv WHERE key = $1', [prefix + key])).rows.length > 0;
+        const d = workKeyAdoption(deserialize(value), orgHas);
+        if (d === 'collision') throw workKeyAdoptCollision(prefix + key);
+        if (d === 'reset-position') resetPositions.push(key);
+      }
+      if (!dryRun) for (const k of resetPositions) await q('DELETE FROM gnl_work_kv WHERE key = $1', [k]);
+      const notCarried = new Set(resetPositions);
       for (const [table, col, store] of KEYED) {
         const inQ = space(col);
         alreadyScoped += Number((await q(`SELECT COUNT(*) AS c FROM ${table} WHERE ${inQ.cond}`, inQ.params)).rows[0].c);
@@ -570,6 +582,7 @@ export class PostgresStorage implements Storage {
         let n = 0;
         for (const { k } of rows) {
           if (isPlatformKey(k)) { skipped.add(k.split(':')[0]!); continue; }
+          if (table === 'gnl_work_kv' && notCarried.has(k)) continue;
           n += Number((await q(`SELECT COUNT(*) AS c FROM ${table} WHERE ${col} = $1`, [k])).rows[0].c);
           if (dryRun) continue;
           if (table === 'gnl_work_log') {
@@ -606,7 +619,7 @@ export class PostgresStorage implements Storage {
       if (!dryRun) await q('ROLLBACK').catch(() => {});
       throw e;
     } finally { client.release?.(); }
-    return { orgId, dryRun, moved, alreadyScoped, skippedPlatformKeys: [...skipped].sort() };
+    return { orgId, dryRun, moved, alreadyScoped, skippedPlatformKeys: [...skipped].sort(), resetPositions: resetPositions.sort() };
   }
 
   async compact(opts?: { full?: boolean }): Promise<{ reclaimedBytes: number }> {

@@ -26,7 +26,7 @@ import type { AdoptIntoOrgResult,
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, WorkStore, CacheStore, MetaStore, LogRecord,
 } from './storage.js';
-import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, compareLogPosition } from './storage.js';
+import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision } from './storage.js';
 
 const SCHEMA_VERSION = '1';
 
@@ -1156,6 +1156,22 @@ export class RedisStorage implements Storage {
       return out;
     };
 
+    // Work-store keys by `workKeyAdoption`, decided before anything moves (logs included): a read
+    // position is dropped rather than carried — it used to overwrite the organization's own cursor
+    // here, stranding its pending records behind it — and any other key the organization already
+    // holds refuses the adoption, as the SQL stores' primary key does.
+    const wkBase = this.pfx + WK;
+    const resetPositions: string[] = [];
+    for (const k of await scanAll(globEscape(wkBase) + '*')) {
+      const bare = k.slice(wkBase.length);
+      if (isOrganizationKey(bare) || isPlatformKey(bare)) continue;
+      const v = await this.client.get(k);
+      if (v === null) continue;
+      const d = workKeyAdoption(deserialize(v), (await this.client.get(wkBase + prefix + bare)) !== null);
+      if (d === 'collision') throw workKeyAdoptCollision(prefix + bare);
+      if (d === 'reset-position') resetPositions.push(bare);
+    }
+
     // Work LOGS first, and checked before anything moves. They were not moved at all before: the
     // organization's reader never saw an adopted log, and the root records sat outside every org.
     // A record moves to the organization's namespace UNNUMBERED (0.9's bare form), so the next `list`
@@ -1184,6 +1200,8 @@ export class RedisStorage implements Storage {
           }
         }
       }
+      // Every refusal is behind us: the first write of the adoption.
+      for (const bare of resetPositions) await this.client.del(wkBase + bare);
       for (const [to, moves] of logMoves) {
         const recs: Array<LogRecord & { seq: number; key: string; raw: string }> = [];
         for (const { src, dst } of moves) {
@@ -1209,6 +1227,7 @@ export class RedisStorage implements Storage {
       let n = 0;
       for (const k of keys) {
         const bare = k.slice(full.length);
+        if (space === WK && resetPositions.includes(bare)) continue; // dropped above (under dryRun, still listed)
         if (isOrganizationKey(bare)) { alreadyScoped++; continue; }
         if (isPlatformKey(bare) || (space === META && ENGINE_META_KEYS.includes(bare))) { skipped.add(bare.split(':')[0]!); continue; }
         n++;
@@ -1229,7 +1248,7 @@ export class RedisStorage implements Storage {
     moved.cache = 0;
     // The vector port does not exist on this engine (capabilities.vectors === 'none'), so it is absent
     // from the report rather than reported as zero — see AdoptIntoOrgResult.
-    return { orgId, dryRun, moved, alreadyScoped, skippedPlatformKeys: [...skipped].sort() };
+    return { orgId, dryRun, moved, alreadyScoped, skippedPlatformKeys: [...skipped].sort(), resetPositions: resetPositions.sort() };
   }
 
   async init(): Promise<void> {

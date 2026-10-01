@@ -22,8 +22,9 @@
  * edit cannot move one without seeing the other.
  */
 import { ORG_SCOPE, orgPrefix, orgScopeOf, withOrg } from './organization.js';
-import { toJournal, orgVectorId, workingMemoryScope, MEMORY_PARTITION, partitionReadCount } from './storage.js';
+import { toJournal, orgVectorId, workingMemoryScope, MEMORY_PARTITION, VECTOR_PARTITION, partitionReadCount } from './storage.js';
 import { asReaderJournal, type Journal, type JournalReader } from './journal.js';
+import { recordThreadCreated } from './thread-owner.js';
 import type {
   CacheStore, CapabilityMatrix, ListQuery, LogRecord, MemoryStore, MessageRecord, MessageAppend, MetaStore,
   Page, RunJournal, Storage, ThreadRecord,
@@ -175,7 +176,7 @@ async function partitioned<T>(memory: MemoryStore, p: string, scan: () => Promis
   return out;
 }
 
-function scopedMemory(memory: MemoryStore, p: string): MemoryStore {
+function scopedMemory(memory: MemoryStore, p: string, ownerJournal: Journal): MemoryStore {
   /**
    * Puts a message row into the underlying store's terms; `outMsg` is the exact inverse.
    *
@@ -213,11 +214,22 @@ function scopedMemory(memory: MemoryStore, p: string): MemoryStore {
     return { ...rec, id, ...(rec.parentThreadId !== undefined ? { parentThreadId: parent ?? rec.parentThreadId } : {}) };
   };
   const scoped: MemoryStore = {
-    upsertThread: (rec) => memory.upsertThread({
-      ...rec,
-      id: add(p, rec.id),
-      ...(rec.parentThreadId !== undefined ? { parentThreadId: add(p, rec.parentThreadId) } : {}),
-    }),
+    /**
+     * Every writer of an organization's thread passes here — `AgentMemory`, a host writing the store
+     * port directly, a migration — so this is where the thread gets the organization's owner record
+     * (`recordThreadCreated`, first write wins). It used to be written by `AgentMemory` alone: a thread
+     * created through this port by anything else had no organization-side record, so
+     * `findReservedRootThreads` listed it as undecided and the root's `eraseSubject` reported it as the
+     * root person's (measured, every store).
+     */
+    upsertThread: async (rec) => {
+      await memory.upsertThread({
+        ...rec,
+        id: add(p, rec.id),
+        ...(rec.parentThreadId !== undefined ? { parentThreadId: add(p, rec.parentThreadId) } : {}),
+      });
+      await recordThreadCreated(ownerJournal, rec.id, rec.resourceId);
+    },
     getThread: async (id) => {
       const rec = await memory.getThread(add(p, id));
       return rec === undefined ? undefined : outThread(rec);
@@ -293,10 +305,12 @@ function scopedVectors(vectors: VectorStore, p: string, orgId: string): VectorSt
     // The caller's own `namespace` is deliberately overwritten, not merged or respected. This wrapper
     // is the organization boundary; a document that could choose its own namespace could choose
     // another organization's.
-    upsert: (items: VectorItem[]) => vectors.upsert(items.map((it) => ({ ...it, id: own(it.id), namespace: ns }))),
+    // Each call carries this organization's grant (`VECTOR_PARTITION`): the root store refuses a call
+    // that names the reserved space without one (`assertRootVectorNames`).
+    upsert: (items: VectorItem[]) => vectors.upsert(items.map((it) => ({ ...it, id: own(it.id), namespace: ns, [VECTOR_PARTITION]: ns }))),
     // `opts.namespace` is likewise ignored rather than honoured — same reason, in the read direction.
     query: async (embedding: number[], topK: number, opts?: VectorQueryOptions) =>
-      (await vectors.query(embedding, topK, { ...opts, namespace: ns })).map(stripNs),
+      (await vectors.query(embedding, topK, { ...opts, namespace: ns, [VECTOR_PARTITION]: ns })).map(stripNs),
   };
   if (vectors.delete) scoped.delete = scopedVectorDelete(vectors, ns).delete;
   // Marked like the storage it belongs to, so `orgStorageScopeOf(vectors)` answers too. @gnldev/memory
@@ -308,7 +322,7 @@ function scopedVectors(vectors: VectorStore, p: string, orgId: string): VectorSt
 
 /** Always inside the organization: the namespace is forced, and ids are this organization's. */
 function scopedVectorDelete(vectors: Pick<VectorStore, 'delete'>, ns: string): Pick<VectorStore, 'delete'> {
-  return { delete: (where: VectorDeleteWhere) => vectors.delete!({ ...where, namespace: ns, ...(where.ids ? { ids: where.ids.map((id) => orgVectorId(ns, id)) } : {}) }) };
+  return { delete: (where: VectorDeleteWhere) => vectors.delete!({ ...where, namespace: ns, [VECTOR_PARTITION]: ns, ...(where.ids ? { ids: where.ids.map((id) => orgVectorId(ns, id)) } : {}) }) };
 }
 
 /**
@@ -376,14 +390,16 @@ export function withOrgStorage(storage: Storage, orgId: string): Storage {
   // Throws on an empty or `:`-bearing id — the single guard, shared with `withOrg`.
   const p = orgPrefix(orgId);
 
+  const runs = scopedRuns(storage.runs, p, orgId);
   const out: Storage = {
     name: storage.name,
     // Capabilities describe what the ENGINE can do, and scoping does not change that. Copied rather
     // than aliased so a caller mutating the returned matrix cannot reach the root storage's.
     capabilities: { ...storage.capabilities } as CapabilityMatrix,
-    runs: scopedRuns(storage.runs, p, orgId),
+    runs,
     meta: scopedMeta(storage.meta, p),
-    ...(storage.memory ? { memory: scopedMemory(storage.memory, p) } : {}),
+    // The owner record goes through this organization's own journal view (`org:<id>:thread:<t>:owner`).
+    ...(storage.memory ? { memory: scopedMemory(storage.memory, p, toJournal(runs)) } : {}),
     ...(storage.vectors ? { vectors: scopedVectors(storage.vectors, p, orgId) } : {}),
     ...(storage.work ? { work: scopedWork(storage.work, p, orgId) } : {}),
     ...(storage.cache ? { cache: scopedCache(storage.cache, p) } : {}),

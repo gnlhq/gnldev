@@ -484,7 +484,7 @@ export interface VectorMatch extends VectorDoc {
   score: number;
 }
 /** Narrows which documents a query may be answered from — see `VectorStore.query`. */
-export interface VectorQueryOptions {
+export interface VectorQueryOptions extends VectorPartitionOption {
   /**
    * Only documents in this namespace are eligible. Omitted means "no restriction" and searches
    * everything, which is the pre-existing behaviour and the only backwards-compatible default.
@@ -510,7 +510,7 @@ export interface VectorQueryOptions {
 }
 
 /** What `VectorStore.delete` removes: every given condition must match. No condition removes nothing. */
-export interface VectorDeleteWhere {
+export interface VectorDeleteWhere extends VectorPartitionOption {
   ids?: string[];
   /** Every document of this end user — the erasure path (`purgeResource(…, { vectors })`). */
   owner?: string;
@@ -590,6 +590,7 @@ export function vectorWriteBatch<T extends VectorLabels>(items: readonly T[]): T
     if (it.namespace !== undefined && (typeof it.namespace !== 'string' || it.namespace === '' || !isWellFormed(it.namespace))) {
       throw new TypeError(`@gnldev/durable: document '${it.id}': 'namespace' must be a non-empty, well-formed string or absent — got ${JSON.stringify(it.namespace)}`);
     }
+    assertRootVectorNames({ namespace: it.namespace, ids: [it.id], [VECTOR_PARTITION]: (it as VectorPartitionOption)[VECTOR_PARTITION] });
     const before = byId.get(it.id);
     if (before) assertSameVectorOwner(before, it);
     byId.delete(it.id); // re-inserted, so the survivor sits where its last copy was
@@ -603,7 +604,10 @@ export function vectorWriteBatch<T extends VectorLabels>(items: readonly T[]): T
  * after the upsert (its text, its metadata, its `owner`) changes nothing stored.
  */
 export function vectorItemCopy(it: VectorItem): VectorItem {
-  return { ...it, embedding: [...it.embedding], ...(it.metadata ? { metadata: structuredClone(it.metadata) } : {}) };
+  // The grant (`VECTOR_PARTITION`) is the call's, not the document's: stored, it would come back on a
+  // match the root could re-upsert as an organization's.
+  const { [VECTOR_PARTITION]: _grant, ...doc } = it as VectorItem & VectorPartitionOption;
+  return { ...doc, embedding: [...it.embedding], ...(it.metadata ? { metadata: structuredClone(it.metadata) } : {}) };
 }
 
 /**
@@ -640,7 +644,8 @@ export const SHARED_ONLY = '';
  * `vectorWriteBatch`), but Postgres would compare it as U+FFFD and answer with someone else's
  * documents; so it reads here as what it means in every store: the general shelf, or nothing.
  */
-export function vectorQueryScope(opts: { namespace?: string; visibleTo?: string } | undefined): { namespace?: string; visibleTo?: string; none: boolean } {
+export function vectorQueryScope(opts: ({ namespace?: string; visibleTo?: string } & VectorPartitionOption) | undefined): { namespace?: string; visibleTo?: string; none: boolean } {
+  if (opts) assertRootVectorNames(opts);
   const out: { namespace?: string; visibleTo?: string; none: boolean } = { none: false };
   if (opts?.namespace !== undefined) {
     out.namespace = opts.namespace;
@@ -663,6 +668,7 @@ export function visibleToSubject(doc: { owner?: string; shared?: boolean }, visi
  * `u\uFFFD`'s documents.
  */
 export function vectorDeletePlan(where: VectorDeleteWhere): VectorDeleteWhere | null {
+  assertRootVectorNames(where);
   const ids = where.ids?.filter((id) => typeof id === 'string' && isWellFormed(id));
   if (ids !== undefined && ids.length === 0) return null;
   if (where.owner !== undefined && !isWellFormed(where.owner)) return null;
@@ -695,6 +701,58 @@ export function vectorDeletePlan(where: VectorDeleteWhere): VectorDeleteWhere | 
 /** Is this an organization's namespace? No namespace is nobody's organization. */
 export function vectorInOrganization(namespace: string | null | undefined): boolean {
   return typeof namespace === 'string' && isOrganizationKey(namespace);
+}
+
+/**
+ * The code-only grant an organization's view (`withOrgStorage(...).vectors`) adds to every call it
+ * makes on the ROOT store: `[VECTOR_PARTITION]: 'org:<id>'` on each upserted item, on the query options
+ * and on the delete condition. The vector twin of `MEMORY_PARTITION`: a Symbol, so code holding the
+ * view (or building one, like an organization's observational memory) can pass it and a request body
+ * (JSON) cannot.
+ *
+ * Without it a call is the ROOT's, and `assertRootVectorNames` refuses any namespace or id in the
+ * organizations' reserved space. ADR-0001: in the root scope every organization's rows are hidden —
+ * including when the caller names one.
+ */
+export const VECTOR_PARTITION: unique symbol = Symbol.for('@gnldev/durable.vectorPartition');
+/** The code-only option an organization's view adds to a vector call. See `VECTOR_PARTITION`. */
+export interface VectorPartitionOption {
+  readonly [VECTOR_PARTITION]?: string;
+}
+
+/**
+ * A root-scope vector call named a namespace or an id in the organizations' reserved space (`org:`).
+ * Such a namespace is an organization's partition (`withOrgStorage` writes acme's documents under
+ * `org:acme`, ids `org:acme:<id>`), and a root caller that could name it would write, replace, read or
+ * delete that organization's documents. Thrown by every bundled store, before anything is touched.
+ */
+export class ReservedVectorNameError extends Error {
+  constructor(readonly what: 'namespace' | 'id', readonly value: string) {
+    super(
+      `@gnldev/durable: vector ${what} '${value}' starts with '${ORG_KEY_PREFIX}', the space organizations' documents live in, ` +
+        'and this call is the root scope\'s, which cannot name them. Use a namespace (or id) that does not start with ' +
+        `'${ORG_KEY_PREFIX}'; to work inside an organization, use withOrgStorage(storage, orgId).vectors.`,
+    );
+    this.name = 'ReservedVectorNameError';
+  }
+}
+
+/**
+ * THE ROOT-SCOPE NAMING RULE for vectors — `assertRootThreadId`'s twin, on the reading
+ * `isOrganizationKey` owns. A call carrying an organization's grant (`VECTOR_PARTITION`) may name that
+ * partition and ids under it, nothing else in the reserved space; a call without one names none of it.
+ * Run by `vectorWriteBatch` (each item), `vectorQueryScope` and `vectorDeletePlan`, so every store
+ * that runs the vector write rule refuses the same calls.
+ */
+export function assertRootVectorNames(call: { namespace?: unknown; ids?: readonly unknown[] } & VectorPartitionOption): void {
+  const granted = call[VECTOR_PARTITION];
+  const ns = call.namespace;
+  if (typeof ns === 'string' && isOrganizationKey(ns) && ns !== granted) throw new ReservedVectorNameError('namespace', ns);
+  for (const id of call.ids ?? []) {
+    if (typeof id === 'string' && isOrganizationKey(id) && !(granted !== undefined && id.startsWith(`${granted}:`))) {
+      throw new ReservedVectorNameError('id', id);
+    }
+  }
 }
 
 /**
@@ -806,6 +864,34 @@ export function decodeLogCursor(cursor: string | undefined): LogPosition | undef
   return m ? { seq: Number(m[1]), ts: Number(m[2]), id: m[3]! } : undefined;
 }
 
+/**
+ * THE ADOPTION RULE FOR A WORK-STORE KEY — one rule, applied by every store's `adoptIntoOrg`.
+ *
+ * A read position (a consumer's or the queue's cursor: a value this store issued as `nextCursor`, or
+ * `''`, the events package's "from the head") is NEVER carried into the organization. The log it points
+ * into moves with the adoption and is RENUMBERED after the organization's own records, so the root
+ * position names the wrong record there: carried, it overwrote the organization's own cursor (in-memory,
+ * Redis — measured: 10 of 10 pending organization jobs stranded behind it) or collided with it (SQLite,
+ * Postgres — the whole adoption refused on a raw UNIQUE error). Not carried, the organization keeps its
+ * own position, and every moved record lands after it; with none, its consumers read from the head and
+ * skip finished records by their markers — one re-scan, nothing runs twice.
+ *
+ * Any OTHER root key the organization already holds refuses the adoption before anything moves: that
+ * is somebody's data, and neither copy may silently win.
+ */
+export function workKeyAdoption(rootValue: unknown, orgHasKey: boolean): 'move' | 'reset-position' | 'collision' {
+  if (typeof rootValue === 'string' && (rootValue === '' || decodeLogCursor(rootValue) !== undefined)) return 'reset-position';
+  return orgHasKey ? 'collision' : 'move';
+}
+
+/** The refusal for a work-store key both the root and the organization hold — see `workKeyAdoption`. */
+export function workKeyAdoptCollision(orgKey: string): Error {
+  return new Error(
+    `@gnldev/durable: adoptIntoOrg would move a work-store key onto '${orgKey}', which the organization already holds. `
+      + 'Delete one of the two (they are not a read position, so neither can be dropped for you), then adopt again. Nothing was moved.',
+  );
+}
+
 /** Orders two log positions: sequence, then producer time, then id (the order unnumbered records are numbered in). */
 export function compareLogPosition(a: LogPosition, b: LogPosition): number {
   return a.seq - b.seq || a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -829,13 +915,21 @@ export interface WorkStore {
    *     with its own statement (SQL) or value format (Redis), which knows nothing of positions.
    * Every bundled store orders by a store-assigned per-namespace sequence (`LogPosition`), which only
    * grows — deletions leave gaps, never reuse — and hands out the cursor as the last record's position.
-   * The SQL and Redis stores number a record when a reader FIRST SEES it, not when it is written: the
-   * write is the same one 0.9 made, and `list` numbers every committed unnumbered record after all
-   * numbered ones before it reads a page, with the numbering serialised per namespace (SQL: the counter
-   * row is locked until commit; Redis: one script). A record still being written is invisible to that
-   * numbering and gets a later number when it is seen — so no writer, of any version, can put a record
-   * behind a cursor, and a store needs no cooperation from writers to keep this. (The in-memory store
-   * has one writer and numbers at append.) A cursor the store did not issue (a 0.9 row offset) restarts
+   * WHERE a record gets its number differs by store, and the rule they share is that a number is
+   * always above every number already handed out, so no writer, of any version, can put a record
+   * behind a cursor:
+   *   · in-memory: at append (one writer).
+   *   · Redis: at append, in the append script, which numbers after the namespace's counter. A 0.9
+   *     writer's bare record (no number) is numbered by the first `list` that sees it, in one script.
+   *   · SQLite: at insert, by a trigger in the database (`gnl_work_log_number`), so a 0.9 process's
+   *     INSERT on the same file is numbered too — inside its own write, under SQLite's single writer
+   *     lock. A row the trigger never saw (written before it existed, or reset by `adoptIntoOrg`) is
+   *     numbered by the first `list` that sees it.
+   *   · Postgres: by the reader. The write is the same one 0.9 made, and `list` numbers every committed
+   *     unnumbered record after all numbered ones before it reads a page, with the counter row locked
+   *     until commit; a record still being written is invisible to that numbering and gets a later
+   *     number when it is seen.
+   * A cursor the store did not issue (a 0.9 row offset) restarts
    * at the head: the queue and the consumer skip finished records by their markers, so that costs one
    * re-scan and nothing runs twice.
    */
@@ -995,6 +1089,13 @@ export interface AdoptIntoOrgResult {
    * authentication and organization registration if it were ever wrong.
    */
   skippedPlatformKeys: string[];
+  /**
+   * Root work-store keys that held a read position (`qcursor`, `evtcursor:*`) and were NOT carried into
+   * the organization, by name — see `workKeyAdoption`. The organization's own position, if it had one,
+   * is unchanged; otherwise its consumers start from the head of the log and skip what is finished.
+   * Present on every bundled store's result.
+   */
+  resetPositions?: string[];
 }
 
 export type StoreName = keyof CapabilityMatrix;

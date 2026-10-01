@@ -405,14 +405,19 @@ export function createWorker(
   // the cursor is a record's position now, so an erasure or a slow producer clock cannot move it).
   const QCURSOR = 'qcursor';
 
+  /** Done or dead-lettered — the ONE reading of "this job is finished", before the lease and under it. */
+  async function isTerminal(jobId: string): Promise<boolean> {
+    return (await work.get(`qdone:${jobId}`)) !== undefined || (await work.get(`qfail:${jobId}`)) !== undefined;
+  }
+
   async function runOnce(): Promise<boolean> {
     let cursor = await work.get<string>(QCURSOR);
     for (;;) {
       const page = await work.list<JobRecord>('qjob', { cursor });
       let allTerminal = true;
       for (const job of page.items) {
-        if (await work.get(`qdone:${job.id}`)) continue; // done
-        if (await work.get(`qfail:${job.id}`)) continue; // dead-letter
+        // A cheap pre-filter only. It decides nothing: see the re-check under the lease below.
+        if (await isTerminal(job.id)) continue;
         allTerminal = false;
         const runId = runIdOfJob(job); // `job:<id>`, or the run a retried dead letter continues
         // THE LEASE'S KEY — deliberately NOT the runId.
@@ -439,6 +444,16 @@ export function createWorker(
         // token is a token whichever key it was minted on.
         const lock = await acquireRunLock(runs, `${runId}:lease`, owner, ttlMs);
         if (!lock) continue; // held by another worker / fresh lease
+        // "Is it finished?" is answered AGAIN, now that this worker holds the lease. The check above
+        // ran before it, and between the two another worker could take the lease, run the job, write
+        // `qdone` and release — after which this lease is simply free, and the handler ran a second
+        // time. Measured on Postgres with 3 workers: 3-5% of jobs ran twice (0.9.0 too), side effects
+        // outside `ctx.run` included. A finisher writes `qdone`/`qfail` BEFORE it releases (or its
+        // lease expires), so under the lease the answer cannot change any more.
+        if (await isTerminal(job.id)) {
+          await lock.release();
+          continue;
+        }
         // 8.2 (closes a correctness debt): terminal writes (qdone/qfail/qatt) get their OWN fencing
         // chain inside WorkStore. `qown:<jobId>` answers "who currently holds this" for the ENTIRE
         // DURATION of this run via WorkStore's own in-engine CAS (putIfMatch) — INDEPENDENT of the

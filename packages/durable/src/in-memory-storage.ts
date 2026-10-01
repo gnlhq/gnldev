@@ -8,7 +8,7 @@ import { InMemoryJournal } from './journal.js';
 import { stableStringify } from './hash.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
 import type { JournalEntry, RunSummary } from './journal.js';
-import { decodeLogCursor, encodeLogCursor, compareLogPosition, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision } from './storage.js';
+import { decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision } from './storage.js';
 import type {
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -292,7 +292,7 @@ class InMemoryWorkStore implements WorkStore {
    * consumer has persisted. It used to be `rekeyMap`: the moved log REPLACED the organization's (its
    * records gone) and kept its own low numbers, behind that cursor.
    */
-  _rekey(f: (k: string) => string | undefined): number {
+  _rekey(f: (k: string) => string | undefined, resetPositions: string[] = []): number {
     let n = 0;
     for (const [ns, recs] of [...this.logs]) {
       const to = f(ns);
@@ -305,7 +305,27 @@ class InMemoryWorkStore implements WorkStore {
       this.logs.delete(ns);
       n++;
     }
-    return n + rekeyMap(this.kv, f);
+    // Keys by `workKeyAdoption` — a read position is dropped, not carried (a collision on any other key
+    // was refused by `_kvCollision` before anything moved).
+    for (const k of [...this.kv.keys()]) {
+      const to = f(k);
+      if (to === undefined || to === k) continue;
+      if (workKeyAdoption(this.kv.get(k), this.kv.has(to)) === 'reset-position') { resetPositions.push(k); this.kv.delete(k); continue; }
+      this.kv.set(to, this.kv.get(k)); this.kv.delete(k); n++;
+    }
+    return n;
+  }
+  /** @internal — what `workKeyAdoption` decides for each key, before anything moves: a refusal, and the positions a move would drop. */
+  _kvPlan(f: (k: string) => string | undefined): { collision?: Error; resets: string[] } {
+    const resets: string[] = [];
+    for (const [k, v] of this.kv) {
+      const to = f(k);
+      if (to === undefined || to === k) continue;
+      const d = workKeyAdoption(v, this.kv.has(to));
+      if (d === 'collision') return { collision: workKeyAdoptCollision(to), resets };
+      if (d === 'reset-position') resets.push(k);
+    }
+    return { resets: resets.sort() };
   }
   /** @internal — an id a moved log shares with the log it would join (adoptIntoOrg refuses, as SQL's key does). */
   _logCollision(f: (k: string) => string | undefined): string | undefined {
@@ -465,23 +485,26 @@ export class InMemoryStorage implements Storage {
     // rather than passing `rename`, whose counters belong to the adoption, not to this question.
     const clash = this.work._logCollision((k) => (isOrganizationKey(k) || isPlatformKey(k) ? undefined : prefix + k));
     if (clash) throw new Error(`@gnldev/durable: adoptIntoOrg would move a work-log record onto '${clash}', which the organization's log already holds. Nothing was moved.`);
+    const kvPlan = this.work._kvPlan((k) => (isOrganizationKey(k) || isPlatformKey(k) ? undefined : prefix + k));
+    if (kvPlan.collision) throw kvPlan.collision;
     if (dryRun) {
       const moved = {
         runs: count([...this.runs.journal.keys()]),
         memory: 0, work: 0, cache: 0, meta: 0,
         vectors,
       };
-      return { orgId, dryRun, moved, alreadyScoped, skippedPlatformKeys: [...skipped].sort() };
+      return { orgId, dryRun, moved, alreadyScoped, skippedPlatformKeys: [...skipped].sort(), resetPositions: kvPlan.resets };
     }
+    const resetPositions: string[] = [];
     const moved = {
       runs: this.runs.journal.rekey(rename),
       memory: this.memory._rekey(rename),
-      work: this.work._rekey(rename),
+      work: this.work._rekey(rename, resetPositions),
       cache: this.cache._rekey(rename),
       meta: this.meta._rekey(rename),
       vectors: this.vectors._stamp(prefix.slice(0, -1), false),
     };
-    return { orgId, dryRun, moved, alreadyScoped, skippedPlatformKeys: [...skipped].sort() };
+    return { orgId, dryRun, moved, alreadyScoped, skippedPlatformKeys: [...skipped].sort(), resetPositions: resetPositions.sort() };
   }
   /** Access to the underlying journal for replay/time-travel tests. */
   get journal() { return this.runs.journal; }

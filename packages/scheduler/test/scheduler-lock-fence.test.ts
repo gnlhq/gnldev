@@ -397,6 +397,7 @@ describe('scheduler: journal without putIfMatch (documented fallback)', () => {
       attempts: 0,
       fireCount: 1,
       status: 'pending',
+      of: expect.any(String),
     });
 
     const r2 = await pollScheduler(j, r.runner, t0 + 60_000, { owner: 'A' });

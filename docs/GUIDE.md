@@ -288,8 +288,9 @@ use `@gnldev/rag`'s `PostgresVectorStore`, which owns its own `vector(dim)` tabl
 **⑧ `gnl_work_log` — queue/event log.** Columns: `ns (namespace — which queue/topic, e.g.,
 'evt:order'), id (record id; ns+id is the primary key → the same event CANNOT be inserted twice
 = idempotent publishing), payload (content), ts (the producer's clock, informational), seq (the
-position the store assigns — 0 until the first read numbers the record, after every record numbered
-before it; the queue worker and every consumer read in `seq` order), ord (Postgres only: the order
+position the store assigns, after every record numbered before it — on SQLite by a trigger in the
+INSERT itself, on Postgres by the first read, 0 until then; the queue worker and every consumer read
+in `seq` order), ord (Postgres only: the order
 records were appended in, which is the order unnumbered ones are numbered in)`. *When?* When `@gnldev/queue` adds a job, when
 `@gnldev/events` publishes an event. Append-only — and **nothing in the framework prunes it**.
 `sweepLog` does not: it takes a `Journal` and sweeps `appendLog`-based namespaces (the audit log,

@@ -12,7 +12,7 @@ import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus } from '.
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, orgSpaceSql } from './organization.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
-import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision } from './storage.js';
+import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision } from './storage.js';
 import type {
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -338,6 +338,7 @@ export class SqliteStorage implements Storage {
       }
     }
     this.db.exec(WORK_LOG_SEQ_INDEX);
+    this.db.exec(WORK_LOG_NUMBER_TRIGGER);
     // The seed used to be
     // check-then-INSERT (SELECT → INSERT if absent) — a TOCTOU: two simultaneous booters both saw no
     // row, both inserted, and the loser CRASHED ON BOOT with a UNIQUE constraint. `INSERT OR IGNORE`
@@ -400,6 +401,7 @@ export class SqliteStorage implements Storage {
     let alreadyScoped = 0;
     const bump = (store: string, n: number) => { moved[store] = (moved[store] ?? 0) + n; };
 
+    const resetPositions: string[] = [];
     const run = () => {
       // Vectors first, before anything moves: a legacy document whose adopted id (`orgVectorId`) is
       // already taken refuses the whole adoption, the same in every store.
@@ -411,6 +413,19 @@ export class SqliteStorage implements Storage {
       // as already scoped and never moved — the same rule, spelled once (organization.ts).
       const inOrg = (col: string) => orgSpaceSql(col, () => '?');
       const outOrg = (col: string) => orgSpaceSql(col, () => '?', { outside: true });
+      // Work-store keys by `workKeyAdoption`, decided before anything moves: a read position is
+      // dropped rather than carried, and any other key the organization holds refuses the adoption
+      // (it used to be the raw UNIQUE violation of the UPDATE below).
+      const kvRoot = outOrg('key');
+      for (const { key, value } of this.db.prepare(`SELECT key, value FROM gnl_work_kv WHERE ${kvRoot.cond}`).all(...kvRoot.params) as { key: string; value: string }[]) {
+        if (isPlatformKey(key)) continue;
+        const orgHas = this.db.prepare('SELECT 1 AS x FROM gnl_work_kv WHERE key = ?').get(prefix + key) !== undefined;
+        const d = workKeyAdoption(deserialize(value), orgHas);
+        if (d === 'collision') throw workKeyAdoptCollision(prefix + key);
+        if (d === 'reset-position') resetPositions.push(key);
+      }
+      if (!dryRun) for (const k of resetPositions) this.db.prepare('DELETE FROM gnl_work_kv WHERE key = ?').run(k);
+      const notCarried = new Set(resetPositions);
       for (const [table, col, store] of KEYED) {
         const scopedQ = inOrg(col);
         alreadyScoped += this.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${scopedQ.cond}`).get(...scopedQ.params).c as number;
@@ -422,6 +437,7 @@ export class SqliteStorage implements Storage {
         let n = 0;
         for (const { k } of rows) {
           if (isPlatformKey(k)) { skipped.add(k.split(':')[0]!); continue; }
+          if (table === 'gnl_work_kv' && notCarried.has(k)) continue;
           n += this.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${col} = ?`).get(k).c as number;
           if (dryRun) continue;
           if (table === 'gnl_work_log') {
@@ -460,7 +476,7 @@ export class SqliteStorage implements Storage {
       this.db.exec('BEGIN IMMEDIATE');
       try { run(); this.db.exec('COMMIT'); } catch (e) { this.db.exec('ROLLBACK'); throw e; }
     }
-    return { orgId, dryRun, moved, alreadyScoped, skippedPlatformKeys: [...skipped].sort() };
+    return { orgId, dryRun, moved, alreadyScoped, skippedPlatformKeys: [...skipped].sort(), resetPositions: resetPositions.sort() };
   }
 
   async compact(): Promise<{ reclaimedBytes: number }> {
@@ -490,6 +506,7 @@ export class SqliteStorage implements Storage {
       'ALTER TABLE gnl_runs ADD COLUMN canceled INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE gnl_work_log ADD COLUMN seq INTEGER NOT NULL DEFAULT 0',
       WORK_LOG_SEQ_INDEX,
+      WORK_LOG_NUMBER_TRIGGER,
     ];
   }
 
@@ -594,6 +611,27 @@ CREATE TABLE IF NOT EXISTS gnl_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL,
 `;
 /** `WorkStore.list`'s keyset, in its ORDER BY order (and `seq = 0` for the unnumbered). Created after the `seq` migration, not in DDL. */
 const WORK_LOG_SEQ_INDEX = 'CREATE INDEX IF NOT EXISTS gnl_work_log_seq ON gnl_work_log (ns, seq, ts, id)';
+/**
+ * Numbers a work-log record IN THE WRITE THAT INSERTS IT, whoever wrote it. A trigger rather than a
+ * statement in `append`: it lives in the database, so a 0.9 process on the same file — whose INSERT
+ * knows nothing of `seq` — is numbered too, which is why numbering moved to the reader in the first
+ * place. SQLite admits one writer at a time, so a record's number is above every number committed
+ * before it and below every one committed after: it can never land behind a cursor.
+ *
+ * Numbering on READ, which this replaces for every new record, needed the write lock from a reader,
+ * and a reader cannot win that lock from processes that write without pause (SQLite's busy handler is
+ * not fair): measured, 3 producer processes kept a reader's new records unlisted for up to 5 s (p99
+ * 465 ms; 0.9 never waited). A longer, escalating wait for the lock made it worse (p50 88 → 146 ms,
+ * max not better). `numberNew` still numbers the records the trigger never saw: rows written before
+ * it existed, and the records `adoptIntoOrg` moves (reset to 0 so they land after the organization's).
+ * Created after the `seq` migration, like the index.
+ */
+const WORK_LOG_NUMBER_TRIGGER = `CREATE TRIGGER IF NOT EXISTS gnl_work_log_number AFTER INSERT ON gnl_work_log WHEN NEW.seq = 0
+BEGIN
+  INSERT OR IGNORE INTO gnl_work_seq (ns, seq) VALUES (NEW.ns, 0);
+  UPDATE gnl_work_seq SET seq = seq + 1 WHERE ns = NEW.ns;
+  UPDATE gnl_work_log SET seq = (SELECT seq FROM gnl_work_seq WHERE ns = NEW.ns) WHERE rowid = NEW.rowid;
+END`;
 
 // ── RunJournal ──────────────────────────────────────────────────────────────────
 class SqliteRunJournal implements RunJournal {
@@ -1303,10 +1341,11 @@ class SqliteVectorStore implements VectorStore {
 class SqliteWorkStore implements WorkStore {
   constructor(private db: any) {}
   /**
-   * 0.9's statement, unchanged: the record is written UNNUMBERED (`seq` 0) and numbered by the first
-   * `list` that sees it (`numberNew`). Numbering here instead made the write a transaction and, worse,
-   * left a 0.9 process on the same file writing rows the new order put behind every cursor (measured
-   * in a rolling deploy: "pending 3" forever). Idempotent: an existing id is left alone.
+   * 0.9's statement, unchanged: the record is numbered by the database's insert trigger
+   * (`WORK_LOG_NUMBER_TRIGGER`), inside this write — and so is a 0.9 process's identical INSERT on the
+   * same file. Numbering in this statement instead left a 0.9 process writing rows the new order put
+   * behind every cursor (measured in a rolling deploy: "pending 3" forever). Idempotent: an existing id
+   * is left alone.
    */
   async append(ns: string, payload: unknown, id?: string): Promise<string> {
     const eid = id ?? `${ns}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -1315,6 +1354,9 @@ class SqliteWorkStore implements WorkStore {
     return eid;
   }
   /**
+   * Only for the records the insert trigger never numbered — rows written before it existed, and rows
+   * `adoptIntoOrg` reset to 0 — so in steady state the first query finds nothing and no lock is asked for.
+   *
    * Numbers the namespace's committed unnumbered records in the order they were inserted (`rowid`: a
    * new row's is above every existing one's, and SQLite commits one writer at a time), after every
    * number handed out so far (`WorkStore.list`). Not `(ts, id)`: two records one producer appends in

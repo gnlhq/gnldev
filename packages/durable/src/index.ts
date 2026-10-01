@@ -103,7 +103,7 @@ export type { RunDurableArgs, StreamDurableArgs, DurableResult, ResumeAgentConfi
 // K1/W1 (B): sentinel→error conversion helper for code that consumes streamDurable directly.
 export { streamFinishError } from './run.js';
 // Greenfield storage contracts (ports + Storage + capability + composite).
-export { CapabilityError, requireCapability, composite, toJournal, matchFilter, visibleToSubject, SHARED_ONLY, vectorWriteBatch, vectorQueryScope, vectorDeletePlan, vectorDeleteMatcher, vectorInOrganization, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorMetadataMatches, OBSERVATION_VECTOR_KEY, vectorItemCopy, assertSameVectorOwner, assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, orgVectorId } from './storage.js';
+export { CapabilityError, requireCapability, composite, toJournal, matchFilter, visibleToSubject, SHARED_ONLY, vectorWriteBatch, vectorQueryScope, vectorDeletePlan, vectorDeleteMatcher, vectorInOrganization, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorMetadataMatches, OBSERVATION_VECTOR_KEY, vectorItemCopy, assertSameVectorOwner, assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, orgVectorId, VECTOR_PARTITION, ReservedVectorNameError, assertRootVectorNames, type VectorPartitionOption } from './storage.js';
 // ADR-0002: the caller a door hands the engine, the one identity channel to tools and child runs, and
 // the one answer to "does this run exist, and whose is it" (run-identity.ts).
 export {

@@ -134,6 +134,10 @@ storages) applies the same write rule, before anything is written:
   characters, no staff prefix such as `operator:` (`ownerIdProblem` in `@gnldev/durable`, the same rule
   as `subjectIdProblem` in `@gnldev/auth`). Otherwise the upsert throws `OwnerIdError`.
 - `shared` is `true`, `false` or absent; `namespace` is a non-empty string or absent.
+- A namespace or id starting with `org:` is an organization's (`withOrgStorage` writes acme's
+  documents under `org:acme`): an upsert, query or delete that names one throws
+  `ReservedVectorNameError` unless it comes through that organization's view
+  (`withOrgStorage(storage, orgId).vectors`). Any other namespace (`acme`, `ORG:x`, `my-org:x`) is yours.
 - An upsert **updates** a document; it does not move it to another owner or label. Upserting an
   existing id with a different `owner`/`shared` (or namespace) fails with `VectorOwnerConflictError`,
   so one user cannot take over another's document or replace a shared one. The same id twice in one

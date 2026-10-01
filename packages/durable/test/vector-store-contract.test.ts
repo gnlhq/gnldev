@@ -13,7 +13,7 @@
 import { describe, it, expect, afterAll } from 'vitest';
 import { newDb } from 'pg-mem';
 import pg from 'pg';
-import { InMemoryStorage, withOrgStorage, type VectorStore, type VectorDeleteWhere } from '../src/index.js';
+import { InMemoryStorage, withOrgStorage, VECTOR_PARTITION, type VectorStore, type VectorDeleteWhere } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { InMemoryVectorStore, GraphRag, PostgresVectorStore } from '../../rag/src/index.js';
@@ -151,20 +151,22 @@ describe.each(STORES)('vector write rule — $name', (store) => {
     // `org:acme` is the namespace withOrgStorage writes acme's documents under; `organic` and `ORG:acme` only look like one.
     await s.upsert([
       doc('root-bob', { owner: 'bob' }), doc('n-bob', { owner: 'bob', namespace: 'n' }), doc('organic-bob', { owner: 'bob', namespace: 'organic' }), doc('upper-bob', { owner: 'bob', namespace: 'ORG:acme' }),
-      doc('org:acme:bob', { owner: 'bob', namespace: 'org:acme' }), doc('org:globex:bob', { owner: 'bob', namespace: 'org:globex' }),
-      doc('root-cem', { owner: 'cem' }), doc('s1', { shared: true }), doc('org:acme:s1', { shared: true, namespace: 'org:acme' }),
+      doc('root-cem', { owner: 'cem' }), doc('s1', { shared: true }),
     ]);
+    // Organizations' documents as their views write them: with the view's grant (the root cannot name them).
+    await s.upsert([doc('org:acme:bob', { owner: 'bob', namespace: 'org:acme' }), doc('org:acme:s1', { shared: true, namespace: 'org:acme' })].map((d) => ({ ...d, [VECTOR_PARTITION]: 'org:acme' })));
+    await s.upsert([{ ...doc('org:globex:bob', { owner: 'bob', namespace: 'org:globex' }), [VECTOR_PARTITION]: 'org:globex' }]);
     const del = (w: unknown) => outcome(() => s.delete!(w as VectorDeleteWhere));
     // A store that honours the flag says so; erasure refuses one that does not (erase-vectors-org.test.ts).
     expect(s.deleteOutsideOrganizations).toBe(true);
     // It narrows, it never selects: alone it is no condition, and inside an organization it matches nothing.
-    expect([await del({ outsideOrganizations: true }), await del({ owner: 'bob', namespace: 'org:acme', outsideOrganizations: true })])
+    expect([await del({ outsideOrganizations: true }), await del({ owner: 'bob', namespace: 'org:acme', outsideOrganizations: true, [VECTOR_PARTITION]: 'org:acme' })])
       .toEqual(['ok:0', 'ok:0']);
     expect(await del({ owner: 'bob', outsideOrganizations: true })).toBe('ok:4');
     expect(await all(s)).toBe('org:acme:bob/bob=org:acme:bob,org:acme:s1/-/S=org:acme:s1,org:globex:bob/bob=org:globex:bob,root-cem/cem=root-cem,s1/-/S=s1');
     // With ids it is one more condition like the others.
     await s.upsert([doc('n-bob', { owner: 'bob', namespace: 'n' })]);
-    expect(await del({ ids: ['n-bob', 'org:acme:bob'], outsideOrganizations: true })).toBe('ok:1');
+    expect(await del({ ids: ['n-bob', 'org:acme:bob'], outsideOrganizations: true, [VECTOR_PARTITION]: 'org:acme' })).toBe('ok:1');
     // `false` is the old meaning: every namespace.
     expect(await del({ owner: 'bob', outsideOrganizations: false })).toBe('ok:2');
     expect(await all(s)).toBe('org:acme:s1/-/S=org:acme:s1,root-cem/cem=root-cem,s1/-/S=s1');
@@ -234,7 +236,7 @@ describe.each(STORES.filter((s) => s.storage))('adopt rename — $name', (store)
     const acme = withOrgStorage(root, 'acme').vectors!;
     await acme.upsert([{ id: 'd2', text: 'UPDATED', shared: true, embedding: E }]);
     expect(await all(acme)).toBe('d2/-/S=UPDATED');
-    expect(await all(root.vectors!, { namespace: 'org:acme' })).toBe('org:acme:d2/-/S=UPDATED');
+    expect(await all(root.vectors!, { namespace: 'org:acme', [VECTOR_PARTITION]: 'org:acme' })).toBe('org:acme:d2/-/S=UPDATED');
   });
 });
 
@@ -261,5 +263,67 @@ describe.skipIf(RACERS.length === 0).each(RACERS.length ? RACERS : STORES.slice(
     // Reported, not asserted: how often this machine actually hit the race.
     console.log(`[${store.name}] batches refused by the racing writer: ${refused}/40, half-written: ${halves}`);
     expect(halves).toBe(0);
+  });
+});
+
+// RESERVED SPACE (R5-vec). Invariant: a root-scope vector call cannot name a namespace — or an id — in
+// the organizations' reserved space (`org:`, `isOrganizationKey`, the rule memory applies to thread ids);
+// an organization reaches its own documents only through its view (`withOrgStorage(...).vectors`).
+// Measured before (every store, and in 0.9.0): the root upserted, replaced, queried and deleted acme's
+// documents by naming `namespace: 'org:acme'`, or acme's stored id `org:acme:<id>`.
+describe.each(STORES)('reserved organization space — $name', (store) => {
+  const ACME = 'org:acme';
+  async function seeded(): Promise<{ root: VectorStore; acme?: VectorStore }> {
+    if (store.storage) {
+      const st = await store.storage();
+      const acme = withOrgStorage(st, 'acme').vectors!;
+      await acme.upsert([doc('h', { shared: true }, 'ACME-SECRET')]);
+      return { root: st.vectors!, acme };
+    }
+    return { root: await store.vectors() };
+  }
+
+  it('the root cannot write, read or delete by naming an organization\'s namespace or id; nothing changes', async () => {
+    const { root, acme } = await seeded();
+    const del = (w: unknown) => outcome(() => root.delete!(w as VectorDeleteWhere));
+    expect([
+      await outcome(() => root.upsert([doc('h', { shared: true, namespace: ACME }, 'ROOT')])),
+      await outcome(() => root.upsert([doc('org:acme:h', { shared: true }, 'ROOT')])),
+      await outcome(() => root.query(E, 10, { namespace: ACME })),
+      await del({ namespace: ACME }),
+      await del({ ids: ['org:acme:h'] }),
+      await del({ namespace: ACME, filter: { k: 1 } }),
+      await del({ owner: 'bob', namespace: ACME, outsideOrganizations: true }),
+    ]).toEqual(Array(7).fill('throw:ReservedVectorNameError'));
+    if (acme) expect(await all(acme)).toBe('h/-/S=ACME-SECRET');
+  });
+
+  it('siblings: only the exact `org:` prefix is reserved — `ORG:acme`, `org%3Aacme`, `orgs`, `my-org:x` stay usable (the way through)', async () => {
+    const { root } = await seeded();
+    for (const ns of ['ORG:acme', 'org%3Aacme', 'orgs', 'my-org:x', 'Org:x']) {
+      await root.upsert([doc(`d-${ns}`, { shared: true, namespace: ns })]);
+      expect(await all(root, { namespace: ns })).toBe(`d-${ns}/-/S=d-${ns}`);
+      expect(await root.delete!({ namespace: ns })).toBe(1);
+    }
+  });
+
+  it('sibling: `org:` alone is in the reserved space (as for thread ids)', async () => {
+    const { root } = await seeded();
+    expect([
+      await outcome(() => root.upsert([doc('x', { namespace: 'org:' })])),
+      await outcome(() => root.query(E, 10, { namespace: 'org:' })),
+      await outcome(() => root.delete!({ namespace: 'org:' })),
+    ]).toEqual(Array(3).fill('throw:ReservedVectorNameError'));
+  });
+
+  it.skipIf(!store.storage)('sibling: an organization\'s view naming `org:other` stays inside its own space', async () => {
+    const st = await store.storage!();
+    const globex = withOrgStorage(st, 'globex').vectors!;
+    await globex.upsert([doc('g', { shared: true }, 'GLOBEX')]);
+    const acme = withOrgStorage(st, 'acme').vectors!;
+    await acme.upsert([doc('a', { shared: true, namespace: 'org:globex' }, 'ACME')]);
+    expect(await all(acme, { namespace: 'org:globex' })).toBe('a/-/S=ACME');
+    expect(await acme.delete!({ namespace: 'org:globex', ids: ['g'] })).toBe(0);
+    expect(await all(globex)).toBe('g/-/S=GLOBEX');
   });
 });

@@ -2,7 +2,7 @@
 // Keeps triggers in the journal (definition immutable, state mutable). The poll loop (now=Date.now())
 // fires due triggers exactly-once (acquireRunLock + per-fireCount runId). The workflow run carries its
 // own durable guarantee. Time = DATA (nextRunAt in the journal) → resolve-then-freeze, replay-safe.
-import { acquireRunLock, createPollLoop, orgPrefix, ownedName, ownedPrefix, ownerOfName, stableStringify, user, staff, UNKNOWN } from '@gnldev/durable';
+import { acquireRunLock, argsHash, createPollLoop, orgPrefix, ownedName, ownedPrefix, ownerOfName, stableStringify, user, staff, UNKNOWN } from '@gnldev/durable';
 import type { Journal, Caller } from '@gnldev/durable';
 import { cronNeverFires, nextCronTime } from './cron.js';
 import { assertRootJournal } from './root-journal.js';
@@ -118,10 +118,61 @@ interface TriggerState {
   status: 'pending' | 'done' | 'failed';
   /** Set by `moveTrigger` on the retired system trigger: the owned id it now lives under. */
   movedTo?: string;
+  /**
+   * The fingerprint of the definition this state was computed FOR (`definitionFingerprint`). A state
+   * whose `of` names another definition is a half-written trigger, and a registration repairs it.
+   * Absent on states written before 0.10 — those are trusted (see `stateBelongsTo`).
+   */
+  of?: string;
 }
 
 const DEF = (id: string) => `sched:def:${id}`;
 const STATE = (id: string) => `sched:state:${id}`;
+
+/** What a state's `of` names: the stable hash of the definition, the same reading `stableStringify` equality uses. */
+function definitionFingerprint(def: TriggerDef): string {
+  return argsHash(def);
+}
+
+/**
+ * Whether a stored state was computed for this definition. A state without `of` was written before
+ * the fingerprint existed and is trusted: treating it as foreign would reset every running trigger
+ * on the upgrade boot, and re-fire a one-shot that is already `done`.
+ */
+function stateBelongsTo(state: TriggerState, def: TriggerDef): boolean {
+  return state.of === undefined || state.of === definitionFingerprint(def);
+}
+
+/**
+ * THE ONE WRITER OF A TRIGGER — both halves, `sched:def:<id>` and `sched:state:<id>`, as one unit.
+ *
+ * A trigger is two records and the poller needs both to agree. Written as two puts, a crash between
+ * them left a definition next to a state computed for the PREVIOUS one: a `done` one-shot replaced by
+ * `every: 1000` stayed done, a 0.9 `every: 0` trigger marked failed stayed failed, and the identical
+ * registration on the next boot read only the definition, found "the same spec", and did nothing —
+ * so the trigger never fired again and the advice in `sched:fail:` ("call scheduleWorkflow again")
+ * stopped working. Measured: 4/4 crash scenarios, in-memory and SQLite.
+ *
+ * Two mechanisms, one rule ("after any crash, re-running the same registration converges to a state
+ * the poller fires"):
+ *   - `applyBatch` (every first-party journal): both puts land in one transaction / Lua call, so there
+ *     is no window at all.
+ *   - a journal without it: definition first, then the state, and the state carries `of` — the
+ *     fingerprint of its definition. A crash in between leaves a state whose `of` names the old
+ *     definition, and `scheduleWorkflow`'s same-spec path repairs exactly that (`stateBelongsTo`).
+ *     Writing the state FIRST would not do: the poller would fire the OLD definition with the new
+ *     state (a `done` one-shot fires again).
+ */
+async function writeTrigger(journal: Journal, id: string, def: TriggerDef, state: TriggerState): Promise<TriggerState> {
+  const stamped: TriggerState = { ...state, of: definitionFingerprint(def) };
+  if (journal.applyBatch) {
+    await journal.applyBatch({ puts: [{ key: DEF(id), value: def }, { key: STATE(id), value: stamped }] });
+  } else {
+    await journal.put(DEF(id), def);
+    await journal.put(STATE(id), stamped);
+  }
+  return stamped;
+}
 const FAIL = (id: string) => `sched:fail:${id}`;
 const BUDGET_SKIP = (id: string) => `sched:budget-skip:${id}`;
 const BUSY_SKIP = (id: string) => `sched:busy-skip:${id}`;
@@ -280,11 +331,11 @@ function definitionDiff(stored: TriggerDef, given: TriggerDef): string {
   return [...(schedule ? [schedule] : []), ...fields].join(', ');
 }
 
-function firstRunAt(spec: ScheduleSpec, now: number): number {
-  if (spec.at != null) return spec.at;
-  if (spec.every != null) return now + spec.every;
-  if (spec.cron != null) return nextCronTime(spec.cron, now);
-  throw new Error('scheduleWorkflow: one of at | every | cron is required');
+/** A definition's first time from `now` — read from the DEFINITION, so a repair under 'keep' uses the stored schedule. */
+function firstRunAt(def: TriggerDef, now: number): number {
+  if (def.kind === 'at') return def.value as number;
+  if (def.kind === 'every') return now + (def.value as number);
+  return nextCronTime(def.value as string, now);
 }
 /**
  * Computes the next fire time. `prevSlot` = the PLANNED slot that just fired (state.nextRunAt) —
@@ -386,14 +437,12 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
     // the run id, and a run id that already ran replays its recorded answer instead of firing. (A
     // one-shot that fired is `done` with its counter unmoved, so the stored count alone is not enough.)
     const prev = await journal.get<TriggerState>(STATE(id));
-    const state: TriggerState = {
-      nextRunAt: firstRunAt(spec, now),
+    const state = await writeTrigger(journal, id, def, {
+      nextRunAt: firstRunAt(def, now),
       attempts: 0,
       fireCount: Math.max(prev?.fireCount ?? 0, await fireCountAfterLoss(journal, id)),
       status: 'pending',
-    };
-    await journal.put(DEF(id), def);
-    await journal.put(STATE(id), state);
+    });
     console.warn(
       storedProblem !== undefined
         ? `[scheduler] invalid trigger definition replaced (trigger ${id}, workflow ${spec.name}) — the stored one could not fire (${storedProblem}); the definition from this scheduleWorkflow call was written in its place, fireCount=${state.fireCount}.`
@@ -422,14 +471,30 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
      * again, or a different one with `ifExists: 'keep'`. A running trigger's schedule is never
      * redefined silently: a different spec was refused above unless the caller said which it wanted.
      */
-    if ((await journal.get(STATE(id))) === undefined) {
-      const state: TriggerState = {
-        nextRunAt: firstRunAt(spec, now),
+    const current = await journal.get<TriggerState>(STATE(id));
+    if (current !== undefined && !stateBelongsTo(current, stored)) {
+      // HALF-WRITTEN: the definition was replaced and the process stopped before its state landed
+      // (only reachable on a journal without `applyBatch` — see writeTrigger). The state still
+      // describes the previous definition, so it is replaced like a lost one; the counter keeps
+      // climbing past every run id either definition used.
+      const state = await writeTrigger(journal, id, stored, {
+        nextRunAt: firstRunAt(stored, now),
+        attempts: 0,
+        fireCount: Math.max(current.fireCount, await fireCountAfterLoss(journal, id)),
+        status: 'pending',
+      });
+      console.warn(
+        `[scheduler] half-written trigger repaired (trigger ${id}, workflow ${spec.name}) — 'sched:state:${id}' was computed for a different definition than the stored one (a registration stopped between its two writes). A state for the stored definition was written: nextRunAt=${state.nextRunAt}, attempts=0, fireCount=${state.fireCount}.`,
+      );
+      return id;
+    }
+    if (current === undefined) {
+      const state = await writeTrigger(journal, id, stored, {
+        nextRunAt: firstRunAt(stored, now),
         attempts: 0,
         fireCount: await fireCountAfterLoss(journal, id),
         status: 'pending',
-      };
-      await journal.put(STATE(id), state);
+      });
       // LOUD, and deliberately not a debug line. A system that heals itself in silence never shows
       // the operator the thing that keeps breaking it — and what breaks this is usually a purge or a
       // retention rule that runs again next week. `attempts` is reset because the previous attempt
@@ -441,9 +506,7 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
     return id;
   }
   // A trigger nobody has seen before: both halves are written here, and only here.
-  await journal.put(DEF(id), def);
-  const state: TriggerState = { nextRunAt: firstRunAt(spec, now), attempts: 0, fireCount: 0, status: 'pending' };
-  await journal.put(STATE(id), state);
+  await writeTrigger(journal, id, def, { nextRunAt: firstRunAt(def, now), attempts: 0, fireCount: 0, status: 'pending' });
   return id;
 }
 
@@ -497,7 +560,10 @@ export async function pollScheduler(
     // on to the next trigger instead of stopping at this one.
     const problem = definitionProblem(def);
     if (problem !== undefined) {
-      const failed: TriggerState = { ...state, status: 'failed' };
+      // Stamped with the definition it failed FOR: the corrected registration then replaces both
+      // halves, and if it stops between them the state still names the bad definition — which the
+      // same-spec path reads as half-written and repairs (see writeTrigger).
+      const failed: TriggerState = { ...state, status: 'failed', of: definitionFingerprint(def) };
       const won = journal.putIfMatch ? await journal.putIfMatch(STATE(id), state, failed) : (await journal.put(STATE(id), failed), true);
       if (won) {
         await journal.put(FAIL(id), {
@@ -558,7 +624,11 @@ export async function pollScheduler(
     // genuinely holds the lock always matches, so a correct poller is never blocked.
     // A journal WITHOUT putIfMatch falls back to an unconditional put (old behavior, documented risk
     // — the same fallback as run-lock.ts / claim()).
-    const commit = async (next: TriggerState, what: string): Promise<boolean> => {
+    // Every state the poller writes names the definition it was computed from (see writeTrigger), so
+    // a state the poller has touched once is never mistaken for a half-written one.
+    const of = definitionFingerprint(def);
+    const commit = async (computed: TriggerState, what: string): Promise<boolean> => {
+      const next: TriggerState = { ...computed, of };
       if (!journal.putIfMatch) {
         await journal.put(STATE(id), next);
         return true;
@@ -832,13 +902,15 @@ export async function moveTrigger(
   const state = await journal.get<TriggerState>(STATE(fromId));
   if (!def || !state) return null;
   const toId = ownedName(fromId, { resourceId: owner.resourceId, orgId: owner.orgId });
-  if ((await journal.get(DEF(toId))) === undefined) {
+  // Both halves of the owned trigger, or neither: a move that stopped between them is finished by
+  // calling it again (a definition already there without its state is completed, not skipped).
+  const toDef = await journal.get<TriggerDef>(DEF(toId));
+  if (toDef === undefined || (await journal.get(STATE(toId))) === undefined) {
     const { resourceId: _r, orgId: _o, ownerKind: _k, ...rest } = def;
-    await journal.put(DEF(toId), { ...rest, ...owner } satisfies TriggerDef);
     // The run ids start over under the new id (`sched:<toId>:<n>`), so the count carries on without
     // pointing a fire at a run the old id already completed.
-    const { movedTo: _m, ...carried } = state;
-    await journal.put(STATE(toId), carried satisfies TriggerState);
+    const { movedTo: _m, of: _f, ...carried } = state;
+    await writeTrigger(journal, toId, toDef ?? ({ ...rest, ...owner } satisfies TriggerDef), carried);
   }
   if (state.status === 'pending') {
     const retired: TriggerState = { ...state, status: 'done', movedTo: toId };

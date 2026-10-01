@@ -33,10 +33,10 @@ describe('GraphRag.query(opts) — namespace narrowing', () => {
   it('returns ZERO rows for a namespace that was never written to (not the whole corpus)', async () => {
     const graph = new GraphRag(GRAPH_OPTS);
     await graph.upsert([
-      { id: 'acme-1', text: 'acme handbook', embedding: QUERY, namespace: 'org:acme' },
-      { id: 'globex-1', text: 'globex handbook', embedding: BRIDGE_EMB, namespace: 'org:globex' },
+      { id: 'acme-1', text: 'acme handbook', embedding: QUERY, namespace: 'tenant:acme' },
+      { id: 'globex-1', text: 'globex handbook', embedding: BRIDGE_EMB, namespace: 'tenant:globex' },
     ]);
-    const out = await graph.query(QUERY, 10, { namespace: 'org:never-written' });
+    const out = await graph.query(QUERY, 10, { namespace: 'tenant:never-written' });
     expect(out, 'an unknown namespace must be empty, not the unfiltered corpus').toEqual([]);
   });
 
@@ -44,8 +44,8 @@ describe('GraphRag.query(opts) — namespace narrowing', () => {
   // namespace: `visible.length === 0` must short-circuit rather than fall through to "no narrowing".
   it('returns ZERO rows when the requested namespace excludes every item in a single-namespace corpus', async () => {
     const graph = new GraphRag(GRAPH_OPTS);
-    await graph.upsert([{ id: 'a', text: 'only doc', embedding: QUERY, namespace: 'org:acme' }]);
-    const out = await graph.query(QUERY, 5, { namespace: 'org:globex' });
+    await graph.upsert([{ id: 'a', text: 'only doc', embedding: QUERY, namespace: 'tenant:acme' }]);
+    const out = await graph.query(QUERY, 5, { namespace: 'tenant:globex' });
     expect(out, 'an empty visible set must not degrade into an unfiltered search').toEqual([]);
   });
 
@@ -55,11 +55,11 @@ describe('GraphRag.query(opts) — namespace narrowing', () => {
   it('an item in another namespace never arrives via the graph walk, even when strongly connected to a top hit', async () => {
     const graph = new GraphRag(GRAPH_OPTS);
     await graph.upsert([
-      { id: 'B-bridge', text: 'globex: strong direct match', embedding: BRIDGE_EMB, namespace: 'org:globex' },
-      { id: 'A-far', text: 'acme: SECRET, only reachable by walking', embedding: FAR_EMB, namespace: 'org:acme' },
+      { id: 'B-bridge', text: 'globex: strong direct match', embedding: BRIDGE_EMB, namespace: 'tenant:globex' },
+      { id: 'A-far', text: 'acme: SECRET, only reachable by walking', embedding: FAR_EMB, namespace: 'tenant:acme' },
     ]);
-    const out = await graph.query(QUERY, 10, { namespace: 'org:globex' });
-    expect(ids(out), 'querying org:globex must not surface an org:acme id').toEqual(['B-bridge']);
+    const out = await graph.query(QUERY, 10, { namespace: 'tenant:globex' });
+    expect(ids(out), 'querying tenant:globex must not surface an tenant:acme id').toEqual(['B-bridge']);
     expect(
       out.some((m) => m.id.startsWith('A-') || m.text.includes('SECRET')),
       'no row may carry an id or text belonging to the other namespace',
@@ -71,10 +71,10 @@ describe('GraphRag.query(opts) — namespace narrowing', () => {
   it('the SAME corpus does surface the weakly-matching item when both live in one namespace (control)', async () => {
     const graph = new GraphRag(GRAPH_OPTS);
     await graph.upsert([
-      { id: 'B-bridge', text: 'strong direct match', embedding: BRIDGE_EMB, namespace: 'org:globex' },
-      { id: 'A-far', text: 'only reachable by walking', embedding: FAR_EMB, namespace: 'org:globex' },
+      { id: 'B-bridge', text: 'strong direct match', embedding: BRIDGE_EMB, namespace: 'tenant:globex' },
+      { id: 'A-far', text: 'only reachable by walking', embedding: FAR_EMB, namespace: 'tenant:globex' },
     ]);
-    const out = await graph.query(QUERY, 10, { namespace: 'org:globex' });
+    const out = await graph.query(QUERY, 10, { namespace: 'tenant:globex' });
     expect(ids(out)).toEqual(['A-far', 'B-bridge']);
     // And it arrived by the WALK, not by direct similarity (which is 0 for FAR).
     expect(out.find((m) => m.id === 'A-far')!.score).toBeGreaterThan(0.3);
@@ -87,8 +87,8 @@ describe('GraphRag — edges are built namespace-locally (structure, not just qu
   it('upsert of a new item creates NO edge to an above-threshold neighbour in a different namespace', async () => {
     const graph = new GraphRag(GRAPH_OPTS);
     await graph.upsert([
-      { id: 'b', text: 'bridge', embedding: BRIDGE_EMB, namespace: 'org:globex' },
-      { id: 'f', text: 'far', embedding: FAR_EMB, namespace: 'org:acme' },
+      { id: 'b', text: 'bridge', embedding: BRIDGE_EMB, namespace: 'tenant:globex' },
+      { id: 'f', text: 'far', embedding: FAR_EMB, namespace: 'tenant:acme' },
     ]);
     expect(graph.stats(), 'a cross-namespace edge is a permanent leak path').toEqual({ nodes: 2, edges: 0 });
   });
@@ -98,8 +98,8 @@ describe('GraphRag — edges are built namespace-locally (structure, not just qu
   it('the same pair in one namespace DOES create an edge (control for the threshold)', async () => {
     const graph = new GraphRag(GRAPH_OPTS);
     await graph.upsert([
-      { id: 'b', text: 'bridge', embedding: BRIDGE_EMB, namespace: 'org:globex' },
-      { id: 'f', text: 'far', embedding: FAR_EMB, namespace: 'org:globex' },
+      { id: 'b', text: 'bridge', embedding: BRIDGE_EMB, namespace: 'tenant:globex' },
+      { id: 'f', text: 'far', embedding: FAR_EMB, namespace: 'tenant:globex' },
     ]);
     expect(graph.stats()).toEqual({ nodes: 2, edges: 1 });
   });
@@ -111,13 +111,13 @@ describe('GraphRag — edges are built namespace-locally (structure, not just qu
   it('the edge-rebuild path (re-upsert of an existing id) creates no edge across namespaces even at cosine 1.0', async () => {
     const graph = new GraphRag(GRAPH_OPTS);
     await graph.upsert([
-      { id: 'b', text: 'bridge', embedding: BRIDGE_EMB, namespace: 'org:globex' },
-      { id: 'f', text: 'far', embedding: FAR_EMB, namespace: 'org:acme' },
+      { id: 'b', text: 'bridge', embedding: BRIDGE_EMB, namespace: 'tenant:globex' },
+      { id: 'f', text: 'far', embedding: FAR_EMB, namespace: 'tenant:acme' },
     ]);
     // Re-upsert 'f' with the exact embedding of 'b' — still a different namespace.
-    await graph.upsert([{ id: 'f', text: 'far, moved', embedding: BRIDGE_EMB, namespace: 'org:acme' }]);
+    await graph.upsert([{ id: 'f', text: 'far, moved', embedding: BRIDGE_EMB, namespace: 'tenant:acme' }]);
     expect(graph.stats(), 'rebuildEdgesFor must apply the same namespace rule as upsert').toEqual({ nodes: 2, edges: 0 });
-    const out = await graph.query(QUERY, 10, { namespace: 'org:globex' });
+    const out = await graph.query(QUERY, 10, { namespace: 'tenant:globex' });
     expect(ids(out), 'a rebuilt edge must not become a cross-tenant path either').toEqual(['b']);
   });
 
@@ -127,15 +127,15 @@ describe('GraphRag — edges are built namespace-locally (structure, not just qu
   it('an item moved to a different namespace keeps no edge inside the old one', async () => {
     const graph = new GraphRag(GRAPH_OPTS);
     await graph.upsert([
-      { id: 'b', text: 'bridge', embedding: BRIDGE_EMB, namespace: 'org:globex' },
-      { id: 'f', text: 'far', embedding: FAR_EMB, namespace: 'org:globex' },
+      { id: 'b', text: 'bridge', embedding: BRIDGE_EMB, namespace: 'tenant:globex' },
+      { id: 'f', text: 'far', embedding: FAR_EMB, namespace: 'tenant:globex' },
     ]);
     expect(graph.stats().edges).toBe(1);
     // An upsert updates a document; it does not move it to another partition (assertSameVectorOwner),
     // so a move is a delete and an insert — and neither half may leave the old edge behind.
-    await expect(graph.upsert([{ id: 'f', text: 'far', embedding: FAR_EMB, namespace: 'org:acme' }])).rejects.toThrow(/different owner or label/);
+    await expect(graph.upsert([{ id: 'f', text: 'far', embedding: FAR_EMB, namespace: 'tenant:acme' }])).rejects.toThrow(/different owner or label/);
     expect(await graph.delete({ ids: ['f'] })).toBe(1);
-    await graph.upsert([{ id: 'f', text: 'far', embedding: FAR_EMB, namespace: 'org:acme' }]); // moved out
+    await graph.upsert([{ id: 'f', text: 'far', embedding: FAR_EMB, namespace: 'tenant:acme' }]); // moved out
     expect(graph.stats(), 'moving an item out of a namespace must remove its edges there').toEqual({ nodes: 2, edges: 0 });
   });
 });
@@ -213,8 +213,8 @@ describe('GraphRag.query — backward compatibility of the 2-argument form', () 
   it('query(embedding, topK) with no opts still returns items from every namespace', async () => {
     const graph = new GraphRag(GRAPH_OPTS);
     await graph.upsert([
-      { id: 'a', text: 'acme', embedding: QUERY, namespace: 'org:acme' },
-      { id: 'b', text: 'globex', embedding: BRIDGE_EMB, namespace: 'org:globex' },
+      { id: 'a', text: 'acme', embedding: QUERY, namespace: 'tenant:acme' },
+      { id: 'b', text: 'globex', embedding: BRIDGE_EMB, namespace: 'tenant:globex' },
       { id: 'c', text: 'no namespace', embedding: FAR_EMB },
     ]);
     const out = await graph.query(QUERY, 10);
@@ -226,8 +226,8 @@ describe('GraphRag.query — backward compatibility of the 2-argument form', () 
   it('query with an empty opts object behaves identically to the 2-argument form', async () => {
     const graph = new GraphRag(GRAPH_OPTS);
     const corpus: VectorItem[] = [
-      { id: 'a', text: 'acme', embedding: QUERY, namespace: 'org:acme' },
-      { id: 'b', text: 'globex', embedding: BRIDGE_EMB, namespace: 'org:globex' },
+      { id: 'a', text: 'acme', embedding: QUERY, namespace: 'tenant:acme' },
+      { id: 'b', text: 'globex', embedding: BRIDGE_EMB, namespace: 'tenant:globex' },
     ];
     await graph.upsert(corpus);
     const twoArg = await graph.query(QUERY, 10);
@@ -253,9 +253,9 @@ describe('GraphRag.query — backward compatibility of the 2-argument form', () 
     const graph = new GraphRag(GRAPH_OPTS);
     await graph.upsert([
       { id: 'ns-less', text: 'global doc', embedding: QUERY },
-      { id: 'ns-acme', text: 'acme doc', embedding: QUERY, namespace: 'org:acme' },
+      { id: 'ns-acme', text: 'acme doc', embedding: QUERY, namespace: 'tenant:acme' },
     ]);
-    const out = await graph.query(QUERY, 10, { namespace: 'org:acme' });
+    const out = await graph.query(QUERY, 10, { namespace: 'tenant:acme' });
     expect(ids(out), 'an item without a namespace must not leak into a scoped query').toEqual(['ns-acme']);
   });
 });
@@ -282,13 +282,13 @@ describe('createRagTool — forwarding of namespace/filter to store.query', () =
   it('forwards the configured namespace and filter verbatim as store.query 3rd argument', async () => {
     const store = new RecordingStore();
     const filter = { tier: 'gold', region: 'eu' };
-    const t = createRagTool({ store, embed, topK: 3, namespace: 'org:acme', filter });
+    const t = createRagTool({ store, embed, topK: 3, namespace: 'tenant:acme', filter });
     await runTool(t, 'anything');
 
     expect(store.calls).toHaveLength(1);
     expect(store.calls[0]!.topK).toBe(3);
     expect(store.calls[0]!.opts, 'the tool is the only documented RAG path — scoping must reach the store').toEqual({
-      namespace: 'org:acme',
+      namespace: 'tenant:acme',
       filter: { tier: 'gold', region: 'eu' },
     });
   });
@@ -310,7 +310,7 @@ describe('createRagTool — forwarding of namespace/filter to store.query', () =
   // Each half independently: configuring only one must not drag the other along as an undefined key.
   it('passes only the namespace key when filter is not configured (and vice versa)', async () => {
     const nsOnly = new RecordingStore();
-    await runTool(createRagTool({ store: nsOnly, embed, namespace: 'org:acme' }), 'q');
+    await runTool(createRagTool({ store: nsOnly, embed, namespace: 'tenant:acme' }), 'q');
     expect(Object.keys(nsOnly.calls[0]!.opts!).sort()).toEqual(['namespace']);
 
     const filterOnly = new RecordingStore();
@@ -321,9 +321,9 @@ describe('createRagTool — forwarding of namespace/filter to store.query', () =
   // Two tools over ONE store must not share scope — the documented "one tool per tenant" pattern.
   it('two tools over the same store forward their own distinct namespaces', async () => {
     const store = new RecordingStore();
-    await runTool(createRagTool({ store, embed, namespace: 'org:acme' }), 'q');
-    await runTool(createRagTool({ store, embed, namespace: 'org:globex' }), 'q');
-    expect(store.calls.map((c) => c.opts!.namespace)).toEqual(['org:acme', 'org:globex']);
+    await runTool(createRagTool({ store, embed, namespace: 'tenant:acme' }), 'q');
+    await runTool(createRagTool({ store, embed, namespace: 'tenant:globex' }), 'q');
+    expect(store.calls.map((c) => c.opts!.namespace)).toEqual(['tenant:acme', 'tenant:globex']);
   });
 });
 
@@ -336,14 +336,14 @@ describe('createRagTool — end-to-end tenant isolation over real stores', () =>
     return [s.includes('refund') ? 1 : 0, s.includes('policy') ? 1 : 0, s.includes('acme') ? 1 : 0, s.includes('globex') ? 1 : 0];
   };
   const corpus = async (): Promise<VectorItem[]> => [
-    { id: 'acme-1', text: 'acme refund policy: 30 days, no questions', embedding: await embed('acme refund policy'), namespace: 'org:acme' },
-    { id: 'globex-1', text: 'globex refund policy: 7 days, receipt required', embedding: await embed('globex refund policy'), namespace: 'org:globex' },
+    { id: 'acme-1', text: 'acme refund policy: 30 days, no questions', embedding: await embed('acme refund policy'), namespace: 'tenant:acme' },
+    { id: 'globex-1', text: 'globex refund policy: 7 days, receipt required', embedding: await embed('globex refund policy'), namespace: 'tenant:globex' },
   ];
 
   it('a GraphRag-backed tool scoped to tenant A never returns tenant B text', async () => {
     const store = new GraphRag(GRAPH_OPTS);
     await store.upsert(await corpus());
-    const t = createRagTool({ store, embed, topK: 10, namespace: 'org:acme' });
+    const t = createRagTool({ store, embed, topK: 10, namespace: 'tenant:acme' });
     const hits: any[] = await runTool(t, 'refund policy');
 
     expect(hits.length).toBeGreaterThan(0); // guard: must not pass because nothing came back
@@ -356,7 +356,7 @@ describe('createRagTool — end-to-end tenant isolation over real stores', () =>
   it('an InMemoryVectorStore-backed tool scoped to tenant B never returns tenant A text', async () => {
     const store = new InMemoryVectorStore();
     await store.upsert(await corpus());
-    const t = createRagTool({ store, embed, topK: 10, namespace: 'org:globex' });
+    const t = createRagTool({ store, embed, topK: 10, namespace: 'tenant:globex' });
     const hits: any[] = await runTool(t, 'refund policy');
 
     expect(hits.length).toBeGreaterThan(0);
@@ -385,7 +385,7 @@ describe('createRagTool — end-to-end tenant isolation over real stores', () =>
       { ...base[0]!, id: 'acme-2', text: 'acme internal refund policy draft', metadata: { visibility: 'internal' } },
       base[1]!,
     ]);
-    const t = createRagTool({ store, embed, topK: 10, namespace: 'org:acme', filter: { visibility: 'public' } });
+    const t = createRagTool({ store, embed, topK: 10, namespace: 'tenant:acme', filter: { visibility: 'public' } });
     const hits: any[] = await runTool(t, 'refund policy');
     expect(hits.map((h) => h.text), 'internal and cross-tenant docs must both be excluded').toEqual([
       'acme refund policy: 30 days, no questions',

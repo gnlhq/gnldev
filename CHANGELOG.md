@@ -59,6 +59,12 @@ and who is affected.
 - **The root scope cannot name a thread whose id starts with `org:`** (`ReservedThreadIdError`; `400
   thread_id_reserved` on the REST API): use another thread id, or work inside the organization with
   `withOrgStorage(storage, orgId)`.
+- **The root scope cannot name a vector namespace or document id that starts with `org:`**
+  (`ReservedVectorNameError`, from every bundled vector store on `upsert`, `query` and `delete`, and so
+  from `ingestDocuments`, `deleteDocuments` and `createRagTool`): use another namespace (`acme-notes`,
+  `ORG:x` and `my-org:x` are fine — only the exact `org:` prefix is reserved), or work inside the
+  organization with `withOrgStorage(storage, orgId).vectors`. A wrapper store in front of a bundled root
+  store that rebuilds the call passes `[VECTOR_PARTITION]` on (or spreads the original object).
 - **The root scope's run reads no longer reach an organization's runs** — `GET /runs`, `GET /runs/:id`
   and every run view and export on the REST API and in Studio, served with no organization: to read
   one organization's runs, name it (`x-gnl-org: acme` as a platform admin, with the `org` option), or in
@@ -147,7 +153,8 @@ and who is affected.
   `JOURNAL_LOG_MAX_ATTEMPTS`; `semanticLogKey`, `SEMANTIC_LOG_PREFIX`, `SEMANTIC_LOG_SUFFIX` (the key
   @gnldev/rag's `SemanticMemory` keeps a thread's log under, built in one place); `MEMORY_PARTITION`,
   `memoryPartitionOf`, `inMemoryPartition`, `assertRootThreadId`, `ReservedThreadIdError` (+ types
-  `MemoryPartition`, `MemoryPartitionOption`); `isOrganizationKey`, `parseOrganizationKey`, `orgSpaceSql`,
+  `MemoryPartition`, `MemoryPartitionOption`); `VECTOR_PARTITION`, `assertRootVectorNames`,
+  `ReservedVectorNameError` (+ type `VectorPartitionOption`); `isOrganizationKey`, `parseOrganizationKey`, `orgSpaceSql`,
   `ORG_KEY_PREFIX`, `withRootScope`; `findReservedRootThreads` (+ type `ReservedRootThread`);
   `recordThreadCreated`;
   `assertDeletesOutsideOrganizations`; `encodeStepRecord`, `decodeStepRecord`; `scoreSample`,
@@ -370,6 +377,23 @@ and who is affected.
   memory). An organization's memory is unaffected: its view prefixes every id. Way through: use a thread
   id that does not start with `org:`, or work inside the organization with `withOrgStorage(storage,
   orgId)`.
+- **The root scope can no longer write, read or delete an organization's documents by naming its
+  vector namespace.** `withOrgStorage` keeps acme's documents in the root store under namespace
+  `org:acme` (ids `org:acme:<id>`), and nothing stopped a root call from naming it: measured on the
+  durable InMemory, SQLite and Postgres stores (and in 0.9.0), a root `ingestDocuments` of a document
+  with `namespace: 'org:acme'` deleted acme's document of the same id and wrote the root's text in its
+  place (`{ indexed: 1, removed: 1 }`); a root `query`/`createRagTool` with that namespace answered with
+  acme's documents; `delete({ ids: ['org:acme:h'] })` removed one. Every bundled store (`@gnldev/durable`
+  InMemory/SQLite/Postgres, `@gnldev/rag` `InMemoryVectorStore`/`GraphRag`/`PostgresVectorStore`) now
+  refuses, through the shared rule (`vectorWriteBatch`, `vectorQueryScope`, `vectorDeletePlan` →
+  `assertRootVectorNames`, on `isOrganizationKey`), a namespace or id in the `org:` space unless the call
+  carries that organization's code-only grant (`VECTOR_PARTITION`, a Symbol a JSON body cannot hold),
+  which `withOrgStorage(...).vectors` and an organization's observational memory add. Nothing is
+  touched before the refusal. Who is affected: code that wrote or read `org:`-prefixed namespaces on a
+  root or standalone store — rename the namespace, or go through `withOrgStorage(storage,
+  orgId).vectors`. A store you wrote yourself that does not run the shared rule is not covered: call
+  `assertRootVectorNames` (or the three rule functions) in it. A root query with no namespace still
+  searches every namespace (unchanged).
 - **Root observational memory no longer ranks by an organization's observation vectors.**
   `AgentMemory.recallObservationsSemantic` on a root memory queried every namespace; an organization's
   vector for a thread with the same bare id carried the same per-thread `obsId` (`obs-0`) and answered
@@ -711,12 +735,47 @@ and who is affected.
   `scoreRun`/run after the upgrade, instead of replaying its 0 — one judge call per such score — and
   the new record is replayed from then on; `scoreRun(..., { memo: false })` never reads a memo. A suite re-run with a scorer added runs its
   cases again (the added scorer used to be missing and averaged as 0).
+- **@gnldev/scheduler: a crash between a trigger's two writes left it dead, and the identical
+  registration on the next boot did nothing.** A replace (or the repair of a 0.9 `every: 0` trigger)
+  wrote `sched:def:<id>` and `sched:state:<id>` as two puts, and the same-spec check read only the
+  definition: a done one-shot re-registered as `every: 1000` stayed done, a failed one stayed failed,
+  and `sched:fail:`'s advice ("call scheduleWorkflow again") stopped working (measured: 4 of 4 scenarios,
+  in-memory and SQLite). Both halves now have one writer, atomic through `applyBatch` on every bundled
+  journal; on a journal without it the state names its definition (`of`) and the same-spec path repairs
+  a half-written trigger. `moveTrigger` stopped between its writes is finished by calling it again, and
+  a lost state under `ifExists: 'keep'` is rebuilt from the stored schedule, not the ignored one.
+- **@gnldev/queue: concurrent workers ran 3–5% of jobs twice** (Postgres, 3 workers; 0.9.0 too), side
+  effects outside `ctx.run` included. A worker checked `qdone` before taking the lease and never after,
+  so a job another worker finished and released in between ran again. The check is repeated under the
+  lease. Measured: duplicates 17–38 of 400 → 0 (Postgres, 5 runs), 14–25 of 150 → 0 (two processes on
+  one SQLite file). @gnldev/events has no lease and promises at-least-once delivery; unchanged.
+- **`adoptIntoOrg` carried the root's read positions into the organization.** The root `qcursor` /
+  `evtcursor:*` points into a log the adoption renumbers after the organization's records, so it named
+  the wrong record there: in-memory and Redis overwrote the organization's own cursor (10 of 10 pending
+  organization jobs stranded), SQLite and Postgres refused the adoption on a raw UNIQUE error, and even a
+  FIRST adoption after an erasure in the root stranded every pending job, on all four stores. A read
+  position is now never carried: the organization keeps its own, or reads from the head and skips what
+  is finished by its markers. The result lists the reset keys (`resetPositions`). Any other work-store
+  key both sides hold refuses the adoption before anything moves, with one message in every store.
+- **SQLite: a reader's new work-log records waited behind processes that write without pause.**
+  Numbering on read needed the write lock, and a reader does not win it from busy writers (SQLite's lock
+  is not fair): with 3 producer processes, a committed record waited up to 509 ms to be listed. A
+  trigger (`gnl_work_log_number`) now numbers every record in the INSERT that writes it, a 0.9 process's
+  included. Reader delay after commit, median of 10 runs: p50 64 → 12 ms, p99 285 → 23 ms, max 324 →
+  26 ms. Cost: an append is 17% slower (432 → 506 µs, one process, file-backed). An escalating lock wait
+  was measured first and was worse (max 928 ms). The multi-second waits the audit saw are the writers'
+  own wait for SQLite's lock, which 0.9 has too.
+- **An organization's thread written by anything but `AgentMemory` had no organization-side owner
+  record**, so `findReservedRootThreads` listed it as undecided and the root `eraseSubject` reported it
+  as the root person's. `withOrgStorage(...).memory.upsertThread` now writes it (`recordThreadCreated`,
+  first write wins) for every writer; `AgentMemory`'s own write (protected `recordCreated`) is gone.
 
 ### Changed
 
 - **Upgrading a work store adds columns and a table, and the write stays 0.9's.** SQLite and Postgres
   add `gnl_work_log.seq` (0 = not numbered yet), the index `gnl_work_log_seq` and the table
-  `gnl_work_seq` at startup, like the earlier additive columns; Postgres also adds `gnl_work_log.ord`
+  `gnl_work_seq` at startup, like the earlier additive columns; SQLite also adds the trigger
+  `gnl_work_log_number`, which numbers a record in the INSERT that writes it; Postgres also adds `gnl_work_log.ord`
   and the sequence `gnl_work_log_ord` (a column default: the order records were appended in). The
   append is 0.9's statement; the first `list` of a namespace numbers its unnumbered records after every
   numbered one — existing rows once, then whatever a writer of either version added since — in append
@@ -799,9 +858,9 @@ and who is affected.
   records from this version on. An agent turn's messages carry no time of their own, so a thread whose
   messages all came from 0.9 turns stays `keptNoTs` until a new turn is appended (then it ages from that
   turn) or it is erased.
-- **The first read of a work log numbers it (SQLite, Postgres).** `WorkStore.list` numbers the records
-  no reader has numbered yet: a 0.9 backlog, or a 0.9 producer's records in a rolling deploy, is
-  numbered by the first read after the upgrade, which writes each one's number once (measured above:
+- **The first read of a work log numbers it (Postgres; on SQLite only rows written before this
+  version).** `WorkStore.list` numbers the records no reader has numbered yet: a 0.9 backlog, or (on
+  Postgres) a 0.9 producer's records in a rolling deploy, is numbered by the first read after the upgrade, which writes each one's number once (measured above:
   1 500 fresh records read at 31 975 records/s on Postgres, 184 051 on SQLite). An idle read is two
   statements instead of 0.9's one (1.6 ms on the same Postgres). Redis numbers at append and pays
   nothing on read.
@@ -842,16 +901,11 @@ and who is affected.
   one is moved, the organization reads it. `findReservedRootThreads` / `migrateReservedRootThreads`
   list it as undecided and never move it unguided, and the root `eraseSubject` reports it without
   deleting it — measured: guessing moved an organization's own 0.9 thread out from under it. Name it
-  in `threadIds` to move it. A thread an organization's `AgentMemory` creates from this version on
-  carries the organization's record, so it is never undecided.
+  in `threadIds` to move it. A thread written through an organization's memory view from this version
+  on — by `AgentMemory` or any other writer — carries the organization's record, so it is never undecided.
 - **Redis numbers a 0.9 producer's records in producer-clock order** (`ts`, then id): a bare SET keeps
   no insertion order. SQLite and Postgres use insertion order. Either way such a record is numbered
   above every number handed out, so it never lands behind a cursor.
-- **`adoptIntoOrg` into an organization that already has a queue or a consumer cursor.** The moved log
-  lands after the organization's records, but the root `qcursor` / `evtcursor:*` is a key like any
-  other: SQLite and Postgres refuse the adoption on the duplicate key; the in-memory and Redis stores
-  overwrite the organization's cursor with the root one, which can leave the organization's unhandled
-  records behind it. Delete one of the two cursors (see above) before adopting.
 
 ## [0.9.0] — 2026-09-30
 

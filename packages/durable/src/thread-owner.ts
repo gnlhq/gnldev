@@ -123,8 +123,9 @@ async function allBornUnknown(journal: Journal, runs: RunSummary[]): Promise<boo
 /**
  * A memory created a thread for `resourceId` with no run: its owner record, first write wins — the
  * record the gate would otherwise backfill from the same `resourceId` on the thread's first run.
- * `@gnldev/memory`'s AgentMemory writes it for an ORGANIZATION's thread, through that organization's
- * journal view (`org:<id>:thread:<t>:owner`): that record is what tells an organization's thread apart
+ * An organization's memory view (`withOrgStorage(...).memory.upsertThread`, the one path every writer of
+ * an organization's thread takes) writes it, through that organization's journal view
+ * (`org:<id>:thread:<t>:owner`): that record is what tells an organization's thread apart
  * from one 0.9 let the root create under the same physical id (`findReservedRootThreads` in
  * erase.ts). Without it a thread made by a memory alone is undecided there, every time.
  */
