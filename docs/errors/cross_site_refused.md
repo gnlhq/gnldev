@@ -4,12 +4,17 @@
 
 ## What happened
 
-A page on another site sent a state-changing request (`POST`, `PUT`, `PATCH`, `DELETE`) to a surface
-that has no identity to authenticate — a REST API or Studio with no auth provider (or only a
-`{ read, write }` pair), or a standalone door (`createChatRoute`, `createAguiRoute`, `createMcpServer`
+A page on another site sent a state-changing request (`POST`, `PUT`, `PATCH`, `DELETE`) that carried
+no identity — to a REST API or Studio with no auth provider (or only a `{ read, write }` pair); to a REST
+API or Studio whose provider names identities (`roleAuth`, `@gnldev/auth-ee`, a provider of your own) for
+a request that resolved to no caller and that the provider allowed anyway (a provider that lets anonymous
+requests through) — a request the provider refuses is answered with its own refusal (`roleAuth`'s 401),
+from any site; or to a standalone door (`createChatRoute`, `createAguiRoute`, `createMcpServer`
 over HTTP) for a request that resolved no caller — the door has no `identify`, or its `identify` answered
 nothing for this request (an anonymous visitor, or `identify: () => undefined`). Having an `identify`
-does not turn the check off; resolving a caller does. The browser said the page was on another site:
+does not turn the check off; resolving a caller does. A door handed `authorize` asks it first, as
+REST and Studio ask their provider: an anonymous request it refuses is answered with that refusal
+(`roleAuth`'s 401), from any site, and only one it allows is checked here. The browser said the page was on another site:
 `Sec-Fetch-Site: cross-site`, or, from a client that does not send Fetch Metadata, an `Origin` naming
 another host (or `null`). On MCP the refusal is a JSON-RPC error with code `-32000` and
 `data: { code: "cross_site_refused" }`.
@@ -41,7 +46,8 @@ If another site really is meant to call the surface — one line:
 
 | Surface | Way through |
 | --- | --- |
-| `createRestApi` / `createStudioApp` | `auth: roleAuth({ admin: { token } })` (or any provider that binds an identity): a page on another site cannot read your bearer token, so it cannot ride it |
+| `createRestApi` / `createStudioApp`, for callers with a credential | `auth: roleAuth({ admin: { token } })` (or any provider that binds an identity), and send the credential: a request it resolves to a caller is not checked — a page on another site cannot read your bearer token, so it cannot ride it |
+| `createRestApi` / `createStudioApp`, called by pages on other sites with no credential (a public widget) | `allowCrossSite: true` in the `createRestApi` / `createStudioApp` options. It lifts this check only: the host rule in [`host_not_allowed`](./host_not_allowed.md) still applies |
 | `createChatRoute` / `createAguiRoute` / `createMcpServer`, embedded on other sites with no sign-in (a public chat widget on a customer's website) | `allowCrossSite: true` in the door's options. It lifts this check only: the door still answers only the names in [`host_not_allowed`](./host_not_allowed.md), so list the name it is served under — `allowedHosts: ['chat.example.com']` |
 | `createChatRoute` / `createAguiRoute` / `createMcpServer`, for signed-in users | `identify: (req) => principal`, reading a verified token: a request it resolves a named caller for carries an identity, and neither check runs for it |
 

@@ -123,12 +123,19 @@ describe('K3: what does not change', () => {
     expect((await bodyOf(none.deny(r2, 'read'))).error).toMatch(/has no auth provider/);
   });
 
-  it('DECIDED: an anonymous write a provider allows is not refused as cross-site (no REST/Studio option could let it through)', async () => {
-    // A provider that names identities and allows an anonymous write has said anybody may make it — a
-    // public widget on another site included. Doors have `allowCrossSite`; the REST/Studio gate has no
-    // such option, so this check stays a configuration question there (see gate.ts `decide`).
-    const gate = makeGate({ authenticate: () => null, authorize: () => ({ allow: true }) });
-    const r = new Request('http://localhost:4111/api/agents/a/run', { method: 'POST', headers: { host: 'localhost:4111', 'sec-fetch-site': 'cross-site', origin: 'https://widget.example' }, body: '{}' });
-    expect(await gate.allowP(r, 'agents:run')).toBe(true);
+  it('an anonymous cross-site write a provider allows is refused cross_site_refused; allowCrossSite: true is the way through', async () => {
+    // Was DECIDED the other way while REST/Studio had no `allowCrossSite`. They have it now (the doors'
+    // option, same meaning), so the check is asked per request, as on a door.
+    const provider: AuthProvider = { authenticate: () => null, authorize: () => ({ allow: true }) };
+    const mk = () => new Request('http://localhost:4111/api/agents/a/run', { method: 'POST', headers: { host: 'localhost:4111', 'sec-fetch-site': 'cross-site', origin: 'https://widget.example' }, body: '{}' });
+    const gate = makeGate(provider);
+    const r = mk();
+    expect(await gate.allowP(r, 'agents:run')).toBe(false);
+    const res = gate.deny(r, 'write');
+    expect(res.status).toBe(403);
+    const body = await bodyOf(res);
+    expect(body.code).toBe('cross_site_refused');
+    expect(body.error).toContain('allowCrossSite: true in the createRestApi / createStudioApp options');
+    expect(await makeGate(provider, { allowCrossSite: true }).allowP(mk(), 'agents:run')).toBe(true);
   });
 });

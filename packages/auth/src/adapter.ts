@@ -26,27 +26,21 @@ export function bindsIdentity(auth: AuthProvider | undefined): boolean {
 
 /**
  * Does this request carry an identity — so the open-surface checks (the host rule and the cross-site
- * check) have nothing to protect and are skipped? The ONE answer, for every surface:
+ * check) have nothing to protect and are skipped? The ONE answer, asked in ONE place (`openSurfaceGuard`) for
+ * every surface: the REST and Studio gate (`makeGate`) passes it with the principal its provider resolved for THIS request (none without a
+ * provider; none, by construction, for a `{ read, write }` pair); a standalone door (`doorGate`) with
+ * the principal its `identify` resolved. The answer is the engine's: `callerKind(principal) !== 'unnamed'`
+ * — the checks are skipped only for a caller the engine would hold to a name.
  *
- *   • the REST and Studio gate (`makeGate`) ask it with their `provider` for the cross-site check (a
- *     provider that binds an identity is defended by its bearer token, which no other site can read) —
- *     and, for the host rule, with the `principal` that provider resolved for THIS request, once it has
- *     allowed it: a request that resolved to nobody has no token to be the defence (gate.ts `decide`);
- *   • a standalone door (`doorGate`) asks it with the `principal` its `identify` resolved for THIS
- *     request, and the answer is the engine's: `callerKind(principal) !== 'unnamed'`. A door skips the
- *     checks only for a caller the engine would hold to a name. An `identify` that answered nothing —
- *     or answered an object the engine names nobody with (`{ kind: 'subject', id: session?.userId }`
- *     for a visitor with no user, `id: ''`, a reserved id, `{}`) — resolved no identity, so the checks
- *     run. The presence of the function, or of an object, says nothing about the request.
- *
- * Before this had one owner the doors asked "was `identify` passed?" instead, and
- * `identify: () => undefined` (or an `identify` that answers nothing for an anonymous visitor) turned
- * both checks off: measured, a DNS-rebound page read a thread back and a cross-site form ran the model.
- * Then it read "`identify` answered an object", and the same two requests got through with an anonymous
- * visitor's `{ kind: 'subject', id: undefined }` — the engine called that caller `unnamed` meanwhile.
+ * It took the provider too, once: "does this surface's provider bind identities?" — a CONFIGURATION
+ * question, and the gate asked it for every request. A provider that names identities and lets some
+ * requests through anonymously then skipped both checks for those requests: measured, a DNS-rebound page
+ * read Studio's runs, and a page on another site swept Studio's retention. The doors had the same hole
+ * twice before (`identify` passed; `identify` answered an object), each time a question about the
+ * configuration or the shape answered in place of one about the request.
  */
-export function carriesIdentity(source: { provider?: AuthProvider; principal?: Principal | null }): boolean {
-  return bindsIdentity(source.provider) || callerKind(source.principal) !== 'unnamed';
+export function carriesIdentity(source: { principal?: Principal | null }): boolean {
+  return callerKind(source.principal) !== 'unnamed';
 }
 
 /** {read,write} → AuthProvider. If there's no fn in that direction, it's unrestricted (preserves the existing `!fn || fn(c)` behavior). */

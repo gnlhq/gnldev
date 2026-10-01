@@ -10,14 +10,14 @@ export { markRefusal, markCredentialRejected, credentialRejected, CREDENTIAL_REJ
 // What a permission string means and whether a grant covers it — the one matcher every tier uses.
 export { permissionMatches, parsePermission, patternPartMatches, isReadPermission, grantsAllow, type ParsedPermission } from './permission.js';
 export { roleAuth, CLIENT_ROLE, CLIENT_WRITES, END_USER_ROLE, FREE_ROLE_GRANTS, type EndUserTokens } from './role-auth.js';
-export { makeGate, principalOf, hostNotAllowedMessage, permissionContext, type Gate, type GateOptions, type HostRuleAuth } from './gate.js';
+export { makeGate, principalOf, permissionContext, type Gate, type GateOptions } from './gate.js';
 export { fromReadWrite, normalizeAuth, bindsIdentity, carriesIdentity, type ReadWriteAuth } from './adapter.js';
 export { safeEqual } from './safe-equal.js';
 // One JWT verifier for the free `endUsers` class and every @gnldev/auth-ee SSO provider.
 export { verifyJwt, jwtFromRequest, b64uDecode, declaredKind, signSubjectToken, MIN_SUBJECT_SECRET_BYTES, MAX_SUBJECT_TTL_SEC, MAX_REVOCABLE_SUBJECT_TTL_SEC, type JwtVerifyOptions } from './jwt.js';
 export { isCrossSiteStateChange, crossSiteRefusedMessage, isHostAllowed, hostnameOf, parseAllowedHosts } from './same-site.js';
 // The providerless protections for a standalone door (chat, AG-UI, MCP over HTTP), for a request with no identity.
-export { openDoorGuard, type OpenDoorGuardOptions, type OpenDoorRefusal } from './open-door.js';
+export { openSurfaceGuard, hostNotAllowedMessage, type OpenSurface, type OpenSurfaceGuardOptions, type OpenSurfaceRefusal, type HostRuleAuth } from './open-surface.js';
 export { subjectTokenEndpoint, sessionTokenId, type SubjectSession } from './token-endpoint.js';
 // The one reading a standalone door (chat, AG-UI, MCP) makes of a request — `doorGate`: `identify`, then
 // the open-surface checks for a request with no identity, then the role.

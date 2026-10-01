@@ -265,13 +265,23 @@ export interface RestApiOptions {
    */
   allowOpenAccess?: boolean;
   /**
-   * Host names this surface also answers when it has NO auth provider, besides `localhost`,
-   * `*.localhost` and any IP address. Other names are refused 403 `host_not_allowed` — a DNS-rebinding
-   * page's shape. Leading dot = the domain and every name under it (`'.ngrok-free.app'`); `true` =
-   * every name. `GNL_ALLOWED_HOSTS` (comma-separated, or `*`) adds to it. Ignored with an
-   * identity-binding provider. See @gnldev/auth `GateOptions.allowedHosts`.
+   * Host names this surface also answers, besides `localhost`, `*.localhost` and any IP address, for a
+   * request that carries no identity: with no auth provider, with a `{ read, write }` pair, or with a
+   * provider that names identities when this request resolved to no caller and the provider allowed it
+   * anyway. Other names are refused 403 `host_not_allowed` — a DNS-rebinding page's shape. A request the
+   * provider resolves to a caller is answered under any name. Leading dot = the domain and every name
+   * under it (`'.ngrok-free.app'`); `true` = every name. `GNL_ALLOWED_HOSTS` (comma-separated, or `*`)
+   * adds to it. See @gnldev/auth `GateOptions.allowedHosts`.
    */
   allowedHosts?: readonly string[] | true;
+  /**
+   * `true` when pages on other sites are meant to make state-changing requests to this REST API with no
+   * credential the auth provider resolves — a public widget embedded on a customer's website. Lifts the
+   * cross-site check (403 `cross_site_refused`) only; the host rule stays. A request that resolves to a
+   * caller is never cross-site-checked. Same option, same meaning, as a standalone door's. See @gnldev/auth
+   * `GateOptions.allowCrossSite`.
+   */
+  allowCrossSite?: boolean;
   /**
    * Opt-in multi-organization support: each request descends into that organization's journal (withOrg)
    * → runs, memory, and exactly-once guarantees are isolated per organization. The resolved organization
@@ -730,7 +740,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
   // Opt-in auth gate: endpoints are open without a provider; in production this is only possible with
   // allowOpenAccess: true (otherwise makeGate throws at setup), outside production a single warning is issued on the first request.
   const authProvider = normalizeAuth(opts.auth);
-  const { allow, allowP, deny } = makeGate(authProvider, { allowOpenAccess: opts.allowOpenAccess, ...(opts.allowedHosts !== undefined ? { allowedHosts: opts.allowedHosts } : {}) });
+  const { allow, allowP, deny } = makeGate(authProvider, { allowOpenAccess: opts.allowOpenAccess, ...(opts.allowedHosts !== undefined ? { allowedHosts: opts.allowedHosts } : {}), ...(opts.allowCrossSite !== undefined ? { allowCrossSite: opts.allowCrossSite } : {}) });
   /**
    * Record why this request is refused, and answer it — the response may hide the reason (a foreign
    * run reads as a 404); the record must not. `withDecisions` reports it once the request is answered.

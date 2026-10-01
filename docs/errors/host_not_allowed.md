@@ -13,7 +13,8 @@ The surface has no identity to authenticate, and the request was addressed to it
   `"this server's auth names no identity (a { read, write } pair, …)"`. The pair is refused too, even
   when its predicates check a token: a predicate is opaque, and a rebound page is same-origin, so it may
   send any header it likes — an `Authorization` header included. Nothing can tell a predicate that checks
-  a secret from one that checks that a header is present;
+  a secret from one that checks that a header is present. A request the pair itself refuses is answered
+  with the pair's refusal, under any name;
 - a request to a REST API or Studio whose provider **binds identities** (`roleAuth`, `@gnldev/auth-ee`, a
   provider of your own) that **resolved to no caller** — no credential, or one the provider named nobody
   with — **and that the provider allowed anyway** (a provider that serves anonymous reads) —
@@ -24,7 +25,8 @@ The surface has no identity to authenticate, and the request was addressed to it
   — that **resolved no caller**: the door has no `identify`, or its `identify` answered nothing for this
   request (an anonymous visitor, or `identify: () => undefined`) — `"this request carried no identity the
   createChatRoute door resolved …"`. Having an `identify` does not turn the rule off; resolving a caller
-  does. On MCP it is a JSON-RPC error with code `-32000` and `data: { code: "host_not_allowed", host }`.
+  does. A door handed `authorize` asks it first: an anonymous request it refuses is answered with that
+  refusal (`roleAuth`'s 401), whatever the name, and only one it allows is checked here. On MCP it is a JSON-RPC error with code `-32000` and `data: { code: "host_not_allowed", host }`.
 
 The body names the host it saw:
 

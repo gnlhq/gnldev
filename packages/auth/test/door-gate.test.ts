@@ -1,7 +1,7 @@
 // The preamble every standalone door runs, at its one owner: `doorGate`.
 //
 // Invariant (D1): "does this request carry an identity, so skip the open-surface checks" has ONE answer,
-// `carriesIdentity`, which `makeGate` asks with its provider and a door asks with the principal its
+// `carriesIdentity`, which `makeGate` asks with the principal its provider resolved and a door asks with the principal its
 // `identify` resolved for THIS request. An `identify` that answers nothing is no identity: the host rule
 // and the cross-site check run. `allowCrossSite: true` lifts the cross-site check only.
 //
@@ -30,13 +30,13 @@ describe('one owner for "this request carries an identity"', () => {
     expect(refusedCode(await door(crossSite()))).toBe('cross_site_refused');
   });
 
-  it('carriesIdentity: a provider that binds identity, or a resolved principal — nothing else', () => {
+  it('carriesIdentity: a resolved principal the engine names — nothing else (the provider is not asked)', () => {
     expect(carriesIdentity({})).toBe(false);
     expect(carriesIdentity({ principal: undefined })).toBe(false);
     expect(carriesIdentity({ principal: null })).toBe(false);
     expect(carriesIdentity({ principal: user })).toBe(true);
-    expect(carriesIdentity({ provider: normalizeAuth({ read: () => true })! })).toBe(false);
-    expect(carriesIdentity({ provider: roleAuth({ admin: { token: 't'.repeat(32) } })! })).toBe(true);
+    // A configuration is no identity: the provider argument is gone, so it cannot answer for a request.
+    expect(carriesIdentity({ provider: roleAuth({ admin: { token: 't'.repeat(32) } })! } as never)).toBe(false);
   });
 
   it('a request that resolved to a principal skips both checks; the same door refuses the anonymous one', async () => {

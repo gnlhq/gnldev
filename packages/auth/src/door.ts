@@ -7,8 +7,7 @@ import type { AuthProvider, Principal } from './types.js';
 import { callerKind, engineCallerOf, type EngineCaller, type Identify } from './scope.js';
 import { markRefusal, notePrincipal, noteVerdict, credentialRejected, CREDENTIAL_REJECTED } from './decision.js';
 import { permissionContext } from './gate.js';
-import { carriesIdentity } from './adapter.js';
-import { openDoorGuard } from './open-door.js';
+import { openSurfaceGuard } from './open-surface.js';
 
 /**
  * Why a door refuses an application that names no user. The sentence @gnldev/server answers an
@@ -132,12 +131,13 @@ export type DoorAdmission = { principal: Principal | undefined; caller: EngineCa
  * MCP doors call (it was three, cloned line for line, and the clones shared a wrong rule: "the door was
  * given `identify`, so skip the open-surface checks").
  *
- * Per request, in order:
+ * Per request, in order — the same order @gnldev/server's and Studio's gate (`makeGate`) runs:
  *   1. who: `callerOfRequest` — `identify` once, then `engineCallerOf` (a rejected credential → 401, an
  *      application naming nobody → 400);
- *   2. the open-surface checks, unless the request carries an identity (`carriesIdentity`, the owner
- *      `makeGate` asks too): the host rule, then the cross-site check (`allowCrossSite: true` lifts it);
- *   3. the role, when `permission` is given and the door was handed `authorize` (`authorizeDoorRequest`).
+ *   2. the role, when `permission` is given and the door was handed `authorize` (`authorizeDoorRequest`);
+ *   3. the open-surface protections: `openSurfaceGuard`, the one function every surface asks, with the
+ *      principal step 1 resolved (the host rule, then the cross-site check; `allowCrossSite: true` lifts
+ *      the latter).
  * Every refusal is recorded for the door's `onDecision` (`markRefusal` / `noteVerdict`).
  *
  * Built once, where the door is built: an `allowedHosts` entry that can never match throws there, and so
@@ -152,21 +152,16 @@ export function doorGate(opts: DoorGateOptions): (req: Request, ask?: { named?: 
         'who is then served as anonymous (with the host rule and the cross-site check: allowedHosts, allowCrossSite).',
     );
   }
-  const guard = openDoorGuard({ door: opts.door, allowedHosts: opts.allowedHosts, allowCrossSite: opts.allowCrossSite });
+  const guard = openSurfaceGuard({ surface: { door: opts.door }, allowedHosts: opts.allowedHosts, allowCrossSite: opts.allowCrossSite });
   return async (req, ask = {}) => {
     const who = await callerOfRequest(opts.identify, req, ask.named);
     if ('refused' in who) return { refused: { status: who.status ?? 400, body: { error: who.refused } } };
-    if (!carriesIdentity({ principal: who.principal })) {
-      const open = guard(req);
-      if (open) {
-        markRefusal(req, 'policy', { detail: open.code });
-        return { refused: { status: open.status, body: { error: open.error, code: open.code, ...(open.host !== undefined ? { host: open.host } : {}) } } };
-      }
-    }
     if (ask.permission !== undefined) {
       const denied = await authorizeDoorRequest(opts.authorize, who.principal, req, ask.permission);
       if (denied) return { refused: { status: denied.status, body: { error: denied.refused } } };
     }
+    const open = guard(req, who.principal);
+    if (open) return { refused: { status: open.status, body: { error: open.error, code: open.code, ...(open.host !== undefined ? { host: open.host } : {}) } } };
     return who;
   };
 }

@@ -141,6 +141,20 @@ and who is affected.
   allowed is held to the host rule** (403 `host_not_allowed` under a name that is not loopback, an IP or
   listed). A deployment that serves anonymous reads on its own domain lists it:
   `allowedHosts: ['api.example.com']`, or `GNL_ALLOWED_HOSTS=api.example.com`.
+- **The same request is cross-site-checked on REST and Studio** (403 `cross_site_refused` for an anonymous
+  state change from another site; it used to be skipped for every request once the provider named
+  identities). A deployment whose pages on other sites call REST/Studio with no credential adds
+  `allowCrossSite: true` to `createRestApi` / `createStudioApp` — the doors' option, same meaning.
+- **A door handed `authorize` answers an anonymous request it refuses with that refusal** (`roleAuth`'s
+  401), from any site and under any name, instead of `cross_site_refused` / `host_not_allowed`: the
+  open-surface checks now run after the role, on doors as on REST/Studio. Likewise a `{ read, write }`
+  pair's own refusal now precedes `host_not_allowed`. Code that matched the 403 code for such a request
+  matches the provider's answer.
+- **`openDoorGuard` is `openSurfaceGuard(opts)(req, principal)`** (@gnldev/auth; types
+  `OpenSurfaceGuardOptions`, `OpenSurfaceRefusal`, `OpenSurface` replace `OpenDoorGuardOptions`,
+  `OpenDoorRefusal`): pass `{ surface: { door: 'createChatRoute' }, allowedHosts, allowCrossSite }` and the
+  principal the request resolved. `carriesIdentity` takes `{ principal }` only — it no longer takes
+  `provider`. `hostNotAllowedMessage` and `HostRuleAuth` are still exported, from the same package.
 
 ### Added
 
@@ -150,13 +164,15 @@ and who is affected.
 - **@gnldev/durable `RESERVED_ID_ERROR_CODES` and `reservedIdFailure(e)`** — the status, code and body
   every door gives `ReservedThreadIdError`.
 - @gnldev/auth: `FREE_ROLE_GRANTS`, `hostNotAllowedMessage`, `hostnameOf`, `isHostAllowed`,
-  `parseAllowedHosts`, `crossSiteRefusedMessage`, `openDoorGuard` (+ types `OpenDoorGuardOptions`,
-  `OpenDoorRefusal`, `HostRuleAuth`), `GateOptions.allowedHosts`, and the error codes
-  `host_not_allowed` and `cross_site_refused` in `AUTH_ERROR_CODES`.
+  `parseAllowedHosts`, `crossSiteRefusedMessage`, `openSurfaceGuard` (+ types `OpenSurfaceGuardOptions`,
+  `OpenSurfaceRefusal`, `OpenSurface`, `HostRuleAuth`), `GateOptions.allowedHosts`,
+  `GateOptions.allowCrossSite`, and the error codes `host_not_allowed` and `cross_site_refused` in
+  `AUTH_ERROR_CODES`.
 - @gnldev/auth: `doorGate` (+ types `DoorGateOptions`, `DoorRefusal`, `DoorAdmission`), `carriesIdentity`,
-  `permissionContext`, `authErrorResponse` (+ type `AuthErrorCode`), `OpenDoorGuardOptions.allowCrossSite`.
+  `permissionContext`, `authErrorResponse` (+ type `AuthErrorCode`), `OpenSurfaceGuardOptions.allowCrossSite`.
 - @gnldev/auth-ee: `DEFAULT_ROLE_GRANTS`; `createRbac`'s second argument (`CreateRbacOptions.replace`).
-- @gnldev/server, @gnldev/studio: the `allowedHosts` option on `createRestApi` and `createStudioApp`;
+- @gnldev/server, @gnldev/studio: the `allowedHosts` and `allowCrossSite` options on `createRestApi` and
+  `createStudioApp`;
   the error code `thread_id_reserved` in `EDGE_ERROR_CODES`.
 - @gnldev/chat-adapter, @gnldev/agui, @gnldev/mcp: the `allowedHosts` and `allowCrossSite` options on
   `createChatRoute`, `createAguiRoute` and `createMcpServer`; @gnldev/mcp: `MCP_REFUSED` (`-32000`).
@@ -195,8 +211,21 @@ and who is affected.
   holds a request that resolved to nobody, and that the provider allowed, to the host rule — the same
   `carriesIdentity({ principal })` a door asks; after: 403 `host_not_allowed`. Unchanged: `roleAuth`'s
   401 for no token on any name, a token answered on any name, a `{ read, write }` pair and no provider.
-  Way through, named in the refusal: `allowedHosts` / `GNL_ALLOWED_HOSTS`, or send a credential. The
-  cross-site check is not extended this way — see Known limits.
+  Way through, named in the refusal: `allowedHosts` / `GNL_ALLOWED_HOSTS`, or send a credential.
+- **The same provider let a page on another site make an anonymous state change on Studio.** The
+  cross-site check on REST/Studio was still decided by configuration (`bindsIdentity(provider)`), so a
+  provider that names identities and allows some requests anonymously skipped it for every request.
+  Measured on a real socket: Studio's `POST /api/retention/sweep` and `POST /api/auth/sse-ticket`,
+  `Sec-Fetch-Site: cross-site`, no credential → 200. (REST's scoped routes already refused an unnamed
+  caller at the engine — 403, model not called.) The gate now asks per request, as the doors do: a request
+  that resolved to no caller and that the provider allowed is cross-site-checked → 403
+  `cross_site_refused`, recorded `policy`. Unchanged: `roleAuth`'s 401 (no token, wrong token) from any
+  site; a credential the provider resolves, from any site. New: `allowCrossSite: true` on
+  `createRestApi` / `createStudioApp` — the doors' option, same meaning — for a public widget. One
+  function now decides for every surface (ADR-0004): `openSurfaceGuard`, which `makeGate` and `doorGate`
+  both call after `authorize`; the gate and a door answer all 70 cells of the parity matrix alike (13
+  differed). Migration under Breaking. Held by `open-surface-parity.test.ts` and
+  `open-surface-surfaces.test.ts`.
 - **A valid licence took reads away, and gave writes, on permissions no host lists.** The free tier and
   @gnldev/auth-ee evaluated the same grant data with two matchers ("ends with `:read`" and "the first two
   `:` segments"). Measured on 12 odd strings × 4 free roles: 8 pairs differed — `x:y:read` allowed free
@@ -288,7 +317,7 @@ and who is affected.
   code in `data.code` — not `-32603`, which read as a crash) and a state-changing request a page on
   another site sent (403 `cross_site_refused`), before anything runs.
   After the fix the same probe gets 403, 403, 403 and one model call (the developer's own). The
-  functions are the gate's own (`openDoorGuard` in @gnldev/auth). **Who is affected:** a door with no
+  check is the gate's own (`openSurfaceGuard` in @gnldev/auth). **Who is affected:** a door with no
   `identify` reached by another name (a tunnel, Codespaces, a Docker service) or called by a page on
   another site. `localhost`, `127.0.0.1`, a LAN IP, a UI on another localhost port, stdio MCP and
   in-process calls are unchanged; so is a request `identify` resolved a caller for (the next entry says
@@ -862,11 +891,6 @@ and who is affected.
 
 ### Known limits
 
-- **The REST/Studio cross-site check still asks the provider, not the request.** A provider that names
-  identities and allows an anonymous write lets a page on another site make it: such a provider has said
-  anybody may, and REST/Studio have no `allowCrossSite` option to say "other sites may embed this" (the
-  doors do), so refusing would leave a public anonymous endpoint no way through. The host rule above
-  covers the DNS-rebinding read.
 - **Studio's role presets list viewer, member and admin only.** `ROLE_PERMISSION_PRESETS` pre-fills the Users
   editor, which offers those three; `client` and `end-user` are roleAuth credential classes and
   `platform-admin` a scope only a platform admin grants. A test holds each listed preset to
