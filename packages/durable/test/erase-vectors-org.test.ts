@@ -7,6 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { InMemoryStorage } from '../src/in-memory-storage.js';
 import { withOrgStorage } from '../src/org-storage.js';
 import { toJournal, VECTOR_PARTITION } from '../src/storage.js';
+import { VECTOR_ALL_PARTITIONS } from '../src/index.js';
 import { eraseSubject } from '../src/erase.js';
 import { purgeResource } from '../src/retention.js';
 import type { Storage, VectorStore } from '../src/storage.js';
@@ -23,7 +24,7 @@ async function world() {
   await put('globex', 'DOC-globex-bob', 'bob');
   await put(undefined, 'DOC-root-bob', 'bob');
   /** Every document id left in the store, whichever organization holds it. */
-  const left = async () => (await storage.vectors!.query([1, 0], 100)).map((m) => m.id).sort();
+  const left = async () => (await storage.vectors!.query([1, 0], 100, { [VECTOR_ALL_PARTITIONS]: true })).map((m) => m.id).sort();
   return { storage, left };
 }
 

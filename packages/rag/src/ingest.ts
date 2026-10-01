@@ -5,7 +5,7 @@
 // #2-#4 of the OLD text retrievable; edited down to one chunk, every `#i` survived beside the new bare
 // id. `ingestDocuments` gives the write the document's shape: write what the document has now as a new
 // generation, then remove every other generation.
-import { assertDeletesOutsideOrganizations, orgPrefix, orgStorageScopeOf, vectorWriteBatch, OBSERVATION_VECTOR_KEY } from '@gnldev/durable';
+import { assertRootOutsideOrganizations, orgPrefix, orgStorageScopeOf, vectorWriteBatch, OBSERVATION_VECTOR_KEY } from '@gnldev/durable';
 import { chunkDocuments, DOC_TRAIL_KEY, CHUNK_TRAIL_KEY, GEN_TRAIL_KEY, documentIdPart, type ChunkOptions } from './chunk.js';
 import type { DeleteWhere, Embed, VectorDoc, VectorItem, VectorStore } from './vector-store.js';
 
@@ -34,14 +34,14 @@ function requireDelete(store: VectorStore, fn: string): asserts store is VectorS
  *   - through an organization's view (`withOrgStorage(...).vectors`): nothing to add, the view forces
  *     its own namespace (and would contradict `outsideOrganizations`);
  *   - otherwise the document is the root's, and the delete must stay outside every organization. A
- *     store that does not declare `deleteOutsideOrganizations` cannot be trusted with that, so it is
+ *     store that does not declare `rootOutsideOrganizations` cannot be trusted with that, so it is
  *     refused (the same rule erasure applies): measured, a root re-ingest of `handbook` on such a
  *     store deleted acme's `handbook` (1 → 0).
  */
 function partitionOf(store: VectorStore, namespace: string | undefined, fn: string): Pick<DeleteWhere, 'namespace' | 'outsideOrganizations'> {
   if (namespace !== undefined) return { namespace };
   if (orgStorageScopeOf(store) !== undefined) return {};
-  assertDeletesOutsideOrganizations(store, `@gnldev/rag: ${fn} (a document with no namespace)`, 'Or give the documents a `namespace`, which keeps the delete inside it.');
+  assertRootOutsideOrganizations(store, `@gnldev/rag: ${fn} (a document with no namespace)`, 'Or give the documents a `namespace`, which keeps the delete inside it.');
   return { outsideOrganizations: true };
 }
 
@@ -156,7 +156,7 @@ function ingestError(id: string, replaced: string[], what: string, cause: unknow
  * some, which leaves those chunks of an older version behind until the next ingest; it never removes
  * the newest.
  * A document with no `namespace` written to a root store also needs the store to declare
- * `deleteOutsideOrganizations`; without it this throws before anything changes — give the documents a
+ * `rootOutsideOrganizations`; without it this throws before anything changes — give the documents a
  * `namespace`, or make the store honour the flag.
  */
 export async function ingestDocuments(store: VectorStore, embed: Embed, docs: VectorDoc[], opts?: ChunkOptions): Promise<IngestResult> {

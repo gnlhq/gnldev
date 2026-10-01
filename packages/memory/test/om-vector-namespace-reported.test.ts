@@ -6,7 +6,7 @@
 // measured before this file, an organization's `recallObservationsSemantic` returned [] with the
 // observation right there, and nothing said why.
 import { describe, it, expect, vi } from 'vitest';
-import { InMemoryStorage, withOrgStorage, VECTOR_PARTITION, type Observation } from '@gnldev/durable';
+import { InMemoryStorage, withOrgStorage, VECTOR_PARTITION, VECTOR_ALL_PARTITIONS, type Observation } from '@gnldev/durable';
 import { AgentMemory } from '../src/index.js';
 
 const DIMS = ['password', 'weather', 'car'];
@@ -59,7 +59,8 @@ describe("an organization's memory over the root vector store (bundled)", () => 
     const mem = new AgentMemory({ storage: acmeStorage, observationalMemory: { enabled: true, observerModel: {} as never, omVectors: { store: storage.vectors!, embed: omEmbed } } });
     await (mem as any).indexObservationVector('t-1', 0, 0, obs);
     expect((await mem.recallObservationsSemantic('t-1', 'car')).map((o) => o.id)).toEqual(['obs-0']);
-    expect((await storage.vectors!.query(await embed('car'), 5)).map((m) => `${m.namespace}|${m.id}`)).toEqual(['org:acme|org:acme:om:t-1:0:0']);
+    expect(await storage.vectors!.query(await embed('car'), 5)).toEqual([]);
+    expect((await storage.vectors!.query(await embed('car'), 5, { [VECTOR_ALL_PARTITIONS]: true })).map((m) => `${m.namespace}|${m.id}`)).toEqual(['org:acme|org:acme:om:t-1:0:0']);
     await expect(storage.vectors!.query(await embed('car'), 5, { namespace: 'org:acme' })).rejects.toThrow(/withOrgStorage/);
   });
 });

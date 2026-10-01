@@ -13,7 +13,7 @@
 import { describe, it, expect, afterAll } from 'vitest';
 import { newDb } from 'pg-mem';
 import pg from 'pg';
-import { InMemoryStorage, withOrgStorage, VECTOR_PARTITION, type VectorStore, type VectorDeleteWhere } from '../src/index.js';
+import { InMemoryStorage, withOrgStorage, VECTOR_PARTITION, VECTOR_ALL_PARTITIONS, type VectorStore, type VectorDeleteWhere } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { InMemoryVectorStore, GraphRag, PostgresVectorStore } from '../../rag/src/index.js';
@@ -59,7 +59,7 @@ async function outcome(f: () => Promise<unknown>): Promise<string> {
 }
 /** Every stored document, as `id/owner[/S]=text`, sorted — the whole store, not a query's view of it. */
 async function all(s: VectorStore, opts?: Parameters<VectorStore['query']>[2]): Promise<string> {
-  return (await s.query(E, 100, opts)).map((m) => `${m.id}/${m.owner ?? '-'}${m.shared ? '/S' : ''}=${m.text}`).sort().join(',');
+  return (await s.query(E, 100, opts ?? { [VECTOR_ALL_PARTITIONS]: true })).map((m) => `${m.id}/${m.owner ?? '-'}${m.shared ? '/S' : ''}=${m.text}`).sort().join(',');
 }
 const doc = (id: string, labels: { owner?: string; shared?: boolean; namespace?: string } = {}, text = id) => ({ id, text, embedding: E, ...labels });
 
@@ -158,7 +158,7 @@ describe.each(STORES)('vector write rule — $name', (store) => {
     await s.upsert([{ ...doc('org:globex:bob', { owner: 'bob', namespace: 'org:globex' }), [VECTOR_PARTITION]: 'org:globex' }]);
     const del = (w: unknown) => outcome(() => s.delete!(w as VectorDeleteWhere));
     // A store that honours the flag says so; erasure refuses one that does not (erase-vectors-org.test.ts).
-    expect(s.deleteOutsideOrganizations).toBe(true);
+    expect(s.rootOutsideOrganizations).toBe(true);
     // It narrows, it never selects: alone it is no condition, and inside an organization it matches nothing.
     expect([await del({ outsideOrganizations: true }), await del({ owner: 'bob', namespace: 'org:acme', outsideOrganizations: true, [VECTOR_PARTITION]: 'org:acme' })])
       .toEqual(['ok:0', 'ok:0']);
@@ -167,8 +167,10 @@ describe.each(STORES)('vector write rule — $name', (store) => {
     // With ids it is one more condition like the others.
     await s.upsert([doc('n-bob', { owner: 'bob', namespace: 'n' })]);
     expect(await del({ ids: ['n-bob', 'org:acme:bob'], outsideOrganizations: true, [VECTOR_PARTITION]: 'org:acme' })).toBe('ok:1');
-    // `false` is the old meaning: every namespace.
-    expect(await del({ owner: 'bob', outsideOrganizations: false })).toBe('ok:2');
+    // Without a namespace a delete is the root's (ADR-0001): `false` — which a request body can carry —
+    // does not widen it. Every namespace takes the code-only grant.
+    expect(await del({ owner: 'bob', outsideOrganizations: false })).toBe('ok:0');
+    expect(await del({ owner: 'bob', [VECTOR_ALL_PARTITIONS]: true })).toBe('ok:2');
     expect(await all(s)).toBe('org:acme:s1/-/S=org:acme:s1,root-cem/cem=root-cem,s1/-/S=s1');
   });
 
@@ -223,7 +225,7 @@ describe.each(STORES.filter((s) => s.storage))('adopt rename — $name', (store)
     expect(await outcome(() => root.adoptIntoOrg('acme', { allowUnregistered: true, dryRun: true }))).toBe('throw:VectorOwnerConflictError');
     expect(await outcome(() => root.adoptIntoOrg('acme', { allowUnregistered: true }))).toBe('throw:VectorOwnerConflictError');
     expect(await all(withOrgStorage(root, 'acme').vectors!)).toBe('d1/-/S=ACME-OWN');
-    expect((await root.vectors!.query(E, 10)).map((m) => `${m.id}|${m.namespace ?? '-'}`).sort()).toEqual(['d1|-', 'org:acme:d1|org:acme']);
+    expect((await root.vectors!.query(E, 10, { [VECTOR_ALL_PARTITIONS]: true })).map((m) => `${m.id}|${m.namespace ?? '-'}`).sort()).toEqual(['d1|-', 'org:acme:d1|org:acme']);
     // Sibling: the journal row was not moved either — the vectors are checked before anything moves.
     expect(await root.runs.get('job:1')).toEqual({ v: 1 });
   });

@@ -484,10 +484,12 @@ export interface VectorMatch extends VectorDoc {
   score: number;
 }
 /** Narrows which documents a query may be answered from — see `VectorStore.query`. */
-export interface VectorQueryOptions extends VectorPartitionOption {
+export interface VectorQueryOptions extends VectorPartitionOption, VectorAllPartitionsOption {
   /**
-   * Only documents in this namespace are eligible. Omitted means "no restriction" and searches
-   * everything, which is the pre-existing behaviour and the only backwards-compatible default.
+   * Only documents in this namespace are eligible. Omitted means the ROOT's documents: every
+   * namespace that is not an organization's (`org:<id>`), and documents with none. ADR-0001: in the
+   * root scope every organization's rows are hidden, as a memory scan is (`MEMORY_PARTITION`). Code
+   * that must search every organization too passes `[VECTOR_ALL_PARTITIONS]: true`.
    *
    * `withOrgStorage` supplies it on every call, so an organization-scoped store cannot be queried
    * without one. That is deliberate: an optional filter defaulting to unrestricted is safe as a port
@@ -510,7 +512,12 @@ export interface VectorQueryOptions extends VectorPartitionOption {
 }
 
 /** What `VectorStore.delete` removes: every given condition must match. No condition removes nothing. */
-export interface VectorDeleteWhere extends VectorPartitionOption {
+export interface VectorDeleteWhere extends VectorPartitionOption, VectorAllPartitionsOption {
+  /*
+   * Without a `namespace`, a delete takes the ROOT's documents only — `outsideOrganizations` is the
+   * default (`vectorDeletePlan`). An erasure of the same id in every organization passes
+   * `[VECTOR_ALL_PARTITIONS]: true` (`purgeResource` without `outsideOrganizations`).
+   */
   ids?: string[];
   /** Every document of this end user — the erasure path (`purgeResource(…, { vectors })`). */
   owner?: string;
@@ -522,7 +529,7 @@ export interface VectorDeleteWhere extends VectorPartitionOption {
    * acme's and globex's `bob`, who are other people. It narrows, it never selects: alone it is no
    * condition, and with an organization's `namespace` it matches nothing.
    *
-   * A store that honours it says so with `VectorStore.deleteOutsideOrganizations`. One written before
+   * A store that honours it says so with `VectorStore.rootOutsideOrganizations`. One written before
    * it would read this delete as "the owner everywhere", so erasure refuses such a store.
    */
   outsideOrganizations?: boolean;
@@ -644,9 +651,12 @@ export const SHARED_ONLY = '';
  * `vectorWriteBatch`), but Postgres would compare it as U+FFFD and answer with someone else's
  * documents; so it reads here as what it means in every store: the general shelf, or nothing.
  */
-export function vectorQueryScope(opts: ({ namespace?: string; visibleTo?: string } & VectorPartitionOption) | undefined): { namespace?: string; visibleTo?: string; none: boolean } {
+export function vectorQueryScope(opts: ({ namespace?: string; visibleTo?: string } & VectorPartitionOption & VectorAllPartitionsOption) | undefined): { namespace?: string; visibleTo?: string; none: boolean; outsideOrganizations: boolean } {
   if (opts) assertRootVectorNames(opts);
-  const out: { namespace?: string; visibleTo?: string; none: boolean } = { none: false };
+  // No namespace is the ROOT's partition (ADR-0001), unless the caller holds the code-only grant.
+  const out: { namespace?: string; visibleTo?: string; none: boolean; outsideOrganizations: boolean } = {
+    none: false, outsideOrganizations: opts?.namespace === undefined && opts?.[VECTOR_ALL_PARTITIONS] !== true,
+  };
   if (opts?.namespace !== undefined) {
     out.namespace = opts.namespace;
     if (!isWellFormed(opts.namespace)) out.none = true;
@@ -675,7 +685,10 @@ export function vectorDeletePlan(where: VectorDeleteWhere): VectorDeleteWhere | 
   if (where.namespace !== undefined && !isWellFormed(where.namespace)) return null;
   // Outside every organization and inside one names no document. With another namespace the flag
   // already holds, so the plan drops it and the store sees a plain namespace.
-  const outside = where.outsideOrganizations === true;
+  // No namespace is the ROOT's partition (ADR-0001): `outsideOrganizations` unless the caller holds
+  // the code-only grant to reach every organization too (`VECTOR_ALL_PARTITIONS`).
+  const outside = where.outsideOrganizations === true
+    || (where.namespace === undefined && (where as VectorAllPartitionsOption)[VECTOR_ALL_PARTITIONS] !== true);
   if (outside && vectorInOrganization(where.namespace)) return null;
   const filter = where.filter !== undefined && Object.keys(where.filter).length > 0 ? where.filter : undefined;
   // `outsideOrganizations` narrows and never selects: `{ outsideOrganizations: true }` alone would be
@@ -718,6 +731,36 @@ export const VECTOR_PARTITION: unique symbol = Symbol.for('@gnldev/durable.vecto
 /** The code-only option an organization's view adds to a vector call. See `VECTOR_PARTITION`. */
 export interface VectorPartitionOption {
   readonly [VECTOR_PARTITION]?: string;
+}
+
+/**
+ * Refuses a vector store that has not declared `rootOutsideOrganizations`, before anything is touched.
+ * Asked where organizations' documents would enter a store (an organization's write, `withOrgStorage`
+ * or an organization's observational memory) and where the root deletes outside organizations
+ * (erasure, ingest): a store that does not keep root calls outside organizations would show the root
+ * an organization's documents, or delete another organization's person.
+ */
+export function assertRootOutsideOrganizations(vectors: Pick<VectorStore, 'rootOutsideOrganizations'>, who: string, orElse?: string): void {
+  if (vectors.rootOutsideOrganizations === true) return;
+  throw new Error(
+    `${who}: the vector store does not declare rootOutsideOrganizations, so a root call without a namespace could reach ` +
+      "organizations' documents. Nothing was written or deleted. Make its query and delete without a namespace skip " +
+      '`org:` namespaces (run vectorQueryScope(opts) and vectorDeletePlan(where) and apply their `outsideOrganizations`), ' +
+      'then add `readonly rootOutsideOrganizations = true`.' + (orElse ? ` ${orElse}` : ''),
+  );
+}
+
+/**
+ * The code-only grant to reach EVERY partition from the root store: a query or a delete without a
+ * `namespace` then spans the root's documents and every organization's. Without it, such a call is the
+ * root's alone (`vectorQueryScope`, `vectorDeletePlan`) — ADR-0001, as `MEMORY_PARTITION` is for memory.
+ * A Symbol, so code can pass it and a request body (JSON) cannot. It names nothing: the naming rule
+ * (`assertRootVectorNames`) is unchanged. Passed by `purgeResource` without `outsideOrganizations`.
+ */
+export const VECTOR_ALL_PARTITIONS: unique symbol = Symbol.for('@gnldev/durable.vectorAllPartitions');
+/** The code-only option that widens a root vector query or delete to every partition. See `VECTOR_ALL_PARTITIONS`. */
+export interface VectorAllPartitionsOption {
+  readonly [VECTOR_ALL_PARTITIONS]?: true;
 }
 
 /**
@@ -813,11 +856,14 @@ export interface VectorStore {
   /** Removes the documents matching every given condition; returns how many. No condition removes nothing. */
   delete?(where: VectorDeleteWhere): Promise<number>;
   /**
-   * `true` when `delete` honours `VectorDeleteWhere.outsideOrganizations`. Declared, not assumed: a
-   * store written before the flag ignores it and deletes the owner in every organization, so erasing
-   * an organization-less person refuses a store that does not say this.
+   * `true` when a call WITHOUT a namespace stays outside every organization — `query` skips their
+   * documents (`vectorQueryScope(opts).outsideOrganizations`) and `delete` leaves them
+   * (`vectorDeletePlan`) — unless it carries `VECTOR_ALL_PARTITIONS`. ADR-0001. Declared, not assumed:
+   * an organization's write into a store that does not declare it is refused
+   * (`assertRootOutsideOrganizations`), so organizations' documents only ever sit in a store that keeps
+   * them from the root; root erasure and root ingest refuse such a store too.
    */
-  readonly deleteOutsideOrganizations?: boolean;
+  readonly rootOutsideOrganizations?: boolean;
 }
 
 // ── 4) WorkStore = queue + events + scheduler primitive (has its OWN namespace; doesn't pollute RunJournal) ──

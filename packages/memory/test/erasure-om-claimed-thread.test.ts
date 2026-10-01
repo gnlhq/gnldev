@@ -4,7 +4,7 @@
 //   before ["OBS-BEFORE-CLAIM: IBAN TR55-AYSE","OBS-AFTER-CLAIM"] → after ["OBS-BEFORE-CLAIM: IBAN TR55-AYSE"]
 // A thread's observations go with the thread, whoever labelled them.
 import { describe, it, expect } from 'vitest';
-import { InMemoryStorage, createGnl, user, eraseSubject, scopeConfigToOrg } from '@gnldev/durable';
+import { InMemoryStorage, createGnl, user, eraseSubject, scopeConfigToOrg, VECTOR_ALL_PARTITIONS } from '@gnldev/durable';
 import { memoryPreset } from '../src/index.js';
 
 (globalThis as { AI_SDK_LOG_WARNINGS?: boolean }).AI_SDK_LOG_WARNINGS = false;
@@ -15,7 +15,7 @@ const echo: any = {
 };
 const embed = async (t: string[]) => t.map(() => [1, 0, 0]);
 const obs = (id: string, text: string, seq: number, threadId: string) => ({ id, text, fromSeq: seq - 1, toSeq: seq, threadId });
-const texts = async (s: InMemoryStorage) => (await s.vectors!.query([1, 0, 0], 50)).map((m) => m.text).sort();
+const texts = async (s: InMemoryStorage) => (await s.vectors!.query([1, 0, 0], 50, { [VECTOR_ALL_PARTITIONS]: true })).map((m) => m.text).sort();
 
 describe('erasure takes a thread\'s observations, however they were labelled', () => {
   it('an observation indexed while the thread was anonymous goes when its later owner is erased', async () => {

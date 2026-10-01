@@ -8,7 +8,7 @@
 // GraphRAG as a query-time layer is the user's pattern. Since it runs durable inside `createRagTool`,
 // the query RESULT is journaled → the graph isn't retraversed on resume/replay (exactly-once RAG preserved).
 import { cosineSimilarity } from 'ai';
-import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorItemCopy } from '@gnldev/durable';
+import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorItemCopy, vectorInOrganization } from '@gnldev/durable';
 import { matchesFilter } from './vector-store.js';
 import type { VectorStore, VectorItem, VectorMatch, QueryOptions, DeleteWhere } from './vector-store.js';
 
@@ -31,7 +31,7 @@ export interface GraphRagOptions {
  * the HIGHEST score is kept.
  */
 export class GraphRag implements VectorStore {
-  readonly deleteOutsideOrganizations = true;
+  readonly rootOutsideOrganizations = true;
   private items: VectorItem[] = [];
   private byId = new Map<string, number>(); // id → items index
   private edges = new Map<string, { id: string; w: number }[]>(); // id → neighbors (edge weight = similarity)
@@ -135,6 +135,7 @@ export class GraphRag implements VectorStore {
     // still let it seed the graph walk below and lend its score to a neighbour.
     const visible = this.items.filter((it) =>
       (scope.namespace === undefined || it.namespace === scope.namespace)
+      && !(scope.outsideOrganizations && vectorInOrganization(it.namespace)) // the root's partition (ADR-0001)
       && matchesFilter(it.metadata, opts?.filter)
       && visibleToSubject(it, scope.visibleTo));
     if (visible.length === 0) return [];

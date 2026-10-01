@@ -33,7 +33,7 @@ export interface PostgresVectorStoreOptions {
  * the pg query does NOT RE-RUN on resume/replay. Even if ANN/HNSW is approximate, the result comes back from the journal.
  */
 export class PostgresVectorStore implements VectorStore {
-  readonly deleteOutsideOrganizations = true;
+  readonly rootOutsideOrganizations = true;
   private pool: PoolLike;
   private table: string;
   private dimension?: number;
@@ -166,6 +166,7 @@ export class PostgresVectorStore implements VectorStore {
       params.push(scope.namespace);
       where.push(`namespace = $${params.length}`);
     }
+    if (scope.outsideOrganizations) where.push(VECTOR_OUTSIDE_ORGANIZATIONS_SQL); // the root's partition (ADR-0001)
     if (opts?.filter && Object.keys(opts.filter).length > 0) {
       params.push(JSON.stringify(opts.filter));
       where.push(`metadata @> $${params.length}::jsonb`);

@@ -21,7 +21,8 @@
  * erased from, or the erasure refuses. What lives OUTSIDE the storage — another package's records in
  * its own format, or a memory kept in some other database — comes in as an eraser.
  */
-import { purgeResource, purgeThread, assertDeletesOutsideOrganizations } from './retention.js';
+import { purgeResource, purgeThread } from './retention.js';
+import { assertRootOutsideOrganizations } from './storage.js';
 import { ownedPrefix } from './owned-name.js';
 import { threadOwnerOf, threadOwnerKey } from './thread-owner.js';
 import { withOrg, isOrganizationKey, parseOrganizationKey, orgPrefix, ORG_KEY_PREFIX, ORG_RECORD_PRE } from './organization.js';
@@ -339,7 +340,7 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
     }
     // Without an organization, the documents half says "outside every organization" — asked here,
     // before anything goes, so a store that cannot honour it leaves this person entirely in place.
-    if (outside) assertDeletesOutsideOrganizations(v, '@gnldev/durable: eraseSubject');
+    if (outside) assertRootOutsideOrganizations(v, '@gnldev/durable: eraseSubject');
   }
   // A person in an organization: their runs, threads and working memory live in that organization's
   // partition, and the same id in another organization is somebody else.

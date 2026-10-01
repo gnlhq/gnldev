@@ -39,7 +39,7 @@ await runDurable({ runId: 'r1', journal, model, tools: { searchPolicy }, prompt:
   versions whole. The listing is a `query` with the trail as `filter`: an approximate index (pgvector
   HNSW/IVFFlat) may miss chunks, which then stay until the next ingest. Your own metadata — `source`
   included — is never used to find a document's chunks.
-  Without a `namespace` on a root store, the store must declare `deleteOutsideOrganizations` (so the
+  Without a `namespace` on a root store, the store must declare `rootOutsideOrganizations` (so the
   delete cannot reach an organization's document of the same id); otherwise it is refused. Use it for
   anything you re-index after an edit; `indexDocuments` only upserts, so an edit that yields fewer chunks leaves the old tail retrievable.
   `deleteDocuments(store, ids, { namespace? })` removes documents the same way. Both need `store.delete`.

@@ -14,6 +14,7 @@ import type { Journal, JournalReader } from './journal.js';
 /** What sweepRuns needs off a `:input` record: the freeze stamp, plus whatever identityOnlyInput reads. */
 type FrozenInputLike = { at?: number } & Record<string, unknown>;
 import type { WorkStore, VectorStore } from './storage.js';
+import { VECTOR_ALL_PARTITIONS, assertRootOutsideOrganizations } from './storage.js';
 import { getRunCost } from './cost.js';
 import { metricsRunKey, metricsDoneKey, metricsScoresDoneKey } from './metrics.js';
 import { USAGE_KEY, usageCountedKey } from './budget.js';
@@ -451,21 +452,6 @@ function xidShape(rest: string, value: unknown): 'own' | 'foreign' {
  *  - Needs `listKeys`+`listRunsPaged`; an adapter without them keeps today's three-prefix behaviour
  *    rather than silently reporting a fuller erasure than it performed.
  */
-/**
- * Refuses a vector store that has not declared `deleteOutsideOrganizations`, before anything is
- * deleted. A store that does not know the flag reads `{ owner, outsideOrganizations: true }` as "the
- * owner everywhere" and takes the same id's documents in every organization — other people.
- */
-export function assertDeletesOutsideOrganizations(vectors: Pick<VectorStore, 'deleteOutsideOrganizations'>, who: string, orElse?: string): void {
-  if (vectors.deleteOutsideOrganizations === true) return;
-  throw new Error(
-    `${who} was asked to delete documents outside organizations only (outsideOrganizations), but the vector store ` +
-      'does not declare deleteOutsideOrganizations. Nothing was deleted: an adapter that ignores the flag would also ' +
-      'delete the same documents inside every organization — other people\'s. Make the adapter honour ' +
-      'VectorDeleteWhere.outsideOrganizations and set deleteOutsideOrganizations: true.' + (orElse ? ` ${orElse}` : ''),
-  );
-}
-
 export async function purgeResource(
   journal: Journal,
   resourceId: string,
@@ -475,9 +461,9 @@ export async function purgeResource(
      * store is a separate port from the journal, so without it their documents stay — a store with no
      * `delete` is refused rather than skipped, since an erasure that quietly keeps half is the failure
      * this function exists to avoid. With `outsideOrganizations` the store must also declare
-     * `deleteOutsideOrganizations`, for the same reason.
+     * `rootOutsideOrganizations`, for the same reason.
      */
-    vectors?: Pick<VectorStore, 'delete' | 'deleteOutsideOrganizations'>;
+    vectors?: Pick<VectorStore, 'delete' | 'rootOutsideOrganizations'>;
     /**
      * The memory that holds the threads, when it can name their owners (`getThreadResource`). Asked
      * so erasure decides "is this thread theirs" exactly as the engine's gate does; without it a
@@ -500,7 +486,7 @@ export async function purgeResource(
   if (opts.vectors && typeof opts.vectors.delete !== 'function') {
     throw new Error('@gnldev/durable: purgeResource was given a vector store that cannot delete, so this person\'s documents cannot be erased');
   }
-  if (opts.vectors && opts.outsideOrganizations) assertDeletesOutsideOrganizations(opts.vectors, '@gnldev/durable: purgeResource');
+  if (opts.vectors && opts.outsideOrganizations) assertRootOutsideOrganizations(opts.vectors, '@gnldev/durable: purgeResource');
   // `suggstats:` carries the FULL lesson key (`suggstats:lesson:res:<rid>:<id>`) — the injection
   // counter's key itself names the person, so it must die with them (GDPR brief audit, K27 EK-3).
   // deletePrefix sweeps counter rows since P1.6, so this reaches HINCRBY-backed adapters too.
@@ -516,7 +502,9 @@ export async function purgeResource(
   }).listRunsPaged;
   // Their own documents in the knowledge base (shared ones are nobody's to erase with one person).
   // Before the early return below, which a journal without paged listing takes.
-  if (opts.vectors) total += await opts.vectors.delete!({ owner: resourceId, ...(opts.outsideOrganizations ? { outsideOrganizations: true } : {}) });
+  // Without `outsideOrganizations` this erasure is the id's in every partition: the grant says so, since
+  // a root delete without a namespace is otherwise the root's alone (ADR-0001, `vectorDeletePlan`).
+  if (opts.vectors) total += await opts.vectors.delete!({ owner: resourceId, ...(opts.outsideOrganizations ? { outsideOrganizations: true } : { [VECTOR_ALL_PARTITIONS]: true as const }) });
   if (typeof paged !== 'function') return total;
   const threads = new Set<string>();
   const runIds: string[] = [];

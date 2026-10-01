@@ -1,5 +1,5 @@
 import { cosineSimilarity } from 'ai';
-import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy } from '@gnldev/durable';
+import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, vectorInOrganization, type VectorAllPartitionsOption } from '@gnldev/durable';
 
 export interface VectorDoc {
   id: string;
@@ -20,8 +20,11 @@ export interface VectorMatch extends VectorDoc {
 }
 
 /** 7.2: query narrowing/blending options (all optional → old behavior if not given). */
-export interface QueryOptions {
-  /** Only items in this namespace (matches item.namespace from upsert). All items if not given. */
+export interface QueryOptions extends VectorAllPartitionsOption {
+  /**
+   * Only items in this namespace (matches item.namespace from upsert). Not given: every item outside
+   * the organizations' namespaces (`org:<id>`) — ADR-0001; `[VECTOR_ALL_PARTITIONS]: true` reaches them too.
+   */
   namespace?: string;
   /**
    * Answer on behalf of this end user: only their own documents (`owner`) and everyone's (`shared`).
@@ -40,7 +43,7 @@ export interface QueryOptions {
 }
 
 /** 7.2: delete condition — id list and/or metadata filter and/or namespace. */
-export interface DeleteWhere {
+export interface DeleteWhere extends VectorAllPartitionsOption {
   ids?: string[];
   /**
    * Metadata shallow equality: every key must match. A key whose value is `undefined` matches a record
@@ -62,8 +65,8 @@ export interface VectorStore {
   query(embedding: number[], topK: number, opts?: QueryOptions): Promise<VectorMatch[]>;
   /** 7.2 (optional): delete by id/filter/namespace, returns the number deleted. */
   delete?(where: DeleteWhere): Promise<number>;
-  /** `true` when `delete` honours `outsideOrganizations`; erasure refuses a store that does not say so. */
-  readonly deleteOutsideOrganizations?: boolean;
+  /** `true` when query and delete without a namespace skip organizations' documents — see @gnldev/durable `VectorStore.rootOutsideOrganizations`. */
+  readonly rootOutsideOrganizations?: boolean;
 }
 
 /** text → embedding function. Wired to the AI SDK `embed` in prod; faked in tests. */
@@ -110,7 +113,7 @@ export function matchesFilter(metadata: Record<string, unknown> | undefined, fil
 
 /** In-memory vector store (cosine similarity). The pgvector adapter implements the same interface for prod. */
 export class InMemoryVectorStore implements VectorStore {
-  readonly deleteOutsideOrganizations = true;
+  readonly rootOutsideOrganizations = true;
   private items: VectorItem[] = [];
 
   async upsert(items: VectorItem[]): Promise<void> {
@@ -136,6 +139,7 @@ export class InMemoryVectorStore implements VectorStore {
     for (const it of this.items) {
       // 7.2: namespace + metadata narrowing (BEFORE score computation — no wasted work).
       if (scope.namespace !== undefined && it.namespace !== scope.namespace) continue;
+      if (scope.outsideOrganizations && vectorInOrganization(it.namespace)) continue; // the root's partition (ADR-0001)
       if (!matchesFilter(it.metadata, opts?.filter)) continue;
       if (!visibleToSubject(it, scope.visibleTo)) continue;
       const vec = cosineSimilarity(embedding, it.embedding);

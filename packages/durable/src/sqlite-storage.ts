@@ -1275,7 +1275,7 @@ class SqliteMemoryStore implements MemoryStore {
 
 // ── VectorStore (scan/brute-force) ──────────────────────────────────────────────
 class SqliteVectorStore implements VectorStore {
-  readonly deleteOutsideOrganizations = true;
+  readonly rootOutsideOrganizations = true;
   constructor(private db: any) {}
   async upsert(items: VectorItem[]): Promise<void> {
     const batch = vectorWriteBatch(items);
@@ -1325,6 +1325,7 @@ class SqliteVectorStore implements VectorStore {
     const where: string[] = [];
     const params: unknown[] = [];
     if (scope.namespace !== undefined) { where.push('namespace IS ?'); params.push(scope.namespace); }
+    if (scope.outsideOrganizations) where.push(VECTOR_OUTSIDE_ORGANIZATIONS_SQL); // the root's partition (ADR-0001)
     if (scope.visibleTo !== undefined) { where.push('(shared = 1 OR owner = ?)'); params.push(scope.visibleTo); }
     const rows = this.db
       .prepare(`SELECT id, text, embedding, metadata, namespace, owner, shared FROM gnl_vectors${where.length ? ` WHERE ${where.join(' AND ')}` : ''}`)

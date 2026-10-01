@@ -8,7 +8,7 @@ import { InMemoryJournal } from './journal.js';
 import { stableStringify } from './hash.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
 import type { JournalEntry, RunSummary } from './journal.js';
-import { decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision } from './storage.js';
+import { decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision, vectorInOrganization } from './storage.js';
 import type {
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -236,7 +236,7 @@ class InMemoryMemoryStore implements MemoryStore {
 
 // ── VectorStore (cosine, same behavior as rag's InMemoryVectorStore) ───────────
 class InMemoryVectorStore implements VectorStore {
-  readonly deleteOutsideOrganizations = true;
+  readonly rootOutsideOrganizations = true;
   /** @internal — see Storage.adoptIntoOrg. Stamps the namespace on documents that have none. */
   _stamp(ns: string, dryRun: boolean): number {
     // Renamed as well as stamped: an organization's documents are stored under `<ns>:<id>` (see
@@ -277,7 +277,7 @@ class InMemoryVectorStore implements VectorStore {
     const scope = vectorQueryScope(opts);
     if (scope.none) return [];
     return this.items
-      .filter((it) => (scope.namespace === undefined || it.namespace === scope.namespace) && visibleToSubject(it, scope.visibleTo) && vectorMetadataMatches(it.metadata, opts?.filter))
+      .filter((it) => (scope.namespace === undefined || it.namespace === scope.namespace) && !(scope.outsideOrganizations && vectorInOrganization(it.namespace)) && visibleToSubject(it, scope.visibleTo) && vectorMetadataMatches(it.metadata, opts?.filter))
       .map((it) => ({ id: it.id, text: it.text, metadata: it.metadata, ...(it.namespace !== undefined ? { namespace: it.namespace } : {}), ...(it.owner !== undefined ? { owner: it.owner } : {}), ...(it.shared ? { shared: true } : {}), score: cosineSimilarity(embedding, it.embedding) }))
       .sort((a, b) => b.score - a.score)
       .slice(0, topK);

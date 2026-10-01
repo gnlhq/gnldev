@@ -5,14 +5,14 @@
 // Before this, a document's identity lived in the user's own `metadata.source`: `deleteDocuments(['handbook'])`
 // deleted every record the user had labelled `source: 'handbook'`; the chunk id `guide#1` was also
 // what a document literally named `guide#1` was stored under, so ingesting `guide` overwrote it; and
-// a root ingest on a vector store that does not declare `deleteOutsideOrganizations` deleted the
+// a root ingest on a vector store that does not declare `rootOutsideOrganizations` deleted the
 // same-id document inside every organization (review panel: acme 1 → 0).
 //
 // Now the trail is reserved metadata (`__gnlDoc`, `__gnlChunk`) the user's metadata never shares,
 // chunk ids escape `#`/`%` in the document id so no document id is another's chunk id, and a root
 // write that cannot stay outside the organizations is refused before anything is deleted.
 import { describe, it, expect } from 'vitest';
-import { InMemoryStorage, withOrgStorage } from '@gnldev/durable';
+import { InMemoryStorage, withOrgStorage, VECTOR_ALL_PARTITIONS } from '@gnldev/durable';
 import { SqliteStorage } from '../../durable/src/sqlite-storage.js';
 import { InMemoryVectorStore, chunkDocuments, indexDocuments, ingestDocuments, deleteDocuments, type VectorStore } from '../src/index.js';
 
@@ -25,7 +25,7 @@ const stores: [string, () => VectorStore][] = [
   ['durable InMemoryStorage.vectors', () => new InMemoryStorage().vectors as unknown as VectorStore],
   ['durable SqliteStorage.vectors', () => new SqliteStorage(':memory:').vectors as unknown as VectorStore],
 ];
-const all = async (s: VectorStore) => (await s.query([1, 1, 1], 100)).map((h) => ({ id: h.id, text: h.text, metadata: h.metadata ?? {} })).sort((a, b) => a.id.localeCompare(b.id));
+const all = async (s: VectorStore) => (await s.query([1, 1, 1], 100, { [VECTOR_ALL_PARTITIONS]: true })).map((h) => ({ id: h.id, text: h.text, metadata: h.metadata ?? {} })).sort((a, b) => a.id.localeCompare(b.id));
 
 describe.each(stores)('a document is identified by the framework, not by the user\'s metadata (%s)', (_n, make) => {
   it("a document named like another's chunk ('guide#1') survives that document's ingest, and the reverse", async () => {
@@ -119,7 +119,7 @@ describe('vectors written by 0.9.0 (trail in `source`/`chunk`, one-chunk documen
 });
 
 describe('a root write that cannot stay outside the organizations is refused', () => {
-  /** The same store, through an adapter that does not declare `deleteOutsideOrganizations`. */
+  /** The same store, through an adapter that does not declare `rootOutsideOrganizations`. */
   const undeclared = (raw: VectorStore): VectorStore => ({ upsert: (i) => raw.upsert(i), query: (...a) => raw.query(...a), delete: (w) => raw.delete!(w) });
 
   it("root ingest on such a store deletes nothing of acme's and says how through", async () => {
@@ -127,8 +127,8 @@ describe('a root write that cannot stay outside the organizations is refused', (
     const raw = storage.vectors as unknown as VectorStore;
     const acme = withOrgStorage(storage, 'acme', { allowUnregistered: true }).vectors as unknown as VectorStore;
     await ingestDocuments(acme, embed, [{ id: 'handbook', text: 'ACME CONFIDENTIAL handbook' }]);
-    await expect(ingestDocuments(undeclared(raw), embed, [{ id: 'handbook', text: 'root public handbook' }])).rejects.toThrow(/deleteOutsideOrganizations[\s\S]*give the documents a `namespace`/);
-    await expect(deleteDocuments(undeclared(raw), ['handbook'])).rejects.toThrow(/deleteOutsideOrganizations[\s\S]*give the documents a `namespace`/);
+    await expect(ingestDocuments(undeclared(raw), embed, [{ id: 'handbook', text: 'root public handbook' }])).rejects.toThrow(/rootOutsideOrganizations[\s\S]*give the documents a `namespace`/);
+    await expect(deleteDocuments(undeclared(raw), ['handbook'])).rejects.toThrow(/rootOutsideOrganizations[\s\S]*give the documents a `namespace`/);
     expect((await all(raw)).filter((r) => r.text.includes('ACME'))).toHaveLength(1);
     expect((await all(raw)).filter((r) => r.text.includes('root'))).toHaveLength(0); // refused before writing
   });

@@ -103,7 +103,7 @@ export type { RunDurableArgs, StreamDurableArgs, DurableResult, ResumeAgentConfi
 // K1/W1 (B): sentinel→error conversion helper for code that consumes streamDurable directly.
 export { streamFinishError } from './run.js';
 // Greenfield storage contracts (ports + Storage + capability + composite).
-export { CapabilityError, requireCapability, composite, toJournal, matchFilter, visibleToSubject, SHARED_ONLY, vectorWriteBatch, vectorQueryScope, vectorDeletePlan, vectorDeleteMatcher, vectorInOrganization, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorMetadataMatches, OBSERVATION_VECTOR_KEY, vectorItemCopy, assertSameVectorOwner, assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, orgVectorId, VECTOR_PARTITION, ReservedVectorNameError, assertRootVectorNames, type VectorPartitionOption } from './storage.js';
+export { CapabilityError, requireCapability, composite, toJournal, matchFilter, visibleToSubject, SHARED_ONLY, vectorWriteBatch, vectorQueryScope, vectorDeletePlan, vectorDeleteMatcher, vectorInOrganization, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorMetadataMatches, OBSERVATION_VECTOR_KEY, vectorItemCopy, assertSameVectorOwner, assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, orgVectorId, VECTOR_PARTITION, VECTOR_ALL_PARTITIONS, type VectorAllPartitionsOption, assertRootOutsideOrganizations, ReservedVectorNameError, assertRootVectorNames, type VectorPartitionOption } from './storage.js';
 // ADR-0002: the caller a door hands the engine, the one identity channel to tools and child runs, and
 // the one answer to "does this run exist, and whose is it" (run-identity.ts).
 export {
@@ -164,7 +164,7 @@ export { withSubjectJournal, withSubjectMemory, type SubjectViewOptions, type Su
 export { threadOwnerOf, admitThreadRun, threadOwnerKey, assignThreadOwner, recordThreadCreated, type ThreadOwnership } from './thread-owner.js';
 export { ownedName, ownerOfName, assertSystemName, ownedPrefix, ownerIdProblem, assertOwnerId, OwnerIdError, RESERVED_OWNER_PREFIXES } from './owned-name.js';
 export { eraseSubject, subjectRuns, assertRootWorkForErasure, findReservedRootThreads, type ReservedRootThread, type EraseOptions, type EraseReport, type SubjectEraser, type SubjectRun } from './erase.js';
-export { assertDeletesOutsideOrganizations, orgPurgedKey, purgeRun, isRealRun, purgeThread, purgeResource, purgeBatch, purgeOrganization, purgeOrganizationWork, sweepRuns, sweepLog, sweepThreads, listOrphanThreadState, createRetentionSweeper } from './retention.js';
+export { orgPurgedKey, purgeRun, isRealRun, purgeThread, purgeResource, purgeBatch, purgeOrganization, purgeOrganizationWork, sweepRuns, sweepLog, sweepThreads, listOrphanThreadState, createRetentionSweeper } from './retention.js';
 export type { LogSweepTarget, RetentionSweeperOptions, RetentionSweepSummary, RetentionSweeper } from './retention.js';
 export { recordIdemConflict, readIdemLedger } from './idem-ledger.js';
 export { semKey, semTombKey, SEM_TEMPLATE_VERSION } from './semantic-dup.js';

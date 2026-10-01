@@ -15,6 +15,7 @@ import {
   type Storage, type VectorStore,
 } from '@gnldev/durable';
 import { SqliteStorage } from '../../durable/src/sqlite-storage.js';
+import { VECTOR_ALL_PARTITIONS } from '@gnldev/durable';
 import { AgentMemory, memoryPreset, migrateWorkingMemoryKeys } from '../src/index.js';
 
 (globalThis as { AI_SDK_LOG_WARNINGS?: boolean }).AI_SDK_LOG_WARNINGS = false;
@@ -235,7 +236,7 @@ async function observed(storage: Storage, p: Who, vectorsFor: (view: Storage) =>
 async function vectorTexts(storage: Storage): Promise<string[]> {
   const out = new Set<string>();
   for (const v of [storage.vectors!, withOrgStorage(storage, 'acme').vectors!, withOrgStorage(storage, 'globex').vectors!]) {
-    for (const m of await v.query([1, 0, 0], 100)) out.add(m.text);
+    for (const m of await v.query([1, 0, 0], 100, { [VECTOR_ALL_PARTITIONS]: true })) out.add(m.text);
   }
   return [...out].sort();
 }
@@ -257,7 +258,7 @@ describe('Ş3: observational-memory vectors belong to the thread\'s owner', () =
       await withOrgStorage(storage, 'acme').vectors!.upsert([{ id: 'shared-doc', text: 'SHARED|acme|', embedding: [1, 0, 0], shared: true }]);
       expect(await vectorTexts(storage)).toEqual([...all, 'SHARED|acme|', 'SHARED|doc|'].sort());
       // Bob's own view shows his observations and the shared shelf, never Ayse's.
-      expect((await storage.vectors!.query([1, 0, 0], 100, { visibleTo: 'u-bob' })).map((m) => m.text).sort())
+      expect((await storage.vectors!.query([1, 0, 0], 100, { ...{ visibleTo: 'u-bob' }, [VECTOR_ALL_PARTITIONS]: true })).map((m) => m.text).sort())
         .toEqual(['OBS|u-bob@-|', 'OBS|u-bob@acme|', 'SHARED|acme|', 'SHARED|doc|']);
 
       // The organization-less Ayse: hers go, acme's and globex's Ayse are other people.

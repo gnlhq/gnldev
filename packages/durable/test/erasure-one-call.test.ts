@@ -7,7 +7,7 @@
 // (`jobEraser`, `triggerEraser`, `eventEraser`); durable erases what it owns (runs, threads, documents)
 // and every owned log record by the owner's id prefix.
 import { describe, it, expect } from 'vitest';
-import { InMemoryStorage, createGnl, scopeConfigToOrg, eraseSubject, toJournal, withOrgStorage, runOwnerOf } from '../src/index.js';
+import { InMemoryStorage, createGnl, scopeConfigToOrg, eraseSubject, toJournal, withOrgStorage, runOwnerOf, VECTOR_ALL_PARTITIONS } from '../src/index.js';
 import { indexDocuments } from '../../rag/src/index.js';
 import { enqueue, createWorker, listJobs, jobEraser } from '../../queue/src/index.js';
 import { emit, createConsumer, eventEraser } from '../../events/src/index.js';
@@ -56,7 +56,7 @@ async function everything(storage: InMemoryStorage, vectors: NonNullable<InMemor
   for (const j of jobs) for (const m of ['qdone', 'qfail', 'qatt', 'qown']) kv.push(`${m}:${j.id}=${JSON.stringify(await storage.work!.get(`${m}:${j.id}`))}`);
   const events: string[] = [];
   await createConsumer(storage.work!, 'audit', (p) => { events.push(JSON.stringify(p)); }, { name: `probe-${Math.random()}` }).poll();
-  const docs = (await vectors.query([1, 0], 100)).map((m) => m.text);
+  const docs = (await vectors.query([1, 0], 100, { [VECTOR_ALL_PARTITIONS]: true })).map((m) => m.text);
   const triggers = (await listTriggers(toJournal(storage.runs))).map((t) => `${t.id}:${JSON.stringify(t.input)}`);
   return [...values, ...jobs.map((j) => JSON.stringify(j)), ...kv, ...events, ...docs, ...triggers].join('\n');
 }

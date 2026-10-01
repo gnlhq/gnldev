@@ -6,13 +6,13 @@
 // and wrote the root's text in its place; `createRagTool({ namespace: 'org:acme' })` over the root store
 // answered with acme's documents.
 import { describe, it, expect } from 'vitest';
-import { InMemoryStorage, withOrgStorage } from '@gnldev/durable';
+import { InMemoryStorage, withOrgStorage, VECTOR_ALL_PARTITIONS } from '@gnldev/durable';
 import { SqliteStorage } from '../../durable/src/sqlite-storage.js';
 import { ingestDocuments, deleteDocuments, createRagTool, type VectorStore } from '../src/index.js';
 
 const embed = async (_t: string) => [1, 1, 1];
 // `ingestDocuments` writes `<id>#<i>@<generation>`; the generation is compared away here.
-const all = async (vs: VectorStore) => (await vs.query([1, 1, 1], 1000)).map((m) => `${m.namespace ?? '-'}|${m.id.replace(/@[0-9a-z]+$/, '')}|${m.text}`).sort();
+const all = async (vs: VectorStore) => (await vs.query([1, 1, 1], 1000, { [VECTOR_ALL_PARTITIONS]: true })).map((m) => `${m.namespace ?? '-'}|${m.id.replace(/@[0-9a-z]+$/, '')}|${m.text}`).sort();
 
 describe.each([
   ['durable InMemory', () => new InMemoryStorage()],

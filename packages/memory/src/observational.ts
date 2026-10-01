@@ -103,6 +103,8 @@ export interface OmVectorStore {
   upsert(items: OmVectorItem[]): Promise<void>;
   /** `opts` carries the organization's grant (`VECTOR_PARTITION`) when the store is the root's. */
   query(embedding: number[], topK: number, opts?: { namespace?: string } & VectorPartitionOption): Promise<OmVectorMatch[]>;
+  /** An organization's memory writes into a root store only when this is `true` — @gnldev/durable `VectorStore.rootOutsideOrganizations`. */
+  readonly rootOutsideOrganizations?: boolean;
 }
 
 /** Approximate token count (not a real tokenizer; the char/4 heuristic). */

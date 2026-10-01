@@ -76,9 +76,20 @@ and who is affected.
   organization's threads from the root, `withOrgStorage(storage, orgId).memory`. A custom `MemoryStore`
   applies `memoryPartitionOf(opts)` / `inMemoryPartition` in `recall`'s resource branch and in
   `listThreads`.
-- **A root `ingestDocuments` / `deleteDocuments` on a vector store that does not declare
-  `deleteOutsideOrganizations` is refused**: give the documents a `namespace`, or make the store honour
-  `outsideOrganizations` and declare `deleteOutsideOrganizations: true`.
+- **A root vector `query` or `delete` without a `namespace` is the root's alone** — it no longer reaches
+  any organization's documents (`org:<id>` namespaces), on every bundled store and through
+  `createRagTool`, `ingestDocuments`, `deleteDocuments` and `eraseSubject`. Code that must reach every
+  organization too passes the code-only grant: `store.query(e, k, { [VECTOR_ALL_PARTITIONS]: true })`,
+  `store.delete({ owner, [VECTOR_ALL_PARTITIONS]: true })`. `outsideOrganizations: false` on a delete no
+  longer widens it; `purgeResource(journal, id, { vectors })` without `outsideOrganizations` still
+  erases the id in every organization (it passes the grant).
+- **`VectorStore.deleteOutsideOrganizations` is renamed `rootOutsideOrganizations`, and means query too**;
+  `assertDeletesOutsideOrganizations` is `assertRootOutsideOrganizations(vectors, who, orElse?)`. A
+  custom store applies `vectorQueryScope(opts).outsideOrganizations` in `query` and
+  `vectorDeletePlan(where)` in `delete`, then declares `readonly rootOutsideOrganizations = true`. An
+  organization's write into a store that does not declare it is refused (`withOrgStorage(...).vectors`,
+  an organization's observational memory over the root store), as are a root `ingestDocuments` /
+  `deleteDocuments` and a root erasure: or give root documents a `namespace`.
 - **A custom vector store's `delete` must read a filter key whose value is `undefined` as "has no such
   key"** (`DeleteWhere.filter`) for `ingestDocuments` / `deleteDocuments` to remove 0.9.0 records
   safely. A store that serialises the filter to JSON drops the key, and the 0.9.0 cleanup then takes
@@ -157,7 +168,8 @@ and who is affected.
   `ReservedVectorNameError` (+ type `VectorPartitionOption`); `isOrganizationKey`, `parseOrganizationKey`, `orgSpaceSql`,
   `ORG_KEY_PREFIX`, `withRootScope`; `findReservedRootThreads` (+ type `ReservedRootThread`);
   `recordThreadCreated`;
-  `assertDeletesOutsideOrganizations`; `encodeStepRecord`, `decodeStepRecord`; `scoreSample`,
+  `VECTOR_ALL_PARTITIONS` (+ type `VectorAllPartitionsOption`), `assertRootOutsideOrganizations`,
+  `VectorStore.rootOutsideOrganizations`; `encodeStepRecord`, `decodeStepRecord`; `scoreSample`,
   `runScoreSample`, `scoreRunMemoized`, `scorerFingerprint`, `inputText`, `assertDistinctScorerNames`,
   `memoizeScoring` (+ types `ScoreSampleFields`, `FingerprintedScorer`); `ScorerLike.fingerprint`; the
   optional `Processor` hook `processToolError` (+ type `ProcessorToolError`).
@@ -392,8 +404,15 @@ and who is affected.
   touched before the refusal. Who is affected: code that wrote or read `org:`-prefixed namespaces on a
   root or standalone store — rename the namespace, or go through `withOrgStorage(storage,
   orgId).vectors`. A store you wrote yourself that does not run the shared rule is not covered: call
-  `assertRootVectorNames` (or the three rule functions) in it. A root query with no namespace still
-  searches every namespace (unchanged).
+  `assertRootVectorNames` (or the three rule functions) in it.
+- **A root vector query with no namespace no longer ranks an organization's documents.** Measured on
+  every bundled store: a root `query` / `createRagTool` without a namespace searched every namespace, so
+  acme's documents closer to the query filled the root's topK (and a root delete by `owner` or `filter`
+  took another organization's person). `vectorQueryScope` and `vectorDeletePlan` now keep a call without
+  a namespace outside organizations unless it carries `VECTOR_ALL_PARTITIONS` (a Symbol a JSON body
+  cannot hold); ten organizations closer to the query no longer crowd the root out of its topK, and a
+  root memory's semantic recall is not starved by organization vectors. Held by
+  `root-vector-partition.test.ts` on six stores.
 - **Root observational memory no longer ranks by an organization's observation vectors.**
   `AgentMemory.recallObservationsSemantic` on a root memory queried every namespace; an organization's
   vector for a thread with the same bare id carried the same per-thread `obsId` (`obs-0`) and answered
@@ -403,11 +422,11 @@ and who is affected.
   now falls back to the keyword match over the organization's own observations and warns once, naming
   the fix (return `namespace`, or pass the organization's view).
 - **A root `ingestDocuments`/`deleteDocuments` no longer deletes an organization's document of the same
-  id** (@gnldev/rag). On a vector store that does not declare `deleteOutsideOrganizations`, a root
+  id** (@gnldev/rag). On a vector store that does not declare `rootOutsideOrganizations`, a root
   re-ingest of `handbook` deleted acme's `handbook` (review panel: 1 → 0). Such a call is now refused
   before anything is embedded, written or deleted (the same rule erasure applies). Way through: give the
-  documents a `namespace`, or make the store honour `outsideOrganizations` and declare
-  `deleteOutsideOrganizations: true`. An organization's view (`withOrgStorage(...).vectors`) is unaffected.
+  documents a `namespace`, or make the store keep root calls outside organizations and declare
+  `rootOutsideOrganizations: true`. An organization's view (`withOrgStorage(...).vectors`) is unaffected.
 
 ### Fixed
 

@@ -22,7 +22,7 @@
  * edit cannot move one without seeing the other.
  */
 import { ORG_SCOPE, orgPrefix, orgScopeOf, withOrg } from './organization.js';
-import { toJournal, orgVectorId, workingMemoryScope, MEMORY_PARTITION, VECTOR_PARTITION, partitionReadCount } from './storage.js';
+import { toJournal, orgVectorId, workingMemoryScope, MEMORY_PARTITION, VECTOR_PARTITION, partitionReadCount, assertRootOutsideOrganizations } from './storage.js';
 import { asReaderJournal, type Journal, type JournalReader } from './journal.js';
 import { recordThreadCreated } from './thread-owner.js';
 import type {
@@ -307,7 +307,8 @@ function scopedVectors(vectors: VectorStore, p: string, orgId: string): VectorSt
     // another organization's.
     // Each call carries this organization's grant (`VECTOR_PARTITION`): the root store refuses a call
     // that names the reserved space without one (`assertRootVectorNames`).
-    upsert: (items: VectorItem[]) => vectors.upsert(items.map((it) => ({ ...it, id: own(it.id), namespace: ns, [VECTOR_PARTITION]: ns }))),
+    // Organizations' documents enter only a store that keeps them from the root (ADR-0001).
+    upsert: (items: VectorItem[]) => (assertRootOutsideOrganizations(vectors, `@gnldev/durable: organization '${orgId}''s vector store`), vectors).upsert(items.map((it) => ({ ...it, id: own(it.id), namespace: ns, [VECTOR_PARTITION]: ns }))),
     // `opts.namespace` is likewise ignored rather than honoured — same reason, in the read direction.
     query: async (embedding: number[], topK: number, opts?: VectorQueryOptions) =>
       (await vectors.query(embedding, topK, { ...opts, namespace: ns, [VECTOR_PARTITION]: ns })).map(stripNs),

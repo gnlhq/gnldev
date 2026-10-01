@@ -5,7 +5,7 @@
 // loadContext runs BEFORE persistInput, so the whole context freezes into `:input` = replayable.
 import { cosineSimilarity } from 'ai';
 import { requireCapability, durableProcessorStep, workingMemoryScope, OM_LEAVES, OM_VECTOR_SOURCE, OBSERVATION_VECTOR_KEY, type OmLeaf } from '@gnldev/durable';
-import { threadOwnerOf, toJournal, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, VECTOR_PARTITION, assertRootThreadId, type Memory } from '@gnldev/durable';
+import { threadOwnerOf, toJournal, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, VECTOR_PARTITION, assertRootThreadId, assertRootOutsideOrganizations, type Memory } from '@gnldev/durable';
 import { PROVENANCE_RECENT_CAP, messagePreview } from '@gnldev/durable';
 import type { Storage, RunJournal, MemoryStore, MessageRecord, MessageAppend, ThreadRecord, RecallOptions, MemoryContextProvenance, RecalledMessageRef } from '@gnldev/durable';
 import { messageText, hasNorm, type Embed } from './keys.js';
@@ -638,6 +638,8 @@ export class AgentMemory {
     const owner = (await threadOwnerOf(toJournal(this.runs), this as unknown as Memory, threadId)).owner;
     // The one vector write rule every store runs — here too, since `omVectors.store` may be any
     // structural store that does not run it.
+    // An organization's observations enter the root store only if it keeps them from the root (ADR-0001).
+    if (ns) assertRootOutsideOrganizations(ov.store, '@gnldev/memory: observationalMemory.omVectors.store');
     const [item] = vectorWriteBatch([{
       id: ns ? orgVectorId(ns, id) : id,
       text: o.text,

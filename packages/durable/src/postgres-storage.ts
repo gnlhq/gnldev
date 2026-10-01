@@ -1489,7 +1489,7 @@ class PgMemoryStore implements MemoryStore {
 }
 
 class PgVectorStore implements VectorStore {
-  readonly deleteOutsideOrganizations = true;
+  readonly rootOutsideOrganizations = true;
   constructor(private q: Q, private tx: Tx) {}
   async upsert(items: VectorItem[]): Promise<void> {
     const batch = vectorWriteBatch(items);
@@ -1556,6 +1556,7 @@ class PgVectorStore implements VectorStore {
     const params: unknown[] = [];
     // `=` is exact here: a namespace is never null on this path (undefined means "no filter" above).
     if (scope.namespace !== undefined) { params.push(scope.namespace); where.push(`namespace = $${params.length}`); }
+    if (scope.outsideOrganizations) where.push(VECTOR_OUTSIDE_ORGANIZATIONS_SQL); // the root's partition (ADR-0001)
     if (scope.visibleTo !== undefined) { params.push(scope.visibleTo); where.push(`(shared IS TRUE OR owner = $${params.length})`); }
     const r = await this.q(`SELECT id, text, embedding, metadata, namespace, owner, shared FROM gnl_vectors${where.length ? ` WHERE ${where.join(' AND ')}` : ''}`, params);
     return r.rows
