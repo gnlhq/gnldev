@@ -3,8 +3,8 @@
 // it), working memory (resource and thread scope), observations, and the journal-kept logs of
 // BasicMemory and SemanticMemory in 0.9.0's bare-array shape — beside another person's (u2) thread.
 import { describe, expect, it } from 'vitest';
-import { BasicMemory, ReservedThreadIdError, eraseSubject, readJournalLog, sweepThreads, toJournal, withOrgStorage } from '@gnldev/durable';
-import { AgentMemory } from '@gnldev/memory';
+import { BasicMemory, ReservedThreadIdError, eraseSubject, findReservedRootThreads, readJournalLog, sweepThreads, toJournal, withOrgStorage } from '@gnldev/durable';
+import { AgentMemory, migrateReservedRootThreads } from '@gnldev/memory';
 import { SemanticMemory } from '@gnldev/rag';
 import * as S from '../../generate/shapes.mjs';
 import { itMigrates, notes090, openFixture, rowsContaining } from '../support.js';
@@ -44,11 +44,28 @@ describe('upgrade from 0.9.0 — memory', () => {
     for (const id of M.orgPrefixedRootThreads) await expect(mem.getMessages(id)).rejects.toBeInstanceOf(ReservedThreadIdError);
   });
 
-  it('a 0.9.0 root thread named `org:…` is still listed for its owner, so it can be found and moved', async () => {
+  it('a 0.9.0 root thread named `org:…` is found and moved by the documented way through, and the organization keeps its own', async () => {
     const { storage } = openFixture('memory.db');
-    const mem = new AgentMemory({ storage, embed: S.fixtureEmbed });
-    const ids = (await mem.listThreads({ resourceId: 'u1' })).map((t) => t.id);
-    expect(ids).toEqual(expect.arrayContaining(M.orgPrefixedRootThreads));
+    const root = new AgentMemory({ storage, embed: S.fixtureEmbed });
+    const acme = new AgentMemory({ storage: withOrgStorage(storage, M.orgId), embed: S.fixtureEmbed });
+    // The root scans skip the reserved space (documented); the finder lists what is there for u1.
+    expect((await root.listThreads({ resourceId: 'u1' })).map((t) => t.id)).not.toEqual(expect.arrayContaining(M.orgPrefixedRootThreads));
+    const found = await findReservedRootThreads(storage, { resourceId: 'u1' });
+    expect(found).toEqual([
+      { id: 'org:123', resourceId: 'u1', rootOnly: true }, // no organization's view can produce it
+      { id: `org:${M.orgId}:${M.orgThread}`, resourceId: 'u1', rootOnly: false }, // acme's own — no record either way
+      { id: 'org:legacy:notes', resourceId: 'u1', rootOnly: false }, // shaped like an organization's: undecided
+    ]);
+    // The default migration moves only what is certainly the root's.
+    const r = await migrateReservedRootThreads(storage);
+    expect(r.moved).toEqual([{ from: 'org:123', to: 'legacy-org:123' }]);
+    expect(r.undecided).toEqual([`org:${M.orgId}:${M.orgThread}`, 'org:legacy:notes']);
+    expect(text(await root.getMessages('legacy-org:123'))).toContain(mark('ORGPREFIX'));
+    expect(text(await acme.getMessages(M.orgThread))).toContain(mark('ACME'));
+    // The operator names the undecided root one; acme's stays acme's.
+    expect((await migrateReservedRootThreads(storage, { threadIds: ['org:legacy:notes'] })).moved).toEqual([{ from: 'org:legacy:notes', to: 'legacy-org:legacy:notes' }]);
+    expect(text(await root.getMessages('legacy-org:legacy:notes'))).toContain(mark('ORGPREFIX'));
+    expect((await acme.listThreads({ resourceId: 'u1' })).map((t) => t.id)).toEqual([M.orgThread]);
   });
 
   it('working memory 0.9.0 wrote (resource and thread scope) is read back', async () => {

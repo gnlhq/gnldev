@@ -314,7 +314,8 @@ and who is affected.
   the store scanned the root, and the view kept none of it. The view now warns once per store when no
   store read the partition it passed, naming the fix (forward `{ ...q }`, read `memoryPartitionOf`).
 - **`eraseSubject` without an organization said nothing about a person's 0.9 root threads named
-  `org:…`.** It now lists those the root certainly owns in `unreachedThreads` (`findReservedRootThreads`).
+  `org:…`.** It now lists every one of the person's in that space in `unreachedThreads`
+  (`findReservedRootThreads`) — the root's, and the ones it cannot tell from an organization's own.
 - **`WorkStore.list` on Postgres threw under REPEATABLE READ or SERIALIZABLE.** With either as the
   database's `default_transaction_isolation`, two readers numbering one namespace collided on its
   counter row and one failed with 40001 (measured: 74 of 120 `list` calls). Numbering now runs at READ
@@ -675,9 +676,11 @@ and who is affected.
   worker re-reads from the head (markers skip what is done): the `gnl_work_kv` rows `qcursor` and
   `evtcursor:*` (`org:<id>:`-prefixed for an organization), or the Redis keys `<keyPrefix>wk:qcursor`
   and `<keyPrefix>wk:evtcursor:*`.
-- **A 0.9 root thread shaped like an existing organization's (`org:acme:x`), with no owner record
-  either way,** cannot be told from that organization's own thread: until it is moved, the organization
-  reads it. `findReservedRootThreads` / `migrateReservedRootThreads` list it as undecided; name it in
+- **A 0.9 root thread shaped like an organization's (`org:acme:x`), with no owner record either way,**
+  cannot be told from that organization's own thread (0.9 registered no organization, so "does acme
+  exist" cannot be read from the journal either): until it is moved, the organization reads it.
+  `findReservedRootThreads` / `migrateReservedRootThreads` list it as undecided and never move it
+  unguided — measured: guessing moved an organization's own 0.9 thread out from under it. Name it in
   `threadIds` to move it.
 - **Redis numbers a 0.9 producer's records in producer-clock order** (`ts`, then id): a bare SET keeps
   no insertion order. SQLite and Postgres use insertion order. Either way such a record is numbered

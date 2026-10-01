@@ -7,7 +7,7 @@
 // id (review panel A "0.9 root thread", panel B a-orgthread.mjs: "org view acme: getMessages t1 -> [secret]").
 // `migrateReservedRootThreads` moves them to a free id; `eraseSubject` lists the unmoved ones.
 import { describe, it, expect } from 'vitest';
-import { InMemoryStorage, withOrgStorage, eraseSubject, ReservedThreadIdError, threadOwnerKey, toJournal, ORG_RECORD_PRE, type Storage, type MemoryStore } from '@gnldev/durable';
+import { InMemoryStorage, withOrgStorage, eraseSubject, ReservedThreadIdError, threadOwnerKey, toJournal, ORG_RECORD_PRE, type Storage, type MemoryStore, findReservedRootThreads } from '@gnldev/durable';
 import { SqliteStorage } from '../../durable/src/sqlite-storage.js';
 import { AgentMemory, migrateReservedRootThreads } from '../src/index.js';
 
@@ -46,10 +46,11 @@ describe.each(engines)('threads 0.9 let the root create under org: (%s)', (_n, m
     const { s, acme, root } = await store09();
     await expect(root.getMessages('org:acme:support')).rejects.toBeInstanceOf(ReservedThreadIdError);
     expect(JSON.stringify(await acme.getMessages('support'))).toContain('ROOT-SECRET-SUPPORT');
-    // The erasure reaches the one whose owner record the root holds, and lists the one it cannot name
-    // that is certainly the root's. `org:acme:ambiguous` could be acme's (as `t-acme` is): not listed.
+    // The erasure reaches the one whose owner record the root holds, and lists every other one of u1's
+    // in that space: the one that is certainly the root's and the two it cannot tell apart (one of them
+    // IS acme's `t-acme` — this erasure did not reach it; acme's own, `{ orgId: 'acme' }`, does).
     const r = await eraseSubject(s, 'u1');
-    expect(r.unreachedThreads).toEqual(['org:123']);
+    expect(r.unreachedThreads).toEqual(['org:123', 'org:acme:ambiguous', 'org:acme:t-acme']);
   });
 
   it('migrateReservedRootThreads moves the root\'s, leaves the undecided one unless named, and acme no longer reads the root\'s', async () => {
@@ -73,10 +74,33 @@ describe.each(engines)('threads 0.9 let the root create under org: (%s)', (_n, m
     // Named, the undecided one moves too; a second run finds nothing.
     expect((await migrateReservedRootThreads(s, { threadIds: ['org:acme:ambiguous'] })).moved).toEqual([{ from: 'org:acme:ambiguous', to: 'legacy-org:acme:ambiguous' }]);
     expect(await migrateReservedRootThreads(s)).toEqual({ moved: [], undecided: ['org:acme:t-acme'], skipped: [] });
-    // And the erasure now reaches all of them.
+    // And the erasure now reaches all of the root's; acme's own is still reported as not reached here.
     const erased = await eraseSubject(s, 'u1');
-    expect(erased.unreachedThreads).toEqual([]);
+    expect(erased.unreachedThreads).toEqual(['org:acme:t-acme']);
     expect(erased.memoryThreads).toBe(3);
+  });
+
+  it('an organization 0.9 never registered (the common case): its own thread is undecided, never moved, and it keeps reading it', async () => {
+    // 0.9's withOrgStorage wrote no `__org__:` record, and a memory-only thread leaves no owner record,
+    // so the journal says nothing about acme at all. Guessing "no such organization → the root's" moved
+    // acme's thread out from under it (measured on the 0.9.0 fixture); it must be undecided.
+    const s = make();
+    await seed(s.memory!, 'org:123', 'u1', 'ROOT-SECRET-123');
+    const acme = new AgentMemory({ storage: withOrgStorage(s, 'acme'), embed, recentN: 5 });
+    await acme.createThread({ id: 't-acme', resourceId: 'u1' });
+    await acme.append('t-acme', [{ role: 'user', content: 'ACME-OWN' }]);
+
+    expect(await findReservedRootThreads(s)).toEqual([
+      { id: 'org:123', resourceId: 'u1', rootOnly: true },
+      { id: 'org:acme:t-acme', resourceId: 'u1', rootOnly: false },
+    ]);
+    const r = await migrateReservedRootThreads(s);
+    expect(r).toEqual({ moved: [{ from: 'org:123', to: 'legacy-org:123' }], undecided: ['org:acme:t-acme'], skipped: [] });
+    expect((await acme.getMessages('t-acme')).map((m: { content: string }) => m.content)).toEqual(['ACME-OWN']);
+    expect((await acme.listThreads({ resourceId: 'u1' })).map((t) => t.id)).toEqual(['t-acme']);
+    // Named explicitly it moves — the operator's decision, not a guess.
+    expect((await migrateReservedRootThreads(s, { threadIds: ['org:acme:t-acme'] })).moved).toEqual([{ from: 'org:acme:t-acme', to: 'legacy-org:acme:t-acme' }]);
+    expect(await acme.listThreads({ resourceId: 'u1' })).toEqual([]);
   });
 
   it('refuses a new id that is taken, or still in the reserved space, and names why', async () => {
