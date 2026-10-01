@@ -414,7 +414,7 @@ export const NOT_A_BIRTH: Record<string, string> = {
   resumeRun: 'continues an existing run (engine door op "resumeRun"), never starts one',
   admitRun: 'THE entry every birth calls, not a birth itself',
   admitThreadRun: 'the thread gate',
-  decideRun: 'a decision', runOwnerOf: 'a reading', isRealRun: 'a reading', runStarted: 'a reading',
+  decideRun: 'a decision', runOwnerOf: 'a reading', runTargetOf: 'a reading', isRealRun: 'a reading', runStarted: 'a reading',
   runCanceled: 'a reading', runCompensated: 'a reading', summarizeRun: 'a reading', runIdOfKey: 'key parsing',
   runIdentity: 'builds an identity value', forkRunId: 'derives an id', rolloverKey: 'derives a key',
   runBusyMessage: 'an error message', streamFinishError: 'an error helper',

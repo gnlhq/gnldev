@@ -4,9 +4,9 @@ import type { StreamTextResult } from 'ai';
 import { withDurableModel } from './durable-model.js';
 import { durableTools, CLAIM_TTL_MS } from './durable-tool.js';
 import { acquireRunLock } from './run-lock.js';
-import { RunBusyError, runBusyMessage, SideEffectRetryBlockedError, RetryLimitExceededError, RunThreadMismatchError, RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunSweptError, ThreadOwnerMismatchError, NotAnAgentRunError } from './errors.js';
+import { RunBusyError, runBusyMessage, SideEffectRetryBlockedError, RetryLimitExceededError, RunThreadMismatchError, RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunSweptError, ThreadOwnerMismatchError } from './errors.js';
 import { admitThreadRun } from './thread-owner.js';
-import { UNKNOWN, ownerFields, callerFromResourceId, callerOf, userIdOf, user, runIdentity, runOwnerOf, actingCaller, claimRunOwner, ownerLabel, type Caller, type RunIdentity, type RunOwner } from './run-identity.js';
+import { UNKNOWN, ownerFields, callerFromResourceId, callerOf, userIdOf, user, runIdentity, runOwnerOf, actingCaller, assertRunTarget, claimRunOwner, ownerLabel, type Caller, type RunIdentity, type RunOwner } from './run-identity.js';
 import { argsHash, rawInputFingerprint, isDerivedRunId, DERIVED_RUN_ID_PREFIX, type WorkScope, type WorkScopeKind } from './hash.js';
 import { recordIdemConflict } from './idem-ledger.js';
 import { createProcessorCtx, composePrepareStep, composeOnStepFinish, durableProcessorStep, ProcessorRetry, RetryExhaustedByProcessorError, type StepHookFailure } from './processor.js';
@@ -1626,30 +1626,6 @@ export function identityOnlyInput(frozen: FrozenInput | undefined): { kind: 'wor
 }
 
 /**
- * The refusal, ADDRESSED. The repo's refusal style is that the error names the remedy — and the
- * remedy here is not "retry", it is "you are holding the wrong kind of id". Dropping through
- * silently was the measured failure: the agent path proceeded, wrote its own rows under a workflow's
- * runId, and the `:input` claim (first-wins) meant the identity record could not even be overwritten
- * — two kinds of record racing for one key.
- */
-function refuseIdentityOnlyInput(runId: string, id: { kind: 'workflow' | 'network' | 'batch'; name?: string }): NotAnAgentRunError {
-  const n = id.name ?? '?';
-  // The remedy is per-DOOR, because "you are holding the wrong kind of id" is only half an answer —
-  // the other half is which door this id opens.
-  const REMEDY: Record<typeof id.kind, string> = {
-    workflow: `Drive it with runWorkflow('${n}', …, { runId }) — or use a fresh runId for an agent run.`,
-    network: `Drive it with runNetwork('${n}', { runId, task }) — or use a fresh runId for an agent run.`,
-    batch: `Answer a batch item through the batch's own run() with \`approvals\` — or use a fresh runId for an agent run.`,
-  };
-  return new NotAnAgentRunError(
-    `@gnldev/durable: runId "${runId}" belongs to the ${id.kind} '${n}', not to an agent run — its ':input' entry is an ` +
-      `IDENTITY record (owner/thread/actor), not a frozen request, so there is no prompt to resume with. ` +
-      REMEDY[id.kind],
-    { runId, kind: id.kind, ...(id.name ? { name: id.name } : {}) },
-  );
-}
-
-/**
  * The turn's span inside the message array: `[start, end)`. `start` is the history/incoming boundary
  * (see trackIncomingBoundary); `end` is one past the turn's LAST message, which is `messages.length`
  * unless the chain put something BEHIND the turn (see trackTurnEnd).
@@ -3055,12 +3031,12 @@ async function runDurableInner(args: RunDurableArgs, admission: { admitted: bool
   // assertThreadOwnership's own doc for why the order matters (K2/K3 hardening).
   const entry = await enterAgentRun(journal, runId, args);
   const frozenInput = entry.frozenInput;
-  // WHOSE runId IS THIS — asked before the ownership check, because a workflow/batch identity record
-  // is not a frozen agent input at all (see identityOnlyInput). Refused on the SAME read, and before
-  // anything is written: an agent attempt against a workflow's runId used to proceed on an empty
-  // request and leave its rows under that workflow's prefix.
-  const identityOnly = identityOnlyInput(entry.recorded as FrozenInput | undefined);
-  if (identityOnly) throw refuseIdentityOnlyInput(runId, identityOnly);
+  // WHOSE runId IS THIS (run-identity.ts assertRunTarget), on the SAME read and before anything is
+  // written: a runId started for another agent, a workflow, a network or a batch item is refused — an
+  // agent attempt used to answer from that target's journal, or proceed on an empty request and leave
+  // its rows under a workflow's prefix. A caller who may not act on the run meets the owner refusal
+  // instead, and learns no target.
+  assertRunTarget(entry.recorded, { kind: 'agent', ...(agentName ? { name: agentName } : {}) }, runId, entry.refusal);
   // A run this caller may not act on is refused as THAT before the thread gates below: they name the
   // thread the run was started for, which is the owner's. Answered first, they told a stranger who sent
   // another user's runId which conversation it belongs to — with a thread of their own (the mismatch
@@ -3402,8 +3378,7 @@ export async function resumeRun(
   // workflow/batch IDENTITY record, so there is still no recorded input. Addressed rather than
   // silent — the refusal above says what is missing, this one says what the id actually is and
   // which door drives it (see identityOnlyInput).
-  const identityOnly = identityOnlyInput(input as FrozenInput);
-  if (identityOnly) throw refuseIdentityOnlyInput(runId, identityOnly);
+  assertRunTarget(input, { kind: 'agent' }, runId);
   // `limits` is a runtime value the CLI/embed callers can't re-supply (it isn't part of
   // AgentConfig). If the caller passes `limits`, it wins (explicit override); otherwise recover the
   // limits frozen at run start from the journal so the resumed run keeps its cost cap / loop /
@@ -3576,8 +3551,7 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
   const frozenInput = entry.frozenInput;
   // Parity with runDurableInner — "unutulan hep yüzeyler": chat-adapter and agui reach the engine
   // through THIS function, so a client-supplied workflow/batch runId arrives here first.
-  const identityOnly = identityOnlyInput(entry.recorded as FrozenInput | undefined);
-  if (identityOnly) throw refuseIdentityOnlyInput(runId, identityOnly);
+  assertRunTarget(entry.recorded, { kind: 'agent', ...(agentName ? { name: agentName } : {}) }, runId, entry.refusal);
   // A run this caller may not act on is refused as THAT before the thread gates below: they name the
   // thread the run was started for, which is the owner's. Answered first, they told a stranger who sent
   // another user's runId which conversation it belongs to — with a thread of their own (the mismatch

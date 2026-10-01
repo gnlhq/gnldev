@@ -61,8 +61,11 @@ describe('kimlik-amaçlı :input ajan koşumu girdisi sayılmaz', () => {
   it('iş akışı id ile runDurable REDDEDİLİR — sessizce ilk-yazım gibi devam etmez', async () => {
     const journal = new InMemoryJournal();
     const runId = await seedWorkflowRun(journal, 'wf-ident-1');
+    // The owner is told what the id is; a stranger is refused as a stranger and learns no target.
+    await expect(runDurable({ runId, journal, model: model(), prompt: 'merhaba', resourceId: 'u-ayse' } as never))
+      .rejects.toMatchObject({ name: 'RunTargetMismatchError', message: expect.stringMatching(/workflow 'w'/) });
     await expect(runDurable({ runId, journal, model: model(), prompt: 'merhaba' } as never))
-      .rejects.toThrow(/workflow/);
+      .rejects.toMatchObject({ name: 'RunOwnerMismatchError', message: expect.not.stringMatching(/workflow/) });
     // `:input` claim'i zaten kayıtlı olduğu için kimlik kaydı EZİLEMEZ — iki tür kayıt tek anahtarda
     // yarışamaz, ve kimlik kaydı olduğu gibi kalır.
     const input = await journal.get<{ workflow?: string; prompt?: unknown }>(`${runId}:input`);
@@ -73,8 +76,10 @@ describe('kimlik-amaçlı :input ajan koşumu girdisi sayılmaz', () => {
   it('iş akışı id ile streamDurable REDDEDİLİR — unutulan hep yüzeyler', async () => {
     const journal = new InMemoryJournal();
     const runId = await seedWorkflowRun(journal, 'wf-ident-2');
+    await expect(streamDurable({ runId, journal, model: model(), prompt: 'merhaba', resourceId: 'u-ayse' } as never))
+      .rejects.toMatchObject({ name: 'RunTargetMismatchError', message: expect.stringMatching(/workflow 'w'/) });
     await expect(streamDurable({ runId, journal, model: model(), prompt: 'merhaba' } as never))
-      .rejects.toThrow(/workflow/);
+      .rejects.toMatchObject({ name: 'RunOwnerMismatchError', message: expect.not.stringMatching(/workflow/) });
   });
 
   it('GERÇEK donmuş girdili koşumun resume\'u değişmeden çalışır', async () => {

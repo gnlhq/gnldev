@@ -329,29 +329,26 @@ export class BatchPlanMismatchError extends Error {
 }
 
 /**
- * Bu runId bir AJAN koşumuna ait değil — bir iş akışı, AĞ ya da batch item koşumuna ait.
- *
- * `<runId>:input` iki farklı işi birden görüyor: ajan yolunda DONMUŞ GİRDİ (prompt/messages/system),
- * iş akışı/ağ/batch yolunda ise yalnız KİMLİK ({resourceId, workflow|network|batch, …}) — sahiplik kapısı,
- * `listRuns({resourceId})` ve `purgeResource` o anahtarı okuduğu için. Ajan yolu anahtarın
- * VARLIĞINI "girdi donmuş" diye okur, ve bir kimlik kaydını benimsemek prompt/messages/system'ı
- * undefined'a set eder: boş girdiyle model çağrısı, üstüne o id'nin altına karışan ajan kayıtları.
- *
- * Aile gereği 409 + `resumable` YOK: düzeltilecek şey id'nin kendisi, hiçbir retry temizlemez.
+ * A runId re-used for a different target than the one it was started for: agent `a`'s runId sent to
+ * agent `b`, workflow `x`'s to workflow `y`, a workflow's, network's or batch item's to an agent.
+ * The run's journal is the first target's; answering from it under another name returned that
+ * target's result as the second one's (measured: 200 and agent `a`'s text from `/agents/b/run`), and
+ * an agent attempt on a workflow's id proceeded on an empty request. Refused only to a caller who may
+ * act on the run — a stranger meets the owner refusal and learns no target. 409, no `resumable`.
  */
-export class NotAnAgentRunError extends Error {
+export class RunTargetMismatchError extends Error {
   constructor(
     message: string,
-    public readonly detail: { runId: string; kind: 'workflow' | 'network' | 'batch'; name?: string },
+    public readonly detail: { runId: string; startedFor: { kind: string; name?: string }; requested: { kind: string; name?: string } },
   ) {
     super(message);
-    this.name = 'NotAnAgentRunError';
+    this.name = 'RunTargetMismatchError';
   }
 }
 
 const CALLER_CONFLICT_BY_NAME = {
   RunThreadMismatchError: 'run_thread_mismatch',
-  NotAnAgentRunError: 'not_an_agent_run',
+  RunTargetMismatchError: 'run_target_mismatch',
   RunInputMismatchError: 'run_input_mismatch',
   RunActorMismatchError: 'run_actor_mismatch',
   RunOwnerMismatchError: 'run_owner_mismatch',
@@ -593,7 +590,7 @@ export function upstreamFailure(err: unknown): UpstreamFailure | undefined {
 const WIRE_STATUS_BY_CODE = {
   // caller-conflict — all 409: something about the request needs fixing; no retry clears it
   run_thread_mismatch: 409,
-  not_an_agent_run: 409,
+  run_target_mismatch: 409,
   run_input_mismatch: 409,
   run_actor_mismatch: 409,
   run_owner_mismatch: 409,

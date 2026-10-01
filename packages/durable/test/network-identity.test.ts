@@ -80,7 +80,7 @@ describe('ağ kimliği', () => {
     expect(await journal.listKeys!('net-4:'), 'router kararları ve görev metni kaldı').toEqual([]);
   });
 
-  it("ağ runId'sine ajan yolundan girmek NotAnAgentRunError — hata 'network' der", async () => {
+  it("ağ runId'sine ajan yolundan girmek RunTargetMismatchError — hata sahibine 'network' der", async () => {
     // `:input` artık iki iş yapıyor: ajan yolunda donmuş istek, iş akışı/batch/AĞ yolunda kimlik
     // kaydı. Ajan yolu "donmuş" kararını anahtarın DOLULUĞUNDAN veriyor — tanıtılmayan bir kimlik
     // kaydı boş bir isteğin modele gitmesi demekti, üstelik satırlar ağın önekine düşerdi.
@@ -88,8 +88,12 @@ describe('ağ kimliği', () => {
     const gnl = netGnl(journal);
     await gnl.runNetwork!('n', { runId: 'net-5', task: 'iş', resourceId: 'u-ayse' } as never);
     await expect(
-      runDurable({ journal, model: createMockModel(async () => finalTextResult('x')), runId: 'net-5', prompt: 'x' } as never),
+      runDurable({ journal, model: createMockModel(async () => finalTextResult('x')), runId: 'net-5', prompt: 'x', resourceId: 'u-ayse' } as never),
     ).rejects.toThrow(/network 'n'/);
+    // A stranger is refused as a stranger and learns no target.
+    await expect(
+      runDurable({ journal, model: createMockModel(async () => finalTextResult('x')), runId: 'net-5', prompt: 'x' } as never),
+    ).rejects.toMatchObject({ name: 'RunOwnerMismatchError', message: expect.not.stringMatching(/network/) });
   });
 });
 

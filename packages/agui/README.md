@@ -244,7 +244,7 @@ All eight are `CALLER_CONFLICT_CODES` in `@gnldev/durable`, and this route retur
 | `run_owner_mismatch` | The run belongs to a different subject. |
 | `run_actor_mismatch` | Started by one actor, re-used by another — the first is frozen into the input, first-wins. |
 | `thread_owner_mismatch` | The `resourceId` and the `threadId` belong to different people; nothing was appended. |
-| `not_an_agent_run` | That id belongs to a workflow, a network or a batch item — `detail.kind` says which. |
+| `run_target_mismatch` | That id was started for another agent, workflow, network or batch item — `detail.startedFor` says which. |
 | `run_swept` | Retention deleted the record; a `${runId}:swept` tombstone says it existed. |
 | `batch_plan_mismatch` | A `batchId` carries one plan, and these items are not it. |
 

@@ -14,6 +14,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Migration notes, one line each; the full entries under Security, Fixed and Changed have the measurement
 and who is affected.
 
+- **A runId sent to a different target than the one it was started for is refused with `409
+  run_target_mismatch`** (agent `a`'s runId to agent `b`, workflow `x`'s to workflow `y`, a workflow's,
+  network's or batch item's to an agent, an agent's to a workflow). Give each target its own runId, or
+  name the work with `workKey` (its id includes the target). The code `not_an_agent_run` and
+  `NotAnAgentRunError` are removed: that case is `run_target_mismatch` / `RunTargetMismatchError` now,
+  and a caller who may not act on the run gets `run_owner_mismatch` instead, which names no target.
 - **Studio's `StudioMemory` is picked from @gnldev/durable's `Memory`** (and AgentMemory `implements
   Required<Memory>`), so a renamed method is a compile error on either side. The truncate method Studio
   calls is `truncateMessagesAfter` (was `truncateMessages`, which no shipped memory had). Pass the memory
@@ -224,6 +230,21 @@ and who is affected.
 - @gnldev/scheduler: `ScheduleSpec.ifExists` (`'refuse'` by default, `'replace'`, `'keep'`).
 
 ### Security
+
+- **A runId answered for a different agent or workflow than the one it was started for.** A run's journal
+  is its target's, and no entry asked whose target it was. Measured on the previous build: `POST
+  /agents/b/run` with agent `a`'s runId → 200 with `a`'s text, `b`'s model never called — on the REST run,
+  resume and stream routes, the AG-UI door and the chat door, and through `createGnl().run`; `POST
+  /workflows/y/run` with workflow `x`'s runId → 200 with `x`'s output; named networks alike. The owner
+  check still held (no other user's run was reachable); what a caller got was one target's answer under
+  another's name. The rule now lives once, in @gnldev/durable `assertRunTarget`, asked by both run entries
+  (`admitRun` for workflows, networks and batch items; the agent entry for agents), so every door refuses
+  alike without a door of its own knowing: 15 sibling scenarios across the doors and run kinds, 15 refused
+  or served as before. The earlier agent-door check for a workflow's, network's or batch item's runId
+  (`NotAnAgentRunError`) told anyone holding the id which workflow it belonged to; the rule is asked after
+  the owner check, so a stranger learns no target. A run recorded with no target (0.9 and earlier) is not
+  refused. Measured as a candidate and rejected: a check on the REST door alone, which left AG-UI and chat
+  answering and named the target to a stranger.
 
 - **Studio served an organization from a store that belonged to another when the host set `orgScoped: true`.**
   The flag was the host's word that its one object honoured the organization it was handed; Studio could

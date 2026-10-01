@@ -24,7 +24,7 @@
  */
 import { claim, runKeys, isVersionedRecord, type Journal } from './journal.js';
 import { stampFormat } from './format.js';
-import { RunOwnerMismatchError } from './errors.js';
+import { RunOwnerMismatchError, RunTargetMismatchError } from './errors.js';
 
 import type { Caller, RunIdentity, GnlToolContext, StaffCaller, UnknownCaller, UserCaller } from './identity-types.js';
 export type { UserCaller, StaffCaller, UnknownCaller, Caller, RunIdentity, GnlToolContext } from './identity-types.js';
@@ -372,6 +372,52 @@ export function ownerLabel(c: Caller): string {
 }
 
 /**
+ * What a run was started FOR: an agent, a workflow, a network or a batch. `name` is absent when it is
+ * not known — a nameless primitive (`runNetwork` records `network: ''`, `runDurable` without an
+ * `agentName`) — and then only the kind is compared.
+ */
+export type RunTarget = { kind: 'agent' | 'workflow' | 'network' | 'batch'; name?: string };
+
+/**
+ * The target an owner record names, or `undefined` when it names none — a record written before
+ * targets were recorded. Absence is not evidence: such a run is not refused to anyone. An agent's
+ * record is its frozen request (`prompt`/`messages`), named by `agent` when the door knew the name.
+ */
+export function runTargetOf(rec: unknown): RunTarget | undefined {
+  if (rec === null || typeof rec !== 'object') return undefined;
+  const r = rec as Record<string, unknown>;
+  for (const kind of ['workflow', 'network', 'batch'] as const) {
+    const name = r[kind];
+    if (typeof name === 'string') return { kind, ...(name !== '' ? { name } : {}) };
+  }
+  if (typeof r.agent === 'string' && r.agent !== '') return { kind: 'agent', name: r.agent };
+  if (r.prompt !== undefined || r.messages !== undefined || r.system !== undefined) return { kind: 'agent' };
+  return undefined;
+}
+
+/** Whether a run recorded for `recorded` may be driven as `requested`: same kind, and the same name when both are known. */
+function sameTarget(recorded: RunTarget, requested: RunTarget): boolean {
+  return recorded.kind === requested.kind && (recorded.name === undefined || requested.name === undefined || recorded.name === requested.name);
+}
+
+/**
+ * THE rule "a runId belongs to the target that started it", for every run kind and every door.
+ * `stranger` is the refusal for a caller who may not act on the run: a mismatched target is refused
+ * to them as THAT, so the target is named only to someone who may act on the run.
+ */
+export function assertRunTarget(record: unknown, requested: RunTarget, runId: string, stranger?: Error): void {
+  const recorded = runTargetOf(record);
+  if (recorded === undefined || sameTarget(recorded, requested)) return;
+  if (stranger) throw stranger;
+  const label = (t: RunTarget) => (t.name !== undefined ? `${t.kind} '${t.name}'` : `a ${t.kind}`);
+  throw new RunTargetMismatchError(
+    `@gnldev/durable: runId "${runId}" was started for ${label(recorded)} and is now being run for ${label(requested)}. ` +
+      `A runId belongs to one target: its journal holds that target's steps and result. Give each target its own runId.`,
+    { runId, startedFor: recorded, requested },
+  );
+}
+
+/**
  * THE ENTRY of a run, for every kind: read the owner once, decide, and — for a run that does not exist
  * yet, when `birth` is given — record the owner at once (`claimRunOwner`). Returns who the run acts
  * for (`actingCaller`). Refuses with the store's own error when the owner cannot be read, and with
@@ -395,6 +441,8 @@ export async function admitRun(
     );
   const acting = actingCaller(owner, caller);
   if (!acting) throw refuse(owner.state === 'owned' ? owner.owner : UNKNOWN);
+  const requested = runTargetOf(birth);
+  if (requested && owner.state === 'owned') assertRunTarget(owner.record, requested, runId);
   if (owner.state === 'missing' && birth) {
     // Two births racing for one id: the claim has one winner, and the loser is held to it.
     const recorded = await claimRunOwner(journal, runId, acting, birth);

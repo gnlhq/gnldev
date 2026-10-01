@@ -47,7 +47,7 @@ them.
 | [`run_actor_mismatch`](./run_actor_mismatch.md) | Same runId, different actor (`critical` profile). |
 | [`run_owner_mismatch`](./run_owner_mismatch.md) | A derived (`run1_`) run addressed by a different subject. |
 | [`run_swept`](./run_swept.md) | Retention deleted this run; a late retry would repeat its effects. |
-| [`not_an_agent_run`](./not_an_agent_run.md) | This runId belongs to a workflow, network or batch. |
+| [`run_target_mismatch`](./run_target_mismatch.md) | This runId was started for another agent, workflow, network or batch. |
 | [`batch_plan_mismatch`](./batch_plan_mismatch.md) | The items do not match the plan that was approved. |
 
 ## Blocked — the run is waiting on you

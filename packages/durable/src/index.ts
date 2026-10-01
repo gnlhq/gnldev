@@ -37,9 +37,8 @@ export { usageAndCostFromModelValue, modelRecordFacts } from './cost.js';
 export type { ModelPricing, PricingDoc } from './pricing.js';
 export {
   DivergenceError, RunBusyError, SideEffectRetryBlockedError, RetryLimitExceededError,
-  ReplicationNotAcknowledgedError, SuiteVersionMismatchError, RunThreadMismatchError,
+  ReplicationNotAcknowledgedError, SuiteVersionMismatchError, RunThreadMismatchError, RunTargetMismatchError,
   RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, RunSweptError, BatchPlanMismatchError,
-  NotAnAgentRunError,
   CALLER_CONFLICT_CODES, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, FOREIGN_PARTY_DETAIL_FIELDS,
   BLOCKED_ERROR_CODES, blockedErrorCode, upstreamFailure, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES,
   RESERVED_ID_ERROR_CODES, reservedIdFailure,
@@ -108,7 +107,7 @@ export { CapabilityError, requireCapability, composite, toJournal, matchFilter, 
 // the one answer to "does this run exist, and whose is it" (run-identity.ts).
 export {
   STAFF, UNKNOWN, user, staff, userIdOf, sealFieldsOf, resolveCaller, type SealFields, runIdentity, childIdentity, toolContextFor, identityOf,
-  runOwnerOf, decideRunAccess, decideRun, admitRun, claimRunOwner, inheritRunOwner, SUBJECT_VIEW,
+  runOwnerOf, decideRunAccess, decideRun, admitRun, claimRunOwner, inheritRunOwner, assertRunTarget, runTargetOf, type RunTarget, SUBJECT_VIEW,
   type Caller, type UserCaller, type StaffCaller, type UnknownCaller, type RunIdentity, type GnlToolContext,
   type RunOwner, type RunKind, type RunDecision, type RawJournal,
 } from './run-identity.js';

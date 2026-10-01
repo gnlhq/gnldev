@@ -43,7 +43,7 @@ import { RunBusyError, CALLER_CONFLICT_CODES } from './errors.js';
  *   prep) and was measured turning a victim's completed run into 'failed' — an authorisation
  *   refusal writing into the history of the person it refused.
  *
- * NotAnAgentRunError: the third member of the same family, and the one with the most to lose. The
+ * RunTargetMismatchError: the third member of the same family, and the one with the most to lose. The
  *   RunId belongs to a WORKFLOW or a BATCH ITEM — a live run with its own record, written by its own
  *   Machinery. An agent-path call against it is refused before it reads anything; stamping 'failed'
  *   From here would put an agent verdict on a workflow's outcome, which is precisely the
