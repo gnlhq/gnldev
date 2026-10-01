@@ -33,12 +33,17 @@ and who is affected.
   `{ __gnlStepRecord: 'void' }`, and an output that has a `__gnlStepRecord` key is stored wrapped. Code
   that reads `<runId>:wf:<step>` keys itself: read through `decodeStepRecord(v)` from @gnldev/durable.
   0.9.0 journals read unchanged; a journal written now is not for 0.9.0 (downgrades are unsupported).
-- **With a `processToolError` hook that changes the text, a tool's thrown error is a masked copy** —
-  same class and `name`, `message` is the hook's text, and its own properties (`code`, `status`…) are
-  not copied. Code that inspects the error in-process reads the original from `error.cause`. When the
-  class cannot be copied safely (a `DOMException` such as fetch's `AbortError`/`TimeoutError`, an error
-  from another realm, an error whose getters throw, a non-Error value) it is a plain `Error` with the
-  original's `name` as an own property — `instanceof DOMException` is false on it; read `error.cause`.
+- **A failed tool call's journaled `error` is the text the model sees, not `error.message`** —
+  `String(error)` for an `Error` (`TypeError: no account`, was `no account`), JSON for a thrown object
+  (was `[object Object]`), `unknown error` for `undefined`. A `processToolError` hook receives that text.
+  Code that matched `{ status: 'failed', error }` against the bare message matches the prefixed text.
+- **With a `processToolError` hook that changes the text, a tool's thrown error is a masked copy** that
+  renders as the hook's text: same class and `name` while the text still starts with `<name>: ` (then
+  `message` is the rest), otherwise `name` is `''` and `message` is the whole text. Its own properties
+  (`code`, `status`…) are not copied. Code that inspects the error in-process reads the original from
+  `error.cause`. When the class cannot be copied safely (a `DOMException` such as fetch's
+  `AbortError`/`TimeoutError`, an error from another realm, an error whose getters throw, a non-Error
+  value) it is a plain `Error` — `instanceof DOMException` is false on it; read `error.cause`.
 - **A server with no auth (or a `{ read, write }` pair) answers only `localhost`, `*.localhost`, IP
   addresses and the names you list** — `allowedHosts: ['mybox.test', '.ngrok-free.app']` on
   `createRestApi` / `createStudioApp`, or `GNL_ALLOWED_HOSTS=mybox.test,.ngrok-free.app`. An
@@ -68,6 +73,13 @@ and who is affected.
 - **A root `ingestDocuments` / `deleteDocuments` on a vector store that does not declare
   `deleteOutsideOrganizations` is refused**: give the documents a `namespace`, or make the store honour
   `outsideOrganizations` and declare `deleteOutsideOrganizations: true`.
+- **A custom vector store's `delete` must read a filter key whose value is `undefined` as "has no such
+  key"** (`DeleteWhere.filter`) for `ingestDocuments` / `deleteDocuments` to remove 0.9.0 records
+  safely. A store that serialises the filter to JSON drops the key, and the 0.9.0 cleanup then takes
+  the record at the document's own raw id even when it is another document's or an observation's. The
+  bundled stores do; the contract test (`vector-store-contract.test.ts`) pins it. No capability flag:
+  the generation cleanup of `ingestDocuments` reads only ids and equal values, and the 0.9.0 cleanup
+  names only ids.
 - **`chunkDocuments` records a chunk's document as `metadata.__gnlDoc` / `__gnlChunk`, no longer as
   `source` / `chunk`, and escapes `%` and `#` in chunk ids**: read `metadata.__gnlDoc` where you read
   `metadata.source`, and re-ingest once with `ingestDocuments` to replace 0.9.0 chunks.
@@ -314,8 +326,15 @@ and who is affected.
   fixed error class, never the thrown error's own `name`. A tool that THROWS is covered too: the error
   text journaled as `{ status: 'failed', error }` is masked, through a new optional `Processor` hook,
   `processToolError` (@gnldev/durable). The text is masked once, where the error is thrown: when the
-  hooks changed it, the error the tool rethrows carries the masked text (same class and `name` where
-  copying the class is safe, otherwise a plain `Error` with the same `name`; the original as `cause`).
+  hooks changed it, the error the tool rethrows renders as the masked text (same class and `name` where
+  copying the class is safe, otherwise a plain `Error`; the original as `cause`). The hooks see the
+  text every consumer renders — the AI SDK's rule: `String(error)` for an `Error`, so its `name` is in
+  it; JSON for a thrown object. Measured before: they saw `.message` only, so an address in the error's
+  `name` (`NotFound<ayse@acme.com>`), or in a field of a thrown object (`{ detail: '…ayse@…' }`,
+  `{ message, email }`), reached the thread, the model's next prompt and `fullStream` while the journal
+  held `[object Object]`. `piiRedactor` also masks the arguments of every tool call (`tool-call` parts'
+  `input`) in the messages it sees — before, `lookup({ email })` put the address in thread memory and
+  `response.messages`; the tool still runs with the raw arguments.
   Masking never changes whether a run completes: measured in this cycle, the class copy of a
   `DOMException` (fetch abort/timeout) could not be read — `.name` and `String(err)` threw
   ERR_INVALID_THIS — and the run threw a TypeError where 0.9.0 and the unmasked path completed. A thrown
@@ -538,6 +557,16 @@ and who is affected.
   The generator now decides "nothing to wire" itself: a `wiring` whose `code` is blank (the 0.9 shape,
   still allowed by `RecipeWiring`) adds no line either — found after the first fix, which changed only
   the recipe table — and `gnl add` prints "How to run it:" for such a recipe, not "Add to gnl.config.ts:".
+  The generator also decides what the base already wires: `gnl init . --features idempotency-tool` in an
+  existing project wrote `import { chargeOrder }` twice (TS2300; `node gnl.config.ts` was a
+  SyntaxError), because only the fresh-scaffold caller stripped that recipe. A recipe whose import the
+  base config already has, or one listed twice, is wired once whoever calls `generateConfig`. The four
+  `model-*` recipes no longer declare a config wiring — a model is set on the agent, in
+  `src/agents/assistant.ts` — so `generateConfig(Object.values(RECIPES))` no longer writes a second
+  `agents` key (TS1117) and four `model` imports, and `gnl add model <provider>` no longer prints "Add to
+  gnl.config.ts:" above an instruction for another file. The repo test now typechecks every single, pair
+  and alternate-answer project, `gnl init` in an existing project, and `generateConfig` over every
+  recipe (reversed, and each listed twice), in one TypeScript program.
 - **Concurrent turns on one thread no longer lose messages in the journal-kept memories**
   (`BasicMemory` in @gnldev/durable, `SemanticMemory` in @gnldev/rag). Both read the thread's log,
   awaited, and wrote it back. Measured on 0.9.0: 10 concurrent appends kept 1; two processes appending
@@ -593,6 +622,18 @@ and who is affected.
   after, on the rag and durable in-memory stores, SQLite and real pgvector: shrink, grow, same size,
   many↔one and delete all leave exactly the current chunks. `indexDocuments` stays upsert-only. Way
   through for a store without `delete`: `indexDocuments(store, embed, chunkDocuments(docs))`.
+  A replace is one version, not delete-then-write: the new chunks are written first as a generation
+  (`<id>#<i>@<generation>`, `metadata.__gnlGen`), then every other generation of the document is
+  removed. Measured on the first version (delete, then upsert at `<id>#<i>`): two concurrent ingests of
+  one document left chunks of both versions in 10 of 10 runs on the in-memory, SQLite and graph stores
+  (pg-mem kept the older one), and an upsert that failed after the delete left the document with no
+  chunks and an error that did not name it. Measured after: one whole version in 10 of 10 on all five
+  stores (the later call wins), the previous version whole after a failed write, and the error names
+  the document and what was already replaced (`err.documentId`, `err.replaced`). Cost, re-ingesting
+  50 three-chunk documents (median of 10 after 2 warm-ups, ms per document): in-memory 0.15 → 0.27 at
+  500 stored rows and 1.07 → 2.19 at 8000; SQLite 2.24 → 3.21 and 11.4 → 23.6 — the listing is a
+  `query`, which on the SQLite and Postgres stores of @gnldev/durable reads every row of the partition
+  (the delete it adds to already did, so the cost stays linear in the table).
 - **`PostgresVectorStore.delete` before any write no longer creates a one-number vector table.** On a fresh
   database a `delete` created `embedding vector(1)`, and every upsert after it failed ("expected 1
   dimensions, not 3") — found through `ingestDocuments`, whose first step is a delete. It now reads the

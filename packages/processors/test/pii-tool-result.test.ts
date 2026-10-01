@@ -220,7 +220,7 @@ describe('piiRedactor redactToolResults — the tool error path', () => {
     const { journal, dump } = await e2e(async () => { throw new Error(`no account for ${EMAIL}`); });
     expect(dump).not.toContain(EMAIL);
     const rec = await journal.get<any>('err:tool:call-1');
-    expect(rec).toMatchObject({ status: 'failed', error: 'no account for [REDACTED_EMAIL]' });
+    expect(rec).toMatchObject({ status: 'failed', error: 'Error: no account for [REDACTED_EMAIL]' });
     const reports = await readProcessorReports(journal, 'err');
     expect(reports).toEqual([expect.objectContaining({ phase: 'tool', findings: expect.objectContaining({ redactedCount: 1, types: ['email'] }) })]);
   });
@@ -232,7 +232,7 @@ describe('piiRedactor redactToolResults — the tool error path', () => {
 
   it('skipTools journals that tool\'s error as thrown, as it does its output', async () => {
     const { journal } = await e2e(async () => { throw new Error(`no account for ${EMAIL}`); }, { redactToolResults: { skipTools: ['lookupUser'] } });
-    expect(await journal.get<any>('err:tool:call-1')).toMatchObject({ error: `no account for ${EMAIL}` });
+    expect(await journal.get<any>('err:tool:call-1')).toMatchObject({ error: `Error: no account for ${EMAIL}` });
   });
 });
 

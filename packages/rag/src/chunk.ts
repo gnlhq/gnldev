@@ -135,6 +135,8 @@ export function chunkText(text: string, opts?: ChunkOptions): Chunk[] {
  */
 export const DOC_TRAIL_KEY = '__gnlDoc';
 export const CHUNK_TRAIL_KEY = '__gnlChunk';
+/** The generation an `ingestDocuments` write belongs to — see `ingestDocuments`. */
+export const GEN_TRAIL_KEY = '__gnlGen';
 
 /**
  * A document id as it appears inside a vector id: `%` and `#` escaped, so a document's own id never

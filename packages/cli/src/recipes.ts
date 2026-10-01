@@ -201,7 +201,8 @@ export const chargeOrder = {
     },
     humanWire: `import { chargeOrder } from './src/tools/charge-order.js';
 // …then add it to an agent's tools inside the config object:
-  agents: { assistant: { ...assistant, tools: { chargeOrder } } }`,
+  agents: { assistant: { ...assistant, tools: { chargeOrder } } }
+(A gnl.config.ts written by \`gnl init\` already imports it and gives it to the charge-demo agent.)`,
     note: "GNL's edge: this tool is never silently run twice, even when the model re-emits the same call under a new toolCallId (a documented AI SDK pattern). "
       + '`gnl add` does not touch your agents — your own model has to actually call it. (A fresh scaffold '
       + 'ships this tool wired to a `charge-demo` agent whose mock model does, plus test/proof.test.ts.)',
@@ -738,12 +739,12 @@ function modelRecipe(provider: string, label: string, dep: string, contents: str
     // constant. A provider missing from that table is a recipe that cannot say what it installs.
     depRange: AI_SDK_PROVIDER_RANGES[dep] ?? (() => { throw new Error(`gnl: no AI SDK range declared for ${dep}`); })(),
     env,
-    wiring: {
-      import: `import { model } from './${file.replace(/\.ts$/, '.js')}';`,
-      place: 'configField',
-      code: 'agents: { assistant }',
-    },
-    humanWire: `In src/agents/assistant.ts, two lines:
+    // No `wiring`: a model is chosen on the AGENT, in src/agents/assistant.ts — nothing goes into
+    // gnl.config.ts. The wiring this used to declare (`agents: { assistant }` + `import { model }`)
+    // was not a line anyone should add there: generateConfig wrote it as a second `agents` key
+    // (TS1117) and a second `model` import, and `gnl add model` printed "Add to gnl.config.ts:"
+    // above an instruction for another file.
+    humanWire: `Nothing to add to gnl.config.ts — the model is set on the agent, in src/agents/assistant.ts, two lines:
   import { model } from '../models/${provider}.js';
   …and in the config object:  model,   (replacing the echoModel() line — the mock import can go)`,
     note: `put the key in .env in the project root — gnl dev/studio load it on start, and the shell still wins. Add .env to .gitignore.`,

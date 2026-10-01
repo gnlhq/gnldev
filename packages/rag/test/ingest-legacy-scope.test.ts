@@ -26,7 +26,8 @@ const stores: [string, () => VectorStore][] = [
   ['durable InMemoryStorage.vectors', () => new InMemoryStorage().vectors as unknown as VectorStore],
   ['durable SqliteStorage.vectors', () => new SqliteStorage(':memory:').vectors as unknown as VectorStore],
 ];
-const ids = async (s: VectorStore) => (await s.query(v, 1000)).map((h) => h.id).sort();
+// `ingestDocuments` writes `<id>#<i>@<generation>`; the generation is compared away here.
+const ids = async (s: VectorStore) => (await s.query(v, 1000)).map((h) => h.id.replace(/@[0-9a-z]+$/, '')).sort();
 
 /** 0.9.0's `chunkDocuments` + `indexDocuments`: one chunk under the raw id, many as `<id>#<n>` with `{ source, chunk }`. */
 async function write090(s: VectorStore, id: string, chunks: number, metadata: Record<string, unknown> = {}) {
@@ -39,7 +40,7 @@ describe.each(stores)('0.9.0 records and the delete scope (%s)', (_n, make) => {
     const s = make();
     for (const id of ['faq#2024', '100%-guide', 'solo#x', 'q%23x']) await write090(s, id, 1);
     await ingestDocuments(s, embed, [{ id: 'faq#2024', text: 'new' }, { id: '100%-guide', text: 'new' }], opts);
-    expect(await ids(s)).toEqual(['100%25-guide', 'faq%232024', 'q%23x', 'solo#x'].sort());
+    expect(await ids(s)).toEqual(['100%25-guide#0', 'faq%232024#0', 'q%23x', 'solo#x'].sort());
     await deleteDocuments(s, ['solo#x', 'q%23x', 'faq#2024', '100%-guide']);
     expect(await ids(s)).toEqual([]);
   });
@@ -49,17 +50,17 @@ describe.each(stores)('0.9.0 records and the delete scope (%s)', (_n, make) => {
     await write090(s, 'guide', 6);
     await s.upsert([{ id: 'guide#1', text: 'the document called guide#1', embedding: v }]); // 0.9.0 overwrote chunk 1
     await ingestDocuments(s, embed, [{ id: 'guide', text: 'short guide' }], opts);
-    expect(await ids(s)).toEqual(['guide', 'guide#1']);
+    expect(await ids(s)).toEqual(['guide#0', 'guide#1']);
     await deleteDocuments(s, ['guide#1']);
-    expect(await ids(s)).toEqual(['guide']);
+    expect(await ids(s)).toEqual(['guide#0']);
   });
 
   it("deleting a document leaves another document's CURRENT record that has the same raw id", async () => {
     const s = make();
     await ingestDocuments(s, embed, [{ id: 'q#x', text: 'the q#x document' }, { id: 'guide', text: paras(3, 'G') }], opts);
-    expect(await ids(s)).toEqual(['guide#0', 'guide#1', 'guide#2', 'q%23x']);
+    expect(await ids(s)).toEqual(['guide#0', 'guide#1', 'guide#2', 'q%23x#0']);
     expect(await deleteDocuments(s, ['q%23x', 'guide#1'])).toBe(0);
-    expect(await ids(s)).toEqual(['guide#0', 'guide#1', 'guide#2', 'q%23x']);
+    expect(await ids(s)).toEqual(['guide#0', 'guide#1', 'guide#2', 'q%23x#0']);
   });
 
   it("deleting a document leaves another document's 0.9.0 chunk that has the same raw id", async () => {

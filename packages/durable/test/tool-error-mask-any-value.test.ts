@@ -59,18 +59,33 @@ const cases: Array<[string, unknown, string | undefined]> = [
 
 describe('maskedToolError: any thrown value yields a readable masked Error', () => {
   for (const [label, orig, name] of cases) {
-    it(label, () => {
-      const m = maskedToolError(orig, TEXT);
+    // The hooks process `toolErrorText(orig)` — the name is part of that text for an error.
+    it(`${label}: masked text with the name kept`, () => {
+      const text = `${name}: ${TEXT}`;
+      const m = maskedToolError(orig, text);
       const r = readAll(m); // must not throw
       expect(m).toBeInstanceOf(Error);
-      expect(r.message).toBe(TEXT);
-      expect(r.name).toBe(name);
-      expect(r.str).toBe(`${name}: ${TEXT}`);
+      expect(r.str).toBe(text);
       expect(r.stack).not.toContain(SECRET);
-      expect(r.str).not.toContain(SECRET);
+      expect(m.cause).toBe(orig);
+    });
+    it(`${label}: masked text without the name — renders as the text alone`, () => {
+      const m = maskedToolError(orig, TEXT);
+      const r = readAll(m);
+      expect(r.str).toBe(TEXT);
+      expect(r.name).toBe('');
+      expect(r.message).toBe(TEXT);
+      expect(r.stack).not.toContain(SECRET);
       expect(m.cause).toBe(orig);
     });
   }
+
+  it('the name is kept where the text still carries it', () => {
+    for (const [, orig, name] of cases.slice(0, 9)) {
+      const m = maskedToolError(orig, `${name}: ${TEXT}`);
+      expect([m.name, m.message]).toEqual([name, TEXT]);
+    }
+  });
 
   it('class is kept where safe: a subclass instance stays instanceof its class, without its own fields', () => {
     const m = maskedToolError(new PayErr(`card of ${SECRET}`), TEXT);
@@ -80,7 +95,7 @@ describe('maskedToolError: any thrown value yields a readable masked Error', () 
 
   it('a DOMException becomes a plain Error with the DOMException name as an own property', () => {
     const orig = new DOMException(`abort ${SECRET}`, 'AbortError');
-    const m = maskedToolError(orig, TEXT);
+    const m = maskedToolError(orig, `AbortError: ${TEXT}`);
     expect(Object.getPrototypeOf(m)).toBe(Error.prototype);
     expect(Object.prototype.hasOwnProperty.call(m, 'name')).toBe(true);
     expect(m.name).toBe('AbortError');
@@ -94,7 +109,7 @@ describe('maskedToolError: any thrown value yields a readable masked Error', () 
     let thrown: unknown;
     try { await fetch(`http://127.0.0.1:${port}/${SECRET}`, { signal: AbortSignal.timeout(1) }); } catch (e) { thrown = e; }
     expect(thrown).toBeDefined();
-    const m = maskedToolError(thrown, TEXT);
+    const m = maskedToolError(thrown, `${(thrown as any).name}: ${TEXT}`);
     const r = readAll(m);
     expect(r.message).toBe(TEXT);
     expect(r.name).toBe((thrown as any).name);

@@ -22,6 +22,9 @@ const rows = (path: string): Row[] =>
 const ownedOn090 = (all: Row[], doc: string) =>
   all.filter((r) => r.id === doc || (r.id.startsWith(`${doc}#`) && r.meta?.source === doc && typeof r.meta?.chunk === 'number' && r.id === `${doc}#${r.meta.chunk}`)).map((r) => r.id);
 
+/** `ingestDocuments` writes `<id>#<i>@<generation>`; the generation is compared away. */
+const ungen = (id: string) => id.replace(/@[0-9a-z]+$/, '');
+
 /** The two id lists are the same set; a failure names the ids (`{ unexpected, missing }`) instead of a count. */
 function expectIds(actual: string[], expected: string[]): void {
   const diff = {
@@ -49,10 +52,10 @@ describe('upgrade from 0.9.0 — rag', () => {
       expect(old.length, `the fixture holds 0.9.0 records for ${doc}`).toBeGreaterThan(0);
       await ingestDocuments(f.storage.vectors, S.fixtureEmbed, [{ id: doc, text: `now short ${doc}` }]);
       const after = rows(f.path);
-      const fresh = after.filter((r) => r.meta?.[DOC_TRAIL_KEY] === doc).map((r) => r.id);
-      expect(fresh).toEqual([documentIdPart(doc)]);
+      const fresh = after.filter((r) => r.meta?.[DOC_TRAIL_KEY] === doc).map((r) => ungen(r.id));
+      expect(fresh).toEqual([`${documentIdPart(doc)}#0`]);
       const others = before.filter((r) => !old.includes(r.id)).map((r) => r.id);
-      expectIds(after.map((r) => r.id), [...others, documentIdPart(doc)]);
+      expectIds(after.map((r) => ungen(r.id)), [...others, `${documentIdPart(doc)}#0`]);
     });
   });
 
@@ -83,7 +86,7 @@ describe('upgrade from 0.9.0 — rag', () => {
     const f = openFixture('rag.db');
     const single = S.RAG_DOCS.find((d) => d.id === 'single')!;
     await ingestDocuments(f.storage.vectors, S.fixtureEmbed, [single]);
-    const row = rows(f.path).find((r) => r.id === 'single');
+    const row = rows(f.path).find((r) => ungen(r.id) === 'single#0');
     expect(row?.meta).toMatchObject({ source: 'confluence', team: 'a', [DOC_TRAIL_KEY]: 'single' });
   });
 });

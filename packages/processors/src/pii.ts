@@ -58,6 +58,8 @@ export interface PiiRedactorOptions {
 }
 
 const DEFAULT_TYPES: PiiType[] = ['email', 'phone', 'creditCard', 'ssn', 'ip', 'iban'];
+/** The default mask, shared by `piiRedactor` and `piiTextRedactor` — one definition, so they cannot drift. */
+const DEFAULT_MASK = (t: PiiType): string => `[REDACTED_${t.toUpperCase()}]`;
 
 /**
  * Rejects a configuration that would mask less than the caller thinks it does.
@@ -105,7 +107,7 @@ export function piiTextRedactor(
   opts: Pick<PiiRedactorOptions, 'types' | 'mask' | 'extraPatterns' | 'validate'> = {},
 ): (text: string) => string {
   const types = opts.types ?? DEFAULT_TYPES;
-  const mask = opts.mask ?? ((t: PiiType) => `[REDACTED_${t.toUpperCase()}]`);
+  const mask = opts.mask ?? DEFAULT_MASK;
   const extra = opts.extraPatterns ?? [];
   const validate = opts.validate !== false;
   assertUsablePatterns(types, extra);
@@ -295,6 +297,45 @@ function redactStructured(
   return { value: out, total, types: [...hit], paths, withheld };
 }
 
+/**
+ * The `input` of every `tool-call` part, walked like a tool result (`redactStructured`). The model
+ * writes a tool call's arguments the way it writes text — `lookup({ email: 'ayse@acme.com' })` — and
+ * `redactMessages` masks only `text` parts, so the arguments reached thread memory and
+ * `response.messages` raw. Only the messages' COPY is changed: the tool itself already ran with the
+ * arguments the model produced. A value the walk cannot finish is replaced by a marker, never kept.
+ */
+function redactToolCallInputs<M extends any[] | undefined>(
+  messages: M,
+  redactText: (text: string) => { text: string; total: number; types: string[] },
+): { messages: M; total: number; types: string[] } {
+  let total = 0;
+  const hit = new Set<string>();
+  if (!messages) return { messages, total, types: [] };
+  const marker = '[REDACTED_TOOL_CALL_INPUT: piiRedactor could not walk these arguments]';
+  const out = messages.map((m) => {
+    if (!Array.isArray(m?.content) || !m.content.some((p: any) => p?.type === 'tool-call' && p.input !== undefined)) return m;
+    return {
+      ...m,
+      content: m.content.map((part: any) => {
+        if (part?.type !== 'tool-call' || part.input === undefined) return part;
+        try {
+          const walked = redactStructured(part.input, redactText, marker);
+          total += walked.total;
+          for (const t of walked.types) hit.add(t);
+          return walked.total || walked.withheld.length ? { ...part, input: walked.value } : part;
+        } catch {
+          return { ...part, input: marker };
+        }
+      }),
+    };
+  });
+  return { messages: out as M, total, types: [...hit] };
+}
+
+function mergeCounts(a: { total: number; types: string[] }, b: { total: number; types: string[] }): { total: number; types: string[] } {
+  return { total: a.total + b.total, types: [...new Set([...a.types, ...b.types])] };
+}
+
 /** Aggregates redactions across ALL text fields of a ProcessorInput/ProcessorOutput (system/prompt/messages
  *  are counted separately — same granularity as redactMessages, which redacts each message/part INDEPENDENTLY). */
 function countInputRedactions(
@@ -333,7 +374,10 @@ function countInputRedactions(
  *
  * SCOPE, measured — WHAT THE OUTPUT SIDE DOES NOT COVER: `processOutput` transforms the
  * `{text, messages}` view, so `result.text` and `result.response.messages` come back masked on both
- * `runDurable` and `streamDurable`, and so does persisted thread memory. `result.steps` and
+ * `runDurable` and `streamDurable`, and so does persisted thread memory — text parts, and the
+ * arguments of every tool call (`tool-call` parts' `input`, walked like a tool result). The tool
+ * itself still runs with the raw arguments, and the journal's model-step record holds the raw step,
+ * like `steps`. Tool RESULTS are masked at their source only with `redactToolResults`. `result.steps` and
  * `result.content` DO NOT — they still hold the model's raw output, and a caller reading either one
  * sees unredacted PII. This is not fixable inside the hook: a processor's output arity is
  * unconstrained (a summariser legally returns one message for a turn that produced three), so no
@@ -344,11 +388,12 @@ function countInputRedactions(
  */
 export function piiRedactor(opts: PiiRedactorOptions = {}): Processor {
   const types = opts.types ?? DEFAULT_TYPES;
-  const mask = opts.mask ?? ((t: PiiType) => `[REDACTED_${t.toUpperCase()}]`);
+  const mask = opts.mask ?? DEFAULT_MASK;
   const extra = opts.extraPatterns ?? [];
   const validate = opts.validate !== false;
   assertUsablePatterns(types, extra);
   const on = opts.on ?? 'both';
+  const redactText = compileRedactions(types, mask, { extra, validate });
 
   const proc: Processor = { name: 'pii-redactor' };
 
@@ -363,7 +408,9 @@ export function piiRedactor(opts: PiiRedactorOptions = {}): Processor {
         prompt: typeof input.prompt === 'string' ? redactString(input.prompt, types, mask, extra, validate) : input.prompt,
         messages: input.messages ? redactMessages(input.messages, types, mask, extra, validate) : input.messages,
       };
-      const { total, types: hitTypes } = countInputRedactions(input, types, mask, extra, validate);
+      const calls = redactToolCallInputs(out.messages, redactText);
+      out.messages = calls.messages;
+      const { total, types: hitTypes } = mergeCounts(countInputRedactions(input, types, mask, extra, validate), calls);
       if (total > 0) void recordProcessorReport(ctx, 'pii-redactor', 'input', { redactedCount: total, types: hitTypes });
       return out;
     };
@@ -376,9 +423,11 @@ export function piiRedactor(opts: PiiRedactorOptions = {}): Processor {
         text: typeof output.text === 'string' ? redactString(output.text, types, mask, extra, validate) : output.text,
         messages: output.messages ? redactMessages(output.messages, types, mask, extra, validate) : output.messages,
       };
-      const { total, types: hitTypes } = countInputRedactions(
+      const calls = redactToolCallInputs(out.messages, redactText);
+      out.messages = calls.messages;
+      const { total, types: hitTypes } = mergeCounts(countInputRedactions(
         { prompt: output.text, messages: output.messages }, types, mask, extra, validate,
-      );
+      ), calls);
       if (total > 0) void recordProcessorReport(ctx, 'pii-redactor', 'output', { redactedCount: total, types: hitTypes });
       return out;
     };
@@ -391,7 +440,6 @@ export function piiRedactor(opts: PiiRedactorOptions = {}): Processor {
   // (`redactStructured`), and anything the walk cannot finish is replaced, never passed through.
   if (opts.redactToolResults) {
     const skip = new Set(typeof opts.redactToolResults === 'object' ? opts.redactToolResults.skipTools ?? [] : []);
-    const redactText = compileRedactions(types, mask, { extra, validate });
     const wayThrough = (toolName: string) =>
       `To journal this tool's output unredacted, pass piiRedactor({ redactToolResults: { skipTools: ['${toolName}'] } })`;
     // `string[]`, not `PiiType[]`: a custom pattern's name belongs in the audit report too, or the
@@ -434,9 +482,11 @@ export function piiRedactor(opts: PiiRedactorOptions = {}): Processor {
       return { output: walked.value };
     };
     // The same promise on the ERROR path: a tool that throws `Error('no account for ayse@acme.com')`
-    // had its message journaled as `{status:'failed', error}` with no processor consulted. The text
-    // is redacted like any string output; the thrown error itself is untouched (retry policies and
-    // the caller still see it as thrown).
+    // had its message journaled as `{status:'failed', error}` with no processor consulted. `res.error`
+    // is the text every consumer renders for the thrown value (durable's `toolErrorText`: `name:
+    // message` for an Error, JSON for a thrown object), and the error durable rethrows renders as
+    // the text returned here — so the journal, the thread, the next prompt and the stream all carry
+    // the masked text. The original stays reachable in-process as the rethrown error's `cause`.
     proc.processToolError = async (res: ProcessorToolError, ctx: ProcessorCtx) => {
       if (skip.has(res.toolName)) return { error: res.error };
       const r = redactText(res.error);

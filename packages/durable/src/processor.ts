@@ -82,14 +82,17 @@ export interface Processor {
    */
   processToolResult?(res: ProcessorToolResult, ctx: ProcessorCtx): Promise<{ output: unknown }> | { output: unknown };
   /**
-   * The error-path twin of `processToolResult`: called when a tool's execute THROWS, with the text
-   * about to be journaled as `{ status: 'failed', error }`, BEFORE it is written. The returned `error`
-   * is what the journal stores. A redactor that covers tool output needs this too — a tool that
-   * throws `Error('no account for ayse@acme.com')` put the address in the journal with no processor
-   * consulted. When the hooks CHANGE the text, the error that propagates carries it too: same class
-   * and `name`, `message` = the returned text, the original error as `cause` (its own properties —
-   * `code`, `status` — are read from there). That error is what the model, the thread and the stream
-   * render, so the text is masked once, here. Unchanged text leaves the error exactly as thrown. A
+   * The error-path twin of `processToolResult`: called when a tool's execute THROWS, BEFORE anything
+   * is written. `error` is the text every consumer renders for the thrown value — the AI SDK's rule:
+   * a string as is, an `Error` as `String(error)` (`name: message`, so the name is in it), `null` /
+   * `undefined` as 'unknown error', any other value as `JSON.stringify(value)`. The returned `error`
+   * is what the journal stores as `{ status: 'failed', error }`, and the error that propagates renders
+   * as exactly that text: when the hooks CHANGE it, the error is re-made with `message` = the returned
+   * text minus the `name: ` prefix it still starts with — the same class and `name` where that is
+   * safe — or, when the hooks changed the name too (or the value was not an error), `name` = '' and
+   * `message` = the whole text, since any other name would be prefixed again. The original is `cause`
+   * (its `name` and own properties — `code`, `status` — are read from there). That error is what the
+   * model, the thread and the stream render, so the text is masked once, here. Unchanged text leaves the error exactly as thrown. A
    * hook that throws, or returns no string, is not trusted with a fallback — the journal and the
    * error get a fixed "withheld" text instead of the unredacted one.
    */
@@ -223,7 +226,7 @@ export interface ProcessorToolResult {
   output: unknown;
 }
 
-/** Tool-error context passed to processToolError: `error` is the text the journal would store. */
+/** Tool-error context passed to processToolError: `error` is the text the model, thread, stream and journal render (see `Processor.processToolError`). */
 export interface ProcessorToolError {
   toolName: string;
   toolCallId: string;

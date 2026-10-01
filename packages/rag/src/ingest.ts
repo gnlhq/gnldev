@@ -3,10 +3,10 @@
 // `indexDocuments` upserts chunk by chunk, so re-indexing an edited document only overwrites the
 // chunk ids the new text produces. Measured: a document edited from 5 chunks down to 2 left chunks
 // #2-#4 of the OLD text retrievable; edited down to one chunk, every `#i` survived beside the new bare
-// id. `ingestDocuments` gives the write the document's shape: remove what the document had, then
-// write what it has now.
-import { assertDeletesOutsideOrganizations, orgStorageScopeOf, vectorWriteBatch } from '@gnldev/durable';
-import { chunkDocuments, DOC_TRAIL_KEY, type ChunkOptions } from './chunk.js';
+// id. `ingestDocuments` gives the write the document's shape: write what the document has now as a new
+// generation, then remove every other generation.
+import { assertDeletesOutsideOrganizations, orgPrefix, orgStorageScopeOf, vectorWriteBatch, OBSERVATION_VECTOR_KEY } from '@gnldev/durable';
+import { chunkDocuments, DOC_TRAIL_KEY, CHUNK_TRAIL_KEY, GEN_TRAIL_KEY, documentIdPart, type ChunkOptions } from './chunk.js';
 import type { DeleteWhere, Embed, VectorDoc, VectorItem, VectorStore } from './vector-store.js';
 
 export interface IngestResult {
@@ -61,7 +61,7 @@ const CHUNK_POSITION = /#\d+$/;
  *   - by trail (`__gnlDoc === id`): every chunk `chunkDocuments` writes now;
  *   - 0.9.0's one-chunk shape: the document as given, under its RAW id, no trail. A record at that id
  *     is left alone when it carries a trail (another document's current record — `q#x` is stored at
- *     `q%23x`), or an observation's id (`obsId`, observational memory's vectors), or — for an id shaped
+ *     `q%23x`), or an observation's id (`OBSERVATION_VECTOR_KEY`, observational memory's vectors), or — for an id shaped
  *     like a chunk position, `<p>#<n>` — both `source` and `chunk` (that is `p`'s 0.9.0 chunk);
  *   - 0.9.0's multi-chunk shape: `<id>#<n>` carrying `source: id`, scanned in blocks so a missing
  *     position does not end the scan. The id shape AND the label must match, so a record the user
@@ -71,8 +71,14 @@ const CHUNK_POSITION = /#\d+$/;
  * WITHOUT that key (`DeleteWhere.filter`). The user's own metadata is never matched on its own.
  */
 async function removeDocument(store: VectorStore & { delete: NonNullable<VectorStore['delete']> }, id: string, part: Pick<DeleteWhere, 'namespace' | 'outsideOrganizations'>): Promise<number> {
-  let removed = await store.delete({ filter: { [DOC_TRAIL_KEY]: id }, ...part });
-  const untrailed = { [DOC_TRAIL_KEY]: undefined, obsId: undefined };
+  const removed = await store.delete({ filter: { [DOC_TRAIL_KEY]: id }, ...part });
+  return removed + await removeLegacyRecords(store, id, part);
+}
+
+/** 0.9.0's records of document `id` — the untrailed shapes `removeDocument` describes. */
+async function removeLegacyRecords(store: Pick<Required<VectorStore>, 'delete'>, id: string, part: Pick<DeleteWhere, 'namespace' | 'outsideOrganizations'>): Promise<number> {
+  let removed = 0;
+  const untrailed = { [DOC_TRAIL_KEY]: undefined, [OBSERVATION_VECTOR_KEY]: undefined };
   if (CHUNK_POSITION.test(id)) {
     removed += await store.delete({ ids: [id], filter: { ...untrailed, chunk: undefined }, ...part });
     removed += await store.delete({ ids: [id], filter: { ...untrailed, source: undefined }, ...part });
@@ -89,24 +95,76 @@ async function removeDocument(store: VectorStore & { delete: NonNullable<VectorS
 }
 
 /**
- * Chunks, embeds and indexes `docs` so each document's stored chunks are exactly its current ones.
+ * A generation stamp: sortable as text, and unique — the time, a per-process counter, and a random
+ * part for two processes in the same millisecond. Which of two concurrent ingests wins is decided by
+ * comparing these, so every process reaches the same answer.
+ */
+let genSeq = 0;
+function newGeneration(): string {
+  const seq = (genSeq = (genSeq + 1) % 36 ** 4).toString(36).padStart(4, '0');
+  return `${Date.now().toString(36).padStart(9, '0')}${seq}${Math.random().toString(36).slice(2, 8).padEnd(6, '0')}`;
+}
+
+/**
+ * The partition a generation belongs to, as text — so a listing that reaches past the partition (a
+ * root document's listing sees every namespace) never compares this document's generations with
+ * another partition's copy of the same id. Through an organization's view it is `org:<id>`, the
+ * namespace the view forces whatever the document names — the key a root write naming that namespace
+ * gets too.
+ */
+function partitionKey(store: VectorStore, namespace: string | undefined): string {
+  // The view first: it overwrites a document's own `namespace` with the organization's.
+  const org = orgStorageScopeOf(store);
+  if (org !== undefined) return `ns:${orgPrefix(org).slice(0, -1)}`;
+  if (namespace !== undefined) return `ns:${namespace}`;
+  return 'root';
+}
+
+/** Enough for "every chunk of one document" on any store; a store that caps `topK` lists fewer. */
+const LIST_ALL = 1_000_000;
+
+/** An ingest that failed, naming the document and what was already replaced before it. */
+function ingestError(id: string, replaced: string[], what: string, cause: unknown): Error {
+  const done = replaced.length ? ` Documents already replaced in this call: ${replaced.map((r) => `'${r}'`).join(', ')}.` : '';
+  const err = new Error(`@gnldev/rag: ingestDocuments ${what} document '${id}'; its previous version is still in place.${done} (${(cause as Error)?.message ?? String(cause)})`, { cause });
+  return Object.assign(err, { documentId: id, replaced });
+}
+
+/**
+ * Chunks, embeds and indexes `docs` so each document's stored chunks are exactly one version of it.
  *
- * Per document: its chunks are embedded first, then every chunk it had (see `removeDocument`) is
- * deleted in its partition, then the new chunks are upserted. Embedding first means a failing embed
- * leaves the previous version in place; between the delete and the upsert a query can see the
- * document missing, never half old and half new.
+ * Invariant: when this resolves or rejects, each named document holds either all of its new chunks or
+ * all of its previous ones — never a mix of two versions, and never nothing unless the new text is
+ * empty. Per document:
  *
- * Needs `store.delete`. Without it this throws, naming the upsert-only way through. A document with no
- * `namespace` written to a root store also needs the store to declare `deleteOutsideOrganizations`;
- * without it this throws before anything changes — give the documents a `namespace`, or make the
- * store honour the flag.
+ *   1. its chunks are written as a new GENERATION — ids `<id>#<i>@<gen>`, metadata `__gnlGen` —
+ *      beside the previous version, which is untouched;
+ *   2. the document's chunks are listed (`query` with its trail as the filter) and every generation
+ *      but the newest one listed in this partition is deleted, with the 0.9.0 shapes and the chunks of
+ *      a write that had no generation (`indexDocuments(chunkDocuments(…))`);
+ *   3. when the write or the cleanup fails, this call's chunks are deleted again and the error names
+ *      the document and the documents this call had already replaced.
+ *
+ * Measured before (delete, then upsert, at the positional ids `<id>#<i>`): two concurrent ingests of
+ * one document left chunks of BOTH versions in 10 of 10 runs on four stores, and an upsert that failed
+ * after the delete left the document with no chunks. Concurrent ingests now converge: each one keeps
+ * the newest generation it lists, and the last to list has seen every write before it. While an
+ * ingest runs, a query can see both versions in full (never a part of one).
+ *
+ * Needs `store.delete`, and a `query` that applies `filter` before `topK` (every store in this repo
+ * does) and lists all of a document's chunks — an approximate index (pgvector HNSW/IVFFlat) can miss
+ * some, which leaves those chunks of an older version behind until the next ingest; it never removes
+ * the newest.
+ * A document with no `namespace` written to a root store also needs the store to declare
+ * `deleteOutsideOrganizations`; without it this throws before anything changes — give the documents a
+ * `namespace`, or make the store honour the flag.
  */
 export async function ingestDocuments(store: VectorStore, embed: Embed, docs: VectorDoc[], opts?: ChunkOptions): Promise<IngestResult> {
   requireDelete(store, 'ingestDocuments');
   const parts = docs.map((d) => partitionOf(store, d.namespace, 'ingestDocuments'));
-  // Every chunk is checked against the one vector write rule BEFORE anything is embedded or deleted:
+  // Every chunk is checked against the one vector write rule BEFORE anything is embedded or written:
   // an id a store cannot hold used to fail at that document's upsert, after the documents before it
-  // had already lost their old chunks.
+  // had already been replaced.
   const chunked = docs.map((doc) => chunkDocuments([doc], opts));
   vectorWriteBatch(chunked.flat());
   const perDoc: VectorItem[][] = [];
@@ -115,12 +173,86 @@ export async function ingestDocuments(store: VectorStore, embed: Embed, docs: Ve
   }
   let removed = 0;
   let indexed = 0;
+  const replaced: string[] = [];
   for (let i = 0; i < docs.length; i++) {
-    removed += await removeDocument(store, docs[i]!.id, parts[i]!);
-    if (perDoc[i]!.length) await store.upsert(perDoc[i]!);
-    indexed += perDoc[i]!.length;
+    const doc = docs[i]!;
+    const part = parts[i]!;
+    const items = perDoc[i]!;
+    if (items.length === 0) {
+      // No text, no version to keep: the document is removed, as `deleteDocuments` would.
+      removed += await removeDocument(store, doc.id, part);
+      replaced.push(doc.id);
+      continue;
+    }
+    const gen = `${partitionKey(store, doc.namespace)}|${newGeneration()}`;
+    const idPart = documentIdPart(doc.id);
+    const written = items.map((it) => ({
+      ...it,
+      id: `${idPart}#${String(it.metadata?.[CHUNK_TRAIL_KEY] ?? 0)}@${gen.slice(gen.indexOf('|') + 1)}`,
+      metadata: { ...it.metadata, [GEN_TRAIL_KEY]: gen },
+    }));
+    const ids = written.map((w) => w.id);
+    const undo = async () => { try { await store.delete({ ids, ...part }); } catch { /* the error below says what is left */ } };
+    try {
+      await store.upsert(written);
+    } catch (e) {
+      await undo();
+      throw ingestError(doc.id, replaced, 'could not write', e);
+    }
+    // The first delete that removes something is the commit point: before it, undoing this write
+    // leaves the previous version whole; after it, the new version is the one to keep.
+    const tracked = { removed: 0 };
+    const counting = { delete: async (w: DeleteWhere) => { const n = await store.delete(w); tracked.removed += n; return n; } } as typeof store;
+    try {
+      await removeOtherGenerations(store, counting, doc, gen, written[0]!.embedding, part);
+      await removeLegacyRecords(counting, doc.id, part);
+    } catch (e) {
+      if (tracked.removed === 0) {
+        await undo();
+        throw ingestError(doc.id, replaced, 'could not remove the previous version of', e);
+      }
+      throw Object.assign(new Error(
+        `@gnldev/rag: ingestDocuments wrote document '${doc.id}' but could not finish removing its previous version — ` +
+          `run ingestDocuments again for it.${replaced.length ? ` Documents already replaced in this call: ${replaced.map((r) => `'${r}'`).join(', ')}.` : ''} ` +
+          `(${(e as Error)?.message ?? String(e)})`, { cause: e }), { documentId: doc.id, replaced });
+    }
+    removed += tracked.removed;
+    indexed += written.length;
+    replaced.push(doc.id);
   }
   return { indexed, removed };
+}
+
+/**
+ * Deletes every chunk of `doc` in its partition that is not of the newest generation listed — which
+ * is `gen` unless a concurrent ingest wrote a newer one, in which case this call's own chunks go. A
+ * chunk with no generation (written by `indexDocuments`, or before generations) is never the newest.
+ *
+ * Only conditions every store reads the same way: the listed ids, guarded by the document's trail
+ * (and the stale generation's stamp). NOT by `{ __gnlGen: undefined }`: a store that serialises the filter to JSON drops that key, and the
+ * delete would have taken the new generation with the old (measured on a 0.9.0-contract store: the
+ * document was left with no chunks).
+ */
+async function removeOtherGenerations(store: VectorStore, del: Pick<Required<VectorStore>, 'delete'>, doc: VectorDoc, gen: string, probe: number[], part: Pick<DeleteWhere, 'namespace' | 'outsideOrganizations'>): Promise<number> {
+  const prefix = gen.slice(0, gen.indexOf('|') + 1);
+  const listed = await store.query(probe, LIST_ALL, { filter: { [DOC_TRAIL_KEY]: doc.id }, ...(doc.namespace !== undefined ? { namespace: doc.namespace } : {}) });
+  // Listed ids per generation ('' = no generation). The deletes name these ids, so they cost an id
+  // lookup rather than another scan of the store; the filter beside the ids is the guard that keeps
+  // an id from ever reaching another document's record.
+  const byGen = new Map<string, string[]>([[gen, []]]);
+  for (const m of listed) {
+    const g = m.metadata?.[GEN_TRAIL_KEY];
+    const key = typeof g !== 'string' ? '' : g.startsWith(prefix) ? g : undefined;
+    if (key === undefined) continue; // another partition's copy of this id
+    byGen.set(key, [...(byGen.get(key) ?? []), m.id]);
+  }
+  const newest = [...byGen.keys()].filter((g) => g !== '').sort().at(-1)!;
+  let removed = 0;
+  for (const [g, ids] of byGen) {
+    if (g === newest || ids.length === 0) continue;
+    removed += await del.delete({ ids, filter: { [DOC_TRAIL_KEY]: doc.id, ...(g ? { [GEN_TRAIL_KEY]: g } : {}) }, ...part });
+  }
+  return removed;
 }
 
 /**

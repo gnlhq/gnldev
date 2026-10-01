@@ -1863,14 +1863,16 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // 'suspended' is deliberately excluded: an approved resume is the FIRST attempt of that call.
         const prevAttempts = record && (record.status === 'failed' || record.status === 'running') ? (record.attempts ?? 1) : 0;
         // The error text is tool data like any output: the processors that see the output see this
-        // too (`processToolError`), before it is journaled. When they CHANGED the text, the error that
-        // leaves this function carries the changed text too (`maskedToolError`) — it is the copy the
-        // model, the thread and the stream render, so masking only the journal record left the raw
-        // text in every other place. Masked once, here, where it is thrown.
-        // Read defensively: a thrown value whose `message` getter throws (or a hostile Proxy) must not
-        // turn this handler into a second throw that skips the terminal write below.
-        const thrownText = thrownErrorText(error);
-        let journaledError = thrownText;
+        // too (`processToolError`), before it is journaled. The text is the one EVERY consumer renders
+        // (`toolErrorText` — the AI SDK's own rule: `String(error)` for an Error, so its `name` is in it;
+        // JSON for a thrown object), not `.message`: a hook shown only the message left an address in
+        // the error's `name`, or in a field of a thrown object, in the thread and the next prompt.
+        // When the hooks CHANGED the text — or the SDK would not render the thrown value as this text —
+        // the error that leaves this function is re-made to render exactly it (`maskedToolError`).
+        // Masked once, here, where it is thrown. Read defensively: a thrown value whose getters throw
+        // (or a hostile Proxy) must not turn this handler into a second throw that skips the write below.
+        const thrown = toolErrorText(error);
+        let journaledError = thrown.text;
         if (ctx.toolResultProcessors?.length) {
           const procCtx = createProcessorCtx(ctx.journal, ctx.runId);
           try {
@@ -1908,7 +1910,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         }
         // NOTE: taint is marked at INVOCATION now (see ), so a FAILED untrusted tool is already
         // tainted — its error body (also attacker-authorable) is covered without a post-hoc mark here.
-        throw journaledError === thrownText ? error : maskedToolError(error, journaledError);
+        throw thrown.rendersAsIs && journaledError === thrown.text ? error : maskedToolError(error, journaledError);
       }
       return output;
     },
@@ -1916,61 +1918,109 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
 }
 
 /**
- * The error a tool threw, re-made with the text a `processToolError` hook produced.
+ * The text a thrown value becomes wherever it is shown — the ONE renderer for a tool error.
  *
- * Invariant: masking changes the TEXT, never whether the run completes. Whatever was thrown, the
- * result is an `Error` of this realm whose `name`, `message`, `stack` and `String()` can all be read
- * without throwing — the AI SDK renders a tool error with `error.toString()`, so a copy that cannot be
- * read turns a tool failure the model could answer into a run that throws.
+ * It is the AI SDK's rule (`getErrorMessage`, which builds the `error-text` tool result the model, the
+ * thread and `response.messages` carry): a string is itself, an `Error` is `error.toString()` — so
+ * `name: message`, and its `name` is part of the text — `null`/`undefined` is 'unknown error', anything
+ * else is `JSON.stringify(value)`. The processors see this text, the journal stores it, and the error
+ * that leaves the tool renders as it.
  *
- * Two shapes:
- *   · Same prototype (so `instanceof` and `name` still hold) when the thrown value is an `Error` of
- *     this realm AND the copy reads safely. Built-in classes and user subclasses take this path.
- *   · Otherwise a plain `Error` carrying the original's `name` as an own property. Measured before this
- *     fallback existed: a DOMException (fetch's AbortError/TimeoutError) has brand-checked `name` and
- *     `message` getters on its prototype, so the prototype copy threw ERR_INVALID_THIS on `.name` and on
- *     `String(err)`, and the run threw a TypeError where 0.9.0 and the unmasked path completed. The same
- *     path takes an error from another realm (node:vm, an iframe — not `instanceof Error` here, so the
- *     SDK would have rendered the copy as `{}`), an error whose getters throw, and any non-Error value.
+ * `rendersAsIs` says whether the SDK, handed the thrown value itself, would render exactly `text`. It
+ * is false when this function had to fall back: an error from another realm or a DOMException that is
+ * not `instanceof Error` here (the SDK would render `{}`), a `toString` or `JSON.stringify` that throws
+ * or returns no string (a cyclic object, a BigInt, a function). Then the value is never rethrown as is —
+ * `maskedToolError` re-makes it so the model sees the text the processors and the journal saw.
+ */
+export function toolErrorText(error: unknown): { text: string; rendersAsIs: boolean } {
+  try {
+    if (error === null || error === undefined) return { text: 'unknown error', rendersAsIs: true };
+    if (typeof error === 'string') return { text: error, rendersAsIs: true };
+    if (sameRealmError(error)) {
+      try {
+        const text = error.toString();
+        if (typeof text === 'string') return { text, rendersAsIs: true };
+      } catch { /* fall back below */ }
+    } else if (!isErrorLike(error)) {
+      try {
+        const json = JSON.stringify(error);
+        if (typeof json === 'string') return { text: json, rendersAsIs: true };
+      } catch { /* fall back below */ }
+    }
+    if (isErrorLike(error)) {
+      const message = (() => { try { const m = (error as { message?: unknown }).message; return typeof m === 'string' ? m : ''; } catch { return ''; } })();
+      const name = safeErrorName(error);
+      return { text: message ? `${name}: ${message}` : name, rendersAsIs: false };
+    }
+  } catch { /* next */ }
+  try { return { text: String(error), rendersAsIs: false }; } catch { /* next */ }
+  return { text: '[tool error: the thrown value could not be read as text]', rendersAsIs: false };
+}
+
+/**
+ * The error a tool threw, re-made so that it renders as `text` — the text the `processToolError`
+ * hooks produced from `toolErrorText(original)`.
  *
- * Both shapes: `message` = the processed text, the stack's header rewritten to match (frames kept —
- * they name code, not data), and the ORIGINAL as `cause` — application code in this process can still
- * read it; the model, the thread and the stream see only the masked text. Own properties (`code`,
- * `status`, a custom `email`…) are NOT copied: they are as likely as the message to hold the value the
- * hook removed. Read them from `cause`.
+ * Invariant: `String(result) === text`. That is what the AI SDK puts in front of the model, into the
+ * thread and onto the stream for an Error — so the text the hooks saw is the text every consumer gets.
+ * `toolErrorText` renders an error as `name: message`, so the name is part of the text the hooks
+ * processed. Two outcomes:
+ *   · The hooks left the name alone (`text` still starts with `<name>: `, or is the name): the copy
+ *     keeps that `name` — `err.name === 'AbortError'` checks still hold — and `message` is the rest.
+ *   · Otherwise (the name held the value a hook removed, as in `NotFound<ayse@acme.com>`, or the
+ *     thrown value was not an error at all): `name` is the empty string and `message` is the whole
+ *     text. With any other name `String()` would prefix it again, and bring the removed value back.
+ * The stack's header is the text (frames kept — they name code, not data); the ORIGINAL is `cause`,
+ * so application code in this process can still read its name and fields there.
+ *
+ * Masking changes the TEXT, never whether the run completes: the result is an `Error` of this realm
+ * whose `name`, `message`, `stack` and `String()` read without throwing. Same prototype (so
+ * `instanceof` holds) when the thrown value is an `Error` of this realm and the copy renders as `text`;
+ * otherwise a plain `Error` — a DOMException's brand-checked getters, another realm's error, a
+ * prototype whose `toString` renders something else, and any non-Error value take that path.
+ * Own properties (`code`, `status`, a custom `email`…) are NOT copied: they are as likely as the
+ * message to hold the value the hook removed. Read them from `cause`.
  */
 export function maskedToolError(original: unknown, text: string): Error {
   const errorLike = isErrorLike(original);
-  const name = errorLike ? safeErrorName(original) : 'Error';
+  const thrownName = errorLike ? safeErrorName(original) : undefined;
+  const [name, message] =
+    thrownName !== undefined && text === thrownName ? [thrownName, '']
+    : thrownName !== undefined && text.startsWith(`${thrownName}: `) ? [thrownName, text.slice(thrownName.length + 2)]
+    : ['', text];
   const frames = errorLike ? safeStackFrames(original) : undefined;
   const own = { writable: true, configurable: true, enumerable: false };
+  const fields = (stackFrames: string) => ({
+    name: { ...own, value: name },
+    message: { ...own, value: message },
+    stack: { ...own, value: `${text}${stackFrames}` },
+    cause: { ...own, value: original },
+  });
   if (sameRealmError(original)) {
     try {
       const masked = Object.create(Object.getPrototypeOf(original)) as Error;
-      Object.defineProperties(masked, {
-        message: { ...own, value: text },
-        stack: { ...own, value: `${name}: ${text}${frames ?? ''}` },
-        cause: { ...own, value: original },
-      });
-      // `name` usually lives on the prototype; an instance-assigned one is copied so the class still reads right.
-      if (Object.prototype.hasOwnProperty.call(original, 'name')) Object.defineProperty(masked, 'name', { ...own, value: name });
-      // The copy is only handed on if it reads like an Error — a prototype whose accessors are
-      // brand-checked (DOMException) or that render something else fails here and takes the fallback.
-      if (masked.name === name && masked.message === text && typeof String(masked) === 'string') return masked;
+      Object.defineProperties(masked, fields(frames ?? ''));
+      // Handed on only if it renders as the text and every accessor its prototypes define can be read
+      // on it — a brand-checked prototype (DOMException's `code`, …) or a toString that renders
+      // something else fails here and takes the fallback.
+      if (masked.name === name && masked.message === message && String(masked) === text && accessorsReadOn(masked)) return masked;
     } catch { /* unsafe to copy — fall through to the plain Error */ }
   }
-  const plain = new Error(text, { cause: original });
-  if (name !== 'Error') Object.defineProperty(plain, 'name', { ...own, value: name });
-  const ownFrames = frames ?? safeStackFrames(plain) ?? '';
-  Object.defineProperty(plain, 'stack', { ...own, value: `${name}: ${text}${ownFrames}` });
+  const plain = new Error(message, { cause: original });
+  Object.defineProperties(plain, fields(frames ?? safeStackFrames(plain) ?? ''));
   return plain;
 }
 
-/** `String(error?.message ?? error)`, but never throwing — the text the journal and the hooks see. */
-function thrownErrorText(error: unknown): string {
-  try { return String((error as { message?: unknown } | null | undefined)?.message ?? error); } catch { /* next */ }
-  try { return String(error); } catch { /* next */ }
-  return '[tool error: the thrown value could not be read as text]';
+/** Whether every getter on `value`'s prototype chain can be called on it without throwing. */
+function accessorsReadOn(value: object): boolean {
+  try {
+    for (let proto = Object.getPrototypeOf(value); proto && proto !== Object.prototype; proto = Object.getPrototypeOf(proto)) {
+      for (const desc of Object.values(Object.getOwnPropertyDescriptors(proto))) {
+        if (desc.get) desc.get.call(value);
+      }
+    }
+    return true;
+  } catch { return false; }
 }
 
 /** `instanceof Error` in this realm, without letting a hostile value (a Proxy) throw out of it. */

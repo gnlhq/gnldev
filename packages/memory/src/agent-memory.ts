@@ -4,7 +4,7 @@
 //   • RunJournal   (storage.runs):   OM's LLM memoization + durable progress (replay is deterministic).
 // loadContext runs BEFORE persistInput, so the whole context freezes into `:input` = replayable.
 import { cosineSimilarity } from 'ai';
-import { requireCapability, durableProcessorStep, workingMemoryScope, OM_LEAVES, OM_VECTOR_SOURCE, type OmLeaf } from '@gnldev/durable';
+import { requireCapability, durableProcessorStep, workingMemoryScope, OM_LEAVES, OM_VECTOR_SOURCE, OBSERVATION_VECTOR_KEY, type OmLeaf } from '@gnldev/durable';
 import { threadOwnerOf, recordThreadCreated, toJournal, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, assertRootThreadId, type Memory } from '@gnldev/durable';
 import { PROVENANCE_RECENT_CAP, messagePreview } from '@gnldev/durable';
 import type { Storage, RunJournal, MemoryStore, MessageRecord, MessageAppend, ThreadRecord, RecallOptions, MemoryContextProvenance, RecalledMessageRef } from '@gnldev/durable';
@@ -644,7 +644,7 @@ export class AgentMemory {
       embedding: embedding!,
       ...(ns ? { namespace: ns } : {}),
       ...(owner !== undefined ? { owner } : {}),
-      metadata: { source: OM_VECTOR_SOURCE, threadId, level, fromSeq: o.fromSeq, toSeq: o.toSeq, obsId: o.id },
+      metadata: { source: OM_VECTOR_SOURCE, threadId, level, fromSeq: o.fromSeq, toSeq: o.toSeq, [OBSERVATION_VECTOR_KEY]: o.id },
     }]);
     await ov.store.upsert([item!]);
   }
@@ -717,7 +717,7 @@ export class AgentMemory {
       .slice(0, topK);
     const out: OmRecallMatch[] = [];
     for (const h of scoped) {
-      const o = obsById.get(h.metadata?.obsId as string);
+      const o = obsById.get(h.metadata?.[OBSERVATION_VECTOR_KEY] as string);
       if (!o) continue;
       out.push({ ...o, range: o.fromSeq != null && o.toSeq != null && o.threadId ? { threadId: o.threadId, fromSeq: o.fromSeq, toSeq: o.toSeq } : undefined });
     }

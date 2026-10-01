@@ -35,7 +35,13 @@ await runDurable({
   journals that tool's output as it returned. The audit report lists the paths it masked. The walk
   follows what the journal (superjson) stores: a boxed `new String(…)` is masked as text, a `Map`/`Set`
   is walked and kept, and binary data (`Buffer`, typed arrays) is replaced by a marker at its path. A
-  tool that throws has its journaled error text masked too (the `processToolError` hook).
+  tool that throws has its error masked too (the `processToolError` hook): the hook sees the text every
+  consumer renders — `name: message` for an `Error`, JSON for a thrown object — and the journal, the
+  thread, the model's next prompt and the stream all carry the masked text.
+- Tool-call arguments: `piiRedactor()` masks the `input` of every `tool-call` part in the messages it
+  sees (thread memory, `response.messages`, and history passed in), walked like a tool result. The tool
+  itself runs with the arguments the model wrote; the journal's model-step record keeps the raw step,
+  as `result.steps` does.
 - `tokenLimit(...)` · `promptInjectionDetector(...)` · `outputLimit(...)`
 - `piiTextRedactor(opts?) → (text: string) => string` — the same masking as `piiRedactor`, as a plain
   string function, for text that never passes through a processor at all. A `Processor` only sees

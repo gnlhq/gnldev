@@ -530,6 +530,13 @@ export interface VectorDeleteWhere {
   filter?: Record<string, unknown>;
 }
 
+/**
+ * The metadata key that marks a vector as an observation of observational memory (@gnldev/memory
+ * writes the observation's id under it). @gnldev/rag's document cleanup leaves such a record alone
+ * when it sits at a document's raw id — one name, owned here, instead of a literal in each package.
+ */
+export const OBSERVATION_VECTOR_KEY = 'obsId';
+
 /** The metadata narrowing of `filter` on a query or a delete: every key equals (`===`), as in @gnldev/rag. */
 export function vectorMetadataMatches(metadata: Record<string, unknown> | undefined, filter: Record<string, unknown> | undefined): boolean {
   if (!filter) return true;

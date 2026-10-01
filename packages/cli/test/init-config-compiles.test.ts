@@ -21,6 +21,7 @@ import { spawn } from 'node:child_process';
 import { scaffold, generateConfig } from '../src/scaffold.js';
 import { FEATURE_IDS, E2E_FEATURE, RECIPES } from '../src/recipes.js';
 import type { InitAnswers } from '../src/init-answers.js';
+import { captureLog } from './helpers.js';
 
 const ts = createRequire(import.meta.url)('typescript') as typeof import('typescript');
 const here = dirname(fileURLToPath(import.meta.url));
@@ -31,19 +32,31 @@ const PAIRS: string[][] = CODE_FEATURES.flatMap((a, i) => CODE_FEATURES.slice(i 
 const OTHER_ANSWERS: InitAnswers = { preset: 'critical', identity: 'end-users', store: 'pg', serving: 'dev' };
 
 interface Case { label: string; features: string[]; answers?: InitAnswers; typecheck: boolean }
-// Every case is parsed. The typecheck runs over the bare project (no recipe: the branches a feature
-// switches off) and ALL recipes together under both answer sets (every config line and every recipe file
-// side by side — a single or a pair is a subset of those lines). Not over all 90: that took ~22s of CPU
-// in one test, and in the full parallel suite it pushed a pg-mem test (19s alone, 30s limit) past its
-// timeout, measured twice; three projects take ~6s.
+// Every case is parsed AND typechecked — every single recipe, every pair, each one under the other
+// answer set, all together — in ONE `tsc` program (a child process at the lowest CPU priority, see
+// below). Measured on this machine: ~460 files for the pairs, 5–10s of tsc wall time under a load of
+// 20+. It used to typecheck only the bare project and all-together, arguing "a single or a pair is a
+// subset of those lines" — true of the scaffold path, and exactly what let a second caller of
+// generateConfig (`gnl init` in an existing project) write a config that did not parse.
 const CASES: Case[] = [
   { label: 'no recipe', features: [], typecheck: true },
   { label: 'no recipe (critical, end-users, pg)', features: [], answers: OTHER_ANSWERS, typecheck: true },
-  ...CODE_FEATURES.map((f) => ({ label: f, features: [f], typecheck: false })),
-  ...PAIRS.map((p) => ({ label: p.join('+'), features: p, typecheck: false })),
-  ...CODE_FEATURES.map((f) => ({ label: `${f} (critical, end-users, pg)`, features: [f], answers: OTHER_ANSWERS, typecheck: false })),
+  ...CODE_FEATURES.map((f) => ({ label: f, features: [f], typecheck: true })),
+  ...PAIRS.map((p) => ({ label: p.join('+'), features: p, typecheck: true })),
+  ...CODE_FEATURES.map((f) => ({ label: `${f} (critical, end-users, pg)`, features: [f], answers: OTHER_ANSWERS, typecheck: true })),
   { label: 'all recipes', features: [...CODE_FEATURES], typecheck: true },
   { label: 'all recipes (critical, end-users, pg)', features: [...CODE_FEATURES], answers: OTHER_ANSWERS, typecheck: true },
+];
+
+// The OTHER callers of generateConfig, in the same program. `gnl init` in an existing project builds
+// its own recipe list and passes it unfiltered; `generateConfig` and `RECIPES` are public exports, so
+// any recipe set — every entry at once (model recipes included), a recipe listed twice, any order —
+// is a config somebody can write. Each is checked inside a project that has every recipe's file.
+const INTEGRATE: string[][] = [['idempotency-tool'], ['idempotency-tool', 'rag'], ['otel', 'job', 'cache', 'schedule'], [...CODE_FEATURES]];
+const GENERATED: Array<[string, () => string]> = [
+  ['generateConfig(every RECIPES entry)', () => generateConfig(Object.values(RECIPES))],
+  ['generateConfig(every RECIPES entry, reversed, critical/end-users/pg)', () => generateConfig(Object.values(RECIPES).reverse(), OTHER_ANSWERS)],
+  ['generateConfig(each recipe twice)', () => generateConfig([...Object.values(RECIPES), ...Object.values(RECIPES)])],
 ];
 
 /** Resolve a third-party package from wherever the workspace installed it. */
@@ -84,6 +97,13 @@ beforeAll(() => {
     dirs.set(c.label, dir);
     if (c.typecheck) typechecked.add(c.label);
   });
+  GENERATED.forEach(([label, make], i) => {
+    const dir = join(base, `g${i}`);
+    scaffold(dir, { features: [...CODE_FEATURES] });
+    writeFileSync(join(dir, 'gnl.config.ts'), make());
+    dirs.set(label, dir);
+    typechecked.add(label);
+  });
   // CONTROL: a project whose config carries one deliberate type error — proves the program below
   // really typechecks (a check that resolved everything to `any` would pass it).
   const control = join(base, 'control');
@@ -95,6 +115,19 @@ beforeAll(() => {
 }, 120_000);
 
 const CONTROL = 'CONTROL (deliberate type error)';
+
+beforeAll(async () => {
+  const { initCommand } = await import('../src/commands/init.js');
+  for (const [i, features] of INTEGRATE.entries()) {
+    const dir = join(base, `i${i}`);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: `existing-${i}`, type: 'module', dependencies: {} }, null, 2));
+    await captureLog(() => initCommand.run({ argv: [dir, '--features', features.join(','), '--yes'] }));
+    const label = `gnl init in an existing project --features ${features.join(',')}`;
+    dirs.set(label, dir);
+    typechecked.add(label);
+  }
+}, 120_000);
 
 afterAll(() => {
   if (base) rmSync(base, { recursive: true, force: true });
@@ -115,8 +148,8 @@ function projectFiles(dir: string): string[] {
 }
 
 describe('every recipe and every pair of recipes: gnl.config.ts parses', () => {
-  it.each(CASES.filter((c) => c.label !== CONTROL).map((c) => [c.label, c] as const))('%s', (_label, c) => {
-    const src = readFileSync(join(dirs.get(c.label)!, 'gnl.config.ts'), 'utf8');
+  it.each([...CASES.map((c) => c.label), ...GENERATED.map(([l]) => l)])('%s', (label) => {
+    const src = readFileSync(join(dirs.get(label)!, 'gnl.config.ts'), 'utf8');
     const sf = ts.createSourceFile('gnl.config.ts', src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
     const diags = (sf as unknown as { parseDiagnostics: import('typescript').Diagnostic[] }).parseDiagnostics.map((d) => {
       const { line } = sf.getLineAndCharacterOfPosition(d.start!);
@@ -126,12 +159,12 @@ describe('every recipe and every pair of recipes: gnl.config.ts parses', () => {
   });
 });
 
-describe('the bare project and all recipes together: the generated project typechecks', () => {
+describe('every generated project typechecks', () => {
   // `tsc` in a CHILD process at the lowest CPU priority. In-process, this program (the AI SDK's and the
   // packages' types) ran alongside the rest of the suite at full priority and, measured three runs out of
   // three, pushed a pg-mem test that takes 19s alone past its 30s timeout; without it, three of three
   // passed. At the lowest priority it yields the CPU to the suite instead of competing with it.
-  it('tsc --noEmit over the bare project and all recipes together, the template\'s compiler options, zero errors', async () => {
+  it('tsc --noEmit over every case above, the template\'s compiler options, zero errors', async () => {
     const tpl = JSON.parse(readFileSync(join(REPO, 'packages', 'cli', 'templates', 'minimal', 'tsconfig.json'), 'utf8'));
     const roots = [...dirs].filter(([label]) => typechecked.has(label)).flatMap(([, d]) => projectFiles(d));
     const tsconfig = join(base, 'tsconfig.json');
@@ -166,5 +199,31 @@ describe('a recipe with nothing to wire contributes nothing to the config', () =
     expect(src.split('\n').filter((l) => /^\s*,\s*$/.test(l))).toEqual([]);
     const importBlock = src.split('\n').slice(0, src.split('\n').indexOf(''));
     expect(importBlock.every((l) => l.startsWith('import '))).toBe(true);
+  });
+});
+
+describe('generateConfig does not wire again what the base wires', () => {
+  const count = (src: string, re: RegExp) => (src.match(re) ?? []).length;
+  it('the idempotency-tool recipe, however it is passed: one chargeOrder import, on the charge-demo agent only', () => {
+    for (const set of [[RECIPES['idempotency-tool']!], [RECIPES['idempotency-tool']!, RECIPES['idempotency-tool']!, RECIPES.rag!], Object.values(RECIPES)]) {
+      const src = generateConfig(set);
+      expect(count(src, /^import \{ chargeOrder \}/gm)).toBe(1);
+      expect(src).not.toMatch(/assistant: \{ \.\.\.assistant, tools: \{[^}]*chargeOrder/);
+    }
+  });
+
+  it('a model recipe adds nothing to gnl.config.ts — the model is set on the agent', () => {
+    const bare = generateConfig([]);
+    for (const r of Object.values(RECIPES).filter((x) => x.id.startsWith('model-'))) {
+      expect(generateConfig([r])).toBe(bare);
+      expect(r.humanWire).toMatch(/^Nothing to add to gnl\.config\.ts/);
+    }
+  });
+
+  it('"nothing to add" in the printed instruction agrees with the generator, for every recipe', () => {
+    const bare = generateConfig([]);
+    for (const r of Object.values(RECIPES)) {
+      if (/^Nothing to add to gnl\.config\.ts/.test(r.humanWire)) expect(generateConfig([r]), r.id).toBe(bare);
+    }
   });
 });

@@ -9,7 +9,7 @@
 // so the raw text reached the model, the thread log and GET /threads/:id/messages.
 import { describe, it, expect } from 'vitest';
 import { InMemoryJournal } from '../src/index.js';
-import { durableTools } from '../src/durable-tool.js';
+import { durableTools, toolErrorText } from '../src/durable-tool.js';
 
 const EMAIL = 'ayse@acme.com';
 const mask = { name: 'mask', processToolError: ({ error }: { error: string }) => ({ error: error.replaceAll(EMAIL, '[REDACTED_EMAIL]') }) };
@@ -32,7 +32,9 @@ describe('a thrown tool error is masked at its source', () => {
   it('the error that leaves the tool carries the processed text; the original is its cause', async () => {
     const original = new NotFoundError(`no account for ${EMAIL}`);
     const { thrown, record } = await thrownBy(async () => { throw original; });
-    expect(record.error).toBe('no account for [REDACTED_EMAIL]');
+    // The text is what the AI SDK renders for an Error — `String(error)`, so the name is in it.
+    expect(record.error).toBe('NotFoundError: no account for [REDACTED_EMAIL]');
+    expect(String(thrown)).toBe(record.error);
     expect(thrown.message).toBe('no account for [REDACTED_EMAIL]');
     expect(thrown).toBeInstanceOf(NotFoundError);
     expect(thrown.name).toBe('NotFoundError');
@@ -53,13 +55,13 @@ describe('a thrown tool error is masked at its source', () => {
     const original = new Error(`no account for ${EMAIL}`);
     const { thrown, record } = await thrownBy(async () => { throw original; }, []);
     expect(thrown).toBe(original);
-    expect(record.error).toBe(`no account for ${EMAIL}`);
+    expect(record.error).toBe(`Error: no account for ${EMAIL}`);
   });
 
   it('a thrown non-Error value is replaced by an Error holding the processed text', async () => {
     const { thrown } = await thrownBy(async () => { throw `no account for ${EMAIL}`; });
     expect(thrown).toBeInstanceOf(Error);
-    expect(thrown.message).toBe('no account for [REDACTED_EMAIL]');
+    expect(String(thrown)).toBe('no account for [REDACTED_EMAIL]');
     expect(thrown.cause).toBe(`no account for ${EMAIL}`);
   });
 
@@ -67,7 +69,7 @@ describe('a thrown tool error is masked at its source', () => {
     const { thrown, record } = await thrownBy(async () => { throw new Error(`no account for ${EMAIL}`); },
       [{ name: 'broken', processToolError: () => { throw new Error('redactor bug'); } }]);
     expect(record.error).toMatch(/^\[tool error withheld: a processToolError hook threw/);
-    expect(thrown.message).toBe(record.error);
+    expect(String(thrown)).toBe(record.error);
   });
 
   // S6: a hook that returns no string used to journal `undefined` (and, after it, crash the next hook).
@@ -80,7 +82,53 @@ describe('a thrown tool error is masked at its source', () => {
       [{ name: 'sloppy', processToolError: hook }]);
     expect(typeof record.error).toBe('string');
     expect(record.error).toMatch(/^\[tool error withheld: a processToolError hook returned no text/);
-    expect(thrown.message).toBe(record.error);
+    expect(String(thrown)).toBe(record.error);
     expect(JSON.stringify(record)).not.toContain(EMAIL);
+  });
+});
+
+// The hooks see the text every consumer renders — not `.message`. Measured before: the hook saw
+// `.message` only, so an address in the error's `name`, or in a field of a thrown object, reached the
+// thread and the model's next prompt untouched (and the journal held "[object Object]" for objects).
+describe('the hooks see the text every consumer renders', () => {
+  it('an address in the error NAME is masked; the name is dropped from the copy, the text keeps the masked name', async () => {
+    const original = new Error('no such account');
+    original.name = `NotFound<${EMAIL}>`;
+    const { thrown, record } = await thrownBy(async () => { throw original; });
+    expect(record.error).toBe('NotFound<[REDACTED_EMAIL]>: no such account');
+    expect(String(thrown)).toBe(record.error);
+    expect(thrown.name).toBe('');
+    expect(`${String(thrown)} ${String(thrown.stack)}`).not.toContain(EMAIL);
+    expect(thrown.cause).toBe(original);
+  });
+
+  it('a thrown plain object is rendered as JSON — the hook sees its fields, not "[object Object]"', async () => {
+    const original = { code: 'E_NOTFOUND', detail: `no account for ${EMAIL}` };
+    const { thrown, record } = await thrownBy(async () => { throw original; });
+    expect(record.error).toBe('{"code":"E_NOTFOUND","detail":"no account for [REDACTED_EMAIL]"}');
+    expect(String(thrown)).toBe(record.error);
+  });
+
+  it('a thrown object with a clean message and an address in another field is masked too', async () => {
+    const { thrown, record } = await thrownBy(async () => { throw { message: 'lookup failed', email: EMAIL }; });
+    expect(record.error).toBe('{"message":"lookup failed","email":"[REDACTED_EMAIL]"}');
+    expect(String(thrown)).toBe(record.error);
+  });
+
+  it('an object the SDK cannot render as is (cyclic) is re-made even when no hook changed it', async () => {
+    const cyclic: any = { message: 'boom' }; cyclic.self = cyclic;
+    expect(toolErrorText(cyclic).rendersAsIs).toBe(false);
+    const { thrown, record } = await thrownBy(async () => { throw cyclic; }, []);
+    expect(thrown).not.toBe(cyclic);
+    expect(String(thrown)).toBe(record.error);
+  });
+
+  it.each([
+    ['a string', 'plain text', 'plain text'],
+    ['undefined', undefined, 'unknown error'],
+    ['an Error', new TypeError('bad'), 'TypeError: bad'],
+    ['a number', 42, '42'],
+  ])('toolErrorText renders %s the way the AI SDK does', (_l, value, text) => {
+    expect(toolErrorText(value)).toEqual({ text, rendersAsIs: true });
   });
 });

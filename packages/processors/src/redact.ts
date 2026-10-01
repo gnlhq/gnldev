@@ -288,7 +288,12 @@ export function redactString(
   return applyRedactions(s, types, mask, { extra, validate }).text;
 }
 
-/** Redacts a message list (string or parts-array content); returns a copy. */
+/**
+ * Redacts a message list (string content, and every part with a `text` field — text, reasoning);
+ * returns a copy. It does NOT walk a `tool-call` part's `input` or a `tool-result` part's `output`:
+ * those are structured values, not text. `piiRedactor` walks tool-call inputs itself on both sides,
+ * and masks tool results at their source with `redactToolResults`.
+ */
 export function redactMessages(
   messages: any[],
   types: PiiType[],

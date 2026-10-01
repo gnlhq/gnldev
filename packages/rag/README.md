@@ -28,9 +28,17 @@ await runDurable({ runId: 'r1', journal, model, tools: { searchPolicy }, prompt:
 - `InMemoryVectorStore` · `indexDocuments(store, embed, docs)` · `VectorStore` interface (plug in your own
   backend)
 - `ingestDocuments(store, embed, docs, chunkOptions?)` — chunk, embed and write whole documents so each
-  document's stored chunks are exactly its current ones: its old chunks (by the reserved trail
-  `metadata.__gnlDoc === id`, its one-chunk id, or the 0.9.0 `<id>#<n>` + `source`/`chunk` shape) are
-  deleted in its partition first. Your own metadata — `source` included — is never used to find them.
+  document's stored chunks are exactly one version of it: when the call resolves or rejects, a document
+  holds all of its new chunks or all of its previous ones, never a mix and never nothing. The new
+  chunks are written first, as a new generation (ids `<id>#<i>@<generation>`, `metadata.__gnlGen`);
+  then the document's chunks are listed by the reserved trail `metadata.__gnlDoc === id` and every
+  other generation is deleted in its partition, with the 0.9.0 shapes (a one-chunk document under its
+  raw id, `<id>#<n>` + `source`/`chunk`). Two concurrent ingests of one document converge on the newer
+  one. A write that fails is undone and the error names the document (`err.documentId`) and the
+  documents this call had already replaced (`err.replaced`). While an ingest runs, a query can see both
+  versions whole. The listing is a `query` with the trail as `filter`: an approximate index (pgvector
+  HNSW/IVFFlat) may miss chunks, which then stay until the next ingest. Your own metadata — `source`
+  included — is never used to find a document's chunks.
   Without a `namespace` on a root store, the store must declare `deleteOutsideOrganizations` (so the
   delete cannot reach an organization's document of the same id); otherwise it is refused. Use it for
   anything you re-index after an edit; `indexDocuments` only upserts, so an edit that yields fewer chunks leaves the old tail retrievable.

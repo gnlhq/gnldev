@@ -288,7 +288,7 @@ export const initCommand: Command = {
       write('src/agents/charge-demo.ts', fromTemplate('src/agents/charge-demo.ts'),
         '(calls the tool below, so the wiring is visible from the first run)');
       write(RECIPES['idempotency-tool']!.file, recipeContents(RECIPES['idempotency-tool']!));
-      for (const r of recipes) write(r.file, recipeContents(r));
+      for (const r of recipes) if (r !== RECIPES['idempotency-tool']) write(r.file, recipeContents(r));
 
       // EVERY package the files above import, asked of the one function that knows — not `r.dep`,
       // which is singular and therefore silently dropped the second import the otel recipe makes

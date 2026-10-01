@@ -184,6 +184,24 @@ describe.each(STORES)('vector write rule — $name', (store) => {
     expect(await all(s)).toBe('a2/alice=a2');
   });
 
+  // A filter key whose value is `undefined` matches a record WITHOUT that key (VectorDeleteWhere /
+  // rag DeleteWhere). @gnldev/rag's 0.9.0-record cleanup depends on it: a store that serialises the
+  // filter to JSON drops the key, and the delete widens to records that DO carry it.
+  it('filter: a key whose value is undefined matches only records without that key', async () => {
+    const s = await store.vectors();
+    await s.upsert([
+      { ...doc('t1'), metadata: { doc: 'x', trail: 'x' } },
+      { ...doc('t2'), metadata: { doc: 'x' } },
+      { ...doc('t3') },
+    ]);
+    const del = (w: unknown) => outcome(() => s.delete!(w as VectorDeleteWhere));
+    expect(await del({ ids: ['t1', 't2'], filter: { trail: undefined } })).toBe('ok:1');
+    expect(await all(s)).toBe('t1/-=t1,t3/-=t3');
+    expect(await del({ filter: { doc: 'x', trail: undefined } })).toBe('ok:0');
+    expect(await del({ ids: ['t3'], filter: { trail: undefined, doc: undefined } })).toBe('ok:1');
+    expect(await all(s)).toBe('t1/-=t1');
+  });
+
   it('a stored document is a copy: changing the item after the upsert changes nothing', async () => {
     const s = await store.vectors();
     const item = { ...doc('m1', { owner: 'alice' }, 'orig'), metadata: { k: 'orig' } };
