@@ -1026,7 +1026,8 @@ class SqliteMemoryStore implements MemoryStore {
     return pageOf(rows.map((r: any) => this.rowToThread(r)), start, limit, total);
   }
   async deleteThread(id: string): Promise<void> {
-    this.db.prepare('UPDATE gnl_threads SET deleted_at = ? WHERE id = ?').run(Date.now(), id);
+    // Soft delete, and the row keeps nothing the person wrote: its title is often their first message.
+    this.db.prepare('UPDATE gnl_threads SET deleted_at = ?, title = NULL, metadata = NULL, parent_thread_id = NULL WHERE id = ?').run(Date.now(), id);
     this.db.prepare('DELETE FROM gnl_messages WHERE thread_id = ?').run(id);
     this.db.prepare('DELETE FROM gnl_working_memory WHERE scope_id = ?').run(workingMemoryScope.thread(id));
     const legacy = legacyWorkingMemoryScope.thread(id);

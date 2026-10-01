@@ -242,8 +242,13 @@ const logQueues = new WeakMap<object, Map<string, Promise<void>>>();
  * to write them back — the earlier parts pass through as strings, and only a read decodes them.
  *
  * `gnlLog` marks the shape (a 0.9.0 log is a bare array, read as one part — see `readJournalLog`).
+ *
+ * `appendedAt[i]` is when part `i` was appended (epoch ms; `null` for a part written before this field —
+ * a 0.9.0 log, or an earlier 0.10 append). It is what dates a message that carries no timestamp of its
+ * own — every message an agent turn stores (the AI SDK message has no time field), so without it the
+ * thread sweep could never age a real conversation (`sweepThreads`, `keptNoTs`).
  */
-interface JournalLogValue { gnlLog: 1; parts: string[] }
+interface JournalLogValue { gnlLog: 1; parts: string[]; appendedAt?: Array<number | null> }
 
 function isLogValue(v: unknown): v is JournalLogValue {
   return typeof v === 'object' && v !== null && (v as JournalLogValue).gnlLog === 1 && Array.isArray((v as JournalLogValue).parts);
@@ -283,6 +288,18 @@ export const JOURNAL_LOG_MAX_ATTEMPTS = 8;
  */
 export async function readJournalLog<T = unknown>(journal: Pick<Journal, 'get'>, key: string): Promise<T[]> {
   return decodeLog<T>(await journal.get<unknown>(key));
+}
+
+/** Like `readJournalLog`, each entry with the time its append was written, when the log recorded one. */
+export async function readJournalLogDated<T = unknown>(journal: Pick<Journal, 'get'>, key: string): Promise<Array<{ entry: T; appendedAt?: number }>> {
+  const stored = await journal.get<unknown>(key);
+  if (!isLogValue(stored)) return decodeLog<T>(stored).map((entry) => ({ entry }));
+  const out: Array<{ entry: T; appendedAt?: number }> = [];
+  stored.parts.forEach((part, i) => {
+    const at = stored.appendedAt?.[i];
+    for (const entry of deserialize<T[]>(part)) out.push(typeof at === 'number' && Number.isFinite(at) ? { entry, appendedAt: at } : { entry });
+  });
+  return out;
 }
 
 function decodeLog<T>(stored: unknown): T[] {
@@ -336,7 +353,7 @@ async function casAppend(journal: Journal, key: string, part: string): Promise<v
   let lastLost: number | undefined;
   for (;;) {
     const current = await journal.get<unknown>(key);
-    const next: JournalLogValue = { gnlLog: 1, parts: [...priorParts(current), part] };
+    const next: JournalLogValue = { gnlLog: 1, parts: [...priorParts(current), part], appendedAt: [...priorTimes(current), Date.now()] };
     if (!cas) return journal.put(key, next);
     // A 0.9.0 log is the entries themselves, compared through `asStored` — see there.
     const won = current === undefined
@@ -382,6 +399,13 @@ function sizeOf(current: unknown): number {
   if (current === undefined || current === null) return -1;
   if (Array.isArray(current)) return -2 - current.length;
   return isLogValue(current) ? current.parts.length : -1;
+}
+
+/** `appendedAt` aligned with `priorParts`: `null` where a part's time was never recorded. */
+function priorTimes(current: unknown): Array<number | null> {
+  if (current === undefined || current === null) return [];
+  if (Array.isArray(current)) return current.length ? [null] : [];
+  return isLogValue(current) ? current.parts.map((_, i) => current.appendedAt?.[i] ?? null) : [];
 }
 
 function priorParts(current: unknown): string[] {

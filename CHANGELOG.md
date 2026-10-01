@@ -112,8 +112,9 @@ and who is affected.
   `JOURNAL_LOG_MAX_ATTEMPTS`; `semanticLogKey`, `SEMANTIC_LOG_PREFIX`, `SEMANTIC_LOG_SUFFIX` (the key
   @gnldev/rag's `SemanticMemory` keeps a thread's log under, built in one place); `MEMORY_PARTITION`,
   `memoryPartitionOf`, `inMemoryPartition`, `assertRootThreadId`, `ReservedThreadIdError` (+ types
-  `MemoryPartition`, `MemoryPartitionOption`); `isOrganizationKey`, `orgSpaceSql`, `ORG_KEY_PREFIX`,
-  `withRootScope`; `findReservedRootThreads` (+ type `ReservedRootThread`);
+  `MemoryPartition`, `MemoryPartitionOption`); `isOrganizationKey`, `parseOrganizationKey`, `orgSpaceSql`,
+  `ORG_KEY_PREFIX`, `withRootScope`; `findReservedRootThreads` (+ type `ReservedRootThread`);
+  `recordThreadCreated`;
   `assertDeletesOutsideOrganizations`; `encodeStepRecord`, `decodeStepRecord`; `scoreSample`,
   `runScoreSample`, `scoreRunMemoized`, `scorerFingerprint`, `inputText`, `assertDistinctScorerNames`,
   `memoizeScoring` (+ types `ScoreSampleFields`, `FingerprintedScorer`); `ScorerLike.fingerprint`; the
@@ -137,9 +138,25 @@ and who is affected.
   `sweepThreads` looked there: erasure listed the thread in `unreachedThreads` but the user's messages
   stayed in the journal, and a sweep never dated or removed the log. Measured with data written by 0.9.0
   and by this version alike. `purgeThread` now removes the `sem:` log with the thread, `sweepThreads`
-  dates and removes it, and erasure no longer reports a thread it removed. A sibling: `eraseSubject`
+  dates and removes it — a message with no timestamp (every agent turn's) by when its append was
+  written, which the log now records (measured before: a real agent turn's thread was `keptNoTs` on
+  every sweep, BasicMemory and SemanticMemory alike) — and erasure no longer reports a thread it removed. A sibling: `eraseSubject`
   also left a `BasicMemory` thread whose runs were already gone while reporting `unreachedThreads: []`;
   it now removes it through the thread's owner record. Nothing to change in your code.
+- **The default `migrateReservedRootThreads`, and the root `eraseSubject`, took an organization's own
+  threads.** 0.9's thread gate wrote a root owner record (`backfilled: true`, the store's `resourceId`)
+  even for a ROOT request it refused on an organization's thread id, and that record was read as "the
+  root's". Measured on a 0.9.0 database: the default migration moved acme's `t-run` and `t-cont` to
+  `legacy-org:acme:*`, acme then read nothing and the root's `u1` read both; the root erasure of `u1`
+  deleted them. One question now decides, for the finder, the migration and the root erasure alike: an
+  organization's owner record says it is that organization's; a backfilled root record is no evidence;
+  only an id no organization can produce (`org:123`) or a root record the root wrote itself makes it the
+  root's; anything else is undecided — listed, never moved unless named in `threadIds`, and reported
+  (not deleted) by the root erasure. Nothing to change in your code.
+- **A deleted thread kept its title.** `MemoryStore.deleteThread` soft-deletes the thread record, which
+  kept `title` (often the person's first message, from an implicit thread) and `metadata`: after an
+  erasure the first message was still in `gnl_threads`. The kept record now holds the id, owner and
+  times only (in-memory, SQLite, Postgres).
 - **The root scope read every organization's runs.** ADR-0001 says "in the root scope, every
   organization's rows are hidden", and memory held it; runs did not. An organization's run sits in the
   root journal as `org:<id>:<runId>`, and the root scope read through the raw journal. Measured through
@@ -330,8 +347,8 @@ and who is affected.
   the store scanned the root, and the view kept none of it. The view now warns once per store when no
   store read the partition it passed, naming the fix (forward `{ ...q }`, read `memoryPartitionOf`).
 - **`eraseSubject` without an organization said nothing about a person's 0.9 root threads named
-  `org:…`.** It now lists every one of the person's in that space in `unreachedThreads`
-  (`findReservedRootThreads`) — the root's, and the ones it cannot tell from an organization's own.
+  `org:…`.** It now erases the ones that are certainly the root's and lists the undecided ones in
+  `unreachedThreads` (`findReservedRootThreads`); an organization's own is left to its erasure.
 - **`WorkStore.list` on Postgres threw under REPEATABLE READ or SERIALIZABLE.** With either as the
   database's `default_transaction_isolation`, two readers numbering one namespace collided on its
   counter row and one failed with 40001 (measured: 74 of 120 `list` calls). Numbering now runs at READ
@@ -670,6 +687,18 @@ and who is affected.
 
 ### Known limits
 
+- **Messages a 0.9 process appended without a timestamp cannot be aged.** The thread sweep dates a
+  message by its `ts` / `at` / `createdAt`, else by when its append was written — which the journal log
+  records from this version on. An agent turn's messages carry no time of their own, so a thread whose
+  messages all came from 0.9 turns stays `keptNoTs` until a new turn is appended (then it ages from that
+  turn) or it is erased.
+- **The first read of a work log numbers it (SQLite, Postgres).** `WorkStore.list` numbers the records
+  no reader has numbered yet: a 0.9 backlog, or a 0.9 producer's records in a rolling deploy, is
+  numbered by the first read after the upgrade, which writes each one's number once (measured above:
+  1 500 fresh records read at 31 975 records/s on Postgres, 184 051 on SQLite). An idle read is two
+  statements instead of 0.9's one (1.6 ms on the same Postgres). Redis numbers at append and pays
+  nothing on read.
+
 - **Upgrading from 0.9: stop every 0.9 process that runs agents, workflows, sweeps or workers before any
   process of this version writes to the same storage.** 0.9 cannot read what this version writes, and
   0.9.0 cannot be changed. Measured with 0.9.0 against this version's data on one database:
@@ -698,12 +727,16 @@ and who is affected.
   worker re-reads from the head (markers skip what is done): the `gnl_work_kv` rows `qcursor` and
   `evtcursor:*` (`org:<id>:`-prefixed for an organization), or the Redis keys `<keyPrefix>wk:qcursor`
   and `<keyPrefix>wk:evtcursor:*`.
-- **A 0.9 root thread shaped like an organization's (`org:acme:x`), with no owner record either way,**
-  cannot be told from that organization's own thread (0.9 registered no organization, so "does acme
-  exist" cannot be read from the journal either): until it is moved, the organization reads it.
-  `findReservedRootThreads` / `migrateReservedRootThreads` list it as undecided and never move it
-  unguided — measured: guessing moved an organization's own 0.9 thread out from under it. Name it in
-  `threadIds` to move it.
+- **A 0.9 root thread shaped like an organization's (`org:acme:x`)** cannot be told from that
+  organization's own thread unless an owner record says whose it is: the organization's record (it is
+  the organization's), or a root record the root wrote itself, not a backfilled one (it is the root's).
+  0.9 registered no organization, wrote no record for a thread made by a memory alone, and backfilled a
+  root record even for a root request it refused, so most such threads have no deciding record: until
+  one is moved, the organization reads it. `findReservedRootThreads` / `migrateReservedRootThreads`
+  list it as undecided and never move it unguided, and the root `eraseSubject` reports it without
+  deleting it — measured: guessing moved an organization's own 0.9 thread out from under it. Name it
+  in `threadIds` to move it. A thread an organization's `AgentMemory` creates from this version on
+  carries the organization's record, so it is never undecided.
 - **Redis numbers a 0.9 producer's records in producer-clock order** (`ts`, then id): a bare SET keeps
   no insertion order. SQLite and Postgres use insertion order. Either way such a record is numbered
   above every number handed out, so it never lands behind a cursor.

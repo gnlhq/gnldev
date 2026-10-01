@@ -154,6 +154,16 @@ export const MEMORY = {
   orgThread: 't-acme',
   /** Root threads 0.9.0 let a caller name with the organization prefix. */
   orgPrefixedRootThreads: ['org:123', 'org:legacy:notes'],
+  /**
+   * acme's own threads that a 0.9.0 ROOT request named by their physical id (`org:acme:<t>`). The gate
+   * refused it, and BACKFILLED a root owner record from the store's resourceId on the way
+   * (`thread:org:acme:<t>:owner = { resourceId: 'u1', backfilled: true }`). `orgRunThread` also has
+   * acme's own record (a run of acme's wrote it); `orgMemThread` was written by a memory alone.
+   */
+  orgRunThread: 't-run',
+  orgMemThread: 't-cont',
+  /** The root caller of that request. */
+  intruder: 'intruder',
   otherUserThread: 't-u2',
   wmThread: 't-wm',
   omThread: 't-om',

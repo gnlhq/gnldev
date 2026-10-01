@@ -9,7 +9,7 @@
 import type { Journal, JournalEntry, RunSummary, JournalReader, RunStatus } from './journal.js';
 import { VectorOwnerConflictError } from './errors.js';
 import { assertOwnerId, isWellFormed, OwnerIdError } from './owned-name.js';
-import { ORG_KEY_PREFIX, isOrganizationKey, orgSpaceSql, prefixSql } from './organization.js';
+import { ORG_KEY_PREFIX, isOrganizationKey, parseOrganizationKey, orgSpaceSql, prefixSql } from './organization.js';
 
 // ── Common ──────────────────────────────────────────────────────────────────
 
@@ -209,7 +209,7 @@ export function memoryPartitionOf(opts: MemoryPartitionOption | undefined): Memo
   if (prefix === undefined) return { kind: 'root' };
   // Written only by withOrgStorage, from a validated orgId. Anything else is a bug worth stopping on,
   // not a reason to widen the scan.
-  if (typeof prefix !== 'string' || !/^org:([^:]+:)?$/.test(prefix)) {
+  if (typeof prefix !== 'string' || (prefix !== ORG_KEY_PREFIX && parseOrganizationKey(prefix)?.rest !== '')) {
     throw new Error(`@gnldev/durable: invalid memory partition '${String(prefix)}' — expected 'org:<id>:'`);
   }
   partitionSeen.set(prefix, (partitionSeen.get(prefix) ?? 0) + 1);
@@ -343,7 +343,7 @@ export const workingMemoryScope = {
  */
 export const legacyWorkingMemoryScope = {
   thread: (threadId: string): string | undefined => {
-    const bare = /^org:[^:]+:/.test(threadId) ? threadId.slice(threadId.indexOf(':', 4) + 1) : threadId;
+    const bare = parseOrganizationKey(threadId)?.rest ?? threadId;
     return /^(thread|resource|res):/.test(bare) ? undefined : threadId;
   },
   resource: (resourceId: string): string => `res:${resourceId}`,

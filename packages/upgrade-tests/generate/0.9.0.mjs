@@ -166,9 +166,31 @@ async function memoryScenario(s) {
   await plain.createThread({ id: M.otherUserThread, resourceId: 'u2' });
   await plain.append(M.otherUserThread, [{ role: 'user', content: 'U2-KEEP hello' }]);
 
-  const org = new AgentMemory({ storage: m.durable.withOrgStorage(s, M.orgId), embed: S.fixtureEmbed });
+  const orgStorage = m.durable.withOrgStorage(s, M.orgId);
+  const org = new AgentMemory({ storage: orgStorage, embed: S.fixtureEmbed });
   await org.createThread({ id: M.orgThread, resourceId: 'u1' });
   await org.append(M.orgThread, [{ role: 'user', content: `${mark('ACME')} org hello` }]);
+  // acme's run-backed thread (acme's own owner record) and a memory-only one; then a ROOT request names
+  // each by its physical id. 0.9.0 refuses it — and backfills a root owner record first.
+  const { echoModel: echo } = await load('durable', 'mock-model.js');
+  await m.durable.runDurable({
+    runId: 'r-acme-run', journal: m.durable.toJournal(orgStorage.runs), model: echo(), prompt: `${mark('ACMERUN')} acme run`,
+    memory: org, threadId: M.orgRunThread, resourceId: 'u1',
+  });
+  await org.createThread({ id: M.orgMemThread, resourceId: 'u1' });
+  await org.append(M.orgMemThread, [{ role: 'user', content: `${mark('ACMEMEM')} acme memory only` }]);
+  const refused = {};
+  for (const t of [M.orgRunThread, M.orgMemThread]) {
+    try {
+      await m.durable.runDurable({
+        runId: `r-intrude-${t}`, journal: m.durable.toJournal(s.runs), model: echo(), prompt: 'intruder asks',
+        memory: plain, threadId: `org:${M.orgId}:${t}`, resourceId: M.intruder,
+      });
+      refused[t] = false;
+    } catch (e) {
+      refused[t] = e.name ?? 'Error';
+    }
+  }
 
   const wm = new AgentMemory({ storage: s, embed: S.fixtureEmbed, workingMemory: { scope: 'resource', template: '# Notes' } });
   await wm.createThread({ id: M.wmThread, resourceId: 'u1' });
@@ -197,6 +219,8 @@ async function memoryScenario(s) {
     rootListThreads: (await plain.listThreads({ resourceId: 'u1' })).map((t) => t.id),
     observations: (await s.memory.getObservations(M.omThread)).map((o) => o.text),
     basicShape: Array.isArray(await j.get(`mem:${M.basicThread}:messages`)) ? 'array' : typeof (await j.get(`mem:${M.basicThread}:messages`)),
+    intruderRefused: refused,
+    ownerRecords: Object.fromEntries(await Promise.all((await j.listKeys('')).filter((k) => k.endsWith(':owner') && k.includes(`${M.orgId}:`)).sort().map(async (k) => [k, await j.get(k)]))),
   };
 }
 

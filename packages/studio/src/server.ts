@@ -5,7 +5,7 @@ import { Hono, type Context } from 'hono';
 import { sseResponse } from './sse.js';
 
 import { STUDIO_ERROR_CODES } from './error-codes.js';
-import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, eraseSubject, subjectRuns, toJournal, decodeStepRecord } from '@gnldev/durable';
+import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, eraseSubject, subjectRuns, toJournal, decodeStepRecord } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
 import type { JournalReader, Journal, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
@@ -2520,7 +2520,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const bound = principalOf(c.req.raw)?.orgId ?? orgALS.getStore();
     // Merge DISCOVERED orgs (with org:<id>: prefixed data) with EXPLICITLY REGISTERED ones (__org__:<id>) →
     // a newly created org with no runs yet also shows up in the list.
-    const discovered = keys.map((k) => { const j = k.indexOf(':', ORG_KEY_PREFIX.length); return j > ORG_KEY_PREFIX.length ? k.slice(ORG_KEY_PREFIX.length, j) : ''; }).filter(Boolean);
+    const discovered = keys.map((k) => parseOrganizationKey(k)?.orgId).filter((id): id is string => id !== undefined);
     // listKeys also returns tombstones (put(__org__:id, null) — see DELETE /organizations); the codebase's
     // general convention is `get(...) != null` = "exists" (see ~line 972, ~1029). A deleted org would
     // otherwise stay in the list (the "0 records deleted but still shows on screen" bug) → skip records with a null value.

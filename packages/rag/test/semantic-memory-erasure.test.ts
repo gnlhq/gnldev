@@ -6,7 +6,8 @@
 // in `unreachedThreads` and left every message; the sweep never saw the thread at all. Data written by
 // the current code, not only 0.9.0's.
 import { describe, it, expect } from 'vitest';
-import { InMemoryStorage, assignThreadOwner, eraseSubject, sweepThreads, toJournal, semanticLogKey } from '@gnldev/durable';
+import { InMemoryStorage, InMemoryJournal, createGnl, assignThreadOwner, eraseSubject, sweepThreads, toJournal, semanticLogKey } from '@gnldev/durable';
+import { echoModel } from '@gnldev/durable/mock';
 import { SemanticMemory } from '../src/index.js';
 
 const embed = async (t: string) => [t.length, 1, 1];
@@ -36,5 +37,18 @@ describe('SemanticMemory and the thread lifecycle', () => {
     expect(r.purged).toEqual(['old']);
     expect(await journal.get(semanticLogKey('old'))).toBeUndefined();
     expect((await sm.getMessages('new')).map((m) => m.content)).toEqual(['new']);
+  });
+
+  it("a real agent turn's messages (no timestamp of their own) are dated by their append: swept once old, kept while young", async () => {
+    // Measured before: the engine stores the AI SDK message as given — no time field — so every agent
+    // turn's thread counted as `keptNoTs` and no sweep ever removed one.
+    const journal = new InMemoryJournal();
+    const sm = new SemanticMemory({ journal, embed });
+    const gnl = createGnl({ journal, memory: sm, agents: { a: { model: echoModel() } } } as never);
+    await gnl.run('a', { runId: 'r1', prompt: 'hello', threadId: 't1' } as never);
+    expect((await sweepThreads(journal, { olderThanMs: 60_000, now: Date.now() })).purged).toEqual([]);
+    const r = await sweepThreads(journal, { olderThanMs: 60_000, now: Date.now() + 86_400_000 });
+    expect(r).toMatchObject({ purged: ['t1'], keptNoTs: 0 });
+    expect(await journal.get(semanticLogKey('t1'))).toBeUndefined();
   });
 });

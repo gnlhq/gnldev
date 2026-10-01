@@ -121,6 +121,19 @@ async function allBornUnknown(journal: Journal, runs: RunSummary[]): Promise<boo
 }
 
 /**
+ * A memory created a thread for `resourceId` with no run: its owner record, first write wins — the
+ * record the gate would otherwise backfill from the same `resourceId` on the thread's first run.
+ * `@gnldev/memory`'s AgentMemory writes it for an ORGANIZATION's thread, through that organization's
+ * journal view (`org:<id>:thread:<t>:owner`): that record is what tells an organization's thread apart
+ * from one 0.9 let the root create under the same physical id (`findReservedRootThreads` in
+ * erase.ts). Without it a thread made by a memory alone is undecided there, every time.
+ */
+export async function recordThreadCreated(journal: Journal, threadId: string, resourceId: string): Promise<void> {
+  if (typeof resourceId !== 'string' || resourceId === '') return; // names nobody: nothing to record
+  await claim(journal, threadOwnerKey(threadId), { at: Date.now(), resourceId, created: true });
+}
+
+/**
  * An OPERATOR's answer to "whose thread is this": writes the owner record, replacing whatever it said.
  * The one way a closed thread (history, no derivable owner — see `threadOwnerOf`) reaches a user again.
  * Staff-only by nature: call it from an operator path, never with an id an end user supplied.

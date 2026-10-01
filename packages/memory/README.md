@@ -120,8 +120,12 @@ in place); a thread id that begins `thread:`, `resource:` or `res:` is ambiguous
 - **Threads 0.9 let the root create under `org:`:** the root scope can no longer name such an id, and
   one shaped like an organization's (`org:acme:support`) is read by that organization.
   `migrateReservedRootThreads(storage)` moves the root's to `legacy-<id>` (messages, working memory,
-  observations, owner record); `{ dryRun: true }` reports first, and a thread that may be the
-  organization's own is listed as `undecided` and moved only when named in `threadIds`.
+  observations, owner record); `{ dryRun: true }` reports first. The root's are the ids no organization
+  can produce (`org:123`) and the ones whose root owner record the root wrote itself — a record 0.9's gate
+  backfilled is no evidence. One the organization's owner record claims is never moved; any other may be
+  the organization's own, is listed as `undecided`, and is moved only when named in `threadIds`. An
+  organization's `AgentMemory` writes that record when it creates a thread, so its threads are never
+  undecided.
 
 ## Lite alternative
 For anyone who just wants simple topK recall, `SemanticMemory` in `@gnldev/rag` is lighter; it uses the same

@@ -5,7 +5,7 @@
 import { runKeys, summarizeRun, nestedAgentRunId, runIdOfKey } from './journal.js';
 import { identityOnlyInput } from './run.js';
 import { workKeyHash } from './hash.js';
-import { MEM_LEAVES, OM_LEAVES, readJournalLog, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX } from './memory.js';
+import { MEM_LEAVES, OM_LEAVES, memKey, readJournalLogDated, semanticLogKey, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX } from './memory.js';
 import type { Memory } from './memory.js';
 import { threadOwnerOf, threadOwnerKey } from './thread-owner.js';
 import type { WorkScopeKind } from './hash.js';
@@ -1224,9 +1224,12 @@ export async function listOrphanThreadState(journal: Journal): Promise<OrphanThr
 }
 
 /**
- * Sweeps BasicMemory threads: threads whose last message ts is older than the threshold are
- * permanently deleted via purgeThread (`mem:<threadId>:` prefix — messages + working together).
- * Safe side: threads whose ts can't be read (untimestamped messages or no messages at all) are NOT deleted.
+ * Sweeps BasicMemory and SemanticMemory threads: threads whose last message is older than the
+ * threshold are permanently deleted via purgeThread (`mem:<threadId>:` prefix — messages + working
+ * together; `sem:<threadId>:log`). A message is dated by its own `ts`/`at`/`createdAt`, else by when its
+ * append was written (the journal log records that since 0.10 — an agent turn's messages carry no time).
+ * Safe side: threads none of whose messages can be dated (no messages, or only messages appended by
+ * 0.9 or earlier without a timestamp) are NOT deleted (`keptNoTs`).
  * Requires listKeys + deletePrefix (requireDelete pattern).
  *
  * THE DISCOVERY GAP, reported rather than silently closed (`orphanThreadState`).
@@ -1275,11 +1278,18 @@ export async function sweepThreads(journal: Journal, opts: ThreadSweepOptions): 
   const result: ThreadSweepResult = { scanned: 0, purged: [], keptNoTs: 0, orphanThreadState: [] };
   for (const threadId of threadIds) {
     result.scanned++;
-    const messages = [
-      ...(await readJournalLog<any>(journal, `${MEM_PREFIX}${threadId}:messages`)),
-      ...(await readJournalLog<{ message?: unknown }>(journal, `${SEMANTIC_LOG_PREFIX}${threadId}${SEMANTIC_LOG_SUFFIX}`)).map((e) => e?.message),
-    ];
-    const stamps = messages.map(readMessageTs).filter((t): t is number => t !== undefined);
+    // Each message is dated by its own timestamp, else by when its append was written (the log
+    // records that — an agent turn's messages carry no time of their own). Keys come from the same
+    // builders the memories write with; an id they refuse is not read, and so not dated: kept.
+    const dated = async <T>(key: () => string, message: (e: T) => unknown) => {
+      let k: string;
+      try { k = key(); } catch { return []; }
+      return (await readJournalLogDated<T>(journal, k)).map(({ entry, appendedAt }) => readMessageTs(message(entry)) ?? appendedAt);
+    };
+    const stamps = [
+      ...(await dated<unknown>(() => memKey(threadId, 'messages'), (m) => m)),
+      ...(await dated<{ message?: unknown }>(() => semanticLogKey(threadId), (e) => e?.message)),
+    ].filter((t): t is number => t !== undefined);
     if (stamps.length === 0) {
       result.keptNoTs++; // age can't be measured → safe side: preserve
       continue;

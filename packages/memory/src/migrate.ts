@@ -79,8 +79,9 @@ export async function migrateWorkingMemoryKeys(store: MemoryStore, opts: Migrate
 export interface MigrateReservedRootThreadsOptions {
   /**
    * Threads to move. Omitted: every thread `findReservedRootThreads` is certain is the root's
-   * (`rootOnly`). A thread shaped like an organization's with no owner record either way is only
-   * moved when named here — it may be that organization's own.
+   * (`rootOnly`). An undecided one (shaped like an organization's, and no owner record the root wrote
+   * itself) is only moved when named here — it may be that organization's own. One an organization's
+   * owner record claims is never moved; naming it reports it in `skipped`.
    */
   threadIds?: string[];
   /** The new id for a thread. Default: `legacy-<id>` (`org:acme:support` → `legacy-org:acme:support`). */
@@ -93,7 +94,7 @@ export interface MigrateReservedRootThreadsReport {
   moved: Array<{ from: string; to: string }>;
   /** Root threads in the reserved space that were not moved because they may be an organization's: name them in `threadIds` to move them. */
   undecided: string[];
-  /** Not moved, with the reason: the new id is taken, or is itself in the reserved space. */
+  /** Not moved, with the reason and the way through: the new id is taken or is itself in the reserved space (`rename`), or a named id is an organization's own or no such thread. */
   skipped: Array<{ id: string; reason: string }>;
 }
 
@@ -125,14 +126,31 @@ export async function migrateReservedRootThreads(storage: Storage, opts: Migrate
   const found = await findReservedRootThreads(storage);
   const named = opts.threadIds ? new Set(opts.threadIds) : undefined;
   const runs = toJournal(storage.runs);
+  // A named id the finder does not return is not moved, and says why: an organization's own (its owner
+  // record says so — moving it would take it from that organization), or no thread of the reserved space.
+  for (const id of named ?? []) {
+    if (found.some((t) => t.id === id)) continue;
+    report.skipped.push({
+      id,
+      reason: isOrganizationKey(id) && (await store.getThread(id)) !== undefined
+        ? 'an organization\'s owner record says this thread is that organization\'s own; it is not moved from under it'
+        : 'no root thread with this id in the organizations\' reserved space',
+    });
+  }
   for (const t of found) {
     if (named ? !named.has(t.id) : !t.rootOnly) {
       if (!t.rootOnly) report.undecided.push(t.id);
       continue;
     }
     const to = rename(t.id);
-    if (isOrganizationKey(to)) { report.skipped.push({ id: t.id, reason: `the new id '${to}' is in the organizations' reserved space too` }); continue; }
-    if ((await store.getThread(to)) !== undefined) { report.skipped.push({ id: t.id, reason: `a thread '${to}' already exists` }); continue; }
+    if (isOrganizationKey(to)) {
+      report.skipped.push({ id: t.id, reason: `the new id '${to}' is in the organizations' reserved space too: give \`rename\` an id outside \`org:\`` });
+      continue;
+    }
+    if ((await store.getThread(to)) !== undefined) {
+      report.skipped.push({ id: t.id, reason: `a thread '${to}' already exists: give this thread a free id with the \`rename\` option` });
+      continue;
+    }
     report.moved.push({ from: t.id, to });
     if (opts.dryRun) continue;
     await moveThread(store, t.id, to);

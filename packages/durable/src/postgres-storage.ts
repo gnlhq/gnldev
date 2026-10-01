@@ -1263,7 +1263,8 @@ class PgMemoryStore implements MemoryStore {
     return pageOf(r.rows.map((x) => this.toThread(x)), start, limit, total);
   }
   async deleteThread(id: string): Promise<void> {
-    await this.q('UPDATE gnl_threads SET deleted_at = $1 WHERE id = $2', [Date.now(), id]);
+    // Soft delete, and the row keeps nothing the person wrote: its title is often their first message.
+    await this.q('UPDATE gnl_threads SET deleted_at = $1, title = NULL, metadata = NULL, parent_thread_id = NULL WHERE id = $2', [Date.now(), id]);
     await this.q('DELETE FROM gnl_messages WHERE thread_id = $1', [id]);
     await this.q('DELETE FROM gnl_working_memory WHERE scope_id = $1', [workingMemoryScope.thread(id)]);
     const legacy = legacyWorkingMemoryScope.thread(id);

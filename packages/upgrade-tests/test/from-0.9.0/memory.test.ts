@@ -54,18 +54,47 @@ describe('upgrade from 0.9.0 — memory', () => {
     expect(found).toEqual([
       { id: 'org:123', resourceId: 'u1', rootOnly: true }, // no organization's view can produce it
       { id: `org:${M.orgId}:${M.orgThread}`, resourceId: 'u1', rootOnly: false }, // acme's own — no record either way
+      { id: `org:${M.orgId}:${M.orgMemThread}`, resourceId: 'u1', rootOnly: false }, // acme's — only a BACKFILLED root record
       { id: 'org:legacy:notes', resourceId: 'u1', rootOnly: false }, // shaped like an organization's: undecided
-    ]);
+    ]); // `org:acme:t-run` is not listed: acme's own record decides first
     // The default migration moves only what is certainly the root's.
     const r = await migrateReservedRootThreads(storage);
     expect(r.moved).toEqual([{ from: 'org:123', to: 'legacy-org:123' }]);
-    expect(r.undecided).toEqual([`org:${M.orgId}:${M.orgThread}`, 'org:legacy:notes']);
+    expect(r.undecided).toEqual([`org:${M.orgId}:${M.orgThread}`, `org:${M.orgId}:${M.orgMemThread}`, 'org:legacy:notes']);
     expect(text(await root.getMessages('legacy-org:123'))).toContain(mark('ORGPREFIX'));
     expect(text(await acme.getMessages(M.orgThread))).toContain(mark('ACME'));
     // The operator names the undecided root one; acme's stays acme's.
     expect((await migrateReservedRootThreads(storage, { threadIds: ['org:legacy:notes'] })).moved).toEqual([{ from: 'org:legacy:notes', to: 'legacy-org:legacy:notes' }]);
     expect(text(await root.getMessages('legacy-org:legacy:notes'))).toContain(mark('ORGPREFIX'));
-    expect((await acme.listThreads({ resourceId: 'u1' })).map((t) => t.id)).toEqual([M.orgThread]);
+    expect((await acme.listThreads({ resourceId: 'u1' })).map((t) => t.id).sort()).toEqual([M.orgMemThread, M.orgRunThread, M.orgThread].sort());
+  });
+
+  // final-B M1: 0.9.0's gate backfilled a root owner record (`backfilled: true`, the store's resourceId —
+  // acme's u1) for a ROOT request it refused. Read as "the root's", the default migration moved acme's
+  // threads to `legacy-org:acme:*`, acme read nothing, and the root's u1 read them; the root erasure
+  // deleted them.
+  it("acme's threads a refused 0.9.0 root request named stay acme's: not moved, not erased by the root", async () => {
+    expect(notes090.memory.intruderRefused).toEqual({ [M.orgRunThread]: 'ThreadOwnerMismatchError', [M.orgMemThread]: 'ThreadOwnerMismatchError' });
+    expect(notes090.memory.ownerRecords[`thread:org:${M.orgId}:${M.orgRunThread}:owner`]).toMatchObject({ resourceId: 'u1', backfilled: true });
+    expect(notes090.memory.ownerRecords[`thread:org:${M.orgId}:${M.orgMemThread}:owner`]).toMatchObject({ resourceId: 'u1', backfilled: true });
+    const f = openFixture('memory.db');
+    const acme = new AgentMemory({ storage: withOrgStorage(f.storage, M.orgId), embed: S.fixtureEmbed });
+    const r = await migrateReservedRootThreads(f.storage);
+    expect(r.moved.map((x) => x.from)).not.toEqual(expect.arrayContaining([`org:${M.orgId}:${M.orgRunThread}`]));
+    expect(r.moved.map((x) => x.from)).not.toEqual(expect.arrayContaining([`org:${M.orgId}:${M.orgMemThread}`]));
+    // Named, the one acme's own record claims is refused with the reason; the undecided one would move (not done here).
+    const named = await migrateReservedRootThreads(f.storage, { threadIds: [`org:${M.orgId}:${M.orgRunThread}`], dryRun: true });
+    expect(named.moved).toEqual([]);
+    expect(named.skipped[0]!.reason).toMatch(/organization's own/);
+    const erased = await eraseSubject(f.storage, 'u1');
+    expect(erased.unreachedThreads).toContain(`org:${M.orgId}:${M.orgMemThread}`);
+    expect(erased.unreachedThreads).not.toContain(`org:${M.orgId}:${M.orgRunThread}`);
+    expect(text(await acme.getMessages(M.orgRunThread))).toContain(mark('ACMERUN'));
+    expect(text(await acme.getMessages(M.orgMemThread))).toContain(mark('ACMEMEM'));
+    // acme's own erasure takes them.
+    await eraseSubject(f.storage, 'u1', { orgId: M.orgId });
+    expect(await acme.getMessages(M.orgRunThread)).toEqual([]);
+    expect(await acme.getMessages(M.orgMemThread)).toEqual([]);
   });
 
   it('working memory 0.9.0 wrote (resource and thread scope) is read back', async () => {

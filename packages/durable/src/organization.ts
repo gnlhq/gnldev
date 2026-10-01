@@ -170,6 +170,20 @@ export function isOrganizationKey(id: string): boolean {
 }
 
 /**
+ * The ONE reading of an id in the reserved space: `org:<orgId>:<rest>` → `{ orgId, rest }`, the id an
+ * organization's view writes for its own `rest` (a thread, a run, a key). `undefined` for an id no
+ * organization's view can produce: outside the space, or `org:123` (no second separator), or `org::x`
+ * (an empty organization id, which `orgPrefix` refuses). `rest` may be empty (`org:acme:`, a prefix).
+ * Each regex that parsed this shape by hand answered a slightly different question.
+ */
+export function parseOrganizationKey(id: string): { orgId: string; rest: string } | undefined {
+  if (!isOrganizationKey(id)) return undefined;
+  const end = id.indexOf(':', ORG_KEY_PREFIX.length);
+  if (end <= ORG_KEY_PREFIX.length) return undefined;
+  return { orgId: id.slice(ORG_KEY_PREFIX.length, end), rest: id.slice(end + 1) };
+}
+
+/**
  * The SQL twin of `isOrganizationKey` (and of `id.startsWith(orgPrefix(orgId))` with `orgId`): a
  * condition on column `col` for the two SQL adapters. `ph()` renders the next placeholder in the
  * adapter's syntax (`?` or `$k`); `params` fill them in order. `outside: true` negates it.

@@ -121,7 +121,8 @@ class InMemoryMemoryStore implements MemoryStore {
   }
   async deleteThread(id: string) {
     const t = this.threads.get(id);
-    if (t) this.threads.set(id, { ...t, deletedAt: Date.now() });
+    // Soft delete, and the record keeps nothing the person wrote: its title is often their first message.
+    if (t) this.threads.set(id, { id: t.id, resourceId: t.resourceId, createdAt: t.createdAt, updatedAt: t.updatedAt, deletedAt: Date.now() });
     this.messages.delete(id);
     this.wm.delete(workingMemoryScope.thread(id));
     const legacy = legacyWorkingMemoryScope.thread(id);

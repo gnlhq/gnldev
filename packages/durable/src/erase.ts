@@ -24,7 +24,7 @@
 import { purgeResource, purgeThread, assertDeletesOutsideOrganizations } from './retention.js';
 import { ownedPrefix } from './owned-name.js';
 import { threadOwnerOf, threadOwnerKey } from './thread-owner.js';
-import { withOrg, isOrganizationKey, orgPrefix, ORG_KEY_PREFIX, ORG_RECORD_PRE } from './organization.js';
+import { withOrg, isOrganizationKey, parseOrganizationKey, orgPrefix, ORG_KEY_PREFIX, ORG_RECORD_PRE } from './organization.js';
 import { orgVectorDelete, orgStorageScopeOf, withOrgStorage } from './org-storage.js';
 import { toJournal, workingMemoryScope, legacyWorkingMemoryScope, MEMORY_PARTITION } from './storage.js';
 import { memKey, MEM_LEAVES, OM_VECTOR_SOURCE, semanticLogKey } from './memory.js';
@@ -69,9 +69,10 @@ export interface EraseReport {
    * erasure did NOT reach everything, whatever the other counts say.
    *
    * Also lists, for an erasure outside organizations, this person's threads that 0.9 let the root
-   * create under an `org:` id (`findReservedRootThreads`, the `rootOnly` ones): the root scope can no
-   * longer name them.
-   * Move them to a free id with `migrateReservedRootThreads` (@gnldev/memory) and erase again.
+   * create under an `org:` id and that are not certainly the root's (`findReservedRootThreads`,
+   * `rootOnly: false`): they may be an organization's, so they are not deleted here. The certain ones
+   * are erased like any other thread. Decide each one, move it with `migrateReservedRootThreads`
+   * (@gnldev/memory, naming it in `threadIds`), and erase again.
    */
   unreachedThreads: string[];
   /** What each eraser removed, by its name. */
@@ -136,13 +137,61 @@ export interface ReservedRootThread {
   id: string;
   resourceId: string;
   /**
-   * `true`: certainly the root's — no organization's view can produce this id (`org:123`, `org::x`),
-   * or the root journal holds its owner record. `false`: shaped like an organization's thread
-   * (`org:acme:support`) and no owner record says whose it is — it may be that organization's own
-   * (0.9 registered no organization and a memory-only thread leaves no record), so it is not guessed;
-   * decide by hand and name it in `migrateReservedRootThreads`'s `threadIds`.
+   * `true`: certainly the root's (`reservedThreadVerdict`) — no organization's view can produce this id
+   * (`org:123`, `org::x`), or the root journal holds an owner record the root itself wrote. `false`:
+   * shaped like an organization's thread (`org:acme:support`) and nothing says whose it is — it may be
+   * that organization's own (0.9 registered no organization, a memory-only thread leaves no record, and
+   * 0.9's gate BACKFILLED a root record from the store's resourceId even for a refused root request),
+   * so it is not guessed; decide by hand and name it in `migrateReservedRootThreads`'s `threadIds`.
    */
   rootOnly: boolean;
+}
+
+/** Whose a reserved-space thread is, as far as the journal can tell. */
+type ReservedVerdict = 'organization' | 'root' | 'undecided';
+
+/**
+ * THE question for a thread in the root store under an `org:` id: is it certainly the ROOT's? Asked by
+ * `findReservedRootThreads` (so `migrateReservedRootThreads`) and by the root `eraseSubject` — one
+ * answer, so the finder cannot list as the root's what the erasure would then delete, or the reverse.
+ *
+ *  1. An owner record the ORGANIZATION wrote (`org:<id>:thread:<t>:owner`) decides first: its own.
+ *  2. A root record with `backfilled: true` is NOT evidence. The gate wrote it by copying the store's
+ *     `resourceId` — the organization's own user, for an organization's thread — and 0.9 wrote it even
+ *     for a root request it then refused (measured on the 0.9.0 fixture: the default migration moved
+ *     acme's `t-run` to `legacy-org:acme:t-run`, acme read nothing, and the root user read its secret).
+ *  3. Certainly the root's: an id no organization's view can produce (`org:123`, `org::x`), or a root
+ *     owner record the root wrote itself (its first run on a thread that did not exist yet).
+ *  4. Anything else: undecided. Never guessed in either direction.
+ */
+async function reservedThreadVerdict(runs: Journal, threadId: string): Promise<ReservedVerdict> {
+  const shaped = parseOrganizationKey(threadId);
+  if (shaped === undefined) return 'root';
+  if ((await runs.get(orgPrefix(shaped.orgId) + threadOwnerKey(shaped.rest))) !== undefined) return 'organization';
+  const rec = await runs.get<{ backfilled?: unknown } | null>(threadOwnerKey(threadId));
+  if (rec !== undefined && rec !== null && rec.backfilled !== true) return 'root';
+  return 'undecided';
+}
+
+/** The reserved-space threads one memory store holds that are not an organization's, by `reservedThreadVerdict` over `runs`. */
+async function reservedThreadsIn(store: MemoryStore, runs: Journal, resourceId?: string): Promise<ReservedRootThread[]> {
+  const out: ReservedRootThread[] = [];
+  let cursor: string | undefined;
+  do {
+    // The whole reserved space: a code-only partition no organization's view uses.
+    const page = await store.listThreads({
+      ...(resourceId !== undefined ? { resourceId } : {}),
+      limit: 500, ...(cursor !== undefined ? { cursor } : {}), [MEMORY_PARTITION]: ORG_KEY_PREFIX,
+    });
+    for (const t of page.items) {
+      if (!isOrganizationKey(t.id)) continue; // a store that ignores the partition lists the root's too
+      if (resourceId !== undefined && t.resourceId !== resourceId) continue; // …or ignores the filter
+      const verdict = await reservedThreadVerdict(runs, t.id);
+      if (verdict !== 'organization') out.push({ id: t.id, resourceId: t.resourceId, rootOnly: verdict === 'root' });
+    }
+    cursor = page.nextCursor;
+  } while (cursor !== undefined);
+  return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 /**
@@ -152,44 +201,18 @@ export interface ReservedRootThread {
  * (`ReservedThreadIdError`) and its scans skip them, so such a thread is unreachable from the root —
  * and one shaped like an organization's (`org:acme:support`) is READ by that organization, whose view
  * resolves `support` to the same physical id. `migrateReservedRootThreads` (@gnldev/memory) moves them
- * to a free id; `eraseSubject` lists the person's in `unreachedThreads`.
+ * to a free id; the root `eraseSubject` erases the person's certain ones and lists the undecided ones.
  *
- * An organization's genuine thread is told apart by its owner record, which an organization's journal
- * writes under its own prefix (`org:<id>:thread:<t>:owner`) and the root's under the bare key
- * (`thread:org:<id>:<t>:owner`). Excluded when the organization holds the record. A thread written by a
- * memory alone (no run) has no record either way, and 0.9 registered no organization, so whether that
- * organization "exists" cannot be read from the journal: such a thread is listed as undecided, never
- * guessed to be the root's (measured: guessing moved an organization's own 0.9 thread out from under it).
+ * Whose each one is: `reservedThreadVerdict` — an organization's owner record excludes it; only an id no
+ * organization can produce, or a root owner record the root wrote itself (not a backfilled one), makes
+ * it `rootOnly`; anything else is listed as undecided, never guessed.
  */
 export async function findReservedRootThreads(storage: Storage, opts: { resourceId?: string } = {}): Promise<ReservedRootThread[]> {
   if (orgStorageScopeOf(storage) !== undefined) {
     throw new Error('@gnldev/durable: findReservedRootThreads takes the root storage — an organization\'s view has no root threads');
   }
-  const store = storage.memory;
-  if (!store) return [];
-  const runs = toJournal(storage.runs);
-  const out: ReservedRootThread[] = [];
-  let cursor: string | undefined;
-  do {
-    // The whole reserved space: a code-only partition no organization's view uses.
-    const page = await store.listThreads({
-      ...(opts.resourceId !== undefined ? { resourceId: opts.resourceId } : {}),
-      limit: 500, ...(cursor !== undefined ? { cursor } : {}), [MEMORY_PARTITION]: ORG_KEY_PREFIX,
-    });
-    for (const t of page.items) {
-      if (!isOrganizationKey(t.id)) continue; // a store that ignores the partition lists the root's too
-      const shaped = /^org:([^:]+):(.+)$/.exec(t.id);
-      if (!shaped || (await runs.get(threadOwnerKey(t.id))) !== undefined) {
-        out.push({ id: t.id, resourceId: t.resourceId, rootOnly: true });
-        continue;
-      }
-      const [, orgId, bare] = shaped as unknown as [string, string, string];
-      if ((await runs.get(orgPrefix(orgId) + threadOwnerKey(bare))) !== undefined) continue; // the organization's own
-      out.push({ id: t.id, resourceId: t.resourceId, rootOnly: false }); // no record either way: undecided
-    }
-    cursor = page.nextCursor;
-  } while (cursor !== undefined);
-  return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  if (!storage.memory) return [];
+  return reservedThreadsIn(storage.memory, toJournal(storage.runs), opts.resourceId);
 }
 
 /** A storage handed in as `memory`: the root one, with a memory store; `storage` itself counts once. */
@@ -335,12 +358,28 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
   // Threads first, while the owner records still exist: the ones this person owns, by the ONE question.
   const ownedByRecord = new Set<string>();
   for (const k of (await runs.listKeys?.('thread:')) ?? []) if (k.endsWith(':owner')) ownedByRecord.add(k.slice('thread:'.length, -':owner'.length));
+  // Outside organizations, a thread under an `org:` id is the root's to erase only when it is CERTAINLY
+  // the root's (`reservedThreadVerdict`); an organization's goes with that organization's erasure, and
+  // an undecided one is reported, not deleted. Asked before `threadOwnerOf`, which would backfill.
+  const verdicts = new Map<string, ReservedVerdict>();
+  const verdictOf = async (t: string) => {
+    let v = verdicts.get(t);
+    if (v === undefined) verdicts.set(t, (v = await reservedThreadVerdict(runs, t)));
+    return v;
+  };
+  const reserved: ReservedRootThread[] = [];
   const deleted: Array<{ thread: string; runs: Journal }> = [];
   const reached = new Set<string>();
   let workingMemory = 0;
   for (const { store, runs: memRuns } of stores) {
-    const candidates = new Set<string>([...(await listedThreads(store, resourceId, outside)), ...ownedByRecord]);
+    // This person's threads in the reserved space of this store; the certain ones are erased here.
+    const mine = outside ? await reservedThreadsIn(store, runs, resourceId) : [];
+    reserved.push(...mine);
+    const candidates = new Set<string>([
+      ...(await listedThreads(store, resourceId, outside)), ...ownedByRecord, ...mine.filter((t) => t.rootOnly).map((t) => t.id),
+    ]);
     for (const t of candidates) {
+      if (outside && isOrganizationKey(t) && (await verdictOf(t)) !== 'root') continue;
       if ((await threadOwnerOf(runs, ownerAsker(store), t)).owner !== resourceId) continue;
       // Counted only when the store held it: a thread found by its owner record may live elsewhere.
       if (!(await holdsThread(store, t))) continue;
@@ -358,6 +397,15 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
   const journalKept: string[] = [];
   for (const t of ownedByRecord) {
     if (reached.has(t)) continue;
+    if (outside && isOrganizationKey(t)) {
+      const v = await verdictOf(t);
+      if (v === 'organization') continue; // the organization's: its own erasure (`{ orgId }`) reaches it
+      if (v === 'undecided') {
+        // The record does not say whose it is; it is neither deleted nor guessed — named, when it names this person.
+        if ((await runs.get<{ resourceId?: string }>(threadOwnerKey(t)))?.resourceId === resourceId) unreachedThreads.push(t);
+        continue;
+      }
+    }
     if ((await threadOwnerOf(runs, asker, t)).owner !== resourceId) continue;
     // A journal-kept thread (BasicMemory, SemanticMemory) is erased here, by its owner record: it used
     // to be reached only through a run of this person, so a thread with none kept every message and
@@ -365,13 +413,11 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
     if (await journalHoldsThread(runs, t)) journalKept.push(t);
     else unreachedThreads.push(t);
   }
-  // Threads 0.9 let the root create under an `org:` id: the root can no longer name them, so they are
-  // not erased here — every one of the person's in that space is reported (an undecided one too: this
-  // erasure did not reach it; the organization's own erasure, `{ orgId }`, does), with the way
-  // through (`findReservedRootThreads` / `migrateReservedRootThreads`).
-  if (outside && storage.memory) {
-    for (const t of await findReservedRootThreads(storage, { resourceId })) if (!reached.has(t.id)) unreachedThreads.push(t.id);
-  }
+  // Threads 0.9 let the root create under an `org:` id: the certain ones were erased above; every other
+  // one of the person's in that space is reported — undecided, so this erasure did not take it (if it is
+  // an organization's, that organization's erasure, `{ orgId }`, does) — with the way through
+  // (`findReservedRootThreads` / `migrateReservedRootThreads` with `threadIds`, then erase again).
+  for (const t of reserved) if (!reached.has(t.id)) unreachedThreads.push(t.id);
   let journalRows = await purgeResource(runs, resourceId, {
     ...(vectors ? { vectors } : {}),
     ...(asker ? { memory: asker } : {}),

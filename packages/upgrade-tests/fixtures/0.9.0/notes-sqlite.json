@@ -471,6 +471,8 @@
    "rootListThreads": [
     "t-om",
     "t-wm",
+    "org:acme:t-cont",
+    "org:acme:t-run",
     "org:acme:t-acme",
     "org:legacy:notes",
     "org:123",
@@ -479,7 +481,27 @@
    "observations": [
     "- SECRET-U1-OBS prefers tea"
    ],
-   "basicShape": "array"
+   "basicShape": "array",
+   "intruderRefused": {
+    "t-run": "ThreadOwnerMismatchError",
+    "t-cont": "ThreadOwnerMismatchError"
+   },
+   "ownerRecords": {
+    "org:acme:thread:t-run:owner": {
+     "at": 1790769600086,
+     "resourceId": "u1"
+    },
+    "thread:org:acme:t-cont:owner": {
+     "at": 1790769600316,
+     "resourceId": "u1",
+     "backfilled": true
+    },
+    "thread:org:acme:t-run:owner": {
+     "at": 1790769600296,
+     "resourceId": "u1",
+     "backfilled": true
+    }
+   }
   },
   "rag": {
    "ids": [

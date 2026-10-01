@@ -5,7 +5,7 @@
 // loadContext runs BEFORE persistInput, so the whole context freezes into `:input` = replayable.
 import { cosineSimilarity } from 'ai';
 import { requireCapability, durableProcessorStep, workingMemoryScope, OM_LEAVES, OM_VECTOR_SOURCE, type OmLeaf } from '@gnldev/durable';
-import { threadOwnerOf, toJournal, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, assertRootThreadId, type Memory } from '@gnldev/durable';
+import { threadOwnerOf, recordThreadCreated, toJournal, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, assertRootThreadId, type Memory } from '@gnldev/durable';
 import { PROVENANCE_RECENT_CAP, messagePreview } from '@gnldev/durable';
 import type { Storage, RunJournal, MemoryStore, MessageRecord, MessageAppend, ThreadRecord, RecallOptions, MemoryContextProvenance, RecalledMessageRef } from '@gnldev/durable';
 import { messageText, hasNorm, type Embed } from './keys.js';
@@ -811,7 +811,17 @@ export class AgentMemory {
     const now = Date.now();
     const rec: ThreadRecord = { id, resourceId: input.resourceId, title: input.title, metadata: input.metadata, createdAt: now, updatedAt: now };
     await this.store.upsertThread(rec);
+    await this.recordCreated(id, input.resourceId);
     return rec;
+  }
+
+  /**
+   * An organization's thread carries its owner record from the moment it exists, run or no run
+   * (`recordThreadCreated`): the root store holds it under the same physical id 0.9 let the root
+   * create, and the record is what says it is this organization's (`findReservedRootThreads`).
+   */
+  protected async recordCreated(threadId: string, resourceId: string): Promise<void> {
+    if (!this.rootScope) await recordThreadCreated(toJournal(this.runs), threadId, resourceId);
   }
   async getThreadById(threadId: string): Promise<ThreadRecord | undefined> {
     this.scoped(threadId);
@@ -863,6 +873,7 @@ export class AgentMemory {
     const now = Date.now();
     const rec: ThreadRecord = { id: dst, resourceId, title: src?.title, metadata: src?.metadata, parentThreadId: srcThreadId, createdAt: now, updatedAt: now };
     await this.store.upsertThread(rec);
+    await this.recordCreated(dst, resourceId);
     return rec;
   }
 
@@ -872,6 +883,7 @@ export class AgentMemory {
     if (existing) return;
     const now = Date.now();
     const title = firstText ? firstText.replace(/\s+/g, ' ').trim().slice(0, 80) : undefined;
+    // No owner record here: this runs inside a run, whose gate (`admitThreadRun`) already wrote it.
     await this.store.upsertThread({ id: threadId, resourceId, title, createdAt: now, updatedAt: now });
     if (this.titleGen && firstText) {
       void Promise.resolve(this.titleGen(firstText))

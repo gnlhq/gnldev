@@ -106,18 +106,37 @@ describe('sweepThreads (BasicMemory retention)', () => {
     expect(await memory.getWorkingMemory('new-thread')).toBe('note to keep');
   });
 
-  it('thread with a message lacking ts is kept and counted in keptNoTs (safe side)', async () => {
+  it('a message lacking ts is dated by when its append was written; a 0.9.0 log with none is kept (keptNoTs)', async () => {
     const journal = new InMemoryJournal();
     const memory = new BasicMemory(journal);
     const now = Date.now();
 
-    await memory.append('unstamped', [{ role: 'user', content: 'no ts' }]); // raw AI SDK message
+    await memory.append('unstamped', [{ role: 'user', content: 'no ts' }]); // raw AI SDK message, appended now
     await memory.append('old', [{ role: 'user', content: 'x', ts: now - 3 * HOUR }]);
+    // As 0.9.0 stored a log: the entries themselves, no append time anywhere.
+    await journal.put('mem:legacy:messages', [{ role: 'user', content: 'from 0.9' }]);
 
+    const young = await sweepThreads(journal, { olderThanMs: HOUR, now });
+    expect(young.purged).toEqual(['old']);
+    expect(young.keptNoTs).toBe(1); // legacy: age cannot be measured → preserved
+    expect(await memory.getMessages('unstamped')).toHaveLength(1); // appended just now: young
+
+    // Two hours on, the unstamped thread is old by its append time; the 0.9.0 log still cannot be dated.
+    const later = await sweepThreads(journal, { olderThanMs: HOUR, now: now + 2 * HOUR });
+    expect(later.purged).toEqual(['unstamped']);
+    expect(later.keptNoTs).toBe(1);
+    expect(await memory.getMessages('legacy')).toHaveLength(1);
+  });
+
+  it("a message's own timestamp wins over its append time (an import of old history is dated by the history)", async () => {
+    const journal = new InMemoryJournal();
+    const memory = new BasicMemory(journal);
+    const now = Date.now();
+    await memory.append('imported', [{ role: 'user', content: 'x', ts: now - 3 * HOUR }]);
+    await memory.append('continued', [{ role: 'user', content: 'x', ts: now - 3 * HOUR }]);
+    await memory.append('continued', [{ role: 'user', content: 'a new turn, no ts' }]);
     const res = await sweepThreads(journal, { olderThanMs: HOUR, now });
-    expect(res.purged).toEqual(['old']);
-    expect(res.keptNoTs).toBe(1);
-    expect(await memory.getMessages('unstamped')).toHaveLength(1); // not deleted
+    expect(res.purged).toEqual(['imported']); // `continued` had a turn just now
   });
 
   it("suffix-based inference still works correctly even if threadId contains ':'", async () => {

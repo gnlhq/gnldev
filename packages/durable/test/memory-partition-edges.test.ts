@@ -99,7 +99,7 @@ describe.each(engines)('memory partition edges (%s)', (_n, make) => {
     expect(warn.mock.calls.filter((c) => String(c[0]).includes('MEMORY_PARTITION'))).toEqual([]);
   });
 
-  it('a 0.9 root thread named org:… that the root erasure did not delete is listed in unreachedThreads', async () => {
+  it('a 0.9 root thread named org:…: the root erasure deletes the certain one and lists the undecided one in unreachedThreads', async () => {
     const s = await make();
     const who = `u09-${RUN}`;
     // What 0.9's root AgentMemory wrote for these ids (no check then). `org:123` is no organization's
@@ -108,7 +108,10 @@ describe.each(engines)('memory partition edges (%s)', (_n, make) => {
     await seed(s.memory!, `org:acme-${RUN}:support`, who, 'ROOT-PRIVATE-2');
     await seed(s.memory!, `mine-${RUN}`, who, 'ROOT-OWN');
     const report = await eraseSubject(s, who);
-    expect(report.memoryThreads).toBe(1);
-    expect(report.unreachedThreads).toEqual([`org:123-${RUN}`, `org:acme-${RUN}:support`].sort());
+    // `mine` and `org:123` (no organization can produce that id); `support` may be acme's: not deleted, named.
+    expect(report.memoryThreads).toBe(2);
+    expect(report.unreachedThreads).toEqual([`org:acme-${RUN}:support`]);
+    expect(await s.memory!.getThread(`org:123-${RUN}`)).toBeUndefined();
+    expect(await s.memory!.getThread(`org:acme-${RUN}:support`)).toBeDefined();
   });
 });
