@@ -13,20 +13,12 @@ export function devMemoryFactory(mem: typeof Memory): (storage: Storage | Journa
   return (storage) => mem.memoryPreset(storage as Storage, 'chat');
 }
 
-/** createStudioApp.memory VIEW adapter (list/read) — from storage. Pattern from examples/app. */
-export function devStudioMemory(mem: typeof Memory, storage: Storage) {
-  const m = mem.memoryPreset(storage, 'chat');
-  return {
-    // The two listings stay SEPARATE, matching `Memory.listThreads`/`listAllThreads`. Collapsing them
-    // into one string-taking method is what made Studio's `?resourceId=` filter inert for a host that
-    // passed AgentMemory directly: the string landed where an `{ resourceId }` object was read, so the
-    // store was asked for every thread and answered with every user's.
-    listThreads: (opts: { resourceId: string }) => m.listThreads(opts),
-    listAllThreads: () => m.listAllThreads(),
-    getMessages: (tid: string) => m.getMessages(tid),
-    getWorkingMemory: (tid: string) => m.getWorkingMemory(tid),
-    updateThread: (tid: string, patch: { title?: string; metadata?: Record<string, unknown> }) => m.updateThread(tid, patch),
-    deleteThread: (tid: string) => m.deleteThread(tid),
-    truncateMessages: (tid: string, afterIndex: number) => m.truncateMessagesAfter(tid, afterIndex),
-  };
+/**
+ * createStudioApp.memory — the 'chat' preset over `storage`, handed to Studio as it is. Studio's memory
+ * type is picked from @gnldev/durable's `Memory`, which AgentMemory implements, so there is no adapter
+ * left to keep in step: this used to forward each method by hand, and the forwarding is where a renamed
+ * method got lost.
+ */
+export function devStudioMemory(mem: typeof Memory, storage: Storage): AgentMemory {
+  return mem.memoryPreset(storage, 'chat');
 }

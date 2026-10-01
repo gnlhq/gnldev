@@ -1,6 +1,6 @@
 // Threads view: DELETE /threads/:id/messages — truncates a thread from a message index onward
 // (destructive; e.g. "retry from here"/branching flows). Studio bridges this via the StudioMemory
-// interface's optional truncateMessages (the host typically wraps @gnldev/memory's AgentMemory
+// interface's optional truncateMessagesAfter (the host typically wraps @gnldev/memory's AgentMemory
 // truncateMessagesAfter) — here we mock it and verify permission (write) + audit + the 501 fallback
 // for both "not implemented" and "adapter returned null (store doesn't support it)".
 import { describe, it, expect } from 'vitest';
@@ -8,7 +8,7 @@ import { InMemoryJournal } from '@gnldev/durable';
 import { createStudioApi, type StudioMemory } from '../src/server.js';
 import { call } from './call.js';
 
-/** Simple fake memory: only truncateMessages matters here; listThreads/getMessages are stubs. */
+/** Simple fake memory: only truncateMessagesAfter matters here; listThreads/getMessages are stubs. */
 function fakeMemory(removedByCall: (number | null)[]): StudioMemory & { truncateCalls: { threadId: string; afterIndex: number }[] } {
   const truncateCalls: { threadId: string; afterIndex: number }[] = [];
   let i = 0;
@@ -16,7 +16,7 @@ function fakeMemory(removedByCall: (number | null)[]): StudioMemory & { truncate
     truncateCalls,
     listThreads: () => [],
     getMessages: () => [],
-    truncateMessages: async (threadId: string, afterIndex: number) => {
+    truncateMessagesAfter: async (threadId: string, afterIndex: number) => {
       truncateCalls.push({ threadId, afterIndex });
       const r = removedByCall[i] ?? null;
       i += 1;
@@ -29,7 +29,7 @@ const del = (app: any, path: string, body: unknown, headers: Record<string, stri
   call(app, path, { method: 'DELETE', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
 
 describe('DELETE /threads/:id/messages', () => {
-  it('truncates via memory.truncateMessages, returns removed count, lands in audit', async () => {
+  it('truncates via memory.truncateMessagesAfter, returns removed count, lands in audit', async () => {
     const memory = fakeMemory([6]);
     const app = createStudioApi({ reader: new InMemoryJournal(), memory });
 
@@ -53,7 +53,7 @@ describe('DELETE /threads/:id/messages', () => {
     expect(memory.truncateCalls).toEqual([{ threadId: 't1', afterIndex: -1 }]);
   });
 
-  it('403 without write permission (truncateMessages is never called)', async () => {
+  it('403 without write permission (truncateMessagesAfter is never called)', async () => {
     const memory = fakeMemory([6]);
     const app = createStudioApi({ reader: new InMemoryJournal(), memory, auth: { write: () => false } });
 
@@ -62,11 +62,11 @@ describe('DELETE /threads/:id/messages', () => {
     expect(memory.truncateCalls).toHaveLength(0);
   });
 
-  it('501 if memory.truncateMessages is not implemented (listThreads/getMessages only)', async () => {
+  it('501 if memory.truncateMessagesAfter is not implemented (listThreads/getMessages only)', async () => {
     const app = createStudioApi({ reader: new InMemoryJournal(), memory: { listThreads: () => [], getMessages: () => [] } });
     const res = await del(app, '/threads/t1/messages', { afterIndex: 3 });
     expect(res.status).toBe(501);
-    expect(await res.json()).toEqual({ error: 'truncateMessages is not supported' });
+    expect(await res.json()).toEqual({ error: 'truncateMessagesAfter is not supported' });
   });
 
   it('501 if the adapter returns null (underlying store does not support the capability)', async () => {
@@ -74,7 +74,7 @@ describe('DELETE /threads/:id/messages', () => {
     const app = createStudioApi({ reader: new InMemoryJournal(), memory });
     const res = await del(app, '/threads/t1/messages', { afterIndex: 3 });
     expect(res.status).toBe(501);
-    expect(await res.json()).toEqual({ error: 'truncateMessages is not supported' });
+    expect(await res.json()).toEqual({ error: 'truncateMessagesAfter is not supported' });
 
     // a null return is NOT a write failure — nothing lands in audit
     const audit = await (await call(app, '/audit?action=thread.truncate')).json();

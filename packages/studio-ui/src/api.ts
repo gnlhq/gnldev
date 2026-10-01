@@ -672,7 +672,7 @@ export const api = {
    * FLOW-10: truncates a thread's PERSISTED history — `afterIndex` is INCLUSIVE (kept), everything
    * after it is removed. Index space matches GET /threads/:id/messages' response order (the same
    * array Playground's `mapMessages` consumes) — NOT the local, possibly-fanned-out `Msg[]` index.
-   * 501 when the host's memory adapter doesn't implement truncateMessages (see Playground's
+   * 501 when the host's memory adapter doesn't implement truncateMessagesAfter (see Playground's
    * warnStaleServerHistory fallback); 400 if `afterIndex` is missing/not a number.
    */
   truncateThreadMessages: (id: string, afterIndex: number) =>

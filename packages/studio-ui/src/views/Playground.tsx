@@ -550,7 +550,7 @@ export function Playground() {
       await api.truncateThreadMessages(thread, srcIdx - 1);
       // success → the server thread now matches the local trim, no "stale history" warning needed.
     } catch (e) {
-      if (e instanceof ApiError && e.status === 501) { warnStaleServerHistory(); return; } // adapter doesn't support truncateMessages → old behavior
+      if (e instanceof ApiError && e.status === 501) { warnStaleServerHistory(); return; } // adapter doesn't support truncateMessagesAfter → old behavior
       toast.error(errMessage(e)); // any other error: inform, but don't block the run
     }
   }
@@ -583,7 +583,7 @@ export function Playground() {
   }
 
   // Fallback for FLOW-10's truncateServerThread: the host's memory adapter doesn't implement
-  // truncateMessages (DELETE /threads/:id/messages → 501), or the local edit/regenerate target
+  // truncateMessagesAfter (DELETE /threads/:id/messages → 501), or the local edit/regenerate target
   // couldn't be safely lined up with a server index. Either way, the LOCAL trim above still happens,
   // but the server-side thread history still contains the old turn, and it reappears once the page is
   // reloaded and restored via loadThread — so we surface this explicitly rather than pretending it worked.

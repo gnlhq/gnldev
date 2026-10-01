@@ -411,12 +411,12 @@ function hostObjects(optIn: boolean) {
 async function makeApi(optIn = false) {
   const journal = await seeded();
   const mem = (j: { get: (k: string) => Promise<unknown>; put: (k: string, v: unknown) => Promise<void> }) => ({
-    listThreads: async () => ((await j.get('threads')) as unknown[]) ?? [],
+    listAllThreads: async () => ((await j.get('threads')) as unknown[]) ?? [],
     getMessages: async (id: string) => ((await j.get(`thread:${id}`)) as unknown[]) ?? [],
     getWorkingMemory: async (id: string) => (await j.get(`wm:${id}`)) as string | undefined,
     updateThread: async (id: string, patch: unknown) => { await j.put(`thread-meta:${id}`, patch); },
     deleteThread: async (id: string) => { await j.put(`thread:${id}`, []); },
-    truncateMessages: async (id: string) => { await j.put(`thread:${id}`, []); return 1; },
+    truncateMessagesAfter: async (id: string) => { await j.put(`thread:${id}`, []); return 1; },
     appendMessages: async () => {},
   });
   const api = createStudioApi({
@@ -699,7 +699,7 @@ describe('the ownership control — acme must SEE what globex must not', () => {
    *
    * `PATCH`/`DELETE /threads/:id` and `DELETE /threads/:id/messages` all answer `{ok:true}` to
    * everybody, so no comparison of bodies can ever separate the owner from a stranger. Their seams
-   * (`updateThread`, `deleteThread`, `truncateMessages`) receive only a threadId — no organization —
+   * (`updateThread`, `deleteThread`, `truncateMessagesAfter`) receive only a threadId — no organization —
    * because isolation comes from the ALS-scoped journal the conversation store is built over.
    *
    * So the observable is WHERE THE WRITE LANDED. The owner's mutation must reach the owner's key, and
@@ -1314,7 +1314,7 @@ describe('the conversation store honours the orgScoped claim', () => {
     const journal = await seeded();
     const api = createStudioApi({
       reader: journal, auth: authProvider, org: {},
-      memory: { orgScoped: true, listThreads: () => [{ id: 't', title: 'GLOBEX-OWN' }], getMessages: () => [] },
+      memory: { orgScoped: true, listAllThreads: () => [{ id: 't', title: 'GLOBEX-OWN' }], getMessages: () => [] },
     } as never) as unknown as (r: Request) => Promise<Response>;
 
     for (const key of THREAD_ROUTES) {
@@ -1328,7 +1328,7 @@ describe('the conversation store honours the orgScoped claim', () => {
     const journal = await seeded();
     const api = createStudioApi({
       reader: journal, auth: authProvider, org: {},
-      memory: { listThreads: () => [{ id: 't', title: MARKER }], getMessages: () => [] },
+      memory: { listAllThreads: () => [{ id: 't', title: MARKER }], getMessages: () => [] },
     } as never) as unknown as (r: Request) => Promise<Response>;
 
     for (const key of THREAD_ROUTES) {

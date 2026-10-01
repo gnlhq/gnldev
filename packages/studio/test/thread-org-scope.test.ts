@@ -32,7 +32,7 @@ function hostMemory() {
     memory: {
       getMessages: async (t: string) => threads.get(t) ?? [],
       append: async () => {},
-      listThreads: async () => [...threads.keys()].map((id) => ({ id })),
+      listAllThreads: async () => [...threads.keys()].map((id) => ({ id })),
       deleteThread: async (t: string) => threads.delete(t),
     },
   };

@@ -106,7 +106,13 @@ function genId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${(idCounter++).toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
-export class AgentMemory {
+/**
+ * Implements ALL of @gnldev/durable's `Memory`, optional methods included (`Required<Memory>`).
+ * Declared rather than assumed, and `Required` because a plain `implements Memory` accepts a missing
+ * optional method — so renaming `truncateMessagesAfter` here would compile and silently take the
+ * capability away from every consumer that feature-detects it (Studio answered 501 for exactly that).
+ */
+export class AgentMemory implements Required<Memory> {
   /** Storage (shared by tests/cli). */
   readonly storage: Storage;
   protected runs: RunJournal;
@@ -445,22 +451,52 @@ export class AgentMemory {
    * `deleteMessagesAfter` at all (adapter capability gap), so a caller (e.g. Studio's route) can
    * answer "not supported" (501) instead of reporting a silent no-op.
    *
-   * NOT touched: observation records (`store.getObservations`/`putObservations`). After a truncation,
-   * an existing observation's `fromSeq`/`toSeq` range may now point partly or wholly at deleted
-   * messages (`expandObservation` would then return a partial/empty slice for that range). Reconciling
-   * observations with a truncated history is out of scope here.
+   * Observational memory is brought back in line with the cut (`forgetObservedAfter`). It used to be
+   * left alone, and the cost was not only a stale summary: the observed-up-to cursor stayed past the
+   * cut, the store hands the next messages the freed positions, and the next turn landed BELOW the
+   * cursor — so it never reached the model. Measured through Studio's route: a 4-message thread
+   * observed to seq 3, truncated after index 0, then a new user turn: the context held only the old
+   * observation.
    */
   async truncateMessagesAfter(threadId: string, afterIndex: number): Promise<number | null> {
     this.scoped(threadId);
     const del = this.store.deleteMessagesAfter;
     if (!del) return null;
-    if (afterIndex === -1) return del.call(this.store, threadId, -1);
-    if (!Number.isInteger(afterIndex) || afterIndex < -1) return 0;
-    const all = await this.allMessages(threadId);
-    const displayed = all.length <= this.recentN ? all : all.slice(-this.recentN);
-    if (afterIndex >= displayed.length) return 0;
-    const seq = displayed[afterIndex]!.seq;
-    return del.call(this.store, threadId, seq);
+    let cut = -1;
+    if (afterIndex !== -1) {
+      if (!Number.isInteger(afterIndex) || afterIndex < -1) return 0;
+      const all = await this.allMessages(threadId);
+      const displayed = all.length <= this.recentN ? all : all.slice(-this.recentN);
+      if (afterIndex >= displayed.length) return 0;
+      cut = displayed[afterIndex]!.seq;
+    }
+    const removed = await del.call(this.store, threadId, cut);
+    await this.forgetObservedAfter(threadId, cut);
+    return removed;
+  }
+
+  /**
+   * After a truncation at `cut`: drop every observation that summarises a deleted message, give back
+   * the observations a dropped reflection had condensed, and pull the observed-up-to cursor back so the
+   * kept messages a dropped observation covered are shown raw again, and every message written after
+   * the cut is shown at all. The step counters (`observeSeq`, `reflectSeq`) are NOT reset: they name
+   * memoized observer steps, and reusing one would replay the summary of the deleted messages.
+   * A range-less (pre-P2) observation cannot be placed, so it is kept unless the whole thread was cleared.
+   */
+  protected async forgetObservedAfter(threadId: string, cut: number): Promise<void> {
+    const observed = await this.runs.get<number>(omKey(threadId, 'observedSeq'));
+    const obs: Observation[] = await this.store.getObservations(threadId);
+    const gone = obs.filter((o) => (o.toSeq != null ? o.toSeq > cut : cut === -1));
+    if (gone.length) {
+      const goneIds = new Set(gone.map((o) => o.id));
+      const freed = new Set(gone.filter((o) => o.level > 0).flatMap((o) => o.sourceIds));
+      const kept = obs.filter((o) => !goneIds.has(o.id)).map((o) => (freed.has(o.id) && o.condensed ? { ...o, condensed: false } : o));
+      await this.store.putObservations(threadId, kept);
+    }
+    if (observed === undefined) return;
+    let floor = cut;
+    for (const o of gone) if (o.level === 0 && o.fromSeq != null) floor = Math.min(floor, o.fromSeq - 1);
+    if (observed > floor) await this.runs.put(omKey(threadId, 'observedSeq'), floor);
   }
 
   /** Rich context hook (run.ts feature-detects it). */

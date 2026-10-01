@@ -38,7 +38,7 @@ app.mount('/studio', createStudioApp({
     listAllThreads: () => memory.listAllThreads(),
     getMessages: (tid) => memory.getMessages(tid),
     getWorkingMemory: (tid) => memory.getWorkingMemory(tid),
-    truncateMessages: (tid, afterIndex) => memory.truncateMessagesAfter(tid, afterIndex),
+    truncateMessagesAfter: (tid, afterIndex) => memory.truncateMessagesAfter(tid, afterIndex),
   },
   // A {read,write} predicate receives a web-standard `Request` (see @gnldev/auth ReadWriteAuth), not
   // a Hono Context. The previous `c.req.header(...)` therefore threw `TypeError: Cannot read

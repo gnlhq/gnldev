@@ -14,6 +14,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Migration notes, one line each; the full entries under Security, Fixed and Changed have the measurement
 and who is affected.
 
+- **Studio's `StudioMemory` is picked from @gnldev/durable's `Memory`** (and AgentMemory `implements
+  Required<Memory>`), so a renamed method is a compile error on either side. The truncate method Studio
+  calls is `truncateMessagesAfter` (was `truncateMessages`, which no shipped memory had). Pass the memory
+  as it is (`memory: agentMemory`), or rename the adapter's key; a hand-written adapter's methods return
+  promises (`async`).
+- **Studio no longer calls `listThreads()` with no argument for the unfiltered thread list**: implement
+  `listAllThreads()` on a hand-written memory.
+- **The hand-written Studio memory adapters are gone** — `gnl studio` and @gnldev/cli's `devStudioMemory`
+  hand Studio the `'chat'` preset itself (`devStudioMemory` now returns an `AgentMemory`).
 - **`EDGE_ERROR_CODES.threadIdReserved` is gone from @gnldev/server** — the code is
   `RESERVED_ID_ERROR_CODES.ReservedThreadIdError` in @gnldev/durable (same string, `thread_id_reserved`,
   same 400), and `reservedIdFailure(e)` renders it.
@@ -171,6 +180,12 @@ and who is affected.
 - @gnldev/auth: `doorGate` (+ types `DoorGateOptions`, `DoorRefusal`, `DoorAdmission`), `carriesIdentity`,
   `permissionContext`, `authErrorResponse` (+ type `AuthErrorCode`), `OpenSurfaceGuardOptions.allowCrossSite`.
 - @gnldev/auth-ee: `DEFAULT_ROLE_GRANTS`; `createRbac`'s second argument (`CreateRbacOptions.replace`).
+- @gnldev/studio: `memory` may be a function of the calling organization, `({ orgId }) =>
+  memoryPreset(orgId ? withOrgStorage(storage, orgId) : storage)` (type `StudioMemoryOption`), resolved
+  once per organization. A memory is never handed the organization, so this is the scoped path.
+- @gnldev/durable: the optional `Memory.updateThread`, `Memory.deleteThread` and
+  `Memory.truncateMessagesAfter` (the shapes AgentMemory already had); @gnldev/memory: `AgentMemory`
+  `implements Required<Memory>`.
 - @gnldev/server, @gnldev/studio: the `allowedHosts` and `allowCrossSite` options on `createRestApi` and
   `createStudioApp`;
   the error code `thread_id_reserved` in `EDGE_ERROR_CODES`.
@@ -458,6 +473,16 @@ and who is affected.
   `rootOutsideOrganizations: true`. An organization's view (`withOrgStorage(...).vectors`) is unaffected.
 
 ### Fixed
+
+- **Studio's "delete messages after" answered 501 for every AgentMemory** — Studio called
+  `truncateMessages`, AgentMemory has `truncateMessagesAfter`, and each side was only checked against its
+  own copy of the contract; `gnl studio`'s adapter did not forward it at all. Now one contract
+  (`Memory`), held by `studio-memory-conformance.test.ts`.
+- **Truncating a thread no longer hides the next turn from observational memory.** The observed-up-to
+  cursor stayed past the cut; the store gives the next messages the freed positions, so they landed below
+  it and never reached the model (measured through Studio's route: the context held only the old
+  observation). `truncateMessagesAfter` now drops the observations of deleted messages, gives back what a
+  dropped reflection had condensed, and pulls the cursor back to the cut.
 
 - **Studio's workflow fork decided for itself which step a journal key belongs to, and disagreed with
   the engine** — it took the FIRST step id a key started with, so a fork keeping `a` copied step `a:x`

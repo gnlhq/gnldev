@@ -181,7 +181,7 @@ export function buildServer(deps: ServerDeps) {
         listAllThreads: () => memory.listAllThreads(),
         getMessages: (tid) => memory.getMessages(tid),
         getWorkingMemory: (tid) => memory.getWorkingMemory(tid),
-        truncateMessages: (tid, afterIndex) => memory.truncateMessagesAfter(tid, afterIndex),
+        truncateMessagesAfter: (tid, afterIndex) => memory.truncateMessagesAfter(tid, afterIndex),
       },
       auth: authProvider,
     }),

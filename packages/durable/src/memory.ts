@@ -140,6 +140,28 @@ export interface Memory {
   /** EVERY thread, unfiltered — the operator/global view (optional; see `listThreads`). */
   listAllThreads?(): Promise<unknown[]>;
   /**
+   * Rename a thread or change its metadata (optional). A consumer that finds it absent answers
+   * "not supported" (Studio: 501).
+   *
+   * The thread-management methods below are declared HERE, beside `listThreads`, for the reason
+   * `listThreads` is: @gnldev/studio used to keep its own copy of their shapes, and its copy said
+   * `truncateMessages` where @gnldev/memory's AgentMemory says `truncateMessagesAfter`. Every
+   * AgentMemory handed to Studio answered 501 on "delete messages after", and nothing could notice,
+   * because each side was only checked against itself. Studio's memory type is now picked from this
+   * interface and AgentMemory `implements` it, so the two cannot disagree without a compile error.
+   */
+  updateThread?(threadId: string, patch: { title?: string; metadata?: Record<string, unknown> }): Promise<unknown>;
+  /** Delete a thread with its messages, observations and thread-scoped working memory (optional). */
+  deleteThread?(threadId: string): Promise<void>;
+  /**
+   * Truncate a thread AFTER `afterIndex` (optional): the message AT `afterIndex` is kept, every message
+   * after it is deleted. `afterIndex` indexes the array `getMessages(threadId)` (no `opts`) returns.
+   * `-1` deletes every message; any other index outside that array removes nothing and returns `0`.
+   * Returns the number of messages deleted, or `null` when the store under the memory cannot delete
+   * messages at all — distinct from `0`, so a caller can answer "not supported" instead of "nothing to do".
+   */
+  truncateMessagesAfter?(threadId: string, afterIndex: number): Promise<number | null>;
+  /**
    * Rich path (optional — provided by @gnldev/memory's AgentMemory): composes recall + working memory +
    * observational memory + the WM tool in ONE call. If defined, runDurable/streamDurable use this
    * instead of `getMessages`/`getWorkingMemory`. `provenance` (optional, additive) is the memory-side

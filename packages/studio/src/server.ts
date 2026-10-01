@@ -7,7 +7,7 @@ import { sseResponse } from './sse.js';
 import { STUDIO_ERROR_CODES } from './error-codes.js';
 import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, reservedIdFailure, eraseSubject, subjectRuns, toJournal, decodeStepRecord } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
-import type { JournalReader, Journal, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser } from '@gnldev/durable';
+import type { JournalReader, Journal, Memory, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
 import { listTriggers } from '@gnldev/scheduler';
 import { mountSpa, notBuiltHtml } from './spa.js';
@@ -205,47 +205,36 @@ export interface StudioAgentRunner {
 }
 
 /**
- * For the Memory/Threads view (optional). The app wraps a @gnldev/memory (AgentMemory) instance in this interface.
- * `listThreads` takes a resourceId (threads are indexed by resource).
+ * For the Memory/Threads view (optional): the slice of @gnldev/durable's `Memory` this page calls.
+ *
+ * PICKED from `Memory`, not restated. This used to be Studio's own interface, and it drifted from the
+ * object it describes twice: `listThreads(resourceId?: string)` where AgentMemory reads
+ * `opts.resourceId` (every user's threads served under one user's filter), then `truncateMessages`
+ * where AgentMemory says `truncateMessagesAfter` (the route answered 501 for every AgentMemory). A
+ * shape declared on the caller's side has no one to disagree with; picked from the owner's interface,
+ * a rename on either side is a compile error. @gnldev/memory's `AgentMemory` satisfies it as-is, and
+ * so do `BasicMemory` and rag's `SemanticMemory` (which have no thread listing — the page shows none).
  */
-export interface StudioMemory {
+export type StudioMemory = Pick<Memory, 'getMessages' | 'getWorkingMemory' | 'listThreads' | 'listAllThreads' | 'updateThread' | 'deleteThread' | 'truncateMessagesAfter'> & {
   /**
-   * The host's explicit claim that this object keeps its own organization boundary — that it honours
-   * the `ctx.orgId` it is handed on every call.
+   * The host's claim that this object keeps its own organization boundary. Without it, a caller acting
+   * as an organization is REFUSED on the thread routes (403 `org_scope_refused`).
    *
-   * Studio cannot verify it and does not try: this is somebody else's object with its own storage
-   * behind it. Without the claim, a caller acting as an organization is REFUSED on the routes that
-   * reach this object (403 `org_scope_refused`), because serving them would hand one organization another
-   * organization's data. An operator with no organization scope is unaffected either way.
-   *
-   * DECLARED here, not just read. Every refusal message tells the host to "set `orgScoped: true` on
-   * it", and the field existed nowhere in the types — so a host following that instruction got
-   * `TS2353: 'orgScoped' does not exist in type ...` and the documented fix could not be written down
-   * in TypeScript at all. It was read through a cast in three places, which is what hid it.
+   * Unlike its siblings, a memory is never handed the calling organization — `Memory`'s methods take a
+   * thread id and nothing else — so the claim is only true for an object that finds the organization
+   * itself. The usual way to scope it is not a claim at all: pass `memory` as a function of the
+   * organization (`StudioMemoryOption`), and give each organization its own storage view.
    */
   orgScoped?: boolean;
-  /**
-   * ONE resource's threads. The OBJECT argument matters: this type used to read
-   * `listThreads(resourceId?: string)` and the route below passed a bare string, while
-   * @gnldev/memory's AgentMemory reads `opts.resourceId` — so the filter silently did nothing and the
-   * route answered with EVERY user's threads. Declaring a shape for someone else's method is how that
-   * survived; the contract now lives in @gnldev/durable's `Memory` and this mirrors it.
-   */
-  listThreads (opts: { resourceId: string }): Promise<unknown[]> | unknown[];
-  /** EVERY thread — the operator/global view this page shows when no resource is named. */
-  listAllThreads? (): Promise<unknown[]> | unknown[];
-  getMessages (threadId: string): Promise<unknown[]> | unknown[];
-  getWorkingMemory?(threadId: string): Promise<unknown> | unknown;
-  /** Updates the thread's title/metadata (rename). Returns 501 from the route if the adapter doesn't support it. */
-  updateThread?(threadId: string, patch: { title?: string; metadata?: Record<string, unknown> }): Promise<unknown> | unknown;
-  /** Deletes the thread (soft-delete). Returns 501 from the route if the adapter doesn't support it. */
-  deleteThread?(threadId: string): Promise<void> | void;
-  /** Truncates the thread: deletes the message at `afterIndex` and every message after it (index base:
-   *  the `getMessages` list — i.e. matches the `/threads/:id/messages` response 1:1). `afterIndex === -1`
-   *  deletes every message. Returns the number of deleted messages, or `null` if the underlying store
-   *  doesn't support the capability. Returns 501 from the route if the adapter doesn't support it. */
-  truncateMessages?(threadId: string, afterIndex: number): Promise<number | null> | number | null;
-}
+};
+
+/**
+ * `memory` as an object, or as a function that returns the calling organization's memory
+ * (`orgId` undefined for the root/operator scope). The function form is how an organization's
+ * conversations reach Studio honestly: `({ orgId }) => memoryPreset(orgId ? withOrgStorage(storage, orgId) : storage)`
+ * — the storage view prefixes every thread id, so one organization cannot name another's thread.
+ */
+export type StudioMemoryOption = StudioMemory | ((scope: { orgId?: string }) => StudioMemory);
 
 /** Introspection for a single workflow (Workflows view). */
 export interface WorkflowMeta {
@@ -743,8 +732,8 @@ export interface StudioApiOptions {
   chat?: StudioChat;
   /** If given, the Playground works: pick an agent from the browser + prompt + (streaming) response + approval. */
   gnl?: StudioAgentRunner;
-  /** If given, the Memory/Threads view works. */
-  memory?: StudioMemory;
+  /** If given, the Memory/Threads view works. An object, or a function of the calling organization (see `StudioMemoryOption`). */
+  memory?: StudioMemoryOption;
   /** If `memory` isn't given and reader is a writable Journal, derives StudioMemory from it (CLI/dev default). */
   memoryFactory?: (reader: Journal) => StudioMemory;
   /** If given, the Workflows view works. */
@@ -1468,8 +1457,23 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   }
 
   // If memory isn't given and reader is a writable Journal, derive it from the factory (CLI/dev default).
-  const resolvedMemory: StudioMemory | undefined =
-    memory ?? (opts.memoryFactory && writable ? opts.memoryFactory(reader as unknown as Journal) : undefined);
+  const fixedMemory: StudioMemory | undefined = typeof memory === 'function'
+    ? undefined
+    : memory ?? (opts.memoryFactory && writable ? opts.memoryFactory(reader as unknown as Journal) : undefined);
+  const hasMemory = typeof memory === 'function' || !!fixedMemory;
+  /**
+   * The memory a request reaches: the fixed object, or — when `memory` is a function — the calling
+   * organization's, built once per organization. The organization is read the way `requireScopedMemory`
+   * reads it, so the refusal and the resolution cannot disagree about who is asking.
+   */
+  const memoryByOrg = new Map<string, StudioMemory>();
+  const memoryFor = (c: Context): StudioMemory | undefined => {
+    if (typeof memory !== 'function') return fixedMemory;
+    const orgId = principalOf(c.req.raw)?.orgId ?? orgALS.getStore();
+    let m = memoryByOrg.get(orgId ?? '');
+    if (!m) { m = memory(orgId ? { orgId } : {}); memoryByOrg.set(orgId ?? '', m); }
+    return m;
+  };
   /**
    * Whether thread storage is organization-scoped.
    *
@@ -1490,7 +1494,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    * `cache`, `queue` and `workflowStore`: refusing by default is the safe side, and an explicit claim
    * in the host's own code is how a host leaves it.
    */
-  const memoryIsOrgScoped = !memory || (memory as { orgScoped?: boolean }).orgScoped === true;
+  // A function of the organization is scoped by construction: each organization gets its own object.
+  const memoryIsOrgScoped = !memory || typeof memory === 'function' || memory.orgScoped === true;
 
   const WF_STORE_PRE = '__studio_wf__';
   const resolvedWfStore: StudioWorkflowStore | undefined = _wfStoreOpt ?? (
@@ -1840,7 +1845,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       tools: !!gnl?.listTools,
       toolExec: !!gnl?.runTool,
       toolExecDurable: !!gnl?.runTool && !!gnl?.toolExecDurable,
-      memory: !!resolvedMemory && threads,
+      memory: hasMemory && threads,
       workflows: !!gnl?.listWorkflows || !!workflows,
       workflowExec: !!gnl?.runWorkflow || (canRunManaged && reach('workflowStore')),
       scorers: !!scorers,
@@ -4197,23 +4202,19 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   app.get('/threads', async (c) => {
     if (!(await allowP(c.req.raw, 'threads:read'))) return deny(c.req.raw, 'read');
     { const denied = requireScopedMemory(c); if (denied) return denied; }
+    const resolvedMemory = memoryFor(c);
     if (!resolvedMemory) return c.json([]);
     const resourceId = c.req.query('resourceId') || undefined;
     // See the `listThreads` note on the type above: the one-resource method takes an object, and the
     // unfiltered view is a DIFFERENT method. Conflating them is what made this filter inert.
-    if (resourceId) return c.json(await resolvedMemory.listThreads({ resourceId }));
-    // `listAllThreads` when the adapter has it; otherwise `listThreads()` with NO argument, which is
-    // what an adapter written against the previous `listThreads(resourceId?: string)` shape implements
-    // as its unfiltered view. Not a catch-all fallback: AgentMemory HAS `listAllThreads` and takes the
-    // first branch, so the legacy call is only ever made to an adapter that meant it. Without this,
-    // splitting the method silently emptied the operator's thread list for every host that had
-    // implemented the old contract.
-    if (resolvedMemory.listAllThreads) return c.json(await resolvedMemory.listAllThreads());
-    return c.json(await (resolvedMemory.listThreads as unknown as () => Promise<unknown[]> | unknown[])());
+    if (resourceId) return c.json(resolvedMemory.listThreads ? await resolvedMemory.listThreads({ resourceId }) : []);
+    // Both listings are optional in `Memory`; a memory without one has no conversations to show.
+    return c.json(resolvedMemory.listAllThreads ? await resolvedMemory.listAllThreads() : []);
   });
   app.get('/threads/:id/messages', async (c) => {
     if (!(await allowP(c.req.raw, 'threads:read'))) return deny(c.req.raw, 'read');
     { const denied = requireScopedMemory(c); if (denied) return denied; }
+    const resolvedMemory = memoryFor(c);
     if (!resolvedMemory) return c.json([]);
     try {
       return c.json(await resolvedMemory.getMessages(decodeURIComponent(c.req.param('id'))));
@@ -4225,6 +4226,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   app.get('/threads/:id/working-memory', async (c) => {
     if (!(await allowP(c.req.raw, 'threads:read'))) return deny(c.req.raw, 'read');
     { const denied = requireScopedMemory(c); if (denied) return denied; }
+    const resolvedMemory = memoryFor(c);
     if (!resolvedMemory?.getWorkingMemory) return c.json({ value: null });
     try {
       return c.json({ value: (await resolvedMemory.getWorkingMemory(decodeURIComponent(c.req.param('id')))) ?? null });
@@ -4236,6 +4238,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   app.patch('/threads/:id', async (c) => {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
     { const denied = requireScopedMemory(c); if (denied) return denied; }
+    const resolvedMemory = memoryFor(c);
     if (!resolvedMemory?.updateThread) return c.json({ error: 'updateThread is not supported' }, 501);
     const patch = (await c.req.json().catch(() => ({}))) as { title?: string; metadata?: Record<string, unknown> };
     try {
@@ -4249,6 +4252,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   app.delete('/threads/:id', async (c) => {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
     { const denied = requireScopedMemory(c); if (denied) return denied; }
+    const resolvedMemory = memoryFor(c);
     if (!resolvedMemory?.deleteThread) return c.json({ error: 'deleteThread is not supported' }, 501);
     try {
       await resolvedMemory.deleteThread(decodeURIComponent(c.req.param('id')));
@@ -4258,23 +4262,23 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       return reservedIdResponse(c, e) ?? c.json({ error: String((e as Error)?.message ?? e) }, 400);
     }
   });
-  // Truncates a thread FROM a message index onward (destructive, e.g. for "retry from here"/branching
-  // flows) — deletes the message at afterIndex and everything after it (index base: getMessages, same
-  // list the /threads/:id/messages route returns). afterIndex===-1 deletes the whole thread's messages.
-  // 501 both when the adapter doesn't implement truncateMessages AND when it does but the underlying
+  // Truncates a thread AFTER a message index (destructive, e.g. for "retry from here"/branching flows) —
+  // the contract is `Memory.truncateMessagesAfter`'s: the message at afterIndex is kept, everything after
+  // it goes. 501 both when the memory doesn't implement truncateMessagesAfter AND when it does but the underlying
   // store can't support it (signaled by a `null` return) — same externally-observable outcome either way.
   app.delete('/threads/:id/messages', async (c) => {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
     { const denied = requireScopedMemory(c); if (denied) return denied; }
-    if (!resolvedMemory?.truncateMessages) return c.json({ error: 'truncateMessages is not supported' }, 501);
+    const resolvedMemory = memoryFor(c);
+    if (!resolvedMemory?.truncateMessagesAfter) return c.json({ error: 'truncateMessagesAfter is not supported' }, 501);
     const body = (await c.req.json().catch(() => ({}))) as { afterIndex?: unknown };
     if (typeof body.afterIndex !== 'number' || !Number.isFinite(body.afterIndex)) {
       return c.json({ error: 'afterIndex (number) is required' }, 400);
     }
     try {
       const id = decodeURIComponent(c.req.param('id'));
-      const removed = await resolvedMemory.truncateMessages(id, body.afterIndex);
-      if (removed == null) return c.json({ error: 'truncateMessages is not supported' }, 501);
+      const removed = await resolvedMemory.truncateMessagesAfter(id, body.afterIndex);
+      if (removed == null) return c.json({ error: 'truncateMessagesAfter is not supported' }, 501);
       await audit(c, 'thread.truncate', id, { afterIndex: body.afterIndex, removed });
       return c.json({ ok: true, removed });
     } catch (e) {

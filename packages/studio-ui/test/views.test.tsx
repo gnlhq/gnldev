@@ -468,7 +468,7 @@ describe('studio-ui components', () => {
           : {
               ok: false, status: 501,
               headers: { get: () => 'application/json' },
-              json: async () => ({ error: 'truncateMessages is not supported' }),
+              json: async () => ({ error: 'truncateMessagesAfter is not supported' }),
               clone() { return this; },
             };
       }
@@ -503,7 +503,7 @@ describe('studio-ui components', () => {
     await waitFor(() => expect(screen.getByText('edited answer')).toBeTruthy());
   });
 
-  it('Playground submitEdit: a 501 (adapter has no truncateMessages) falls back to the old "stale history" toast, and the run still proceeds', async () => {
+  it('Playground submitEdit: a 501 (adapter has no truncateMessagesAfter) falls back to the old "stale history" toast, and the run still proceeds', async () => {
     stubFetchWithTruncate({ truncateOk: false });
     wrap(<Playground />);
     await openAndSubmitEdit();

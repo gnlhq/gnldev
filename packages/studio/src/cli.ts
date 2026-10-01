@@ -60,19 +60,10 @@ async function main(): Promise<void> {
         catch { return undefined; }
       })();
       if (mem?.memoryPreset) {
-        const view = mem.memoryPreset(cfg.storage, 'chat');
-        memory = {
-          // Straight through now that the host type names the two methods separately. This adapter
-          // already branched correctly, which is why the CLI never showed the bug the direct path did:
-          // a host handing AgentMemory to createStudioApi got the string call, and its `?resourceId=`
-          // filter silently returned every user's threads.
-          listThreads: (opts: { resourceId: string }) => view.listThreads(opts),
-          listAllThreads: () => view.listAllThreads(),
-          getMessages: (tid: string) => view.getMessages(tid),
-          getWorkingMemory: (tid: string) => view.getWorkingMemory(tid),
-          updateThread: (tid: string, patch: { title?: string; metadata?: Record<string, unknown> }) => view.updateThread(tid, patch),
-          deleteThread: (tid: string) => view.deleteThread(tid),
-        };
+        // Handed over as it is: Studio's memory type is picked from @gnldev/durable's `Memory`, which
+        // AgentMemory implements. The hand-written adapter that stood here forwarded six methods and
+        // missed the seventh, so this command's "delete messages after" answered 501.
+        memory = mem.memoryPreset(cfg.storage, 'chat');
         // createGnl's memoryFactory is what makes Playground RUNS write to a thread (the view above only
         // reads). Respect a user-provided factory in the config; otherwise use the 'chat' preset.
         memoryFactory = cfg.memoryFactory ?? ((storage: unknown) => mem.memoryPreset(storage, 'chat'));
