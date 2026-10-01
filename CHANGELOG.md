@@ -746,8 +746,15 @@ and who is affected.
   the document and what was already replaced (`err.documentId`, `err.replaced`). Cost, re-ingesting
   50 three-chunk documents (median of 10 after 2 warm-ups, ms per document): in-memory 0.15 → 0.27 at
   500 stored rows and 1.07 → 2.19 at 8000; SQLite 2.24 → 3.21 and 11.4 → 23.6 — the listing is a
-  `query`, which on the SQLite and Postgres stores of @gnldev/durable reads every row of the partition
-  (the delete it adds to already did, so the cost stays linear in the table).
+  `query`, which on the SQLite and Postgres stores of @gnldev/durable read every row of the partition.
+  Every store now indexes the document a record belongs to (`VECTOR_DOCUMENT_KEY`, the `__gnlDoc` key
+  `chunkDocuments` writes), and a `query` or `delete` whose filter names a document reads that index
+  first; the whole filter is still applied. Measured, ms per document, 3,200 → 32,000 stored rows:
+  SQLite 11.8 → 140.8 before, 0.47 → 0.48 after; Postgres 15.2 → 117.7 before, 4.8 → 4.9 after — the
+  cost no longer grows with the table. `deleteDocuments` reads the index too. The Postgres store of
+  @gnldev/durable gains a `doc` column and index on `gnl_vectors`, added and filled on first open; the
+  SQLite store an expression index; `PostgresVectorStore` an index on `metadata ->> '__gnlDoc'`. A custom
+  store without an index still works and reads every row, as before.
 - **`PostgresVectorStore.delete` before any write no longer creates a one-number vector table.** On a fresh
   database a `delete` created `embedding vector(1)`, and every upsert after it failed ("expected 1
   dimensions, not 3") — found through `ingestDocuments`, whose first step is a delete. It now reads the
@@ -932,6 +939,14 @@ and who is affected.
   an identity, or serving the page from this machine's own site). The status is unchanged.
 
 ### Known limits
+
+- **A 0.9 process left running beside this version can hide one old chunk from a re-ingest.** The Postgres
+  store of @gnldev/durable fills `gnl_vectors.doc` itself on every write; a 0.9 process does not. If a
+  0.9 process rewrites an existing record so it belongs to another document, `doc` keeps the old value
+  and the next `ingestDocuments` of that document leaves that record behind. Records a 0.9 process
+  inserts are found (their `doc` is NULL, which every document lookup includes). Stop every 0.9 process
+  before starting this version. The first open of a large `gnl_vectors` also builds the index and fills
+  `doc` for every row; that time was measured up to 32,000 rows only.
 
 - **Studio's role presets list viewer, member and admin only.** `ROLE_PERMISSION_PRESETS` pre-fills the Users
   editor, which offers those three; `client` and `end-user` are roleAuth credential classes and
