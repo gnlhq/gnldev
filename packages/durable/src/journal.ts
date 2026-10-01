@@ -335,6 +335,16 @@ export const runKeys = {
    * unaffected. Purged with the run by the `${runId}:` prefix.
    */
   outcome: (runId: string) => `${runId}:outcome`,
+  /**
+   * The output the run RETURNED when output processors changed it: `{ text }`, written at completion
+   * by run.ts (generate and stream paths) through `recordRunOutput`, read by `runScoreSample`. The
+   * journal's model records keep what the MODEL said; this keeps what the CALLER got, so every runner
+   * that scores the run (an agent's `scorers`, `scoreRun`, Studio's rescore) scores that, and a
+   * redactor's input never reaches a judge. Absent when no `processOutput` hook changed the text —
+   * the returned text is then its last model step's. Suffix-anchored and outside the `:model:`/`:tool:`
+   * pattern like `:memctx` → invisible to parseJournalKey; purged with the run by the `${runId}:` prefix.
+   */
+  output: (runId: string) => `${runId}:output`,
 } as const;
 
 /**

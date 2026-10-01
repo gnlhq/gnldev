@@ -242,7 +242,8 @@ export interface ScorerLike {
   fingerprint?: string;
   /**
    * Runtime scoring sample (built by `runScoreSample`, as in evals' `scoreRun`): `output` = the
-   * agent's final text, `input` = the question from the run's frozen input — the prompt, or the last
+   * text the run returned — after the agent's output processors, so a redactor's input never reaches
+   * a judge (and a later `scoreRun` scores the same text, replaying this memo) — `input` = the question from the run's frozen input — the prompt, or the last
    * user turn when the run was started with `messages` — and `runId`.
    * NOTE: RAG context (`context`) is NOT AVAILABLE here — scorers that require context (faithfulness,
    * hallucination, contextPrecision) always return 0 in registry scorers; use them with `scoreRun`,
@@ -1149,7 +1150,9 @@ export function createGnl(config: CreateGnlConfig) {
       const scores: Record<string, unknown> = {};
       // The sample and the memo are the run-scoring owner's (scoring.ts: runScoreSample,
       // scoreRunMemoized) — the same calls scoreRun makes, so scoring this run again from Studio
-      // replays this memo instead of asking the judge twice. RAG context isn't available here — see ScorerLike.
+      // replays this memo instead of asking the judge twice. The output is the owner's too: the run's
+      // journaled returned output when an output processor changed it (result.text is that same text).
+      // RAG context isn't available here — see ScorerLike.
       const sample = await runScoreSample(journal, runId, { output: (result as any).text ?? '' });
       for (const s of a.scorers) {
         scores[s.name] = await scoreRunMemoized(journal, runId, s, sample);

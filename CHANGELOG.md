@@ -28,7 +28,10 @@ and who is affected.
   0.9.0 journals read unchanged; a journal written now is not for 0.9.0 (downgrades are unsupported).
 - **With a `processToolError` hook that changes the text, a tool's thrown error is a masked copy** —
   same class and `name`, `message` is the hook's text, and its own properties (`code`, `status`…) are
-  not copied. Code that inspects the error in-process reads the original from `error.cause`.
+  not copied. Code that inspects the error in-process reads the original from `error.cause`. When the
+  class cannot be copied safely (a `DOMException` such as fetch's `AbortError`/`TimeoutError`, an error
+  from another realm, an error whose getters throw, a non-Error value) it is a plain `Error` with the
+  original's `name` as an own property — `instanceof DOMException` is false on it; read `error.cause`.
 - **A server with no auth (or a `{ read, write }` pair) answers only `localhost`, `*.localhost`, IP
   addresses and the names you list** — `allowedHosts: ['mybox.test', '.ngrok-free.app']` on
   `createRestApi` / `createStudioApp`, or `GNL_ALLOWED_HOSTS=mybox.test,.ngrok-free.app`. An
@@ -248,8 +251,13 @@ and who is affected.
   fixed error class, never the thrown error's own `name`. A tool that THROWS is covered too: the error
   text journaled as `{ status: 'failed', error }` is masked, through a new optional `Processor` hook,
   `processToolError` (@gnldev/durable). The text is masked once, where the error is thrown: when the
-  hooks changed it, the error the tool rethrows carries the masked text (same class and `name`, the
-  original as `cause`), because that error — not the journal record — is what the model's next
+  hooks changed it, the error the tool rethrows carries the masked text (same class and `name` where
+  copying the class is safe, otherwise a plain `Error` with the same `name`; the original as `cause`).
+  Masking never changes whether a run completes: measured in this cycle, the class copy of a
+  `DOMException` (fetch abort/timeout) could not be read — `.name` and `String(err)` threw
+  ERR_INVALID_THIS — and the run threw a TypeError where 0.9.0 and the unmasked path completed. A thrown
+  value whose `message` getter throws is journaled `failed` instead of leaving the call `running`. The
+  masked copy matters because that error — not the journal record — is what the model's next
   prompt, the thread (`AgentMemory`, and `BasicMemory`'s `mem:<thread>:messages`),
   `GET /threads/:id/messages` and the stream's `tool-error` event render. Measured before: the journal
   record was masked and all four of those carried the raw address. A hook that returns no string is
@@ -572,7 +580,13 @@ and who is affected.
   its `runId`), and one memo owner, `scoreRunMemoized`; an agent's `scorers` and `scoreRun` both call
   them. Measured before: the two built different samples for one run, so scoring a run from Studio
   after the agent had scored it asked the judge again and overwrote the record, and a trajectory
-  scorer on an agent got no `runId` (score 0). **A memo is replayed only for what it was computed on:**
+  scorer on an agent got no `runId` (score 0). **The sample's output is what the run returned, after
+  its output processors**, for every runner: a run whose `processOutput` changed the text journals the
+  returned text as `<runId>:output` (`{ text }`, purged with the run), and `runScoreSample` reads it
+  first. Measured in this cycle: under an output processor the agent's `scorers` scored the processed
+  text and `scoreRun` the raw model text — the judge was asked twice, the memo overwritten, and with
+  `piiRedactor` on output the unredacted text reached the judge model on rescore. `scoreRun` on a
+  STREAMED run scored `''` (it read only generated steps' `content`); it now scores the streamed text. **A memo is replayed only for what it was computed on:**
   a score record (`<runId>:proc:eval:<name>`, still `{ v }`, now with a `basis` hash) for the same
   sample and the same scorer, a dataset case for the same case and scorers. A scorer is known by its
   name and its `fingerprint` (new optional `Scorer` field): the built-in factories set it from their

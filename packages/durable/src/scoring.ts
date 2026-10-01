@@ -6,7 +6,7 @@
 // runner on the old ones (measured: two scorers named 'judge' on an agent → the second replayed the
 // first's memo; a run started with `messages` gave `answerRelevancy` no question). One owner makes
 // the fourth runner correct by construction instead of by a later audit.
-import type { Journal } from './journal.js';
+import type { Journal, JournalEntry } from './journal.js';
 import { runKeys } from './journal.js';
 import { argsHash } from './hash.js';
 
@@ -99,6 +99,41 @@ export function scoreSample(fields: {
 }
 
 /**
+ * The text of a run's last model step — what a run with no output processor returned. A generated
+ * step is journaled as `{ content }`, a streamed one as `{ parts }` (its text is the `text-delta`s);
+ * reading only `content` scored every streamed run as '' (measured).
+ */
+function finalModelText(entries: readonly JournalEntry[]): string {
+  const models = entries.filter((e) => e.kind === 'model');
+  const last = models[models.length - 1]?.value as { content?: unknown; parts?: unknown } | undefined;
+  if (Array.isArray(last?.content)) {
+    return (last.content as Array<{ type?: unknown; text?: unknown }>).filter((p) => p?.type === 'text').map((p) => String(p.text ?? '')).join('');
+  }
+  if (Array.isArray(last?.parts)) {
+    return (last.parts as Array<{ type?: unknown; delta?: unknown }>).filter((p) => p?.type === 'text-delta').map((p) => String(p.delta ?? '')).join('');
+  }
+  return '';
+}
+
+/**
+ * Record the output a completed run RETURNED, for `runScoreSample` (`runKeys.output`). Called by run.ts
+ * at completion. `processed` = output processors CHANGED the text: then it is written (an identity
+ * processor writes nothing — the model's text is still what the run returned). Otherwise it
+ * is written only over an existing record — a run re-driven without the processor returns the model's
+ * text again, and a stale processed record must not keep answering for it. A run that never had an
+ * output processor writes nothing (one point read). The processed write is not best-effort: without
+ * it a rescore would read the raw model text the processor removed.
+ */
+export async function recordRunOutput(journal: Journal, runId: string, text: string, processed: boolean): Promise<void> {
+  const key = runKeys.output(runId);
+  if (processed) { await journal.put(key, { text }); return; }
+  // The stale-record check is housekeeping on a path that never wrote one before: it may not fail a run.
+  try {
+    if ((await journal.get(key)) !== undefined) await journal.put(key, { text });
+  } catch { /* advisory */ }
+}
+
+/**
  * THE sample for a durable RUN — the one function every runner that scores a run calls (an agent's
  * `scorers` in `createGnl`, and @gnldev/evals' `scoreRun`, which Studio's `/runs/:id/score` uses).
  * The question is read from the run's frozen `:input` (what the run was started with, written before
@@ -106,23 +141,36 @@ export function scoreSample(fields: {
  * same from both. Two runners that build the same sample share one memo: the run scored at completion
  * is not judged again when it is scored from Studio.
  *
- * Measured before: the registry built `{ output, input: messages ?? prompt }` at its call site and
+ * The OUTPUT is owned here too: it is what the run RETURNED. When output processors changed it, that
+ * is the `:output` record the run wrote at completion (`recordRunOutput`), and it wins over anything a
+ * runner passes. Otherwise it is `fields.output` (the registry passes the `result.text` it holds), else
+ * the last model step's text from `fields.entries` (scoreRun passes the entries it read), else ''.
+ * Measured before: under a `processOutput` processor the registry scored the processed `result.text`
+ * and `scoreRun` the raw model text from the journal — two samples for one run, the judge asked twice,
+ * the memo overwritten, and with a redactor the unredacted output reached the judge on rescore.
+ *
+ * Measured before that: the registry built `{ output, input: messages ?? prompt }` at its call site and
  * `scoreRun` built `{ output, input: inputText(:input), runId }` at its own — two samples for one run,
  * so the second runner missed the first's memo, asked the judge again and overwrote the record, and
  * a trajectory scorer on an agent got no `runId`.
  *
  * `input` overrides the frozen question (scoreRun's `opts.input`, for a wrapped prompt). A journal that
- * cannot be read by key (a bare reader) gives no question rather than a wrong one.
+ * cannot be read by key (a bare reader) gives no question rather than a wrong one, and no `:output`.
  */
 export async function runScoreSample(
   journal: { get?: Journal['get'] },
   runId: string,
-  fields: { output: string; input?: unknown; expected?: string; context?: string | string[] },
+  fields: { output?: string; entries?: readonly JournalEntry[]; input?: unknown; expected?: string; context?: string | string[] },
 ): Promise<ScoreSampleFields> {
+  const canGet = typeof journal.get === 'function';
   const input = fields.input !== undefined
     ? fields.input
-    : typeof journal.get === 'function' ? await journal.get(runKeys.input(runId)) : undefined;
-  return scoreSample({ output: fields.output, input, expected: fields.expected, context: fields.context, runId });
+    : canGet ? await journal.get!(runKeys.input(runId)) : undefined;
+  const returned = canGet ? await journal.get!<{ text?: unknown }>(runKeys.output(runId)) : undefined;
+  const output = typeof returned?.text === 'string'
+    ? returned.text
+    : fields.output ?? (fields.entries ? finalModelText(fields.entries) : '');
+  return scoreSample({ output, input, expected: fields.expected, context: fields.context, runId });
 }
 
 /** What a scorer must look like to be memoized: a name, a `score`, and optionally its own fingerprint. */

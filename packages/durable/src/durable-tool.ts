@@ -1867,7 +1867,9 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // leaves this function carries the changed text too (`maskedToolError`) — it is the copy the
         // model, the thread and the stream render, so masking only the journal record left the raw
         // text in every other place. Masked once, here, where it is thrown.
-        const thrownText = String(error?.message ?? error);
+        // Read defensively: a thrown value whose `message` getter throws (or a hostile Proxy) must not
+        // turn this handler into a second throw that skips the terminal write below.
+        const thrownText = thrownErrorText(error);
         let journaledError = thrownText;
         if (ctx.toolResultProcessors?.length) {
           const procCtx = createProcessorCtx(ctx.journal, ctx.runId);
@@ -1916,28 +1918,95 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
 /**
  * The error a tool threw, re-made with the text a `processToolError` hook produced.
  *
- * Same prototype (so `instanceof` and `name` still hold), `message` = the processed text, the stack's
- * header rewritten to match, and the ORIGINAL as `cause` — application code in this process can still
- * read it; the AI SDK renders only `message`, so the model, the thread and the stream see the masked
- * text. Own properties (`code`, `status`, a custom `email`…) are NOT copied: they are as likely as the
- * message to hold the value the hook removed. Read them from `cause`.
+ * Invariant: masking changes the TEXT, never whether the run completes. Whatever was thrown, the
+ * result is an `Error` of this realm whose `name`, `message`, `stack` and `String()` can all be read
+ * without throwing — the AI SDK renders a tool error with `error.toString()`, so a copy that cannot be
+ * read turns a tool failure the model could answer into a run that throws.
+ *
+ * Two shapes:
+ *   · Same prototype (so `instanceof` and `name` still hold) when the thrown value is an `Error` of
+ *     this realm AND the copy reads safely. Built-in classes and user subclasses take this path.
+ *   · Otherwise a plain `Error` carrying the original's `name` as an own property. Measured before this
+ *     fallback existed: a DOMException (fetch's AbortError/TimeoutError) has brand-checked `name` and
+ *     `message` getters on its prototype, so the prototype copy threw ERR_INVALID_THIS on `.name` and on
+ *     `String(err)`, and the run threw a TypeError where 0.9.0 and the unmasked path completed. The same
+ *     path takes an error from another realm (node:vm, an iframe — not `instanceof Error` here, so the
+ *     SDK would have rendered the copy as `{}`), an error whose getters throw, and any non-Error value.
+ *
+ * Both shapes: `message` = the processed text, the stack's header rewritten to match (frames kept —
+ * they name code, not data), and the ORIGINAL as `cause` — application code in this process can still
+ * read it; the model, the thread and the stream see only the masked text. Own properties (`code`,
+ * `status`, a custom `email`…) are NOT copied: they are as likely as the message to hold the value the
+ * hook removed. Read them from `cause`.
  */
 export function maskedToolError(original: unknown, text: string): Error {
-  if (!(original instanceof Error)) return new Error(text, { cause: original });
-  const masked = Object.create(Object.getPrototypeOf(original)) as Error;
-  // The frames are kept (they name code, not data); the header that repeats the message is not. A
-  // stack that does not contain the message verbatim is dropped whole — it cannot be split safely.
-  const at = typeof original.stack === 'string' && original.message ? original.stack.indexOf(original.message) : -1;
-  const frames = at >= 0 ? original.stack!.slice(at + original.message.length) : '';
+  const errorLike = isErrorLike(original);
+  const name = errorLike ? safeErrorName(original) : 'Error';
+  const frames = errorLike ? safeStackFrames(original) : undefined;
   const own = { writable: true, configurable: true, enumerable: false };
-  Object.defineProperties(masked, {
-    message: { ...own, value: text },
-    stack: { ...own, value: `${original.name}: ${text}${frames}` },
-    cause: { ...own, value: original },
-  });
-  // `name` usually lives on the prototype; an instance-assigned one is copied so the class still reads right.
-  if (Object.prototype.hasOwnProperty.call(original, 'name')) Object.defineProperty(masked, 'name', { ...own, value: original.name });
-  return masked;
+  if (sameRealmError(original)) {
+    try {
+      const masked = Object.create(Object.getPrototypeOf(original)) as Error;
+      Object.defineProperties(masked, {
+        message: { ...own, value: text },
+        stack: { ...own, value: `${name}: ${text}${frames ?? ''}` },
+        cause: { ...own, value: original },
+      });
+      // `name` usually lives on the prototype; an instance-assigned one is copied so the class still reads right.
+      if (Object.prototype.hasOwnProperty.call(original, 'name')) Object.defineProperty(masked, 'name', { ...own, value: name });
+      // The copy is only handed on if it reads like an Error — a prototype whose accessors are
+      // brand-checked (DOMException) or that render something else fails here and takes the fallback.
+      if (masked.name === name && masked.message === text && typeof String(masked) === 'string') return masked;
+    } catch { /* unsafe to copy — fall through to the plain Error */ }
+  }
+  const plain = new Error(text, { cause: original });
+  if (name !== 'Error') Object.defineProperty(plain, 'name', { ...own, value: name });
+  const ownFrames = frames ?? safeStackFrames(plain) ?? '';
+  Object.defineProperty(plain, 'stack', { ...own, value: `${name}: ${text}${ownFrames}` });
+  return plain;
+}
+
+/** `String(error?.message ?? error)`, but never throwing — the text the journal and the hooks see. */
+function thrownErrorText(error: unknown): string {
+  try { return String((error as { message?: unknown } | null | undefined)?.message ?? error); } catch { /* next */ }
+  try { return String(error); } catch { /* next */ }
+  return '[tool error: the thrown value could not be read as text]';
+}
+
+/** `instanceof Error` in this realm, without letting a hostile value (a Proxy) throw out of it. */
+function sameRealmError(value: unknown): value is Error {
+  try { return value instanceof Error; } catch { return false; }
+}
+
+/** An Error of any realm, or a DOMException — anything that has a meaningful error `name`. */
+function isErrorLike(value: unknown): boolean {
+  if (sameRealmError(value)) return true;
+  try {
+    const tag = Object.prototype.toString.call(value);
+    return tag === '[object Error]' || tag === '[object DOMException]';
+  } catch { return false; }
+}
+
+/** The thrown error's name when it can be read as a non-empty string, else 'Error'. */
+function safeErrorName(value: unknown): string {
+  try {
+    const n = (value as { name?: unknown }).name;
+    return typeof n === 'string' && n.length > 0 ? n : 'Error';
+  } catch { return 'Error'; }
+}
+
+/**
+ * The stack's frames (everything after the header that repeats the message), or undefined when they
+ * cannot be read or split safely — a stack that does not contain the message verbatim is not split.
+ */
+function safeStackFrames(value: unknown): string | undefined {
+  try {
+    const stack = (value as { stack?: unknown }).stack;
+    const message = (value as { message?: unknown }).message;
+    if (typeof stack !== 'string' || typeof message !== 'string' || !message) return undefined;
+    const at = stack.indexOf(message);
+    return at >= 0 ? stack.slice(at + message.length) : undefined;
+  } catch { return undefined; }
 }
 
 /** Makes an entire ToolSet (Record<name, tool>) durable; carries the tool name to the guard. */

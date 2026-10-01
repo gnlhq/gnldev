@@ -32,6 +32,7 @@ import type { RunLimits } from './limits.js';
 import type { LanguageModelV4 } from '@ai-sdk/provider';
 import { systemText, finishReasonText, producedMessages, type InstructionsLike } from './sdk-compat.js';
 import { runFailed, runFailedIfUnrecorded, runStarted, runSucceeded, classifyRunError, isRunFailure, readRunOutcome } from './outcome.js';
+import { recordRunOutput } from './scoring.js';
 
 type GenerateTextOptions = Parameters<typeof generateText>[0];
 type StreamTextOptions = Parameters<typeof streamText>[0];
@@ -2606,6 +2607,7 @@ function shadowProps<T extends object>(obj: T, props: Record<string, unknown>): 
 // → byte-identical to pre-D4-retry behavior, zero new journal keys.
 const RETRY_LADDER_GLOBAL_CAP = 3;
 
+
 function appendRetryFeedback(options: any, feedback: string): void {
   const prior: any[] = Array.isArray(options.messages)
     ? options.messages
@@ -2624,7 +2626,7 @@ async function runGenerateWithRetryLadder(
   runId: string,
   /** Carries an error a per-step hook threw and the SDK swallowed — see composeOnStepFinish. */
   stepHookFailure: StepHookFailure = {},
-): Promise<{ result: any; interrupts: Interrupt[]; produced?: any[] }> {
+): Promise<{ result: any; interrupts: Interrupt[]; produced?: any[]; rawText?: unknown }> {
   const usedByProcessor: Record<string, number> = {};
   let attempt = 0;
 
@@ -2679,8 +2681,9 @@ async function runGenerateWithRetryLadder(
     // 8.7 Output processors: run ONLY on a completed run (not suspended) — same as before D4-retry,
     // now with a catch for ProcessorRetry.
     if (procCtx && interrupts.length === 0) {
+      const rawText = (result as any).text;
       let pout: ProcessorOutput = {
-        text: (result as any).text,
+        text: rawText,
         messages: producedMessages(result),
         result,
       };
@@ -2727,7 +2730,7 @@ async function runGenerateWithRetryLadder(
       // Closing this properly needs a hook that owns step/content records — a processor-contract
       // change, not a patch here. Until then the honest statement belongs where the user reads it:
       // the processor's own docs (@gnldev/processors piiRedactor).
-      return { result, interrupts, produced: pout.messages };
+      return { result, interrupts, produced: pout.messages, rawText };
     }
 
     return { result, interrupts };
@@ -3232,7 +3235,7 @@ async function runDurableInner(args: RunDurableArgs, admission: { admitted: bool
   // bounded retry-with-feedback ladder (see runGenerateWithRetryLadder above for the full contract —
   // includes the K1/W1 sentinel-to-error conversion and the 8.7 output-processor pass, byte-for-
   // byte unchanged for a run with no ProcessorRetry-throwing processor).
-  const { result: ladderResult, interrupts, produced: processedProduced } = await runGenerateWithRetryLadder(options, processors, procCtx, journal, runId, stepHookFailure);
+  const { result: ladderResult, interrupts, produced: processedProduced, rawText } = await runGenerateWithRetryLadder(options, processors, procCtx, journal, runId, stepHookFailure);
   let result = ladderResult;
 
   // Memory: idempotent append on completion (not suspended) — resume/retry does NOT double-write.
@@ -3268,6 +3271,11 @@ async function runDurableInner(args: RunDurableArgs, admission: { admitted: bool
     try {
       await recordRunMetrics(journal, journal as unknown as JournalReader, runId, agentName ? { agentName } : {});
     } catch { /* advisory aggregate — must not affect the run */ }
+    // The output this run RETURNS, for every runner that scores it (scoring.ts runScoreSample): when
+    // an output processor changed it, the journal's model records no longer say what the caller got.
+    const returnedText = String((result as any).text ?? '');
+    await recordRunOutput(journal, runId, returnedText,
+      processedProduced !== undefined && returnedText !== String(rawText ?? ''));
     // Overwrites any 'failed' from an earlier attempt: a run that was fixed and resumed to success is
     // not a failed run. Inside the `interrupts.length === 0` branch, so a suspended run — which returns
     // normally, awaiting a human — is not mislabelled as finished.
@@ -3788,6 +3796,11 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
             // Use runDurable/generateText for a processor that needs retry-with-feedback.
             const pout = await outputProcessed(async () => ev);
             if (pout) produced = pout.messages;
+            // What `await result.text` returns (maskTerminal reads the same pass) — see recordRunOutput.
+            const returnedText = String((pout ? pout.text : ev?.text) ?? '');
+            await recordRunOutput(journal, runId, returnedText, returnedText !== String(ev?.text ?? ''));
+          } else {
+            await recordRunOutput(journal, runId, String(ev?.text ?? ''), false);
           }
           if (memory && threadId) {
             // TWO-PHASE MARKER — SAME pattern/parity as runDurableInner (see claimMemoryAppend).

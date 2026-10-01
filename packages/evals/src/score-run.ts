@@ -4,6 +4,7 @@ import type { Scorer, ScoreResult, ScoreSample } from './scorer.js';
 
 export interface ScoreRunResult {
   runId: string;
+  /** The output that was scored: what the run returned — after its output processors, when it had any. */
   output: string;
   /** The question the input-reading scorers were given (`opts.input`, else the run's journaled input). */
   input?: string;
@@ -33,14 +34,6 @@ export interface ScoreRunOptions {
   context?: string | string[] | ((entries: JournalEntry[]) => string | string[] | undefined);
 }
 
-/** Extracts the output to be scored from the journal trace (the text of the last model entry). */
-function extractFinalText(entries: JournalEntry[]): string {
-  const models = entries.filter((e) => e.kind === 'model');
-  const last = models[models.length - 1];
-  const content = ((last?.value as any)?.content ?? []) as any[];
-  return content.filter((p) => p?.type === 'text').map((p) => p.text).join('');
-}
-
 /**
  * Scores a run from its JOURNAL TRACE (post-execution, deterministic). Same journal → same
  * output → same score for rule-based scorers. If the journal is writable, each scorer result is
@@ -55,14 +48,14 @@ export async function scoreRun(
 ): Promise<ScoreRunResult> {
   assertDistinctScorerNames(scorers, '@gnldev/evals scoreRun');
   const entries = await reader.readRun(runId);
-  const output = extractFinalText(entries);
   const j = reader as Partial<Journal>;
   const context = typeof opts.context === 'function' ? opts.context(entries) : opts.context;
-  // The sample is the run-scoring owner's (durable's runScoreSample): the question from the run's
-  // frozen `:input`, and `runId` for trajectory-style scorers — the same sample an agent's `scorers`
-  // built when the run completed, so a run scored there is replayed here, not judged again.
-  const sample: ScoreSample = await runScoreSample(j, runId, { output, input: opts.input, expected: opts.expected, context });
-  const input = sample.input;
+  // The sample is the run-scoring owner's (durable's runScoreSample): the output the run RETURNED
+  // (after its output processors — never the raw model text a redactor removed), the question from the
+  // run's frozen `:input`, and `runId` for trajectory-style scorers — the same sample an agent's
+  // `scorers` built when the run completed, so a run scored there is replayed here, not judged again.
+  const sample: ScoreSample = await runScoreSample(j, runId, { entries, input: opts.input, expected: opts.expected, context });
+  const { output, input } = sample;
 
   const canMemo = opts.memo !== false && typeof j.get === 'function' && typeof j.put === 'function';
 
