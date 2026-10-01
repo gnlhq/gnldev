@@ -14,6 +14,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Migration notes, one line each; the full entries under Security, Fixed and Changed have the measurement
 and who is affected.
 
+- **`EDGE_ERROR_CODES.threadIdReserved` is gone from @gnldev/server** — the code is
+  `RESERVED_ID_ERROR_CODES.ReservedThreadIdError` in @gnldev/durable (same string, `thread_id_reserved`,
+  same 400), and `reservedIdFailure(e)` renders it.
+- **`forkWorkflowRun` copies more of a kept step, and Studio's workflow fork copies less** — both now
+  copy exactly `forkedStepKeys(...)`: a kept step's loop rounds, foreach items, parallel legs and branch
+  arms travel with it (the engine left them), and its retry counter and side-effect claim stay behind
+  (Studio took them). A step whose id continues another's (`a:x` beside `a`) is its own.
 - **Workflow step uses that share a journal key throw where the workflow is built** — a repeated id,
   a top-level `pay:check` beside `asStep('pay')` with an inner `check`, or one `waitForResume` gate used
   twice (the same nested workflow under two `asStep`s). Rename one: `step('inc-2', inc.run)`,
@@ -108,6 +115,11 @@ and who is affected.
 
 ### Added
 
+- **@gnldev/workflow `stepOwnerOf(rest, ids)` and `forkedStepKeys(rests, ids, kept)`** — the one rule for
+  which top-level step a `<runId>:wf:` key belongs to, and which keys a fork copies. Studio keeps a
+  pinned copy held to it by `workflow-fork-parity.test.ts`.
+- **@gnldev/durable `RESERVED_ID_ERROR_CODES` and `reservedIdFailure(e)`** — the status, code and body
+  every door gives `ReservedThreadIdError`.
 - @gnldev/auth: `FREE_ROLE_GRANTS`, `hostNotAllowedMessage`, `hostnameOf`, `isHostAllowed`,
   `parseAllowedHosts`, `crossSiteRefusedMessage`, `openDoorGuard` (+ types `OpenDoorGuardOptions`,
   `OpenDoorRefusal`, `HostRuleAuth`), `GateOptions.allowedHosts`, and the error codes
@@ -356,6 +368,16 @@ and who is affected.
 
 ### Fixed
 
+- **Studio's workflow fork decided for itself which step a journal key belongs to, and disagreed with
+  the engine** — it took the FIRST step id a key started with, so a fork keeping `a` copied step `a:x`
+  and the fork replayed `a:x` instead of running it; and it copied `pay:attempts` and `charge:_claim`,
+  which `forkWorkflowRun` leaves behind. Measured on one journal, Studio vs engine: `[a, a:x]` vs `[a]`,
+  and `[charge, charge:_claim, pay, pay:attempts]` vs `[charge, pay]`. Both now copy `forkedStepKeys`.
+- **`thread_id_reserved` was one door's code** — a root-scope thread id under `org:` answered 500 on
+  Studio's `GET /threads/:id/messages` and `/working-memory`, and 400 with no `code` on Studio
+  PATCH/DELETE, the chat route and the AG-UI route; only REST said `thread_id_reserved`, from its own
+  copy of the `org:` test. Every door now answers `400 { code: 'thread_id_reserved', detail: { threadId } }`
+  through @gnldev/durable's `reservedIdFailure`, and REST asks the memory's own `assertRootThreadId`.
 - **A page served from this machine on another loopback name is no longer refused as cross-site.** A
   SPA on `http://127.0.0.1:5173` calling an API on `http://localhost:3000` is marked
   `Sec-Fetch-Site: cross-site` by the browser (127.0.0.1 and localhost are different sites), and the REST

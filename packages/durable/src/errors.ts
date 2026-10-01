@@ -491,6 +491,32 @@ export const LIMIT_ERROR_CODES = {
   toolLoopDetected: 'tool_loop_detected',
 } as const;
 
+/**
+ * A request named an id its scope may not name — `ReservedThreadIdError` (storage.ts), thrown by a
+ * root-scope `AgentMemory` for a thread id under `org:`. 400: the caller's input needs changing; no
+ * retry clears it.
+ *
+ * WHY A MAP AND A RENDERER HERE. The code used to be spelled at one door (@gnldev/server's
+ * `EDGE_ERROR_CODES`, with its own copy of the `org:` test in front of the memory), and every other
+ * door met the error as whatever its catch-all said: Studio's thread reads answered 500, Studio's
+ * PATCH/DELETE and the chat and AG-UI routes 400 with no `code`. The error is thrown here, in the
+ * package every door depends on, so the code and its status live with it (ADR-0002 point 0, as for
+ * `LIMIT_ERROR_CODES`) and each door renders `reservedIdFailure(e)` in one line.
+ */
+export const RESERVED_ID_ERROR_CODES = {
+  ReservedThreadIdError: 'thread_id_reserved',
+} as const;
+
+/** The response every door gives a reserved-id refusal: status, and the body to send. Name-matched like `blockedErrorCode`. */
+export function reservedIdFailure(err: unknown): { status: 400; body: { error: string; code: 'thread_id_reserved'; detail: { threadId: string } } } | undefined {
+  const e = err as { name?: unknown; message?: unknown; threadId?: unknown } | null | undefined;
+  if (e?.name !== 'ReservedThreadIdError') return undefined;
+  return {
+    status: 400,
+    body: { error: String(e.message), code: RESERVED_ID_ERROR_CODES.ReservedThreadIdError, detail: { threadId: String(e.threadId) } },
+  };
+}
+
 export interface UpstreamFailure {
   /** HTTP status to answer the CALLER with — never the upstream's status verbatim (see below). */
   status: 429 | 502 | 504;
@@ -587,6 +613,8 @@ const WIRE_STATUS_BY_CODE = {
   upstream_unauthorized: 502,
   upstream_unavailable: 502,
   upstream_timeout: 504,
+  // reserved id — the caller named what its scope may not name; change the id
+  thread_id_reserved: 400,
 } as const;
 /** A code with a pinned HTTP status. */
 export type WireErrorCode = keyof typeof WIRE_STATUS_BY_CODE;

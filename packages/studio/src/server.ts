@@ -5,7 +5,7 @@ import { Hono, type Context } from 'hono';
 import { sseResponse } from './sse.js';
 
 import { STUDIO_ERROR_CODES } from './error-codes.js';
-import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, eraseSubject, subjectRuns, toJournal, decodeStepRecord } from '@gnldev/durable';
+import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, reservedIdFailure, eraseSubject, subjectRuns, toJournal, decodeStepRecord } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
 import type { JournalReader, Journal, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
@@ -29,6 +29,41 @@ import { pipeAgentStream } from './sse.js';
 export function isWorkflowStepKey(rest: string): boolean {
   if (rest.startsWith('_') || rest.includes(':_')) return false;
   return !rest.endsWith(':attempts');
+}
+
+/**
+ * The keys a workflow fork copies — @gnldev/workflow's `forkedStepKeys`, pinned here for the same
+ * reason as `isWorkflowStepKey` above (the core does not import the optional peer), and held to it by
+ * test/workflow-fork-parity.test.ts. A key travels when it is a step's (not bookkeeping) and its
+ * top-level owner is kept; a `:_fallback` marker travels only with its output.
+ *
+ * The fork door once decided ownership itself — the FIRST step id the key started with — so a fork
+ * keeping `a` took `a:x`, a step of its own, and the fork replayed it instead of running it; and it
+ * copied retry counters and side-effect claims the engine's fork leaves behind.
+ */
+export function forkedWorkflowStepKeys(rests: Iterable<string>, stepIds: readonly string[], kept: Iterable<string>): string[] {
+  const ids = new Set(stepIds);
+  const keep = new Set(kept);
+  const all = new Set(rests);
+  const ownerOf = (rest: string): string | undefined => {
+    if (ids.has(rest)) return rest;
+    for (let i = rest.length - 1; i > 0; i--) {
+      const ch = rest.charCodeAt(i);
+      if (ch !== 58 && ch !== 47 && ch !== 35 && ch !== 91) continue; // ':' '/' '#' '['
+      const head = rest.slice(0, i);
+      if (ids.has(head)) return head;
+    }
+    return undefined;
+  };
+  const travels = (rest: string) => isWorkflowStepKey(rest) && keep.has(ownerOf(rest) as string);
+  const out: string[] = [];
+  for (const rest of all) {
+    if (rest.endsWith(':_fallback')) {
+      const subject = rest.slice(0, -':_fallback'.length);
+      if (all.has(subject) && travels(subject)) out.push(rest);
+    } else if (travels(rest)) out.push(rest);
+  }
+  return out;
 }
 /** Scheduler view trigger row (same shape as @gnldev/scheduler `listTriggers` — see GET /scheduler/triggers). */
 export type { TriggerInfo } from '@gnldev/scheduler';
@@ -3891,6 +3926,16 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   });
 
   /**
+   * A thread id the memory refuses to name (`ReservedThreadIdError`: a root-scope memory asked for an
+   * id under `org:`), answered the way every door answers it — durable's `reservedIdFailure`, 400
+   * `thread_id_reserved`. Studio's thread reads let it escape as a 500; its writes and runs flattened
+   * it to a 400 with no code.
+   */
+  function reservedIdResponse(c: Context, e: unknown): Response | undefined {
+    const f = reservedIdFailure(e);
+    return f ? c.json(f.body, f.status) : undefined;
+  }
+  /**
    * K1/W1: the SAME mapping as `limitErrorResponse`/`blockedErrorResponse` in @gnldev/server — but Studio is
    * NOT dependent on @gnldev/server (no dependency in package.json, only @gnldev/durable) → it's set up
    * LOCALLY here. The code/HTTP status choices are IDENTICAL to packages/server/src/index.ts: run_limit_
@@ -3922,6 +3967,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     // the generic 400, telling the caller its request was malformed when the request was fine.
     // Measured: a free endpoint answering 429 arrived as `400 "Failed after 3 attempts…"`, which a
     // client with retry logic reads as "never retry" at the exact moment it should wait.
+    const reserved = reservedIdResponse(c, e);
+    if (reserved) return reserved;
     const up = upstreamFailure(e);
     if (up) {
       const eu = e as { message?: string } | null | undefined;
@@ -4158,13 +4205,23 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allowP(c.req.raw, 'threads:read'))) return deny(c.req.raw, 'read');
     { const denied = requireScopedMemory(c); if (denied) return denied; }
     if (!resolvedMemory) return c.json([]);
-    return c.json(await resolvedMemory.getMessages(decodeURIComponent(c.req.param('id'))));
+    try {
+      return c.json(await resolvedMemory.getMessages(decodeURIComponent(c.req.param('id'))));
+    } catch (e) {
+      const r = reservedIdResponse(c, e); if (r) return r;
+      throw e;
+    }
   });
   app.get('/threads/:id/working-memory', async (c) => {
     if (!(await allowP(c.req.raw, 'threads:read'))) return deny(c.req.raw, 'read');
     { const denied = requireScopedMemory(c); if (denied) return denied; }
     if (!resolvedMemory?.getWorkingMemory) return c.json({ value: null });
-    return c.json({ value: (await resolvedMemory.getWorkingMemory(decodeURIComponent(c.req.param('id')))) ?? null });
+    try {
+      return c.json({ value: (await resolvedMemory.getWorkingMemory(decodeURIComponent(c.req.param('id')))) ?? null });
+    } catch (e) {
+      const r = reservedIdResponse(c, e); if (r) return r;
+      throw e;
+    }
   });
   app.patch('/threads/:id', async (c) => {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
@@ -4176,7 +4233,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       await audit(c, 'thread.rename', decodeURIComponent(c.req.param('id')), patch);
       return c.json({ ok: true, thread });
     } catch (e) {
-      return c.json({ error: String((e as Error)?.message ?? e) }, 400);
+      return reservedIdResponse(c, e) ?? c.json({ error: String((e as Error)?.message ?? e) }, 400);
     }
   });
   app.delete('/threads/:id', async (c) => {
@@ -4188,7 +4245,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       await audit(c, 'thread.delete', decodeURIComponent(c.req.param('id')));
       return c.json({ ok: true });
     } catch (e) {
-      return c.json({ error: String((e as Error)?.message ?? e) }, 400);
+      return reservedIdResponse(c, e) ?? c.json({ error: String((e as Error)?.message ?? e) }, 400);
     }
   });
   // Truncates a thread FROM a message index onward (destructive, e.g. for "retry from here"/branching
@@ -4211,7 +4268,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       await audit(c, 'thread.truncate', id, { afterIndex: body.afterIndex, removed });
       return c.json({ ok: true, removed });
     } catch (e) {
-      return c.json({ error: String((e as Error)?.message ?? e) }, 400);
+      return reservedIdResponse(c, e) ?? c.json({ error: String((e as Error)?.message ?? e) }, 400);
     }
   });
 
@@ -5247,14 +5304,18 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const prefix = `${src}:wf:`;
     const keys = await rw.listKeys!(prefix).catch(() => [] as string[]);
     let copied = 0;
-    for (const k of keys) {
-      const rest = k.slice(prefix.length);
-      // Composite sub-keys are also attributed to their step: foreach[0], loop#2, nested:child …
-      const owner = stepIds.find((sid) => rest === sid || rest.startsWith(sid + '[') || rest.startsWith(sid + '#') || rest.startsWith(sid + ':'));
-      if (owner && keep.has(owner)) {
-        await rw.put!(`${dst}:wf:${rest}`, await rw.get!(k));
-        copied++;
-      }
+    // Composite sub-keys travel with their step (foreach[0], loop#2, nested:child …); which keys those
+    // are is the engine's rule, pinned (`forkedWorkflowStepKeys`), not decided here.
+    // Asked twice, as the engine does: a listed key holding nothing is not a record, and a fallback
+    // marker whose output is gone must stay behind.
+    const held = new Map<string, unknown>();
+    for (const rest of forkedWorkflowStepKeys(keys.map((k) => k.slice(prefix.length)), stepIds, keep)) {
+      const v = await rw.get!(prefix + rest);
+      if (v !== undefined) held.set(rest, v);
+    }
+    for (const rest of forkedWorkflowStepKeys(held.keys(), stepIds, keep)) {
+      await rw.put!(`${dst}:wf:${rest}`, held.get(rest));
+      copied++;
     }
     await audit(c, 'fork', src, { workflow: name, upto, newRunId: dst });
     return c.json({ ok: true, newRunId: dst, copied, keptSteps: [...keep] });

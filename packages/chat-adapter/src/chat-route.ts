@@ -9,7 +9,7 @@ import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { convertToModelMessages } from 'ai';
 import type { UIMessage } from 'ai';
-import { createGnl, scopeConfigToOrg, RunThreadMismatchError, blockedErrorCode, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, upstreamFailure, sealRequestContext, sealFieldsOf, resolveWorkIdentity } from '@gnldev/durable';
+import { createGnl, scopeConfigToOrg, RunThreadMismatchError, blockedErrorCode, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, upstreamFailure, reservedIdFailure, sealRequestContext, sealFieldsOf, resolveWorkIdentity } from '@gnldev/durable';
 import type { CreateGnlConfig } from '@gnldev/durable';
 import { doorGate, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify } from '@gnldev/auth';
 import { toUIMessageStreamResponse } from './ui-stream.js';
@@ -148,6 +148,9 @@ function typedErrorResponse(c: Context, e: unknown, workKey?: string): Response 
     if (code === 'run_busy') res.headers.set('Retry-After', '5');
     return res;
   }
+  // A root-scope thread id under `org:` — durable's one answer for it (400 thread_id_reserved).
+  const reserved = reservedIdFailure(e);
+  if (reserved) return c.json(reserved.body, reserved.status);
   const up = upstreamFailure(e);
   if (up) {
     const err = e as { message?: string } | null | undefined;

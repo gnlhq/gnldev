@@ -47,6 +47,7 @@ const SOURCES = [
     BLOCKED_ERROR_CODES: (cls) => `blocked (${cls})`,
     UPSTREAM_ERROR_CODES: (cls) => `upstream (${cls})`,
     LIMIT_ERROR_CODES: (cls) => `limit (${cls})`,
+    RESERVED_ID_ERROR_CODES: (cls) => `reserved id (${cls})`,
   } },
   { dist: ['packages', 'server', 'dist', 'edge-errors.js'], build: '@gnldev/server', status: 'EDGE_ERROR_STATUS', maps: {
     EDGE_ERROR_CODES: (cls) => `HTTP edge (${cls})`,

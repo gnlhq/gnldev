@@ -174,7 +174,8 @@ export type MemoryPartition = { kind: 'root' } | { kind: 'org'; prefix: string }
 
 /**
  * A root-scope caller named a thread in the organizations' reserved space. Thrown by a root-scope
- * `AgentMemory` (and refused as `thread_id_reserved` by the REST door): such an id is an
+ * `AgentMemory`, and answered `400 thread_id_reserved` on every door through `reservedIdFailure`
+ * (errors.ts): such an id is an
  * organization's physical thread id, and a root caller that could use it would read that thread, or
  * write a thread INTO that organization's partition.
  */

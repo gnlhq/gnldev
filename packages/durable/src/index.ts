@@ -42,6 +42,7 @@ export {
   NotAnAgentRunError,
   CALLER_CONFLICT_CODES, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, FOREIGN_PARTY_DETAIL_FIELDS,
   BLOCKED_ERROR_CODES, blockedErrorCode, upstreamFailure, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES,
+  RESERVED_ID_ERROR_CODES, reservedIdFailure,
   // The HTTP status of every wire code, for a client or a door that maps a code to a response.
   WIRE_ERROR_STATUS,
   // The error→note→help formatter. Exported because the refusals a user actually meets are split

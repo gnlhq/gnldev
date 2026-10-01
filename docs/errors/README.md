@@ -12,10 +12,11 @@ longer exists fails it too.
 | `BLOCKED_ERROR_CODES` | `@gnldev/durable` | runs waiting on a decision |
 | `UPSTREAM_ERROR_CODES` | `@gnldev/durable` | the model provider failed |
 | `LIMIT_ERROR_CODES` | `@gnldev/durable` | a run stopped at a `limits` ceiling or a tool loop |
+| `RESERVED_ID_ERROR_CODES` | `@gnldev/durable` | an id the caller's scope may not name |
 | `EDGE_ERROR_CODES` | `@gnldev/server` | refusals the HTTP layer writes itself |
 | `STUDIO_ERROR_CODES` | `@gnldev/studio` | the operator console's own refusals |
 
-All six are enumerable values, so the check reads them and keeps no list of its own. It used to keep
+Every one is an enumerable value, so the check reads them and keeps no list of its own. It used to keep
 one — three edge codes typed into the script by hand, under a comment admitting that a fourth added
 tomorrow would be caught by nothing. That was measured before it was replaced, and it had already
 happened: the edge was printing **nine** codes, and the upstream family existed only as a TypeScript
@@ -84,6 +85,15 @@ re-drive the **same** runId, and the journal replays what already completed.
 | [`run_limit_exceeded`](./run_limit_exceeded.md) | 422 | The run met a `limits` ceiling and stopped there. |
 | [`tool_loop_detected`](./tool_loop_detected.md) | 422 | One tool, the same arguments, over and over — no progress. |
 
+## A name the caller's scope may not use
+
+The caller named an id its scope cannot name — `RESERVED_ID_ERROR_CODES` in `@gnldev/durable`, where
+the error is thrown. Every door (REST, Studio, chat, AG-UI) answers it through `reservedIdFailure`.
+
+| Code | Status | In one line |
+| --- | --- | --- |
+| [`thread_id_reserved`](./thread_id_reserved.md) | 400 | A root-scope request named a thread under `org:`, the organizations' reserved id space. |
+
 ## Written at the HTTP edge
 
 Refusals the route layer makes on its own, before or around the run — `EDGE_ERROR_CODES` in
@@ -98,7 +108,6 @@ Refusals the route layer makes on its own, before or around the run — `EDGE_ER
 | [`a2a_timestamp_invalid`](./a2a_timestamp_invalid.md) | 401 | Outside the ±300s replay window — usually clock skew. |
 | [`a2a_signature_invalid`](./a2a_signature_invalid.md) | 401 | The HMAC did not verify over the bytes received. |
 | [`body_consumed_upstream`](./body_consumed_upstream.md) | 500 | A body parser mounted ahead of the handler drained the request. |
-| [`thread_id_reserved`](./thread_id_reserved.md) | 400 | A root-scope request named a thread under `org:`, the organizations' reserved id space. |
 
 ## The decision record — `@gnldev/auth`
 

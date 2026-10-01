@@ -28,5 +28,7 @@ user may call a thread `org:notes` and it is stored as `org:acme:org:notes`.
 - **To work with an organization's threads**, make the request as that organization: an identity
   bound to it (`orgId` on the principal), or your deployment's organization resolver. In code, build
   the memory over `withOrgStorage(storage, orgId)`.
-- A root-scope `AgentMemory` refuses the same ids with `ReservedThreadIdError`, so doors without this
-  check (the standalone chat and AG-UI routes) fail closed rather than serve the thread.
+- A root-scope `AgentMemory` refuses the same ids with `ReservedThreadIdError`, and every door — REST,
+  Studio, the standalone chat and AG-UI routes — answers that error the same way, through
+  `reservedIdFailure` in `@gnldev/durable`: this status, this code, and `detail.threadId`. In code,
+  `RESERVED_ID_ERROR_CODES` names it.

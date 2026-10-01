@@ -3,7 +3,7 @@
 import { Hono, type Context } from 'hono';
 import { toFetchHandler, type FetchHandler } from './handler.js';
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, cancelAgentRun, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, isOrganizationKey, orgPrefix, withRootScope, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext } from '@gnldev/durable';
+import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, cancelAgentRun, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, reservedIdFailure, assertRootThreadId, orgPrefix, withRootScope, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext } from '@gnldev/durable';
 import type { CreateGnlConfig, Journal, JournalReader, BudgetLimit, UsageCostCache, RunLimits, ResolvedWorkIdentity, WorkScopeKind, StreamSurface as DurableStreamSurface, StreamSurfaceInput } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, callerKind, subjectIdProblem, actorIdOf, engineCallerOf, markRefusal, settleDecision, decisionNotRecorded, type AuthProvider, type ReadWriteAuth, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
 // P0.4 @gnldev/workflow is zero-dependency (see its package.json) — depending on it
@@ -653,6 +653,12 @@ function blockedErrorResponse(c: Context, e: unknown): Response | undefined {
  * choices and their reasoning live in @gnldev/durable#upstreamFailure; this only renders them, plus
  * `Retry-After` when the upstream named a delay.
  */
+/** A reserved-id refusal (`ReservedThreadIdError`), as every door answers it — see @gnldev/durable#reservedIdFailure. */
+function reservedIdResponse(c: Context, e: unknown): Response | undefined {
+  const f = reservedIdFailure(e);
+  return f ? c.json(f.body, f.status) : undefined;
+}
+
 function upstreamErrorResponse(c: Context, e: unknown): Response | undefined {
   const up = upstreamFailure(e);
   if (!up) return undefined;
@@ -961,12 +967,18 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
    * refuses the same ids (`ReservedThreadIdError`); this is the door's clean 400 in front of it.
    */
   function reservedThreadRefused(c: Context, s: Instance, threadId: unknown): Response | undefined {
-    if (s.orgId !== undefined || typeof threadId !== 'string' || !isOrganizationKey(threadId)) return undefined;
-    return c.json({
-      error: `thread id '${threadId}' starts with 'org:', which is reserved for organizations' threads; use a thread id that does not start with 'org:'`,
-      code: EDGE_ERROR_CODES.threadIdReserved,
-      detail: { threadId },
-    }, 400);
+    if (s.orgId !== undefined || typeof threadId !== 'string') return undefined;
+    // The memory's own rule and its own error, asked early: the check is the root-scope memory's
+    // (`assertRootThreadId`), the answer is durable's (`reservedIdFailure`) — this door only asks
+    // before the ownership lookup below reads anything.
+    try {
+      assertRootThreadId(threadId);
+      return undefined;
+    } catch (e) {
+      const r = reservedIdResponse(c, e);
+      if (r) return r;
+      throw e;
+    }
   }
 
   async function threadOwnershipDenied(
@@ -1547,7 +1559,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       // The correlation handle rides on refusals too: a caller who named work and got a 409 has no
       // other way to learn which run it collided with.
       return stampRunHeaders(
-        limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400),
+        limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400),
         runId,
       );
     } finally {
@@ -1639,7 +1651,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       // wants to badge it should not have to infer it from prose. Additive; absent on fresh work.
       return c.json({ ok: true, runId: body.runId, text: r.text, interrupts: r.interrupts, finishReason: r.finishReason, ...((r as { replayedToolCalls?: unknown[] }).replayedToolCalls?.length ? { replayedToolCalls: (r as { replayedToolCalls?: unknown[] }).replayedToolCalls } : {}) });
     } catch (e: any) {
-      return limitErrorResponse(c, e) ?? threadMismatchResponse(c, e) ?? callerConflictResponse(c, e) ?? blockedErrorResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400);
+      return limitErrorResponse(c, e) ?? threadMismatchResponse(c, e) ?? callerConflictResponse(c, e) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400);
     }
   });
 
@@ -1921,7 +1933,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     } catch (e: any) {
       unregisterInflight(key, ctrl);
       return stampRunHeaders(
-        limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400),
+        limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400),
         runId,
       );
     }
@@ -2068,7 +2080,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       const effective = (result as { runId?: string }).runId ?? runId;
       return effective ? stampRunHeaders(res, effective) : res;
     } catch (e: any) {
-      const res = limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400);
+      const res = limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400);
       return runId ? stampRunHeaders(res, runId) : res;
     } finally {
       if (wfKey) unregisterInflight(wfKey, ctrl);

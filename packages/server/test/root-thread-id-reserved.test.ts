@@ -9,12 +9,12 @@
 // inside acme, and `org:acme:t-acme` names acme's existing thread directly. The door refuses the
 // reserved space for root-scope callers with `thread_id_reserved` (400) before anything runs.
 import { describe, it, expect } from 'vitest';
-import { InMemoryStorage, type Storage } from '@gnldev/durable';
+import { InMemoryStorage, RESERVED_ID_ERROR_CODES, type Storage } from '@gnldev/durable';
 import { SqliteStorage } from '../../durable/src/sqlite-storage.js';
 import { echoModel } from '@gnldev/durable/mock';
 import { memoryPreset } from '../../memory/src/index.js';
 import { createChatRoute } from '../../chat-adapter/src/index.js';
-import { createRestApi, EDGE_ERROR_CODES } from '../src/index.js';
+import { createRestApi } from '../src/index.js';
 
 (globalThis as any).AI_SDK_LOG_WARNINGS = false;
 const SECRET = 'ACME-SECRET-42';
@@ -68,7 +68,7 @@ describe.each(engines)('REST: a root-scope caller cannot name a thread under org
     const res = await run('root-user', 'r-root', threadId, 'what is my secret password');
     expect(res.status).toBe(400);
     expect((await res.json()).code).toBe('thread_id_reserved');
-    expect(EDGE_ERROR_CODES.threadIdReserved).toBe('thread_id_reserved');
+    expect(RESERVED_ID_ERROR_CODES.ReservedThreadIdError).toBe('thread_id_reserved');
     expect(spy.prompts.length).toBe(before);
   });
 
@@ -118,5 +118,39 @@ describe('standalone chat door, root user naming acme\'s space (no door check th
     const r = await chat('root-user', 'org:acme:conv-acme', 'what is my secret password');
     expect(r.body).not.toContain(SECRET);
     expect(spy.prompts.slice(before).join('')).not.toContain(SECRET);
+  });
+});
+
+// ONE ERROR, ONE ANSWER ON EVERY DOOR. `ReservedThreadIdError` is answered through @gnldev/durable's
+// `reservedIdFailure`: 400, `code: 'thread_id_reserved'`, `detail.threadId`. Measured before (round 5):
+// Studio's GET /threads/:id/messages and /working-memory answered 500; Studio PATCH/DELETE and the
+// chat and AG-UI routes 400 with no `code`; only REST said `thread_id_reserved`, from its own copy of
+// the `org:` test and its own sentence.
+describe('every door answers a reserved thread id with the same status, code and detail', async () => {
+  const { createStudioApi } = await import('../../studio/src/server.js');
+  const { createAguiRoute } = await import('../../agui/src/index.js');
+  const { WIRE_ERROR_STATUS } = await import('@gnldev/durable');
+  const threadId = 'org:acme:t';
+  const enc = encodeURIComponent(threadId);
+  const json = { 'content-type': 'application/json' };
+  const mk = () => {
+    const storage = new InMemoryStorage();
+    return { storage, memory: memoryPreset(storage, 'chat') as any, agents: { a: { model: echoModel() } } };
+  };
+  const doors: Array<[string, () => Promise<Response>]> = [
+    ['studio GET messages', async () => { const k = mk(); return (createStudioApi({ reader: k.storage.runs as any, memory: k.memory }) as any)(new Request(`http://x/threads/${enc}/messages`)); }],
+    ['studio GET working-memory', async () => { const k = mk(); return (createStudioApi({ reader: k.storage.runs as any, memory: k.memory }) as any)(new Request(`http://x/threads/${enc}/working-memory`)); }],
+    ['studio PATCH thread', async () => { const k = mk(); return (createStudioApi({ reader: k.storage.runs as any, memory: k.memory }) as any)(new Request(`http://x/threads/${enc}`, { method: 'PATCH', headers: json, body: '{"title":"x"}' })); }],
+    ['studio DELETE thread', async () => { const k = mk(); return (createStudioApi({ reader: k.storage.runs as any, memory: k.memory }) as any)(new Request(`http://x/threads/${enc}`, { method: 'DELETE' })); }],
+    ['rest GET messages', async () => { const k = mk(); return (createRestApi({ storage: k.storage, memory: k.memory, agents: k.agents } as any, { protectionsBanner: false } as any) as any).fetch(new Request(`http://x/threads/${enc}/messages`)); }],
+    ['rest POST run', async () => { const k = mk(); return (createRestApi({ storage: k.storage, memory: k.memory, agents: k.agents } as any, { protectionsBanner: false } as any) as any).fetch(new Request('http://x/agents/a/run', { method: 'POST', headers: json, body: JSON.stringify({ runId: 'r', threadId, resourceId: 'u', prompt: 'x' }) })); }],
+    ['chat POST', async () => { const k = mk(); return (createChatRoute({ storage: k.storage, memory: k.memory, agents: k.agents } as any, {}) as any).fetch(new Request('http://x/agents/a/chat', { method: 'POST', headers: json, body: JSON.stringify({ id: 'c', threadId, messages: [{ id: 'm', role: 'user', parts: [{ type: 'text', text: 'hi' }] }] }) })); }],
+    ['agui POST', async () => { const k = mk(); return (createAguiRoute({ storage: k.storage, memory: k.memory, agents: k.agents } as any, {}) as any).fetch(new Request('http://x/agents/a/run', { method: 'POST', headers: json, body: JSON.stringify({ threadId, runId: 'r', messages: [{ id: 'm', role: 'user', content: 'hi' }] }) })); }],
+  ];
+  it.each(doors)('%s', async (_door, hit) => {
+    const res = await hit();
+    const body = await res.json();
+    expect(res.status).toBe(WIRE_ERROR_STATUS.thread_id_reserved);
+    expect(body).toMatchObject({ code: 'thread_id_reserved', detail: { threadId } });
   });
 });

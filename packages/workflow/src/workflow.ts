@@ -1064,9 +1064,10 @@ export interface WorkflowRunStatus {
  * on executes for real.
  *
  * Honest bounds, stated rather than discovered:
- *  · order comes from `build()`, so the copied prefix is exact for sequential flows; nested
- *    sub-workflow keys (`asStep`) are swept in when the journal has `listKeys`, best-effort
- *    without it.
+ *  · order comes from `build()`, so the copied prefix is exact for sequential flows; the keys a
+ *    kept step writes besides its own output (an `asStep`'s nested steps, parallel legs, branch
+ *    arms, loop rounds, foreach items — see `stepOwnerOf`) are swept in when the journal has
+ *    `listKeys`, best-effort without it. `forkedStepKeys` decides what travels.
  *  · the ORIGINAL INPUT is not recorded by the engine, so the caller passes it again when running
  *    the fork. For a fork past step 0 it only feeds already-cached steps and is inert.
  *  · retry counters are deliberately NOT copied — a forked step deserves its full retry budget.
@@ -1100,36 +1101,28 @@ export async function forkWorkflowRun(
     }
   }
 
-  const topLevel = new Set(order);
-  const prefixIds = order.slice(0, at);
-  const copiedSteps: string[] = [];
-  for (const id of prefixIds) {
-    const flat = await journal.get(`${srcRunId}:wf:${id}`);
-    if (flat !== undefined) {
-      await journal.put(`${dstRunId}:wf:${id}`, flat);
-      copiedSteps.push(id);
-      // The fallback marker travels WITH the output it describes, and only with it. Copying it
-      // unconditionally (which the `:_`-skipping sweep below would never do, but an earlier
-      // unprefixed key did) produced a fork whose record claimed a substitution for an output that
-      // was never copied: measured on a source that crashed between writing the marker and writing
-      // the step output, the fork then reported "failed twice, fell back to B" for a step it ran
-      // itself and got right first time. A provenance record must not outlive its subject.
-      const marker = await journal.get(`${srcRunId}:wf:${id}:_fallback`);
-      if (marker !== undefined) await journal.put(`${dstRunId}:wf:${id}:_fallback`, marker);
-    }
-    // Nested sub-workflow steps live under `<runId>:wf:<id>:<inner>` — sweep them when the journal
-    // can list, skipping the engine's own records (`isEngineRecordKey`) and every key that belongs to
-    // ANOTHER top-level step: an id may itself contain ':' (`a:x` beside `a`), and a fork at `a:x`
-    // must re-run `a:x`, not find it copied by `a`'s sweep.
-    if (journal.listKeys) {
-      for (const key of await journal.listKeys(`${srcRunId}:wf:${id}:`)) {
-        const tail = key.slice(`${srcRunId}:wf:`.length);
-        if (isEngineRecordKey(tail) || topLevelOwnerOf(tail, topLevel) !== id) continue;
-        const v = await journal.get(key);
-        if (v !== undefined) await journal.put(`${dstRunId}:wf:${tail}`, v);
-      }
-    }
+  const kept = order.slice(0, at);
+  // Which keys travel is decided by `forkedStepKeys`, the one rule every fork path uses (Studio's
+  // fork door keeps a pinned copy, held to this one by a parity test). Without `listKeys` the only
+  // keys this can know are each kept step's own output and its fallback marker — best-effort, as
+  // documented above.
+  const rests = journal.listKeys
+    ? (await journal.listKeys(`${srcRunId}:wf:`)).map((k) => k.slice(`${srcRunId}:wf:`.length))
+    : kept.flatMap((id) => [id, `${id}:_fallback`]);
+  // A listed key that holds nothing is not a record (a store may list a key it holds `undefined`
+  // under), so the rule is asked twice: once to know what to read, once over what was actually there —
+  // which is how a fallback marker whose output is gone stays behind.
+  const held = new Map<string, unknown>();
+  for (const rest of forkedStepKeys(rests, order, kept)) {
+    const v = await journal.get(`${srcRunId}:wf:${rest}`);
+    if (v !== undefined) held.set(rest, v);
   }
+  const copied = new Set<string>();
+  for (const rest of forkedStepKeys(held.keys(), order, kept)) {
+    await journal.put(`${dstRunId}:wf:${rest}`, held.get(rest));
+    copied.add(rest);
+  }
+  const copiedSteps = kept.filter((id) => copied.has(id));
   // The registry record, so the fork is FINDABLE and says where it came from.
   await journal.put(statusKey(dstRunId), {
     runId: dstRunId, status: 'forked', forkedFrom: { runId: srcRunId, fromStepId }, at: Date.now(),
@@ -1137,14 +1130,55 @@ export async function forkWorkflowRun(
   return { dstRunId, copiedSteps };
 }
 
-/** The top-level step a nested key belongs to: the longest id in `ids` that is the key itself or precedes a ':' in it. */
-function topLevelOwnerOf(tail: string, ids: Set<string>): string | undefined {
-  if (ids.has(tail)) return tail;
-  for (let i = tail.lastIndexOf(':'); i > 0; i = tail.lastIndexOf(':', i - 1)) {
-    const head = tail.slice(0, i);
-    if (ids.has(head)) return head;
+/**
+ * The top-level step a `<runId>:wf:<rest>` key belongs to, or `undefined` when it belongs to none
+ * (the engine's run-wide records: `_suspend`, `_resume:<waitId>`, …).
+ *
+ * The ONE rule for "whose key is this". A top-level step `s` writes `s` itself and keys that continue
+ * `s` with a separator the engine scopes under it: `s:<inner>` (an asStep's nested steps, a retry's
+ * counter and marker, a side-effect claim), `s/<leg>` (a parallel leg, a branch arm), `s#<n>` (a loop
+ * round), `s[<n>]` (a foreach item). An id may itself contain those separators (`a:x` beside `a`),
+ * so the LONGEST id that the key is or continues wins — a fork that keeps `a` must not take `a:x`.
+ * The builder refuses two uses that reach one key, so the answer is unique for a built workflow.
+ *
+ * Bound: a retry's fallback step is journaled under its OWN id, not under the retried step's, so its
+ * key belongs to no top-level step here unless the fallback's id is one.
+ */
+export function stepOwnerOf(rest: string, stepIds: ReadonlySet<string>): string | undefined {
+  if (stepIds.has(rest)) return rest;
+  for (let i = rest.length - 1; i > 0; i--) {
+    const ch = rest.charCodeAt(i);
+    // ':' '/' '#' '['
+    if (ch !== 58 && ch !== 47 && ch !== 35 && ch !== 91) continue;
+    const head = rest.slice(0, i);
+    if (stepIds.has(head)) return head;
   }
   return undefined;
+}
+
+/**
+ * The keys a fork copies: given every key a source run holds under `<runId>:wf:` (the part after it),
+ * the workflow's top-level step ids in order, and the steps the fork keeps, the keys that travel.
+ *
+ * The ONE decision for every fork path — `forkWorkflowRun`, and Studio's fork door through a pinned
+ * copy. A key travels when it is not an engine record (`isEngineRecordKey`) and its owner
+ * (`stepOwnerOf`) is kept. A fallback marker `<k>:_fallback` travels with the output it describes,
+ * `<k>`, and only with it: a provenance record must not outlive its subject. Retry counters and
+ * side-effect claims never travel — a forked step gets its full retry budget and a fresh claim.
+ */
+export function forkedStepKeys(rests: Iterable<string>, stepIds: readonly string[], kept: Iterable<string>): string[] {
+  const ids = new Set(stepIds);
+  const keep = new Set(kept);
+  const all = new Set(rests);
+  const travels = (rest: string) => !isEngineRecordKey(rest) && keep.has(stepOwnerOf(rest, ids) as string);
+  const out: string[] = [];
+  for (const rest of all) {
+    if (rest.endsWith(':_fallback')) {
+      const subject = rest.slice(0, -':_fallback'.length);
+      if (all.has(subject) && travels(subject)) out.push(rest);
+    } else if (travels(rest)) out.push(rest);
+  }
+  return out;
 }
 
 export async function cancelWorkflowRun(
