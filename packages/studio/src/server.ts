@@ -667,9 +667,16 @@ export const PERMISSION_CATALOG: PermissionCatalogEntry[] = [
 ];
 
 /**
- * Role → pre-checked permissions. MIRRORS the @gnldev/auth-ee rbac.ts default grants (both are code, kept in
- * sync by the GNL team in one release). The UI seeds a role's checkboxes from this when a role is picked;
- * the customer admin can then tick/untick individual boxes and PATCH the user's explicit permissions.
+ * Role → pre-checked permissions for the Users editor: the UI pre-fills a role's checkboxes from this when a
+ * role is picked, and the customer admin can then tick/untick boxes and PATCH the user's explicit
+ * permissions. It is a UI PRESET, not the authorization map, and it lists only the roles that editor
+ * offers a user (studio-ui `RBAC_ROLES`: viewer, member, admin). The map that decides is @gnldev/auth-ee's
+ * `DEFAULT_ROLE_GRANTS`, which this package cannot import at runtime (the paid package is not a dependency
+ * of the free one). The roles it has and this does not are not picked here: `client` is a deployment's
+ * application credential and `end-user` a token the application signs (both @gnldev/auth roleAuth
+ * classes, not user-store users), and `platform-admin` is a scope only a platform admin may grant.
+ * A test kept with the paid package, which is not part of this repository, holds each listed role to
+ * `DEFAULT_ROLE_GRANTS`, so the two cannot drift.
  */
 export const ROLE_PERMISSION_PRESETS: Record<string, string[]> = {
   // UNCHANGED on purpose. The named read permissions exist so a customer admin can UNTICK one — the

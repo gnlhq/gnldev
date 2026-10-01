@@ -22,6 +22,7 @@
 import { createHash } from 'node:crypto';
 import type { AuthProvider, Principal, Decision, AuthContext, Cred } from './types.js';
 import { safeEqual } from './safe-equal.js';
+import { grantsAllow, isReadPermission } from './permission.js';
 import { PLATFORM_ADMIN_ROLE, subjectIdProblem } from './scope.js';
 import { verifyJwt, MIN_SUBJECT_SECRET_BYTES, MAX_SUBJECT_TTL_SEC, MAX_REVOCABLE_SUBJECT_TTL_SEC } from './jwt.js';
 
@@ -48,8 +49,9 @@ export const END_USER_ROLE = 'end-user';
 
 /**
  * What `roleAuth` grants each of its roles, written as permission patterns (`resource:action`, `*` a
- * wildcard) — the form an RBAC provider evaluates. `roleAuth.authorize` below is the enforcement; this
- * is the same rule as data, so the paid tier can START from it instead of restating it.
+ * wildcard; the grammar is permission.ts's) — the form an RBAC provider evaluates. It IS the rule:
+ * `roleAuth.authorize` below reads this map with `permissionMatches`, the matcher the paid tier uses,
+ * so the paid tier can START from it instead of restating it.
  *
  * It exists because restating it went wrong: @gnldev/auth-ee's default RBAC map listed viewer, member,
  * admin and platform-admin, and not `client` or `end-user`. With a valid licence the free provider
@@ -71,6 +73,15 @@ export const FREE_ROLE_GRANTS: Readonly<Record<string, readonly string[]>> = Obj
   [END_USER_ROLE]: Object.freeze(['*:read', ...CLIENT_WRITES]),
   viewer: Object.freeze(['*:read']),
 });
+
+/**
+ * Is this check a write, for the refusal's status (403 "you may not" vs 401 "who are you")? A named
+ * permission says so itself — the grammar's reads are what `*:read` covers — and a coarse check says
+ * it in `action`.
+ */
+function isWrite(ctx: AuthContext): boolean {
+  return ctx.permission !== undefined ? !isReadPermission(ctx.permission) : ctx.action === 'write';
+}
 
 /**
  * Who may verify an end user's token, and where that user lives.
@@ -309,20 +320,23 @@ export function roleAuth(cfg: {
       // 403 on writes, which told a client holding an expired token "you may not" instead of "who are
       // you" — so a refreshing client could not tell a refresh would help.
       if (!principal) return { allow: false, status: 401, reason: 'unauthorized' };
-      if (ctx.action === 'write') {
-        if (roles.includes('admin')) return { allow: true };
-        // An application credential may only perform writes this file NAMES. `ctx.permission` is
-        // undefined for a route gated with the coarse `allow(req,'write')` — denied, deliberately.
-        if (roles.includes(CLIENT_ROLE) || roles.includes(END_USER_ROLE)) {
-          return ctx.permission && CLIENT_WRITES.has(ctx.permission)
-            ? { allow: true }
-            : { allow: false, status: 403, reason: `unauthorized (${roles.includes(END_USER_ROLE) ? "an end user" : "client credentials"} cannot ${ctx.permission ?? 'perform this write'})` };
-        }
-        return { allow: false, status: 403, reason: 'unauthorized (admin required)' };
+      // The decision is FREE_ROLE_GRANTS read by the one matcher (permission.ts) — the map and the
+      // matcher @gnldev/auth-ee's RBAC starts from, so a licence can only add to it. It was a second,
+      // hand-written evaluator ("ends with :read", "is in CLIENT_WRITES") that agreed with the map on
+      // the permissions the hosts ask for and disagreed on others (`x:y:read`, `agents:run:x`).
+      //
+      // A named permission is matched as named, whatever `action` says — as the paid tier does. A
+      // coarse check (`allow(req, 'read' | 'write')`, no permission) asks for that action on EVERY
+      // resource: `*:read` is covered by `*:read` and `*`, `*:write` by `*` alone — so a route gated
+      // coarsely stays admin-only for writes, and an application credential is refused it (the
+      // whitelist note in the module header).
+      const required = ctx.permission ?? `*:${ctx.action}`;
+      if (roles.some((r) => Object.hasOwn(FREE_ROLE_GRANTS, r) && grantsAllow(FREE_ROLE_GRANTS[r]!, required))) return { allow: true };
+      if (!isWrite(ctx)) return { allow: false, status: 401, reason: 'unauthorized' };
+      if (roles.includes(CLIENT_ROLE) || roles.includes(END_USER_ROLE)) {
+        return { allow: false, status: 403, reason: `unauthorized (${roles.includes(END_USER_ROLE) ? "an end user" : "client credentials"} cannot ${ctx.permission ?? 'perform this write'})` };
       }
-      return roles.includes('admin') || roles.includes(CLIENT_ROLE) || roles.includes('viewer') || roles.includes(END_USER_ROLE)
-        ? { allow: true }
-        : { allow: false, status: 401, reason: 'unauthorized' };
+      return { allow: false, status: 403, reason: 'unauthorized (admin required)' };
     },
     capabilities() {
       return { sso: false, rbac: false, audit: false, multiOrganization: false, users: false };

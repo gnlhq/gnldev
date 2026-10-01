@@ -4,10 +4,11 @@
 // used to need Hono's `Context` type in its own signature, which quietly tied its Hono version to
 // ours — the same coupling the factories dropped when they stopped returning a Hono app. Everything
 // the gate reads (method, path, headers, query) is on `Request`; nothing was lost by narrowing.
-import type { AuthProvider, Decision, Principal } from './types.js';
+import type { AuthContext, AuthProvider, Decision, Principal } from './types.js';
 import { isCrossSiteStateChange, isHostAllowed, hostnameOf, allowedHostEntry, readAllowedHosts, crossSiteRefusedMessage } from './same-site.js';
-import { carriesIdentity } from './adapter.js';
-import { notePrincipal, noteVerdict, settleDecision, authErrorResponse, AUTH_ERROR_CODES } from './decision.js';
+import { bindsIdentity, carriesIdentity } from './adapter.js';
+import { isReadPermission } from './permission.js';
+import { notePrincipal, noteVerdict, markRefusal, settleDecision, authErrorResponse, AUTH_ERROR_CODES } from './decision.js';
 
 /** The way through a cross-site refusal on REST / Studio. */
 const CROSS_SITE_WAY = "give it an identity to check — an auth provider that binds one, auth: roleAuth({ admin: { token } }) — or serve the page from this machine (a dev-server proxy to the API)";
@@ -20,8 +21,8 @@ export interface Gate {
    *   • No provider (auth off) → true (unchanged opt-in behavior).
    *   • EE / RBAC provider → the permission is passed through `AuthContext.permission` and matched against
    *     the principal's EFFECTIVE permissions (explicit `permissions[]` ?? role grants) — see rbac.ts.
-   *   • Free / read-write provider → the permission is REDUCED to read/write (`:read` suffix → read, else
-   *     write) and evaluated coarsely. This makes `allowP(req,'X:write') ≡ allow(req,'write')` and
+   *   • Free / read-write provider → the permission is REDUCED to read/write (`isReadPermission`: what
+   *     `*:read` covers is a read, else write) and evaluated coarsely. This makes `allowP(req,'X:write') ≡ allow(req,'write')` and
    *     `allowP(req,'*:read') ≡ allow(req,'read')` in the free tier → no regression.
    * A denial records its decision against the request (like allow) so `deny()` can surface status/reason.
    */
@@ -77,14 +78,20 @@ export interface GateOptions {
    * `gnl studio` and your own server all take it with no code change — also when it is loaded (dotenv)
    * after the module that builds the server.
    *
-   * Ignored when the provider binds an identity: the bearer token is the defence there, and a rebound
-   * page cannot read it.
+   * With a provider that binds an identity, a request that resolved to a caller is answered under any
+   * name (its bearer token is the defence, and a rebound page cannot read it). A request that resolved
+   * to NOBODY and that the provider allowed anyway — a provider serving anonymous reads — is held to
+   * this list like a surface with no auth: it carries no token for a rebound page to lack.
    */
   allowedHosts?: readonly string[] | true;
 }
 
-/** What a surface refusing by the host rule has for auth: nothing, or a `{ read, write }` pair (no identity). */
-export type HostRuleAuth = 'none' | 'read-write';
+/**
+ * Why the host rule applied: the surface has no auth (`'none'`), its auth names no identity (`'read-write'`:
+ * a `{ read, write }` pair or `bindsIdentity: false`), or its provider names identities and this request
+ * resolved to none, and was allowed anyway (`'unnamed'`).
+ */
+export type HostRuleAuth = 'none' | 'read-write' | 'unnamed';
 
 /**
  * Name suffixes of tunnels and hosted dev environments that hand out a NEW name per session: for these the
@@ -109,7 +116,9 @@ export function hostNotAllowedMessage(hostname: string, opts: { auth?: HostRuleA
     ? `this request carried no identity the ${opts.door} door resolved (it has no \`identify\`, or \`identify\` answered nothing for it), so it is answered only when addressed as localhost or by an IP address`
     : opts.auth === 'read-write'
       ? `this server's auth names no identity (a { read, write } pair, or a provider with bindsIdentity: false) — so, like a server with no auth, it answers only requests addressed to it as localhost or by an IP address`
-      : `this server has no auth provider, so it answers only requests addressed to it as localhost or by an IP address`;
+      : opts.auth === 'unnamed'
+        ? `this request resolved to no caller (the auth provider named nobody for it) and the provider allowed it anyway — so, like a request to a server with no auth, it is answered only when addressed as localhost or by an IP address`
+        : `this server has no auth provider, so it answers only requests addressed to it as localhost or by an IP address`;
   return (
     `${what}, and this one was addressed to "${hostname}" (the shape of a DNS-rebinding page). ` +
     `If that name is yours — a LAN hostname, a tunnel, Codespaces, a Docker service — list it: ` +
@@ -118,7 +127,9 @@ export function hostNotAllowedMessage(hostname: string, opts: { auth?: HostRuleA
     '.' +
     (opts.auth === 'read-write'
       ? ` Or authenticate with a provider that binds an identity — auth: roleAuth({ admin: { token } }) — which answers any name, because a rebound page cannot read its token.`
-      : '') +
+      : opts.auth === 'unnamed'
+        ? ` Or send a credential the provider resolves to a caller (Authorization: Bearer …): a request that carries one is answered under any name, because a rebound page cannot read it.`
+        : '') +
     ` See docs/errors/host_not_allowed.md.`
   );
 }
@@ -160,11 +171,13 @@ export function hostAllowList(allowedHosts: readonly string[] | true | undefined
  * the same thing on every door that asks: @gnldev/server's and Studio's gate (`allowP`) and a standalone
  * door handed `authorize` (`authorizeDoorRequest`). The two built it separately for a day.
  *
- * Free-tier reduction: anything ending in ':read' is a read, everything else is a write. An RBAC provider
- * ignores `action` and matches `permission` exactly; a free provider uses this reduced action.
+ * Reduction for a provider that only knows read/write (a `{ read, write }` pair, a hand-written provider):
+ * a permission the grant `*:read` covers is a read, everything else is a write — `isReadPermission`, the
+ * one matcher's answer (permission.ts), so the reduction and every grant evaluator agree on what a read
+ * is. `roleAuth` and an RBAC provider match `permission` itself with that matcher.
  */
 export function permissionContext(req: Request, permission: string): { path: string; method: string; action: 'read' | 'write'; permission: string } {
-  const action: 'read' | 'write' = permission.endsWith(':read') ? 'read' : 'write';
+  const action: 'read' | 'write' = isReadPermission(permission) ? 'read' : 'write';
   return { path: new URL(req.url).pathname, method: req.method, action, permission };
 }
 
@@ -196,15 +209,17 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
    * HTTP/1.1 (an in-process `app.fetch`, or HTTP/2, which a browser speaks only over TLS, where a
    * rebound name fails the certificate before any request is sent), so there is nothing to check.
    */
-  function hostWithoutIdentity(req: Request): boolean {
-    if (carriesIdentity({ provider })) return false;
+  function hostWithoutIdentity(req: Request, auth: HostRuleAuth = hostRuleAuth): boolean {
+    if (auth !== 'unnamed' && carriesIdentity({ provider })) return false;
     const host = req.headers.get('host');
     if (!host || isHostAllowed(host, allowedHosts())) return false;
     const name = hostnameOf(host);
-    hostRefusals.set(req, { name, auth: hostRuleAuth });
+    hostRefusals.set(req, { name, auth });
+    // Recorded for `onDecision`: with a provider, the verdict noted before this said allowed.
+    markRefusal(req, 'policy', { detail: AUTH_ERROR_CODES.hostNotAllowed });
     if (!warnedHost) {
       warnedHost = true;
-      console.warn(`@gnldev/auth: refused a request addressed to "${name}". ${hostNotAllowedMessage(name, { auth: hostRuleAuth })}`);
+      console.warn(`@gnldev/auth: refused a request addressed to "${name}". ${hostNotAllowedMessage(name, { auth })}`);
     }
     return true;
   }
@@ -264,34 +279,48 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
     }
     return true;
   }
+  /**
+   * One request through the gate, for `allow` and `allowP` alike.
+   *
+   * WHEN the open-surface checks run depends on what the provider can know:
+   *   • no provider, or one with no principal model (`bindsIdentity: false`, a `{ read, write }` pair):
+   *     no request can carry an identity, so the host rule and the cross-site check run FIRST, as before;
+   *   • a provider that binds identities: the request is authenticated, and the host rule runs for a
+   *     request that resolved to nobody the engine holds to a name (`carriesIdentity({ principal })`, the
+   *     question a standalone door asks) and that `authorize` ALLOWED. Asked before, with the provider
+   *     alone — a configuration question — a provider that serves anonymous reads served them to a
+   *     DNS-rebound page: measured, Studio answered `GET /runs` to `Host: evil.example` with no token,
+   *     prompts included. A refused request is answered exactly as before (`roleAuth`'s 401 for no
+   *     token is unchanged on every host name): nothing was going to be served.
+   *
+   * The cross-site check is NOT extended the same way. A provider that names identities and allows an
+   * anonymous WRITE has said anybody may make it, and a page on another site could be such a caller
+   * (a public widget). REST and Studio have no option to say "other sites may embed this" (a door has
+   * `allowCrossSite`), so refusing it would leave that deployment with no way through.
+   */
+  async function decide(req: Request, ctx: AuthContext): Promise<boolean> {
+    const binds = bindsIdentity(provider);
+    if (!binds && (hostWithoutIdentity(req) || crossSiteWithoutIdentity(req))) return false;
+    if (!provider) return openSurfaceAllows(req);
+    const principal = await provider.authenticate(req);
+    if (principal) principals.set(req, principal);
+    const decision = await provider.authorize(principal, req, ctx);
+    notePrincipal(req, principal);
+    noteVerdict(req, ctx, decision);
+    if (!decision.allow) {
+      decisions.set(req, decision);
+      return false;
+    }
+    if (binds && !carriesIdentity({ principal }) && hostWithoutIdentity(req, 'unnamed')) return false;
+    return true;
+  }
+
   return {
-    async allow(req, action, resource) {
-      if (hostWithoutIdentity(req) || crossSiteWithoutIdentity(req)) return false;
-      if (!provider) return openSurfaceAllows(req);
-      const principal = await provider.authenticate(req);
-      if (principal) principals.set(req, principal);
-      const decision = await provider.authorize(principal, req, {
-        path: new URL(req.url).pathname,
-        method: req.method,
-        action,
-        resource,
-      });
-      notePrincipal(req, principal);
-      noteVerdict(req, { path: new URL(req.url).pathname, method: req.method, action, resource }, decision);
-      if (!decision.allow) decisions.set(req, decision);
-      return decision.allow;
+    allow(req, action, resource) {
+      return decide(req, { path: new URL(req.url).pathname, method: req.method, action, resource });
     },
-    async allowP(req, permission) {
-      if (hostWithoutIdentity(req) || crossSiteWithoutIdentity(req)) return false;
-      if (!provider) return openSurfaceAllows(req);
-      const principal = await provider.authenticate(req);
-      if (principal) principals.set(req, principal);
-      const ctx = permissionContext(req, permission);
-      const decision = await provider.authorize(principal, req, ctx);
-      notePrincipal(req, principal);
-      noteVerdict(req, ctx, decision);
-      if (!decision.allow) decisions.set(req, decision);
-      return decision.allow;
+    allowP(req, permission) {
+      return decide(req, permissionContext(req, permission));
     },
     deny(req, action) {
       const refusedHost = hostRefusals.get(req);

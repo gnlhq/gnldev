@@ -438,8 +438,8 @@ import { checkBudget, assertBudget, getOrgUsage, BudgetExceededError } from '@gn
     package: `@gnldev/auth-ee`,
     install: `import { createRbac, createEnterpriseAuth } from '@gnldev/auth-ee';
 import type { Permission, RbacProvider } from '@gnldev/auth-ee';`,
-    apis: [`createRbac(roleGrants?) — defaults to { admin: ['*'], viewer: ['*:read'] }`, `Permission — 'resource:action' pattern (e.g. 'runs:read', '*:read', '*')`, `permissionMatches(granted, required) — wildcard (*)-supported matching`],
-    example: `const rbac = createRbac({ editor: ['runs:read', 'runs:write'], viewer: ['*:read'] });
+    apis: [`createRbac(roleGrants?, { replace? }) — roleGrants MERGES into DEFAULT_ROLE_GRANTS (a role you name gets exactly your list, the others keep theirs); { replace: true } makes it the whole map`, `DEFAULT_ROLE_GRANTS — @gnldev/auth's FREE_ROLE_GRANTS (admin: ['*'], client and end-user: ['*:read', 'agents:run', 'workflow:run', 'run:cancel'], viewer: ['*:read']) plus member: ['*:read', 'agents:run'] and platform-admin: ['*']`, `Permission — 'resource:action', split at the LAST colon ('billing:invoices:read' is read on 'billing:invoices'); '*' is a whole resource or a whole action: '*:read' covers every permission ending ':read', 'x:*' every action on 'x' (not on 'x:y'), '*' everything`, `permissionMatches(granted, required) — the one matcher, from @gnldev/auth; the free roleAuth decides with it too, so a licence only adds`],
+    example: `const rbac = createRbac({ editor: ['runs:read', 'runs:write'] }); // admin, viewer, client… keep their defaults
 const auth = createEnterpriseAuth({ licenseKey, rbac, fallback });
 // Authorize(principal, ctx) -> { allow: true } | { allow: false, status: 403 }`,
   },

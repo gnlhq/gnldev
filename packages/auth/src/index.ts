@@ -7,6 +7,8 @@ export { PRINCIPAL_KINDS } from './types.js';
 export type { Principal, PrincipalKind, AuthContext, Decision, AuthCapabilities, AuthProvider, Cred, AccessDecision, RefusalReason } from './types.js';
 // The outcome a host reports to `AuthProvider.onDecision`: what the caller got, not what `authorize` said first.
 export { markRefusal, markCredentialRejected, credentialRejected, CREDENTIAL_REJECTED, outcomeOf, settleDecision, decisionNotRecorded, authErrorResponse, AUTH_ERROR_CODES, AUTH_ERROR_STATUS, type AuthErrorCode } from './decision.js';
+// What a permission string means and whether a grant covers it — the one matcher every tier uses.
+export { permissionMatches, parsePermission, patternPartMatches, isReadPermission, grantsAllow, type ParsedPermission } from './permission.js';
 export { roleAuth, CLIENT_ROLE, CLIENT_WRITES, END_USER_ROLE, FREE_ROLE_GRANTS, type EndUserTokens } from './role-auth.js';
 export { makeGate, principalOf, hostNotAllowedMessage, permissionContext, type Gate, type GateOptions, type HostRuleAuth } from './gate.js';
 export { fromReadWrite, normalizeAuth, bindsIdentity, carriesIdentity, type ReadWriteAuth } from './adapter.js';

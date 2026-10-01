@@ -94,6 +94,17 @@ and who is affected.
   `redactToolResults: { skipTools: ['toolName'] }`.
 - **A custom `WorkStore`** must hand out a cursor that deletions, producer clocks and the writer's
   version cannot move (see Changed); the bundled stores do.
+- **A permission is `resource:action` split at the LAST colon, on every tier** (`permissionMatches`, now
+  exported by @gnldev/auth). With a licence, `agents:run` no longer covers `agents:run:x` and `*:read` no
+  longer covers `runs:read:secret` (the paid matcher dropped every segment after the second); grant the
+  longer name: `createRbac({ runner: ['agents:run:x'] })`. No GNL route asks a 3-segment permission.
+- **`roleAuth().authorize` matches a named `ctx.permission` as named, whatever `ctx.action` says**, as the
+  paid tier does. Only a caller that builds the context by hand with a mismatched pair is affected: build
+  it with `permissionContext(req, permission)`, or leave `permission` out for a coarse read/write check.
+- **With a provider that binds identities, a request that resolved to no caller and that the provider
+  allowed is held to the host rule** (403 `host_not_allowed` under a name that is not loopback, an IP or
+  listed). A deployment that serves anonymous reads on its own domain lists it:
+  `allowedHosts: ['api.example.com']`, or `GNL_ALLOWED_HOSTS=api.example.com`.
 
 ### Added
 
@@ -132,6 +143,29 @@ and who is affected.
 - @gnldev/scheduler: `ScheduleSpec.ifExists` (`'refuse'` by default, `'replace'`, `'keep'`).
 
 ### Security
+
+- **A provider that names identities and serves anonymous reads answered a DNS-rebound page.** The
+  REST/Studio gate asked "does this surface carry an identity?" of the provider (a configuration
+  question) and skipped the host rule for every request, while the doors asked it of the request. Measured
+  (0.9.0 and before this fix): Studio with such a provider answered `GET /runs` and `GET /runs/r1` to
+  `Host: evil.example`, no token, with 200 and the run's prompt. `makeGate` now authenticates first and
+  holds a request that resolved to nobody, and that the provider allowed, to the host rule — the same
+  `carriesIdentity({ principal })` a door asks; after: 403 `host_not_allowed`. Unchanged: `roleAuth`'s
+  401 for no token on any name, a token answered on any name, a `{ read, write }` pair and no provider.
+  Way through, named in the refusal: `allowedHosts` / `GNL_ALLOWED_HOSTS`, or send a credential. The
+  cross-site check is not extended this way — see Known limits.
+- **A valid licence took reads away, and gave writes, on permissions no host lists.** The free tier and
+  @gnldev/auth-ee evaluated the same grant data with two matchers ("ends with `:read`" and "the first two
+  `:` segments"). Measured on 12 odd strings × 4 free roles: 8 pairs differed — `x:y:read` allowed free
+  and refused licensed for client, viewer and end user; `runs:read:secret` and `agents:run:x` refused free
+  and allowed licensed. Now one matcher (@gnldev/auth `permissionMatches`) decides for `roleAuth`,
+  `permissionContext`, RBAC and FGA, and a property test walks ~1 600 role × permission pairs through
+  both providers: they agree on every free role.
+- **`createRbac(map)` kept the caller's arrays**: `map.support.push('*')` after building the provider
+  made `support` an admin. The map is copied and frozen. A role named `constructor` or `__proto__` threw
+  inside the decision (it found Object.prototype's member); it is now refused.
+- **An FGA rule for the run `a:b` also granted the run `a:c`**: rules were matched as a `type:id` string
+  on its first two segments. `type` and `id` are now compared part by part; an id with colons is whole.
 
 - **Erasing a person, and the retention sweep, left `SemanticMemory` logs behind.** @gnldev/rag's
   `SemanticMemory` keeps a thread's log under `sem:<thread>:log`, and neither `eraseSubject` nor
@@ -686,6 +720,16 @@ and who is affected.
   an identity, or serving the page from this machine's own site). The status is unchanged.
 
 ### Known limits
+
+- **The REST/Studio cross-site check still asks the provider, not the request.** A provider that names
+  identities and allows an anonymous write lets a page on another site make it: such a provider has said
+  anybody may, and REST/Studio have no `allowCrossSite` option to say "other sites may embed this" (the
+  doors do), so refusing would leave a public anonymous endpoint no way through. The host rule above
+  covers the DNS-rebinding read.
+- **Studio's role presets list viewer, member and admin only.** `ROLE_PERMISSION_PRESETS` pre-fills the Users
+  editor, which offers those three; `client` and `end-user` are roleAuth credential classes and
+  `platform-admin` a scope only a platform admin grants. A test holds each listed preset to
+  @gnldev/auth-ee's `DEFAULT_ROLE_GRANTS`.
 
 - **Messages a 0.9 process appended without a timestamp cannot be aged.** The thread sweep dates a
   message by its `ts` / `at` / `createdAt`, else by when its append was written — which the journal log

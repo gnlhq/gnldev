@@ -28,8 +28,10 @@ export function bindsIdentity(auth: AuthProvider | undefined): boolean {
  * Does this request carry an identity — so the open-surface checks (the host rule and the cross-site
  * check) have nothing to protect and are skipped? The ONE answer, for every surface:
  *
- *   • the REST and Studio gate (`makeGate`) ask it with their `provider`: a provider that binds an
- *     identity is defended by its bearer token, which neither a rebound page nor another site can read;
+ *   • the REST and Studio gate (`makeGate`) ask it with their `provider` for the cross-site check (a
+ *     provider that binds an identity is defended by its bearer token, which no other site can read) —
+ *     and, for the host rule, with the `principal` that provider resolved for THIS request, once it has
+ *     allowed it: a request that resolved to nobody has no token to be the defence (gate.ts `decide`);
  *   • a standalone door (`doorGate`) asks it with the `principal` its `identify` resolved for THIS
  *     request, and the answer is the engine's: `callerKind(principal) !== 'unnamed'`. A door skips the
  *     checks only for a caller the engine would hold to a name. An `identify` that answered nothing —

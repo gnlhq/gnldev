@@ -6,7 +6,7 @@
 
 The surface has no identity to authenticate, and the request was addressed to it by a name that is not
 `localhost`, not a `*.localhost` name, not an IP address and not listed in `allowedHosts` or
-`GNL_ALLOWED_HOSTS`. "No identity" is one of three things, and the message says which:
+`GNL_ALLOWED_HOSTS`. "No identity" is one of four things, and the message says which:
 
 - a REST API or Studio with **no auth provider** — `"this server has no auth provider, …"`;
 - one whose auth is a **`{ read, write }` predicate pair** (or a provider with `bindsIdentity: false`) —
@@ -14,6 +14,12 @@ The surface has no identity to authenticate, and the request was addressed to it
   when its predicates check a token: a predicate is opaque, and a rebound page is same-origin, so it may
   send any header it likes — an `Authorization` header included. Nothing can tell a predicate that checks
   a secret from one that checks that a header is present;
+- a request to a REST API or Studio whose provider **binds identities** (`roleAuth`, `@gnldev/auth-ee`, a
+  provider of your own) that **resolved to no caller** — no credential, or one the provider named nobody
+  with — **and that the provider allowed anyway** (a provider that serves anonymous reads) —
+  `"this request resolved to no caller (the auth provider named nobody for it) and the provider allowed it
+  anyway …"`. A request the provider refuses is answered with its own refusal (`roleAuth`'s 401 for no
+  token), whatever the name;
 - a request to a standalone door — `createChatRoute`, `createAguiRoute`, or `createMcpServer` over HTTP
   — that **resolved no caller**: the door has no `identify`, or its `identify` answered nothing for this
   request (an anonymous visitor, or `identify: () => undefined`) — `"this request carried no identity the
@@ -45,8 +51,11 @@ So the refusal is on that name. `localhost`, `*.localhost` and IP addresses are 
 else can point them anywhere, which is also why a LAN address (`http://192.168.1.20:4747`) works with no
 setting. Any other name might be somebody else's, so it has to be named by you.
 
-With an auth provider that binds an identity (`roleAuth`, `@gnldev/auth-ee`), this check does not run: a
-rebound page cannot read your bearer token, so the token is the defence, and any host name works.
+With an auth provider that binds an identity (`roleAuth`, `@gnldev/auth-ee`), a request that carries a
+credential the provider resolves to a caller is answered under any name: a rebound page cannot read your
+bearer token, so the token is the defence. A request that carries none has no token to be the defence, so
+if the provider allows it anyway, the name is checked as above. Measured before this: Studio with a
+provider serving anonymous reads answered a rebound page's `GET /runs` — prompts included.
 
 ## What to do
 
