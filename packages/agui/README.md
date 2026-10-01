@@ -158,8 +158,14 @@ user's gets `409 thread_owner_mismatch`, and the model never sees that history.
 
 **Read the principal from something the server trusts** — a session cookie, a verified JWT — never
 from the request body. The route always seals the request context, so a body-supplied
-`__gnl_resourceId` names nobody. A caller `identify` answers nothing for is `unknown`, closed to every
-user's and staff's data, and its request gets the host rule and the cross-site check above.
+`__gnl_resourceId` names nobody. A caller `identify` answers nothing for — or a principal the engine
+names nobody with, like `{ kind: 'subject', id: undefined }` — is `unknown`, closed to every user's and
+staff's data, and its request gets the host rule and the cross-site check above.
+
+**A session cookie needs `SameSite`.** Once `identify` resolves a caller, the cross-site check does not
+run for that request — by design: the identity is meant to defend it. A bearer token does (no other site can
+read it); a cookie alone does not, because the browser attaches it to a plain `<form method="post">` from any
+site. Set the session cookie `SameSite=Lax` (or `Strict`), or check `Origin` in `identify`, or use a bearer token.
 
 **A presented credential the provider rejected is refused with 401**, not served as anonymous — a
 revoked or deleted user's token used to answer 200 as an `unknown` caller, with an audit row saying

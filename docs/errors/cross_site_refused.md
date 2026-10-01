@@ -43,10 +43,17 @@ If another site really is meant to call the surface — one line:
 | --- | --- |
 | `createRestApi` / `createStudioApp` | `auth: roleAuth({ admin: { token } })` (or any provider that binds an identity): a page on another site cannot read your bearer token, so it cannot ride it |
 | `createChatRoute` / `createAguiRoute` / `createMcpServer`, embedded on other sites with no sign-in (a public chat widget on a customer's website) | `allowCrossSite: true` in the door's options. It lifts this check only: the door still answers only the names in [`host_not_allowed`](./host_not_allowed.md), so list the name it is served under — `allowedHosts: ['chat.example.com']` |
-| `createChatRoute` / `createAguiRoute` / `createMcpServer`, for signed-in users | `identify: (req) => principal`, reading a verified token: a request it resolves a caller for carries an identity, and neither check runs for it |
+| `createChatRoute` / `createAguiRoute` / `createMcpServer`, for signed-in users | `identify: (req) => principal`, reading a verified token: a request it resolves a named caller for carries an identity, and neither check runs for it |
 
 `identify: () => undefined` is not a way through: an `identify` that answers nothing resolves no caller,
-so the request is checked like a request to a door with no `identify`.
+so the request is checked like a request to a door with no `identify`. Neither is a principal the engine
+names nobody with (`{ kind: 'subject', id: undefined }`, `id: ''`, a reserved id like `operator:ops`):
+the door skips the check only for a caller the engine would hold to a name.
+
+**If `identify` reads a session cookie**, this check no longer runs once it resolves a caller — by design,
+the identity is meant to defend the request — but a cookie alone does not: the browser attaches it to a
+cross-site `<form method="post">`. Set the cookie `SameSite=Lax` (or `Strict`), or check `Origin` in
+`identify`, or use a bearer token.
 
 Or serve the page from this machine's own site: proxy the API through your dev server (Vite's
 `server.proxy`), which makes the request same-origin.

@@ -58,8 +58,8 @@ const chat = useChat({
 
 ## Chat route (standalone)
 
-For a host that authenticates the request itself (a session cookie, a verified token) and tells the
-route who is calling through `identify`. In production it refuses to start without `identify`. Your
+For a host that authenticates the request itself (a session cookie — [with `SameSite`](#who-is-calling-identify) —
+or a verified token) and tells the route who is calling through `identify`. In production it refuses to start without `identify`. Your
 `identify` may answer `undefined` for a visitor with no session: that visitor is served as anonymous,
 with the checks below.
 
@@ -168,7 +168,13 @@ runs: it is never treated as staff and never as anonymous.
 `AuthProvider` — and **never from the request body**. The route always seals the request context too,
 so a body carrying `{"context":{"__gnl_resourceId":"VICTIM"}}` names nobody.
 
-**If `identify` answers nothing** (or `identify: () => undefined`), the caller is `unknown`, and the
+**A session cookie needs `SameSite`.** Once `identify` resolves a caller, the cross-site check does not
+run for that request — by design: the identity is meant to defend it. A bearer token does (no other site can
+read it); a cookie alone does not, because the browser attaches it to a plain `<form method="post">` from any
+site. Set the session cookie `SameSite=Lax` (or `Strict`), or check `Origin` in `identify`, or use a bearer token.
+
+**If `identify` answers nothing** (or `identify: () => undefined`, or a principal the engine names
+nobody with — `{ kind: 'subject', id: session?.userId }` for a visitor with no user), the caller is `unknown`, and the
 request gets the host rule and the cross-site check [above](#a-request-with-no-identity-what-the-route-refuses).
 Its runs are closed to every user and to staff's threads. Memory has nothing to scope on, so per-user recall
 and `listThreads` have no subject to key by.

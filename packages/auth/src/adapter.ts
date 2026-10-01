@@ -1,5 +1,6 @@
 // Backward compatibility: wraps the old {read,write} predicate pair (StudioAuth / examples/app) into an AuthProvider.
 import type { AuthProvider, Decision, AuthContext, Principal } from './types.js';
+import { callerKind } from './scope.js';
 
 /** Old role-based hook: read = GET (viewer), write = POST/PUT/PATCH/DELETE (admin). */
 export interface ReadWriteAuth {
@@ -30,15 +31,20 @@ export function bindsIdentity(auth: AuthProvider | undefined): boolean {
  *   • the REST and Studio gate (`makeGate`) ask it with their `provider`: a provider that binds an
  *     identity is defended by its bearer token, which neither a rebound page nor another site can read;
  *   • a standalone door (`doorGate`) asks it with the `principal` its `identify` resolved for THIS
- *     request. An `identify` that answered nothing resolved no identity, so the checks run — the
- *     presence of the function says nothing about the request.
+ *     request, and the answer is the engine's: `callerKind(principal) !== 'unnamed'`. A door skips the
+ *     checks only for a caller the engine would hold to a name. An `identify` that answered nothing —
+ *     or answered an object the engine names nobody with (`{ kind: 'subject', id: session?.userId }`
+ *     for a visitor with no user, `id: ''`, a reserved id, `{}`) — resolved no identity, so the checks
+ *     run. The presence of the function, or of an object, says nothing about the request.
  *
  * Before this had one owner the doors asked "was `identify` passed?" instead, and
  * `identify: () => undefined` (or an `identify` that answers nothing for an anonymous visitor) turned
  * both checks off: measured, a DNS-rebound page read a thread back and a cross-site form ran the model.
+ * Then it read "`identify` answered an object", and the same two requests got through with an anonymous
+ * visitor's `{ kind: 'subject', id: undefined }` — the engine called that caller `unnamed` meanwhile.
  */
 export function carriesIdentity(source: { provider?: AuthProvider; principal?: Principal | null }): boolean {
-  return bindsIdentity(source.provider) || source.principal != null;
+  return bindsIdentity(source.provider) || callerKind(source.principal) !== 'unnamed';
 }
 
 /** {read,write} → AuthProvider. If there's no fn in that direction, it's unrestricted (preserves the existing `!fn || fn(c)` behavior). */

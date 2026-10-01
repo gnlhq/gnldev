@@ -33,9 +33,11 @@ and who is affected.
   addresses and the names you list** — `allowedHosts: ['mybox.test', '.ngrok-free.app']` on
   `createRestApi` / `createStudioApp`, or `GNL_ALLOWED_HOSTS=mybox.test,.ngrok-free.app`. An
   `allowedHosts` entry that can never match now throws at startup, naming the fix.
-- **A standalone door does the same for every request that resolved no caller, and refuses its
-  cross-site writes** — no `identify`, or an `identify` that answered nothing for the request
-  (`identify: () => undefined` included: passing `identify` no longer switches the checks off). Same
+- **A standalone door does the same for every request that resolved no caller the engine holds to a
+  name, and refuses its cross-site writes** — no `identify`, an `identify` that answered nothing for
+  the request (`identify: () => undefined` included: passing `identify` no longer switches the checks
+  off), or one that answered a principal `callerKind` reads as `unnamed` (`{ kind: 'subject', id:
+  session?.userId }` for a visitor with no user, `id: ''`, a reserved id, `{}`). Same
   `allowedHosts` option on `createChatRoute` / `createAguiRoute` / `createMcpServer`, or
   `GNL_ALLOWED_HOSTS`; for a door embedded on other sites (a public chat widget), `allowCrossSite: true`;
   for a signed-in caller, an `identify` that resolves it from a verified token.
@@ -206,9 +208,15 @@ and who is affected.
   the same line hid every tool (`no such tool`, an empty list), so the documented way through did not go
   through there either. The decision now has one owner, `carriesIdentity` in @gnldev/auth, which
   `makeGate` asks with its provider and every door asks (through `doorGate`, the one preamble the three
-  doors now share) with the principal `identify` resolved for THIS request: a request that resolved
-  nobody gets the host rule and the cross-site check. After the fix the same probes get 403
-  `host_not_allowed` and 403 `cross_site_refused`, zero model calls. **Who is affected:** a door with an
+  doors now share) with the principal `identify` resolved for THIS request, and answers with the
+  engine's own question, `callerKind(principal) !== 'unnamed'`: a door skips the checks only for a
+  caller the engine would hold to a name. A request that resolved nobody — no principal, or an object the
+  engine names nobody with (`{ kind: 'subject', id: undefined }`, `id: ''`, `operator:ops` as a subject
+  id, `{}`; the final review measured each of these riding through with 200 and a model call while
+  `carriesIdentity` still read "any object") — gets the host rule and the cross-site check. After the
+  fix the same probes get 403 `host_not_allowed` and 403 `cross_site_refused`, zero model calls. An
+  `identify` that reads a session cookie skips the cross-site check once it resolves a caller (by design);
+  set the cookie `SameSite=Lax`/`Strict`, check `Origin`, or use a bearer token. **Who is affected:** a door with an
   `identify` that answers nothing for some requests (anonymous visitors) or for all of them, reached by
   a name other than `localhost` / an IP address, or called by a page on another site. **Way through, one
   line:** `allowedHosts: ['chat.example.com']` (or `GNL_ALLOWED_HOSTS`) for the name the door is served
