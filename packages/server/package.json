@@ -43,6 +43,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@gnldev/a2a": "workspace:^",
     "@gnldev/auth": "workspace:^",
     "@gnldev/workflow": "workspace:^",
     "@hono/node-server": "^1.19.17",

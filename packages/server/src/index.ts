@@ -2,7 +2,7 @@
 // descends into runDurable → exactly-once/durability inherited for free. (The durable counterpart of the common auto-REST pattern.)
 import { Hono, type Context } from 'hono';
 import { toFetchHandler, type FetchHandler } from './handler.js';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { verifyA2ARequest } from '@gnldev/a2a';
 import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, cancelAgentRun, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, upstreamFailure, reservedIdFailure, assertRootThreadId, orgPrefix, withRootScope, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext } from '@gnldev/durable';
 import type { CreateGnlConfig, Journal, JournalReader, BudgetLimit, UsageCostCache, RunLimits, ResolvedWorkIdentity, WorkScopeKind, StreamSurface as DurableStreamSurface, StreamSurfaceInput } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, callerKind, subjectIdProblem, actorIdOf, engineCallerOf, markRefusal, settleDecision, decisionNotRecorded, type AuthProvider, type ReadWriteAuth, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
@@ -17,32 +17,19 @@ import { EDGE_ERROR_CODES } from './edge-errors.js';
 import { LIMIT_ERROR_CODES } from '@gnldev/durable';
 import { pipeAgentStream } from './sse.js';
 
-/** (audit: A2A unsigned) — signature window: a request with a timestamp this old/future is rejected (replay resistance). */
-const A2A_TIMESTAMP_WINDOW_MS = 300_000; // ±300s
-
 /**
- * Verifies the `x-gnl-signature`/`x-gnl-timestamp` header pair produced by @gnldev/a2a's
- * `createA2ATool({ secret })`: signature = HMAC-SHA256(secret, timestamp + '.' + rawBody) hex, compared
- * with `timingSafeEqual` (closed to timing attacks). A second layer INDEPENDENT of the existing auth gate
- * (makeGate/opts.auth) — one asks identity/permission, the other verifies message integrity/origin; both
- * are opt-in and don't affect each other.
- * Invalid/missing → Response (401); valid → undefined.
+ * Verifies the `x-gnl-signature`/`x-gnl-timestamp` pair with @gnldev/a2a's own definition
+ * (`verifyA2ARequest`), over the method and the route this request reached — decoded, as the client
+ * signed it. Missing → 401 a2a_signature_missing; outside ±300s → a2a_timestamp_invalid; no match
+ * (including a signature made for another route) → a2a_signature_invalid.
  */
 function verifyA2ASignature(c: Context, rawBody: string, secret: string): Response | undefined {
-  const signature = c.req.header('x-gnl-signature');
-  const timestamp = c.req.header('x-gnl-timestamp');
-  if (!signature || !timestamp) {
-    return c.json({ error: 'A2A signature headers missing (x-gnl-signature/x-gnl-timestamp)', code: EDGE_ERROR_CODES.a2aSignatureMissing }, 401);
-  }
-  const ts = Number(timestamp);
-  if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > A2A_TIMESTAMP_WINDOW_MS) {
-    return c.json({ error: 'A2A timestamp outside window (±300s) — suspected replay', code: EDGE_ERROR_CODES.a2aTimestampInvalid }, 401);
-  }
-  const expected = createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest();
-  const provided = Buffer.from(signature, 'hex');
-  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
-    return c.json({ error: 'A2A signature invalid', code: EDGE_ERROR_CODES.a2aSignatureInvalid }, 401);
-  }
+  let path: string;
+  try { path = decodeURIComponent(c.req.path); } catch { path = c.req.path; }
+  const verdict = verifyA2ARequest(secret, { method: c.req.method, path, body: rawBody, timestamp: c.req.header('x-gnl-timestamp'), signature: c.req.header('x-gnl-signature') });
+  if (verdict === 'missing') return c.json({ error: 'A2A signature headers missing (x-gnl-signature/x-gnl-timestamp)', code: EDGE_ERROR_CODES.a2aSignatureMissing }, 401);
+  if (verdict === 'stale') return c.json({ error: 'A2A timestamp outside window (±300s) — suspected replay', code: EDGE_ERROR_CODES.a2aTimestampInvalid }, 401);
+  if (verdict === 'invalid') return c.json({ error: 'A2A signature invalid', code: EDGE_ERROR_CODES.a2aSignatureInvalid }, 401);
   return undefined;
 }
 

@@ -1,9 +1,11 @@
+// @gnldev/a2a's client against an in-process @gnldev/server (createRestApi) — here, in the server's tests,
+// because @gnldev/server depends on @gnldev/a2a and a test dependency back would be a cycle.
 // Phase 12 — @gnldev/a2a: in-process remote server (createRestApi). (1) deterministic runId → remote idempotent
 // (same toolCallId two calls → remote charge 1); (2) parent runDurable + resume → remote call SKIPPED.
 import { describe, it, expect } from 'vitest';
 import { InMemoryJournal, runDurable } from '@gnldev/durable';
-import { createRestApi } from '@gnldev/server';
-import { createA2ATool, StepTimeoutError } from '../src/index.js';
+import { createA2ATool, StepTimeoutError } from '@gnldev/a2a';
+import { createRestApi } from '../src/index.js';
 import { call } from './call.js';
 
 function chargeModel(counter: { gen: number }): any {

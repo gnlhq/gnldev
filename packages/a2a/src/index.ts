@@ -6,7 +6,9 @@
 import { tool } from 'ai';
 import type { Tool } from 'ai';
 import { z } from 'zod';
-import { createHmac } from 'node:crypto';
+import { signA2ARequest } from './signature.js';
+
+export { a2aSigningInput, signA2ARequest, verifyA2ARequest, A2A_SIGNATURE_WINDOW_MS, type A2ASignedRequest, type A2ASignatureVerdict } from './signature.js';
 
 export interface A2AToolOptions {
   /** Remote @gnldev/server base URL (e.g. 'https://host'). */
@@ -22,8 +24,8 @@ export interface A2AToolOptions {
   timeoutMs?: number;
   /**
    * TASK (audit: A2A unsigned) — opt-in HMAC-SHA256 signing. When provided, the request body is
-   * sent with a hex signature in the `x-gnl-signature` header: signature = HMAC(secret, timestamp + '.' + body),
-   * `x-gnl-timestamp` (epoch-ms) is also included to be part of the replay window. Verified on the
+   * sent with a hex signature in the `x-gnl-signature` header over the timestamp, the method, the route and
+   * the body (`signA2ARequest`); `x-gnl-timestamp` (epoch-ms) is also included to be part of the replay window. Verified on the
    * remote `@gnldev/server` side via `createRestApi({ a2aSecret })`. If not provided, behavior is
    * UNCHANGED (unsigned request, current behavior).
    */
@@ -125,15 +127,12 @@ export function createA2ATool(opts: A2AToolOptions): Tool<{ task: string }, A2AR
       const user = endUserOf(options);
       const bodyStr = JSON.stringify({ runId, prompt: task, ...(user !== undefined ? { resourceId: user } : {}) });
       const headers: Record<string, string> = { 'content-type': 'application/json', ...(opts.headers ?? {}) };
-      if (opts.secret) {
-        // signature = HMAC(secret, timestamp + '.' + body) → the server side (a2aSecret) verifies with the SAME formula.
-        const timestamp = String(Date.now());
-        headers['x-gnl-timestamp'] = timestamp;
-        headers['x-gnl-signature'] = createHmac('sha256', opts.secret).update(`${timestamp}.${bodyStr}`).digest('hex');
-      }
+      const path = `/agents/${opts.agentName}/run`;
+      // Signed with the one definition the server verifies with (signature.ts): the route is in it.
+      if (opts.secret) Object.assign(headers, signA2ARequest(opts.secret, { method: 'POST', path, body: bodyStr }));
       let res: Response;
       try {
-        res = await doFetch(`${opts.endpoint}/agents/${opts.agentName}/run`, {
+        res = await doFetch(`${opts.endpoint}/agents/${encodeURIComponent(opts.agentName)}/run`, {
           method: 'POST',
           headers,
           body: bodyStr,

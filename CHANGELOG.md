@@ -20,6 +20,11 @@ and who is affected.
   name the work with `workKey` (its id includes the target). The code `not_an_agent_run` and
   `NotAnAgentRunError` are removed: that case is `run_target_mismatch` / `RunTargetMismatchError` now,
   and a caller who may not act on the run gets `run_owner_mismatch` instead, which names no target.
+- **An A2A signature covers the method and the route, not only the body.** A 0.9 `createA2ATool({ secret })`
+  calling a server with `a2aSecret` is refused `401 a2a_signature_invalid`: update both sides together.
+  @gnldev/server now depends on @gnldev/a2a, which owns the definition (`signA2ARequest`,
+  `verifyA2ARequest`); @gnldev/a2a's client-against-server tests moved to @gnldev/server, so the
+  packages still build in one order.
 - **Studio's `StudioMemory` is picked from @gnldev/durable's `Memory`** (and AgentMemory `implements
   Required<Memory>`), so a renamed method is a compile error on either side. The truncate method Studio
   calls is `truncateMessagesAfter` (was `truncateMessages`, which no shipped memory had). Pass the memory
@@ -230,6 +235,20 @@ and who is affected.
 - @gnldev/scheduler: `ScheduleSpec.ifExists` (`'refuse'` by default, `'replace'`, `'keep'`).
 
 ### Security
+
+- **A signed A2A request was accepted by routes it was not signed for.** The signature covered the
+  timestamp and the body, so it named no door. Measured on the previous build with the real client: a
+  request @gnldev/a2a signed for agent `a`, sent to agent `b` → 200 and `b` ran it; to `a`'s `/stream` and
+  `/resume` and to a workflow's run → accepted past the signature check. Anyone who could see one signed
+  request (a proxy, a log) could aim it elsewhere for 300 seconds without the secret. The signed text is
+  now `timestamp.METHOD route.body`, the route decoded and relative to the API root, so a host that mounts
+  the API under a prefix verifies what the client signed. The formula was written three times (client,
+  server, a test) and is defined once now, in @gnldev/a2a, which the server verifies with — @gnldev/a2a
+  still depends on no GNL package. 9 sibling scenarios: the four replays above, a changed body, no
+  signature and a 0.9-style signature are refused with 401; the real client round-trips, also for an agent
+  name that needs URL encoding. Measured as a candidate: the same formula written on both sides, pinned by
+  a round-trip test — it passed the same scenarios and a one-sided change failed 3 tests, but left three
+  copies.
 
 - **A runId answered for a different agent or workflow than the one it was started for.** A run's journal
   is its target's, and no entry asked whose target it was. Measured on the previous build: `POST

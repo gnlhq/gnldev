@@ -26,9 +26,16 @@ await runDurable({ runId: 'parent-1', journal, model, tools, prompt: 'Research X
   - `fetchImpl`: for test/custom transport (e.g. Hono `app.request`).
   - `timeoutMs`: remote-call timeout, default `30_000`. On expiry a `StepTimeoutError` is thrown, so the
     wrapping `durableTool` journals a `failed` record and the model sees the real error — never a silent hang.
-  - `secret`: opt-in HMAC-SHA256 request signing. The body goes out with `x-gnl-signature`
-    (`HMAC(secret, timestamp + '.' + body)`) and `x-gnl-timestamp`; the remote verifies it via
-    `createRestApi({ a2aSecret })`. Omit it and requests are unsigned, exactly as before.
+  - `secret`: opt-in HMAC-SHA256 request signing. The request goes out with `x-gnl-timestamp` and
+    `x-gnl-signature` over the timestamp, the method, the route and the body
+    (`HMAC(secret, timestamp + '.' + 'POST /agents/<name>/run' + '.' + body)`), so a signed request is
+    accepted only by the route it was made for. The remote verifies it via `createRestApi({}, { a2aSecret })`.
+    Omit it and requests are unsigned. Both sides use one definition, exported here: `signA2ARequest`,
+    `verifyA2ARequest`, `a2aSigningInput`.
+  - `a2aSecret` requires a signature on every agent and workflow route of that API, so your own users'
+    unsigned calls are refused there too. To serve both from one process, mount two APIs: one with
+    `a2aSecret` for signed peers (e.g. under `/a2a`) and one without, behind your auth, for your users. The
+    host strips the prefix before handing the request on; the signature covers the route without it.
   - `budgetGuard`: called *before* the fetch — typically `@gnldev/durable`'s `assertBudget`. It gates the
     call made **from this process** only; a2a cannot see or enforce the remote endpoint's own quota. Throwing
     propagates as-is. Omit it and no quota check happens.

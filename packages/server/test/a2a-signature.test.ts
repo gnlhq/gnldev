@@ -4,6 +4,7 @@
 // with the @gnldev/a2a package see packages/a2a/test/a2a.test.ts.
 import { describe, it, expect } from 'vitest';
 import { createHmac } from 'node:crypto';
+import { a2aSigningInput } from '@gnldev/a2a';
 import { InMemoryJournal } from '@gnldev/durable';
 import { createRestApi } from '../src/index.js';
 import { call } from './call.js';
@@ -24,8 +25,9 @@ function mkModel(): any {
   };
 }
 
-function sign(secret: string, timestamp: string, body: string): string {
-  return createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');
+/** Signed with @gnldev/a2a's one definition, for the route the request is sent to. */
+function sign(secret: string, timestamp: string, body: string, path = '/agents/a/run'): string {
+  return createHmac('sha256', secret).update(a2aSigningInput(timestamp, { method: 'POST', path, body })).digest('hex');
 }
 
 function mkApi(a2aSecret?: string) {
@@ -160,7 +162,7 @@ describe('@gnldev/server A2A signature verification (a2aSecret)', () => {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-gnl-signature': sign(secret, timestamp, body),
+        'x-gnl-signature': sign(secret, timestamp, body, '/agents/a/stream'),
         'x-gnl-timestamp': timestamp,
       },
       body,
