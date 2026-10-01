@@ -173,6 +173,9 @@ export class PostgresVectorStore implements VectorStore {
     if (opts?.filter && Object.keys(opts.filter).length > 0) {
       params.push(JSON.stringify(opts.filter));
       where.push(`metadata @> $${params.length}::jsonb`);
+      // The same condition again, spelled the way the document index is: `@>` alone cannot use it.
+      const doc = vectorFilterDocument(opts.filter);
+      if (doc !== undefined) { params.push(doc); where.push(`metadata ->> '${VECTOR_DOCUMENT_KEY}' = $${params.length}`); }
     }
     if (scope.visibleTo !== undefined) {
       params.push(scope.visibleTo);
@@ -237,6 +240,8 @@ export class PostgresVectorStore implements VectorStore {
       if (Object.keys(present).length > 0) {
         params.push(JSON.stringify(present));
         conds.push(`metadata @> $${params.length}::jsonb`);
+        const doc = vectorFilterDocument(present);
+        if (doc !== undefined) { params.push(doc); conds.push(`metadata ->> '${VECTOR_DOCUMENT_KEY}' = $${params.length}`); }
       }
       for (const [k, v] of Object.entries(w.filter)) {
         if (v !== undefined) continue;

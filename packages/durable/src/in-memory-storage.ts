@@ -8,7 +8,7 @@ import { InMemoryJournal } from './journal.js';
 import { stableStringify } from './hash.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
 import type { JournalEntry, RunSummary } from './journal.js';
-import { decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision, vectorInOrganization, vectorDocumentOf } from './storage.js';
+import { decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision, vectorInOrganization, vectorDocumentOf, vectorFilterDocument } from './storage.js';
 import type {
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -292,7 +292,7 @@ class InMemoryVectorStore implements VectorStore {
     const w = vectorDeletePlan(where);
     if (!w) return 0;
     const gone = vectorDeleteMatcher(w);
-    const doomed = [...new Set([...this.candidates(w.ids, undefined)])].filter(gone);
+    const doomed = [...new Set([...this.candidates(w.ids, vectorFilterDocument(w.filter))])].filter(gone);
     for (const it of doomed) { this.remove(it.id); this.byId.delete(it.id); }
     return doomed.length;
   }
@@ -303,7 +303,7 @@ class InMemoryVectorStore implements VectorStore {
     // quietly degrades as other organizations upload — invisible unless a test has two of them in it.
     const scope = vectorQueryScope(opts);
     if (scope.none) return [];
-    return this.items
+    return [...this.candidates(undefined, vectorFilterDocument(opts?.filter))]
       .filter((it) => (scope.namespace === undefined || it.namespace === scope.namespace) && !(scope.outsideOrganizations && vectorInOrganization(it.namespace)) && visibleToSubject(it, scope.visibleTo) && vectorMetadataMatches(it.metadata, opts?.filter))
       .map((it) => ({ id: it.id, text: it.text, metadata: it.metadata, ...(it.namespace !== undefined ? { namespace: it.namespace } : {}), ...(it.owner !== undefined ? { owner: it.owner } : {}), ...(it.shared ? { shared: true } : {}), score: cosineSimilarity(embedding, it.embedding) }))
       .sort((a, b) => b.score - a.score)

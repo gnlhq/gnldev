@@ -1,5 +1,5 @@
 import { cosineSimilarity } from 'ai';
-import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, vectorInOrganization, vectorDocumentOf, type VectorAllPartitionsOption } from '@gnldev/durable';
+import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, vectorInOrganization, vectorDocumentOf, vectorFilterDocument, type VectorAllPartitionsOption } from '@gnldev/durable';
 
 export interface VectorDoc {
   id: string;
@@ -157,7 +157,7 @@ export class InMemoryVectorStore implements VectorStore {
     const scope = vectorQueryScope(opts);
     if (scope.none) return [];
     const out: VectorMatch[] = [];
-    for (const it of this.candidates(undefined, undefined)) {
+    for (const it of this.candidates(undefined, vectorFilterDocument(opts?.filter))) {
       // 7.2: namespace + metadata narrowing (BEFORE score computation — no wasted work).
       if (scope.namespace !== undefined && it.namespace !== scope.namespace) continue;
       if (scope.outsideOrganizations && vectorInOrganization(it.namespace)) continue; // the root's partition (ADR-0001)
@@ -178,7 +178,7 @@ export class InMemoryVectorStore implements VectorStore {
     if (!w) return 0;
     // ALL given conditions must match — the one reading, vectorDeleteMatcher.
     const gone = vectorDeleteMatcher(w);
-    const doomed = [...this.candidates(w.ids, undefined)].filter(gone);
+    const doomed = [...this.candidates(w.ids, vectorFilterDocument(w.filter))].filter(gone);
     for (const it of doomed) { this.unindex(it.id); this.byId.delete(it.id); }
     return doomed.length;
   }

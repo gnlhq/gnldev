@@ -1567,6 +1567,8 @@ class PgVectorStore implements VectorStore {
     // Metadata is serialized, so the filter is read in code (vectorMetadataMatches) and the matching
     // rows deleted by id, in one transaction.
     const filter = w.filter;
+    const doc = vectorFilterDocument(filter);
+    if (doc !== undefined) { params.push(doc); conds.push(`(doc = $${params.length} OR doc IS NULL)`); }
     return this.tx(async (q) => {
       const rows = (await q(`SELECT id, metadata FROM gnl_vectors${conds.length ? ` WHERE ${conds.join(' AND ')}` : ''}`, params)).rows as { id: string; metadata: string | null }[];
       const ids = rows.filter((r) => vectorMetadataMatches(r.metadata ? deserialize<Record<string, unknown>>(r.metadata) : undefined, filter)).map((r) => r.id);
@@ -1589,6 +1591,10 @@ class PgVectorStore implements VectorStore {
     if (scope.namespace !== undefined) { params.push(scope.namespace); where.push(`namespace = $${params.length}`); }
     if (scope.outsideOrganizations) where.push(VECTOR_OUTSIDE_ORGANIZATIONS_SQL); // the root's partition (ADR-0001)
     if (scope.visibleTo !== undefined) { params.push(scope.visibleTo); where.push(`(shared IS TRUE OR owner = $${params.length})`); }
+    // A filter naming a document reads that document's rows (and any row whose `doc` is not computed
+    // yet) through the index; the whole filter is still applied in code below.
+    const doc = vectorFilterDocument(opts?.filter);
+    if (doc !== undefined) { params.push(doc); where.push(`(doc = $${params.length} OR doc IS NULL)`); }
     const r = await this.q(`SELECT id, text, embedding, metadata, namespace, owner, shared FROM gnl_vectors${where.length ? ` WHERE ${where.join(' AND ')}` : ''}`, params);
     return r.rows
       .map((x) => ({ id: x.id, text: x.text, metadata: x.metadata ? deserialize<Record<string, unknown>>(x.metadata) : undefined, ...(x.namespace != null ? { namespace: x.namespace as string } : {}), ...(x.owner != null ? { owner: x.owner as string } : {}), ...(x.shared ? { shared: true } : {}), score: cosineSimilarity(embedding, JSON.parse(x.embedding)) }))

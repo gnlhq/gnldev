@@ -1313,7 +1313,10 @@ class SqliteVectorStore implements VectorStore {
     if (w.outsideOrganizations) conds.push(VECTOR_OUTSIDE_ORGANIZATIONS_SQL);
     if (w.filter) {
       // Metadata is serialized, so the filter is read in code (vectorMetadataMatches) and the matching
-      // rows deleted by id. No await in between: node:sqlite is synchronous.
+      // rows deleted by id. No await in between: node:sqlite is synchronous. A filter naming a
+      // document reads that document's rows through the index first.
+      const doc = vectorFilterDocument(w.filter);
+      if (doc !== undefined) { conds.push(`${VECTOR_DOC_SQL} = ?`); params.push(doc); }
       const rows = this.db.prepare(`SELECT id, metadata FROM gnl_vectors${conds.length ? ` WHERE ${conds.join(' AND ')}` : ''}`).all(...params) as { id: string; metadata: string | null }[];
       const ids = rows.filter((r) => vectorMetadataMatches(r.metadata ? deserialize<Record<string, unknown>>(r.metadata) : undefined, w.filter)).map((r) => r.id);
       if (!ids.length) return 0;
@@ -1336,6 +1339,10 @@ class SqliteVectorStore implements VectorStore {
     if (scope.namespace !== undefined) { where.push('namespace IS ?'); params.push(scope.namespace); }
     if (scope.outsideOrganizations) where.push(VECTOR_OUTSIDE_ORGANIZATIONS_SQL); // the root's partition (ADR-0001)
     if (scope.visibleTo !== undefined) { where.push('(shared = 1 OR owner = ?)'); params.push(scope.visibleTo); }
+    // A filter naming a document is answered from the document index — the rows it can match — and
+    // then read whole in code below, so the index removes only rows the filter removes.
+    const doc = vectorFilterDocument(opts?.filter);
+    if (doc !== undefined) { where.push(`${VECTOR_DOC_SQL} = ?`); params.push(doc); }
     const rows = this.db
       .prepare(`SELECT id, text, embedding, metadata, namespace, owner, shared FROM gnl_vectors${where.length ? ` WHERE ${where.join(' AND ')}` : ''}`)
       .all(...params) as any[];
