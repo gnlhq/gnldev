@@ -27,7 +27,7 @@ import { threadOwnerOf, threadOwnerKey } from './thread-owner.js';
 import { withOrg, isOrganizationKey, orgPrefix, ORG_KEY_PREFIX, ORG_RECORD_PRE } from './organization.js';
 import { orgVectorDelete, orgStorageScopeOf, withOrgStorage } from './org-storage.js';
 import { toJournal, workingMemoryScope, legacyWorkingMemoryScope, MEMORY_PARTITION } from './storage.js';
-import { memKey, MEM_LEAVES, OM_VECTOR_SOURCE } from './memory.js';
+import { memKey, MEM_LEAVES, OM_VECTOR_SOURCE, semanticLogKey } from './memory.js';
 import type { Memory } from './memory.js';
 import { runKeys } from './journal.js';
 import type { Journal } from './journal.js';
@@ -115,7 +115,8 @@ async function journalHoldsThread(runs: Journal, threadId: string): Promise<bool
     try { key = memKey(threadId, leaf); } catch { return false; }
     if ((await runs.get(key)) !== undefined) return true;
   }
-  return false;
+  // SemanticMemory (@gnldev/rag) keeps the thread's messages in its own log; purgeThread erases it.
+  return (await runs.get(semanticLogKey(threadId))) !== undefined;
 }
 
 /** Every thread the store lists for this person. Outside organizations, an organization's thread (`org:<id>:…`) is a namesake's. */
@@ -362,10 +363,15 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
   // Threads the record gives this person and no memory store held: kept in the journal (BasicMemory),
   // or somewhere this erasure was not shown. Asked before `purgeResource` removes the owner records.
   const unreachedThreads: string[] = [];
+  const journalKept: string[] = [];
   for (const t of ownedByRecord) {
     if (reached.has(t)) continue;
     if ((await threadOwnerOf(runs, asker, t)).owner !== resourceId) continue;
-    if (!(await journalHoldsThread(runs, t))) unreachedThreads.push(t);
+    // A journal-kept thread (BasicMemory, SemanticMemory) is erased here, by its owner record: it used
+    // to be reached only through a run of this person, so a thread with none kept every message and
+    // the report named nothing.
+    if (await journalHoldsThread(runs, t)) journalKept.push(t);
+    else unreachedThreads.push(t);
   }
   // Threads 0.9 let the root create under an `org:` id: the root can no longer name them, so they are
   // not erased here — they are reported, with the way through (`findReservedRootThreads`).
@@ -381,6 +387,7 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
   // A memory-store thread's journal side (observational memory, dedup window, owner record) — reached
   // here too, for a thread with no run left to lead `purgeResource` to it; and in the `memory`
   // storage's journal, where that memory kept its observational-memory records.
+  for (const t of journalKept) journalRows += await purgeThread(runs, t);
   for (const { thread, runs: memRuns } of deleted) {
     journalRows += await purgeThread(runs, thread);
     if (memRuns !== runs) journalRows += await purgeThread(memRuns, thread);

@@ -5,7 +5,7 @@
 import { runKeys, summarizeRun, nestedAgentRunId, runIdOfKey } from './journal.js';
 import { identityOnlyInput } from './run.js';
 import { workKeyHash } from './hash.js';
-import { MEM_LEAVES, OM_LEAVES, readJournalLog } from './memory.js';
+import { MEM_LEAVES, OM_LEAVES, readJournalLog, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX } from './memory.js';
 import type { Memory } from './memory.js';
 import { threadOwnerOf, threadOwnerKey } from './thread-owner.js';
 import type { WorkScopeKind } from './hash.js';
@@ -629,7 +629,9 @@ export async function purgeThread(journal: Journal, threadId: string): Promise<n
   // was gone and `om:<thread>:proc:observe:0` still held that summary.
   let total = (await purgeThreadNamespace(journal, MEM_PREFIX, threadId, threadIdOfMemKey))
     + (await purgeThreadNamespace(journal, XTHR_PREFIX, threadId, threadIdOfXthrKey))
-    + (await purgeThreadNamespace(journal, OM_PREFIX, threadId, threadIdOfOmKey));
+    + (await purgeThreadNamespace(journal, OM_PREFIX, threadId, threadIdOfOmKey))
+    // SemanticMemory's log (@gnldev/rag) — the thread's messages, kept under their own prefix.
+    + (await purgeThreadNamespace(journal, SEMANTIC_LOG_PREFIX, threadId, threadIdOfSemKey));
   // The owner record names a person, and with the thread gone it guards nothing.
   if ((await journal.get(threadOwnerKey(threadId))) !== undefined) total += await del(threadOwnerKey(threadId));
 
@@ -1107,6 +1109,12 @@ const XTHR_FAMILIES = [':semjudge-', ':semtomb-', ':sem-', ':dup-', ':args-'] as
 const OM_PREFIX = 'om:';
 const OM_SUFFIXES = OM_LEAVES.map((leaf) => `:${leaf}`);
 
+/** threadId out of SemanticMemory's `sem:<threadId>:log` (`semanticLogKey`). */
+function threadIdOfSemKey(key: string): string | undefined {
+  const rest = key.slice(SEMANTIC_LOG_PREFIX.length);
+  return rest.endsWith(SEMANTIC_LOG_SUFFIX) && rest.length > SEMANTIC_LOG_SUFFIX.length ? rest.slice(0, -SEMANTIC_LOG_SUFFIX.length) : undefined;
+}
+
 function threadIdOfOmKey(key: string): string | undefined {
   const rest = key.slice(OM_PREFIX.length);
   for (const suffix of OM_SUFFIXES) if (rest.endsWith(suffix) && rest.length > suffix.length) return rest.slice(0, -suffix.length);
@@ -1257,11 +1265,20 @@ export async function sweepThreads(journal: Journal, opts: ThreadSweepOptions): 
   // a threadId to the set (safe: only the recognized schema is swept), but if they belong to a
   // recognized thread they still go with it via purgeThread's prefix delete.
   const threadIds = await threadIdsFromMemory(list);
+  // SemanticMemory's threads (@gnldev/rag) keep their messages in `sem:<threadId>:log` — a thread with
+  // only that log is a thread too, and its messages date it.
+  for (const key of await list(SEMANTIC_LOG_PREFIX)) {
+    const t = threadIdOfSemKey(key);
+    if (t !== undefined) threadIds.add(t);
+  }
 
   const result: ThreadSweepResult = { scanned: 0, purged: [], keptNoTs: 0, orphanThreadState: [] };
   for (const threadId of threadIds) {
     result.scanned++;
-    const messages = await readJournalLog<any>(journal, `${MEM_PREFIX}${threadId}:messages`);
+    const messages = [
+      ...(await readJournalLog<any>(journal, `${MEM_PREFIX}${threadId}:messages`)),
+      ...(await readJournalLog<{ message?: unknown }>(journal, `${SEMANTIC_LOG_PREFIX}${threadId}${SEMANTIC_LOG_SUFFIX}`)).map((e) => e?.message),
+    ];
     const stamps = messages.map(readMessageTs).filter((t): t is number => t !== undefined);
     if (stamps.length === 0) {
       result.keptNoTs++; // age can't be measured → safe side: preserve

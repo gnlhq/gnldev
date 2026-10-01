@@ -127,6 +127,14 @@ and who is affected.
 
 ### Security
 
+- **Erasing a person, and the retention sweep, left `SemanticMemory` logs behind.** @gnldev/rag's
+  `SemanticMemory` keeps a thread's log under `sem:<thread>:log`, and neither `eraseSubject` nor
+  `sweepThreads` looked there: erasure listed the thread in `unreachedThreads` but the user's messages
+  stayed in the journal, and a sweep never dated or removed the log. Measured with data written by 0.9.0
+  and by this version alike. `purgeThread` now removes the `sem:` log with the thread, `sweepThreads`
+  dates and removes it, and erasure no longer reports a thread it removed. A sibling: `eraseSubject`
+  also left a `BasicMemory` thread whose runs were already gone while reporting `unreachedThreads: []`;
+  it now removes it through the thread's owner record. Nothing to change in your code.
 - **The root scope read every organization's runs.** ADR-0001 says "in the root scope, every
   organization's rows are hidden", and memory held it; runs did not. An organization's run sits in the
   root journal as `org:<id>:<runId>`, and the root scope read through the raw journal. Measured through

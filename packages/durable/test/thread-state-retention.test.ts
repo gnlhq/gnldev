@@ -387,7 +387,7 @@ describe('a thread id is not a prefix — purging one must not take its descenda
     await counting.put('xthr:solo:sem-pay-a', { v: 1 });
 
     await purgeThread(counting, 'solo');
-    expect(prefixDeletes, 'one per namespace — mem:, xthr: and om: — not one per key').toBe(3);
+    expect(prefixDeletes, 'one per namespace — mem:, xthr:, om: and sem: — not one per key').toBe(4);
   });
 
   it("om: (observational memory) keeps the same boundary — 't' goes, 't:2' and 't:proc:x' stay", async () => {
