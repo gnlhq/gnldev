@@ -11,7 +11,8 @@ import { SqliteStorage } from '../../durable/src/sqlite-storage.js';
 import { ingestDocuments, deleteDocuments, createRagTool, type VectorStore } from '../src/index.js';
 
 const embed = async (_t: string) => [1, 1, 1];
-const all = async (vs: VectorStore) => (await vs.query([1, 1, 1], 1000)).map((m) => `${m.namespace ?? '-'}|${m.id}|${m.text}`).sort();
+// `ingestDocuments` writes `<id>#<i>@<generation>`; the generation is compared away here.
+const all = async (vs: VectorStore) => (await vs.query([1, 1, 1], 1000)).map((m) => `${m.namespace ?? '-'}|${m.id.replace(/@[0-9a-z]+$/, '')}|${m.text}`).sort();
 
 describe.each([
   ['durable InMemory', () => new InMemoryStorage()],
@@ -39,8 +40,8 @@ describe.each([
     const { root, acme } = await world();
     await ingestDocuments(acme, embed, [{ id: 'h', text: 'ACME-NEW', shared: true }]);
     await ingestDocuments(root, embed, [{ id: 'h', text: 'ROOT', shared: true, namespace: 'acme-notes' }]);
-    expect(await all(root)).toEqual(['acme-notes|h|ROOT', 'org:acme|org:acme:h|ACME-NEW']);
+    expect(await all(root)).toEqual(['acme-notes|h#0|ROOT', 'org:acme|org:acme:h#0|ACME-NEW']);
     expect(await deleteDocuments(acme, ['h'])).toBe(1);
-    expect(await all(root)).toEqual(['acme-notes|h|ROOT']);
+    expect(await all(root)).toEqual(['acme-notes|h#0|ROOT']);
   });
 });
