@@ -32,7 +32,31 @@ export interface ScoreResult {
 
 export interface Scorer {
   name: string;
+  /**
+   * What the score depends on besides the sample (a rubric, a model, a threshold). A memoized score
+   * (`scoreRun`, an agent's `scorers`, `evalDataset`) is replayed only for the same fingerprint, so an
+   * edited rubric re-scores instead of replaying the old score under the same name. Default: the source
+   * text of `score` — set this when the behaviour comes from values the function closes over. The
+   * built-in factories set it from their options.
+   */
+  fingerprint?: string;
   score(sample: ScoreSample): Promise<ScoreResult> | ScoreResult;
+}
+
+/**
+ * A fingerprint from a factory's options: the kind plus the options as JSON, with a RegExp as its
+ * source and flags and a model as its provider and id. Functions are left out (an `embed` callback
+ * cannot be compared); a factory whose behaviour hinges on one should take a `fingerprint` option.
+ */
+export function optionsFingerprint(kind: string, options: unknown): string {
+  return `${kind}:${JSON.stringify(options ?? null, (_k, v) => {
+    if (v instanceof RegExp) return `/${v.source}/${v.flags}`;
+    if (v && typeof v === 'object' && typeof (v as { modelId?: unknown }).modelId === 'string') {
+      const m = v as { provider?: unknown; modelId: string };
+      return `model:${String(m.provider ?? '')}/${m.modelId}`;
+    }
+    return v;
+  })}`;
 }
 
 /** Is the output exactly equal to expected (trimmed)? */
@@ -50,6 +74,7 @@ export function exactMatch(): Scorer {
 export function contains(substr?: string): Scorer {
   return {
     name: 'contains',
+    fingerprint: optionsFingerprint('contains', { substr }),
     score: (s) => {
       const needle = substr ?? s.expected ?? '';
       const ok = needle.length > 0 && (s.output ?? '').includes(needle);
@@ -62,6 +87,7 @@ export function contains(substr?: string): Scorer {
 export function regexScore(re: RegExp): Scorer {
   return {
     name: 'regex',
+    fingerprint: optionsFingerprint('regex', { re }),
     score: (s) => {
       const ok = new RegExp(re.source, re.flags).test(s.output ?? '');
       return { score: ok ? 1 : 0, reason: ok ? 'regex matched' : 'regex did not match' };
@@ -96,6 +122,7 @@ export function embeddingSimilarity(
 ): Scorer {
   return {
     name: 'embedding-similarity',
+    fingerprint: optionsFingerprint('embedding-similarity', { threshold: opts?.threshold }),
     score: async (s) => {
       const [ov, ev] = await Promise.all([embed(s.output ?? ''), embed(s.expected ?? '')]);
       const sim = cosine(ov, ev);

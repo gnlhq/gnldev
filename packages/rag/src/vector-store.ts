@@ -42,6 +42,12 @@ export interface QueryOptions {
 /** 7.2: delete condition — id list and/or metadata filter and/or namespace. */
 export interface DeleteWhere {
   ids?: string[];
+  /**
+   * Metadata shallow equality: every key must match. A key whose value is `undefined` matches a record
+   * WITHOUT that key — `ingestDocuments` uses it to leave alone a record that carries another
+   * document's trail. A custom store that serialises the filter must keep that reading (JSON drops
+   * `undefined`, which would widen the delete).
+   */
   filter?: Record<string, unknown>;
   namespace?: string;
   /** Every document of this end user — `owner` is a label, not metadata, so `filter` cannot reach it. */

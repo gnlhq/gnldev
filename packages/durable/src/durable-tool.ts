@@ -1863,13 +1863,25 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // 'suspended' is deliberately excluded: an approved resume is the FIRST attempt of that call.
         const prevAttempts = record && (record.status === 'failed' || record.status === 'running') ? (record.attempts ?? 1) : 0;
         // The error text is tool data like any output: the processors that see the output see this
-        // too (`processToolError`), before it is journaled. The thrown error is rethrown untouched.
-        let journaledError = String(error?.message ?? error);
+        // too (`processToolError`), before it is journaled. When they CHANGED the text, the error that
+        // leaves this function carries the changed text too (`maskedToolError`) — it is the copy the
+        // model, the thread and the stream render, so masking only the journal record left the raw
+        // text in every other place. Masked once, here, where it is thrown.
+        const thrownText = String(error?.message ?? error);
+        let journaledError = thrownText;
         if (ctx.toolResultProcessors?.length) {
           const procCtx = createProcessorCtx(ctx.journal, ctx.runId);
           try {
             for (const proc of ctx.toolResultProcessors) {
-              if (proc.processToolError) journaledError = (await proc.processToolError({ toolName, toolCallId, input, error: journaledError }, procCtx)).error;
+              if (!proc.processToolError) continue;
+              const next = (await proc.processToolError({ toolName, toolCallId, input, error: journaledError }, procCtx))?.error;
+              // A hook that returns no text is not trusted with a guess — the raw text must not
+              // survive it, and `undefined` must not reach the journal or the next hook.
+              if (typeof next !== 'string') {
+                journaledError = `[tool error withheld: a processToolError hook returned no text for the error of '${toolName}']`;
+                break;
+              }
+              journaledError = next;
             }
           } catch {
             // Fail closed: a redactor that could not finish must not leave the raw text behind it.
@@ -1894,11 +1906,38 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         }
         // NOTE: taint is marked at INVOCATION now (see ), so a FAILED untrusted tool is already
         // tainted — its error body (also attacker-authorable) is covered without a post-hoc mark here.
-        throw error;
+        throw journaledError === thrownText ? error : maskedToolError(error, journaledError);
       }
       return output;
     },
   };
+}
+
+/**
+ * The error a tool threw, re-made with the text a `processToolError` hook produced.
+ *
+ * Same prototype (so `instanceof` and `name` still hold), `message` = the processed text, the stack's
+ * header rewritten to match, and the ORIGINAL as `cause` — application code in this process can still
+ * read it; the AI SDK renders only `message`, so the model, the thread and the stream see the masked
+ * text. Own properties (`code`, `status`, a custom `email`…) are NOT copied: they are as likely as the
+ * message to hold the value the hook removed. Read them from `cause`.
+ */
+export function maskedToolError(original: unknown, text: string): Error {
+  if (!(original instanceof Error)) return new Error(text, { cause: original });
+  const masked = Object.create(Object.getPrototypeOf(original)) as Error;
+  // The frames are kept (they name code, not data); the header that repeats the message is not. A
+  // stack that does not contain the message verbatim is dropped whole — it cannot be split safely.
+  const at = typeof original.stack === 'string' && original.message ? original.stack.indexOf(original.message) : -1;
+  const frames = at >= 0 ? original.stack!.slice(at + original.message.length) : '';
+  const own = { writable: true, configurable: true, enumerable: false };
+  Object.defineProperties(masked, {
+    message: { ...own, value: text },
+    stack: { ...own, value: `${original.name}: ${text}${frames}` },
+    cause: { ...own, value: original },
+  });
+  // `name` usually lives on the prototype; an instance-assigned one is copied so the class still reads right.
+  if (Object.prototype.hasOwnProperty.call(original, 'name')) Object.defineProperty(masked, 'name', { ...own, value: original.name });
+  return masked;
 }
 
 /** Makes an entire ToolSet (Record<name, tool>) durable; carries the tool name to the guard. */

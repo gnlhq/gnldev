@@ -58,7 +58,10 @@ label, through the same vector write rule every store runs, so erasing the perso
 organization they also carry its namespace: pass the organization's vector store (the storage
 `memoryFactory` receives), or the root one — the memory then labels namespace and id itself. Another
 organization's vector store is refused. A staff or ownerless thread's observations carry no owner, so
-no end user's query is answered from them.
+no end user's query is answered from them. A custom store passed as the root one must return each
+match's `namespace` from `query`: an organization's semantic recall checks it, and when the matches
+carry none it falls back to the keyword match over the organization's own observations, with one
+warning, instead of answering from vectors it cannot place.
 
 Each observation vector also carries `metadata: { source: 'observational-memory', threadId }`
 (`OM_VECTOR_SOURCE` from @gnldev/durable), and erasing a thread's owner deletes the thread's

@@ -35,10 +35,12 @@ export interface ToolSchemaRule {
  */
 export interface ShapeContext {
   /**
-   * This node — a property schema, as it now stands in the schema being sent — was widened to accept
+   * This node — a property schema, as it stands in the schema this rule returns — was widened to accept
    * `null` as the way to say "not supplied". A `null` the model sends there is read as the key being
-   * absent before the tool validates. Call it with the node that ends up in the schema (after any
-   * wrapping), and do not replace the node afterwards: the record is by identity.
+   * absent before the tool validates. Call it with the node that ends up in the schema this rule
+   * returns (after any wrapping). The pipeline snapshots that schema with the record as soon as the
+   * rule returns, so rules after it may rebuild, clone or strip nodes freely: the record, and the
+   * union-branch reading it relies on, are this rule's own.
    */
   nullMeansAbsent(node: JsonSchema): void;
   /**

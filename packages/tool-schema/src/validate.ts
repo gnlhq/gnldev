@@ -20,10 +20,38 @@ import type { JsonSchema } from './types.js';
  * or a z.union of objects the null the model was told to send was refused.
  */
 
-/** What a patched tool was told, and the nodes a rule widened in it. */
-export interface Shaped {
+/** One rule's record: the schema that rule returned (a snapshot), and the nodes it widened in it. */
+export interface NullRecord {
   schema: JsonSchema;
   nullMeansAbsent: WeakSet<object>;
+}
+
+/** What a patched tool was told (`schema`), and each recording rule's record, in rule order. */
+export interface Shaped {
+  schema: JsonSchema;
+  records: NullRecord[];
+}
+
+/**
+ * A deep copy of `schema` as a rule returned it, with the nodes it marked carried over to their
+ * copies. Taken right after the rule, so no later rule — rebuilding a node, cloning the schema,
+ * deleting `additionalProperties` — can change what the record says. A marked node that is not in the
+ * returned schema is dropped: the rule replaced it after marking it, so nothing was invited there.
+ */
+export function snapshotRecord(schema: JsonSchema, marked: ReadonlySet<object>): NullRecord {
+  const copies = new Map<object, unknown>();
+  const nullMeansAbsent = new WeakSet<object>();
+  const copy = (v: unknown): unknown => {
+    if (v === null || typeof v !== 'object') return v;
+    const seen = copies.get(v);
+    if (seen !== undefined) return seen;
+    const out: any = Array.isArray(v) ? [] : {};
+    copies.set(v, out);
+    for (const [k, x] of Object.entries(v)) out[k] = copy(x);
+    if (marked.has(v)) nullMeansAbsent.add(out);
+    return out;
+  };
+  return { schema: copy(schema) as JsonSchema, nullMeansAbsent };
 }
 
 /** Resolves a local `$ref` (`#/$defs/X`, `#/definitions/X`); anything else is returned as is. */
@@ -83,7 +111,7 @@ function couldBe(value: unknown, branch: any, root: JsonSchema, marks: WeakSet<o
  * At a union, the value is read in every branch it could be in (`couldBe`); a null is dropped only
  * when every such branch recorded it, so a branch where the author allowed null keeps its null.
  */
-export function dropRecordedNulls(value: unknown, node: unknown, shaped: Shaped, root: JsonSchema = shaped.schema): unknown {
+export function dropRecordedNulls(value: unknown, node: unknown, shaped: NullRecord, root: JsonSchema = shaped.schema): unknown {
   const s = deref(node, root);
   if (!s || typeof s !== 'object' || value === null || typeof value !== 'object') return value;
   const marks = shaped.nullMeansAbsent;
@@ -151,7 +179,10 @@ export function validateAsWritten(
   sent: () => readonly Shaped[],
 ): (value: unknown) => Promise<ValidationResult> {
   return async (value) => {
-    const cleaned = sent().map((sh) => dropRecordedNulls(value, sh.schema, sh)).filter((c) => c !== value);
+    // Each recording rule's nulls, read against that rule's own snapshot, in rule order.
+    const cleaned = sent()
+      .map((sh) => sh.records.reduce<unknown>((v, rec) => dropRecordedNulls(v, rec.schema, rec), value))
+      .filter((c) => c !== value);
     if (typeof original?.validate !== 'function') return { success: true, value: cleaned[0] ?? value };
     const first = await original.validate(value);
     if (first.success) return first;

@@ -286,3 +286,41 @@ describe('processToolError — a hook that throws fails closed', () => {
     expect(await journalText(journal)).not.toContain(EMAIL);
   });
 });
+
+// A thrown tool error is masked ONCE, at its source (durable-tool), so every later copy is the
+// masked one. Measured before: the journal's tool record was redacted, but the error was rethrown
+// untouched — the model's next prompt and the thread log (BasicMemory's `mem:<t>:messages`, in the
+// same journal) carried the raw address.
+describe('processToolError — the text the model and the thread see is the redacted one', () => {
+  it('BasicMemory in the same journal: no key holds the thrown address, and neither does the next prompt', async () => {
+    const { BasicMemory } = await import('@gnldev/durable');
+    const journal = new InMemoryJournal();
+    const prompts: string[] = [];
+    const model = toolCallingModel({ toolName: 'lookupUser', input: { id: 'u1' }, doneText: 'done' });
+    const generate = model.doGenerate.bind(model);
+    model.doGenerate = async (o: any) => { prompts.push(JSON.stringify(o.prompt)); return generate(o); };
+    await runDurable({
+      runId: 'basic-mem', journal, prompt: 'look up u1', threadId: 't1', memory: new BasicMemory(journal),
+      model, tools: { lookupUser: { execute: async () => { throw new Error(`no account for ${EMAIL}`); } } },
+      processors: [piiRedactor({ redactToolResults: true })],
+    } as any);
+    expect(prompts.length).toBeGreaterThan(1);
+    expect(prompts.join('\n')).toContain('no account for [REDACTED_EMAIL]');
+    expect(prompts.join('\n')).not.toContain(EMAIL);
+    expect(await journalText(journal)).not.toContain(EMAIL);
+  });
+
+  it('skipTools: the tool\'s error reaches the model as thrown (nothing was changed, nothing is re-made)', async () => {
+    const journal = new InMemoryJournal();
+    const prompts: string[] = [];
+    const model = toolCallingModel({ toolName: 'lookupUser', input: { id: 'u1' }, doneText: 'done' });
+    const generate = model.doGenerate.bind(model);
+    model.doGenerate = async (o: any) => { prompts.push(JSON.stringify(o.prompt)); return generate(o); };
+    await runDurable({
+      runId: 'skip', journal, prompt: 'look up u1', model,
+      tools: { lookupUser: { execute: async () => { throw new Error(`no account for ${EMAIL}`); } } },
+      processors: [piiRedactor({ redactToolResults: { skipTools: ['lookupUser'] } })],
+    } as any);
+    expect(prompts.join('\n')).toContain(EMAIL);
+  });
+});

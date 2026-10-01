@@ -190,6 +190,19 @@ export const OM_LEAVES = ['observedSeq', 'observeSeq', 'reflectSeq'] as const;
 export type OmLeaf = (typeof OM_LEAVES)[number];
 
 /**
+ * SemanticMemory's (`@gnldev/rag`) journal log for a thread: `sem:<threadId>:log`. Built here, beside
+ * `MEM_LEAVES` and `OM_LEAVES`, so the code that erases and sweeps a thread reads the same key the
+ * memory writes — rag's SemanticMemory builds its key with this function. The thread id is checked the
+ * way `memKey` checks it: `sem:model:log` would parse as a run called 'sem'.
+ */
+export const SEMANTIC_LOG_PREFIX = 'sem:';
+export const SEMANTIC_LOG_SUFFIX = ':log';
+export function semanticLogKey(threadId: string): string {
+  assertThreadId(threadId);
+  return `${SEMANTIC_LOG_PREFIX}${threadId}${SEMANTIC_LOG_SUFFIX}`;
+}
+
+/**
  * The `metadata.source` of an observational-memory vector (`@gnldev/memory`, `omVectors.store`). A
  * thread's observations go with the thread, whoever they were labelled for: one indexed while the
  * thread was anonymous carries no owner, and the person who later claimed the thread is still erased
@@ -237,23 +250,31 @@ function isLogValue(v: unknown): v is JournalLogValue {
 }
 
 /**
- * A compare that keeps losing. Each lost round means another writer's append landed, so a long run of
- * them is either a very hot key or a store whose compare can never succeed; in both cases a named
- * failure beats spinning. `appendToJournalLog` gives up after `JOURNAL_LOG_MAX_ATTEMPTS`.
+ * A compare that cannot succeed. A lost compare normally means another writer's append landed, and the
+ * retry then sees a longer log — that is progress, and it is never bounded: any number of concurrent
+ * writers all finish. This error is for the other case, a compare that loses while the log stays exactly
+ * as read: nobody else wrote, so the store's `putIfMatch` does not match the value its own `get` just
+ * returned (a custom adapter comparing by reference, say). Retrying cannot help there.
  */
 export class JournalLogContentionError extends Error {
   constructor(readonly key: string, readonly attempts: number) {
     super(
-      `@gnldev/durable: the append to '${key}' lost its compare-and-set ${attempts} times in a row and was not written. ` +
-      'Another writer kept changing the log, or the journal\'s putIfMatch never matches what its get returned. ' +
-      'Nothing was lost; retry the append, and if it repeats, check the journal adapter\'s putIfMatch.',
+      `@gnldev/durable: the append to '${key}' was not written: the journal's putIfMatch refused the value its get had just ` +
+      `returned ${attempts} times, while no other writer changed it. putIfMatch must compare the stored value's ` +
+      'serialized form, not object identity (see the parity matrix in journal.ts). Nothing was lost. If only one process ' +
+      'writes this journal, give the memory the journal without its compare — ' +
+      '`new BasicMemory({ get: (k) => journal.get(k), put: (k, v) => journal.put(k, v) })` — and the in-process queue orders the appends.',
     );
     this.name = 'JournalLogContentionError';
   }
 }
 
-/** The retry bound for one append. Each lost round is another writer's win, so this is ~that many concurrent writers. */
-export const JOURNAL_LOG_MAX_ATTEMPTS = 64;
+/**
+ * How many lost compares IN A ROW, with the log unchanged in between, end an append with
+ * `JournalLogContentionError`. Not a bound on writers: a round lost to another writer's append changes
+ * the log and resets the count, so 500 concurrent writers all finish.
+ */
+export const JOURNAL_LOG_MAX_ATTEMPTS = 8;
 
 /**
  * Reads a log written by `appendToJournalLog`, in append order. Also reads a 0.9.0 log (a bare array).
@@ -285,9 +306,10 @@ function decodeLog<T>(stored: unknown): T[] {
  *   - an in-process queue per journal and key, so appends from one process never contend at all;
  *   - a compare-and-set write — `putIfAbsent` for the first entry, `putIfMatch` after — retried on a
  *     lost race with the fresh value, so a second PROCESS cannot erase a write either. The compared
- *     value is strings only (see `JournalLogValue`), so a lost compare always means another writer
- *     won; retries yield to the event loop and stop at `JOURNAL_LOG_MAX_ATTEMPTS` with
- *     `JournalLogContentionError`.
+ *     value is strings only (see `JournalLogValue`), so a lost compare means another writer won and the
+ *     retry reads a longer log; retries back off with jitter and are not counted. Only compares lost
+ *     while the log stayed as read are counted, and `JOURNAL_LOG_MAX_ATTEMPTS` of those in a row end
+ *     in `JournalLogContentionError` (a store whose compare cannot match).
  *
  * A journal without `putIfMatch`/`putIfAbsent` gets the queue alone: safe within one process, not
  * across several. Every first-party journal implements both.
@@ -304,19 +326,62 @@ export async function appendToJournalLog(journal: Journal, key: string, entries:
   return run;
 }
 
-const yieldToLoop = () => new Promise<void>((r) => setTimeout(r, 0));
+/** Full jitter, capped: lost rounds spread the writers out instead of having them all re-read at once. */
+const backoff = (lost: number) => new Promise<void>((r) => setTimeout(r, Math.floor(Math.random() * Math.min(1000, 2 ** Math.min(lost, 10)))));
 
 async function casAppend(journal: Journal, key: string, part: string): Promise<void> {
   const cas = typeof journal.putIfMatch === 'function' && typeof journal.putIfAbsent === 'function';
-  for (let attempt = 1; ; attempt++) {
+  let lost = 0;
+  let unchanged = 0;
+  let lastLost: number | undefined;
+  for (;;) {
     const current = await journal.get<unknown>(key);
     const next: JournalLogValue = { gnlLog: 1, parts: [...priorParts(current), part] };
     if (!cas) return journal.put(key, next);
-    if (current === undefined ? await journal.putIfAbsent!(key, next) : await journal.putIfMatch!(key, current, next)) return;
-    if (Array.isArray(current) && (await upgradedInPlace(journal, key, current, next))) return;
-    if (attempt >= JOURNAL_LOG_MAX_ATTEMPTS) throw new JournalLogContentionError(key, attempt);
-    await yieldToLoop();
+    // A 0.9.0 log is the entries themselves, compared through `asStored` — see there.
+    const won = current === undefined
+      ? await journal.putIfAbsent!(key, next)
+      : await journal.putIfMatch!(key, Array.isArray(current) ? asStored(current) : current, next);
+    if (won) return;
+    const seen = sizeOf(current);
+    unchanged = seen === lastLost ? unchanged + 1 : 1;
+    lastLost = seen;
+    // A 0.9.0 log holding something `asStored` does not restore can never be compared. Refusing every
+    // append to it would block the thread for good, so — and only there — the upgrade is the plain put
+    // 0.9.0 itself did, after a re-read shows the log as read (warned: two first appends racing on such
+    // a log can still lose one).
+    if (Array.isArray(current) && unchanged >= 2 && (await upgradedUncomparable(journal, key, current, next))) return;
+    if (unchanged >= JOURNAL_LOG_MAX_ATTEMPTS) throw new JournalLogContentionError(key, unchanged);
+    await backoff(++lost);
   }
+}
+
+const uncomparableWarned = new WeakSet<object>();
+
+async function upgradedUncomparable(journal: Journal, key: string, read: unknown[], next: JournalLogValue): Promise<boolean> {
+  const again = await journal.get<unknown>(key);
+  if (!Array.isArray(again) || serialize(again) !== serialize(read)) return false; // someone did write: retry normally
+  if (!uncomparableWarned.has(journal)) {
+    uncomparableWarned.add(journal);
+    console.warn(
+      `@gnldev/durable: the 0.9.0 log at '${key}' holds a value its journal cannot compare after a round trip, so its ` +
+      'first append was written without a compare. Two processes making that first append at the same moment can ' +
+      'lose one of the two; every later append is compared.',
+    );
+  }
+  await journal.put(key, next);
+  return true;
+}
+
+/**
+ * How long the log is — the progress signal. A log only grows (an append adds a part; a 0.9.0 array is
+ * upgraded to one part plus the new one), so a lost compare followed by the same length means nobody
+ * wrote. Cheap on purpose: it is read on every lost round, and with hundreds of writers there are many.
+ */
+function sizeOf(current: unknown): number {
+  if (current === undefined || current === null) return -1;
+  if (Array.isArray(current)) return -2 - current.length;
+  return isLogValue(current) ? current.parts.length : -1;
 }
 
 function priorParts(current: unknown): string[] {
@@ -326,17 +391,52 @@ function priorParts(current: unknown): string[] {
 }
 
 /**
- * The one case a string compare cannot cover: the FIRST append to a 0.9.0 log, whose stored value is
- * still the entries themselves. If that array does not round-trip (an Error inside), `putIfMatch`
- * can never match it. When a re-read shows the key unchanged — nobody else wrote between our reads,
- * so the compare failed on the round trip, not on a race — the upgrade is written with a plain `put`.
- * The window this leaves is one upgrade per such log, between the re-read and the put.
+ * A 0.9.0 log as it was STORED, so `putIfMatch` can compare it. That log is the entries themselves,
+ * and the compare is "is the stored value the serialised form of `expected`?". Read back, an `Error`
+ * gains an own `cause: undefined` that the original did not have (superjson restores the field it
+ * found absent), so `serialize(read)` is not the stored text and the compare lost on every round.
+ * Dropping that added field restores the stored form; the compare then decides, as for any other
+ * append, and the first append to such a log is no longer a plain put (measured before: two
+ * connections first-appending to one such log lost one append in 20 of 20 rounds).
+ *
+ * A copy: the value read is not changed. Everything else superjson stores round-trips as it is.
  */
-async function upgradedInPlace(journal: Journal, key: string, read: unknown[], next: JournalLogValue): Promise<boolean> {
-  const again = await journal.get<unknown>(key);
-  if (!Array.isArray(again) || serialize(again) !== serialize(read)) return false; // someone did write: retry normally
-  await journal.put(key, next);
-  return true;
+function asStored(value: unknown, seen = new Map<object, unknown>()): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value)) return seen.get(value);
+  if (value instanceof Error) {
+    const copy = Object.create(Object.getPrototypeOf(value)) as Error & Record<string, unknown>;
+    seen.set(value, copy);
+    for (const k of Object.getOwnPropertyNames(value)) {
+      if (k === 'cause' && (value as { cause?: unknown }).cause === undefined) continue;
+      const d = Object.getOwnPropertyDescriptor(value, k)!;
+      Object.defineProperty(copy, k, 'value' in d ? { ...d, value: asStored(d.value, seen) } : d);
+    }
+    return copy;
+  }
+  if (Array.isArray(value)) {
+    const copy: unknown[] = [];
+    seen.set(value, copy);
+    for (const v of value) copy.push(asStored(v, seen));
+    return copy;
+  }
+  if (value instanceof Map) {
+    const copy = new Map();
+    seen.set(value, copy);
+    for (const [k, v] of value) copy.set(asStored(k, seen), asStored(v, seen));
+    return copy;
+  }
+  if (value instanceof Set) {
+    const copy = new Set();
+    seen.set(value, copy);
+    for (const v of value) copy.add(asStored(v, seen));
+    return copy;
+  }
+  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return value;
+  const copy: Record<string, unknown> = {};
+  seen.set(value, copy);
+  for (const [k, v] of Object.entries(value)) copy[k] = asStored(v, seen);
+  return copy;
 }
 
 export class BasicMemory implements Memory {

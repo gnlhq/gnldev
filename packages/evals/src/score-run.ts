@@ -1,4 +1,4 @@
-import { memoizeScoring, runKeys, scoreSample, assertDistinctScorerNames, inputText } from '@gnldev/durable';
+import { runScoreSample, scoreRunMemoized, assertDistinctScorerNames } from '@gnldev/durable';
 import type { JournalReader, Journal, JournalEntry } from '@gnldev/durable';
 import type { Scorer, ScoreResult, ScoreSample } from './scorer.js';
 
@@ -57,22 +57,18 @@ export async function scoreRun(
   const entries = await reader.readRun(runId);
   const output = extractFinalText(entries);
   const j = reader as Partial<Journal>;
-  // The question: the run's frozen `:input` (prompt/messages), which `readRun` does not list — it is
-  // read by key when the reader can. Without it answerRelevancy/completeness scored 0 through this
-  // function on every run ("input required"), and the judge was never asked.
-  const input = opts.input ?? (typeof j.get === 'function' ? inputText(await j.get(runKeys.input(runId))) : undefined);
   const context = typeof opts.context === 'function' ? opts.context(entries) : opts.context;
-  // runId is included so trajectory-style scorers (see trajectory.ts's trajectoryScorerFor) can look
-  // this run's decision sequence back up without any extra wiring at the call site (P1.1).
-  const sample: ScoreSample = scoreSample({ output, input, expected: opts.expected, context, runId });
+  // The sample is the run-scoring owner's (durable's runScoreSample): the question from the run's
+  // frozen `:input`, and `runId` for trajectory-style scorers — the same sample an agent's `scorers`
+  // built when the run completed, so a run scored there is replayed here, not judged again.
+  const sample: ScoreSample = await runScoreSample(j, runId, { output, input: opts.input, expected: opts.expected, context });
+  const input = sample.input;
 
   const canMemo = opts.memo !== false && typeof j.get === 'function' && typeof j.put === 'function';
 
   const scores: Record<string, ScoreResult> = {};
   for (const s of scorers) {
-    scores[s.name] = canMemo
-      ? await memoizeScoring(j as Journal, runId, `eval:${s.name}`, sample, () => s.score(sample))
-      : await s.score(sample);
+    scores[s.name] = canMemo ? await scoreRunMemoized(j as Journal, runId, s, sample) : await s.score(sample);
   }
   return { runId, output, ...(input !== undefined ? { input } : {}), scores };
 }

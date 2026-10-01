@@ -74,8 +74,10 @@ When the model takes up that offer and sends `cc: null`, the tool reads it as `c
 at a key your schema does not require, and does not allow to be `null`, is removed before your
 validator runs. A field you declared `.nullable()` keeps its `null`; a `null` at a required key is
 still an error. The reading comes from the rule's own record of the nodes it widened, read off the
-schema that was sent, so it holds inside unions (a `z.discriminatedUnion`, a `z.union` of objects,
-arrays of either) and for a rule of your own that records through `ctx.nullMeansAbsent`.
+schema that rule returned (a snapshot taken before any later rule runs), so it holds inside unions (a
+`z.discriminatedUnion`, a `z.union` of objects, arrays of either), for a rule of your own that records
+through `ctx.nullMeansAbsent`, and whatever the rules after it do — the gemini rule on an
+OpenAI-compatible Gemini endpoint, or a rule of yours that rebuilds or clones nodes.
 
 An object you declared **open** (`z.record`, `.catchall()`, `z.looseObject`) stays open; every other
 object gets `additionalProperties: false`. OpenAI accepts an open object on any tool that does not set

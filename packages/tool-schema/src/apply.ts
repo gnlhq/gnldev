@@ -1,6 +1,6 @@
 import { asSchema, jsonSchema } from 'ai';
 import { detectModel } from './detect.js';
-import { validateAsWritten, type Shaped } from './validate.js';
+import { validateAsWritten, snapshotRecord, type Shaped, type NullRecord } from './validate.js';
 import type { JsonSchema, ModelInfo, ShapeContext, ToolSchemaRule } from './types.js';
 import { ToolSchemaError } from './errors.js';
 
@@ -42,25 +42,35 @@ function activeRules(rules: ToolSchemaRule[], info: ModelInfo): ToolSchemaRule[]
 /**
  * THE one place rules touch a schema — both `applyToolCompat` (tool level) and `shapeToolDefinitions`
  * (wire level) go through it, so the two paths cannot shape differently. Copies first: rules mutate
- * in place. Returns the nodes the rules recorded as widened (`ShapeContext.nullMeansAbsent`) with the
- * schema they were recorded in — the validator's inverse reads exactly that record.
+ * in place. Returns, beside the schema sent, each recording rule's record (`ShapeContext.nullMeansAbsent`)
+ * with a SNAPSHOT of the schema that rule returned — the validator's inverse reads exactly that.
+ *
+ * Why a snapshot: a record kept by node identity in the final schema did not survive the rules after
+ * the one that made it. A rule that rebuilds a property by spread or clones the schema replaced the
+ * recorded node, and the gemini rule deletes `additionalProperties`, which is what tells one union
+ * branch from another — measured, on an OpenAI-compatible Gemini endpoint the null the model was told
+ * to send inside a union was refused. The snapshot is the recording rule's own schema, frozen before
+ * any later rule runs, so it says what that rule invited however the schema is rewritten afterwards.
  */
 function shapeSchema(schema: JsonSchema, active: ToolSchemaRule[], info: ModelInfo, toolName: string, strict?: boolean): Shaped {
   let js: JsonSchema = structuredClone(schema);
-  const nullMeansAbsent = new WeakSet<object>();
-  const ctx: ShapeContext = {
-    nullMeansAbsent: (node) => { if (node && typeof node === 'object') nullMeansAbsent.add(node); },
-    ...(strict !== undefined ? { strict } : {}),
-  };
+  const records: NullRecord[] = [];
   for (const r of active) {
+    const marked = new Set<object>();
+    const ctx: ShapeContext = {
+      nullMeansAbsent: (node) => { if (node && typeof node === 'object') marked.add(node); },
+      ...(strict !== undefined ? { strict } : {}),
+    };
     try {
       js = r.transform(js, info, ctx) ?? js;
     } catch (err) {
       if (err instanceof ToolSchemaError) throw new ToolSchemaError(`@gnldev/tool-schema: tool '${toolName}': ${err.message}`);
       // any other rule error shouldn't drop the tool; skip that rule
+      continue;
     }
+    if (marked.size) records.push(snapshotRecord(js, marked));
   }
-  return { schema: js, nullMeansAbsent };
+  return { schema: js, records };
 }
 
 /**

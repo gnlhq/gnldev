@@ -13,6 +13,8 @@ coverage/
 *.sqlite
 *.db
 runs.db
+# …except the databases an earlier release wrote, which the upgrade tests open (packages/upgrade-tests)
+!packages/upgrade-tests/fixtures/**/*.db
 
 # Environment
 .env
@@ -41,6 +43,7 @@ __pycache__/
 .doccheck/
 # junit output — CI writes it so a red run names the test; nothing should commit it
 test-results.xml
+upgrade-results.xml
 
 # Denetim çalışma kaydı (evidence-based-audit). Repoya girmez: yayındaki sürümün kusurlarını
 # reprodüksiyonlarıyla anlatıyor ve SECURITY.md düzeltme yayınlanmadan public açıklamayı istemiyor.

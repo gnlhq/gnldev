@@ -88,7 +88,11 @@ export interface OmVectorMatch {
   id: string;
   text: string;
   metadata?: Record<string, unknown>;
-  /** The partition the match lives in, as the store reports it (`@gnldev/durable` `VectorMatch.namespace`). */
+  /**
+   * The partition the match lives in, as the store reports it (`@gnldev/durable` `VectorMatch.namespace`).
+   * Return it: an organization's semantic recall checks it, and over a store whose matches carry none it
+   * falls back to the keyword match (warned once) rather than answering from vectors it cannot place.
+   */
   namespace?: string;
   score: number;
 }

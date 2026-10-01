@@ -75,6 +75,18 @@ const omRunId = (tid: string) => `om:${assertOmThreadId(tid)}`;
  * view is refused: the memory's threads are one organization's, and its observations would land in the
  * other's namespace, readable and erasable there.
  */
+const namespaceNotReportedWarned = new WeakSet<object>();
+function warnNamespaceNotReported(store: object): void {
+  if (namespaceNotReportedWarned.has(store)) return;
+  namespaceNotReportedWarned.add(store);
+  console.warn(
+    "@gnldev/memory: observationalMemory.omVectors.store returned matches without `namespace`, so an organization's " +
+      'semantic recall cannot tell its own observation vectors from another partition\'s — it falls back to the keyword ' +
+      "match over the organization's own observations. Return each match's `namespace` from `query` (the bundled stores " +
+      "do), or pass the organization's view as the store: `withOrgStorage(storage, orgId).vectors`.",
+  );
+}
+
 function omVectorNamespace(storage: Storage, store: unknown): string | undefined {
   if (!store) return undefined;
   const memOrg = orgStorageScopeOf(storage);
@@ -684,6 +696,15 @@ export class AgentMemory {
     const [qEmbedding] = await this.om.omVectors.embed([q]);
     const overfetch = Math.max(topK * 20, 100);
     const hits = await this.om.omVectors.store.query(qEmbedding!, overfetch, ...(this.omVectorNs ? [{ namespace: this.omVectorNs }] : []));
+    // An organization's memory over a store that is not the organization's view labels its vectors with
+    // its namespace and asks for that namespace back — so a hit that reports none means the store does
+    // not echo `namespace` (a structural custom store), not "another organization's". Filtering on it
+    // would answer [] with the observations right there; the keyword match reads the organization's own
+    // observations, so it answers instead, and the store is named once.
+    if (this.omVectorNs !== undefined && hits.length > 0 && hits.every((h) => h.namespace === undefined)) {
+      warnNamespaceNotReported(this.om.omVectors.store);
+      return this.recallObservations(threadId, query);
+    }
     const obsById = new Map((await this.store.getObservations(threadId)).map((o) => [o.id, o as Observation]));
     // The namespace check is the partition: a root memory's query is not narrowed (the port cannot ask
     // for "no namespace"), so an organization's vector for a thread of the same bare id, carrying the

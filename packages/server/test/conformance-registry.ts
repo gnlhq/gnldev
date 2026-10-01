@@ -420,6 +420,7 @@ export const NOT_A_BIRTH: Record<string, string> = {
   runBusyMessage: 'an error message', streamFinishError: 'an error helper',
   cancelAgentRun: 'stops a run (REST/studio cancel op)', compensateRun: 'unwinds a run (studio op)', purgeRun: 'erasure',
   runMigrationCheck: 'schema migration, not a run', runRuleLadder: 'semantic rules, not a run',
+  runScoreSample: 'reads a finished run to build a scoring sample, starts none',
   createProcessorCtx: 'a processor context', createRetentionSweeper: 'erasure worker', createSuggestions: 'suggestion store',
   createPollLoop: 'a timer', createBoundedUsageCache: 'a cache',
   'gnl.agent': 'looks an agent config up', 'gnl.listWorkflows': 'catalog', 'gnl.listNetworks': 'catalog',

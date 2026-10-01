@@ -51,11 +51,16 @@ const r = await evalDataset({
 ## How it works
 Since scores are written to the journal, the eval suite is idempotent; long suites continue after a crash,
 and the same input produces the same score. A memo is replayed only for what it was computed on: a score
-for the same sample (output, question, expected, context), a dataset case for the same case and the same
-scorer names. Anything else — another `expected`, a scorer added to the suite, a score memoized by 0.9.0
-before the runners passed the question — is computed again and replaces the record. The sample rules
-(`scoreSample`, `inputText`, `assertDistinctScorerNames`, `memoizeScoring`) live in `@gnldev/durable`, so all
-three runners share them.
+for the same sample (output, question, expected, context) and the same scorer, a dataset case for the same
+case and the same scorers. A scorer is known by its name and its `fingerprint`: the built-in factories set
+it from their options (an `llmJudge` rubric and model, `contains`' substring), and a scorer without one is
+known by the source of its `score`. Set `fingerprint` yourself when a custom scorer's behaviour comes from
+values it closes over (`{ name: 'tone', fingerprint: optionsFingerprint('tone', { rubric }), score }`).
+Anything else — another `expected`, an edited rubric, a scorer added to the suite, a score memoized by
+0.9.0 before the runners passed the question — is computed again and replaces the record. The sample for
+a run has one builder in `@gnldev/durable` (`runScoreSample`, with `scoreRunMemoized` for the memo), and
+`scoreRun` and an agent's `scorers` both call it: a run the agent scored at completion is replayed when
+it is scored again from Studio, not judged twice.
 
 ## License
 

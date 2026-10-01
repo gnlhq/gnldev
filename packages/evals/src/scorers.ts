@@ -53,6 +53,7 @@ function hasInput(sample: ScoreSample): boolean {
 function requireContext(name: string, judge: Scorer): Scorer {
   return {
     name,
+    ...(judge.fingerprint !== undefined ? { fingerprint: judge.fingerprint } : {}),
     score: (sample) => {
       if (!hasContext(sample)) {
         return { score: 0, reason: `context required: ${name} cannot be evaluated without context (sample.context)` };
@@ -66,6 +67,7 @@ function requireContext(name: string, judge: Scorer): Scorer {
 function requireInput(name: string, judge: Scorer): Scorer {
   return {
     name,
+    ...(judge.fingerprint !== undefined ? { fingerprint: judge.fingerprint } : {}),
     score: (sample) => {
       if (!hasInput(sample)) {
         return { score: 0, reason: `input required: ${name} cannot be evaluated without a question/input (sample.input)` };

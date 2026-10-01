@@ -2,7 +2,7 @@
 // non-LLM-judge scorer set). Zero deps, zero I/O, same {name, score} Scorer shape as scorer.ts/
 // scorers.ts. Every scorer here is a pure function of (output, expected) → same inputs, same score,
 // every call — unlike llm-judge, there is no cost and no non-determinism to worry about.
-import type { Scorer } from './scorer.js';
+import { optionsFingerprint, type Scorer } from './scorer.js';
 
 // ── shared primitives ───────────────────────────────────────────────────────
 
@@ -112,6 +112,7 @@ export function keywordCoverage(opts?: KeywordCoverageOptions): Scorer {
   const name = opts?.name ?? 'keyword-coverage';
   return {
     name,
+    fingerprint: optionsFingerprint('keyword-coverage', { keywords: opts?.keywords ?? null }),
     score: (s) => {
       const keywords = opts?.keywords && opts.keywords.length > 0 ? opts.keywords : Array.from(new Set(tokenize(s.expected ?? '')));
       if (keywords.length === 0) {

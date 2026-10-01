@@ -9,7 +9,7 @@
 // because each case's `memoizeScoring` key (`case:${c.id}`) is disjoint — concurrent cases never
 // contend on the same journal key, so "a completed case is skipped on the next run" still holds
 // exactly, at any concurrency.
-import { memoizeScoring, scoreSample, assertDistinctScorerNames } from '@gnldev/durable';
+import { memoizeScoring, scoreSample, assertDistinctScorerNames, scorerFingerprint } from '@gnldev/durable';
 import type { Journal } from '@gnldev/durable';
 import type { Scorer, ScoreResult } from './scorer.js';
 
@@ -179,8 +179,9 @@ export async function evalDataset(opts: EvalDatasetOptions): Promise<EvalDataset
 
   // A case's memo stands for THIS case scored by THESE scorers. Keyed by the case id alone, a suite
   // re-run with a scorer added replayed the old record — the new scorer never ran and averaged as 0 —
-  // and a suite scored by 0.9.0 (whose samples carried no question) replayed its judges' 0s.
-  const scorerNames = scorers.map((s) => s.name);
+  // and a suite scored by 0.9.0 (whose samples carried no question) replayed its judges' 0s. Each
+  // scorer counts by name AND fingerprint, so an edited rubric re-scores the suite.
+  const scorerNames = scorers.map((s) => [s.name, scorerFingerprint(s)]);
   const worker = async (c: DatasetCase): Promise<EvalCaseResult> =>
     // resumable: a completed case returns from the journal (run + scoring do not run again).
     journal

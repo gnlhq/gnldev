@@ -86,9 +86,12 @@ export interface Processor {
    * about to be journaled as `{ status: 'failed', error }`, BEFORE it is written. The returned `error`
    * is what the journal stores. A redactor that covers tool output needs this too — a tool that
    * throws `Error('no account for ayse@acme.com')` put the address in the journal with no processor
-   * consulted. Only the journaled TEXT changes: the thrown error itself propagates as thrown, so a
-   * retry policy or the caller still sees the original class. A hook that throws is not trusted with
-   * a fallback — the journal gets a fixed "withheld" text instead of the unredacted one.
+   * consulted. When the hooks CHANGE the text, the error that propagates carries it too: same class
+   * and `name`, `message` = the returned text, the original error as `cause` (its own properties —
+   * `code`, `status` — are read from there). That error is what the model, the thread and the stream
+   * render, so the text is masked once, here. Unchanged text leaves the error exactly as thrown. A
+   * hook that throws, or returns no string, is not trusted with a fallback — the journal and the
+   * error get a fixed "withheld" text instead of the unredacted one.
    */
   processToolError?(res: ProcessorToolError, ctx: ProcessorCtx): Promise<{ error: string }> | { error: string };
   /**

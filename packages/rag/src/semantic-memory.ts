@@ -3,7 +3,7 @@
 // vector search. Durable/replayable: the recall result falls into runDurable's input journaling
 // (frozen on resume); embeddings persist in the journal. (Most semantic-recall implementations don't come with these guarantees.)
 import { cosineSimilarity } from 'ai';
-import { matchFilter, memKey, assertThreadId, appendToJournalLog, readJournalLog } from '@gnldev/durable';
+import { matchFilter, memKey, semanticLogKey, appendToJournalLog, readJournalLog } from '@gnldev/durable';
 import type { Memory, Journal } from '@gnldev/durable';
 import type { Embed } from './vector-store.js';
 
@@ -69,11 +69,9 @@ export class SemanticMemory implements Memory {
   }
 
   private key(threadId: string) {
-    // Same hazard, this package's own namespace: `sem:model:log` parses as a run called 'sem', and a
-    // sweep then purges every thread's recall log. The prefix differs; the rule does not, because the
-    // rule belongs to the ':model:'/':tool:' shape rather than to any one keyspace.
-    assertThreadId(threadId);
-    return `sem:${threadId}:log`;
+    // Built by @gnldev/durable (`semanticLogKey`), which checks the thread id and is the one place the
+    // code that erases and sweeps a thread reads this key from.
+    return semanticLogKey(threadId);
   }
   private async load(threadId: string): Promise<LogEntry[]> {
     return readJournalLog<LogEntry>(this.journal, this.key(threadId));

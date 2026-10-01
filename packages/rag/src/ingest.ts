@@ -5,8 +5,8 @@
 // #2-#4 of the OLD text retrievable; edited down to one chunk, every `#i` survived beside the new bare
 // id. `ingestDocuments` gives the write the document's shape: remove what the document had, then
 // write what it has now.
-import { assertDeletesOutsideOrganizations, orgStorageScopeOf } from '@gnldev/durable';
-import { chunkDocuments, documentIdPart, DOC_TRAIL_KEY, type ChunkOptions } from './chunk.js';
+import { assertDeletesOutsideOrganizations, orgStorageScopeOf, vectorWriteBatch } from '@gnldev/durable';
+import { chunkDocuments, DOC_TRAIL_KEY, type ChunkOptions } from './chunk.js';
 import type { DeleteWhere, Embed, VectorDoc, VectorItem, VectorStore } from './vector-store.js';
 
 export interface IngestResult {
@@ -46,23 +46,42 @@ function partitionOf(store: VectorStore, namespace: string | undefined, fn: stri
 }
 
 /**
- * Deletes every chunk of document `id` in `part`, and nothing else:
+ * How many 0.9.0 chunk positions one delete names. 0.9.0 wrote `<id>#0 … <id>#<n-1>`; a position can be
+ * missing (another document called `<id>#<n>` overwrote it), so the scan goes on in blocks and stops
+ * only at a block with nothing of the document's in it.
+ */
+const LEGACY_SCAN_BLOCK = 64;
+
+/** A position-shaped id: `<prefix>#<digits>` — 0.9.0's chunk id, and the current one. */
+const CHUNK_POSITION = /#\d+$/;
+
+/**
+ * Deletes every record of document `id` in `part` — the ones that are provably its — and nothing else:
  *
- *   - by trail (`__gnlDoc === id`) — every chunk `chunkDocuments` writes;
- *   - by the document's own one-chunk id — the id a one-chunk version has always been stored under,
- *     trail or not (0.9.0 stamped none on it);
- *   - 0.9.0's multi-chunk shape, `<id>#<n>` carrying `source: id, chunk: n`, one position at a time
- *     until a gap. The id AND both labels must match, so a record the user merely labelled
- *     `source: id` is left alone.
+ *   - by trail (`__gnlDoc === id`): every chunk `chunkDocuments` writes now;
+ *   - 0.9.0's one-chunk shape: the document as given, under its RAW id, no trail. A record at that id
+ *     is left alone when it carries a trail (another document's current record — `q#x` is stored at
+ *     `q%23x`), or an observation's id (`obsId`, observational memory's vectors), or — for an id shaped
+ *     like a chunk position, `<p>#<n>` — both `source` and `chunk` (that is `p`'s 0.9.0 chunk);
+ *   - 0.9.0's multi-chunk shape: `<id>#<n>` carrying `source: id`, scanned in blocks so a missing
+ *     position does not end the scan. The id shape AND the label must match, so a record the user
+ *     merely labelled `source: id` is left alone.
  *
- * Nothing here reads the user's metadata keys on their own, which is also why observational memory's
- * vectors (`source: 'observational-memory'`, no trail) no longer need a reserved document id.
+ * "Left alone when it carries a key" is a filter whose value is `undefined`: it matches a record
+ * WITHOUT that key (`DeleteWhere.filter`). The user's own metadata is never matched on its own.
  */
 async function removeDocument(store: VectorStore & { delete: NonNullable<VectorStore['delete']> }, id: string, part: Pick<DeleteWhere, 'namespace' | 'outsideOrganizations'>): Promise<number> {
   let removed = await store.delete({ filter: { [DOC_TRAIL_KEY]: id }, ...part });
-  removed += await store.delete({ ids: [documentIdPart(id)], ...part });
-  for (let n = 0; ; n++) {
-    const legacy = await store.delete({ ids: [`${id}#${n}`], filter: { source: id, chunk: n }, ...part });
+  const untrailed = { [DOC_TRAIL_KEY]: undefined, obsId: undefined };
+  if (CHUNK_POSITION.test(id)) {
+    removed += await store.delete({ ids: [id], filter: { ...untrailed, chunk: undefined }, ...part });
+    removed += await store.delete({ ids: [id], filter: { ...untrailed, source: undefined }, ...part });
+  } else {
+    removed += await store.delete({ ids: [id], filter: untrailed, ...part });
+  }
+  for (let from = 0; ; from += LEGACY_SCAN_BLOCK) {
+    const block = Array.from({ length: LEGACY_SCAN_BLOCK }, (_, i) => `${id}#${from + i}`);
+    const legacy = await store.delete({ ids: block, filter: { source: id }, ...part });
     if (legacy === 0) break;
     removed += legacy;
   }
@@ -85,9 +104,13 @@ async function removeDocument(store: VectorStore & { delete: NonNullable<VectorS
 export async function ingestDocuments(store: VectorStore, embed: Embed, docs: VectorDoc[], opts?: ChunkOptions): Promise<IngestResult> {
   requireDelete(store, 'ingestDocuments');
   const parts = docs.map((d) => partitionOf(store, d.namespace, 'ingestDocuments'));
+  // Every chunk is checked against the one vector write rule BEFORE anything is embedded or deleted:
+  // an id a store cannot hold used to fail at that document's upsert, after the documents before it
+  // had already lost their old chunks.
+  const chunked = docs.map((doc) => chunkDocuments([doc], opts));
+  vectorWriteBatch(chunked.flat());
   const perDoc: VectorItem[][] = [];
-  for (const doc of docs) {
-    const chunks = chunkDocuments([doc], opts);
+  for (const chunks of chunked) {
     perDoc.push(await Promise.all(chunks.map(async (c) => ({ ...c, embedding: await embed(c.text) }))));
   }
   let removed = 0;

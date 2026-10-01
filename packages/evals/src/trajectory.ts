@@ -16,7 +16,7 @@
 //    populate `sample.runId` (see score-run.ts / dataset.ts) so this works with zero extra wiring.
 import type { DecisionPoint, JournalReader } from '@gnldev/durable';
 import { buildDecisionSequence } from '@gnldev/durable';
-import type { Scorer, ScoreResult, ScoreSample } from './scorer.js';
+import { optionsFingerprint, type Scorer, type ScoreResult, type ScoreSample } from './scorer.js';
 
 export interface TrajectoryWeights {
   /** Weight of the ordered-subsequence-match dimension (`expectedTools`). */
@@ -166,6 +166,7 @@ export function createTrajectoryScorer(opts: TrajectoryScorerOptions = {}): Scor
   const name = opts.name ?? 'trajectory';
   return {
     name,
+    fingerprint: optionsFingerprint('trajectory', opts),
     score: (sample: TrajectorySample) => {
       const toolNames = toolNamesOf(sample);
       if (!toolNames) {
@@ -200,6 +201,7 @@ export function trajectoryScorerFor(reader: JournalReader, opts: TrajectoryScore
   const name = opts.name ?? 'trajectory';
   return {
     name,
+    fingerprint: optionsFingerprint('trajectory', opts),
     score: async (sample: TrajectorySample) => {
       const runId = sample.runId;
       if (typeof runId !== 'string' || runId.length === 0) {

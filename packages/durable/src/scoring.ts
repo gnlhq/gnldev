@@ -99,6 +99,66 @@ export function scoreSample(fields: {
 }
 
 /**
+ * THE sample for a durable RUN — the one function every runner that scores a run calls (an agent's
+ * `scorers` in `createGnl`, and @gnldev/evals' `scoreRun`, which Studio's `/runs/:id/score` uses).
+ * The question is read from the run's frozen `:input` (what the run was started with, written before
+ * its first model call), and `runId` is always set, so a journal-backed scorer (trajectory) works the
+ * same from both. Two runners that build the same sample share one memo: the run scored at completion
+ * is not judged again when it is scored from Studio.
+ *
+ * Measured before: the registry built `{ output, input: messages ?? prompt }` at its call site and
+ * `scoreRun` built `{ output, input: inputText(:input), runId }` at its own — two samples for one run,
+ * so the second runner missed the first's memo, asked the judge again and overwrote the record, and
+ * a trajectory scorer on an agent got no `runId`.
+ *
+ * `input` overrides the frozen question (scoreRun's `opts.input`, for a wrapped prompt). A journal that
+ * cannot be read by key (a bare reader) gives no question rather than a wrong one.
+ */
+export async function runScoreSample(
+  journal: { get?: Journal['get'] },
+  runId: string,
+  fields: { output: string; input?: unknown; expected?: string; context?: string | string[] },
+): Promise<ScoreSampleFields> {
+  const input = fields.input !== undefined
+    ? fields.input
+    : typeof journal.get === 'function' ? await journal.get(runKeys.input(runId)) : undefined;
+  return scoreSample({ output: fields.output, input, expected: fields.expected, context: fields.context, runId });
+}
+
+/** What a scorer must look like to be memoized: a name, a `score`, and optionally its own fingerprint. */
+export interface FingerprintedScorer {
+  name: string;
+  /**
+   * What the score depends on besides the sample — a judge's rubric and model, a threshold. A memo is
+   * replayed only for the same fingerprint, so editing a rubric re-scores instead of replaying the old
+   * score under the same name. Default: the source text of `score`, which covers a scorer written
+   * inline but not one whose behaviour comes from values it closes over — set this for those (the
+   * built-in `llmJudge` and the judges built on it do).
+   */
+  fingerprint?: string;
+  score: (...args: never[]) => unknown;
+}
+
+/** The scorer half of a memo's basis — see `FingerprintedScorer.fingerprint`. */
+export function scorerFingerprint(scorer: FingerprintedScorer): string {
+  return typeof scorer.fingerprint === 'string' ? scorer.fingerprint : String(scorer.score);
+}
+
+/**
+ * Score one run with one scorer, memoized under `<runId>:proc:eval:<name>` and replayed only for the
+ * same sample AND the same scorer (`scorerFingerprint`). Every run-scoring runner calls this, so the
+ * memo key and its basis have one owner.
+ */
+export function scoreRunMemoized<T>(
+  journal: Journal,
+  runId: string,
+  scorer: FingerprintedScorer & { score: (sample: ScoreSampleFields) => Promise<T> | T },
+  sample: ScoreSampleFields,
+): Promise<T> {
+  return memoizeScoring(journal, runId, `eval:${scorer.name}`, { sample, scorer: scorerFingerprint(scorer) }, () => scorer.score(sample));
+}
+
+/**
  * A score is known by its scorer's NAME everywhere a runner keeps it: the result record
  * (`scores[name]`), a dataset's aggregate, and the journal memo (`eval:<name>`). Two scorers with one
  * name therefore became one — measured, the second of two default-named `llmJudge` rubrics was

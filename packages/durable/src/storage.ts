@@ -567,8 +567,10 @@ type VectorLabels = { id: string; namespace?: unknown; owner?: unknown; shared?:
 export function vectorWriteBatch<T extends VectorLabels>(items: readonly T[]): T[] {
   const byId = new Map<string, T>();
   for (const it of items) {
-    if (typeof it.id !== 'string' || it.id === '' || !isWellFormed(it.id)) {
-      throw new TypeError(`@gnldev/durable: a document id must be a non-empty, well-formed string — got ${JSON.stringify(it.id)}`);
+    // A NUL is refused too: Postgres text cannot hold one, so the same id stored in memory or SQLite
+    // failed there — half-way through a batch, after earlier documents' old chunks were deleted.
+    if (typeof it.id !== 'string' || it.id === '' || !isWellFormed(it.id) || it.id.includes('\u0000')) {
+      throw new TypeError(`@gnldev/durable: a document id must be a non-empty, well-formed string without NUL — got ${JSON.stringify(it.id)}`);
     }
     if (it.shared !== undefined && it.shared !== true && it.shared !== false) {
       throw new TypeError(`@gnldev/durable: document '${it.id}': 'shared' must be true, false or absent — got ${JSON.stringify(it.shared)}`);

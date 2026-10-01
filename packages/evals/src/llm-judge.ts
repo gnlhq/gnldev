@@ -1,5 +1,5 @@
 import { generateText } from 'ai';
-import type { Scorer, ScoreSample } from './scorer.js';
+import { optionsFingerprint, type Scorer, type ScoreSample } from './scorer.js';
 
 export interface LlmJudgeOptions {
   /** AI SDK model (the judge). */
@@ -44,6 +44,9 @@ function hasContext(sample: ScoreSample): boolean {
 export function llmJudge(opts: LlmJudgeOptions): Scorer {
   return {
     name: opts.name ?? 'llm-judge',
+    // The rubric and the judge model ARE the scorer: an edited rubric under the same name must not
+    // replay the old rubric's memoized score.
+    fingerprint: optionsFingerprint('llm-judge', { rubric: opts.rubric, model: opts.model, sampleFields: opts.sampleFields ?? null }),
     score: async (sample) => {
       const fields = opts.sampleFields ?? ['input', 'context'];
       const parts = [opts.rubric];

@@ -21,7 +21,7 @@ export type {
   RunStatus,
   RunOutcomeRecord,
 } from './journal.js';
-export { BasicMemory, appendToJournalLog, readJournalLog, JournalLogContentionError, JOURNAL_LOG_MAX_ATTEMPTS, PROVENANCE_RECENT_CAP, messagePreview, memKey, MEM_LEAVES, OM_LEAVES, OM_VECTOR_SOURCE, type OmLeaf } from './memory.js';
+export { BasicMemory, appendToJournalLog, readJournalLog, JournalLogContentionError, JOURNAL_LOG_MAX_ATTEMPTS, PROVENANCE_RECENT_CAP, messagePreview, memKey, MEM_LEAVES, OM_LEAVES, OM_VECTOR_SOURCE, semanticLogKey, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX, type OmLeaf } from './memory.js';
 export type { Memory, MemoryContextProvenance, RecalledMessageRef, MemLeaf } from './memory.js';
 export { getRunCost, toTraceSpans } from './cost.js';
 // Sibling packages (@gnldev/otel's span builder) read the same journal records and hit the same
@@ -55,7 +55,8 @@ export { assertSuiteConsistent, versionsEqual } from './suite-consistency.js';
 export type { AssertSuiteConsistentOptions } from './suite-consistency.js';
 export { StepTimeoutError, withTimeout } from './timeout.js';
 export { argsHash, stableStringify } from './hash.js';
-export { scoreSample, inputText, assertDistinctScorerNames, memoizeScoring } from './scoring.js';
+export { scoreSample, runScoreSample, scorerFingerprint, scoreRunMemoized, inputText, assertDistinctScorerNames, memoizeScoring } from './scoring.js';
+export type { FingerprintedScorer } from './scoring.js';
 export type { ScoreSampleFields } from './scoring.js';
 // The run-identity primitive (docs/RUNID-WORKKEY-HEYET-KARARI.md §3-§4). Exported on its own, ahead
 // of any call path that accepts a workKey: package #1 ships the derivation and the reservation so the

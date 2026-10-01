@@ -8,6 +8,7 @@
     "pretest": "node scripts/check-dist-fresh.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:legacy": "pnpm --filter @gnldev/upgrade-tests test",
     "typecheck": "pnpm -r typecheck",
     "check:docs": "node scripts/check-doc-samples.mjs",
     "check:versions": "node scripts/check-versions.mjs",

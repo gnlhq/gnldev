@@ -1,6 +1,6 @@
 // @gnldev/evals — scorer + LLM-judge for @gnldev/durable runs. scoreRun produces
 // deterministic & replayable scores from the journal trace (if the journal is writable, memoized → same score on resume).
-export { exactMatch, contains, regexScore, embeddingSimilarity } from './scorer.js';
+export { exactMatch, contains, regexScore, embeddingSimilarity, optionsFingerprint } from './scorer.js';
 export type { Scorer, ScoreSample, ScoreResult } from './scorer.js';
 export { llmJudge } from './llm-judge.js';
 export type { LlmJudgeOptions } from './llm-judge.js';

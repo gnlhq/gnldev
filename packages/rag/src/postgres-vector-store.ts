@@ -227,8 +227,18 @@ export class PostgresVectorStore implements VectorStore {
     }
     if (w.outsideOrganizations) conds.push(VECTOR_OUTSIDE_ORGANIZATIONS_SQL);
     if (w.filter && Object.keys(w.filter).length > 0) {
-      params.push(JSON.stringify(w.filter));
-      conds.push(`metadata @> $${params.length}::jsonb`);
+      // A key whose value is `undefined` means "has no such key" (DeleteWhere.filter); JSON would drop it
+      // and the containment below would then match records that DO carry it.
+      const present = Object.fromEntries(Object.entries(w.filter).filter(([, v]) => v !== undefined));
+      if (Object.keys(present).length > 0) {
+        params.push(JSON.stringify(present));
+        conds.push(`metadata @> $${params.length}::jsonb`);
+      }
+      for (const [k, v] of Object.entries(w.filter)) {
+        if (v !== undefined) continue;
+        params.push(k);
+        conds.push(`NOT (COALESCE(metadata, '{}'::jsonb) ? $${params.length})`);
+      }
     }
     if (w.owner !== undefined) {
       params.push(w.owner);

@@ -182,3 +182,52 @@ jobs:
       # these contracts' open pools (4 uncaught 57P01 errors, a red caused by the schedule).
       # One erasure over every store, the vector write rule, and owned names on the real servers.
       - run: pnpm exec vitest run packages/durable/test/erasure-store-contract.test.ts packages/durable/test/vector-store-contract.test.ts packages/durable/test/owned-name-namespaces.test.ts
+
+  upgrade-from-0-9-0:
+    name: upgrade from 0.9.0 (known failures, not yet gating)
+    runs-on: ubuntu-latest
+    # Opens databases 0.9.0 wrote (packages/upgrade-tests/fixtures/0.9.0) with this code: SQLite files,
+    # a Postgres dump and a Redis dump, plus a rolling deploy with the published 0.9.0 in a child process.
+    # It holds known failures that the fixes after it turn green, so for now a red here does not make the
+    # workflow red (and does not block the release, which `needs` every job of this file). Remove
+    # `continue-on-error` once it is green: from then on it guards the upgrade like any other gate.
+    continue-on-error: true
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      GNL_INTEGRATION: '1'
+      GNL_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      GNL_REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+      # The published 0.9.0, installed outside the workspace (packages/upgrade-tests/README.md says why
+      # it cannot be a workspace dependency while the workspace version is 0.9.0).
+      - run: |
+          echo "GNL_090_ROOT=$RUNNER_TEMP/gnl-090" >> "$GITHUB_ENV"
+          node packages/upgrade-tests/generate/load-0.9.0.mjs "$RUNNER_TEMP/gnl-090"
+      - run: pnpm test:legacy --reporter=default --reporter=junit --outputFile.junit=upgrade-results.xml
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: upgrade-results
+          path: packages/upgrade-tests/upgrade-results.xml

@@ -26,6 +26,9 @@ and who is affected.
   `{ __gnlStepRecord: 'void' }`, and an output that has a `__gnlStepRecord` key is stored wrapped. Code
   that reads `<runId>:wf:<step>` keys itself: read through `decodeStepRecord(v)` from @gnldev/durable.
   0.9.0 journals read unchanged; a journal written now is not for 0.9.0 (downgrades are unsupported).
+- **With a `processToolError` hook that changes the text, a tool's thrown error is a masked copy** —
+  same class and `name`, `message` is the hook's text, and its own properties (`code`, `status`…) are
+  not copied. Code that inspects the error in-process reads the original from `error.cause`.
 - **A server with no auth (or a `{ read, write }` pair) answers only `localhost`, `*.localhost`, IP
   addresses and the names you list** — `allowedHosts: ['mybox.test', '.ngrok-free.app']` on
   `createRestApi` / `createStudioApp`, or `GNL_ALLOWED_HOSTS=mybox.test,.ngrok-free.app`. An
@@ -101,12 +104,15 @@ and who is affected.
 - @gnldev/chat-adapter, @gnldev/agui, @gnldev/mcp: the `allowedHosts` and `allowCrossSite` options on
   `createChatRoute`, `createAguiRoute` and `createMcpServer`; @gnldev/mcp: `MCP_REFUSED` (`-32000`).
 - @gnldev/durable: `appendToJournalLog`, `readJournalLog`, `JournalLogContentionError`,
-  `JOURNAL_LOG_MAX_ATTEMPTS`; `MEMORY_PARTITION`, `memoryPartitionOf`, `inMemoryPartition`,
-  `assertRootThreadId`, `ReservedThreadIdError` (+ types `MemoryPartition`, `MemoryPartitionOption`);
-  `isOrganizationKey`, `orgSpaceSql`, `ORG_KEY_PREFIX`, `withRootScope`; `findReservedRootThreads` (+ type
-  `ReservedRootThread`); `assertDeletesOutsideOrganizations`; `encodeStepRecord`,
-  `decodeStepRecord`; `scoreSample`, `inputText`, `assertDistinctScorerNames`, `memoizeScoring` (+ type
-  `ScoreSampleFields`); the optional `Processor` hook `processToolError` (+ type `ProcessorToolError`).
+  `JOURNAL_LOG_MAX_ATTEMPTS`; `semanticLogKey`, `SEMANTIC_LOG_PREFIX`, `SEMANTIC_LOG_SUFFIX` (the key
+  @gnldev/rag's `SemanticMemory` keeps a thread's log under, built in one place); `MEMORY_PARTITION`,
+  `memoryPartitionOf`, `inMemoryPartition`, `assertRootThreadId`, `ReservedThreadIdError` (+ types
+  `MemoryPartition`, `MemoryPartitionOption`); `isOrganizationKey`, `orgSpaceSql`, `ORG_KEY_PREFIX`,
+  `withRootScope`; `findReservedRootThreads` (+ type `ReservedRootThread`);
+  `assertDeletesOutsideOrganizations`; `encodeStepRecord`, `decodeStepRecord`; `scoreSample`,
+  `runScoreSample`, `scoreRunMemoized`, `scorerFingerprint`, `inputText`, `assertDistinctScorerNames`,
+  `memoizeScoring` (+ types `ScoreSampleFields`, `FingerprintedScorer`); `ScorerLike.fingerprint`; the
+  optional `Processor` hook `processToolError` (+ type `ProcessorToolError`).
 - @gnldev/memory: `OmVectorMatch.namespace` (optional); `migrateReservedRootThreads` (+ types
   `MigrateReservedRootThreadsOptions`, `MigrateReservedRootThreadsReport`).
 - @gnldev/rag: `ingestDocuments`, `deleteDocuments` (+ type `IngestResult`), `documentIdPart`,
@@ -115,7 +121,7 @@ and who is affected.
   `ShapeContext` (a rule's `transform` receives it as a third argument).
 - @gnldev/workflow: `isVoidStepRecord`, `isEngineRecordKey`.
 - @gnldev/evals: `DatasetCase.context`; `scoreRun`'s `context` and `input` options (type
-  `ScoreRunOptions` is now exported).
+  `ScoreRunOptions` is now exported); `Scorer.fingerprint`, `optionsFingerprint`.
 - @gnldev/queue: `retryJob(work, id, { newRun: true })`.
 - @gnldev/scheduler: `ScheduleSpec.ifExists` (`'refuse'` by default, `'replace'`, `'keep'`).
 
@@ -225,7 +231,13 @@ and who is affected.
   marker at its path, because its bytes reached the journal as numbers. The fail-closed marker names a
   fixed error class, never the thrown error's own `name`. A tool that THROWS is covered too: the error
   text journaled as `{ status: 'failed', error }` is masked, through a new optional `Processor` hook,
-  `processToolError` (@gnldev/durable); the thrown error itself is rethrown untouched. On a ~1MB,
+  `processToolError` (@gnldev/durable). The text is masked once, where the error is thrown: when the
+  hooks changed it, the error the tool rethrows carries the masked text (same class and `name`, the
+  original as `cause`), because that error — not the journal record — is what the model's next
+  prompt, the thread (`AgentMemory`, and `BasicMemory`'s `mem:<thread>:messages`),
+  `GET /threads/:id/messages` and the stream's `tool-error` event render. Measured before: the journal
+  record was masked and all four of those carried the raw address. A hook that returns no string is
+  treated like one that throws (fixed "withheld" text) instead of journaling `undefined`. On a ~1MB,
   7000-row result the walk takes ~19ms (it took ~95ms before the patterns were compiled once per
   redactor).
 - **A root-scope end user no longer recalls an organization's messages** (ADR-0001: "In the root scope,
@@ -256,7 +268,10 @@ and who is affected.
   `AgentMemory.recallObservationsSemantic` on a root memory queried every namespace; an organization's
   vector for a thread with the same bare id carried the same per-thread `obsId` (`obs-0`) and answered
   with the root's unrelated observation. Hits outside the memory's own namespace are now dropped.
-  `OmVectorMatch` gains an optional `namespace`.
+  `OmVectorMatch` gains an optional `namespace`. A custom `omVectors.store` that returns no `namespace`
+  on its matches would make an organization's recall answer `[]` with the observation right there; it
+  now falls back to the keyword match over the organization's own observations and warns once, naming
+  the fix (return `namespace`, or pass the organization's view).
 - **A root `ingestDocuments`/`deleteDocuments` no longer deletes an organization's document of the same
   id** (@gnldev/rag). On a vector store that does not declare `deleteOutsideOrganizations`, a root
   re-ingest of `handbook` deleted acme's `handbook` (review panel: 1 → 0). Such a call is now refused
@@ -441,9 +456,18 @@ and who is affected.
   The log is stored as a list of already-serialised parts (`{ gnlLog: 1, parts }`), so the compare is
   between strings. The first version compared `serialize(what it read)` with the stored bytes; superjson
   does not give an `Error` back byte-for-byte, so after one message holding an Error every compare lost
-  and the retry loop never yielded — the process froze (SQLite, measured). Retries now yield and stop
-  after `JOURNAL_LOG_MAX_ATTEMPTS` (64) with `JournalLogContentionError`. Reading is `readJournalLog(journal,
-  key)`; a 0.9.0 log (a bare array) is read as-is and converted on its next append. Measured
+  and the retry loop never yielded — the process froze (SQLite, measured). A lost compare means another
+  writer's append landed, so retries are not counted: they back off with jitter and every writer
+  finishes (measured, 500 concurrent writers on one thread: all kept, none refused, ~3.0s in memory and
+  ~3.6s on SQLite; an earlier bound of 64 attempts kept 64 of 100 and refused 36). Only compares lost
+  while the log stays as read are counted — a store whose `putIfMatch` cannot match its own `get` —
+  and `JOURNAL_LOG_MAX_ATTEMPTS` (8) of those end in `JournalLogContentionError`, which names the fix
+  and the single-process way through. Reading is `readJournalLog(journal,
+  key)`; a 0.9.0 log (a bare array) is read as-is and converted on its next append. That first append is
+  compared too: a 0.9.0 log holding an `Error` used to be upgraded with a plain write, and two
+  connections making that first append together lost one in 20 of 20 rounds (SQLite, measured); it is
+  now compared against the log as stored (none lost). A 0.9.0 log holding a value no compare can match
+  is still upgraded with a plain write, warned once. Measured
   (`BasicMemory.append` × 1000, median of 10, interleaved): in-memory 1723 → 2889 ops/s, SQLite file
   631 → 831 ops/s against 0.9.0. Way through for code that read the key with `journal.get`:
   `readJournalLog(journal, key)`.
@@ -453,9 +477,19 @@ and who is affected.
   chunks #2-#4 of the old text in search results; edited to one chunk, all five `#i` stayed beside the
   new bare id. New: `ingestDocuments(store, embed, docs, chunkOptions?)` chunks, embeds, deletes each
   document's chunks in its partition, then upserts; `deleteDocuments(store, ids, { namespace? })` removes
-  documents the same way. A document's chunks are found by a reserved trail (`metadata.__gnlDoc`), by
-  its one-chunk id, and — for vectors written by 0.9.0 — by the exact 0.9.0 shape (`<id>#<n>` carrying
-  `source: id, chunk: n`), so the first re-ingest after upgrading removes the old chunks too. Nothing is
+  documents the same way. A document's chunks are found by a reserved trail (`metadata.__gnlDoc`) and —
+  for vectors written by 0.9.0 — by the exact 0.9.0 shapes: a one-chunk document under its raw id with
+  no trail, and `<id>#<n>` carrying `source: id`, scanned past a position another document overwrote. So
+  the first re-ingest after upgrading removes the old chunks too, for ids with `#` or `%` as well (they
+  were looked up under the escaped id and survived; and `guide`'s chunks 2–5 survived when `guide#1` had
+  overwritten chunk 1). The raw-id delete leaves alone a record that carries a trail (another
+  document's: `q#x` is stored at `q%23x`), an observation vector (`obsId`), or — for an id shaped
+  `<p>#<n>` — both `source` and `chunk` (`p`'s 0.9.0 chunk); it used to take whatever had the id. That
+  reading needs `DeleteWhere.filter` to treat a key whose value is `undefined` as "has no such key", as
+  every bundled store does (`PostgresVectorStore` now too); a custom store that serialises the filter
+  must keep it. `ingestDocuments` checks every chunk against the vector write rule before the first
+  delete, and that rule now refuses a NUL in an id (Postgres cannot store one): a batch with one used to
+  fail at that document's upsert, after earlier documents' old chunks were deleted. Nothing is
   found through the user's own metadata: `deleteDocuments(['handbook'])` no longer deletes records the
   user labelled `source: 'handbook'`, and a document may now be called `observational-memory`. Measured
   after, on the rag and durable in-memory stores, SQLite and real pgvector: shrink, grow, same size,
@@ -487,7 +521,11 @@ and who is affected.
   `ctx.nullMeansAbsent(node)`), so it holds inside a `z.discriminatedUnion`, a `z.union` of objects and
   arrays of either — measured before: `{ kind: 'a', note: null }` was refused in a discriminated union. A
   custom rule that widens a node to accept `null` records it the same way; one that does not is read as
-  before it existed (its `null` fails the tool's validation). Apart from open objects, the schema sent for a plain model is unchanged,
+  before it existed (its `null` fails the tool's validation). The record is read against a snapshot of
+  the schema the recording rule returned, so the rules after it cannot break it: measured before, on
+  Google's OpenAI-compatible endpoint (both bundled rules apply) the gemini rule's removal of
+  `additionalProperties` made the union branch unreadable and `{ u: { a, x: null } }` was refused, and a
+  later rule that rebuilt a property by spread or cloned the schema made every invited `null` fail. Apart from open objects, the schema sent for a plain model is unchanged,
   so the model request hash of a run started before the upgrade still matches. The tool `argsHash` may
   not: a run started on 0.9.0 with compat on, whose tool call used a `.default()`, a `.transform()` or
   an invited `null`, hashes that call differently when it replays after the upgrade. That is a console
@@ -512,10 +550,19 @@ and who is affected.
   rules now hold for an agent's `scorers` in `createGnl` (@gnldev/durable): a run started with `messages`
   gives the scorer its last user turn as `input` (it gave none), and two scorers with one name are refused
   when `createGnl` is called. One implementation serves all three runners, exported from
-  `@gnldev/durable`: `scoreSample`, `inputText`, `assertDistinctScorerNames`, `memoizeScoring`. **A memo
-  is replayed only for what it was computed on:** a score record (`<runId>:proc:eval:<name>`, still
-  `{ v }`, now with a `basis` hash of the sample) for the same sample, a dataset case for the same case and
-  scorer names. A score memoized by 0.9.0 has no basis, so it is computed again once, on the first
+  `@gnldev/durable`: `scoreSample`, `inputText`, `assertDistinctScorerNames`, `memoizeScoring`. The
+  sample for a RUN has one builder, `runScoreSample` (the question from the run's frozen input, and
+  its `runId`), and one memo owner, `scoreRunMemoized`; an agent's `scorers` and `scoreRun` both call
+  them. Measured before: the two built different samples for one run, so scoring a run from Studio
+  after the agent had scored it asked the judge again and overwrote the record, and a trajectory
+  scorer on an agent got no `runId` (score 0). **A memo is replayed only for what it was computed on:**
+  a score record (`<runId>:proc:eval:<name>`, still `{ v }`, now with a `basis` hash) for the same
+  sample and the same scorer, a dataset case for the same case and scorers. A scorer is known by its
+  name and its `fingerprint` (new optional `Scorer` field): the built-in factories set it from their
+  options (an `llmJudge` rubric and model, `contains`' substring, a trajectory spec), and a scorer
+  without one is fingerprinted by the source of its `score` — an edited rubric re-scores instead of
+  replaying the old rubric's score. Set `fingerprint` on a custom scorer whose behaviour comes from
+  values it closes over. A score memoized by 0.9.0 has no basis, so it is computed again once, on the first
   `scoreRun`/run after the upgrade, instead of replaying its 0 — one judge call per such score — and
   the new record is replayed from then on; `scoreRun(..., { memo: false })` never reads a memo. A suite re-run with a scorer added runs its
   cases again (the added scorer used to be missing and averaged as 0).
@@ -592,6 +639,22 @@ and who is affected.
 
 ### Known limits
 
+- **Upgrading from 0.9: stop every 0.9 process that runs agents, workflows, sweeps or workers before any
+  process of this version writes to the same storage.** 0.9 cannot read what this version writes, and
+  0.9.0 cannot be changed. Measured with 0.9.0 against this version's data on one database:
+  - a thread's memory log written now (`{ gnlLog: 1, parts }`, `BasicMemory` and `SemanticMemory`):
+    a 0.9 agent turn on that thread crashes (`history.slice is not a function`), a 0.9 append throws, a
+    0.9 `BasicMemory.getMessages` returns the raw `{ gnlLog, parts }` record as the thread's messages
+    without any error, and a 0.9 `sweepThreads` aborts on it;
+  - a workflow step whose output was `undefined`, now recorded as `{ __gnlStepRecord: 'void' }`: a 0.9
+    process resuming that run hands the record itself to the next step as its input;
+  - a job copied by this version's `retryJob`: a 0.9 worker that runs the copy repeats the job's side
+    effects.
+
+  The order: stop those 0.9 processes, then start this version. This version reads everything 0.9
+  wrote. A 0.9 process that only appends jobs or publishes events may keep running while this version
+  starts (next item); once a process of this version has written, a 0.9 process that runs agents,
+  workflows, sweeps or workers must not start again.
 - **A rolling deploy with a 0.9 process on the same database.** What holds: a job or event a 0.9 process
   appends is run or delivered by this version's worker or consumer, on every bundled store (it is
   numbered when this version first reads it; measured with 0.9.0's own statements on SQLite, Postgres
@@ -599,8 +662,8 @@ and who is affected.
   WORKER or CONSUMER keeps 0.9's own guarantees — its row-offset cursor still skips work after an
   erasure or behind a slow producer clock, and the two versions overwrite each other's `qcursor` /
   `evtcursor:<topic>:<name>` (each reads the other's as "start from the head", so this costs a re-scan,
-  not a lost record). The safe direction: stop the 0.9 workers and consumers first, then roll the
-  producers. If a 0.9 worker ran after an erasure and its jobs look stuck, delete its cursor so the new
+  not a lost record). This is why the item above stops every 0.9 worker and consumer before this
+  version writes; only 0.9 producers may overlap it. If a 0.9 worker ran after an erasure and its jobs look stuck, delete its cursor so the new
   worker re-reads from the head (markers skip what is done): the `gnl_work_kv` rows `qcursor` and
   `evtcursor:*` (`org:<id>:`-prefixed for an organization), or the Redis keys `<keyPrefix>wk:qcursor`
   and `<keyPrefix>wk:evtcursor:*`.

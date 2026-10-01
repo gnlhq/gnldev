@@ -71,6 +71,11 @@ All of these must pass before a PR is reviewed. See [docs/GUIDE.md](./docs/GUIDE
 architecture walkthrough. Releases are cut by the maintainer from CI, so there is nothing a
 contributor needs to run for one.
 
+A change to anything a database keeps — a stored shape, a key, a cursor, a migration — also runs
+`pnpm test:legacy`: it opens databases the previous release wrote with your code
+([packages/upgrade-tests](./packages/upgrade-tests/README.md)). It is not in `pnpm test` yet, because it
+still holds known failures; a new failure there is yours.
+
 **If your change is user-visible, add a line to `[Unreleased]` in
 [CHANGELOG.md](./CHANGELOG.md).** Anything that breaks goes under `Breaking`, written as an
 instruction ("add `--host 0.0.0.0` if you run in a container") rather than a description of what
