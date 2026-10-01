@@ -544,6 +544,35 @@ export interface VectorDeleteWhere extends VectorPartitionOption, VectorAllParti
  */
 export const OBSERVATION_VECTOR_KEY = 'obsId';
 
+/**
+ * The metadata key that names the document a vector is a chunk of (@gnldev/rag's `chunkDocuments`
+ * writes the document's id under it). Every store in this repository indexes it, so finding one
+ * document's records costs a lookup, not a scan of the table: `ingestDocuments` lists a document after
+ * each write, and a scan made re-indexing N documents cost N × the table (measured, SQLite, 8000 rows:
+ * 99% of an ingest was that scan).
+ */
+export const VECTOR_DOCUMENT_KEY = '__gnlDoc';
+
+/**
+ * The document a record belongs to, as a store indexes it: the `VECTOR_DOCUMENT_KEY` value when it is
+ * a string every store holds unchanged. Anything else is "no document" — such a record is never found
+ * through the index, and a filter naming such a value is read by scanning (see `vectorFilterDocument`).
+ */
+export function vectorDocumentOf(metadata: Record<string, unknown> | undefined): string | undefined {
+  const d = metadata?.[VECTOR_DOCUMENT_KEY];
+  return typeof d === 'string' && isWellFormed(d) && !d.includes('\u0000') ? d : undefined;
+}
+
+/**
+ * The document a metadata filter names, when the index can answer it: the filter's
+ * `VECTOR_DOCUMENT_KEY` value, under the same rule as `vectorDocumentOf`. A store narrows to the
+ * index's rows for it and still applies the whole filter (`vectorMetadataMatches`) to them, so the
+ * index only ever removes rows the filter would remove.
+ */
+export function vectorFilterDocument(filter: Record<string, unknown> | undefined): string | undefined {
+  return filter && Object.prototype.hasOwnProperty.call(filter, VECTOR_DOCUMENT_KEY) ? vectorDocumentOf(filter) : undefined;
+}
+
 /** The metadata narrowing of `filter` on a query or a delete: every key equals (`===`), as in @gnldev/rag. */
 export function vectorMetadataMatches(metadata: Record<string, unknown> | undefined, filter: Record<string, unknown> | undefined): boolean {
   if (!filter) return true;

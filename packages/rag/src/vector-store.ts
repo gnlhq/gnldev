@@ -1,5 +1,5 @@
 import { cosineSimilarity } from 'ai';
-import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, vectorInOrganization, type VectorAllPartitionsOption } from '@gnldev/durable';
+import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, vectorInOrganization, vectorDocumentOf, type VectorAllPartitionsOption } from '@gnldev/durable';
 
 export interface VectorDoc {
   id: string;
@@ -114,20 +114,41 @@ export function matchesFilter(metadata: Record<string, unknown> | undefined, fil
 /** In-memory vector store (cosine similarity). The pgvector adapter implements the same interface for prod. */
 export class InMemoryVectorStore implements VectorStore {
   readonly rootOutsideOrganizations = true;
-  private items: VectorItem[] = [];
+  /**
+   * By id, in insertion order (a Map keeps a replaced entry where it was, as the array did), and by
+   * document (`vectorDocumentOf`, the key `chunkDocuments` writes): a write, a delete by id and one
+   * document's chunks cost a lookup, not a pass over every item.
+   */
+  private byId = new Map<string, VectorItem>();
+  private byDoc = new Map<string, Set<string>>();
+  private put(it: VectorItem): void {
+    this.unindex(it.id);
+    this.byId.set(it.id, it);
+    const d = vectorDocumentOf(it.metadata);
+    if (d !== undefined) { const ids = this.byDoc.get(d) ?? new Set<string>(); ids.add(it.id); this.byDoc.set(d, ids); }
+  }
+  private unindex(id: string): void {
+    const old = this.byId.get(id);
+    const d = old && vectorDocumentOf(old.metadata);
+    if (d === undefined) return;
+    const ids = this.byDoc.get(d);
+    ids?.delete(id);
+    if (ids?.size === 0) this.byDoc.delete(d);
+  }
+  /** The items a condition can match: by id, by document, or every item. */
+  private candidates(ids: string[] | undefined, doc: string | undefined): Iterable<VectorItem> {
+    if (ids) return [...new Set(ids)].flatMap((id) => { const it = this.byId.get(id); return it ? [it] : []; });
+    if (doc !== undefined) return [...(this.byDoc.get(doc) ?? [])].map((id) => this.byId.get(id)!);
+    return this.byId.values();
+  }
 
   async upsert(items: VectorItem[]): Promise<void> {
     // The one write rule every store runs (@gnldev/durable vectorWriteBatch): labels, the owner-id
     // rule, one id twice in a batch. Then the whole batch is checked against what is stored, so a
     // refused batch leaves no half.
     const batch = vectorWriteBatch(items);
-    for (const it of batch) assertSameVectorOwner(this.items.find((x) => x.id === it.id), it);
-    for (const it of batch) {
-      const own = vectorItemCopy(it); // a copy, as the SQL stores keep one
-      const i = this.items.findIndex((x) => x.id === it.id);
-      if (i >= 0) this.items[i] = own;
-      else this.items.push(own);
-    }
+    for (const it of batch) assertSameVectorOwner(this.byId.get(it.id), it);
+    for (const it of batch) this.put(vectorItemCopy(it)); // a copy, as the SQL stores keep one
   }
 
   async query(embedding: number[], topK: number, opts?: QueryOptions): Promise<VectorMatch[]> {
@@ -136,7 +157,7 @@ export class InMemoryVectorStore implements VectorStore {
     const scope = vectorQueryScope(opts);
     if (scope.none) return [];
     const out: VectorMatch[] = [];
-    for (const it of this.items) {
+    for (const it of this.candidates(undefined, undefined)) {
       // 7.2: namespace + metadata narrowing (BEFORE score computation — no wasted work).
       if (scope.namespace !== undefined && it.namespace !== scope.namespace) continue;
       if (scope.outsideOrganizations && vectorInOrganization(it.namespace)) continue; // the root's partition (ADR-0001)
@@ -155,11 +176,11 @@ export class InMemoryVectorStore implements VectorStore {
     // No condition (`{}`, `{ ids: [] }`, `{ filter: {} }`) deletes NOTHING — the one rule, vectorDeletePlan.
     const w = vectorDeletePlan(where);
     if (!w) return 0;
-    const before = this.items.length;
     // ALL given conditions must match — the one reading, vectorDeleteMatcher.
     const gone = vectorDeleteMatcher(w);
-    this.items = this.items.filter((it) => !gone(it));
-    return before - this.items.length;
+    const doomed = [...this.candidates(w.ids, undefined)].filter(gone);
+    for (const it of doomed) { this.unindex(it.id); this.byId.delete(it.id); }
+    return doomed.length;
   }
 }
 

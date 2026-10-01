@@ -10,7 +10,7 @@ import { cosineSimilarity } from 'ai';
 import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus } from './journal.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
-import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision } from './storage.js';
+import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, vectorDocumentOf, vectorFilterDocument } from './storage.js';
 import type { AdoptIntoOrgResult,
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -124,7 +124,7 @@ const DDL = [
   // that already exists, so the column-plus-unique-index shape would reach new installs and silently
   // skip existing ones.
   `CREATE TABLE IF NOT EXISTS gnl_message_batches (thread_id TEXT NOT NULL, batch_key TEXT NOT NULL, seq_from INTEGER NOT NULL, seq_to INTEGER NOT NULL, ts BIGINT NOT NULL, PRIMARY KEY (thread_id, batch_key))`,
-  `CREATE TABLE IF NOT EXISTS gnl_vectors (id TEXT PRIMARY KEY, text TEXT NOT NULL, embedding TEXT NOT NULL, metadata TEXT, namespace TEXT, created_at BIGINT NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS gnl_vectors (id TEXT PRIMARY KEY, text TEXT NOT NULL, embedding TEXT NOT NULL, metadata TEXT, namespace TEXT, created_at BIGINT NOT NULL, doc TEXT)`,
   // Same migration shape as the gnl_runs columns above: `CREATE TABLE IF NOT EXISTS` does nothing to
   // a table that already exists, so an old database would keep a five-column gnl_vectors and every
   // upsert would fail with "column namespace does not exist". Deliberately NOT backfilled — rows
@@ -135,6 +135,14 @@ const DDL = [
   // their own is unlabelled, and an unlabelled row is visible to no end user.
   `ALTER TABLE gnl_vectors ADD COLUMN IF NOT EXISTS owner TEXT`,
   `ALTER TABLE gnl_vectors ADD COLUMN IF NOT EXISTS shared BOOLEAN`,
+  // The document a row belongs to (`vectorDocumentOf` its metadata), written by the store on every
+  // upsert so finding one document's rows is an index lookup. A column the store fills rather than an
+  // index on the metadata: metadata is TEXT, and casting it to json in an index would refuse every
+  // write whose metadata holds a lone surrogate or a NUL (measured: "Unicode low surrogate must follow
+  // a high surrogate") — writes this table accepts today. '' = no document; NULL = not computed yet
+  // (a row written before this column, or by an older process), which every lookup includes.
+  `ALTER TABLE gnl_vectors ADD COLUMN IF NOT EXISTS doc TEXT`,
+  `CREATE INDEX IF NOT EXISTS gnl_vectors_doc ON gnl_vectors (doc)`,
   `CREATE TABLE IF NOT EXISTS gnl_work_log (ns TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, ts BIGINT NOT NULL, seq BIGINT NOT NULL DEFAULT 0, ord BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (ns, id))`,
   `CREATE INDEX IF NOT EXISTS gnl_work_log_ns ON gnl_work_log (ns, ts)`,
   // The store-assigned position `WorkStore.list` pages by (see the port). Same shape as the columns
@@ -437,6 +445,7 @@ export class PostgresStorage implements Storage {
               `CREATE INDEX IF NOT EXISTS gnl_counters_cprefix ON gnl_counters (key COLLATE "C")`,
             ]) await this._pool.query(sql);
           }
+          await backfillVectorDocuments((sql, p) => this._pool.query(sql, p));
           await this._pool.query(`INSERT INTO gnl_meta (k, v) VALUES ('schema_version', $1) ON CONFLICT (k) DO NOTHING`, [SCHEMA_VERSION]);
           // One extra query at startup to read the budget this process is spending against. Warned
           // only when the margin is genuinely thin, so a single-process deployment stays silent.
@@ -1488,6 +1497,28 @@ class PgMemoryStore implements MemoryStore {
   }
 }
 
+/**
+ * Fills `gnl_vectors.doc` for the rows that have none yet — every row, the first time a database meets
+ * the column; afterwards only rows an older process wrote. In blocks, through the `doc` index.
+ */
+async function backfillVectorDocuments(q: (sql: string, p?: unknown[]) => Promise<{ rows: any[] }>): Promise<void> {
+  for (;;) {
+    const rows = (await q(`SELECT id, metadata FROM gnl_vectors WHERE doc IS NULL LIMIT 500`)).rows as { id: string; metadata: string | null }[];
+    if (!rows.length) return;
+    const params: unknown[] = [];
+    const cases = rows.map((r) => {
+      let doc: string | undefined;
+      try { doc = r.metadata ? vectorDocumentOf(deserialize<Record<string, unknown>>(r.metadata)) : undefined; } catch { doc = undefined; }
+      params.push(r.id, doc ?? '');
+      return `WHEN $${params.length - 1} THEN $${params.length}`;
+    });
+    const ids = rows.map((r) => r.id);
+    const at = params.length;
+    params.push(...ids);
+    await q(`UPDATE gnl_vectors SET doc = CASE id ${cases.join(' ')} END WHERE doc IS NULL AND id IN (${ids.map((_, i) => `$${at + i + 1}`).join(',')})`, params);
+  }
+}
+
 class PgVectorStore implements VectorStore {
   readonly rootOutsideOrganizations = true;
   constructor(private q: Q, private tx: Tx) {}
@@ -1508,13 +1539,13 @@ class PgVectorStore implements VectorStore {
         const labels = [it.namespace ?? null, it.owner ?? null, it.shared ? true : null];
         const updated = await q(
           // NULL-safe equality spelled with COALESCE: '' is never a namespace or an owner (vectorWriteBatch).
-          `UPDATE gnl_vectors SET text=$2, embedding=$3, metadata=$4 WHERE id=$1 AND COALESCE(namespace, '') = COALESCE($5, '') AND COALESCE(owner, '') = COALESCE($6, '') AND COALESCE(shared, false) = COALESCE($7, false) RETURNING id`,
-          [it.id, it.text, JSON.stringify(it.embedding), it.metadata ? serialize(it.metadata) : null, ...labels],
+          `UPDATE gnl_vectors SET text=$2, embedding=$3, metadata=$4, doc=$8 WHERE id=$1 AND COALESCE(namespace, '') = COALESCE($5, '') AND COALESCE(owner, '') = COALESCE($6, '') AND COALESCE(shared, false) = COALESCE($7, false) RETURNING id`,
+          [it.id, it.text, JSON.stringify(it.embedding), it.metadata ? serialize(it.metadata) : null, ...labels, vectorDocumentOf(it.metadata) ?? ''],
         );
         if (updated.rows.length > 0) continue;
         const inserted = await q(
-          `INSERT INTO gnl_vectors (id, text, embedding, metadata, namespace, owner, shared, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING RETURNING id`,
-          [it.id, it.text, JSON.stringify(it.embedding), it.metadata ? serialize(it.metadata) : null, ...labels, Date.now()],
+          `INSERT INTO gnl_vectors (id, text, embedding, metadata, namespace, owner, shared, created_at, doc) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING RETURNING id`,
+          [it.id, it.text, JSON.stringify(it.embedding), it.metadata ? serialize(it.metadata) : null, ...labels, Date.now(), vectorDocumentOf(it.metadata) ?? ''],
         );
         if (inserted.rows.length === 0) assertSameVectorOwner((await probe(it.id)) ?? { namespace: '\u0000' }, it);
       }

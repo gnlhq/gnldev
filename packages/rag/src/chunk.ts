@@ -7,6 +7,7 @@
 // 'markdown': splits by heading hierarchy; adds a `heading` breadcrumb metadata to each chunk
 //     (for context display during retrieval), large text within a section is split recursively.
 // 'character': fixed window (fastest; when boundary quality doesn't matter).
+import { VECTOR_DOCUMENT_KEY } from '@gnldev/durable';
 import type { VectorDoc } from './vector-store.js';
 
 export interface ChunkOptions {
@@ -133,7 +134,8 @@ export function chunkText(text: string, opts?: ChunkOptions): Chunk[] {
  * document overwrote the user's `source`, and deleting the document `handbook` deleted every record
  * the user had labelled `source: 'handbook'` — records that were never chunks at all.
  */
-export const DOC_TRAIL_KEY = '__gnlDoc';
+/** Owned by @gnldev/durable, whose stores index it (`VECTOR_DOCUMENT_KEY`). */
+export const DOC_TRAIL_KEY = VECTOR_DOCUMENT_KEY;
 export const CHUNK_TRAIL_KEY = '__gnlChunk';
 /** The generation an `ingestDocuments` write belongs to — see `ingestDocuments`. */
 export const GEN_TRAIL_KEY = '__gnlGen';

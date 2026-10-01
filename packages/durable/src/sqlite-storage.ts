@@ -12,7 +12,7 @@ import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus } from '.
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, orgSpaceSql } from './organization.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
-import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision } from './storage.js';
+import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, VECTOR_DOCUMENT_KEY, vectorFilterDocument } from './storage.js';
 import type {
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -574,6 +574,14 @@ export class SqliteStorage implements Storage {
   }
 }
 
+/**
+ * The document a `gnl_vectors` row belongs to (`VECTOR_DOCUMENT_KEY` in its metadata), as the index
+ * `gnl_vectors_doc` holds it. Metadata is superjson, so the value sits under `json`. Guarded by
+ * `json_valid`: a row whose metadata is not JSON has no document, rather than failing every write
+ * once the index exists. A query must spell the expression exactly so for SQLite to use the index.
+ */
+const VECTOR_DOC_SQL = `(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.json.${VECTOR_DOCUMENT_KEY}') END)`;
+
 const DDL = `
 CREATE TABLE IF NOT EXISTS gnl_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS gnl_run_journal (
@@ -603,6 +611,7 @@ CREATE TABLE IF NOT EXISTS gnl_working_memory (scope_id TEXT PRIMARY KEY, data T
 CREATE TABLE IF NOT EXISTS gnl_observations (thread_id TEXT PRIMARY KEY, obs TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS gnl_message_batches (thread_id TEXT NOT NULL, batch_key TEXT NOT NULL, seq_from INTEGER NOT NULL, seq_to INTEGER NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (thread_id, batch_key));
 CREATE TABLE IF NOT EXISTS gnl_vectors (id TEXT PRIMARY KEY, text TEXT NOT NULL, embedding TEXT NOT NULL, metadata TEXT, namespace TEXT, owner TEXT, shared INTEGER, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS gnl_vectors_doc ON gnl_vectors (${VECTOR_DOC_SQL});
 CREATE TABLE IF NOT EXISTS gnl_work_log (ns TEXT NOT NULL, id TEXT NOT NULL, payload TEXT NOT NULL, ts INTEGER NOT NULL, seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (ns, id));
 CREATE INDEX IF NOT EXISTS gnl_work_log_ns ON gnl_work_log (ns, ts);
 CREATE TABLE IF NOT EXISTS gnl_work_seq (ns TEXT PRIMARY KEY, seq INTEGER NOT NULL);

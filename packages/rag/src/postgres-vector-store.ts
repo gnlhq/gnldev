@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope } from '@gnldev/durable';
+import { vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, VECTOR_DOCUMENT_KEY, vectorFilterDocument } from '@gnldev/durable';
 import type { VectorStore, VectorItem, VectorMatch, QueryOptions, DeleteWhere } from './vector-store.js';
 
 /** Minimal pg.Pool surface — injectable for tests/custom setups (same pattern as PostgresJournal). */
@@ -76,6 +76,9 @@ export class PostgresVectorStore implements VectorStore {
         // Same for the end-user label. Existing rows stay NULL: unlabelled, so visible to no end user.
         await this.pool.query(`ALTER TABLE ${this.table} ADD COLUMN IF NOT EXISTS owner TEXT`);
         await this.pool.query(`ALTER TABLE ${this.table} ADD COLUMN IF NOT EXISTS shared BOOLEAN`);
+        // One document's chunks by the document (`VECTOR_DOCUMENT_KEY`), not by a scan of the table.
+        // Metadata is already JSONB here, so the index refuses no write the column accepts.
+        await this.pool.query(`CREATE INDEX IF NOT EXISTS ${this.table}_doc_idx ON ${this.table} ((metadata ->> '${VECTOR_DOCUMENT_KEY}'))`);
         if (this.index === 'hnsw') {
           await this.pool.query(
             `CREATE INDEX IF NOT EXISTS ${this.table}_embedding_idx

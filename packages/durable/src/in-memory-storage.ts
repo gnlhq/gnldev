@@ -8,7 +8,7 @@ import { InMemoryJournal } from './journal.js';
 import { stableStringify } from './hash.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
 import type { JournalEntry, RunSummary } from './journal.js';
-import { decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision, vectorInOrganization } from './storage.js';
+import { decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision, vectorInOrganization, vectorDocumentOf } from './storage.js';
 import type {
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -243,31 +243,58 @@ class InMemoryVectorStore implements VectorStore {
     // withOrgStorage), so an adopted document keeps its identity instead of being duplicated by the
     // organization's next upsert of the same id. A rename onto a taken id is refused first.
     const legacy = this.items.filter((it) => it.namespace === undefined);
-    const taken = new Set(this.items.map((it) => it.id));
-    const clash = legacy.find((it) => taken.has(orgVectorId(ns, it.id)));
+    const clash = legacy.find((it) => this.byId.has(orgVectorId(ns, it.id)));
     if (clash) throw vectorAdoptCollision(clash.id);
-    if (!dryRun) for (const it of legacy) { it.namespace = ns; it.id = orgVectorId(ns, it.id); }
+    if (!dryRun) {
+      const all = this.items;
+      for (const it of legacy) { it.namespace = ns; it.id = orgVectorId(ns, it.id); }
+      this.byId.clear();
+      this.byDoc.clear();
+      for (const it of all) this.put(it);
+    }
     return legacy.length;
   }
 
-  items: VectorItem[] = [];
+  /**
+   * By id, in insertion order (a Map keeps a replaced entry where it was, as the array did), and by
+   * document (`vectorDocumentOf`): a write, a delete by id and a document's records cost a lookup,
+   * not a pass over every record.
+   */
+  private byId = new Map<string, VectorItem>();
+  private byDoc = new Map<string, Set<string>>();
+  get items(): VectorItem[] { return [...this.byId.values()]; }
+  private put(it: VectorItem): void {
+    this.remove(it.id);
+    this.byId.set(it.id, it);
+    const d = vectorDocumentOf(it.metadata);
+    if (d !== undefined) { const ids = this.byDoc.get(d) ?? new Set<string>(); ids.add(it.id); this.byDoc.set(d, ids); }
+  }
+  private remove(id: string): void {
+    const old = this.byId.get(id);
+    if (!old) return;
+    const d = vectorDocumentOf(old.metadata);
+    if (d !== undefined) { const ids = this.byDoc.get(d); ids?.delete(id); if (ids && ids.size === 0) this.byDoc.delete(d); }
+    // A replaced entry keeps its place: `put` sets it again straight after, and Map.set on an existing key does not move it.
+  }
+  /** The records a condition can match: by id, by document, or every record. */
+  protected candidates(ids: string[] | undefined, doc: string | undefined): Iterable<VectorItem> {
+    if (ids) return ids.flatMap((id) => { const it = this.byId.get(id); return it ? [it] : []; });
+    if (doc !== undefined) return [...(this.byDoc.get(doc) ?? [])].map((id) => this.byId.get(id)!);
+    return this.byId.values();
+  }
   async upsert(items: VectorItem[]) {
     const batch = vectorWriteBatch(items);
     // Checked for the whole batch before anything is written, so a refused batch leaves no half.
-    for (const it of batch) assertSameVectorOwner(this.items.find((x) => x.id === it.id), it);
-    for (const it of batch) {
-      const own = vectorItemCopy(it);
-      const i = this.items.findIndex((x) => x.id === it.id);
-      if (i >= 0) this.items[i] = own; else this.items.push(own);
-    }
+    for (const it of batch) assertSameVectorOwner(this.byId.get(it.id), it);
+    for (const it of batch) this.put(vectorItemCopy(it));
   }
   async delete(where: VectorDeleteWhere): Promise<number> {
     const w = vectorDeletePlan(where);
     if (!w) return 0;
     const gone = vectorDeleteMatcher(w);
-    const before = this.items.length;
-    this.items = this.items.filter((it) => !gone(it));
-    return before - this.items.length;
+    const doomed = [...new Set([...this.candidates(w.ids, undefined)])].filter(gone);
+    for (const it of doomed) { this.remove(it.id); this.byId.delete(it.id); }
+    return doomed.length;
   }
   async query(embedding: number[], topK: number, opts?: VectorQueryOptions): Promise<VectorMatch[]> {
     // Filter, THEN rank, THEN slice. Ranking first and filtering after would make a caller's result
