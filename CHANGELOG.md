@@ -9,6 +9,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-05
+
+**A sub-agent keeps every guarantee the agent keeps, and the request is the unit** (ADR-0005): "once",
+limits and approvals hold across every run a request starts. Measured on a catalog of 22 scenarios, run
+directly and through sub-agents, and end to end with a real model on Postgres and Redis. When you upgrade
+from 0.9, the changes you are most likely to meet:
+
+- A repeated side effect with no idempotency key, or one after untrusted content, now **asks a person**
+  instead of running (`sideEffectDuplicates` and `taintedSideEffects` default to `'suspend'`; `'warn'`
+  restores the old behaviour).
+- A tool with `idempotencyKey` must declare `idempotencyWindow`.
+- Every options object refuses a name it does not take, naming the closest one.
+- A sub-agent returns `{ status, text, interrupts, failed? }`; its approvals are addressed
+  `<delegation call>/<child call>`.
+- A request may not send a `system` message.
+- **Redis:** once every process runs 0.10, call `storage.rebuildKeyIndex()` once — until then a store 0.9
+  wrote lists by SCAN (see Known limits).
+
+The one-line migration note for each is under Breaking.
+
 ### Breaking
 
 Migration notes, one line each; the full entries under Security, Fixed and Changed have the measurement
