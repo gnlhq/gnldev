@@ -1,0 +1,4 @@
+{
+  "*.{ts,tsx,js,jsx}": ["oxlint --type-aware $1"],
+  "*.{js,jsx,ts,tsx,json,jsonc,md,yml,yaml,css,scss}": ["oxfmt"]
+}

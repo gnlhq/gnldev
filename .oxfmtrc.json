@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
-  "ignorePatterns": [],
+  "ignorePatterns": ["node_modules", "dist", "pnpm-lock.yaml", ".git", ".husky"],
   "singleQuote": true,
   "trailingComma": "all",
   "printWidth": 128

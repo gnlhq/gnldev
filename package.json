@@ -1,9 +1,9 @@
 {
   "name": "gnldev",
   "private": true,
-  "type": "module",
   "description": "gnl — a durable execution substrate for AI agents (monorepo)",
   "license": "Apache-2.0",
+  "type": "module",
   "scripts": {
     "build": "pnpm -r build",
     "pretest": "node scripts/check-dist-fresh.mjs",
@@ -22,7 +22,17 @@
     "format": "oxfmt",
     "format:check": "oxfmt --check"
   },
-  "packageManager": "pnpm@12.9.1",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^2.1.9",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.6.0",
+    "oxfmt": "^0.71.0",
+    "oxlint": "^1.86.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
   "devEngines": {
     "packageManager": {
       "name": "pnpm",
@@ -30,13 +40,5 @@
       "onFail": "download"
     }
   },
-  "devDependencies": {
-    "@types/node": "^22.0.0",
-    "@vitest/coverage-v8": "^2.1.9",
-    "oxfmt": "^0.71.0",
-    "oxlint": "^1.86.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.6.0",
-    "vitest": "^2.1.0"
-  }
+  "packageManager": "pnpm@12.9.1"
 }
