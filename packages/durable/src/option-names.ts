@@ -6,7 +6,7 @@
 //
 // Only options bags are checked. An implementation of an interface (a storage, a model, a tool, a
 // processor, a memory) may carry members of its own, so it is never held to a name list.
-import { refuseUnknownNames, refuseMisspelledNames, optionNames, variantNames } from '@gnldev/options';
+import { refuseUnknownNames, refuseMisspelledNames, optionNames, type AnyVariantName } from '@gnldev/options';
 import type { CreateGnlConfig, AgentConfig, NetworkConfig, RunOptions, WorkflowRunOpts } from './registry.js';
 import type { RunLimits } from './limits.js';
 import type { SemanticDupConfig } from './semantic-dup.js';
@@ -68,8 +68,15 @@ const DURABLE_OWN_NAMES = optionNames<Record<DurableOwnName, unknown>>()([
   'strictInput', 'conflictLedger', 'auditOnReject', 'replayDisclosure', 'tombstonePolicy', 'actor', 'processors', 'schemaCompat',
   'limits', 'timeouts', 'onBlocked',
 ]);
-/** The AI SDK's names, as this build knows them. A newer AI SDK's option close to none of these passes. */
-const AI_SDK_NAMES = variantNames<Parameters<typeof import('ai').generateText>[0] | Parameters<typeof import('ai').streamText>[0]>()([
+/**
+ * The AI SDK's names, as this build knows them. A newer AI SDK's option close to none of these passes
+ * (refuseMisspelledNames). Held to the AI SDK one way only: each name must be one of its options, so a
+ * name it drops fails the build; a name it ADDS does not have to be here. Held both ways, the build broke
+ * on every AI SDK release that added an option — measured: ai 7.0.114 added `streamRetries` and
+ * @gnldev/durable no longer compiled anywhere the lockfile does not pin an older version.
+ */
+type AiSdkCall = Parameters<typeof import('ai').generateText>[0] | Parameters<typeof import('ai').streamText>[0];
+const AI_SDK_NAMES = ([
   'maxOutputTokens', 'temperature', 'topP', 'topK', 'presencePenalty', 'frequencyPenalty', 'stopSequences', 'seed', 'reasoning',
   'maxRetries', 'abortSignal', 'headers', 'timeout', 'instructions', 'system', 'allowSystemInMessages', 'prompt', 'messages',
   'tools', 'toolsContext', 'model', 'toolChoice', 'stopWhen', 'telemetry', 'experimental_telemetry', 'providerOptions',
@@ -80,7 +87,7 @@ const AI_SDK_NAMES = variantNames<Parameters<typeof import('ai').generateText>[0
   'experimental_onLanguageModelCallStart', 'onLanguageModelCallEnd', 'experimental_onLanguageModelCallEnd',
   'onToolExecutionStart', 'experimental_onToolCallStart', 'onToolExecutionEnd', 'experimental_onToolCallFinish', 'onStepEnd',
   'onStepFinish', 'onEnd', 'onFinish', 'include', 'experimental_include', '_internal',
-]);
+] as const) satisfies readonly AnyVariantName<AiSdkCall>[];
 const DURABLE_ARG_NAMES = [...DURABLE_OWN_NAMES, ...AI_SDK_NAMES] as const;
 export const RESUME_NAMES = [
   ...optionNames<ResumeAgentConfig>()([

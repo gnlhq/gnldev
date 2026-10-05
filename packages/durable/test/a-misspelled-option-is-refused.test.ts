@@ -73,6 +73,9 @@ describe('runDurable passes the AI SDK\'s options on', () => {
   });
   it('passes a name close to none — an option a newer AI SDK added', async () => {
     await expect(run({ experimental_somethingNew: true })).resolves.toBeDefined();
+    // ai 7.0.114 added `streamRetries` after this build's list was written: it passes here, and the
+    // list is held to the AI SDK one way only (option-names.ts), so the build does not break on it.
+    await expect(run({ streamRetries: 1 })).resolves.toBeDefined();
   });
   it('resumeRun holds its own names', async () => {
     await expect(resumeRun('x', { journal: new InMemoryJournal(), model: thrice, aprovals: {} } as any)).rejects.toThrow(/resumeRun: `aprovals` .* did you mean `approvals`\?/);

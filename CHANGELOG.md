@@ -814,6 +814,12 @@ and who is affected.
 
 ### Fixed
 
+- **@gnldev/durable stopped compiling when the AI SDK added an option** (ai 7.0.114 added `streamRetries`).
+  Its list of the AI SDK's option names was held to the AI SDK both ways, so a build that resolved a newer
+  `ai` than the lockfile failed. It is now held one way: each listed name must be an AI SDK option, a name
+  the AI SDK adds does not have to be listed. At run time nothing changes — a name close to none of the
+  known ones passes on to the AI SDK, a misspelling of one is refused.
+
 - **The Redis store walked the whole Redis database to list a prefix** (@gnldev/durable). Reading a run,
   its approvals, a work-log namespace, a prefix (`listKeys`) or deleting one used `SCAN MATCH`, which
   visits every key the database holds — other applications' too, and the store's own history. Measured:
