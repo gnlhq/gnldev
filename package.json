@@ -17,7 +17,10 @@
     "check:real": "node scripts/check-real-backends.mjs",
     "check:hygiene": "node scripts/check-hygiene.mjs",
     "check:option-docs": "node scripts/check-option-docs.mjs",
-    "check:option-names": "node scripts/check-option-names.mjs"
+    "check:option-names": "node scripts/check-option-names.mjs",
+    "lint": "oxlint --type-aware packages/ test/",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check"
   },
   "packageManager": "pnpm@12.9.1",
   "devEngines": {
@@ -30,6 +33,8 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^2.1.9",
+    "oxfmt": "^0.71.0",
+    "oxlint": "^1.86.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
