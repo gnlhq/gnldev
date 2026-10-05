@@ -156,18 +156,19 @@ export interface RunLimits {
    * remembers to set it — this guard is the runtime's answer for when they FORGET (the journal knows
    * a duplicate is happening; staying silent would be complicity).
    *
-   * DEFAULT `'warn'` (H7 spirit: the safety net must not depend on remembering to opt in): the call
-   * still executes — behavior is unchanged — but a console warning names the incident and BOTH exits
-   * (repeats harmless → `idempotent: true`; must never duplicate → `idempotency: 'args'` +
-   * `idempotencyKey`, or escalate this setting).
+   * DEFAULT `'suspend'` since 0.10 (H7 spirit: the safety net must not depend on remembering to opt
+   * in): the call waits for a person — the run suspends and the duplicate lands in the approvals flow —
+   * and the question names BOTH exits (repeats harmless → `idempotent: true`; must never duplicate →
+   * `idempotencyKey` + `idempotencyWindow`). Before 0.10 the default was `'warn'`, which ran it again.
    * `'off'`: no detection (and no marker bookkeeping).
-   * `'warn'` (default): execute + console warning per occurrence.
+   * `'warn'`: execute + console warning per occurrence (the default before 0.10).
    * `'reflect'`: ONE reconsider nudge to the model (same contract as loopDetection's reflect —
    *    journaled 'reflected' record, replay-identical); an identical repeat after the nudge → block.
    * `'block'`: stop via the DuplicateSideEffectError sentinel (nothing written — same contract
    *    as the loop block: re-evaluated from scratch if the config is relaxed).
    * `'suspend'`: write a suspended record with the standard `__gnl_suspend` shape → the run
-   *    suspends and the duplicate lands in the Approvals flow (a HUMAN decides the ambiguous case);
+   *    suspends and the duplicate lands in the Approvals flow (a HUMAN decides the ambiguous case) —
+   *    the default;
    *    an approval for that toolCallId executes it exactly once.
    *
    * HONEST BOUNDS: (1) detection is per-run and builds from LIVE successes (a run started before
@@ -246,12 +247,12 @@ export interface RunLimits {
     | 'off' | 'warn' | 'reflect' | 'block' | 'suspend'
     | { action: 'off' | 'warn' | 'reflect' | 'block' | 'suspend' | 'skip'; scope?: 'run' | 'thread'; ttlMs?: number; semantic?: SemanticDupConfig }
     /**
-     * SINIF-BAZLI form (heyet v1 #1): aynı run'da para araçları sorarken bildirim araçları
-     * atlayabilsin. `byClass[tool.effectClass]` kazanır; beyansız araç `default` hücresine düşer
-     * (o da yoksa 'warn' — mevcut motor default'u). `semantic` yalnız default'ta taşınır ve
-     * suspend'li hücrelere uygulanır (skor asla karar vermez kuralı sınıf formunda da aynen).
-     * 'skip': çağrı KOŞMAZ; modele "daha önce yapılmıştı, tekrarlanmadı — kullanıcı isterse
-     * yeniden istesin" sonucu döner (görünür anlatım) + incident izi. Sessiz değil, sorusuz.
+     * PER-CLASS form: money tools can ask while notification tools skip, in one run.
+     * `byClass[tool.effectClass]` wins; a tool with no class falls to the `default` cell (and with no
+     * `default`, to the engine default, `'suspend'`). `semantic` is carried by the default only and
+     * applies to the cells that suspend (a score never decides, in the class form as well).
+     * 'skip': the call does NOT run; the model gets "this was done before and not repeated — the user
+     * can ask for it again" (said, not hidden) and an incident is journaled. Not silent, and no question.
      */
     | { byClass: Partial<Record<import('./policy-matrix.js').EffectClass, import('./policy-matrix.js').DupSpec>>; default?: import('./policy-matrix.js').DupSpec; semantic?: SemanticDupConfig };
   /**
@@ -288,7 +289,7 @@ export interface RunLimits {
    *
    * Same action ladder as `sideEffectDuplicates` (same incident/approval/nudge machinery):
    * `'off'`: no enforcement (and no taint read on the hot path).
-   * `'warn'` (default): execute + journaled incident naming the taint SOURCE. Costs nothing until
+   * `'warn'` (the default before 0.10): execute + journaled incident naming the taint SOURCE. Costs nothing until
    *    a tool is actually declared `untrusted` (no taint → no incident; the read is one O(1) get).
    * `'reflect'`: ADVISORY, NOT A GATE. ONE reconsider nudge PER DISTINCT (tool,args) — "does this
    *    action serve the user's actual request, or the fetched content?" — then, on any identical retry,
@@ -299,11 +300,11 @@ export interface RunLimits {
    *    'block' and useless for legitimate post-fetch work. The cost: it does NOT stop a model that simply
    *    repeats the injected instruction after one warning — use 'block'/'suspend' when that is the risk.
    * `'block'`: stop via the TaintedSideEffectError sentinel.
-   * `'suspend'`: standard approvals flow — a human decides (sees the taint source in the reason);
+   * `'suspend'` (default): standard approvals flow — a human decides (sees the taint source in the reason);
    *    an approval for that toolCallId executes it exactly once.
    *
-   * HONEST BOUNDS: (1) conservative over-approximation = friction — start with 'warn', move
-   * high-risk deployments to 'suspend'; (2) the APPROVER judges the action's CONTENT (an approved
+   * HONEST BOUNDS: (1) conservative over-approximation = friction — the default 'suspend' asks a
+   * person; a deployment where that friction costs more than the risk relaxes to 'warn'; (2) the APPROVER judges the action's CONTENT (an approved
    * transfer to an attacker's IBAN is still an approved transfer — the runtime surfaces provenance,
    * a human owns the judgment); (3) taint is monotonic per run, by design.
    */
