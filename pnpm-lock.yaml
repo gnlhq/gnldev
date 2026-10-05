@@ -323,13 +323,17 @@ importers:
         version: 4.23.15
 
   packages/a2a:
+    dependencies:
+      '@gnldev/auth':
+        specifier: workspace:^
+        version: link:../auth
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
     devDependencies:
       '@gnldev/durable':
         specifier: workspace:*
         version: link:../durable
-      '@gnldev/server':
-        specifier: workspace:*
-        version: link:../server
       ai:
         specifier: ^7.0.0
         version: 7.0.114(zod@3.25.76)
@@ -342,6 +346,9 @@ importers:
       '@gnldev/auth':
         specifier: workspace:^
         version: link:../auth
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
       hono:
         specifier: ^4.13.2
         version: 4.13.9
@@ -357,12 +364,20 @@ importers:
         version: 3.25.76
 
   packages/auth:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
     devDependencies:
       hono:
         specifier: ^4.13.2
         version: 4.13.9
 
   packages/cache:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
     devDependencies:
       '@gnldev/durable':
         specifier: workspace:*
@@ -376,6 +391,9 @@ importers:
       '@gnldev/durable':
         specifier: workspace:^
         version: link:../durable
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
     devDependencies:
       ai:
         specifier: ^7.0.0
@@ -389,6 +407,9 @@ importers:
 
   packages/cli:
     dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
       tsx:
         specifier: ^4.19.0
         version: 4.23.15
@@ -425,6 +446,10 @@ importers:
         version: 3.25.76
 
   packages/client:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
     devDependencies:
       '@gnldev/durable':
         specifier: workspace:*
@@ -458,6 +483,9 @@ importers:
 
   packages/durable:
     dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
       superjson:
         specifier: ^2.2.6
         version: 2.2.6
@@ -491,6 +519,10 @@ importers:
         version: 3.25.76
 
   packages/evals:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
     devDependencies:
       '@gnldev/durable':
         specifier: workspace:*
@@ -500,6 +532,10 @@ importers:
         version: 7.0.114(zod@4.6.5)
 
   packages/events:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
     devDependencies:
       '@gnldev/durable':
         specifier: workspace:*
@@ -510,6 +546,9 @@ importers:
       '@gnldev/auth':
         specifier: workspace:^
         version: link:../auth
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
         version: 1.30.1(zod@4.6.5)
@@ -522,6 +561,10 @@ importers:
         version: 7.0.114(zod@4.6.5)
 
   packages/memory:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
     devDependencies:
       '@gnldev/durable':
         specifier: workspace:*
@@ -536,14 +579,22 @@ importers:
         specifier: ^3.25.0
         version: 3.25.76
 
+  packages/options: {}
+
   packages/otel:
     dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.9.1
       '@opentelemetry/exporter-trace-otlp-http':
         specifier: ^0.221.0
         version: 0.221.0(@opentelemetry/api@1.9.1)
+      '@opentelemetry/resources':
+        specifier: ^2.10.0
+        version: 2.11.0(@opentelemetry/api@1.9.1)
       '@opentelemetry/sdk-trace-base':
         specifier: ^2.10.0
         version: 2.11.0(@opentelemetry/api@1.9.1)
@@ -565,18 +616,30 @@ importers:
         version: 3.25.76
 
   packages/processors:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
     devDependencies:
       '@gnldev/durable':
         specifier: workspace:*
         version: link:../durable
 
   packages/queue:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
     devDependencies:
       '@gnldev/durable':
         specifier: workspace:*
         version: link:../durable
 
   packages/rag:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
     devDependencies:
       '@gnldev/durable':
         specifier: workspace:*
@@ -593,6 +656,9 @@ importers:
 
   packages/scheduler:
     dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
       '@gnldev/workflow':
         specifier: workspace:^
         version: link:../workflow
@@ -602,6 +668,10 @@ importers:
         version: link:../durable
 
   packages/semantic-qualify:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
     devDependencies:
       '@gnldev/durable':
         specifier: workspace:*
@@ -609,9 +679,15 @@ importers:
 
   packages/server:
     dependencies:
+      '@gnldev/a2a':
+        specifier: workspace:^
+        version: link:../a2a
       '@gnldev/auth':
         specifier: workspace:^
         version: link:../auth
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
       '@gnldev/workflow':
         specifier: workspace:^
         version: link:../workflow
@@ -640,6 +716,9 @@ importers:
       '@gnldev/durable':
         specifier: workspace:^
         version: link:../durable
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
       '@gnldev/scheduler':
         specifier: workspace:^
         version: link:../scheduler
@@ -780,7 +859,53 @@ importers:
         specifier: npm:zod@^4.4.3
         version: zod@4.6.5
 
-  packages/workflow: {}
+  packages/upgrade-tests:
+    devDependencies:
+      '@gnldev/durable':
+        specifier: workspace:*
+        version: link:../durable
+      '@gnldev/evals':
+        specifier: workspace:*
+        version: link:../evals
+      '@gnldev/events':
+        specifier: workspace:*
+        version: link:../events
+      '@gnldev/memory':
+        specifier: workspace:*
+        version: link:../memory
+      '@gnldev/processors':
+        specifier: workspace:*
+        version: link:../processors
+      '@gnldev/queue':
+        specifier: workspace:*
+        version: link:../queue
+      '@gnldev/rag':
+        specifier: workspace:*
+        version: link:../rag
+      '@gnldev/scheduler':
+        specifier: workspace:*
+        version: link:../scheduler
+      '@gnldev/workflow':
+        specifier: workspace:*
+        version: link:../workflow
+      ai:
+        specifier: ^7.0.0
+        version: 7.0.114(zod@3.25.76)
+      ioredis:
+        specifier: ^5.4.0
+        version: 5.11.1
+      pg:
+        specifier: ^8.0.0
+        version: 8.23.0
+      zod:
+        specifier: ^3.25.0
+        version: 3.25.76
+
+  packages/workflow:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
 
 packages:
 
