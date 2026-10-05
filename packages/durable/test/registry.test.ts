@@ -67,9 +67,12 @@ describe('createGnl + model router (8.6)', () => {
     const gnl = createGnl({ journal, agents: { pay: { model: model('A'), tools: { charge }, maxSteps: 4 } } });
     const gnlB = createGnl({ journal, agents: { pay: { model: model('B'), tools: { charge }, maxSteps: 4 } } });
     // No lock → distinct toolCallIds (call-A/call-B) are separate journal keys → both execute.
+    // The default duplicate ladder is now 'suspend', which would stop the twin on its own; this negative
+    // proof isolates the tool-claim, so the ladder stays at 'warn'.
+    const limits = { sideEffectDuplicates: 'warn' };
     await Promise.allSettled([
-      gnl.run('pay', { runId: 'race-2', prompt: 'x' } as any),
-      gnlB.run('pay', { runId: 'race-2', prompt: 'x' } as any),
+      gnl.run('pay', { runId: 'race-2', prompt: 'x', limits } as any),
+      gnlB.run('pay', { runId: 'race-2', prompt: 'x', limits } as any),
     ]);
     expect(charges).toBe(2); // DOCUMENTED BOUND: without a lock, distinct toolCallIds are not deduped → the lock is REQUIRED
   });

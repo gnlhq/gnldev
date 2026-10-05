@@ -2,6 +2,7 @@
 // nothing, so there is no GNL refresh token. The application already HAS the state that decides
 // whether a user is still logged in — its own session — and this handler turns "session still valid"
 // into a fresh short-lived token, and "no session" into a 401 the browser client surfaces.
+import { refuseUnknownNames } from '@gnldev/options';
 import { createHash, randomUUID } from 'node:crypto';
 import { MAX_SUBJECT_TTL_SEC, MIN_SUBJECT_SECRET_BYTES, signSubjectToken } from './jwt.js';
 import { isCrossSiteStateChange } from './same-site.js';
@@ -47,6 +48,7 @@ export function subjectTokenEndpoint(
   secret: string,
   opts: { ttlSec?: number } = {},
 ): (req: Request) => Promise<Response> {
+  refuseUnknownNames('subjectTokenEndpoint', opts, ['ttlSec']);
   if (Buffer.byteLength(secret, 'utf8') < MIN_SUBJECT_SECRET_BYTES) {
     throw new Error(`@gnldev/auth: subjectTokenEndpoint needs a secret of at least ${MIN_SUBJECT_SECRET_BYTES} bytes`);
   }

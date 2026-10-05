@@ -35,6 +35,7 @@ export interface SelectState {
   single: boolean;
 }
 
+/** @internal — the CLI's own prompt UI. */
 export function initState(
   items: PromptItem[],
   preChecked: Iterable<string> = [],
@@ -320,6 +321,7 @@ export function decodeStream(chunk: string, carry = ''): { keys: Key[]; carry: s
 /**
  * Interactive multi-select. ONLY call this when stdin/stdout are a TTY (the caller guards on
  * `process.stdin.isTTY`). Resolves to the selected ids, or `undefined` if cancelled.
+ * @internal — the CLI's own prompt UI.
  */
 export async function checkboxPrompt(
   items: PromptItem[],

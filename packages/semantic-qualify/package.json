@@ -11,7 +11,7 @@
   "bugs": {
     "url": "https://github.com/gnlhq/gnldev/issues"
   },
-  "author": "Karaca Yılmaz (https://gnl.dev)",
+  "author": "Karaca Y\u0131lmaz (https://gnl.dev)",
   "publishConfig": {
     "access": "public"
   },
@@ -27,7 +27,9 @@
     "qualification"
   ],
   "type": "module",
-  "sideEffects": ["./dist/cli.js"],
+  "sideEffects": [
+    "./dist/cli.js"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -54,5 +56,8 @@
   },
   "bin": {
     "gnl-semantic-qualify": "./dist/cli.js"
+  },
+  "dependencies": {
+    "@gnldev/options": "workspace:^"
   }
 }

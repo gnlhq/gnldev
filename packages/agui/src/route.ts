@@ -12,10 +12,11 @@
 import type { Context } from 'hono';
 import { toFetchHandler, type FetchHandler } from './handler.js';
 import { Hono } from 'hono';
-import { limitBreachFromSteps, blockedFromSteps, BLOCKED_ERROR_CODES, blockedErrorCode, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, reservedIdFailure, sealRequestContext, sealFieldsOf, resolveWorkIdentity } from '@gnldev/durable';
+import { limitBreachFromSteps, blockedFromSteps, BLOCKED_ERROR_CODES, blockedErrorCode, callerConflictAnswer, requestRefusal, sealRequestContext, sealFieldsOf, resolveWorkIdentity, readJsonObject } from '@gnldev/durable';
 import type { CreateGnlConfig, ResolvedWorkIdentity } from '@gnldev/durable';
 import { createGnl, scopeConfigToOrg } from '@gnldev/durable';
-import { doorGate, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify } from '@gnldev/auth';
+import { doorGate, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify, refuseMisplacedOptions, doorOptionKeys, REMOVED_IDENTITY_OPTIONS } from '@gnldev/auth';
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 import { streamSSE } from 'hono/streaming';
 // The two limit codes are READ from @gnldev/durable (`LIMIT_ERROR_CODES`) rather than spelled again
 // here. The event/data SHAPE is deliberately a copy (see the note above), but a code is not a shape:
@@ -26,6 +27,15 @@ import type { StreamSurface } from '@gnldev/durable';
 import { toAguiEvents, initialAguiConvertState, type GnlSseEvent } from './convert.js';
 import { EventType, type AguiEvent, type RunStartedEvent } from './types.js';
 
+/**
+ * The request body as a JSON object (@gnldev/durable `readJsonObject`), or the 400 that says it is not
+ * one. A body that was not JSON used to be read as `{}` and fail on a field it seemed to lack.
+ */
+async function jsonBody(c: Context): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false; response: Response }> {
+  const read = readJsonObject(await c.req.text());
+  return read.ok ? read : { ok: false, response: c.json({ error: read.error, code: read.code }, 400) };
+}
+
 export interface PipeAguiStreamOptions {
   /** AG-UI threadId. If not given, runId is used (single-thread default). */
   threadId?: string;
@@ -33,6 +43,7 @@ export interface PipeAguiStreamOptions {
 
 /** Stream fullStream as AG-UI SSE events (starts with RUN_STARTED, ends with RUN_FINISHED/RUN_ERROR). */
 export function pipeAguiStream(c: Context, runId: string, result: any, opts?: PipeAguiStreamOptions) {
+  refuseUnknownNames('pipeAguiStream', opts, optionNames<PipeAguiStreamOptions>()(['threadId']));
   const threadId = opts?.threadId ?? runId;
   const ctx = { threadId, runId };
   // The header patch, written out rather than imported from @gnldev/server: importing a runtime
@@ -243,6 +254,8 @@ export interface CreateAguiRouteOptions {
    * with no identity, and nothing else: the host rule keeps `allowedHosts`.
    */
   allowCrossSite?: boolean;
+  /** Print this door's protections when it is built (default `true`); `false` when something else already prints them. */
+  protectionsBanner?: boolean;
 }
 
 /**
@@ -263,21 +276,6 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
     if (!g) orgGnls.set(org, (g = createGnl(scopeConfigToOrg(config, org).config)));
     return g;
   };
-  // A REMOVED option fails loudly. Ignoring it would be worse than the hook it replaced: a JavaScript
-  // config (or one cast past the types) that still passes it would start every run ownerless, and
-  // nothing would say so.
-  if ((opts as { resolveResourceId?: unknown }).resolveResourceId !== undefined) {
-    throw new TypeError(
-      '[gnl agui-route] `resolveResourceId` was removed: it handed the resolver the request body, the one place a ' +
-      'subject must never come from. Use `identify: (req) => principal`, reading your session or a verified token.',
-    );
-  }
-  if ((opts as { identity?: unknown }).identity !== undefined) {
-    throw new TypeError(
-      '[gnl agui-route] `identity` was replaced by `identify` (0.7.0): it returns a Principal from @gnldev/auth — ' +
-      "`{ kind: 'subject', id, orgId, roles: [] }` for an end user — so the route can tell a user from staff.",
-    );
-  }
   // Who is calling, the open-surface checks for a request with no identity, the role: @gnldev/auth's
   // `doorGate`, the one preamble every door runs — the same call as @gnldev/chat-adapter's route. In
   // production a route with no `identify` refuses to start.
@@ -287,6 +285,7 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
     authorize: opts.authorize,
     allowedHosts: opts.allowedHosts,
     allowCrossSite: opts.allowCrossSite,
+    protectionsBanner: opts.protectionsBanner,
     restMount: 'createRestApi(config, { auth, surfaces: [aguiSurface()] })',
   });
   const app = new Hono();
@@ -304,7 +303,8 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
   }
   app.post('/agents/:name/run', async (c) => {
     const name = c.req.param('name');
-    const body = (await c.req.json().catch(() => ({}))) as any;
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as any;
     // WHO, resolved once and FIRST — the same reason chat-adapter states: the identity decision below
     // cannot be made without the subject, and a resolver may answer differently the second time.
     // `body.resourceId` is read for an APPLICATION principal only.
@@ -401,11 +401,10 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
       }
       // FAZ-4 caller-conflict family (K9: durable's single map — this route was the consumer the
       // first cut forgot; a critical-profile input/actor/swept refusal must not collapse to a bare 400).
-      const conflict = callerConflictCode(e);
+      const conflict = callerConflictAnswer(e);
       if (conflict) {
-        if (OWNERSHIP_CONFLICT_CODES.includes(conflict)) markRefusal(c.req.raw, 'ownership', { detail: conflict });
-        // Redacted: see `publicConflictDetail` (durable/errors.ts) for what is withheld and why.
-        return c.json({ error: e.message, code: conflict, detail: withWorkKey(publicConflictDetail(e.detail), declared) }, 409);
+        if (conflict.ownership) markRefusal(c.req.raw, 'ownership', { detail: conflict.code });
+        return c.json({ error: conflict.error, code: conflict.code, detail: withWorkKey(conflict.detail, declared) }, 409);
       }
       const blocked = blockedErrorCode(e);
       if (blocked) {
@@ -418,7 +417,7 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
         return res;
       }
       // A root-scope thread id under `org:` — durable's one answer for it (400 thread_id_reserved).
-      const reserved = reservedIdFailure(e);
+      const reserved = requestRefusal(e);
       if (reserved) return c.json(reserved.body, reserved.status);
       if (name === 'RunLimitExceededError' || name === 'ToolLoopDetectedError') {
         const code = name === 'RunLimitExceededError' ? LIMIT_ERROR_CODES.runLimitExceeded : LIMIT_ERROR_CODES.toolLoopDetected;
@@ -438,6 +437,7 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
  * (`/agents/:name/run` is REST's own).
  */
 export function aguiSurface(opts: { path?: string } = {}): StreamSurface<Context> {
+  refuseUnknownNames('aguiSurface', opts, ['path']);
   return {
     path: opts.path ?? '/agents/:name/agui',
     decode(body: any) {
@@ -458,7 +458,11 @@ export function aguiSurface(opts: { path?: string } = {}): StreamSurface<Context
   };
 }
 
+/** Every option createAguiRoute takes in its SECOND argument, held to `CreateAguiRouteOptions` by `pnpm typecheck` below. */
+const AGUI_ROUTE_OPTION_KEYS = doorOptionKeys<CreateAguiRouteOptions>()(['resolveThreadId', 'identify', 'authorize', 'onDecision', 'allowedHosts', 'allowCrossSite', 'protectionsBanner']);
+
 /** The AG-UI route as a fetch handler — mount with `app.mount(path, ...)` on a Hono host. */
 export function createAguiRoute(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}): FetchHandler {
+  refuseMisplacedOptions('createAguiRoute', config, opts, AGUI_ROUTE_OPTION_KEYS, undefined, REMOVED_IDENTITY_OPTIONS);
   return toFetchHandler(aguiRouteApp(config, opts));
 }

@@ -8,6 +8,7 @@
 import { convertToModelMessages } from 'ai';
 import type { UIMessage } from 'ai';
 import { toUIMessageStreamResponse } from './ui-stream.js';
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 
 export interface ChatSurfaceOptions {
   /** Mount path under the REST API. Default `/agents/:name/chat`. */
@@ -15,6 +16,7 @@ export interface ChatSurfaceOptions {
 }
 
 export function chatSurface(opts: ChatSurfaceOptions = {}) {
+  refuseUnknownNames('chatSurface', opts, optionNames<ChatSurfaceOptions>()(['path']));
   return {
     path: opts.path ?? '/agents/:name/chat',
     async decode(body: {

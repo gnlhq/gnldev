@@ -4,6 +4,7 @@
 import { createHmac, createPublicKey, timingSafeEqual, verify as verifySignature, type KeyObject } from 'node:crypto';
 import type { Principal, PrincipalKind } from './types.js';
 import { isPrincipalKind } from './scope.js';
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 
 /** JWT header (only `alg` is used — cross-checked below against the key type to prevent alg-confusion). */
 interface JwtHeader { alg: string; typ?: string; }
@@ -98,6 +99,9 @@ export function jwtFromRequest(req: Request, headerName?: string): string | unde
  * MOVED here, not copied, so a fix to it is a fix everywhere.
  */
 export function verifyJwt(token: string, opts: JwtVerifyOptions, now: number): Principal | null {
+  // Outside the try: a misspelled rule (`isuer`) is the host's mistake, not a bad token to answer null.
+  refuseUnknownNames('verifyJwt', opts, JWT_VERIFY_NAMES);
+  refuseUnknownNames('verifyJwt: claimMap', opts.claimMap, CLAIM_MAP_NAMES);
   try {
     const parts = token.split('.');
     if (parts.length !== 3) return null;
@@ -213,6 +217,7 @@ export function signSubjectToken(
   secret: string,
   opts: { ttlSec?: number; now?: number } = {},
 ): string {
+  refuseUnknownNames('signSubjectToken', opts, SIGN_NAMES);
   if (Buffer.byteLength(secret, 'utf8') < MIN_SUBJECT_SECRET_BYTES) {
     throw new Error(`@gnldev/auth: signSubjectToken needs a secret of at least ${MIN_SUBJECT_SECRET_BYTES} bytes`);
   }
@@ -221,3 +226,7 @@ export function signSubjectToken(
   const input = `${enc({ alg: 'HS256', typ: 'JWT' })}.${enc({ iat: now, ...claims, exp: now + (opts.ttlSec ?? 900) })}`;
   return `${input}.${createHmac('sha256', secret).update(input).digest('base64url')}`;
 }
+
+const JWT_VERIFY_NAMES = optionNames<JwtVerifyOptions>()(['secret', 'publicKey', 'issuer', 'audience', 'claimMap', 'kindOf', 'maxTtlSec', 'onClaims']);
+const CLAIM_MAP_NAMES = optionNames<NonNullable<JwtVerifyOptions['claimMap']>>()(['id', 'roles', 'orgId']);
+const SIGN_NAMES = optionNames<NonNullable<Parameters<typeof signSubjectToken>[2]>>()(['ttlSec', 'now']);

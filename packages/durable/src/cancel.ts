@@ -18,6 +18,8 @@
 import type { Journal } from './journal.js';
 import { runKeys } from './journal.js';
 import { runCanceled } from './outcome.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { CANCEL_RUN_NAMES } from './option-names.js';
 
 /** The cancel flag key — a proc-space record (invisible to the run's timeline), runId-prefixed so
  *  `withOrg` isolates it and run-retention sweeps clean it up with the rest of the run. */
@@ -48,6 +50,7 @@ export class RunCanceledError extends Error {
  * and an outcome saying 'canceled' for a run nothing had actually canceled would be the worse lie.
  */
 export async function cancelAgentRun(journal: Journal, runId: string, opts: { reason?: unknown } = {}): Promise<void> {
+  refuseUnknownNames('cancelAgentRun', opts, CANCEL_RUN_NAMES);
   const record = { at: Date.now(), ...(opts.reason !== undefined ? { reason: opts.reason } : {}) };
   if (journal.putIfAbsent) {
     await journal.putIfAbsent(cancelKey(runId), record); // first cancel wins — idempotent

@@ -1,11 +1,16 @@
 // Public API type helpers — types expressing intent instead of `any` (consumers get these from @gnldev/durable).
 import type { LanguageModelV4 } from '@ai-sdk/provider';
 import type { SemanticIdentity } from './semantic-dup.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { CONFIRM_NAMES, SEMANTIC_IDENTITY_NAMES, TOOL_DURABILITY_NAMES } from './option-names.js';
 
 /** An AI SDK model OR a 'provider/model' string (resolved via the model router). */
 export type ModelInput = LanguageModelV4 | string;
 
-/** Static description text, or undefined when the SDK computes it dynamically (see AnyTool.description). */
+/**
+ * Static description text, or undefined when the SDK computes it dynamically (see AnyTool.description).
+ * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
+ */
 export function toolDescriptionText(t: { description?: unknown } | undefined): string | undefined {
   return typeof t?.description === 'string' ? t.description : undefined;
 }
@@ -179,6 +184,12 @@ export interface AnyTool {
    */
   effectClass?: import('./policy-matrix.js').EffectClass;
   /**
+   * Set by the engine on a delegation tool (`agent_<name>`, createAgentTool): the call hands work to a
+   * child run and does none itself — limits count the child's calls, not the hand-over.
+   * @internal — engine plumbing (agent-tool.ts delegationTool); a host does not set it.
+   */
+  delegation?: true;
+  /**
    * FAZ-7 — read-before-write's framework leg (a LAYER-1 tightening: same-key duplicates; it cannot
    * see a different-args same-intent request — that is the suspend/semantic gates' job). On a FRESH
    * first attempt of a side-effect tool, the engine asks the EXTERNAL system before firing:
@@ -223,7 +234,32 @@ export type ToolDurability = Pick<
  * argument is checked against ToolDurability, so a misspelt option is a compile error rather than a
  * field the runtime silently ignores.
  */
+/**
+ * A key says WHAT the work is; how far it holds is a second decision, and the developer makes it. A
+ * default window decided it for them: `idempotencyKey` alone held for one request, so the same dose asked
+ * for again in the next message was given again (measured, end to end). 'run' is this request only;
+ * 'cross-run' is every request until purged; 'thread' is one conversation.
+ * @internal — engine plumbing (gnlTool, durableTool); the one rule, read where a tool is declared and
+ * again where a plain tool object is wrapped.
+ */
+export function refuseKeyWithoutWindow(where: string, tool: { idempotencyKey?: unknown; idempotencyWindow?: unknown } | undefined, toolName?: string, description?: unknown): void {
+  if (typeof tool?.idempotencyKey !== 'function' || tool.idempotencyWindow !== undefined) return;
+  // Which tool: its name where the engine knows it (durableTool), else its description — gnlTool is
+  // handed the tool before it has a name (the name is its key in the tools object).
+  const name = toolName ? `'${toolName}' `
+    : typeof description === 'string' && description ? `the tool "${description.length > 60 ? `${description.slice(0, 57)}...` : description}" ` : '';
+  throw new TypeError(
+    `@gnldev/durable: ${where}: ${name}has an idempotencyKey but no idempotencyWindow — say how far the key holds. ` +
+      `idempotencyWindow: 'cross-run' — once for every request, until purged (an order, a dose for a slot); ` +
+      `'run' — once in this request only, a new request does it again; 'thread' — once in this conversation.`,
+  );
+}
+
 export function gnlTool<T>(t: T, durability: ToolDurability): T {
+  refuseUnknownNames('gnlTool', durability, TOOL_DURABILITY_NAMES);
+  refuseKeyWithoutWindow('gnlTool', durability, undefined, (t as { description?: unknown } | undefined)?.description);
+  refuseUnknownNames('gnlTool: semanticIdentity', durability?.semanticIdentity, SEMANTIC_IDENTITY_NAMES);
+  if (typeof durability?.confirm === 'object') refuseUnknownNames('gnlTool: confirm', durability.confirm, CONFIRM_NAMES);
   return Object.assign(t as any, durability) as T;
 }
 

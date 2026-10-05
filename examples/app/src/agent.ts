@@ -2,7 +2,7 @@
 // + AgentMemory (per-customer recall + working memory) + processors (PII redaction + moderation) + guard.
 import { tool, stepCountIs } from 'ai';
 import { z } from 'zod';
-import { createGnl, resumeRun } from '@gnldev/durable';
+import { createGnl, resumeRun, STAFF } from '@gnldev/durable';
 import type { Storage } from '@gnldev/durable';
 import { AgentMemory } from '@gnldev/memory';
 import { piiRedactor, moderationProcessor } from '@gnldev/processors';
@@ -74,9 +74,11 @@ export async function buildSupport(storage: Storage, state: AppState) {
     },
   });
 
-  // Resume after approval (continues the suspended refund): the input is read from the journal.
+  // Resume after approval (continues the suspended refund): the input is read from the journal. The
+  // approver is this app's operator, not the customer, so the resume says so (`STAFF`); the run still
+  // acts for the customer it was started for.
   const resume = (runId: string, approvals: Record<string, boolean>) =>
-    resumeRun(runId, { journal, model: supportModel, tools, guard, stopWhen: stepCountIs(8), approvals });
+    resumeRun(runId, { journal, model: supportModel, tools, guard, stopWhen: stepCountIs(8), approvals, caller: STAFF });
 
   return { gnl, memory, resume };
 }

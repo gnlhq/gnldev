@@ -337,7 +337,18 @@ export async function forkRun(
       if (copiedDstKeys.has(dstKey)) continue;
       const e = entryByKey.get(srcKey);
       if (e) {
-        await journal.put(dstKey, e.value);
+        // A mirror of a request-window record (journal.ts runKeys.toolRequest): the fork is a request of
+        // its own, so the record it replays against is copied into the fork's window and the mirror
+        // pointed at it — otherwise the fork finds an empty window and runs the effect again.
+        const mirrorOf = (e.value as { mirrorOf?: unknown } | undefined)?.mirrorOf;
+        const forked = typeof mirrorOf === 'string' ? runKeys.toolRequestIn(mirrorOf, dst) : undefined;
+        if (forked) {
+          const authoritative = await journal.get(mirrorOf as string);
+          if (authoritative !== undefined) await journal.put(forked, authoritative);
+          await journal.put(dstKey, { ...(e.value as object), mirrorOf: forked });
+        } else {
+          await journal.put(dstKey, e.value);
+        }
         copiedDstKeys.add(dstKey);
         copiedTool++;
       }

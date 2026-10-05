@@ -85,7 +85,7 @@ describe('two identical side-effect calls in the same model step', () => {
   });
 
   it("'warn' says the call is RUNNING, because under 'warn' it runs", async () => {
-    // The default action is permissive, and the warning used to borrow the blocking path's sentence:
+    // 'warn' is permissive, and the warning used to borrow the blocking path's sentence:
     // "this concurrent duplicate was NOT EXECUTED". One message, two paths, and on this one the call
     // proceeds immediately afterwards.
     //
@@ -141,7 +141,8 @@ describe('two identical side-effect calls in the same model step', () => {
   it("'warn' is documented as permissive, so it stays permissive — but it warns", async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { chargeCard, charges } = chargeTool();
-    await run('same-warn', { chargeCard });
+    // 'warn' is no longer the default (that is now 'suspend', pinned above); it is asked for explicitly.
+    await run('same-warn', { chargeCard }, { sideEffectDuplicates: 'warn' });
     expect(charges()).toBe(2);
     expect(warn).toHaveBeenCalled();
     warn.mockRestore();

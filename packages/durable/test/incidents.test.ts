@@ -33,11 +33,14 @@ const repeatThenFinish = (n: number) =>
   });
 
 describe('incident journaling', () => {
-  it("default 'warn' duplicate is JOURNALED (not just console) with the verbatim message; replay adds nothing", async () => {
+  it("a 'warn' duplicate is JOURNALED (not just console) with the verbatim message; replay adds nothing", async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const journal = new InMemoryJournal();
     const counter = { runs: 0 };
-    await runDurable({ runId: 'inc-1', journal, model: repeatThenFinish(2), tools: { charge: makeCharge(counter) }, prompt: 'go', stopWhen: stepCountIs(10) });
+    // 'warn' is asked for — the default is now 'suspend' (side-effect-duplicates.test.ts pins it); this
+    // test is about the warn path's message reaching the journal.
+    const limits = { sideEffectDuplicates: 'warn' as const };
+    await runDurable({ runId: 'inc-1', journal, model: repeatThenFinish(2), tools: { charge: makeCharge(counter) }, prompt: 'go', stopWhen: stepCountIs(10), limits });
 
     const incidents = await readIncidents(journal, 'inc-1');
     expect(incidents).toHaveLength(1);
@@ -45,7 +48,7 @@ describe('incident journaling', () => {
     expect(incidents[0].message).toContain('EXECUTE AGAIN'); // the SAME console message, queryable now
 
     // Replay of the completed run: fast-path short-circuits → incident count is stable.
-    await runDurable({ runId: 'inc-1', journal, model: repeatThenFinish(2), tools: { charge: makeCharge(counter) }, prompt: 'go', stopWhen: stepCountIs(10) });
+    await runDurable({ runId: 'inc-1', journal, model: repeatThenFinish(2), tools: { charge: makeCharge(counter) }, prompt: 'go', stopWhen: stepCountIs(10), limits });
     expect(await readIncidents(journal, 'inc-1')).toHaveLength(1);
   });
 

@@ -24,16 +24,15 @@ export const studioCommand: Command = {
       process.exit(1);
     }
     const { loadConfig } = await import('../config.js');
-    const { devMemoryFactory, devStudioMemory } = await import('../memory.js');
-    const { loadDurable, loadStudio, loadStudioAi, loadMemory, loadNodeServer, loadAuth, projectDirOf } = await import('../runtime.js');
+    const { loadDurable, loadStudio, loadStudioAi, loadNodeServer, loadAuth, projectDirOf } = await import('../runtime.js');
     const { resolveAuthProvider } = await import('../dev-server.js');
     const config = await loadConfig(configPath);
     const dir = projectDirOf(configPath);
     const [d, studio, studioAi, { serve }] = await Promise.all([loadDurable(dir), loadStudio(dir), loadStudioAi(dir), loadNodeServer(dir)]);
     const storage = config.storage;
-    const memory = storage ? await loadMemory(dir) : undefined;
-    // Dev default: if storage is present, derive memory → Playground conversations automatically become threads.
-    const gnl = d.createGnl({ ...config, ...(storage ? { memoryFactory: config.memoryFactory ?? devMemoryFactory(memory!) } : {}) });
+    // The config as given, as `gnl dev` runs it (dev-server.ts buildDevApp): no memory store the
+    // deployed app would not have, and Studio's views read the engine's own (`gnl.memory`).
+    const gnl = d.createGnl(config);
     // `gnl dev` has always resolved an auth provider from config/env; this command simply never did,
     // so its admin surface was open regardless of what the operator had configured.
     const provider = await resolveAuthProvider(config, await loadAuth(dir), dir);
@@ -53,7 +52,7 @@ export const studioCommand: Command = {
     const app = studio.createStudioApp({
       reader: storage ? d.toJournal(storage.runs) : (config.journal as any),
       gnl: studio.createStudioRunner(gnl, { ...config, journal: storage ? storage.runs : config.journal }, { toJsonSchema: studioAi.aiToolSchema }),
-      ...(storage ? { memory: devStudioMemory(memory!, storage) } : {}),
+      ...(gnl.memory ? { memory: gnl.memory } : {}),
       auth: provider,
     });
     serve({ fetch: app.fetch, port, hostname: bind.hostname }, (info: { port: number }) => {

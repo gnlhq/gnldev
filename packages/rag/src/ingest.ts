@@ -7,7 +7,12 @@
 // generation, then remove every other generation.
 import { assertRootOutsideOrganizations, orgPrefix, orgStorageScopeOf, vectorWriteBatch, OBSERVATION_VECTOR_KEY } from '@gnldev/durable';
 import { chunkDocuments, DOC_TRAIL_KEY, CHUNK_TRAIL_KEY, GEN_TRAIL_KEY, documentIdPart, type ChunkOptions } from './chunk.js';
-import type { DeleteWhere, Embed, VectorDoc, VectorItem, VectorStore } from './vector-store.js';
+import { embedDocuments, type DeleteWhere, type Embed, type EmbedOptions, type VectorDoc, type VectorItem, type VectorStore } from './vector-store.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { INGEST_DOCUMENTS_OPTS_NAMES, DELETE_DOCUMENTS_OPTS_NAMES } from './option-names.js';
+
+/** How `ingestDocuments` chunks and embeds. */
+export interface IngestOptions extends ChunkOptions, EmbedOptions {}
 
 export interface IngestResult {
   /** Chunks written. */
@@ -132,6 +137,8 @@ function ingestError(id: string, replaced: string[], what: string, cause: unknow
 
 /**
  * Chunks, embeds and indexes `docs` so each document's stored chunks are exactly one version of it.
+ * Embedding runs at most `opts.concurrency` calls at once across all of `docs` (`EmbedOptions`), and
+ * finishes before anything is written: an embed failure leaves every document as it was.
  *
  * Invariant: when this resolves or rejects, each named document holds either all of its new chunks or
  * all of its previous ones — never a mix of two versions, and never nothing unless the new text is
@@ -159,20 +166,27 @@ function ingestError(id: string, replaced: string[], what: string, cause: unknow
  * `rootOutsideOrganizations`; without it this throws before anything changes — give the documents a
  * `namespace`, or make the store honour the flag.
  */
-export async function ingestDocuments(store: VectorStore, embed: Embed, docs: VectorDoc[], opts?: ChunkOptions): Promise<IngestResult> {
+export async function ingestDocuments(store: VectorStore, embed: Embed, docs: VectorDoc[], opts?: IngestOptions): Promise<IngestResult> {
+  refuseUnknownNames('ingestDocuments', opts, INGEST_DOCUMENTS_OPTS_NAMES);
   requireDelete(store, 'ingestDocuments');
   const parts = docs.map((d) => partitionOf(store, d.namespace, 'ingestDocuments'));
   // Every chunk is checked against the one vector write rule BEFORE anything is embedded or written:
   // an id a store cannot hold used to fail at that document's upsert, after the documents before it
   // had already been replaced.
-  const chunked = docs.map((doc) => chunkDocuments([doc], opts));
+  // Only the chunking half goes to chunkDocuments; `concurrency` is this function's.
+  const chunking = opts && { size: opts.size, overlap: opts.overlap, strategy: opts.strategy };
+  const chunked = docs.map((doc) => chunkDocuments([doc], chunking));
   // Checked as the store will see it: an organization's view replaces each chunk's namespace with its
   // own, so a document's `namespace` there is never written and is not the root naming an `org:` one.
   const viewed = orgStorageScopeOf(store) !== undefined;
   vectorWriteBatch(viewed ? chunked.flat().map(({ namespace: _ns, ...c }) => c) : chunked.flat());
+  // One pool over every chunk of every document: the bound is the call's, not a document's.
+  const embedded = await embedDocuments(embed, chunked.flat(), opts);
   const perDoc: VectorItem[][] = [];
+  let at = 0;
   for (const chunks of chunked) {
-    perDoc.push(await Promise.all(chunks.map(async (c) => ({ ...c, embedding: await embed(c.text) }))));
+    perDoc.push(embedded.slice(at, at + chunks.length));
+    at += chunks.length;
   }
   let removed = 0;
   let indexed = 0;
@@ -264,6 +278,7 @@ async function removeOtherGenerations(store: VectorStore, del: Pick<Required<Vec
  * partition rule as `ingestDocuments`. Returns the number of chunks removed.
  */
 export async function deleteDocuments(store: VectorStore, ids: string[], opts?: { namespace?: string }): Promise<number> {
+  refuseUnknownNames('deleteDocuments', opts, DELETE_DOCUMENTS_OPTS_NAMES);
   requireDelete(store, 'deleteDocuments');
   const part = partitionOf(store, opts?.namespace, 'deleteDocuments');
   let removed = 0;

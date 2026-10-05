@@ -10,7 +10,7 @@ import { InMemoryStorage, InMemoryJournal, BasicMemory, withOrgStorage, type Mem
 import { memoryPreset } from '@gnldev/memory';
 import { createStudioApi, type StudioMemory, type StudioMemoryOption } from '@gnldev/studio';
 import * as memoryModule from '@gnldev/memory';
-import { devStudioMemory } from '../src/memory.js';
+import { createGnl } from '@gnldev/durable';
 
 const msgs = (n: number, p = 'm') => Array.from({ length: n }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: `${p}${i}` }));
 type Api = (r: Request) => Promise<Response>;
@@ -24,7 +24,9 @@ const read = async (api: Api, id: string, headers: Record<string, string> = {}) 
 /** Each shipped memory, seeded with one 4-message thread `t1`, and whether it can truncate. */
 const MEMORIES: [string, () => Promise<StudioMemory>, boolean][] = [
   ['AgentMemory (memoryPreset)', async () => { const m = memoryPreset(new InMemoryStorage(), 'chat'); await m.createThread({ id: 't1', resourceId: 'u1' }); await m.append('t1', msgs(4)); return m; }, true],
-  ['devStudioMemory (gnl dev / gnl studio)', async () => { const st = new InMemoryStorage(); const m = devStudioMemory(memoryModule, st); await m.append('t1', msgs(4)); return m; }, true],
+  // What `gnl dev` / `gnl studio` hand Studio: the engine's own memory (`gnl.memory`), resolved from
+  // the config's factory — here the scaffold's `chat` preset.
+  ['the engine\'s memory (gnl dev / gnl studio)', async () => { const st = new InMemoryStorage(); const m = createGnl({ storage: st, memoryFactory: (s: any) => memoryModule.memoryPreset(s, 'chat') } as any).memory as any; await m.append('t1', msgs(4)); return m; }, true],
   ['BasicMemory (@gnldev/durable)', async () => { const m = new BasicMemory(new InMemoryJournal()); await m.append('t1', msgs(4)); return m; }, false],
 ];
 

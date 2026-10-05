@@ -42,6 +42,7 @@ import { argsHash } from './hash.js';
 import { cosine, decodeVec, encodeVec, embedCached } from './semantic-dup.js';
 import type { Journal } from './journal.js';
 import type { ModelInput } from './types.js';
+import { refuseSuggestionsNames } from './option-names.js';
 
 export interface SuggestionsConfig {
   /** May the system PROPOSE lessons after completed runs? Requires `model` and journal listKeys. */
@@ -141,6 +142,7 @@ export const normalizeRule = (v: string): string => v.trim().normalize('NFKC').t
 // ── config-time validation (THROW, not warn — the semantic layer's precedent) ──
 
 export function validateSuggestionsConfig(cfg: SuggestionsConfig, journal: Journal): void {
+  refuseSuggestionsNames(cfg);
   if (typeof cfg.generate !== 'boolean' || typeof cfg.apply !== 'boolean') {
     throw new Error('@gnldev/durable: suggestions requires BOTH switches — `generate` and `apply` — as explicit booleans (the two-switch contract).');
   }
@@ -244,6 +246,7 @@ export interface SuggestionsApi {
 }
 
 export function createSuggestions(journal: Journal, cfg: SuggestionsConfig): SuggestionsApi {
+  refuseSuggestionsNames(cfg);
   const embedCfg = cfg.embed && cfg.embedModelId ? { embed: cfg.embed, embedModelId: cfg.embedModelId } : undefined;
   const minSim = cfg.minSimilarity ?? DEFAULT_MERGE_SIMILARITY;
   const maxInject = cfg.maxInject ?? DEFAULT_MAX_INJECT;

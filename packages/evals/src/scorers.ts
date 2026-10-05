@@ -24,6 +24,8 @@
 // though the output itself is clean.
 import type { Scorer, ScoreSample } from './scorer.js';
 import { llmJudge } from './llm-judge.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { FAITHFULNESS_NAMES, HALLUCINATION_NAMES, ANSWER_RELEVANCY_NAMES, TOXICITY_NAMES, BIAS_NAMES, COMPLETENESS_NAMES, CONTEXT_PRECISION_NAMES, TONE_CONSISTENCY_NAMES } from './option-names.js';
 
 export interface JudgeScorerOptions {
   /** AI SDK model (the judge). */
@@ -94,6 +96,7 @@ const FAITHFULNESS_RUBRIC =
  * DIRECTION: 1.0 = fully faithful (good), 0.0 = not faithful at all (bad).
  */
 export function faithfulness(opts: JudgeScorerOptions): Scorer {
+  refuseUnknownNames('faithfulness', opts, FAITHFULNESS_NAMES);
   const name = opts.name ?? 'faithfulness';
   return requireContext(name, llmJudge({ model: opts.model, name, rubric: FAITHFULNESS_RUBRIC, sampleFields: ['context'] }));
 }
@@ -121,6 +124,7 @@ const HALLUCINATION_RUBRIC =
  * irrelevant.
  */
 export function hallucination(opts: JudgeScorerOptions): Scorer {
+  refuseUnknownNames('hallucination', opts, HALLUCINATION_NAMES);
   const name = opts.name ?? 'hallucination';
   return requireContext(name, llmJudge({ model: opts.model, name, rubric: HALLUCINATION_RUBRIC, sampleFields: ['context'] }));
 }
@@ -140,6 +144,7 @@ const ANSWER_RELEVANCY_RUBRIC =
  * DIRECTION: 1.0 = fully relevant (good), 0.0 = irrelevant (bad).
  */
 export function answerRelevancy(opts: JudgeScorerOptions): Scorer {
+  refuseUnknownNames('answerRelevancy', opts, ANSWER_RELEVANCY_NAMES);
   const name = opts.name ?? 'answer-relevancy';
   return requireInput(name, llmJudge({ model: opts.model, name, rubric: ANSWER_RELEVANCY_RUBRIC, sampleFields: ['input'] }));
 }
@@ -162,6 +167,7 @@ const TOXICITY_RUBRIC =
  * DIRECTION (note, counter-intuitive from the name): 1.0 = NOT toxic (good), 0.0 = very toxic (bad).
  */
 export function toxicity(opts: JudgeScorerOptions): Scorer {
+  refuseUnknownNames('toxicity', opts, TOXICITY_NAMES);
   const name = opts.name ?? 'toxicity';
   return llmJudge({ model: opts.model, name, rubric: TOXICITY_RUBRIC, sampleFields: [] });
 }
@@ -184,6 +190,7 @@ const BIAS_RUBRIC =
  * (bad).
  */
 export function bias(opts: JudgeScorerOptions): Scorer {
+  refuseUnknownNames('bias', opts, BIAS_NAMES);
   const name = opts.name ?? 'bias';
   return llmJudge({ model: opts.model, name, rubric: BIAS_RUBRIC, sampleFields: [] });
 }
@@ -202,6 +209,7 @@ const COMPLETENESS_RUBRIC =
  * DIRECTION: 1.0 = complete (good), 0.0 = substantially incomplete (bad).
  */
 export function completeness(opts: JudgeScorerOptions): Scorer {
+  refuseUnknownNames('completeness', opts, COMPLETENESS_NAMES);
   const name = opts.name ?? 'completeness';
   return requireInput(name, llmJudge({ model: opts.model, name, rubric: COMPLETENESS_RUBRIC, sampleFields: ['input'] }));
 }
@@ -224,6 +232,7 @@ const CONTEXT_PRECISION_RUBRIC =
  * DIRECTION: 1.0 = the retrieved context is fully relevant (good), 0.0 = entirely noise (bad).
  */
 export function contextPrecision(opts: JudgeScorerOptions): Scorer {
+  refuseUnknownNames('contextPrecision', opts, CONTEXT_PRECISION_NAMES);
   const name = opts.name ?? 'context-precision';
   return requireContext(name, llmJudge({ model: opts.model, name, rubric: CONTEXT_PRECISION_RUBRIC, sampleFields: ['input', 'context'] }));
 }
@@ -238,6 +247,7 @@ export function contextPrecision(opts: JudgeScorerOptions): Scorer {
  * deviates from the expected tone (bad).
  */
 export function toneConsistency(opts: ToneConsistencyOptions): Scorer {
+  refuseUnknownNames('toneConsistency', opts, TONE_CONSISTENCY_NAMES);
   const name = opts.name ?? 'tone-consistency';
   const rubric =
     'You are a tone-consistency judge. You will be given an OUTPUT. Your task: evaluate whether the ' +

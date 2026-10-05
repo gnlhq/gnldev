@@ -11,6 +11,8 @@ import { cosineSimilarity } from 'ai';
 import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorItemCopy, vectorInOrganization } from '@gnldev/durable';
 import { matchesFilter } from './vector-store.js';
 import type { VectorStore, VectorItem, VectorMatch, QueryOptions, DeleteWhere } from './vector-store.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { GRAPH_RAG_NAMES, QUERY_NAMES } from './option-names.js';
 
 export interface GraphRagOptions {
   /** Edge threshold: two chunks become neighbors in the graph if their cosine similarity exceeds this. Default 0.75. */
@@ -41,6 +43,7 @@ export class GraphRag implements VectorStore {
   private readonly seeds: number;
 
   constructor(opts: GraphRagOptions = {}) {
+    refuseUnknownNames('GraphRag', opts, GRAPH_RAG_NAMES);
     this.threshold = opts.threshold ?? 0.75;
     this.hops = opts.hops ?? 1;
     this.decay = opts.decay ?? 0.7;
@@ -129,6 +132,7 @@ export class GraphRag implements VectorStore {
    *   query(q, 5, { namespace: 'does-not-exist' })  ->  2 rows
    */
   async query(embedding: number[], topK: number, opts?: QueryOptions): Promise<VectorMatch[]> {
+    refuseUnknownNames('query', opts, QUERY_NAMES);
     const scope = vectorQueryScope(opts);
     if (this.items.length === 0 || scope.none) return [];
     // Narrow FIRST, then score. Scoring an item this caller may not see and discarding it later would

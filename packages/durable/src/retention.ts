@@ -2,7 +2,7 @@
 // journal's append-only philosophy — only for legal deletion (PII purge) and retention sweeps.
 // Requires the `deletePrefix` port (InMemory/Sqlite/Postgres adapters provide it); otherwise
 // throws a clear error.
-import { runKeys, summarizeRun, nestedAgentRunId, runIdOfKey } from './journal.js';
+import { runKeys, summarizeRun, nestedAgentRunId, runIdOfKey, executedHere } from './journal.js';
 import { identityOnlyInput } from './run.js';
 import { workKeyHash } from './hash.js';
 import { MEM_LEAVES, OM_LEAVES, memKey, readJournalLogDated, semanticLogKey, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX } from './memory.js';
@@ -14,7 +14,7 @@ import type { Journal, JournalReader } from './journal.js';
 /** What sweepRuns needs off a `:input` record: the freeze stamp, plus whatever identityOnlyInput reads. */
 type FrozenInputLike = { at?: number } & Record<string, unknown>;
 import type { WorkStore, VectorStore } from './storage.js';
-import { VECTOR_ALL_PARTITIONS, assertRootOutsideOrganizations } from './storage.js';
+import { VECTOR_ALL_PARTITIONS, assertRootOutsideOrganizations, portOf } from './storage.js';
 import { getRunCost } from './cost.js';
 import { metricsRunKey, metricsDoneKey, metricsScoresDoneKey } from './metrics.js';
 import { USAGE_KEY, usageCountedKey } from './budget.js';
@@ -23,6 +23,8 @@ import type { LogItem } from './durable-log.js';
 import { createPollLoop } from './polling.js';
 import { orgPrefix, isOrganizationKey } from './organization.js';
 import type { PollLoop } from './polling.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { LOG_SWEEP_TARGET_NAMES, PURGE_RESOURCE_NAMES, PURGE_RUN_NAMES, RETENTION_SWEEPER_NAMES, SWEEP_LOG_NAMES, SWEEP_RUNS_NAMES, SWEEP_THREADS_NAMES } from './option-names.js';
 
 function requireDelete(journal: Journal): NonNullable<Journal['deletePrefix']> {
   if (typeof journal.deletePrefix !== 'function') {
@@ -277,6 +279,7 @@ export async function purgeRun(
     ownershipTrace?: boolean;
   } = {},
 ): Promise<number> {
+  refuseUnknownNames('purgeRun', opts, PURGE_RUN_NAMES);
   const del = requireDelete(journal);
   if (seen.has(runId)) return 0; // cycle/repeat safety
   seen.add(runId);
@@ -298,6 +301,14 @@ export async function purgeRun(
   if (typeof rr === 'function') {
     for (const e of await rr.call(journal, runId)) {
       if (e.kind !== 'tool') continue;
+      // A request-window record this run EXECUTED (journal.ts ranBy) holds this run's output under the
+      // request's family: erasing the run erases it (measured: purging a sub-agent left its output, a
+      // person's data, behind). A record another run executed is that run's; cross-run and thread
+      // records are shared by design and have their own erasure (deletePrefix / purgeThread).
+      const v = e.value as { mirrorOf?: string; ranBy?: { runId: string; toolCallId: string } } | undefined;
+      if (executedHere(v, runId, e.key.slice(e.key.lastIndexOf(':tool:') + ':tool:'.length))) {
+        total += await deleteExactKey(journal, v!.mirrorOf!);
+      }
       const tcid = e.key.slice(e.key.lastIndexOf(':tool:') + ':tool:'.length);
       // Both KINDS of nested run (sub-agent and workflow-as-tool) in both SHAPES: the parent-scoped id
       // they use now, and the bare legacy one still in journals written before it was scoped — a purge
@@ -323,6 +334,9 @@ export async function purgeRun(
   }
 
   total += await purgeOwnNamespace(journal, runId);
+  // The request's own window (`xreq:<runId>:args-…`), when this run started one: every record its tree
+  // deduped against. `args-` closes the prefix — run 'a' must not reach run 'a:b''s request.
+  total += await del(runKeys.toolRequestPrefix(runId));
   // MEASURED, on both InMemoryJournal and SqliteStorage: `del('mem-appended:r-1')` also removed
   // `mem-appended:r-10`. These two keys are the one family here that ends where the runId ends —
   // every other delete in this function carries a trailing ':' and therefore cannot run past its own
@@ -482,6 +496,7 @@ export async function purgeResource(
     outsideOrganizations?: boolean;
   } = {},
 ): Promise<number> {
+  refuseUnknownNames('purgeResource', opts, PURGE_RESOURCE_NAMES);
   const del = requireDelete(journal);
   if (opts.vectors && typeof opts.vectors.delete !== 'function') {
     throw new Error('@gnldev/durable: purgeResource was given a vector store that cannot delete, so this person\'s documents cannot be erased');
@@ -696,7 +711,8 @@ export async function purgeThread(journal: Journal, threadId: string): Promise<n
  * an erasure runbook promised something the framework could not do; answering "deleted nothing"
  * with a success would recreate exactly that problem in a quieter form.
  */
-export async function purgeOrganizationWork(work: WorkStore, orgId: string): Promise<number> {
+export async function purgeOrganizationWork(workArg: WorkStore, orgId: string): Promise<number> {
+  const work = portOf(workArg, 'work', 'purgeOrganizationWork');
   const prefix = orgPrefix(orgId); // refuses '' (which would sweep `org::`) and a ':'-bearing id
   if (typeof work.deletePrefix !== 'function') {
     throw new Error(
@@ -863,6 +879,7 @@ export async function isRealRun(journal: Journal, runId: string): Promise<boolea
  * Requires a reader (listRuns/readRun) + deletePrefix.
  */
 export async function sweepRuns(journal: Journal & Partial<JournalReader>, opts: SweepOptions): Promise<SweepResult> {
+  refuseUnknownNames('sweepRuns', opts, SWEEP_RUNS_NAMES);
   requireDelete(journal);
   if (typeof journal.listRuns !== 'function' || typeof journal.readRun !== 'function') {
     throw new Error("@gnldev/durable: sweepRuns requires a journal read surface (listRuns/readRun)");
@@ -997,6 +1014,7 @@ export interface LogSweepResult {
  * Safe side: entries without/with malformed `at` are not deleted (counted in keptNoTs).
  */
 export async function sweepLog(journal: Journal, ns: string, opts: LogSweepOptions): Promise<LogSweepResult> {
+  refuseUnknownNames('sweepLog', opts, SWEEP_LOG_NAMES);
   const del = requireDelete(journal);
   const list = requireListKeys(journal);
   const now = opts.now ?? Date.now();
@@ -1248,6 +1266,7 @@ export async function listOrphanThreadState(journal: Journal): Promise<OrphanThr
  *    So erase people BEFORE their runs age out, or carry the thread ids yourself.
  */
 export async function sweepThreads(journal: Journal, opts: ThreadSweepOptions): Promise<ThreadSweepResult> {
+  refuseUnknownNames('sweepThreads', opts, SWEEP_THREADS_NAMES);
   requireDelete(journal);
   const list = requireListKeys(journal);
   const now = opts.now ?? Date.now();
@@ -1352,6 +1371,9 @@ export function createRetentionSweeper(
   journal: Journal & Partial<JournalReader>,
   opts: RetentionSweeperOptions,
 ): RetentionSweeper {
+  refuseUnknownNames('createRetentionSweeper', opts, RETENTION_SWEEPER_NAMES);
+  refuseUnknownNames('createRetentionSweeper: sweep', opts.sweep, SWEEP_RUNS_NAMES);
+  for (const t of [opts.logSweep ?? []].flat()) refuseUnknownNames('createRetentionSweeper: logSweep', t, LOG_SWEEP_TARGET_NAMES);
   const intervalMs = opts.intervalMs ?? 60 * 60_000;
   const logTargets = opts.logSweep ? (Array.isArray(opts.logSweep) ? opts.logSweep : [opts.logSweep]) : [];
 

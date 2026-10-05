@@ -5,13 +5,15 @@
 // loadContext runs BEFORE persistInput, so the whole context freezes into `:input` = replayable.
 import { cosineSimilarity } from 'ai';
 import { requireCapability, durableProcessorStep, workingMemoryScope, OM_LEAVES, OM_VECTOR_SOURCE, OBSERVATION_VECTOR_KEY, type OmLeaf } from '@gnldev/durable';
-import { threadOwnerOf, toJournal, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, VECTOR_PARTITION, assertRootThreadId, assertRootOutsideOrganizations, type Memory } from '@gnldev/durable';
+import { threadOwnerOf, threadRecordOwner, toJournal, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, VECTOR_PARTITION, assertRootThreadId, assertRootOutsideOrganizations, type Memory } from '@gnldev/durable';
 import { PROVENANCE_RECENT_CAP, messagePreview } from '@gnldev/durable';
 import type { Storage, RunJournal, MemoryStore, MessageRecord, MessageAppend, ThreadRecord, RecallOptions, MemoryContextProvenance, RecalledMessageRef } from '@gnldev/durable';
 import { messageText, hasNorm, type Embed } from './keys.js';
 import { deepMerge } from './deep-merge.js';
 import { createWorkingMemoryTool, renderWorkingMemorySystem, type WorkingMemoryConfig } from './working-memory.js';
 import { observe, reflect, approxTokens, resolveModel, type ObservationalMemoryConfig, type Observation, type OmRecallMatch } from './observational.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { MEMORY_CONFIG_NAMES, refuseMemoryBagNames, GET_MESSAGES_NAMES, LOAD_CONTEXT_NAMES, RECALL_OBSERVATIONS_NAMES, CREATE_THREAD_NAMES, UPDATE_THREAD_NAMES, CLONE_THREAD_NAMES } from './option-names.js';
 
 export type { ThreadRecord, RecallOptions };
 
@@ -125,6 +127,8 @@ export class AgentMemory implements Required<Memory> {
   protected titleGen?: (firstUserText: string) => Promise<string | undefined>;
 
   constructor(config: MemoryConfig) {
+    refuseUnknownNames('AgentMemory', config, MEMORY_CONFIG_NAMES);
+    refuseMemoryBagNames('AgentMemory', config);
     requireCapability(config.storage, 'memory');
     this.storage = config.storage;
     this.runs = config.storage.runs;
@@ -350,6 +354,7 @@ export class AgentMemory implements Required<Memory> {
 
   /** Track 1: last N + query-based topK recall. */
   async getMessages(threadId: string, opts?: { query?: string; resourceId?: string; scope?: 'thread' | 'resource' }): Promise<any[]> {
+    refuseUnknownNames('getMessages', opts, GET_MESSAGES_NAMES);
     this.scoped(threadId);
     return (await this.composeTrack1(threadId, opts)).messages;
   }
@@ -501,10 +506,14 @@ export class AgentMemory implements Required<Memory> {
 
   /** Rich context hook (run.ts feature-detects it). */
   async loadContext(threadId: string, opts: { query?: string; resourceId?: string; incoming?: any[] }): Promise<LoadedContext> {
+    refuseUnknownNames('loadContext', opts, LOAD_CONTEXT_NAMES);
     this.scoped(threadId);
-    if (opts.resourceId) {
+    // Every thread a run touches is indexed, so it is listed (Studio's thread list). A run with no
+    // resource indexes it with resourceId '' — the column is NOT NULL — and '' names nobody
+    // (`threadRecordOwner`), so ownership reads exactly as if the entry did not exist.
+    {
       const fu = (opts.incoming ?? []).find((m: any) => m?.role === 'user');
-      await this.ensureThreadIndexed(threadId, opts.resourceId, fu ? messageText(fu) : undefined);
+      await this.ensureThreadIndexed(threadId, opts.resourceId ?? '', fu ? messageText(fu) : undefined);
     }
     let messages: any[];
     const provenance: MemoryContextProvenance = { recalled: [], recentCount: 0 };
@@ -727,6 +736,7 @@ export class AgentMemory implements Required<Memory> {
    * indexing) is silently skipped rather than fabricating a partial match.
    */
   async recallObservationsSemantic(threadId: string, query: string, opts?: { topK?: number; threshold?: number }): Promise<OmRecallMatch[]> {
+    refuseUnknownNames('recallObservationsSemantic', opts, RECALL_OBSERVATIONS_NAMES);
     this.scoped(threadId);
     const q = query.trim();
     if (!q) return [];
@@ -844,9 +854,10 @@ export class AgentMemory implements Required<Memory> {
   // ── Track 3: thread + resource management ─────────────────────────────────────
   async getThreadResource(threadId: string): Promise<string | undefined> {
     this.scoped(threadId);
-    return (await this.store.getThread(threadId))?.resourceId;
+    return threadRecordOwner(await this.store.getThread(threadId));
   }
   async createThread(input: { id?: string; resourceId: string; title?: string; metadata?: Record<string, unknown> }): Promise<ThreadRecord> {
+    refuseUnknownNames('createThread', input, CREATE_THREAD_NAMES);
     const id = this.scoped(input.id ?? genId('th'));
     const now = Date.now();
     const rec: ThreadRecord = { id, resourceId: input.resourceId, title: input.title, metadata: input.metadata, createdAt: now, updatedAt: now };
@@ -862,6 +873,8 @@ export class AgentMemory implements Required<Memory> {
   /** A resource's threads (createdAt ASC — parity). */
   /** Newest conversation first (createdAt DESC) — the thread-list contract Studio's sidebar renders as-is. */
   async listThreads(opts: { resourceId: string }): Promise<ThreadRecord[]> {
+    // '' names nobody: it is not a user whose list would be the ownerless threads.
+    if (!opts.resourceId) return [];
     const page = await this.store.listThreads({ resourceId: opts.resourceId, limit: HUGE });
     return page.items.sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id));
   }
@@ -871,6 +884,7 @@ export class AgentMemory implements Required<Memory> {
       .sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id));
   }
   async updateThread(threadId: string, patch: { title?: string; metadata?: Record<string, unknown> }): Promise<ThreadRecord> {
+    refuseUnknownNames('updateThread', patch, UPDATE_THREAD_NAMES);
     this.scoped(threadId);
     const rec = await this.store.getThread(threadId);
     if (!rec) throw new Error(`thread '${threadId}' does not exist`);
@@ -884,10 +898,11 @@ export class AgentMemory implements Required<Memory> {
   }
   /** COPY a thread (messages/WM/OM) into a new thread (common thread-clone semantics + ancestry). */
   async cloneThread(srcThreadId: string, opts: { newThreadId?: string; resourceId?: string } = {}): Promise<ThreadRecord> {
+    refuseUnknownNames('cloneThread', opts, CLONE_THREAD_NAMES);
     this.scoped(srcThreadId);
     if (opts.newThreadId !== undefined) this.scoped(opts.newThreadId);
     const src = await this.store.getThread(srcThreadId);
-    const resourceId = opts.resourceId ?? src?.resourceId ?? 'default';
+    const resourceId = opts.resourceId ?? threadRecordOwner(src) ?? 'default';
     const dst = opts.newThreadId ?? genId('th');
     const msgs = (await this.store.getMessages(srcThreadId, { limit: HUGE })).items;
     if (msgs.length) await this.store.appendMessages(dst, msgs.map((m) => ({ ...m, threadId: dst })));
@@ -911,7 +926,12 @@ export class AgentMemory implements Required<Memory> {
   /** Minimal record + optional title for an implicit thread (run without calling createThread). */
   protected async ensureThreadIndexed(threadId: string, resourceId: string, firstText?: string): Promise<void> {
     const existing = await this.store.getThread(threadId);
-    if (existing) return;
+    if (existing) {
+      // An ownerless entry takes its owner the first time a run with one continues the thread; whether
+      // that run may, the gate (`admitThreadRun`) already decided.
+      if (!threadRecordOwner(existing) && resourceId) await this.store.upsertThread({ ...existing, resourceId, updatedAt: Date.now() });
+      return;
+    }
     const now = Date.now();
     const title = firstText ? firstText.replace(/\s+/g, ' ').trim().slice(0, 80) : undefined;
     // No owner record here: this runs inside a run, whose gate (`admitThreadRun`) already wrote it.

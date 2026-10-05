@@ -4,6 +4,8 @@ import {
   redactString, redactMessages, applyRedactions, compileRedactions, PII_PATTERNS,
   type PiiType, type PiiPattern,
 } from './redact.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { PII_REDACTOR_NAMES, PII_TEXT_REDACTOR_NAMES } from './option-names.js';
 
 export interface PiiRedactorOptions {
   /** Which PII types to mask (default: all). */
@@ -106,6 +108,7 @@ function assertUsablePatterns(types: PiiType[], extra: PiiPattern[]): void {
 export function piiTextRedactor(
   opts: Pick<PiiRedactorOptions, 'types' | 'mask' | 'extraPatterns' | 'validate'> = {},
 ): (text: string) => string {
+  refuseUnknownNames('piiTextRedactor', opts, PII_TEXT_REDACTOR_NAMES);
   const types = opts.types ?? DEFAULT_TYPES;
   const mask = opts.mask ?? DEFAULT_MASK;
   const extra = opts.extraPatterns ?? [];
@@ -387,6 +390,7 @@ function countInputRedactions(
  * use `on: 'input'` (or `runDurable`) if the wire itself must never carry it.
  */
 export function piiRedactor(opts: PiiRedactorOptions = {}): Processor {
+  refuseUnknownNames('piiRedactor', opts, PII_REDACTOR_NAMES);
   const types = opts.types ?? DEFAULT_TYPES;
   const mask = opts.mask ?? DEFAULT_MASK;
   const extra = opts.extraPatterns ?? [];

@@ -162,7 +162,9 @@ describe('fan-out spend after the parent keeps working', () => {
     // A ceiling high enough that the run completes — the point is what is VISIBLE afterwards.
     await runDurable({
       runId: 'fan-1', journal, model: parentModel, tools: { agent_expert: expert, noop },
-      prompt: 'delegate', stopWhen: stepCountIs(12), limits: { maxCostUsd: 1000 },
+      // The default duplicate ladder is now 'suspend'; the parent's repeated noop calls are what this
+      // test needs, so the ladder stays at 'warn' — the subject is the fan-out spend, not duplicates.
+      prompt: 'delegate', stopWhen: stepCountIs(12), limits: { maxCostUsd: 1000, sideEffectDuplicates: 'warn' },
     } as never);
     expect(step, 'the parent should have kept working after the hand-off').toBeGreaterThan(5);
 

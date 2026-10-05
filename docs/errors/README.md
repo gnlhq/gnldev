@@ -88,11 +88,13 @@ re-drive the **same** runId, and the journal replays what already completed.
 ## A name the caller's scope may not use
 
 The caller named an id its scope cannot name — `RESERVED_ID_ERROR_CODES` in `@gnldev/durable`, where
-the error is thrown. Every door (REST, Studio, chat, AG-UI) answers it through `reservedIdFailure`.
+the error is thrown. Every door (REST, Studio, chat, AG-UI) answers it through `requestRefusal`.
 
 | Code | Status | In one line |
 | --- | --- | --- |
 | [`thread_id_reserved`](./thread_id_reserved.md) | 400 | A root-scope request named a thread under `org:`, the organizations' reserved id space. |
+| [`invalid_json`](./invalid_json.md) | 400 | The request body is not a JSON object. |
+| [`caller_system_message`](./caller_system_message.md) | 400 | A request's `messages` included a `system` one. |
 
 ## Written at the HTTP edge
 

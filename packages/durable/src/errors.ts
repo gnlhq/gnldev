@@ -230,7 +230,7 @@ export class IdempotencyOwnerMismatchError extends Error {
   readonly code = 'idempotency_owner_mismatch';
   constructor(
     message: string,
-    public readonly detail: { toolName: string },
+    public readonly detail: { toolName: string; ownerRecordStatus?: string },
   ) {
     super(message);
     this.name = 'IdempotencyOwnerMismatchError';
@@ -400,6 +400,18 @@ export function publicConflictDetail(detail: unknown): unknown {
   return out;
 }
 
+/**
+ * A caller-conflict error as every door answers it: its code, its sentence, its detail with every
+ * foreign party removed, and whether it is an OWNERSHIP refusal (which a door records as a refusal).
+ * One reading, so a door cannot answer the family and forget the refusal, or the reverse.
+ */
+export function callerConflictAnswer(err: unknown): { code: CallerConflictCode; error: string; detail: unknown; ownership: boolean } | undefined {
+  const code = callerConflictCode(err);
+  if (!code) return undefined;
+  const e = err as { message?: unknown; detail?: unknown };
+  return { code, error: typeof e.message === 'string' ? e.message : String(err), detail: publicConflictDetail(e.detail), ownership: OWNERSHIP_CONFLICT_CODES.includes(code) };
+}
+
 /** Name-matched like blockedErrorCode below (dist/src class-identity resilience). */
 export function callerConflictCode(err: unknown): CallerConflictCode | undefined {
   const name = (err as { name?: unknown } | null | undefined)?.name;
@@ -498,15 +510,27 @@ export const LIMIT_ERROR_CODES = {
  * door met the error as whatever its catch-all said: Studio's thread reads answered 500, Studio's
  * PATCH/DELETE and the chat and AG-UI routes 400 with no `code`. The error is thrown here, in the
  * package every door depends on, so the code and its status live with it (ADR-0002 point 0, as for
- * `LIMIT_ERROR_CODES`) and each door renders `reservedIdFailure(e)` in one line.
+ * `LIMIT_ERROR_CODES`) and each door renders `requestRefusal(e)` in one line.
  */
 export const RESERVED_ID_ERROR_CODES = {
   ReservedThreadIdError: 'thread_id_reserved',
 } as const;
 
-/** The response every door gives a reserved-id refusal: status, and the body to send. Name-matched like `blockedErrorCode`. */
-export function reservedIdFailure(err: unknown): { status: 400; body: { error: string; code: 'thread_id_reserved'; detail: { threadId: string } } } | undefined {
+/** A request whose shape is wrong before anything reads its fields (request-body.ts readJsonObject). */
+export const REQUEST_ERROR_CODES = {
+  invalidJson: 'invalid_json',
+  callerSystemMessage: 'caller_system_message',
+} as const;
+
+/**
+ * The 400 every door gives a request the ENGINE refused for what it carried, before any work: a reserved
+ * thread id (`ReservedThreadIdError`), or a system message the caller sent (`CallerSystemMessageError`,
+ * thrown by `run()`/`stream()` for a call that came through a door — request-body.ts). Name-matched like
+ * `blockedErrorCode`, so it reads an error from any copy of the package.
+ */
+export function requestRefusal(err: unknown): { status: 400; body: { error: string; code: 'thread_id_reserved' | 'caller_system_message'; detail?: { threadId: string } } } | undefined {
   const e = err as { name?: unknown; message?: unknown; threadId?: unknown } | null | undefined;
+  if (e?.name === 'CallerSystemMessageError') return { status: 400, body: { error: String(e.message), code: REQUEST_ERROR_CODES.callerSystemMessage } };
   if (e?.name !== 'ReservedThreadIdError') return undefined;
   return {
     status: 400,
@@ -612,6 +636,9 @@ const WIRE_STATUS_BY_CODE = {
   upstream_timeout: 504,
   // reserved id — the caller named what its scope may not name; change the id
   thread_id_reserved: 400,
+  // request shape — the body is not a JSON object (readJsonObject); fix the request
+  invalid_json: 400,
+  caller_system_message: 400,
 } as const;
 /** A code with a pinned HTTP status. */
 export type WireErrorCode = keyof typeof WIRE_STATUS_BY_CODE;

@@ -96,6 +96,7 @@ describe('reconstructState — args-mode tool with a CUSTOM idempotencyKey (char
     return {
       idempotency: 'args' as const,
       idempotencyKey: (args: any) => String(args.orderId), // dedup by orderId, NOT the full args
+      idempotencyWindow: 'run' as const, // this test is about one run and its fork
       execute: async ({ orderId, amount }: any) => ({ charged: amount, orderId, receipt: `rcpt_${orderId}` }),
     };
   }
@@ -147,7 +148,7 @@ describe.each([
   ['InMemory', () => new InMemoryJournal()],
   ['Sqlite', () => new SqliteStorage(':memory:').runs],
 ])('forkRun — args-mode tool record, %s', (_name, make) => {
-  it('the args-keyed record (not a toolCallId-keyed one) is copied to the fork; fork resume does NOT re-execute the tool', async () => {
+  it('the request-window record is copied into the fork\'s own window; fork resume does NOT re-execute the tool', async () => {
     const journal = make() as any;
     const charges = { n: 0 };
     const tools = () => ({ charge: { idempotency: 'args' as const, execute: async () => ({ charged: (charges.n++, 20) }) } });
@@ -166,8 +167,11 @@ describe.each([
     // carries the RAW JSON-string form) — argsHash must be computed over the parsed object to match
     // the key durable-tool.ts actually wrote.
     const hash = argsHash({ amount: 20 });
-    expect(await journal.get(`fork-args-1:tool:args-charge-${hash}`)).toBeDefined(); // args-keyed record WAS copied
-    expect(await journal.get('fork-args-1:tool:call-c')).toBeUndefined(); // no toolCallId-keyed copy exists (never written in args mode)
+    // The record is the REQUEST's (`xreq:<runId>:args-…`, journal.ts runKeys.toolRequest); the run keeps a
+    // mirror under its own toolCallId. A fork is a request of its own: it gets its own window record,
+    // and its mirror points there.
+    expect(await journal.get(`xreq:fork-args-1:args-charge-${hash}`)).toBeDefined();
+    expect((await journal.get('fork-args-1:tool:call-c'))?.mirrorOf).toBe(`xreq:fork-args-1:args-charge-${hash}`);
     expect(await journal.get('fork-args-1:model:0')).toBeDefined();
     expect(await journal.get('fork-args-1:model:1')).toBeUndefined();
 

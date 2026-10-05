@@ -113,6 +113,11 @@ environment. An assistant embedded on other sites with no sign-in is one line to
 `createAguiRoute(…, { allowCrossSite: true, allowedHosts: ['assist.example.com'] })` — `allowCrossSite`
 lifts the cross-site check only. A request `identify` resolved a caller for gets neither check.
 
+**Its protections, printed when it is built.** `createAguiRoute` prints a short block — whether callers are named
+(`identify`), which hosts an anonymous caller may use (`allowedHosts`), whether other sites may call it
+(`allowCrossSite`) — as `createRestApi` prints its own matrix — to standard error, never standard output; `protectionsBanner: false` silences it.
+An option given in the config (first argument) instead of the options is refused by name, not ignored.
+
 ## Who is calling? (`identify`)
 
 This route declares auth out of scope, and that boundary is right. What it leaves you responsible for

@@ -17,6 +17,7 @@
 // The ways through are the same everywhere: `allowedHosts` / GNL_ALLOWED_HOSTS for the host rule;
 // `allowCrossSite: true` — a surface other sites embed, such as a public chat widget — for the cross-site
 // check alone; or a credential the surface resolves to a caller, for both.
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 import type { Principal } from './types.js';
 import { isCrossSiteStateChange, isHostAllowed, hostnameOf, allowedHostEntry, readAllowedHosts, crossSiteRefusedMessage } from './same-site.js';
 import { carriesIdentity } from './adapter.js';
@@ -43,6 +44,7 @@ const SESSION_NAME_DOMAINS = ['ngrok-free.app', 'ngrok-free.dev', 'ngrok.app', '
  * name no identity (a pair is refused too: a predicate is opaque, and a rebound page is same-origin, so it
  * may send any header, a token-shaped one included). `opts.door` is set by a standalone door, for a request
  * its `identify` resolved no principal for (`'createChatRoute'`), and names where its `allowedHosts` goes.
+ * @internal — door plumbing shared by the GNL doors; gnl builds its argument, no host writes it.
  */
 export function hostNotAllowedMessage(hostname: string, opts: { auth?: HostRuleAuth; door?: string } = {}): string {
   const suffix = SESSION_NAME_DOMAINS.find((d) => hostname.endsWith(`.${d}`));
@@ -157,6 +159,7 @@ function crossSiteWay(surface: OpenSurface): string {
  * can never match throws there, naming the fix.
  */
 export function openSurfaceGuard(opts: OpenSurfaceGuardOptions): (req: Request, principal: Principal | null | undefined) => OpenSurfaceRefusal | undefined {
+  refuseUnknownNames('openSurfaceGuard', opts, OPEN_SURFACE_GUARD_NAMES);
   const allowed = hostAllowList(opts.allowedHosts);
   const { surface } = opts;
   let warnedHost = false;
@@ -192,3 +195,5 @@ function refuse(req: Request, r: Omit<OpenSurfaceRefusal, 'status'>): OpenSurfac
   markRefusal(req, 'policy', { detail: r.code });
   return { status: AUTH_ERROR_STATUS[r.code]!, ...r };
 }
+
+const OPEN_SURFACE_GUARD_NAMES = optionNames<OpenSurfaceGuardOptions>()(['surface', 'allowedHosts', 'allowCrossSite']);

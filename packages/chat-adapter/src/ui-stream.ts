@@ -18,6 +18,7 @@
 import { createUIMessageStreamResponse } from 'ai';
 import type { AsyncIterableStream, StreamTextResult, UIMessage, UIMessageChunk, UIMessageStreamOptions } from 'ai';
 import { maskSentinelOutput } from './sentinel-mask.js';
+import { refuseMisspelledNames, optionNames } from '@gnldev/options';
 
 /** A `data-gnl-interrupt` chunk's payload — one entry per newly-masked suspend in this transform call.
  * FAZ-2: `runId` (when the caller provided one) is the approval ADDRESS — without it the client's
@@ -71,6 +72,15 @@ function maskSentinelChunks(runId?: string): TransformStream<UIMessageChunk, UIM
   });
 }
 
+const UI_STREAM_NAMES = optionNames<UIMessageStreamOptions<UIMessage> & { runId?: string }>()([
+  'originalMessages', 'generateMessageId', 'onEnd', 'onFinish', 'messageMetadata', 'sendReasoning', 'sendSources', 'sendFinish',
+  'sendStart', 'onError', 'runId',
+]);
+const UI_RESPONSE_NAMES = optionNames<ToUIMessageStreamResponseOptions<UIMessage>>()([
+  'originalMessages', 'generateMessageId', 'onEnd', 'onFinish', 'messageMetadata', 'sendReasoning', 'sendSources', 'sendFinish',
+  'sendStart', 'onError', 'runId', 'consumeSseStream', 'headers', 'status', 'statusText',
+]);
+
 /**
  * Thin wrapper over `result.toUIMessageStream()` with the sentinel-masking transform ALWAYS applied.
  * `result` is whatever `gnl.stream()`/`streamDurable` returns (a real AI SDK `StreamTextResult` under a
@@ -80,6 +90,8 @@ export function toUIMessageStream<UI_MESSAGE extends UIMessage = UIMessage>(
   result: Pick<StreamTextResult<any, any, any>, 'toUIMessageStream'>,
   opts?: UIMessageStreamOptions<UI_MESSAGE> & { runId?: string },
 ): AsyncIterableStream<UIMessageChunk> {
+  // The rest goes on to the AI SDK: a misspelling of a known name is refused, a newer SDK's name passes.
+  refuseMisspelledNames('toUIMessageStream', opts, UI_STREAM_NAMES);
   // FAZ-2: `runId` is OURS (stamped onto interrupt chunks), not the AI SDK's — split it off before
   // handing the rest to the native stream builder.
   const { runId, ...native } = opts ?? {};
@@ -114,6 +126,7 @@ export function toUIMessageStreamResponse<UI_MESSAGE extends UIMessage = UIMessa
   result: Pick<StreamTextResult<any, any, any>, 'toUIMessageStream'>,
   opts?: ToUIMessageStreamResponseOptions<UI_MESSAGE>,
 ): Response {
+  refuseMisspelledNames('toUIMessageStreamResponse', opts, UI_RESPONSE_NAMES);
   const { status, statusText, headers, consumeSseStream, ...streamOpts } = opts ?? {};
   const stream = toUIMessageStream(result, streamOpts as UIMessageStreamOptions<UI_MESSAGE> | undefined);
   return createUIMessageStreamResponse({ status, statusText, headers, consumeSseStream, stream });

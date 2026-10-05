@@ -75,6 +75,11 @@ jobs:
       # An option a deployment can set and nobody documented: `subjectBinding` closes a
       # cross-subject read and appeared in zero .md files. check:docs verifies what IS written.
       - run: pnpm check:option-docs
+      # A misspelled option was dropped without a word in every package (`authorise` left a door without
+      # its policy, `isuer` accepted any issuer's token). Each package now refuses a name it does not take,
+      # and this holds the rule to every exported options type, function, constructor and method — a new
+      # one without the check fails here instead of shipping silent.
+      - run: pnpm check:option-names
 
 
   integration:

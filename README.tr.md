@@ -169,7 +169,7 @@ bağlı değil. Aşağıdaki tablo doğrudan kullandığınız paketleri kapsar.
 | **`@gnldev/otel`** | `exportRunToOtlp` + **`otlpPresets`** (Langfuse/Braintrust/Honeycomb/Datadog/Collector + jenerik API-key OTLP) · **canlı mod** (`@gnldev/otel/live`) |
 | **`@gnldev/queue`** | durable job queue + worker · **heartbeat'li lock renew** (uzun handler'larda takeover'ı önler) + opt-in boş-poll backoff |
 | **`@gnldev/events`** | event bus (fan-out) — exactly-once işaretleme + at-least-once teslim; handler idempotent olmalı · **ölü-mektup** (`maxAttempts`/`retryDelayMs` ile aralıklı yeniden denemeler, sonra tüketici başına karantina — `listDeadEvents`/`retryDeadEvent`, Studio'da görülüp serbest bırakılabilir) · opt-in boş-poll backoff |
-| **`@gnldev/a2a`** | uzak agent (network-ötesi dedup — aynı runId replay olur) · **opt-in HMAC-SHA256 imzalı istek** (`createA2ATool({ secret })` ↔ `createRestApi({ a2aSecret })`, timestamp penceresiyle replay direnci) |
+| **`@gnldev/a2a`** | uzak agent (network-ötesi dedup — aynı runId replay olur) · **opt-in HMAC-SHA256 imzalı istek** (`createA2ATool({ secret })` ↔ `createRestApi(config, { a2aSecret })`, timestamp penceresiyle replay direnci) |
 | **`@gnldev/cache`** | cross-run cache |
 | **`@gnldev/studio`** | inspector **+ Playground**: agent seç→prompt→streaming yanıt→onay · time-travel/fork + cost/trace/metrics/diff · admin↔API ayrımı + rol auth |
 | **`@gnldev/client`** | type-safe REST/SSE client (framework-agnostik core) + React hook'ları (`@gnldev/client/react`: `useGnlAgent`/`useChat`) |

@@ -7,7 +7,6 @@
 //  - a thread named `res:u-ayse` was the same key as Ayse's working memory: an anonymous caller, or a
 //    thread-scoped agent on the same storage, read it into its system prompt.
 import { describe, it, expect } from 'vitest';
-import { stepCountIs } from 'ai';
 import {
   InMemoryStorage, createGnl, user, eraseSubject, toJournal, withOrgStorage, workingMemoryScope, type Storage,
 } from '@gnldev/durable';
@@ -43,9 +42,9 @@ const wm = (s: Storage, key: string) => s.memory!.getWorkingMemory(key);
 async function world() {
   const storage = new InMemoryStorage();
   const memory = memoryPreset(storage as any, 'chat', { workingMemory: { scope: 'resource' } });
-  const gnl = createGnl({ storage, memory, agents: { w: { model: writer({ iban: 'TR55-AYSE' }), stopWhen: stepCountIs(3) } } } as any);
+  const gnl = createGnl({ storage, memory, agents: { w: { model: writer({ iban: 'TR55-AYSE' }), maxSteps: 3 } } } as any);
   await gnl.run('w', { runId: 'ay1', prompt: 'remember', threadId: 'ayse-thread', caller: user('u-ayse') });
-  const zgnl = createGnl({ storage, memory, agents: { w: { model: writer({ iban: 'ZED-KEEP' }), stopWhen: stepCountIs(3) } } } as any);
+  const zgnl = createGnl({ storage, memory, agents: { w: { model: writer({ iban: 'ZED-KEEP' }), maxSteps: 3 } } } as any);
   await zgnl.run('w', { runId: 'z1', prompt: 'remember', threadId: 'zed-thread', caller: user('u-zed') });
   return { storage, memory };
 }
@@ -79,7 +78,7 @@ describe('eraseSubject(storage) forgets what AgentMemory holds', () => {
   it('a thread-scoped agent: the thread and its working memory go with the person', async () => {
     const storage = new InMemoryStorage();
     const memory = memoryPreset(storage as any, 'chat', { workingMemory: { scope: 'thread' } });
-    const gnl = createGnl({ storage, memory, agents: { w: { model: writer({ note: 'AYSE-THREAD-WM' }), stopWhen: stepCountIs(3) } } } as any);
+    const gnl = createGnl({ storage, memory, agents: { w: { model: writer({ note: 'AYSE-THREAD-WM' }), maxSteps: 3 } } } as any);
     await gnl.run('w', { runId: 't1', prompt: 'remember', threadId: 't-ayse', caller: user('u-ayse') });
     expect(await wm(storage, workingMemoryScope.thread('t-ayse'))).toEqual({ note: 'AYSE-THREAD-WM' });
 
@@ -151,7 +150,7 @@ describe("a thread id cannot name a person's working memory (M-3)", () => {
   async function ayseRemembers() {
     const storage = new InMemoryStorage();
     const memory = memoryPreset(storage as any, 'chat', { workingMemory: { scope: 'resource' } });
-    const gnl = createGnl({ storage, memory, agents: { w: { model: writer({ secret: 'AYSE-WM-SECRET' }), stopWhen: stepCountIs(3) }, e: { model: echoSys } } } as any);
+    const gnl = createGnl({ storage, memory, agents: { w: { model: writer({ secret: 'AYSE-WM-SECRET' }), maxSteps: 3 }, e: { model: echoSys } } } as any);
     await gnl.run('w', { runId: 'ay1', prompt: 'remember', threadId: 'ayse-thread', caller: user('u-ayse') });
     return { storage, gnl };
   }
@@ -171,7 +170,7 @@ describe("a thread id cannot name a person's working memory (M-3)", () => {
   it.each(['res:u-ayse', 'resource:u-ayse'])('a thread-scoped agent on the same storage, thread %s: cannot read it, and its writes land in its own thread', async (threadId) => {
     const { storage } = await ayseRemembers();
     const memory = memoryPreset(storage as any, 'chat', { workingMemory: { scope: 'thread' } });
-    const gnl = createGnl({ storage, memory, agents: { e: { model: echoSys }, w: { model: writer({ secret: 'MALLORY' }), stopWhen: stepCountIs(3) } } } as any);
+    const gnl = createGnl({ storage, memory, agents: { e: { model: echoSys }, w: { model: writer({ secret: 'MALLORY' }), maxSteps: 3 } } } as any);
     const read = await gnl.run('e', { runId: 'm1', prompt: 'x', threadId, caller: user('u-mallory') });
     expect(read.text).not.toContain('AYSE-WM-SECRET');
     await gnl.run('w', { runId: 'm2', prompt: 'x', threadId, caller: user('u-mallory') });

@@ -60,7 +60,6 @@ function mkApi(memory: unknown) {
   return createRestApi({
     journal: new InMemoryJournal(),
     memory,
-    allowOpenAccess: true,
     agents: {
       a: {
         model: mkModel(),
@@ -74,7 +73,7 @@ function mkApi(memory: unknown) {
         guard: async () => ({ action: 'require-approval' as const, reason: 'big amount' }),
       },
     },
-  } as never);
+  } as never, { allowOpenAccess: true });
 }
 
 const post = (api: any, path: string, body: unknown) =>

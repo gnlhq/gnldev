@@ -107,6 +107,7 @@ function messageOf(err: unknown): string {
   try { return String(err); } catch { return 'unknown error'; }
 }
 
+/** @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it. */
 export async function recordRunOutcome(
   journal: Journal,
   runId: string,

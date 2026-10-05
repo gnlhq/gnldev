@@ -3,6 +3,8 @@
 // exactly-once consumption marker via putIfAbsent. Since the `${ns}:` prefix contains no ':model:'/':tool:', it's invisible to parseJournalKey (the run reader).
 import { claim } from './journal.js';
 import type { Journal } from './journal.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { LIST_LOG_NAMES } from './option-names.js';
 
 export interface LogItem<T = unknown> {
   id: string;
@@ -54,6 +56,7 @@ export interface ListLogOptions {
  * see ListLogOptions.limit for why the whole-namespace read had to become optional.
  */
 export async function listLog<T = unknown>(journal: Journal, ns: string, opts: ListLogOptions = {}): Promise<LogItem<T>[]> {
+  refuseUnknownNames('listLog', opts, LIST_LOG_NAMES);
   const prefix = `${ns}:`;
   let keys = journal.listKeys ? await journal.listKeys(prefix) : [];
   if (opts.limit !== undefined && opts.limit >= 0 && keys.length > opts.limit) {

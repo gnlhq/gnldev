@@ -5,7 +5,7 @@
   "engines": {
     "node": ">=22.13.0"
   },
-  "description": "Durable deterministic workflows: each step journaled exactly-once, crash→resume picks up where it left off.",
+  "description": "Durable deterministic workflows: each step journaled exactly-once, crash\u2192resume picks up where it left off.",
   "keywords": [
     "ai",
     "agent",
@@ -37,7 +37,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
-  "author": "Karaca Yılmaz (https://gnl.dev)",
+  "author": "Karaca Y\u0131lmaz (https://gnl.dev)",
   "homepage": "https://gnl.dev",
   "bugs": {
     "url": "https://github.com/gnlhq/gnldev/issues"
@@ -49,5 +49,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "@gnldev/options": "workspace:^"
   }
 }

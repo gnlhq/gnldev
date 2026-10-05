@@ -15,7 +15,8 @@
     "check:errors": "node scripts/check-error-pages.mjs",
     "check:real": "node scripts/check-real-backends.mjs",
     "check:hygiene": "node scripts/check-hygiene.mjs",
-    "check:option-docs": "node scripts/check-option-docs.mjs"
+    "check:option-docs": "node scripts/check-option-docs.mjs",
+    "check:option-names": "node scripts/check-option-names.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

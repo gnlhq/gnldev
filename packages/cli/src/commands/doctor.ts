@@ -220,6 +220,15 @@ export const doctorCommand: Command = {
       return;
     }
 
+    // A feature `gnl add` wrote but the config never imports does nothing, and nothing else says so.
+    const { unwiredRecipes } = await import('../scaffold.js');
+    const { readFileSync } = await import('node:fs');
+    const unwired = unwiredRecipes(projectDirOf(configPath), readFileSync(configPath, 'utf8'));
+    if (unwired.length) {
+      console.log(bold('features written but not wired'));
+      for (const r of unwired) console.log(`  ${r.file}  ${dim(`— ${configPath} never imports it, so it does nothing. Wire it:`)}\n${r.humanWire.split('\n').map((l) => `      ${l}`).join('\n')}`);
+      console.log('');
+    }
     console.log(d.formatProtections(rows, { title: bold('gnl protections') }).join('\n'));
     console.log('');
     console.log(bold('this journal'));

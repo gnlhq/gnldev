@@ -6,6 +6,8 @@ import { claim, listRunsArray } from './journal.js';
 import { getRunCost, type RunCost } from './cost.js';
 import { effectivePricingTable, type ModelPricing } from './pricing.js';
 import { withOrg } from './organization.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { ASSERT_BUDGET_NAMES, BUDGET_LIMIT_NAMES } from './option-names.js';
 
 /** Journal key prefix for budget documents: `__budget__:<orgId>` + `__budget__:default`. */
 export const BUDGET_PRE = '__budget__:';
@@ -289,6 +291,7 @@ export async function readBudget(journal: Partial<Journal>, orgId?: string): Pro
 
 /** Plain overrun check. */
 export function isBudgetExceeded(usage: OrganizationUsage, limit?: BudgetLimit): boolean {
+  refuseUnknownNames('isBudgetExceeded', limit, BUDGET_LIMIT_NAMES);
   if (!limit) return false;
   return (limit.usdLimit != null && usage.costUsd > limit.usdLimit)
     || (limit.tokenLimit != null && usage.tokens > limit.tokenLimit);
@@ -320,6 +323,7 @@ export async function checkBudget(
   costCache?: UsageCostCache,
   strictSuspendedCost = true,
 ): Promise<BudgetCheck> {
+  refuseUnknownNames('checkBudget', fallback, BUDGET_LIMIT_NAMES);
   const limit = (await readBudget(reader, orgId)) ?? fallback;
   if (!limit || (limit.usdLimit == null && limit.tokenLimit == null)) {
     return { exceeded: false, usage: { runs: 0, tokens: 0, costUsd: 0 } };
@@ -375,6 +379,8 @@ export async function assertBudget(
   reader: JournalReader & Partial<Journal>,
   opts: { orgId?: string; fallback?: BudgetLimit; costCache?: UsageCostCache; strictSuspendedCost?: boolean } = {},
 ): Promise<BudgetCheck> {
+  refuseUnknownNames('assertBudget', opts, ASSERT_BUDGET_NAMES);
+  refuseUnknownNames('assertBudget: fallback', opts.fallback, BUDGET_LIMIT_NAMES);
   const check = await checkBudget(reader, opts.orgId, opts.fallback, opts.costCache, opts.strictSuspendedCost);
   if (check.exceeded) throw new BudgetExceededError(check);
   return check;

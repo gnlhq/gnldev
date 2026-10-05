@@ -5,7 +5,7 @@
   "engines": {
     "node": ">=22.13.0"
   },
-  "description": "Remote agent-to-agent tool over @gnldev/server REST. Deterministic remote runId → exactly-once across the network.",
+  "description": "Agent2Agent (A2A) for GNL: serve your agents to any A2A client (agent card + JSON-RPC message/send, tasks/get, tasks/cancel) and call remote agents \u2014 GNL or standard A2A \u2014 as an AI SDK tool. Deterministic task ids: a retried call is answered once by a GNL server (a remote that does not dedupe on messageId may run it again).",
   "keywords": [
     "ai",
     "agent",
@@ -14,7 +14,10 @@
     "ai-sdk",
     "durable",
     "exactly-once",
-    "remote-agents"
+    "remote-agents",
+    "a2a",
+    "agent2agent",
+    "json-rpc"
   ],
   "type": "module",
   "sideEffects": false,
@@ -24,6 +27,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
     },
     "./package.json": "./package.json"
   },
@@ -35,15 +42,26 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
+  "dependencies": {
+    "@gnldev/auth": "workspace:^",
+    "@gnldev/options": "workspace:^"
+  },
   "peerDependencies": {
+    "@gnldev/durable": "workspace:^",
     "ai": "^7.0.0",
     "zod": "^3.25.76 || ^4.1.8"
   },
+  "peerDependenciesMeta": {
+    "@gnldev/durable": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@gnldev/durable": "workspace:*",
     "ai": "^7.0.0",
     "zod": "^3.25.0"
   },
-  "author": "Karaca Yılmaz (https://gnl.dev)",
+  "author": "Karaca Y\u0131lmaz (https://gnl.dev)",
   "homepage": "https://gnl.dev",
   "bugs": {
     "url": "https://github.com/gnlhq/gnldev/issues"

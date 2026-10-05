@@ -6,7 +6,7 @@
 // veri. Sahibi yazılmayınca:
 //   • `purgeResource(u)` o koşumu SAYMIYOR (sayım `:input.resourceId` üstünden) → silme yarım kalıyor,
 //   • `ownershipDenied` sahibi bulamıyor → kapı sessizce geçiyor.
-// Alt-ajanlar zaten kimliği devralıyordu (runSubAgent'a resourceId/threadId/actor iniyor); sahipsiz
+// Alt-ajanlar zaten kimliği devralıyordu (alt koşuma resourceId/threadId/actor iniyor); sahipsiz
 // kalan tam olarak ROUTER'IN KENDİSİYDİ — yani üstteki kök koşum.
 //
 // MUAFİYET AYNEN KORUNUYOR: özne beyan edilmemişse hiçbir şey yazılmaz. Uydurulmuş sahip yok.

@@ -104,10 +104,12 @@ If you know `generateText`, you already know this — same arguments, same retur
 >
 > **Scope caveat (important):** the default dedup is keyed by `toolCallId`. If the model re-plans the *same
 > business action* under a **new** `toolCallId` (with identical or slightly different args — a
-> documented AI SDK pattern), the call-scoped guard does **not** collapse it: the default `limits.sideEffectDuplicates`
-> is `'warn'`, which logs the duplicate but still **executes** it. For a true "this action happens once"
-> guarantee across re-plans, opt into `idempotency: 'args'` / `idempotencyKey` (next section) or set
-> `limits.sideEffectDuplicates` to `'block'`/`'suspend'`. The 2-line quick-start example is call-scoped only.
+> documented AI SDK pattern), the call-scoped key does not collapse it. With identical args the default
+> `limits.sideEffectDuplicates: 'suspend'` stops the repeat and asks a human — without a key nothing can tell
+> "the same work again" from "two of the same, on purpose". With *different* args it is a new call. For
+> "this action happens once" without a question, give the tool its identity: `idempotency: 'args'` /
+> `idempotencyKey` (next section). A tool that declares no `sideEffect` is treated as one — declare
+> `sideEffect: false` on a read tool.
 
 ## Work identity (`workKey`)
 
@@ -234,7 +236,8 @@ const tools = {
     tool({ description: 'Charge an order', inputSchema: z.object({ orderId: z.string() }), execute: chargeCard }),
     {
       idempotency: 'args',                       // default: 'call' (toolCallId-keyed, unchanged)
-      // or dedup by a logical key: idempotencyKey: (input) => input.orderId,
+      // or dedup by a logical key, saying how far it holds:
+      // idempotencyKey: (input) => input.orderId, idempotencyWindow: 'cross-run',
     },
   ),
 };
@@ -245,7 +248,12 @@ const tools = {
 > `refund({orderId:'123', note:'retry'})` hash differently → **two refunds**. "Exactly-once" here means
 > "once per identical key", not "once per business intent". When the model may vary an irrelevant field,
 > supply an `idempotencyKey` that projects out only the fields that define the action (e.g.
-> `idempotencyKey: (args) => args.orderId`) so the varying `note` no longer splits the key.
+> `idempotencyKey: (args) => args.orderId`) so the varying `note` no longer splits the key. A key comes
+> with its `idempotencyWindow` — `'cross-run'` (every request), `'run'` (this request) or `'thread'` — and
+> is refused without one. Build it from stable identifiers (an id, a date), not from text the model
+> writes: `morphine` and `morphine 5mg` are two keys. Measured with three spellings of one dose: a key
+> from free text gave it twice each time; a closed input (`z.enum` of the allowed values, or of the ids
+> of the rows the agent read) gave it once — the model cannot write a value outside the list.
 
 Every duplicate — including concurrent duplicates inside the same step, which wait for the winner's
 result instead of erroring — collapses into a single execution; the rest receive the journaled output.
@@ -396,6 +404,25 @@ const lookup = { execute: async (args: unknown, options: unknown) => {
   `decideRunAccess(owner, caller)` the one rule (`allow | deny | missing`). A run whose record is lost
   but whose rows remain exists and is nobody's; an unreadable record is denied.
 
+## Sub-agents keep what the agent keeps
+
+A sub-agent — agent-as-tool (`agents: [...]`, `createAgentTool`) or a network target — is born through the
+same agent run as a direct one, one frame below the run that delegated. What holds for the agent run
+directly holds for it, measured case by case (`test/a-sub-agent-guarantees-what-its-parent-does.test.ts`):
+
+- **Once per request.** A keyed or `idempotency: 'args'` call is deduplicated across the whole request —
+  the parent, every sibling, every level. Thirty employees handed to payroll sub-agents, one of them ten
+  times, are paid thirty times. The record is the request's (`xreq:<runId>:args-…`); the call that
+  executed it is the one that unwinds (`compensateRun`) and erases (`purgeRun`) it.
+- **Limits are the request's.** `maxToolCalls`, `maxTokens`, `maxCostUsd` and `maxConcurrency` count the
+  parent's calls, every sibling's and the child's; the hand-over to a sub-agent is not itself a call.
+- **A result the parent can branch on:** `{ status: 'completed' | 'failed' | 'suspended', text,
+  interrupts, failed? }`.
+- **A question has its own address**, `<delegation call>/<child call>` — two sub-agents both numbering
+  their calls `call_0` are two questions. Answer the `toolCallId` the run surfaced.
+- **Who, and what stops it:** the parent's caller, cancellation, timeouts, taint (both ways) and approvals
+  come down with the delegation; the sub-agent's own processors, scorers, guard and sub-agents run.
+
 ## Tools
 
 - **`@gnldev/studio`** (separate package) — web UI: runs/timeline + **time-travel** + approval queue.
@@ -465,6 +492,13 @@ const gnl = createGnl({ journal, agents, preset: 'critical' });
 
 What each protection answers, in one line each:
 
+- **A run is continued from its recorded input, and the caller-system-message rule asks the record too.**
+  Every input is recorded with its origin (a door or the host's code). A record with no origin — written
+  by a version before origins existed — that carries a system message may hold a caller's, so it is not
+  continued on any path (a door, `resumeRun`, `replayRun`, Studio's resume and regression): `400
+  caller_system_message`, saying it is the run's recorded input. From the host's own code,
+  `trustRecordedInput: true` (on `gnl.run`, `resumeRun` or `replayRun`) vouches for such a record when
+  the host wrote that message; it is ignored on a door's call. A run that already ended is replayed as before.
 - **`strictInput`** — one runId carries ONE request: the raw caller input is fingerprinted at freeze
   time; the same runId arriving with different content gets `409 run_input_mismatch` (Stripe's
   "same key, different payload" semantics — the *rule* is Stripe's, the *status* is ours: Stripe
@@ -915,7 +949,7 @@ import { eventEraser } from '@gnldev/events';
 const storage = new InMemoryStorage();
 const report = await eraseSubject(storage, 'ayse', {
   orgId: 'acme', // omit for a person outside organizations
-  erasers: [jobEraser(storage), triggerEraser(toJournal(storage.runs)), eventEraser(storage.work!)],
+  erasers: [jobEraser(storage), triggerEraser(toJournal(storage)), eventEraser(storage.work!)],
 });
 // { journalRows, workRecords, memoryThreads, workingMemory, unreachedThreads, byEraser: { jobs, triggers, events } }
 ```

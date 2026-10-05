@@ -43,7 +43,7 @@
   "devDependencies": {
     "hono": "^4.13.2"
   },
-  "author": "Karaca Yılmaz (https://gnl.dev)",
+  "author": "Karaca Y\u0131lmaz (https://gnl.dev)",
   "homepage": "https://gnl.dev",
   "bugs": {
     "url": "https://github.com/gnlhq/gnldev/issues"
@@ -55,5 +55,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "@gnldev/options": "workspace:^"
   }
 }

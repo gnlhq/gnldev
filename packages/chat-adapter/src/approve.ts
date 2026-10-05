@@ -19,6 +19,8 @@
 // journal REPLAY (safe default); genuinely re-running a side effect goes through this approval
 // ladder, never through a silent re-execution.
 
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
+
 /** The minimum an approval needs from a `data-gnl-interrupt` entry (see GnlInterruptData). */
 export interface ApprovableInterrupt {
   toolCallId: string;
@@ -59,8 +61,11 @@ export interface ApproveOptions {
   fetchImpl?: typeof fetch;
 }
 
+const APPROVE_NAMES = optionNames<ApproveOptions>()(['interrupt', 'messages', 'chatId', 'threadId', 'approved', 'headers', 'fetchImpl']);
+
 /** Re-POSTs the approval to the chat endpoint and returns the raw streaming Response. */
 export async function approve(endpoint: string, opts: ApproveOptions): Promise<Response> {
+  refuseUnknownNames('approve', opts, APPROVE_NAMES);
   const doFetch = opts.fetchImpl ?? fetch;
   return doFetch(endpoint, {
     method: 'POST',

@@ -30,6 +30,8 @@ import { doorGate, actorIdOf, type Identify, type Principal } from '@gnldev/auth
 import { asSchema } from 'ai';
 import type { McpToolDef } from './index.js';
 import { createRateWindow, type RateWindow } from './rate-window.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { CREATE_MCP_SERVER_NAMES, RATE_LIMIT_NAMES, SERVE_MCP_INFO_NAMES, REMOVED_MCP_SERVER_NAMES } from './option-names.js';
 
 /**
  * A tool this server exposes: an AI SDK `tool()` as it is (a `createRagTool`, a `durableTool`), or a
@@ -213,6 +215,8 @@ export interface McpServerOptions {
    * rule keeps `allowedHosts`.
    */
   allowCrossSite?: boolean;
+  /** Print this door's protections when it is built (default `true`); `false` when something else already prints them. */
+  protectionsBanner?: boolean;
 }
 
 export interface McpServer {
@@ -367,14 +371,8 @@ async function announcedSchema(schema: any): Promise<any> {
 
 /** Produces an MCP server surface from a tool set (listTools + callTool). */
 export function createMcpServer(opts: McpServerOptions): McpServer {
-  // The replaced option fails loudly: a JavaScript config that still passes it would otherwise run every
-  // call as `unknown` and hide every tool, with nothing saying why.
-  if ((opts as { identity?: unknown }).identity !== undefined) {
-    throw new TypeError(
-      '@gnldev/mcp: `identity` was replaced by `identify` (0.7.0): it takes the request and returns a Principal from ' +
-        "@gnldev/auth — `identify: (req) => auth.authenticate(req)`, or `{ kind: 'subject', id, orgId, roles: [] }` for an end user.",
-    );
-  }
+  refuseUnknownNames('createMcpServer', opts, CREATE_MCP_SERVER_NAMES, REMOVED_MCP_SERVER_NAMES);
+  if (typeof opts.rateLimit === 'object') refuseUnknownNames('createMcpServer: rateLimit', opts.rateLimit, RATE_LIMIT_NAMES);
   // Said once per server, not per call: a warning printed on every request is a warning nobody reads.
   let warnedAboutIdentity = false;
   const warnMissingIdentity = (toolName: string) => {
@@ -431,7 +429,7 @@ export function createMcpServer(opts: McpServerOptions): McpServer {
   // Who is calling, and the open-surface checks for a message with no identity: @gnldev/auth's
   // `doorGate`, the one preamble every door runs. The checks read the headers of the HTTP request the
   // message arrived in; over stdio, or called in process, `requestOf` carries none, so they pass.
-  const admit = doorGate({ door: 'createMcpServer', identify: opts.identify, allowedHosts: opts.allowedHosts, allowCrossSite: opts.allowCrossSite });
+  const admit = doorGate({ door: 'createMcpServer', identify: opts.identify, allowedHosts: opts.allowedHosts, allowCrossSite: opts.allowCrossSite, protectionsBanner: opts.protectionsBanner, uncheckedWhen: 'a message with no HTTP request (stdio, in process) — there the process boundary is the trust boundary' });
   async function prepare(caller: McpCallerContext | undefined, named: string | undefined): Promise<Prepared | { refused: string }> {
     const c = caller ?? {};
     let who;
@@ -691,6 +689,7 @@ function requestFromInfo(info: { headers?: Record<string, string | string[] | un
  * createMcpServer as a real MCP server (optional peer; string-import → build doesn't break without the SDK).
  */
 export async function serveMcp(server: McpServer, transport: any, info: { name?: string; version?: string } = {}): Promise<void> {
+  refuseUnknownNames('serveMcp', info, SERVE_MCP_INFO_NAMES);
   const [{ Server }, { ListToolsRequestSchema, CallToolRequestSchema }] = await Promise.all([
     import('@modelcontextprotocol/sdk/server/index.js') as Promise<any>,
     import('@modelcontextprotocol/sdk/types.js') as Promise<any>,

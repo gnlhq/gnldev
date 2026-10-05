@@ -15,14 +15,17 @@
 // is a property of the adapter in front of this config, not of the config, so that row is filled by
 // the caller (`ProtectionContext.identity`) or it honestly reads "unknown".
 import type { CreateGnlConfig } from './registry.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { FORMAT_PROTECTIONS_NAMES, PROTECTION_CONTEXT_NAMES, refuseConfigNames } from './option-names.js';
 
 /**
  * ✓ on · ○ off · ─ dev-only.
  *
  * The third mark is the one that earns its place. A protection that is on HERE and off in the
  * project's own config is not protection, it is a difference between two machines — and the way that
- * difference is normally discovered is in production, by its absence. `gnl dev` derives a memory
- * store when the config has storage; `src/app.ts` does not. Same config, two behaviours.
+ * difference is normally discovered is in production, by its absence. `gnl dev` once derived a
+ * memory store the deployed `src/app.ts` did not have; it now runs the config as given, and this mark
+ * is for any process that still turns something on that the deployment will not have.
  */
 export type ProtectionMark = 'on' | 'off' | 'dev-only' | 'unknown';
 
@@ -116,6 +119,8 @@ function adapterName(config: CreateGnlConfig): string {
  * reported rather than papered over with a type refactor.
  */
 export function describeProtections(config: CreateGnlConfig, ctx: ProtectionContext = {}): ProtectionRow[] {
+  refuseConfigNames('describeProtections', config);
+  refuseUnknownNames('describeProtections', ctx, PROTECTION_CONTEXT_NAMES);
   const preset = config.preset;
   const critical = preset === 'critical';
   const surface = ctx.surface ?? 'this process';
@@ -297,6 +302,7 @@ export function describeProtections(config: CreateGnlConfig, ctx: ProtectionCont
  * whether that is one `console.log` or several.
  */
 export function formatProtections(rows: ProtectionRow[], opts: { title?: string } = {}): string[] {
+  refuseUnknownNames('formatProtections', opts, FORMAT_PROTECTIONS_NAMES);
   const labelW = Math.max(...rows.map((r) => r.label.length));
   const valueW = Math.max(...rows.map((r) => r.value.length));
   const lines = rows.map((r) => {

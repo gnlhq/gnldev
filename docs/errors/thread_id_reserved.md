@@ -30,5 +30,5 @@ user may call a thread `org:notes` and it is stored as `org:acme:org:notes`.
   the memory over `withOrgStorage(storage, orgId)`.
 - A root-scope `AgentMemory` refuses the same ids with `ReservedThreadIdError`, and every door — REST,
   Studio, the standalone chat and AG-UI routes — answers that error the same way, through
-  `reservedIdFailure` in `@gnldev/durable`: this status, this code, and `detail.threadId`. In code,
+  `requestRefusal` in `@gnldev/durable`: this status, this code, and `detail.threadId`. In code,
   `RESERVED_ID_ERROR_CODES` names it.

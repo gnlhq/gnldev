@@ -29,6 +29,9 @@ import { createMockModel, countToolResults, toolCallResult, finalTextResult } fr
 
 const sawNudge = (prompt: any[]) => JSON.stringify(prompt ?? []).includes('__gnl_reflected');
 
+// The default duplicate ladder is now 'suspend': an undeclared tool repeated with identical arguments
+// would be asked about before loop detection is ever reached. These tests isolate loop detection, so
+// every run here keeps the duplicate ladder at 'warn'.
 const makeStuck = (counter: { runs: number }) =>
   tool({
     description: 'tool that always does the same work',
@@ -56,7 +59,8 @@ describe('loop reflection — causality & soundness', () => {
     const res = await runDurable({
       runId: 'cf-off', journal, model: selfCorrectingModel(), tools: { stuck: makeStuck(counter) },
       prompt: 'loop', stopWhen: stepCountIs(6),
-      // no limits at all
+      // no loop limits; the duplicate ladder kept at 'warn' (see makeStuck)
+      limits: { sideEffectDuplicates: 'warn' },
     });
     expect(res.text).not.toBe('Recovered.'); // no signal → no recovery, ever
     expect(counter.runs).toBe(6); // pure runaway: every step re-executed the tool
@@ -69,7 +73,7 @@ describe('loop reflection — causality & soundness', () => {
       runDurable({
         runId: 'cf-block', journal, model: selfCorrectingModel(), tools: { stuck: makeStuck(counter) },
         prompt: 'loop', stopWhen: stepCountIs(20),
-        limits: { loopDetection: { maxRepeats: 2 } }, // default onRepeat = 'block'
+        limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2 } }, // default onRepeat = 'block'
       }),
     ).rejects.toBeInstanceOf(ToolLoopDetectedError);
     expect(counter.runs).toBe(2);
@@ -84,7 +88,7 @@ describe('loop reflection — causality & soundness', () => {
     const res = await runDurable({
       runId: 'cf-reflect', journal, model: selfCorrectingModel(), tools: { stuck: makeStuck(counter) },
       prompt: 'loop', stopWhen: stepCountIs(20),
-      limits: { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+      limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
     });
     expect(res.text).toBe('Recovered.');
     expect(counter.runs).toBe(2); // same threshold as A2 — but recovery instead of a dead run
@@ -103,7 +107,7 @@ describe('loop reflection — causality & soundness', () => {
     await runDurable({
       runId: 'chan-1', journal, model, tools: { stuck: makeStuck(counter) },
       prompt: 'loop', stopWhen: stepCountIs(20),
-      limits: { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+      limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
     });
     // The LAST prompt (the one that produced the final text) carries call-3's tool result = the nudge.
     const last = JSON.stringify(seenPrompts[seenPrompts.length - 1]);
@@ -128,7 +132,7 @@ describe('loop reflection — causality & soundness', () => {
       runDurable({
         runId: 'crash-1', journal, model: crashing, tools: { stuck: makeStuck(counter) },
         prompt: 'loop', stopWhen: stepCountIs(20),
-        limits: { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+        limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
       }),
     ).rejects.toThrow('simulated crash');
     expect(counter.runs).toBe(2);
@@ -143,7 +147,7 @@ describe('loop reflection — causality & soundness', () => {
     const res = await runDurable({
       runId: 'crash-1', journal, model: healthy, tools: { stuck: makeStuck(counter) },
       prompt: 'loop', stopWhen: stepCountIs(20),
-      limits: { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+      limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
     });
     expect(res.text).toBe('Recovered.');
     expect(counter.runs).toBe(2); // resume re-executed NOTHING
@@ -164,7 +168,7 @@ describe('loop reflection — causality & soundness', () => {
     const res = await runDurable({
       runId: 'inter-1', journal, model, tools: { stuck: makeStuck(counter) },
       prompt: 'loop', stopWhen: stepCountIs(20),
-      limits: { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+      limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
     });
     expect(res.text).toBe('Done.');
     // A,A executed; B executed (chain reset — NOT nudged despite 2 prior calls of the same tool);
@@ -188,7 +192,7 @@ describe('loop reflection — causality & soundness', () => {
     const res = await runDurable({
       runId: 'iso-1', journal, model, tools: { t1: makeStuck(c1), t2: makeStuck(c2) },
       prompt: 'go', stopWhen: stepCountIs(10),
-      limits: { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+      limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
     });
     expect(res.text).toBe('Done.');
     expect(c1.runs).toBe(2);
@@ -203,7 +207,7 @@ describe('loop reflection — causality & soundness', () => {
       const done = countToolResults(prompt);
       return toolCallResult('stuck', `call-${done + 1}`, {});
     });
-    const limits = { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' as const } };
+    const limits = { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' as const } };
 
     // Run 1: nudge (call-3) → identical insistence (call-4) → hard block.
     await expect(
@@ -240,7 +244,7 @@ describe('loop reflection — causality & soundness', () => {
     const res = await runDurable({
       runId: 'purity-1', journal, model, tools: { stuck: makeStuck(counter) },
       prompt: 'go', stopWhen: stepCountIs(20),
-      limits: { maxToolCalls: 3, loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+      limits: { sideEffectDuplicates: 'warn', maxToolCalls: 3, loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
     });
     expect(res.text).toBe('Done.');
     expect(counter.runs).toBe(3); // A×2 + NEW — the nudge consumed nothing
@@ -267,7 +271,7 @@ describe('loop reflection — causality & soundness', () => {
     const res = await runDurable({
       runId: 'args-1', journal, model, tools: { dedup },
       prompt: 'go', stopWhen: stepCountIs(20),
-      limits: { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+      limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
     });
     expect(res.text).toBe('Done.');
     expect(realRuns).toBe(1); // 5 model-side calls, ONE real execution — args-dedup, silently
@@ -278,7 +282,7 @@ describe('loop reflection — causality & soundness', () => {
   it('I per-run window: a NEW runId gets a fresh chain — a genuinely new business request runs normally', async () => {
     const journal = new InMemoryJournal();
     const counter = { runs: 0 };
-    const limits = { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' as const } };
+    const limits = { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' as const } };
     const model = () => createMockModel(async ({ prompt }: any) => {
       if (sawNudge(prompt)) return finalTextResult('Recovered.');
       const done = countToolResults(prompt);
@@ -303,7 +307,7 @@ describe('loop reflection — causality & soundness', () => {
     await runDurable({
       runId: 'tt-1', journal, model, tools: { stuck: makeStuck(counter) },
       prompt: 'loop', stopWhen: stepCountIs(20),
-      limits: { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+      limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
     });
     const state = reconstructState(await journal.readRun('tt-1'));
     expect(state.pending).toEqual([]); // call-3 (reflected) is resolved, not eternally pending
@@ -344,7 +348,7 @@ describe('loop reflection — causality & soundness', () => {
     const res = await streamDurable({
       runId: 'stream-1', journal, model, tools: { stuck: makeStuck(counter) },
       prompt: 'loop', stopWhen: stepCountIs(20),
-      limits: { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+      limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
     });
     expect(await res.text).toBe('Recovered.');
     expect(counter.runs).toBe(2);

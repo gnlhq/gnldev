@@ -3,6 +3,8 @@
 // doesn't require a deploy. Since the document is small, simplicity without caching was preferred.
 import type { Journal } from './journal.js';
 import type { Guard, GuardDecision } from './guard.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { POLICY_GUARD_NAMES } from './option-names.js';
 
 export interface PolicyRule {
   /** Tool name (exact match) or '*' (all). Exact match is evaluated BEFORE the wildcard. */
@@ -40,6 +42,7 @@ export function evaluatePolicy(
  * empty; rules take effect immediately (on the next tool call) as they're added from Studio.
  */
 export function policyGuard(journal: Journal, opts: { key?: string; fallback?: GuardDecision['action'] } = {}): Guard {
+  refuseUnknownNames('policyGuard', opts, POLICY_GUARD_NAMES);
   const key = opts.key ?? POLICY_KEY;
   return async ({ toolName }) => {
     const doc = await journal.get<PolicyDoc>(key);

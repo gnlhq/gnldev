@@ -2,6 +2,8 @@
 // the rerank LLM call also becomes part of the tool's result → durableTool journals it → **replayable rerank** (most RAG implementations don't have this).
 import { generateText } from 'ai';
 import type { VectorMatch } from './vector-store.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { LLM_RERANKER_NAMES } from './option-names.js';
 
 export interface Reranker {
   rerank(query: string, matches: VectorMatch[], topN?: number): Promise<VectorMatch[]>;
@@ -23,6 +25,7 @@ function parseIndices(text: string, n: number): number[] {
 
 /** Reranker that asks the model to order documents by relevance. */
 export function llmReranker(opts: { model: any }): Reranker {
+  refuseUnknownNames('llmReranker', opts, LLM_RERANKER_NAMES);
   return {
     async rerank(query, matches, topN) {
       if (matches.length <= 1) return topN ? matches.slice(0, topN) : matches;

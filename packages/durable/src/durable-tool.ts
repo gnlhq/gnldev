@@ -1,21 +1,23 @@
 import { argsHash } from './hash.js';
+import { refuseKeyWithoutWindow } from './types.js';
+import { approvalsForChild, addressedId } from './guard.js';
 import { assertThreadId } from './journal.js';
-import { withTimeout } from './timeout.js';
+import { withTimeout, StepTimeoutError } from './timeout.js';
 import { stampFormat, upgradeFormat } from './format.js';
 import { DivergenceError, RetryLimitExceededError, RunBusyError, SideEffectRetryBlockedError, IdempotencyOwnerMismatchError } from './errors.js';
 import { claim, ctxGet, runKeys } from './journal.js';
-import { userIdOf, ownerFields, fieldsOwner, decideRunAccess, toolContextFor, closeLegacyResourceId } from './run-identity.js';
+import { userIdOf, ownerFields, fieldsOwner, decideRunAccess, toolContextFor, closeLegacyResourceId, requestOf } from './run-identity.js';
 import { orgScopeOf, orgPrefix } from './organization.js';
 import { CompensatedRunError, runCompensated } from './compensation.js';
 import { recordIncident } from './incidents.js';
 import { markRunTainted, readRunTaint } from './taint.js';
-import { checkToolGate, recordToolOutcome } from './limits.js';
+import { checkToolGate, recordToolOutcome, takeToolSeat, releaseToolSeat, takeConcurrencySlot, releaseConcurrencySlot } from './limits.js';
 import { validateSemanticConfig, assertSemanticIdentity, identityUnusableReason, extractSemFields, canonicalTextOf, findSemanticCandidate, writeSemRecord, semTombKey } from './semantic-dup.js';
 import { SEM_RULESET_VERSION } from './semantic-rules.js';
 import { judgeGrayPair } from './semantic-judge.js';
 import { xidPlanOf, writeXid, readXid, xidWhen, amountsDifferOf, type XidPlan } from './xid.js';
 import type { SemPlan } from './semantic-dup.js';
-import type { RunLimits } from './limits.js';
+import type { RunLimits, ToolSeat } from './limits.js';
 import { createProcessorCtx } from './processor.js';
 import type { DurableCtx, Journal, ToolJournalRecord } from './journal.js';
 import type { JournalReader } from './journal.js';
@@ -70,6 +72,14 @@ function blockedOrThrow(
 /** Per-(tool,args) first-success marker — see the guard block
  *  in `durableTool` below. Lives under runKeys.proc (invisible to reader/time-travel, purged with the
  *  run). `nudged` = the reconsider nudge has been delivered for this (tool,args) → escalate to block. */
+/** What one call holds while it runs: its maxToolCalls seat, its maxConcurrency slot, and whether a
+ *  timed-out attempt still running gives them back itself when it ends. */
+interface Seat {
+  held: { id: string; seat: ToolSeat } | undefined;
+  late: boolean;
+  slot: string | undefined;
+}
+
 interface DupMarker {
   firstToolCallId: string;
   at: number;
@@ -107,6 +117,31 @@ async function claimDupMarker(journal: Journal, dupKey: string, next: DupMarker,
   if (journal.putIfMatch) return journal.putIfMatch(dupKey, raw, next);
   await journal.put(dupKey, next); // single-process fallback — the same documented bound as claim()
   return true;
+}
+
+/**
+ * A human said "no — that is the same work again" about one keyless repeat. The same repeat, again in the
+ * same request, is that same question: it gets the same answer instead of a new question (measured: a
+ * 30-order file with ORD-020 ten times asked 10 questions, one per repeat). Only a REFUSAL carries over;
+ * an approval runs the one call it answered, as before.
+ */
+const dupDeclinedKey = (requestRunId: string, toolName: string, hash: string): string =>
+  runKeys.proc(requestRunId, `dupdeclined-${toolName}-${hash}`);
+
+/** The answer a declined repeat gets, without asking again. */
+async function declinedRepeat(ctx: DurableCtx, key: string, toolCallId: string, toolName: string, hash: string): Promise<unknown | undefined> {
+  const declined = await ctx.journal.get<{ toolCallId?: string }>(dupDeclinedKey(requestOf(ctx.identity), toolName, hash));
+  if (!declined) return undefined;
+  const output = {
+    __denied: true,
+    reason: `A human already refused repeating this identical '${toolName}' call in this request — it did NOT run, and was not asked about again.`,
+  };
+  await recordIncident(ctx.journal, ctx.runId, {
+    at: Date.now(), source: 'duplicate-guard', action: 'skip', toolName, toolCallId,
+    message: output.reason, detail: { toolName, argsHash: hash, toolCallId, declinedAs: declined.toolCallId },
+  });
+  await writeToolTerminal(ctx, key, { status: 'denied', output }, toolCallId, toolName, hash);
+  return output;
 }
 
 const dupMarkerKey = (runId: string, toolName: string, hash: string): string =>
@@ -162,13 +197,41 @@ function dupConfigOf(raw: RunLimits['sideEffectDuplicates'], effectClass?: impor
     // Sınıf-bazlı form (heyet matrisi): aracın beyanı hücreyi seçer; beyansız araç default'a düşer.
     // `semantic` yalnız üst seviyede taşınır ve seçilen hücreye eklenir — suspend'li hücrelerde
     // semantik aday bulucu aynen çalışır (skor asla karar vermez, sınıf formunda da).
-    const spec = (effectClass && raw.byClass[effectClass]) || raw.default || { action: 'warn' as const };
+    const spec = (effectClass && raw.byClass[effectClass]) || raw.default || { action: DEFAULT_DUP_ACTION };
     // `semantic` yalnız üst seviyeden gelir ve YALNIZ suspend hücresine uygulanır — skip/block/warn
     // hücresinde semantik aday bulucu çalışmaz (tek çıkışı insan sorusudur; o hücrelerde soru yok).
     return { action: spec.action, scope: spec.scope ?? 'run', ...(spec.ttlMs !== undefined ? { ttlMs: spec.ttlMs } : {}), ...(raw.semantic && spec.action === 'suspend' ? { semantic: raw.semantic } : {}) };
   }
   if (raw && typeof raw === 'object') return { action: raw.action, scope: raw.scope ?? 'run', ...(raw.ttlMs !== undefined ? { ttlMs: raw.ttlMs } : {}), ...(raw.semantic ? { semantic: raw.semantic } : {}) };
-  return { action: raw ?? 'warn', scope: 'run' };
+  return { action: raw ?? DEFAULT_DUP_ACTION, scope: 'run' };
+}
+
+/**
+ * A side effect with no key, repeated with the same arguments in one request, is asked about — not run
+ * twice, not merged. Without a key nothing can tell "the same work again by mistake" from "two of the
+ * same, on purpose" (two identical order lines, two identical doses); a human can. A tool that declares
+ * its identity (`idempotencyKey`, `idempotency: 'args'`, a window) never reaches this guard: its repeat
+ * is resolved by the key. `limits.sideEffectDuplicates` sets another answer ('warn' was the default).
+ */
+const DEFAULT_DUP_ACTION = 'suspend' as const;
+
+/**
+ * Untrusted content entered the request (an `untrusted: true` tool's output, a processor's mark) and a
+ * side effect is next: a human decides. The runtime cannot know which tokens steered the call, so the
+ * only sound default is to ask; 'warn' (the earlier default) let a row-shaped string from a fetched
+ * page become the target of a shipment (measured). `limits.taintedSideEffects` sets another answer.
+ */
+const DEFAULT_TAINT_ACTION = 'suspend' as const;
+
+/**
+ * The way out, said where the question is asked. A tool that declares nothing is treated as a side
+ * effect — the safe reading — so a read tool the developer never declared (a weather lookup asked
+ * twice) lands on a human's desk. That is one line to fix, and the question names it.
+ */
+function undeclaredHint(tool: AnyTool, toolName: string): string {
+  return tool.sideEffect === undefined && tool.idempotent === undefined
+    ? ` ('${toolName}' declares no sideEffect, so it is treated as one — if it changes nothing, declare it: gnlTool(tool, { sideEffect: false }).)`
+    : '';
 }
 
 /**
@@ -240,6 +303,18 @@ async function mirrorUnderRun(
   }
 }
 
+/**
+ * Who a cross-run record belongs to is decided by whoever FIRST writes it — the call that claims it to
+ * run, or the call that suspends it for a human (confirm, a guard's require-approval, the taint
+ * ladder). It was written only on the claim, so a record suspended for an end user had no owner, and
+ * the same user's approval was refused as "someone else's" — the work never ran (measured: confirm,
+ * guard and taint all left the effect at 0, run directly and through a sub-agent alike).
+ * First writer wins (`claim` = putIfAbsent), so a later caller never re-owns it.
+ */
+async function claimCrossRunOwner(ctx: DurableCtx, toolName: string, hash: string): Promise<void> {
+  await claim(ctx.journal, runKeys.toolCrossRunOwner(toolName, hash), ownerFields(ctx.identity));
+}
+
 async function writeToolTerminal(
   ctx: DurableCtx,
   key: string,
@@ -268,13 +343,19 @@ async function writeToolTerminal(
   // denied/suspended/failed paths did not, which left a denial — the most audit-relevant entry there
   // is — identifiable only by correlating its toolCallId against the model step. Filled here because
   // this is the one place every terminal write passes through.
-  const named: ToolJournalRecord =
+  const named0: ToolJournalRecord =
     (record as { toolName?: string }).toolName ? record : { ...record, toolName };
+  // A request-window record is the request's; the run that executed it signs it (journal.ts ranBy).
+  const named: ToolJournalRecord =
+    runKeys.isToolRequest(key) && (named0.status === 'succeeded' || named0.status === 'failed') && named0.ranBy === undefined
+      ? { ...named0, ranBy: { runId: ctx.runId, toolCallId } }
+      : named0;
   const stamped: ToolJournalRecord =
     named.status === 'succeeded' || named.status === 'denied' || named.status === 'reflected'
       ? { ...named, resolvedToolCallIds: [toolCallId] }
       : named;
   await ctx.journal.put(key, stampFormat(stamped));
+  if (key === runKeys.toolCrossRun(toolName, hash)) await claimCrossRunOwner(ctx, toolName, hash);
   await mirrorUnderRun(ctx, key, stamped, toolCallId);
   if (dupKey && record.status === 'succeeded') {
     // Journal clock for the stamp (K2, BOTH ends): windowExpired/ttl decisions read `at` with the
@@ -318,7 +399,10 @@ async function writeToolTerminal(
   // reconstructs the identical count from the same journaled flag.
   if (ctx.limits) {
     const sideEffect = record.status === 'failed' ? record.sideEffect === true : false;
-    await recordToolOutcome(ctx.journal, ctx.runId, toolCallId, toolName, hash, record.status, sideEffect, ctx.limits);
+    const seat = ctx.seats?.get(toolCallId);
+    if (await recordToolOutcome(ctx.journal, ctx.runId, toolCallId, toolName, hash, record.status, sideEffect, ctx.limits, record.delegation === true, requestOf(ctx.identity), seat)) {
+      ctx.seats?.delete(toolCallId); // counted and given back in one step
+    }
   }
 }
 
@@ -429,9 +513,18 @@ async function consumeExistingRecord(
  * kanalda: `config.approvals` (host'un o alt ajan için açıkça yapılandırdığı onaylar) dokunulmaz,
  * oradaki niyet zaten çocuğa aittir.
  */
+/** Copies a record from where an earlier version wrote it to where this one reads it, if only the old one exists. */
+async function adoptRecord(journal: DurableCtx['journal'], from: string, to: string): Promise<void> {
+  const old = await journal.get<ToolJournalRecord>(from);
+  if (old === undefined) return;
+  if (typeof journal.putIfAbsent === 'function') { await journal.putIfAbsent(to, old); return; }
+  if ((await journal.get(to)) === undefined) await journal.put(to, old);
+}
+
 function nestedApprovalsFor(
   record: ToolJournalRecord | undefined,
   approvals: Record<string, boolean> | undefined,
+  toolCallId: string | undefined,
 ): Record<string, boolean> | undefined {
   if (approvals === undefined) return undefined;
   const sus = record?.status === 'suspended'
@@ -440,9 +533,12 @@ function nestedApprovalsFor(
   const scoped: Record<string, boolean> = {};
   if (sus?.kind !== 'nested') return scoped;
   for (const i of sus.nested?.interrupts ?? []) {
-    if (i.toolCallId !== undefined && approvals[i.toolCallId] !== undefined) scoped[i.toolCallId] = approvals[i.toolCallId]!;
+    // A proxy record written before interrupts were addressed holds the child's bare id: read it addressed.
+    const id = i.toolCallId === undefined ? undefined : addressedId(toolCallId, i.toolCallId);
+    if (id !== undefined && approvals[id] !== undefined) scoped[id] = approvals[id]!;
   }
-  return scoped;
+  // The child reads its own ids: the addressed form `<this call>/<child call>` loses this call's prefix.
+  return approvalsForChild(toolCallId, scoped);
 }
 
 /**
@@ -466,12 +562,37 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
   // EVERY EXISTING caller (who never sets this field) is BYTE-FOR-BYTE unchanged.
   // FAZ-3: 'thread' joins as the third window arm — implies 'args' mode for the same reason
   // 'cross-run' does (a shared window only makes sense keyed by arguments, never by per-call ids).
+  refuseKeyWithoutWindow('durableTool', tool, toolName);
   const window: 'run' | 'cross-run' | 'thread' = tool.idempotencyWindow ?? 'run';
   const mode: 'call' | 'args' =
     window !== 'run' || tool.idempotency === 'args' || typeof tool.idempotencyKey === 'function' ? 'args' : 'call';
   return {
     ...tool,
     execute: async (input: any, options: any) => {
+      // The maxToolCalls seat this call holds (limits.ts takeToolSeat): taken where the gate admits it,
+      // given back when the call is over — here for every way out, by the attempt itself when a
+      // timed-out attempt is still running (it settles later, and counts then).
+      const seat: Seat = { held: undefined, late: false, slot: undefined };
+      try {
+        return await executeOnce(input, options, seat);
+      } finally {
+        if (!seat.late) await releaseSeat(seat);
+      }
+    },
+  };
+
+  async function releaseSeat(seat: Seat): Promise<void> {
+    // A seat the call's counted outcome already gave back (writeToolTerminal) is gone from ctx.seats.
+    if (seat.held && ctx.seats?.get(seat.held.id) === seat.held.seat) {
+      ctx.seats.delete(seat.held.id);
+      await releaseToolSeat(ctx.journal, requestOf(ctx.identity), seat.held.seat);
+    }
+    if (seat.slot) await releaseConcurrencySlot(ctx.journal, requestOf(ctx.identity), ctx.limits, seat.slot);
+    seat.held = undefined;
+    seat.slot = undefined;
+  }
+
+  async function executeOnce(input: any, options: any, seat: Seat): Promise<unknown> {
       const toolCallId = options?.toolCallId;
       // Set when THIS call's recover() probe threw. Per invocation on purpose — see the catch below
       // for what happened when the same fact was written onto `tool`.
@@ -520,13 +641,16 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         warnThreadScopeFallback('idempotencyWindow', toolName);
         effWindow = 'run';
       }
+      // The 'run' window is the REQUEST's: a sub-agent's call lands on the same record as the same call
+      // made by its parent, a sibling, or the agent run directly (identity-types.ts requestRunId).
+      const windowRunId = requestOf(ctx.identity);
       const key = mode !== 'args'
         ? runKeys.tool(ctx.runId, toolCallId)
         : effWindow === 'cross-run'
           ? runKeys.toolCrossRun(toolName, hash)
           : effWindow === 'thread'
             ? runKeys.toolThread(ctx.threadId!, toolName, hash)
-            : runKeys.toolByArgs(ctx.runId, toolName, hash);
+            : runKeys.toolRequest(windowRunId, toolName, hash);
       // M1 downstream exactly-once: in 'args' mode, toolName+hash is carried INSTEAD OF toolCallId → even
       // if the model produces a NEW toolCallId with the SAME arguments, downstream (Stripe etc.) dedup
       // stays CONSISTENT (otherwise every new toolCallId would spawn a different provider idempotencyKey).
@@ -555,7 +679,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
             // The downstream key follows the window's scope, same principle as cross-run above: a
             // retried run ON THIS THREAD reusing the same arguments must reuse the SAME provider key.
             ? `${orgPart}thr:${ctx.threadId}:${toolName}:${hash}`
-            : `${orgPart}${ctx.runId}:${toolName}:${hash}`;
+            : `${orgPart}${windowRunId}:${toolName}:${hash}`;
 
       // 1) Exactly-once: if a succeeded/denied/reflected record exists, do NOT execute, return from the
       // journal (replay) — a 'reflected' nudge replays IDENTICALLY too (the same toolCallId must see the
@@ -567,23 +691,45 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // else, by staff, or before owners were recorded is refused — no output, and no second execution.
       // Staff reach any record, as before.
       const ownerKey = effWindow === 'cross-run' && mode === 'args' ? runKeys.toolCrossRunOwner(toolName, hash) : undefined;
-      const assertCrossRunOwner = async (): Promise<void> => {
+      const assertCrossRunOwner = async (rec: ToolJournalRecord): Promise<void> => {
         if (!ownerKey) return;
         // THE ENGINE'S RULE, not a copy of it (run-identity.ts decideRunAccess), with the caller passed
         // explicitly: the owner record and the caller are read from the SAME value (ctx.identity). A
         // user reuses only their own record; `unknown` only one an unknown caller made (or one from
         // before owners were recorded) — never a user's or staff's. A read error propagates.
-        const owner = fieldsOwner(await ctx.journal.get(ownerKey));
+        const ownerRec = await ctx.journal.get(ownerKey);
+        // A record an earlier version suspended has no owner (the owner was written on the claim only —
+        // see claimCrossRunOwner), and its own run's approval was refused (measured: approved, never ran).
+        // The proof of whose it is sits in this run: THIS call's mirror of THIS record, written when this
+        // run suspended it. Only that run can show it; another caller's run cannot, and stays refused.
+        if (ownerRec === undefined && rec.status === 'suspended') {
+          const mine = await ctx.journal.get<{ mirrorOf?: string }>(runKeys.tool(ctx.runId, toolCallId));
+          if (mine?.mirrorOf === key) { await claimCrossRunOwner(ctx, toolName, hash); return; }
+        }
+        const owner = fieldsOwner(ownerRec);
         if (decideRunAccess({ state: 'owned', owner, kind: 'other', recorded: true }, ctx.identity) === 'allow') return;
+        // Say what the OTHER record is, because the reader repeats it: "already run" for a record that was
+        // only waiting for its owner's approval was relayed by a model as "already given" — about a dose
+        // that never ran (measured). Whatever its state, THIS call did not run.
+        const state = rec.status === 'succeeded' ? 'was already done for these arguments by someone else'
+          : rec.status === 'suspended' ? 'is waiting for someone else\'s decision for these arguments — it has NOT run'
+          : rec.status === 'running' ? 'is being run for these arguments by someone else — it has NOT finished'
+          : 'was attempted for these arguments by someone else and did NOT complete';
         throw new IdempotencyOwnerMismatchError(
-          `@gnldev/durable: '${toolName}' was already run for these arguments by someone else — this call is refused ` +
-            `rather than returning their result or running it a second time. A key that identifies one person's work ` +
-            `belongs to that person; use a different key, or run it as staff.`,
-          { toolName },
+          `@gnldev/durable: '${toolName}' ${state}. This call did NOT run it and does not return their result. ` +
+            `A key that identifies one person's work belongs to that person; use a different key, or run it as staff.`,
+          { toolName, ownerRecordStatus: rec.status },
         );
       };
+      // A record written before the run window was the request's lives under the run's own prefix
+      // (`toolByArgs`). Read it where it is and carry it over, once: a run (or a sub-agent) suspended
+      // by an earlier version would otherwise find nothing under the request's key and run a finished
+      // effect again (measured: a charge taken twice on resume).
+      if (mode === 'args' && effWindow === 'run') {
+        await adoptRecord(ctx.journal, runKeys.toolByArgs(ctx.runId, toolName, hash), key);
+      }
       let record = await ctxGet<ToolJournalRecord>(ctx, key);
-      if (record) await assertCrossRunOwner();
+      if (record) await assertCrossRunOwner(record);
       if (record && (record.status === 'succeeded' || record.status === 'denied' || record.status === 'reflected')) {
         // M2 drift detector: if the argsHash of the succeeded record doesn't match the hash of the new
         // input the model produced on replay → non-determinism. Since the model middleware replays the
@@ -674,7 +820,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // taşıması gerekir — yoksa reddedilen iş ebeveyni sonsuza dek askıda bırakır.
         const nestedAnswered =
           nested?.kind === 'nested' &&
-          (nested.nested?.interrupts ?? []).some((i) => i.toolCallId !== undefined && ctx.approvals?.[i.toolCallId] !== undefined);
+          (nested.nested?.interrupts ?? []).some((i) => i.toolCallId !== undefined && ctx.approvals?.[addressedId(toolCallId, i.toolCallId)] !== undefined);
         // A resume that DENIES an
         // already-suspended call used to fall into the `approved !== true` re-suspend return below —
         // the deny was a SILENT NO-OP (the record stayed 'suspended', the approval stayed pending
@@ -698,6 +844,9 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
               : 'Approval denied.',
           };
           await writeToolTerminal(ctx, key, { status: 'denied', output }, toolCallId, toolName, hash);
+          if ((record.output as { __gnl_suspend?: { kind?: string } })?.__gnl_suspend?.kind === 'duplicate') {
+            await claim(ctx.journal, dupDeclinedKey(requestOf(ctx.identity), toolName, hash), { at: Date.now(), toolCallId });
+          }
           return output;
         }
         if (approved !== true && !nestedAnswered) {
@@ -957,7 +1106,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       const dupKey = mode === 'call' && sideEffect && dupAction !== 'off'
         ? dupScope === 'thread'
           ? threadDupMarkerKey(ctx.threadId!, toolName, hash)
-          : dupMarkerKey(ctx.runId, toolName, hash)
+          : dupMarkerKey(requestOf(ctx.identity), toolName, hash)
         : undefined;
       // Visible at the same-step race check further down, just before execute.
       let claimedDup = false;
@@ -1043,13 +1192,16 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
             return output;
           }
           if (dupAction === 'suspend') {
+            const already = await declinedRepeat(ctx, key, toolCallId, toolName, hash);
+            if (already !== undefined) return already;
             // Standard __gnl_suspend shape → the duplicate lands in the SAME approvals flow as guard
             // suspensions (Studio Approvals, resumeRun approvals[toolCallId]) — a human decides the
             // ambiguous case; an approval executes it exactly once (see `approved !== true` above).
             const nowS = ctx.journal.now ? await ctx.journal.now() : Date.now();
             const reason =
               `Duplicate side effect: '${toolName}' already succeeded with identical arguments in ` +
-              `${dupWhere} (first: ${marker.firstToolCallId}). A human must approve executing it again.`;
+              `${dupWhere} (first: ${marker.firstToolCallId}). A human must approve executing it again.` +
+              undeclaredHint(tool, toolName);
             // Zengin payload (heyet v1 #5): bilgisiz onay onay degildir — UI yas/kaynak gosterebilsin.
             const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'duplicate',
               prior: { toolCallId: marker.firstToolCallId, at: marker.at, ageMs: Math.max(0, nowS - marker.at), ...(crossOrigin ? { origin: crossOrigin } : {}) } } };
@@ -1306,7 +1458,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           });
         }
       }
-      const taintAction = ctx.limits?.taintedSideEffects ?? 'warn';
+      const taintAction = ctx.limits?.taintedSideEffects ?? DEFAULT_TAINT_ACTION;
       if (sideEffect && approved !== true && taintAction !== 'off') {
         const taint = await readRunTaint(ctx.journal, ctx.runId);
         if (taint) {
@@ -1322,7 +1474,8 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           if (taintAction === 'suspend') {
             const reason =
               `Tainted context: untrusted external content from ${src} entered this run before this ` +
-              `'${toolName}' call. A human must verify the action serves the user's request (not the fetched content) and approve it.`;
+              `'${toolName}' call. A human must verify the action serves the user's request (not the fetched content) and approve it.` +
+              undeclaredHint(tool, toolName);
             const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'taint' } };
             await recordIncident(ctx.journal, ctx.runId, { at: Date.now(), source: 'taint-guard', action: 'suspend', toolName, toolCallId, message: reason, detail: taintDetail });
             await writeToolTerminal(ctx, key, { status: 'suspended', output: sentinel }, toolCallId, toolName, hash);
@@ -1385,7 +1538,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // returns. Since NOTHING is written to the journal, a blocked call is re-evaluated FROM SCRATCH
       // once the limit is raised / on replay (deterministic, approval NOT required).
       if (ctx.limits) {
-        const gate = await checkToolGate(ctx.journal as unknown as JournalReader, ctx.runId, toolName, hash, ctx.limits);
+        const gate = await checkToolGate(ctx.journal as unknown as JournalReader, ctx.runId, toolName, hash, ctx.limits, requestOf(ctx.identity));
         // NOT a stop. The nudge is returned to the model
         // AS THIS CALL'S TOOL RESULT (the same mechanical shape as the guard's 'denied' path: journal a
         // terminal record, return the output, the loop CONTINUES and the model can self-correct). The
@@ -1426,6 +1579,30 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           });
           return { __gnl_limit_exceeded: { toolCallId, toolName, kind: gate.kind, message: gate.message, detail: gate.detail } };
         }
+        // The gate counted FINISHED calls; parallel ones pass it together. The seat is the atomic half.
+        if (tool.delegation !== true) {
+          const taken = await takeToolSeat(ctx.journal, requestOf(ctx.identity), ctx.limits);
+          if (taken.seat) {
+            seat.held = { id: toolCallId, seat: taken.seat };
+            (ctx.seats ??= new Map()).set(toolCallId, taken.seat);
+          }
+          if (!taken.ok) {
+            const message =
+              `@gnldev/durable: run '${ctx.runId}' reached the maxToolCalls limit (${ctx.limits.maxToolCalls}) counting the calls ` +
+              `running in parallel with this one — the new tool call was NOT EXECUTED`;
+            const detail = { kind: 'maxToolCalls', limit: ctx.limits.maxToolCalls, inFlight: true };
+            await recordIncident(ctx.journal, ctx.runId, { at: Date.now(), source: 'max-tool-calls', action: 'block', toolName, toolCallId, message, detail });
+            return { __gnl_limit_exceeded: { toolCallId, toolName, kind: 'maxToolCalls', message, detail } };
+          }
+          if (ctx.limits.maxConcurrency != null) {
+            const holder = `${ctx.runId}#${toolCallId}`;
+            const staleMs = tool.claimTtlMs ?? ctx.claimTtlMs ?? Math.max(CLAIM_TTL_MS, tool.timeoutMs ?? ctx.toolTimeoutMs ?? 0);
+            if (!(await takeConcurrencySlot(ctx.journal, requestOf(ctx.identity), ctx.limits, holder, staleMs, options?.abortSignal))) {
+              throw options?.abortSignal?.reason ?? new Error(`@gnldev/durable: '${toolName}' was cancelled while waiting for a concurrency slot`);
+            }
+            seat.slot = holder;
+          }
+        }
       }
 
       // 4) ATOMIC CLAIM (M4): only the WINNER writes the 'running' marker → only the winner executes.
@@ -1454,11 +1631,11 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           // counter that only starts existing at the first takeover is one attempt short of the truth.
           const won = await claim(ctx.journal, key, stampFormat({ status: 'running', startedAt: nowTs, attempts: 1 }));
           if (won) {
-            if (ownerKey) await claim(ctx.journal, ownerKey, ownerFields(ctx.identity));
+            if (ownerKey) await claimCrossRunOwner(ctx, toolName, hash);
             break claimLoop; // won → execute below
           }
           record = upgradeFormat(await ctx.journal.get<ToolJournalRecord>(key), key); // H13
-          if (record) await assertCrossRunOwner();
+          if (record) await assertCrossRunOwner(record);
           if (record && (record.status === 'succeeded' || record.status === 'denied' || record.status === 'reflected' || record.status === 'suspended')) {
             return await consumeExistingRecord(ctx, key, record, toolCallId);
           }
@@ -1709,9 +1886,10 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // extend exactly-once beyond the framework, all the way to the downstream side effect
       // (`idempotencyKey` above — `${runId}:${toolCallId}` in 'call' mode, `${runId}:${toolName}:${hash}`
       // in 'args' mode).
-      // Y1 (opt-in): timeout — on timeout a StepTimeoutError is thrown → the catch below writes 'failed'
-      // (side-effect uncertainty is resolved via the H9 recover/approval ladder). An AbortSignal is also
-      // passed to execute (cooperative cancellation): if one already exists, the two are combined.
+      // Y1 (opt-in): timeout — on timeout a StepTimeoutError is thrown to the caller. A read is journaled
+      // 'failed'; a side effect's attempt is still alive and journals its own outcome when it ends (see
+      // the catch below). An AbortSignal is also passed to execute (cooperative cancellation): a tool
+      // that honours it ends the attempt, which is then journaled like any failed one.
       const timeoutMs = tool.timeoutMs ?? ctx.toolTimeoutMs;
       // Expose the PARENT runId to the tool's execute. A sub-agent tool (agent-tool.ts) runs a
       // nested run under its own runId; to carry the parent's taint across that boundary it must know who
@@ -1729,7 +1907,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // `gnl`: who the tool runs for — THE channel (`identityOf(options)`). The old `resourceId` key
       // throws when read (closeLegacyResourceId): a tool that still reads it must fail loudly, not
       // serve "nobody" (which a knowledge-base tool used to read as "everything").
-      const execOpts: any = closeLegacyResourceId({ ...(options ?? {}), idempotencyKey, parentRunId: ctx.runId, gnlApprovals: nestedApprovalsFor(record, ctx.approvals), gnl: toolContextFor(ctx.identity) });
+      const execOpts: any = closeLegacyResourceId({ ...(options ?? {}), idempotencyKey, parentRunId: ctx.runId, gnlApprovals: nestedApprovalsFor(record, ctx.approvals, toolCallId), gnl: toolContextFor(ctx.identity) });
       if (timeoutMs) {
         const tSignal = AbortSignal.timeout(timeoutMs);
         execOpts.abortSignal = execOpts.abortSignal ? AbortSignal.any([execOpts.abortSignal, tSignal]) : tSignal;
@@ -1766,6 +1944,20 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           // nothing: the first thing anyone does with a contradiction like that is stop believing
           // the number next to it.
           const detail = { toolName, argsHash: hash, toolCallId };
+          // 'suspend' asks about the twin like it asks about a repeat: a human decides whether two
+          // identical calls in one step are one action or two. (It used to fall into the block below
+          // and end the run — under the default, a crash where a question was promised.)
+          if (dupAction === 'suspend') {
+            const already = await declinedRepeat(ctx, key, toolCallId, toolName, hash);
+            if (already !== undefined) return already;
+            const reason =
+              `Duplicate side effect: '${toolName}' is already executing with identical arguments in ` +
+              `${dupWhere}. A human must approve executing it a second time.` + undeclaredHint(tool, toolName);
+            const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'duplicate' } };
+            await recordIncident(ctx.journal, ctx.runId, { at: Date.now(), source: 'duplicate-guard', action: 'suspend', toolName, toolCallId, message: reason, detail });
+            await writeToolTerminal(ctx, key, { status: 'suspended', output: sentinel }, toolCallId, toolName, hash);
+            return sentinel;
+          }
           if (dupAction !== 'warn') {
             const message =
               `@gnldev/durable: side-effect tool '${toolName}' is already executing with identical ` +
@@ -1776,7 +1968,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           console.warn(
             `@gnldev/durable: side-effect tool '${toolName}' is already executing with identical ` +
             `arguments in ${dupWhere} — this call is RUNNING ANYWAY because ` +
-            `sideEffectDuplicates.action is 'warn' (the default). Set it to 'block' or 'suspend' ` +
+            `sideEffectDuplicates.action is 'warn'. Set it to 'suspend' (the default) or 'block' ` +
             `to stop the duplicate.`,
           );
         }
@@ -1817,9 +2009,10 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         }
       }
       let output: unknown;
-      try {
-        const p = Promise.resolve(original(input, execOpts));
-        output = timeoutMs ? await withTimeout(p, timeoutMs, toolName) : await p;
+      // The value the call settles with: the processed output, journaled. A closure because a timed-out
+      // attempt is still alive and settles LATER — through the same path (see the catch below).
+      const settleSuccess = async (raw: unknown): Promise<unknown> => {
+        let output = raw;
         // AUDIT TASK: the tool-result processor chain — runs AFTER execute returns SUCCESSFULLY, BEFORE
         // it's written to the journal (prompt-injection flagging, etc). The TRANSFORMED output is
         // journaled below as 'succeeded': this is the SAME philosophy as processInput's "doesn't run
@@ -1853,10 +2046,15 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           status: 'succeeded', output, argsHash: hash, toolName,
           // A compensate-bearing tool's success stores the RAW args — the unwind needs them.
           ...(typeof tool.compensate === 'function' ? { input } : {}),
+          ...(tool.delegation === true ? { delegation: true as const } : {}),
         }, toolCallId, toolName, hash, dupKey, semPlan, xidPlan);
         // NOTE: taint for `untrusted` tools is now marked at INVOCATION (see above), not here —
         // marking after execute lost the same-step parallel race against a side-effect tool's taint read.
-      } catch (error: any) {
+        return output;
+      };
+      // The failure path, for an attempt that ended in an error: journaled as one failed attempt, the
+      // claimed duplicate slot given back. Returns the error to throw.
+      const settleFailure = async (error: any): Promise<unknown> => {
         // Continue the attempts count of a previous 'failed' record if it exists, otherwise this is the first attempt (1).
         // A stale 'running' counts too: crash-then-throw is still attempt N+1, and reading only 'failed'
         // here let a crash loop launder the counter — one crash between two throws reset it to 1.
@@ -1910,11 +2108,31 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         }
         // NOTE: taint is marked at INVOCATION now (see ), so a FAILED untrusted tool is already
         // tainted — its error body (also attacker-authorable) is covered without a post-hoc mark here.
-        throw thrown.rendersAsIs && journaledError === thrown.text ? error : maskedToolError(error, journaledError);
+        return thrown.rendersAsIs && journaledError === thrown.text ? error : maskedToolError(error, journaledError);
+      };
+      const p = Promise.resolve(original(input, execOpts));
+      let pSettled = false;
+      p.then(() => { pSettled = true; }, () => { pSettled = true; });
+      try {
+        output = timeoutMs ? await withTimeout(p, timeoutMs, toolName) : await p;
+      } catch (error: any) {
+        // A TIMED-OUT SIDE EFFECT IS NOT A FAILED ONE. The timeout stops the wait, not the attempt: the
+        // effect may still land. Journaling it 'failed' now handed the next attempt to recover(), which
+        // was asked while the first attempt was still in flight, answered "not done", and the effect ran
+        // twice (measured). So the claim stays 'running' and the attempt settles the record itself when
+        // it ends; a retry meanwhile meets 'running' and waits for that outcome, as for a live twin.
+        if (sideEffect && error instanceof StepTimeoutError && !pSettled) {
+          seat.late = seat.held !== undefined || seat.slot !== undefined;
+          void p.then(
+            (late) => settleSuccess(late).then(() => undefined),
+            (lateErr) => settleFailure(lateErr).then(() => undefined),
+          ).finally(() => (seat.late ? releaseSeat(seat) : undefined)).catch((e) => console.warn(`@gnldev/durable: '${toolName}' finished after its timeout and its outcome could not be journaled:`, e));
+          throw error;
+        }
+        throw await settleFailure(error);
       }
-      return output;
-    },
-  };
+      return await settleSuccess(output);
+  }
 }
 
 /**

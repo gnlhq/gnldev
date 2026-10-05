@@ -27,6 +27,8 @@ import type { AdoptIntoOrgResult,
   RunJournal, WorkStore, CacheStore, MetaStore, LogRecord,
 } from './storage.js';
 import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision } from './storage.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { REDIS_STORAGE_NAMES, ADOPT_INTO_ORG_NAMES } from './option-names.js';
 
 const SCHEMA_VERSION = '1';
 
@@ -266,6 +268,9 @@ function isSuspended(p: { kind: string } | null, value: unknown): boolean {
 
 // H1 CAS Lua script: if GET==ARGV[1] then SET ARGV[2] → 1, else 0. The Redis script runs atomically →
 // this closes the race window between putIfMatch's JS-side comparison and the SET.
+/** HINCRBYFLOAT over ARGV's field/delta pairs, atomically; returns the new values in order. */
+const INCR_FIELDS_LUA = `-- gnl:incr-fields
+local out={} for i=1,#ARGV,2 do out[#out+1]=redis.call('HINCRBYFLOAT',KEYS[1],ARGV[i],ARGV[i+1]) end return out`;
 const CAS_LUA = `if redis.call('GET',KEYS[1])==ARGV[1] then redis.call('SET',KEYS[1],ARGV[2]) return 1 else return 0 end`;
 
 /**
@@ -668,9 +673,22 @@ class RedisRunJournal implements RunJournal {
   /** H8a: engine-internal atomic counter via HINCRBYFLOAT (if the client supports it; otherwise the
    *  method is considered undefined — budget.ts falls back to the legacy path). Key lives in its own
    *  sub-namespace (ctr:). */
-  async incrBy(key: string, fields: Record<string, number>): Promise<void> {
+  async incrBy(key: string, fields: Record<string, number>): Promise<Record<string, number>> {
     if (!this.client.hincrbyfloat) throw new Error('@gnldev/durable redis: client does not support hincrbyfloat');
-    for (const [f, d] of Object.entries(fields)) await this.client.hincrbyfloat(this.pfx + CTR + key, f, d);
+    const entries = Object.entries(fields);
+    const after: Record<string, number> = {};
+    if (entries.length > 1 && this.client.eval) {
+      // Several fields move together (a finished call's count and its seat — limits.ts): one script, so
+      // no reader sees one moved without the other.
+      const values = await this.client.eval(INCR_FIELDS_LUA, 1, this.pfx + CTR + key, ...entries.flat());
+      if (!Array.isArray(values) || values.length !== entries.length) {
+        throw new Error(`@gnldev/durable redis: incrBy's script returned ${JSON.stringify(values)}, not one value per field — the client's eval must run Lua as Redis does`);
+      }
+      entries.forEach(([f], i) => { after[f] = Number(values[i]); });
+      return after;
+    }
+    for (const [f, d] of entries) after[f] = Number(await this.client.hincrbyfloat(this.pfx + CTR + key, f, d));
+    return after;
   }
   async getCounters(key: string): Promise<Record<string, number> | undefined> {
     if (!this.client.hgetall) return undefined;
@@ -781,6 +799,7 @@ class RedisRunJournal implements RunJournal {
     const agents = new Map<string, string>();
     const resourceIds = new Map<string, string>();
     const workKeys = new Map<string, string>();
+    const parentRunIds = new Map<string, string>();
     for (let i = 0; i < keys.length; i++) {
       const s = values[i];
       if (s == null) continue;
@@ -795,11 +814,12 @@ class RedisRunJournal implements RunJournal {
       const rawKey = keys[i]!.slice(cut);
       if (rawKey.endsWith(':input')) {
         const runId = rawKey.slice(0, -':input'.length);
-        const inp = e.v as { threadId?: string; agent?: string; resourceId?: string; workKey?: string } | undefined;
+        const inp = e.v as { threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string } | undefined;
         if (inp?.threadId) threadIds.set(runId, inp.threadId);
         if (inp?.agent) agents.set(runId, inp.agent);
         if (inp?.resourceId) resourceIds.set(runId, inp.resourceId);
         if (inp?.workKey) workKeys.set(runId, inp.workKey);
+        if (inp?.parentRunId) parentRunIds.set(runId, inp.parentRunId);
       }
       // A run whose keys are ALL non-entry ones (it died before its first model step: `:input` plus a
       // claim marker) has nothing in the envelope's r/k fields, so it never reached byRun above and was
@@ -838,18 +858,21 @@ class RedisRunJournal implements RunJournal {
         const agent = agents.get(runId);
         const resourceId = resourceIds.get(runId);
         const workKey = workKeys.get(runId);
+        const parentRunId = parentRunIds.get(runId);
         return {
           runId, status: deriveRunStatus(v.s, outcomes.has(runId) ? { status: outcomes.get(runId)! } : null), modelSteps: v.m, toolCalls: v.t,
           ...(threadId ? { threadId } : {}),
           ...(agent ? { agent } : {}),
           ...(resourceId ? { resourceId } : {}),
           ...(workKey ? { workKey } : {}),
+          ...(parentRunId ? { parentRunId } : {}),
         };
       });
     if (q?.status) all = all.filter((r) => r.status === q.status);
     if (q?.agent) all = all.filter((r) => r.agent === q.agent);
     if (q?.resourceId) all = all.filter((r) => r.resourceId === q.resourceId);
     if (q?.workKey) all = all.filter((r) => r.workKey === q.workKey);
+    if (q?.topLevel) all = all.filter((r) => !r.parentRunId);
     const { start, limit } = offset(q);
     return pageOf(all, start, limit);
   }
@@ -1084,6 +1107,7 @@ export class RedisStorage implements Storage {
   // memory/vectors: NOT PROVIDED (undefined) — capability='none', overridden via composite() (see comment above).
 
   constructor(opts: RedisStorageOptions = {}) {
+    refuseUnknownNames('RedisStorage', opts, REDIS_STORAGE_NAMES);
     const pfx = opts.keyPrefix ?? 'gnl:';
     this.pfx = pfx;
     if (opts.client) {
@@ -1137,6 +1161,7 @@ export class RedisStorage implements Storage {
    * refills. Reported under `skippedPlatformKeys` as `cache:` so the decision is visible.
    */
   async adoptIntoOrg(orgId: string, opts?: { dryRun?: boolean; allowUnregistered?: boolean; allowInFlight?: boolean }): Promise<AdoptIntoOrgResult> {
+    refuseUnknownNames('adoptIntoOrg', opts, ADOPT_INTO_ORG_NAMES);
     const prefix = orgPrefix(orgId);
     await assertOrgRegistered(this.runs, orgId, opts?.allowUnregistered);
     await assertNoRunsInFlight(this.runs, opts?.allowInFlight);

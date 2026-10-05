@@ -22,7 +22,7 @@ import { describe, it, expect } from 'vitest';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CALLER_CONFLICT_CODES, BLOCKED_ERROR_CODES, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES, RESERVED_ID_ERROR_CODES } from '@gnldev/durable';
+import { CALLER_CONFLICT_CODES, BLOCKED_ERROR_CODES, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES, RESERVED_ID_ERROR_CODES, REQUEST_ERROR_CODES } from '@gnldev/durable';
 import { EDGE_ERROR_CODES } from '../src/edge-errors.js';
 import { STUDIO_ERROR_CODES } from '../../studio/src/error-codes.js';
 
@@ -66,6 +66,7 @@ describe('every code written into a response is a value in an exported map', () 
       ...Object.values(UPSTREAM_ERROR_CODES),
       ...Object.values(LIMIT_ERROR_CODES),
       ...Object.values(RESERVED_ID_ERROR_CODES),
+      ...Object.values(REQUEST_ERROR_CODES),
       ...Object.values(EDGE_ERROR_CODES),
       ...Object.values(STUDIO_ERROR_CODES),
     ]);

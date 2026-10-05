@@ -193,7 +193,7 @@ describe("FAZ-3 toolPolicy 'strict-critical'", () => {
 
   it('recover() OR a deterministic idempotencyKey satisfies it', async () => {
     const withRecover = { charge: { sideEffect: true, recover: async () => ({ done: false as const }), execute: async () => ({ ok: 1 }) } };
-    const withKey = { charge: { sideEffect: true, idempotencyKey: (a: any) => String(a.amount), execute: async () => ({ ok: 1 }) } };
+    const withKey = { charge: { sideEffect: true, idempotencyKey: (a: any) => String(a.amount), idempotencyWindow: 'run' as const, execute: async () => ({ ok: 1 }) } };
     await expect(runDurable(baseOpts(new InMemoryJournal(), 'sc2', { model: model(), tools: withRecover, toolPolicy: 'strict-critical' }) as any)).resolves.toBeTruthy();
     await expect(runDurable(baseOpts(new InMemoryJournal(), 'sc3', { model: model(), tools: withKey, toolPolicy: 'strict-critical' }) as any)).resolves.toBeTruthy();
   });

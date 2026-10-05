@@ -78,7 +78,7 @@ const polled: PollResult = await scheduler.poll();
 const fired: number = polled.fired;
 const direct: Promise<PollResult> = pollScheduler(journal, { runWorkflow: async (name) => ({ runId: name }) });
 const triggers: TriggerInfo[] = await listTriggers(journal);
-const status: 'pending' | 'done' | 'failed' | undefined = triggers[0]?.status;
+const status: 'pending' | 'done' | 'failed' | 'paused' | undefined = triggers[0]?.status;
 export { id, callerOption, fired, direct, status };
 `;
 

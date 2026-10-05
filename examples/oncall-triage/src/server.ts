@@ -170,7 +170,7 @@ export function buildServer(deps: ServerDeps) {
   app.mount(
     '/studio',
     createStudioApp({
-      reader: toJournal(storage.runs),
+      reader: toJournal(storage),
       apiBase: '/studio',
       resume: async (runId, approvals) => {
         const r = await resume(runId, approvals);

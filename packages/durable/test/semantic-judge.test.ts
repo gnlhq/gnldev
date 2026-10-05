@@ -18,7 +18,7 @@ import type { SemDupRecord, SemPlan } from '../src/semantic-dup.js';
 
 const cert = (over: Partial<JudgeCert> = {}): JudgeCert => ({
   v: 1, fixtureSetId: 'fx-1', judgeModelId: 'test-judge', judgePromptVersion: JUDGE_PROMPT_VERSION,
-  paraphraseRecall: 0.95, nearMissFp: 0.01, passedAt: Date.now(), ...over,
+  paraphraseRecall: 0.95, nearMissFp: 0.01, paraphrasePairs: 20, nearMissAnswered: 20, passedAt: Date.now(), ...over,
 });
 const cfgOf = (complete: SemanticJudgeConfig['complete'], over: Partial<SemanticJudgeConfig> = {}): SemanticJudgeConfig => ({
   complete, judgeModelId: 'test-judge', qualification: cert(), ...over,

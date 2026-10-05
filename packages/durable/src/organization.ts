@@ -193,6 +193,7 @@ export function parseOrganizationKey(id: string): { orgId: string; rest: string 
  * Postgres — not `prefix.length`, which counts UTF-16 code units: for an id outside the BMP (`🚀team`)
  * that compared one character too many and the organization listed NOTHING of its own (measured on
  * SQLite and Postgres). Bound rather than measured by the database because pg-mem has no `length()`.
+ * @internal — SQL builder shared by the storage adapters.
  */
 export function orgSpaceSql(col: string, ph: () => string, opts: { orgId?: string; outside?: boolean } = {}): { cond: string; params: unknown[] } {
   return prefixSql(col, opts.orgId === undefined ? ORG_KEY_PREFIX : orgPrefix(opts.orgId), ph, opts.outside === true);

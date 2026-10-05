@@ -8,6 +8,8 @@
 // Safe-side behavior: does NOT NARROW when there is no query, or when the tool count is already
 // within topK.
 import type { Processor } from '@gnldev/durable';
+import { refuseUnknownNames } from '@gnldev/options';
+import { TOOL_SEARCH_NAMES } from './option-names.js';
 
 export interface ToolSearchOptions {
   /** text → embedding (wires to the AI SDK `embed`; faked in tests). */
@@ -51,6 +53,7 @@ function queryOf(input?: { messages?: any[]; prompt?: unknown }): string | undef
  * that no longer exist are silently skipped (replay doesn't break even if the tool set changes).
  */
 export function toolSearch(opts: ToolSearchOptions): Processor {
+  refuseUnknownNames('toolSearch', opts, TOOL_SEARCH_NAMES);
   const topK = opts.topK ?? 8;
   if (topK < 1) throw new Error('@gnldev/processors toolSearch: topK must be >= 1');
   const always = new Set(opts.always ?? []);

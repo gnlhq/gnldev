@@ -8,6 +8,7 @@
 // "text started/ended" event (only consecutive text-deltas) → START is synthesized on the first delta,
 // END is closed when the next non-text event arrives (or on done/error).
 import { EventType, type AguiEvent, type RunErrorEvent, type RunFinishedEvent } from './types.js';
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 
 /** The SSE frame shape written by @gnldev/server's pipeAgentStream (event name + JSON data). */
 export interface GnlSseEvent {
@@ -52,6 +53,8 @@ function closeText(state: AguiConvertState): AguiConvertResult {
   };
 }
 
+const CONVERT_CONTEXT_NAMES = optionNames<AguiConvertContext>()(['threadId', 'runId']);
+
 /**
  * Converts a single GNL SSE event into an AG-UI event sequence.
  * If `state` is not given, it starts fresh (`initialAguiConvertState`) — a single state object must
@@ -62,6 +65,7 @@ export function toAguiEvents(
   ctx: AguiConvertContext,
   state: AguiConvertState = initialAguiConvertState,
 ): AguiConvertResult {
+  refuseUnknownNames('toAguiEvents', ctx, CONVERT_CONTEXT_NAMES);
   switch (gnlEvent.event) {
     case 'text-delta': {
       const text: string = gnlEvent.data?.text ?? '';

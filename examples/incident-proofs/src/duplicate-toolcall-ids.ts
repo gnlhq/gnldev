@@ -41,12 +41,15 @@ function multiCallModel(): any {
 }
 
 export async function runDuplicateToolCallIds() {
-  // ── unprotected: default idempotency mode ('call', keyed by toolCallId) — documents CURRENT/baseline behavior ──
+  // ── unprotected: the call-scoped key alone ('call', keyed by toolCallId) ──
+  // GNL's duplicate ladder now defaults to 'suspend' and stops the identical repeats on its own; the
+  // baseline sets it to 'warn' (the earlier default) so this row shows what the call-scoped key alone does.
   let unprotectedCalls = 0;
   const unprotectedTools = { charge: { execute: async () => { unprotectedCalls++; return { charged: 20, seq: unprotectedCalls }; } } };
   await runDurable({
     runId: 'dup-unprotected', journal: new InMemoryJournal(), model: multiCallModel(),
     tools: unprotectedTools as any, stopWhen: stepCountIs(6), prompt: 'charge $20',
+    limits: { sideEffectDuplicates: 'warn' },
   });
 
   // ── with GNL: idempotency: 'args' — journal keyed by (toolName, argsHash) instead of toolCallId ──
@@ -67,7 +70,7 @@ export async function runDuplicateToolCallIds() {
     // The baseline here is GNL on its defaults, not a GNL-free path — the two are indistinguishable
     // for this pattern, because a call-scoped guard cannot see it. Saying "no GNL" would claim the
     // fix is installing the library; it is setting one option.
-    baselineLabel: "GNL defaults (idempotency: 'call')",
+    baselineLabel: "GNL, call-scoped key only (idempotency: 'call', sideEffectDuplicates: 'warn')",
     protectedLabel: "GNL + idempotency: 'args'",
   });
 }

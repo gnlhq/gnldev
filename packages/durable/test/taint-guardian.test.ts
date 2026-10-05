@@ -102,7 +102,7 @@ describe('taintGuardian (taint × sensitive-tool gate) — e2e', () => {
   });
 
   it('(c) a NON-sensitive tool in a TAINTED run → allowed (only the intersection is gated)', async () => {
-    vi.spyOn(console, 'warn').mockImplementation(() => {}); // default taintedSideEffects:'warn' still names it
+    vi.spyOn(console, 'warn').mockImplementation(() => {}); // taintedSideEffects:'warn' still names it
     const journal = new InMemoryJournal();
     const counters = { fetches: 0, sends: 0, notes: 0 };
     const model = createMockModel(async ({ prompt }: any) => {
@@ -114,6 +114,9 @@ describe('taintGuardian (taint × sensitive-tool gate) — e2e', () => {
     const res = await runDurable({
       runId: 'tg-3', journal, model, tools: makeTools(counters, { untrusted: true }),
       prompt: 'go', stopWhen: stepCountIs(10), guard: guardian(),
+      // The run-wide taint ladder now defaults to 'suspend' and would gate every side effect itself;
+      // this test isolates the guardian's intersection, so the ladder stays at 'warn'.
+      limits: { taintedSideEffects: 'warn' },
     });
     expect(res.text).toBe('Done.');
     expect(counters.notes).toBe(1); // tainted, but logNote is not sensitive → not gated

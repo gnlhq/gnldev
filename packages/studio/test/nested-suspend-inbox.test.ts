@@ -64,8 +64,9 @@ describe('onay gelen kutusu: iç içe askı', () => {
       items: Array<{ runId: string; toolCallId: string; toolName: string; reason?: string }>;
     };
     const rows = body.items.filter((i) => i.runId === RUN_ID);
+    // The child's question, addressed from the parent: `<delegation call>/<child call>`.
     expect(rows.map((r) => r.toolCallId), 'gelen kutusu cevaplanamayan bir id gösteriyor')
-      .toEqual([CHILD_TCID]);
+      .toEqual([`${PROXY_TCID}/${CHILD_TCID}`]);
     expect(rows[0]!.toolName).toBe('paraGonder');
     // Bağlam kaybolmasın: operatör bunun bir alt ajandan geldiğini okuyabilmeli.
     expect(String(rows[0]!.reason)).toContain('sub-agent');

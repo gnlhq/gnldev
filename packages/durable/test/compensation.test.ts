@@ -213,7 +213,7 @@ describe('compensateRun — saga unwind', () => {
     expect(compCalls[0]).toMatchObject({ args: { id: 'LEGACY' }, output: { chargeId: 'c9' } });
   });
 
-  it('the double-charge unwind story: duplicate executions (call mode, warn default) each get their OWN compensation', async () => {
+  it('the double-charge unwind story: duplicate executions (call mode, duplicate ladder at warn) each get their OWN compensation', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const journal = new InMemoryJournal();
     const compCalls: CompCall[] = [];
@@ -225,7 +225,9 @@ describe('compensateRun — saga unwind', () => {
       if (done < 2) return toolCallResult('charge', `call-${done + 1}`, { id: 'A' }); // the accidental double charge
       return finalTextResult('Done.');
     });
-    await runDurable({ runId: 'dup-1', journal, model, tools: { charge }, prompt: 'x', stopWhen: stepCountIs(10) });
+    // The default duplicate ladder is now 'suspend' and would ask before the second charge; this story is
+    // about unwinding a double charge that DID happen, so the ladder is set to 'warn' to let it happen.
+    await runDurable({ runId: 'dup-1', journal, model, tools: { charge }, prompt: 'x', stopWhen: stepCountIs(10), limits: { sideEffectDuplicates: 'warn' } });
 
     const report = await compensateRun('dup-1', { journal, tools: { charge } });
     expect(report.entries.filter((e) => e.status === 'compensated')).toHaveLength(2); // BOTH executions refunded

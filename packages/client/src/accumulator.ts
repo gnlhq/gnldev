@@ -53,7 +53,10 @@ export function appendUserMessage(state: ChatState, text: string): ChatState {
   return { ...startTurn(state), messages: [...state.messages, { role: 'user', content: text }] };
 }
 
-/** Apply a completed (non-stream) run result: assistant text + interrupts + runId. */
+/**
+ * Apply a completed (non-stream) run result: assistant text + interrupts + runId.
+ * @internal — a reducer over a server response — data a newer server may extend, not options a host writes.
+ */
 export function applyRunResult(state: ChatState, r: { runId: string; text?: string; interrupts?: Interrupt[]; replayedToolCalls?: ChatState['replayedToolCalls'] }): ChatState {
   return {
     ...state,

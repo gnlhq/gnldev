@@ -1,5 +1,6 @@
-// @gnldev/a2a — remote agent-to-agent. createAgentTool is in-process; this one calls a REMOTE agent (a @gnldev/server
-// REST endpoint) as an AI SDK tool. **Exactly-once across the network:** runId is deterministic
+// @gnldev/a2a — remote agent-to-agent. createAgentTool is in-process; this one calls a REMOTE agent as an AI SDK
+// tool: a @gnldev/server REST endpoint (protocol 'gnl', the default) or any Agent2Agent agent (protocol 'a2a':
+// agent card + JSON-RPC message/send). The serving half — GNL agents as A2A agents — is `@gnldev/a2a/server`. **Exactly-once across the network:** runId is deterministic
 // (`a2a:<idempotencyKey ?? toolCallId>`) → the remote runDurable replays the same runId (a second POST has no
 // side effect). When wrapped in durableTool inside a parent runDurable, the parent also journals it → on parent
 // resume, the remote call is SKIPPED.
@@ -7,13 +8,23 @@ import { tool } from 'ai';
 import type { Tool } from 'ai';
 import { z } from 'zod';
 import { signA2ARequest } from './signature.js';
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 
 export { a2aSigningInput, signA2ARequest, verifyA2ARequest, A2A_SIGNATURE_WINDOW_MS, type A2ASignedRequest, type A2ASignatureVerdict } from './signature.js';
 
 export interface A2AToolOptions {
-  /** Remote @gnldev/server base URL (e.g. 'https://host'). */
+  /**
+   * `'gnl'` (default): the remote is a @gnldev/server; `endpoint` is its base URL and the call is
+   * `POST <endpoint>/agents/<agentName>/run`.
+   * `'a2a'`: the remote is any Agent2Agent agent; `endpoint` is the agent's base URL — the card is read
+   * from `<endpoint>/.well-known/agent.json` (then `agent-card.json`) and the call is a JSON-RPC
+   * `message/send` to the card's `url`. The messageId is the same deterministic key the GNL mode uses,
+   * so a GNL agent behind `createA2AServer` replays a re-sent call instead of running it again.
+   */
+  protocol?: 'gnl' | 'a2a';
+  /** `'gnl'`: the remote @gnldev/server base URL (e.g. 'https://host'). `'a2a'`: the agent's base URL. */
   endpoint: string;
-  /** Remote agent name (REST: POST /agents/<name>/run). */
+  /** Remote agent name (REST: POST /agents/<name>/run). In `'a2a'` mode, a label for the tool and its errors. */
   agentName: string;
   description?: string;
   /** Inject fetch for test/custom transport (e.g. hono app.request). Otherwise global fetch. */
@@ -44,9 +55,9 @@ export interface A2AToolOptions {
 
 /**
  * K3/timeout — an ALIGNED but INDEPENDENT local definition matching `@gnldev/durable`'s `StepTimeoutError`
- * contract (name='StepTimeoutError', detail:{label,timeoutMs}): in @gnldev/a2a's package.json,
- * @gnldev/durable is only a devDependency (for tests) — NOT a runtime dependency/peerDependency
- * (see peerDependencies: only 'ai'/'zod'). Hence, instead of importing it, this class with the same
+ * contract (name='StepTimeoutError', detail:{label,timeoutMs}): @gnldev/durable is an OPTIONAL peer of
+ * @gnldev/a2a, needed only by the `./server` entry — this client entry must import nothing from it.
+ * Hence, instead of importing it, this class with the same
  * name/shape is defined here: when wrapped (with durableTool) inside runDurable, the H9 recovery
  * ladder recognizes it the same way via `err.name === 'StepTimeoutError'`, but the a2a package has
  * no runtime dependency on durable.
@@ -87,16 +98,25 @@ function endUserOf(options: unknown): string | undefined {
 export interface A2AResult {
   text: string;
   interrupts: unknown;
-  /** The deterministic runId the remote replayed under — the exactly-once handle across the network. */
+  /** The deterministic runId the remote ran under — a GNL server answers a retry from its journal under it. */
   runId: string;
   remoteAgent: string;
 }
 
+const A2A_TOOL_NAMES = optionNames<A2AToolOptions>()(['protocol', 'endpoint', 'agentName', 'description', 'fetchImpl', 'headers', 'timeoutMs', 'secret', 'budgetGuard']);
+
 // Declared, not inferred (TS2742): inference would name a pnpm-internal provider-utils path in the
 // emitted .d.ts. `Tool` comes from `ai`, which this package already requires as a peer.
 export function createA2ATool(opts: A2AToolOptions): Tool<{ task: string }, A2AResult> & { idempotent: boolean } {
+  refuseUnknownNames('createA2ATool', opts, A2A_TOOL_NAMES);
   const doFetch = opts.fetchImpl ?? fetch;
-  // H7: the remote side replays the same deterministic runId (exactly-once across the network) →
+  // The HMAC signature is @gnldev/server's REST contract (it signs the REST route); an A2A agent states
+  // its own auth in its card and takes credentials as headers.
+  if (opts.protocol === 'a2a' && opts.secret) {
+    throw new TypeError("[gnl a2a] `secret` signs @gnldev/server's REST route and has no meaning for protocol 'a2a' — pass the agent's credential in `headers`.");
+  }
+  const call = opts.protocol === 'a2a' ? a2aCaller(opts, doFetch) : undefined;
+  // H7: a GNL remote replays the same deterministic runId (a retry is answered from its journal) →
   // a repeat POST has no side effect → idempotent. The runId is derived from
   // `options.idempotencyKey` (parent-run-scoped, globally unique — see durableTool) when available,
   // falling back to the raw `toolCallId` otherwise, which is only unique WITHIN a single run: if this
@@ -122,6 +142,7 @@ export function createA2ATool(opts: A2AToolOptions): Tool<{ task: string }, A2AR
       // the thrown error passes upward as-is (K3: no silent failure).
       if (opts.budgetGuard) await opts.budgetGuard({ agentName: opts.agentName, task, runId });
       const timeoutMs = opts.timeoutMs ?? 30_000;
+      if (call) return call(task, runId.slice('a2a:'.length), endUserOf(options), timeoutMs);
       // The remote reads `resourceId` for an application credential (the user it acts for) and for an
       // operator (staff naming a user speaks for that user); a user credential ignores it.
       const user = endUserOf(options);
@@ -130,24 +151,12 @@ export function createA2ATool(opts: A2AToolOptions): Tool<{ task: string }, A2AR
       const path = `/agents/${opts.agentName}/run`;
       // Signed with the one definition the server verifies with (signature.ts): the route is in it.
       if (opts.secret) Object.assign(headers, signA2ARequest(opts.secret, { method: 'POST', path, body: bodyStr }));
-      let res: Response;
-      try {
-        res = await doFetch(`${opts.endpoint}/agents/${encodeURIComponent(opts.agentName)}/run`, {
-          method: 'POST',
-          headers,
-          body: bodyStr,
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-      } catch (e: any) {
-        // K3: no silent failure — convert the timeout into an error aligned with @gnldev/durable's
-        // StepTimeoutError contract (name='StepTimeoutError'), rethrow the rest as-is.
-        if (e?.name === 'TimeoutError' || e?.name === 'AbortError')
-          throw new StepTimeoutError(
-            `A2A call timed out (${timeoutMs}ms): remote '${opts.agentName}' agent did not respond`,
-            { label: `a2a:${opts.agentName}`, timeoutMs },
-          );
-        throw e;
-      }
+      // K3: no silent failure — a timeout reads as @gnldev/durable's StepTimeoutError (timedFetch).
+      const res = await timedFetch(doFetch, opts.agentName, `${opts.endpoint}/agents/${encodeURIComponent(opts.agentName)}/run`, {
+        method: 'POST',
+        headers,
+        body: bodyStr,
+      }, timeoutMs);
       if (!res.ok) {
         // K3: non-2xx response → throw an error (durableTool writes 'failed', the model sees the real error).
         const bodyText = await res.text().catch(() => '');
@@ -162,4 +171,74 @@ export function createA2ATool(opts: A2AToolOptions): Tool<{ task: string }, A2AR
       return { text: json.text, interrupts: json.interrupts, runId, remoteAgent: opts.agentName };
     },
   }), { idempotent: true });
+}
+
+type Fetch = typeof fetch;
+
+/** A fetch whose timeout reads as `StepTimeoutError` (name='StepTimeoutError'); anything else is rethrown as it is. Both modes call through it. */
+async function timedFetch(doFetch: Fetch, agentName: string, url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  try {
+    return await doFetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e: any) {
+    if (e?.name === 'TimeoutError' || e?.name === 'AbortError')
+      throw new StepTimeoutError(`A2A call timed out (${timeoutMs}ms): remote '${agentName}' agent did not respond`, { label: `a2a:${agentName}`, timeoutMs });
+    throw e;
+  }
+}
+
+/**
+ * The standard A2A half of `createA2ATool`: read the Agent Card once, then JSON-RPC `message/send`.
+ * A Task's answer is its artifacts' text (else its status message's); a Message's is its text parts.
+ * `input-required` comes back as `interrupts` (the data part a GNL agent attaches), like a suspended
+ * GNL run; `failed`, `canceled` and `rejected` throw, as a non-2xx does in the GNL mode.
+ */
+function a2aCaller(opts: A2AToolOptions, doFetch: Fetch) {
+  const base = opts.endpoint.replace(/\/$/, '');
+  let cardUrl: Promise<string> | undefined;
+  const headers = { 'content-type': 'application/json', ...(opts.headers ?? {}) };
+  const readCard = async (timeoutMs: number): Promise<string> => {
+    for (const path of ['/.well-known/agent.json', '/.well-known/agent-card.json']) {
+      const res = await timedFetch(doFetch, opts.agentName, `${base}${path}`, { method: 'GET', headers: opts.headers ?? {} }, timeoutMs);
+      if (!res.ok) continue;
+      const card: any = await res.json().catch(() => null);
+      if (card && typeof card.url === 'string' && card.url !== '') return card.url;
+      throw new Error(`Remote agent '${opts.agentName}' card at ${base}${path} has no 'url'`);
+    }
+    throw new Error(`Remote agent '${opts.agentName}' has no agent card at ${base}/.well-known/agent.json or agent-card.json`);
+  };
+  const textOf = (parts: unknown): string =>
+    Array.isArray(parts) ? parts.filter((p: any) => p?.kind === 'text' && typeof p.text === 'string').map((p: any) => p.text).join('') : '';
+  return async (task: string, key: string, user: string | undefined, timeoutMs: number): Promise<A2AResult> => {
+    // A card that could not be read is not cached: the next call reads it again.
+    const url = await (cardUrl ??= readCard(timeoutMs).catch((e) => { cardUrl = undefined; throw e; }));
+    const body = JSON.stringify({
+      jsonrpc: '2.0', id: key, method: 'message/send',
+      params: {
+        message: { kind: 'message', role: 'user', messageId: key, parts: [{ kind: 'text', text: task }] },
+        configuration: { blocking: true, acceptedOutputModes: ['text/plain', 'application/json'] },
+        ...(user !== undefined ? { metadata: { resourceId: user } } : {}),
+      },
+    });
+    const res = await timedFetch(doFetch, opts.agentName, url, { method: 'POST', headers, body }, timeoutMs);
+    const json: any = await res.json().catch(() => null);
+    if (json?.error) throw new Error(`Remote agent '${opts.agentName}' returned a JSON-RPC error ${json.error.code}: ${String(json.error.message).slice(0, 200)}`);
+    if (!res.ok || !json?.result) throw new Error(`Remote agent '${opts.agentName}' returned an error (HTTP ${res.status}) with no JSON-RPC result`);
+    const r = json.result;
+    if (r.kind === 'message') return { text: textOf(r.parts), interrupts: undefined, runId: `a2a:${key}`, remoteAgent: opts.agentName };
+    const state = r.status?.state;
+    // Only `completed` is an answer and only `input-required` is a GNL suspension. Every other state —
+    // terminal (`failed`, `canceled`, `rejected`) or not final (`submitted`, `working`, `auth-required`,
+    // `unknown`) — throws: a durableTool would journal a resolved call as done and never ask again.
+    if (state !== 'completed' && state !== 'input-required') {
+      throw new Error(`Remote agent '${opts.agentName}' task ${r.id} is '${state}', not an answer: ${textOf(r.status?.message?.parts).slice(0, 200)}`);
+    }
+    const artifactText = Array.isArray(r.artifacts) ? r.artifacts.map((a: any) => textOf(a?.parts)).join('') : '';
+    const data = (r.status?.message?.parts ?? []).find((p: any) => p?.kind === 'data' && Array.isArray(p.data?.interrupts));
+    return {
+      text: artifactText || (state === 'input-required' ? '' : textOf(r.status?.message?.parts)),
+      interrupts: state === 'input-required' ? (data?.data.interrupts ?? [{ reason: textOf(r.status?.message?.parts) }]) : undefined,
+      runId: typeof r.id === 'string' ? r.id : `a2a:${key}`,
+      remoteAgent: opts.agentName,
+    };
+  };
 }

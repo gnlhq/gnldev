@@ -1,5 +1,7 @@
 import { generateText } from 'ai';
 import { optionsFingerprint, type Scorer, type ScoreSample } from './scorer.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { LLM_JUDGE_NAMES } from './option-names.js';
 
 export interface LlmJudgeOptions {
   /** AI SDK model (the judge). */
@@ -42,6 +44,7 @@ function hasContext(sample: ScoreSample): boolean {
  * (faithfulness/hallucination/answerRelevancy/etc.) declare this mechanism according to their needs.
  */
 export function llmJudge(opts: LlmJudgeOptions): Scorer {
+  refuseUnknownNames('llmJudge', opts, LLM_JUDGE_NAMES);
   return {
     name: opts.name ?? 'llm-judge',
     // The rubric and the judge model ARE the scorer: an edited rubric under the same name must not

@@ -53,6 +53,7 @@ export interface AgentRegistryRecord {
  * approval. DynamicArg fields (model/tools/system given as FUNCTIONS) can't be hashed meaningfully, so
  * they contribute a stable `dyn` marker — the fingerprint still changes if you switch a field between
  * static and dynamic, but two runs of the same dynamic config match (deterministic).
+ * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
  */
 export function fingerprintAgent(name: string, cfg: AgentConfig): string {
   const model =

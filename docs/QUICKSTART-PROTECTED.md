@@ -120,21 +120,19 @@ stating out loud:
 A user read out of the request body is the caller naming whoever they like. Read it from your own
 verified session.
 
-## 5. Before you deploy: the `─` row
+## 5. Before you deploy: memory
 
-Run `gnl dev` again and look for a `─` in the matrix:
+`gnl dev` runs your config as given — the same one `src/app.ts` deploys — so what the matrix says
+here is what production does. A config without memory prints:
 
 ```text
-  ─ thread gate      memory derived from storage           default
-      memory is on HERE (gnl dev) and off in src/app.ts — `gnl add memory`
+  ○ thread gate      no memory — threadId carries nothing                default
 ```
 
-`─` means **this process turned it on and your deployment will not have it**. `gnl dev` derives a
-memory store from `storage` so the Playground has threads; `src/app.ts` — the file you actually
-deploy — does not. Same config, two behaviours: conversations remember on your machine and quietly
-forget in production.
-
-Every `─` is that shape. It is the one mark on this screen you should never ship.
+and a conversation is remembered neither in the Playground nor after deploy. `gnl add memory` writes
+`src/memory.ts` and wires it into `gnl.config.ts`, which turns it on for both. (`gnl dev` used to
+derive a memory store for the Playground alone, marked `─`: on here, off in production. It no longer
+does.)
 
 ---
 

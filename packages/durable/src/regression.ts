@@ -6,9 +6,12 @@ import { runKeys } from './journal.js';
 import type { Journal, JournalEntry, JournalReader } from './journal.js';
 import { runDurable } from './run.js';
 import { runOwnerOf } from './run-identity.js';
+import { recordedInputProblem, type InputOrigin } from './request-body.js';
 import type { DurableResult, RunDurableArgs } from './run.js';
 import { argsHash, stableStringify, derivedRunIdBase } from './hash.js';
 import type { Guard } from './guard.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { REPLAY_RUN_NAMES, REGRESSION_REPORT_NAMES } from './option-names.js';
 
 // ── Decision point sequence ────────────────────────────────────────────────────
 // toolCallIds CAN BE DIFFERENT across runs (the model/SDK assigns random ids) → alignment is based
@@ -258,6 +261,8 @@ export interface ReplayRunConfig {
    * injected there (provenance.workingMemoryChars), it remains; callers should disclose that.
    */
   stripMemoryContext?: boolean;
+  /** The host vouches for the source run's recorded input (see RunDurableArgs.trustRecordedInput). */
+  trustRecordedInput?: boolean;
 }
 
 export interface ReplayRunResult {
@@ -313,11 +318,15 @@ async function pickReplayRunId(journal: Journal, runId: string): Promise<string>
  * or touches the original `runId`'s journal records (only writes under `newRunId`).
  */
 export async function replayRun(cfg: ReplayRunConfig): Promise<ReplayRunResult> {
-  const { journal, runId, newRunId, model, tools, system, guard, approvals, stopWhen, replay, stripMemoryContext } = cfg;
-  const input = await journal.get<{ prompt?: unknown; messages?: unknown; system?: unknown }>(runKeys.input(runId));
+  refuseUnknownNames('replayRun', cfg, REPLAY_RUN_NAMES);
+  const { journal, runId, newRunId, model, tools, system, guard, approvals, stopWhen, replay, stripMemoryContext, trustRecordedInput } = cfg;
+  const input = await journal.get<{ prompt?: unknown; messages?: unknown; system?: unknown; origin?: InputOrigin }>(runKeys.input(runId));
   if (!input) {
     throw new Error(`@gnldev/durable: no recorded input for runId "${runId}" — cannot replay.`);
   }
+  // A replay re-runs the source's recorded input: the same rule as continuing it (run.ts
+  // assertRecordedInputUsable), and the new run records the same origin, so a replay cannot launder it.
+  if (trustRecordedInput !== true) { const refusal = recordedInputProblem(runId, input); if (refusal) throw refusal; }
 
   let messages = input.messages as any[] | undefined;
   if (stripMemoryContext) {
@@ -352,6 +361,7 @@ export async function replayRun(cfg: ReplayRunConfig): Promise<ReplayRunResult> 
     ...(input.prompt && !messages ? { prompt: input.prompt } : {}),
     system: system ?? (input.system as string | undefined),
     ...(src.state === 'owned' ? { caller: src.owner } : {}),
+    ...(input.origin !== undefined ? { origin: input.origin } : {}),
   } as any);
 
   return { newRunId: dst, result };
@@ -388,6 +398,7 @@ export async function regressionReport(
   newRunId: string,
   opts?: RegressionReportOptions,
 ): Promise<RegressionReport> {
+  refuseUnknownNames('regressionReport', opts, REGRESSION_REPORT_NAMES);
   const diff = await diffRuns(reader, baseRunId, newRunId);
   const score = opts?.scorer ? await opts.scorer(diff) : undefined;
   return { baseRunId, newRunId, diff, score };

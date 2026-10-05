@@ -18,6 +18,12 @@ export type RunIdentity = Caller & {
   threadId?: string;
   /** The run whose model (or step) started this one, when it is a child run. */
   parentRunId?: string;
+  /**
+   * The run the request started — the root of a delegation tree. Set on child runs only: a sub-agent
+   * does the request's work, so whatever is "once per run" for the agent run directly (an args or
+   * business-key dedup window) is once per REQUEST for the tree.
+   */
+  requestRunId?: string;
 };
 
 /** What the engine hands a tool's `execute` as `options.gnl`. Read it with `identityOf(options)`. */

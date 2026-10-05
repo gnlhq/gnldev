@@ -1,12 +1,21 @@
 import { tool } from 'ai';
 import type { Tool } from 'ai';
 import { z } from 'zod';
-import { identityOf, SHARED_ONLY } from '@gnldev/durable';
+import { identityOf, SHARED_ONLY, vectorDocumentOf } from '@gnldev/durable';
 import type { VectorStore, Embed } from './vector-store.js';
 import type { Reranker } from './rerank.js';
 
 /** One retrieved document as the tool reports it. Named so the tool's public type can be declared. */
 export interface RagHit {
+  /** The stored record's id: a chunk id (`<docId>#<i>…`) for a chunked document, else the document's own. */
+  id: string;
+  /**
+   * The document the hit belongs to — what the model cites, and what a follow-up (`deleteDocuments`,
+   * a re-ingest, a link) names. The chunk trail's document id (`__gnlDoc`) when the record has one,
+   * else the record's own id. Hits used to carry neither, so a model could quote a passage but not say
+   * which document it came from.
+   */
+  documentId: string;
   text: string;
   score: number;
   metadata?: Record<string, unknown>;
@@ -65,6 +74,8 @@ export function createRagTool(opts: {
       });
       if (opts.rerank) matches = await opts.rerank.rerank(query, matches, opts.rerankTopK);
       return matches.map((m): RagHit => ({
+        id: m.id,
+        documentId: vectorDocumentOf(m.metadata) ?? m.id,
         text: m.text,
         score: Number(m.score.toFixed(4)),
         ...(m.metadata ? { metadata: m.metadata } : {}),

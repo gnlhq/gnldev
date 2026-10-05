@@ -305,14 +305,21 @@ describe('@gnldev/events — poison event does not block the topic', () => {
 
     // The record EXISTS now, so the re-quarantine write must be conditional on it being unchanged.
     const real = (work as any).putIfMatch.bind(work);
+    let releasing = false;
     const spy = vi.spyOn(work as any, 'putIfMatch').mockImplementation(async (...a: any[]) => {
+      if (releasing) return real(...a);
       // Scoped to the DEAD-LETTER key on purpose. The attempt counter is written by CAS too now
       // (attempt-cas-race.test.ts), and a blanket `return false` would stop that write instead, so
       // the event would never reach maxAttempts and this test would pass its assertions for the
       // wrong reason — or, as measured, stop reaching the write it exists to pin at all. Every
       // assertion below is unchanged; only the mock's aim is.
       if (!String(a[0]).startsWith('evtdead:')) return real(...a);
-      return false; // someone else wrote this key first
+      // Someone else wrote this key first — a real release, which resets the attempt record before it
+      // writes the dead record. (Writing only the dead record would leave a spent budget no release
+      // leaves, and the next start would read it as an attempt that never finished.)
+      releasing = true;
+      try { await retryDeadEvent(work, 'caswrite', 'A', POISON); } finally { releasing = false; }
+      return false;
     });
     for (let i = 1; i <= 5; i++) await c.poll(); // 5 post-release failures → tries to quarantine
     spy.mockRestore();
@@ -325,8 +332,8 @@ describe('@gnldev/events — poison event does not block the topic', () => {
     // quarantine would go through and `status` below would read `quarantined`. Same position as
     // quarantine-cas-race.test.ts:106.
     const rec = (await listDeadEvents(work, 'caswrite', 'A'))[0]!;
-    expect(rec.status).toBe('released'); // the lost CAS did not overwrite the released record
-    expect(rec.releases).toBe(1);
+    expect(rec.status).toBe('released'); // the lost CAS did not overwrite the release that beat it
+    expect(rec.releases).toBe(2);
 
     broken.value = false;
     expect(await c.poll()).toBe(1); // ...and the event was left live, not silently parked
@@ -357,7 +364,9 @@ describe('@gnldev/events — poison event does not block the topic', () => {
     expect(await work.get('evtcursor:clean:A')).toBeDefined();
     expect(await c.poll()).toBe(0);
     expect(await listDeadEvents(work, 'clean', 'A')).toEqual([]);
-    expect(await work.get('evtatt:clean:A:e0')).toBeUndefined(); // attempt counters only on failure
+    // An attempt is counted when it starts (a process that dies mid-handler has used one too), so a
+    // healthy delivery leaves its record: one attempt, started and finished.
+    expect(await work.get<any>('evtatt:clean:A:e0')).toMatchObject({ n: 1 });
     expect(await work.get('evtrescan:clean:A')).toBeUndefined(); // rescan flag only on release
     expect(warn).not.toHaveBeenCalled();
     expect(error).not.toHaveBeenCalled();

@@ -10,6 +10,8 @@
 // If fn() returns true ("work was done") the interval resets to pollMs; if false ("empty poll") the
 // interval grows ×2 (capped at maxPollMs) WHEN backoff IS ON, or stays fixed at pollMs WHEN it's OFF.
 
+import { refuseUnknownNames } from '@gnldev/options';
+import { POLL_LOOP_NAMES } from './option-names.js';
 export interface PollLoopOptions {
   /** Tick interval (ms). Default 200. */
   pollMs?: number;
@@ -29,6 +31,7 @@ export interface PollLoop {
  * internally) are caught and logged here — the chain NEVER dies (the next tick is always scheduled).
  */
 export function createPollLoop(fn: () => Promise<boolean>, opts: PollLoopOptions = {}): PollLoop {
+  refuseUnknownNames('createPollLoop', opts, POLL_LOOP_NAMES);
   const pollMs = opts.pollMs ?? 200;
   const backoffOn = opts.backoff ?? true;
   const maxPollMs = opts.maxPollMs ?? pollMs * 32;

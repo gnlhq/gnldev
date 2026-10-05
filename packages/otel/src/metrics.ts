@@ -17,8 +17,11 @@
 //   so `all` is 17 and `all` + 14 days is 255 — per organization, per round.)
 import { readCounter, METRICS_ALL_KEY, orgScopeOf } from '@gnldev/durable';
 import type { Journal } from '@gnldev/durable';
+import { serviceResourceAttributes, resourceOptionsOf } from './resource.js';
 import { toKv, nano } from './otlp.js';
 import type { OtlpKeyValue } from './otlp.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { TO_OTLP_METRICS_JSON_OPTS_NAMES } from './option-names.js';
 
 /** OTLP AggregationTemporality: 1 = DELTA, 2 = CUMULATIVE. */
 const CUMULATIVE = 2;
@@ -139,6 +142,7 @@ function sumMetric(name: string, unit: string, value: number, start: string, tim
  * makes its first value read as a jump from nothing, and "no data" can never be alerted on.
  */
 export async function toOtlpMetricsJson(journal: Journal, opts: ToOtlpMetricsOptions): Promise<OtlpMetricsPayload> {
+  refuseUnknownNames('toOtlpMetricsJson', opts, TO_OTLP_METRICS_JSON_OPTS_NAMES);
   // The label is DERIVED from the handle, not accepted alongside it. `withOrg` marks the journal it
   // returns and `orgScopeOf` reads that mark back, so the numbers and the name they are published
   // under come from one source and cannot drift apart. An explicit `orgId` is still allowed for a
@@ -207,11 +211,7 @@ export async function toOtlpMetricsJson(journal: Journal, opts: ToOtlpMetricsOpt
         // data point — where it would be repeated per metric and would invite someone to put two
         // organizations in one export. Nothing unbounded goes anywhere near a label: `runId` is the
         // one that would ruin a backend, and it is right there in the per-run rows the Studio reads.
-        attributes: toKv({
-          'service.name': opts.serviceName ?? 'gnl',
-          ...(orgId ? { 'gnl.org.id': orgId } : {}),
-          ...(opts.resourceAttributes ?? {}),
-        }),
+        attributes: toKv(serviceResourceAttributes(resourceOptionsOf(opts), orgId ? { 'gnl.org.id': orgId } : {})),
       },
       scopeMetrics: [{ scope: { name: '@gnldev/otel' }, metrics }],
     }],

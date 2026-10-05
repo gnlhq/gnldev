@@ -7,6 +7,10 @@ import { createHash } from 'node:crypto';
 import { toTraceSpans } from '@gnldev/durable';
 import type { JournalReader, TraceSpan } from '@gnldev/durable';
 
+import { serviceResourceAttributes, resourceOptionsOf } from './resource.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { TO_OTLP_JSON_OPTS_NAMES, EXPORT_RUN_TO_OTLP_OPTS_NAMES, OTLP_RETRY_NAMES } from './option-names.js';
+
 /** runId → 16-byte (32-hex) deterministic trace id — the same run yields the SAME trace on every export (idempotent). */
 export function otlpTraceId(runId: string): string {
   return createHash('sha256').update(`gnl-otlp-trace:${runId}`).digest('hex').slice(0, 32);
@@ -112,6 +116,7 @@ function spanAttributes(span: TraceSpan): Record<string, unknown> {
  * from runId+seq → converting the same run twice yields the SAME ids (idempotent, replay-consistent).
  */
 export function toOtlpJson(spans: TraceSpan[], opts: ToOtlpJsonOptions): OtlpPayload {
+  refuseUnknownNames('toOtlpJson', opts, TO_OTLP_JSON_OPTS_NAMES);
   const { runId } = opts;
   const traceId = otlpTraceId(runId);
   const rootSpanId = otlpSpanId(runId, 'root');
@@ -148,8 +153,7 @@ export function toOtlpJson(spans: TraceSpan[], opts: ToOtlpJsonOptions): OtlpPay
     });
   }
 
-  const resourceAttrs: Record<string, unknown> = { ...(opts.resourceAttributes ?? {}) };
-  if (opts.serviceName) resourceAttrs['service.name'] = opts.serviceName;
+  const resourceAttrs: Record<string, unknown> = serviceResourceAttributes(resourceOptionsOf(opts));
 
   return {
     resourceSpans: [
@@ -280,6 +284,8 @@ export async function exportRunToOtlp(
   runId: string,
   opts: ExportRunToOtlpOptions,
 ): Promise<ExportRunToOtlpResult> {
+  refuseUnknownNames('exportRunToOtlp', opts, EXPORT_RUN_TO_OTLP_OPTS_NAMES);
+  refuseUnknownNames('exportRunToOtlp: retry', opts.retry, OTLP_RETRY_NAMES);
   const spans = await toTraceSpans(reader, runId);
   const payload = toOtlpJson(spans, {
     runId,

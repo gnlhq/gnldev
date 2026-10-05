@@ -202,7 +202,7 @@ describe('the pricing.update audit record', () => {
 
   it('records the value a price moved FROM and TO', async () => {
     const journal = new InMemoryJournal();
-    const app = createStudioApi({ reader: journal, journal });
+    const app = createStudioApi({ reader: journal });
 
     await put(app, { models: { 'gpt-4o': { inputPer1M: 2.5, outputPer1M: 10 } } });
     await put(app, { models: { 'gpt-4o': { inputPer1M: 0.0001, outputPer1M: 0.0001 } } });
@@ -219,7 +219,7 @@ describe('the pricing.update audit record', () => {
   it('records a REMOVAL under replace, which is the change that unprices a model', async () => {
     // A model dropped from a replace document costs $0 afterwards, so its absence is the whole event.
     const journal = new InMemoryJournal();
-    const app = createStudioApi({ reader: journal, journal });
+    const app = createStudioApi({ reader: journal });
 
     await put(app, { models: { 'gpt-4o': { inputPer1M: 2.5, outputPer1M: 10 } } });
     await put(app, { replace: true, models: { 'other/m': { inputPer1M: 1, outputPer1M: 1 } } });
@@ -232,7 +232,7 @@ describe('the pricing.update audit record', () => {
     // Rewriting the same values is not a price change, and a record full of non-events is a record
     // nobody reads.
     const journal = new InMemoryJournal();
-    const app = createStudioApi({ reader: journal, journal });
+    const app = createStudioApi({ reader: journal });
     const models = { 'gpt-4o': { inputPer1M: 2.5, outputPer1M: 10 }, 'x/y': { inputPer1M: 1, outputPer1M: 1 } };
 
     await put(app, { models });
@@ -247,7 +247,7 @@ describe('the pricing.update audit record', () => {
     // expensive to write is a log somebody turns off. The count stays whole so the record says how much
     // it is not showing.
     const journal = new InMemoryJournal();
-    const app = createStudioApi({ reader: journal, journal });
+    const app = createStudioApi({ reader: journal });
     const many: Record<string, { inputPer1M: number; outputPer1M: number }> = {};
     for (let i = 0; i < 60; i++) many[`m${i}`] = { inputPer1M: i, outputPer1M: i };
 

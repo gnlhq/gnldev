@@ -89,8 +89,14 @@ A failing run prints the pairs it got wrong, so the result is diagnosable rather
 
 ## The bars, and where they come from
 
-`paraphraseRecall >= 0.70` and `nearMissFp <= 0.05`, imported from `@gnldev/durable` so the bench
-scores against the exact numbers the runtime enforces — one contract, not two copies that drift.
+`paraphraseRecall >= 0.70` and `nearMissFp <= 0.05`, over at least 5 pairs each
+(`JUDGE_MIN_PAIRS`), all imported from `@gnldev/durable` so the bench scores against the exact numbers
+the runtime enforces — one contract, not two copies that drift. The certificate carries the counts
+(`paraphrasePairs`, `nearMissAnswered`, `nearMissPairs`), and the runtime refuses one that does not show
+the floor was met. `nearMissFp` is over every near-miss pair put (`nearMissPairs`), answered or not — an
+unanswered pair raises no question at runtime, so that is the rate operators see — while
+`nearMissAnswered` is the coverage floor: under 5 answers, the bar was never exercised and no
+certificate is issued.
 
 Recall is measured on **paraphrase pairs only**. Crediting `dup-exact` would let a judge that merely
 recognises identical strings pass an exam about rewordings, and the deterministic layers already

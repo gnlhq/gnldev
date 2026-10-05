@@ -9,10 +9,20 @@ import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { convertToModelMessages } from 'ai';
 import type { UIMessage } from 'ai';
-import { createGnl, scopeConfigToOrg, RunThreadMismatchError, blockedErrorCode, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, upstreamFailure, reservedIdFailure, sealRequestContext, sealFieldsOf, resolveWorkIdentity } from '@gnldev/durable';
+import { createGnl, scopeConfigToOrg, RunThreadMismatchError, blockedErrorCode, callerConflictAnswer, upstreamFailure, requestRefusal, sealRequestContext, sealFieldsOf, resolveWorkIdentity, readJsonObject } from '@gnldev/durable';
 import type { CreateGnlConfig } from '@gnldev/durable';
-import { doorGate, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify } from '@gnldev/auth';
+import { doorGate, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify, refuseMisplacedOptions, doorOptionKeys, REMOVED_IDENTITY_OPTIONS } from '@gnldev/auth';
+import { refuseUnknownNames } from '@gnldev/options';
 import { toUIMessageStreamResponse } from './ui-stream.js';
+
+/**
+ * The request body as a JSON object (@gnldev/durable `readJsonObject`), or the 400 that says it is not
+ * one. A body that was not JSON used to be read as `{}` and fail on a field it seemed to lack.
+ */
+async function jsonBody(c: Context): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false; response: Response }> {
+  const read = readJsonObject(await c.req.text());
+  return read.ok ? read : { ok: false, response: c.json({ error: read.error, code: read.code }, 400) };
+}
 
 export interface CreateChatRouteOptions {
   /** Resolve the durable `runId` (exactly-once key for THIS request) from the request/body. */
@@ -80,6 +90,8 @@ export interface CreateChatRouteOptions {
    * needs a request that carries an identity (`identify` resolving a verified token).
    */
   allowCrossSite?: boolean;
+  /** Print this door's protections when it is built (default `true`); `false` when something else already prints them. */
+  protectionsBanner?: boolean;
   /**
    * FAZ-2 — per-run concurrency lock, ON by default (`{ ttlMs: 300_000 }`). Two CONCURRENT requests
    * with the same runId (double-click, two tabs, a retry racing the original) used to BOTH execute;
@@ -129,12 +141,10 @@ function typedErrorResponse(c: Context, e: unknown, workKey?: string): Response 
   // FAZ-4 caller-conflict family — same 409-without-resumable posture as thread mismatch above.
   // K9: the map is durable's single CALLER_CONFLICT_CODES export (thread mismatch is answered by the
   // dedicated branch above; its entry here is harmless duplication by design).
-  const conflictCode = callerConflictCode(e);
-  if (conflictCode && conflictCode !== 'run_thread_mismatch') {
-    const err = e as { message?: string; detail?: unknown };
-    if (OWNERSHIP_CONFLICT_CODES.includes(conflictCode)) markRefusal(c.req.raw, 'ownership', { detail: conflictCode });
-    // Redacted: see `publicConflictDetail` (durable/errors.ts) for what is withheld and why.
-    return c.json({ error: err.message, code: conflictCode, detail: withWorkKey(publicConflictDetail(err.detail), workKey) }, 409);
+  const conflict = callerConflictAnswer(e);
+  if (conflict && conflict.code !== 'run_thread_mismatch') {
+    if (conflict.ownership) markRefusal(c.req.raw, 'ownership', { detail: conflict.code });
+    return c.json({ error: conflict.error, code: conflict.code, detail: withWorkKey(conflict.detail, workKey) }, 409);
   }
   const code = blockedErrorCode(e);
   if (code) {
@@ -149,7 +159,7 @@ function typedErrorResponse(c: Context, e: unknown, workKey?: string): Response 
     return res;
   }
   // A root-scope thread id under `org:` — durable's one answer for it (400 thread_id_reserved).
-  const reserved = reservedIdFailure(e);
+  const reserved = requestRefusal(e);
   if (reserved) return c.json(reserved.body, reserved.status);
   const up = upstreamFailure(e);
   if (up) {
@@ -166,6 +176,9 @@ function typedErrorResponse(c: Context, e: unknown, workKey?: string): Response 
   }
   return undefined;
 }
+
+/** Every option createChatRoute takes in its SECOND argument, held to `CreateChatRouteOptions` by `pnpm typecheck` below. */
+const CHAT_ROUTE_OPTION_KEYS = doorOptionKeys<CreateChatRouteOptions>()(['resolveRunId', 'resolveThreadId', 'identify', 'authorize', 'onDecision', 'allowedHosts', 'allowCrossSite', 'protectionsBanner', 'lock']);
 
 /**
  * Produces a single-endpoint Hono router from a createGnl config (or an already-built `gnl` instance)
@@ -207,6 +220,9 @@ export function createChatRoute(
   config: CreateGnlConfig | { gnl: ReturnType<typeof createGnl> },
   opts: CreateChatRouteOptions = {},
 ): Hono {
+  refuseMisplacedOptions('createChatRoute', config, opts, CHAT_ROUTE_OPTION_KEYS, undefined, REMOVED_IDENTITY_OPTIONS);
+  // A prebuilt `{ gnl }` is the whole config: anything beside it would be read by nothing.
+  if ('gnl' in config) refuseUnknownNames('createChatRoute: config', config, ['gnl']);
   const rootGnl = 'gnl' in config ? config.gnl : createGnl(config);
   // One instance per organization, over that organization's partition (see @gnldev/durable
   // `scopeConfigToOrg`). A prebuilt `{ gnl }` carries no config to scope, so it stays as handed in.
@@ -217,21 +233,6 @@ export function createChatRoute(
     if (!g) orgGnls.set(org, (g = createGnl(scopeConfigToOrg(config, org).config)));
     return g;
   };
-  // A REMOVED option fails loudly. Ignoring it would be worse than the hook it replaced: a JavaScript
-  // config (or one cast past the types) that still passes it would start every run ownerless, and
-  // nothing would say so.
-  if ((opts as { resolveResourceId?: unknown }).resolveResourceId !== undefined) {
-    throw new TypeError(
-      '[gnl chat-route] `resolveResourceId` was removed: it handed the resolver the request body, the one place a ' +
-      'subject must never come from. Use `identify: (req) => principal`, reading your session or a verified token.',
-    );
-  }
-  if ((opts as { identity?: unknown }).identity !== undefined) {
-    throw new TypeError(
-      '[gnl chat-route] `identity` was replaced by `identify` (0.7.0): it returns a Principal from @gnldev/auth — ' +
-      "`{ kind: 'subject', id, orgId, roles: [] }` for an end user — so the route can tell a user from staff.",
-    );
-  }
   // Who is calling, the open-surface checks for a request with no identity, the role: @gnldev/auth's
   // `doorGate`, the one preamble every door runs. In production a route with no `identify` refuses to
   // start (it used to warn and serve: every caller ran the model and left an ownerless run, measured).
@@ -241,6 +242,7 @@ export function createChatRoute(
     authorize: opts.authorize,
     allowedHosts: opts.allowedHosts,
     allowCrossSite: opts.allowCrossSite,
+    protectionsBanner: opts.protectionsBanner,
     restMount: 'createRestApi(config, { auth, surfaces: [chatSurface()] })',
   });
   const app = new Hono();
@@ -258,7 +260,8 @@ export function createChatRoute(
   }
   app.post('/agents/:name/chat', async (c) => {
     const name = c.req.param('name');
-    const body = (await c.req.json().catch(() => ({}))) as {
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as {
       id?: string;
       messages?: UIMessage[];
       runId?: string;

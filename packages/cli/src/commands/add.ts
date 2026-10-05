@@ -1,6 +1,7 @@
-// gnl add <feature> — drop a boilerplate recipe into an existing project + print the config wiring.
-// Deliberately does NOT rewrite gnl.config.ts (AST patching is fragile): it writes a src/ file
-// (idempotent — never overwrites) and prints exactly what to add to the config object.
+// gnl add <feature> — drop a boilerplate recipe into an existing project and wire it into the config.
+// Not an AST patch: it writes a src/ file (idempotent — never overwrites) and inserts the config lines
+// `gnl init --features` would have written (scaffold.ts wireRecipe). A config edited out of that shape
+// is not touched; the lines are printed instead.
 // Recipes live in ../recipes.ts (shared with `gnl init`'s feature composition).
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -160,8 +161,27 @@ export const addCommand: Command = {
     // Not every recipe wires into the config — a worker and a scheduler are processes that READ it.
     // Printing "Add to gnl.config.ts:" over an instruction that says the opposite is the command
     // contradicting itself in two consecutive lines.
-    console.log(`\n${cyan(configWiring(r) ? 'Add to gnl.config.ts:' : 'How to run it:')}`);
-    for (const line of r.humanWire.split('\n')) console.log(`  ${line}`);
+    // WIRED, not announced: the config gets the lines `gnl init --features` would have written
+    // (scaffold.ts wireRecipe). Only a config edited out of that shape gets them printed instead —
+    // an unwired recipe is a feature that silently does nothing, and nothing else would say so.
+    if (configWiring(r)) {
+      const configPath = resolve('gnl.config.ts');
+      const before = readFileSync(configPath, 'utf8');
+      const { wireRecipe } = await import('../scaffold.js');
+      const after = wireRecipe(before, r);
+      if (after === before) {
+        console.log(`${dim('•')} gnl.config.ts already wires it`);
+      } else if (after !== undefined) {
+        writeFileSync(configPath, after);
+        console.log(`${green('✓')} wired into ${bold('gnl.config.ts')}`);
+      } else {
+        console.log(`\n${yellow('Add to gnl.config.ts')} ${dim('(it no longer has the shape gnl init wrote, so it was not edited):')}`);
+        for (const line of r.humanWire.split('\n')) console.log(`  ${line}`);
+      }
+    } else {
+      console.log(`\n${cyan('How to run it:')}`);
+      for (const line of r.humanWire.split('\n')) console.log(`  ${line}`);
+    }
     if (r.note) console.log(`\n${dim('note: ' + r.note)}`);
     // THE DEPENDENCY GOES IN, it is not just announced. `gnl add` already writes into this
     // package.json (the script above), and the file it just wrote imports this package — printing

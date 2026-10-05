@@ -1,8 +1,10 @@
 // Converts a createGnl instance into the Playground/Tools runner (StudioAgentRunner). Pure adapter — does not import `ai`.
 // @gnldev/cli and the studio CLI `--config` share this → single source of truth.
 import type { AgentMeta, StudioAgentRunner, StudioCallbackCtx, ToolMeta, ToolListItem } from './server.js';
-import { durableTool, toolDescriptionText, sealRequestContext, serverIdentityOf, runIdentity, userIdOf, UNKNOWN } from '@gnldev/durable';
+import { durableTool, toolDescriptionText, sealRequestContext, serverIdentityOf, runIdentity, userIdOf, UNKNOWN, refuseConfigNames } from '@gnldev/durable';
 import type { Guard, Journal, WorkflowMeta, WorkflowRunResult } from '@gnldev/durable';
+import { refuseUnknownNames } from '@gnldev/options';
+import { CREATE_STUDIO_RUNNER_OPTS_NAMES } from './option-names.js';
 
 export interface RunnerToolLike {
   /** AI SDK 7 lets a tool compute its description at call time; mirrors AnyTool in @gnldev/durable. */
@@ -131,6 +133,9 @@ export function createStudioRunner(
   config: RunnerConfigLike,
   opts: MakeRunnerOptions = {},
 ): StudioAgentRunner {
+  refuseUnknownNames('createStudioRunner', opts, CREATE_STUDIO_RUNNER_OPTS_NAMES);
+  // A gnl config, handed whole (the scaffold passes gnl.config): its own names, the engine's and the project's.
+  refuseConfigNames('createStudioRunner', config);
   const { toJsonSchema, toolExec } = opts;
   const agents = config.agents ?? {};
   // A dynamic tool factory (requestContext) can't be resolved without a request → the runner only sees the static map.

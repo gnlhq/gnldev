@@ -11,9 +11,11 @@
 // in the same pass, and after `maxAttempts` the event is QUARANTINED (dead-letter) rather than
 // retried forever — listDeadEvents() shows it, retryDeadEvent() hands it back. Quarantine is not an
 // ack: a quarantined event is never counted as delivered, because the consumer never saw it.
-import { createPollLoop, orgPrefix, orgStorageScopeOf, ownedName, ownedPrefix, ownerOfName, assertSystemName, assertRootWorkForErasure } from '@gnldev/durable';
+import { createPollLoop, orgPrefix, orgStorageScopeOf, ownedName, ownedPrefix, ownerOfName, assertSystemName, assertRootWorkForErasure, portOf } from '@gnldev/durable';
 import { randomUUID } from 'node:crypto';
 import type { WorkStore } from '@gnldev/durable';
+import { refuseUnknownNames } from '@gnldev/options';
+import { EMIT_OPTS_NAMES, CREATE_CONSUMER_OPTS_NAMES } from './option-names.js';
 
 /** Whose an event is. Delivered to the handler, so the run it starts belongs to that user and organization. */
 export interface EventOwner {
@@ -87,6 +89,23 @@ export interface ConsumerOptions {
    * "Retry forever" is `maxAttempts: Infinity`, not a delay of Infinity.
    */
   retryDelayMs?: number | ((attempt: number) => number);
+  /**
+   * How long a started attempt holds the event before it must be renewed (default 5 minutes). When an
+   * attempt starts it is counted, and the attempt record's `nextAt` is set to start + `leaseMs`, so no
+   * other poll of this consumer name — in this process or another, a 0.9 consumer included — hands the
+   * event out while it runs. A heartbeat renews the hold every `leaseMs / 3` while the handler runs, so a
+   * slow handler is not taken for a dead one. If the process dies, the event is due again once the hold
+   * runs out, and that next start counts: an event whose handler takes its process down is quarantined
+   * after `maxAttempts` starts, not started forever. The cost of a dead process is this wait.
+   */
+  leaseMs?: number;
+  /**
+   * The longest a started attempt is held, counted from its start (default: no limit). After it the
+   * heartbeat stops renewing, the event is due again, and that start counts — so a handler that hangs in
+   * a live process is eventually quarantined. A handler that legitimately runs longer than this is
+   * started again while it runs: set it well above the slowest handler.
+   */
+  maxHoldMs?: number;
 }
 
 /**
@@ -200,11 +219,13 @@ async function countUpTo(work: WorkStore, ns: string, limit: number): Promise<nu
  * name within that owner (`ownedName`), as a queued job's is: the log is one for every organization.
  */
 export async function emit(
-  work: WorkStore,
+  workArg: WorkStore,
   topic: string,
   payload: unknown,
   opts: { id?: string; maxDepth?: number } & EventOwner = {},
 ): Promise<string> {
+  refuseUnknownNames('emit', opts, EMIT_OPTS_NAMES);
+  const work = portOf(workArg, 'work', 'emit');
   // Consumers poll the root log. An organization-scoped work store files the event under
   // `org:<id>:…`, where no consumer reads it — lost without a word, so refused instead.
   const scopedTo = orgStorageScopeOf(work);
@@ -357,17 +378,25 @@ const releaseStamp = (rec: StoredDead | undefined) => `${rec?.releases ?? 0}@${r
 const defaultRetryDelay = (attempt: number) => Math.min(60_000 * 2 ** (attempt - 1), 3_600_000);
 
 export function createConsumer(
-  work: WorkStore,
+  workArg: WorkStore,
   topic: string,
   handler: EventHandler,
   opts: ConsumerOptions,
 ): Consumer {
+  refuseUnknownNames('createConsumer', opts, CREATE_CONSUMER_OPTS_NAMES);
+  const work = portOf(workArg, 'work', 'createConsumer');
   assertTopic(topic);
   const ns = logNsOf(topic);
   const pollMs = opts.pollMs ?? 200;
   const backoffOn = opts.backoff ?? true;
   const maxPollMs = opts.maxPollMs ?? pollMs * 32;
   const maxAttempts = opts.maxAttempts ?? 8;
+  const leaseMs = opts.leaseMs ?? 300_000;
+  const maxHoldMs = opts.maxHoldMs ?? Infinity;
+  for (const [k, v] of [['leaseMs', leaseMs], ['maxHoldMs', maxHoldMs]] as const) {
+    if (!(typeof v === 'number' && v > 0)) throw new TypeError(`@gnldev/events: createConsumer — ${k} must be a positive number of milliseconds (or Infinity for maxHoldMs), got ${String(v)}.`);
+  }
+  if (leaseMs === Infinity) throw new TypeError('@gnldev/events: createConsumer — leaseMs must be finite: it is how long a dead process holds an event.');
   const retryDelay: (attempt: number) => number =
     typeof opts.retryDelayMs === 'function' ? opts.retryDelayMs
       : opts.retryDelayMs != null ? () => opts.retryDelayMs as number
@@ -466,15 +495,69 @@ export function createConsumer(
         // not-yet-acked event per pass (2 → 3, alongside the ack and dead-letter checks). It is paid
         // once per event on a healthy topic — an acked event never reaches this line — and there is
         // no cheaper place to keep it: the due time has to survive a restart, so it lives in the store.
-        const attRaw = await work.get(attKey(topic, opts.name, e.id));
+        const ak = attKey(topic, opts.name, e.id);
+        const attRaw = await work.get(ak);
         const att = readAttempts(attRaw);
         if (att && att.nextAt > Date.now()) { frozen = true; continue; }
+        // The attempt is counted when it STARTS: a process that dies while the handler runs (a crash,
+        // an OOM, a kill) has used an attempt too. Counted on failure, such an event was started
+        // forever and never quarantined.
+        const startedBefore = att?.n ?? 0;
+        if (startedBefore >= maxAttempts) {
+          // The whole budget started and no failure quarantined it: the process stopped while the
+          // handler ran (or between a failure's attempt write and its dead-letter write).
+          const rec: StoredDead = {
+            error: `the event did not finish in ${startedBefore} attempts (the process stopped while the handler ran)`,
+            attempts: startedBefore,
+            at: Date.now(),
+            ...(dead?.releases != null ? { releases: dead.releases } : {}),
+          };
+          const wrote = dead === undefined || !work.putIfMatch
+            ? (await work.put(dk, rec), true)
+            : await work.putIfMatch(dk, dead, rec);
+          if (!wrote) { frozen = true; continue; }
+          console.error(`@gnldev/events: event QUARANTINED — ${rec.error} (topic=${topic}, consumer=${opts.name}, event=${e.id}); inspect with listDeadEvents().`);
+          continue;
+        }
+        const startedAt = Date.now();
+        const startRec: StoredAttempts = {
+          n: startedBefore + 1,
+          firstAt: att?.firstAt || startedAt,
+          nextAt: startedAt + leaseMs, // held while it runs; due again if the process dies
+          ...(att?.gen !== undefined ? { gen: att.gen } : {}),
+        };
+        // A CAS against the record read above, so two polls cannot both count and start the same
+        // attempt. Not the FIRST one: with no record there is nothing to compare, and WorkStore has no
+        // create-if-absent, so two processes that start an event's first attempt at the same moment may
+        // both run it (measured: 2 starts at 0 ms apart, 1 at 15 ms). That is within the contract below
+        // — delivery is at-least-once — and it costs no write on the healthy path.
+        const started = attRaw === undefined || !work.putIfMatch
+          ? (await work.put(ak, startRec), true)
+          : await work.putIfMatch(ak, attRaw, startRec);
+        if (!started) { frozen = true; continue; } // another poll started it, or a release landed: theirs stands
         // Contract: exactly-once MARKING + at-least-once DELIVERY. The marker is written AFTER
         // the handler; a crash between handler success and ackOnce (or a concurrent poll race) →
         // redelivery is possible. Write the handler idempotently, or use durable (runDurable/claim) inside it.
+        // While the handler runs, the hold is renewed (every leaseMs/3) so a slow handler is not taken
+        // for a dead process. A lost renewal (a release, or another poll after an expiry) stops it.
+        let held = startRec;
+        let beating: Promise<void> | undefined;
+        const beat = setInterval(() => {
+          if (beating) return;
+          if (Date.now() - startedAt >= maxHoldMs) { clearInterval(beat); return; } // held as long as it may be: let the hold run out
+          beating = (async () => {
+            const renewed: StoredAttempts = { ...held, nextAt: Math.min(Date.now() + leaseMs, startedAt + maxHoldMs) };
+            const ok = !work.putIfMatch ? (await work.put(ak, renewed), true) : await work.putIfMatch(ak, held, renewed);
+            if (ok) held = renewed; else clearInterval(beat);
+          })().catch(() => {}).finally(() => { beating = undefined; });
+        }, Math.max(1, Math.floor(leaseMs / 3)));
+        (beat as any).unref?.();
+        const stopBeat = async () => { clearInterval(beat); await beating; };
         try {
           await handler(e.payload, { id: e.id, topic, ...ownerOf(e.id) });
+          await stopBeat();
         } catch (err) {
+          await stopBeat();
           // Handler threw → ack marker NOT WRITTEN → the event is not lost. The poll loop doesn't
           // die: this event is skipped, the rest of the page keeps processing.
           //
@@ -491,7 +574,7 @@ export function createConsumer(
             continue;
           }
           const now = Date.now();
-          const n = (att?.n ?? 0) + 1;
+          const n = startRec.n; // this attempt was counted when it started
           // An event that reached its LAST attempt is about to become an operator's problem, so it
           // is worth one extra `get` (only on this branch — never on the healthy or the still-
           // retrying path) to check it is still ours to give up on. Two processes under the SAME
@@ -523,16 +606,10 @@ export function createConsumer(
           // off a counter we no longer own. What remains from the old comment is the benign half —
           // two concurrent polls can still make an attempt go uncounted, which only ever DELAYS
           // quarantine.
-          const ak = attKey(topic, opts.name, e.id);
-          const next: StoredAttempts = {
-            n,
-            firstAt: att?.firstAt || now,
-            nextAt: now + delay,
-            ...(att?.gen !== undefined ? { gen: att.gen } : {}), // the streak keeps its generation
-          };
-          const wroteAtt = attRaw === undefined || !work.putIfMatch
+          const next: StoredAttempts = { ...held, nextAt: now + delay };
+          const wroteAtt = !work.putIfMatch
             ? (await work.put(ak, next), true)
-            : await work.putIfMatch(ak, attRaw, next);
+            : await work.putIfMatch(ak, held, next);
           if (!wroteAtt) {
             frozen = true; // someone else changed the counter under us → theirs stands, not ours
             console.warn(`@gnldev/events: attempt write skipped — the retry record changed concurrently (topic=${topic}, consumer=${opts.name}, event=${e.id}); this attempt is discarded and the event stays live:`, err);
@@ -619,7 +696,8 @@ export function createConsumer(
  * MANAGEMENT function: it reads the WHOLE topic log and does one `get` per event. Do NOT call it
  * from a poll loop — the loop reads only the pages it needs, via cursor (5.1).
  */
-export async function listDeadEvents(work: WorkStore, topic: string, consumer: string): Promise<DeadEvent[]> {
+export async function listDeadEvents(workArg: WorkStore, topic: string, consumer: string): Promise<DeadEvent[]> {
+  const work = portOf(workArg, 'work', 'listDeadEvents');
   const out: DeadEvent[] = [];
   let cursor: string | undefined;
   for (;;) {
@@ -687,7 +765,8 @@ export async function listDeadEvents(work: WorkStore, topic: string, consumer: s
  */
 const RELEASE_CAS_TRIES = 5;
 
-export async function retryDeadEvent(work: WorkStore, topic: string, consumer: string, eventId: string): Promise<boolean> {
+export async function retryDeadEvent(workArg: WorkStore, topic: string, consumer: string, eventId: string): Promise<boolean> {
+  const work = portOf(workArg, 'work', 'retryDeadEvent');
   const dk = deadKey(topic, consumer, eventId);
   const ak = attKey(topic, consumer, eventId);
   // Read → modify → write on a record other writers touch, so it is a compare-and-swap for the same
@@ -746,7 +825,8 @@ export interface SubjectEraser {
  * Refuses a work store that cannot delete by id prefix (`deleteIdPrefix`) and key prefix
  * (`deletePrefix`), rather than report a partial erasure as done.
  */
-export function eventEraser(work: WorkStore): SubjectEraser {
+export function eventEraser(workArg: WorkStore): SubjectEraser {
+  const work = portOf(workArg, 'work', 'eventEraser');
   return {
     name: 'events',
     async erase(owner) {

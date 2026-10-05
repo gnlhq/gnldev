@@ -20,6 +20,8 @@ import type { AdoptIntoOrgResult,
 import { tablesFromDDL } from './migrate.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, orgSpaceSql } from './organization.js';
 import type { SchemaCheckResult, SchemaMigrationResult, MissingColumn } from './migrate.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { POSTGRES_STORAGE_NAMES, ADOPT_INTO_ORG_NAMES, MIGRATE_SCHEMA_NAMES, COMPACT_NAMES } from './option-names.js';
 
 type QueryResult = { rows: any[]; rowCount?: number | null };
 type PoolClient = { query: (sql: string, params?: unknown[]) => Promise<QueryResult>; release?: (destroy?: boolean) => void };
@@ -272,6 +274,7 @@ export class PostgresStorage implements Storage {
   readonly meta: MetaStore;
 
   constructor(opts: PostgresStorageOptions = {}) {
+    refuseUnknownNames('PostgresStorage', opts, POSTGRES_STORAGE_NAMES);
     if (opts.pool) this._pool = opts.pool;
     else {
       const { Pool } = createRequire(import.meta.url)('pg') as { Pool: new (c: any) => Pool };
@@ -520,6 +523,7 @@ export class PostgresStorage implements Storage {
    */
   /** See `Storage.adoptIntoOrg`. Same table list and the same platform-key rule as the SQLite adapter. */
   async adoptIntoOrg(orgId: string, opts?: { dryRun?: boolean; allowUnregistered?: boolean; allowInFlight?: boolean }): Promise<AdoptIntoOrgResult> {
+    refuseUnknownNames('adoptIntoOrg', opts, ADOPT_INTO_ORG_NAMES);
     const prefix = orgPrefix(orgId);
     const ns = prefix.slice(0, -1);
     const dryRun = opts?.dryRun === true;
@@ -632,6 +636,7 @@ export class PostgresStorage implements Storage {
   }
 
   async compact(opts?: { full?: boolean }): Promise<{ reclaimedBytes: number }> {
+    refuseUnknownNames('compact', opts, COMPACT_NAMES);
     const tables = ['gnl_run_journal', 'gnl_runs', 'gnl_messages', 'gnl_work_log', 'gnl_vectors'];
     for (const t of tables) {
       await this.ensureReady();
@@ -687,6 +692,7 @@ export class PostgresStorage implements Storage {
    * first. `dryRun: true` returns the statements it WOULD run without touching the DB.
    */
   async migrateSchema(opts?: { dryRun?: boolean }): Promise<SchemaMigrationResult> {
+    refuseUnknownNames('migrateSchema', opts, MIGRATE_SCHEMA_NAMES);
     const check = await this.checkSchema();
     const expected = tablesFromDDL(DDL);
     const statements: string[] = [];
@@ -853,10 +859,11 @@ class PgRunJournal implements RunJournal {
   }
 
   /** H8a: in-engine atomic counter (UPSERT arithmetic) — lost-update is impossible, hot-row lock is short. */
-  async incrBy(key: string, fields: Record<string, number>): Promise<void> {
+  async incrBy(key: string, fields: Record<string, number>): Promise<Record<string, number>> {
     const flat = flattenIncrs([{ key, fields }]);
-    if (!flat.length) return;
-    await this.q(incrSql(flat.length / 3), flat);
+    if (!flat.length) return {};
+    const r = await this.q(`${incrSql(flat.length / 3)} RETURNING field, value`, flat);
+    return Object.fromEntries(r.rows.map((row: any) => [row.field, Number(row.value)]));
   }
   async getCounters(key: string): Promise<Record<string, number> | undefined> {
     const r = await this.q('SELECT field, value FROM gnl_counters WHERE key = $1', [key]);
@@ -1050,13 +1057,14 @@ class PgRunJournal implements RunJournal {
       : '';
     const statusParams: unknown[] = [];
     const toSummary = (x: any): RunSummary => {
-      const input = x.input_val ? deserialize<{ threadId?: string; agent?: string; resourceId?: string; workKey?: string }>(x.input_val) : undefined;
+      const input = x.input_val ? deserialize<{ threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string }>(x.input_val) : undefined;
       return {
         runId: x.run_id, status: deriveRunStatus(!!x.suspended, outcomeOfRow(x)), modelSteps: Number(x.model_steps), toolCalls: Number(x.tool_calls),
         ...(input?.threadId ? { threadId: input.threadId } : {}),
         ...(input?.agent ? { agent: input.agent } : {}),
         ...(input?.resourceId ? { resourceId: input.resourceId } : {}),
         ...(input?.workKey ? { workKey: input.workKey } : {}),
+        ...(input?.parentRunId ? { parentRunId: input.parentRunId } : {}),
       };
     };
     // `agent`, `resourceId` and `workKey` share ONE path: none is a column, all three live inside the
@@ -1064,7 +1072,7 @@ class PgRunJournal implements RunJournal {
     // rather than three so a request carrying more than one cannot take a branch that applies only
     // some of them — and so the filter-BEFORE-slice contract (JournalReader.listRunsPaged) is
     // satisfied once, not per filter.
-    if (q?.agent || q?.resourceId || q?.workKey) {
+    if (q?.agent || q?.resourceId || q?.workKey || q?.topLevel) {
       const r = await this.q(
         `SELECT r.run_id, r.model_steps, r.tool_calls, r.suspended, r.failed, r.running, r.canceled, j.value AS input_val
          FROM gnl_runs r LEFT JOIN gnl_run_journal j ON j.key = r.run_id || ':input'${statusWhere}
@@ -1073,7 +1081,7 @@ class PgRunJournal implements RunJournal {
       );
       const all = r.rows.map(toSummary)
         .filter((x) => (q.agent ? x.agent === q.agent : true) && (q.resourceId ? x.resourceId === q.resourceId : true)
-          && (q.workKey ? x.workKey === q.workKey : true));
+          && (q.workKey ? x.workKey === q.workKey : true) && (q.topLevel ? !x.parentRunId : true));
       return pageOf(all.slice(start, start + limit), start, limit, all.length);
     }
     const total = Number((await this.q(`SELECT COUNT(*) AS n FROM gnl_runs r${statusWhere}`, statusParams)).rows[0].n);

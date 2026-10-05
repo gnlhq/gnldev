@@ -1,7 +1,9 @@
-// P2 (AUDIT-R2): tokenLimiter — "TokenLimiter" (fuller sibling of tokenLimit).
+// P2 (AUDIT-R2): tokenLimiter — the one trim of the package (tokenLimit is it with defaults). Whole turns;
+// the current turn is never cut, and stops the run when it alone is over the limit.
 import { describe, it, expect } from 'vitest';
 import { InMemoryJournal, createProcessorCtx, readProcessorReports, ProcessorTripwire } from '@gnldev/durable';
 import { tokenLimiter } from '../src/token-limiter.js';
+import { tokenLimit } from '../src/safety.js';
 
 const ctx = { runId: 'r', journal: {} as any, step: async (_n: string, c: any) => c() } as any;
 const u = (c: string) => ({ role: 'user', content: c });
@@ -41,39 +43,55 @@ describe('tokenLimiter — trim-oldest (default)', () => {
     expect(roles.filter((r: string) => r === 'user').length).toBeGreaterThanOrEqual(1);
   });
 
-  it('never drops the last user message even if it alone is the only thing over budget', () => {
+  it('the current turn alone over budget stops the run, naming the turn — it is never cut', () => {
     const huge = 'y'.repeat(4000); // ~1000 tokens
     const messages = [u('short'), a('short'), u(huge)];
-    const out = tokenLimiter({ maxInputTokens: 5 }).processInput!({ messages }, ctx) as any;
-    expect(out.messages).toEqual([messages[2]]);
+    const proc = tokenLimiter({ maxInputTokens: 5 });
+    expect(() => proc.processInput!({ messages }, ctx)).toThrow(ProcessorTripwire);
+    expect(() => proc.processInput!({ messages }, ctx)).toThrow(/current turn alone is ~1000 tokens, over the 5 limit/);
   });
 
-  it('never drops system messages (keepSystem default true) even under a tiny budget', () => {
+  it('never drops system messages (keepSystem default true); the older turn between goes whole', () => {
     const huge = 'y'.repeat(4000);
     const messages = [sys('system rules'), u(huge), u('final question')];
-    const out = tokenLimiter({ maxInputTokens: 1 }).processInput!({ messages }, ctx) as any;
-    expect(out.messages).toContainEqual(messages[0]);
-    expect(out.messages).toContainEqual(messages[2]); // last user
+    const out = tokenLimiter({ maxInputTokens: 10 }).processInput!({ messages }, ctx) as any;
+    expect(out.messages).toEqual([messages[0], messages[2]]);
   });
 
   it('keepSystem: false — a system message in the array CAN be dropped (only last-user stays protected)', () => {
     const huge = 'y'.repeat(4000);
     const messages = [sys('system rules'), u(huge), u('final question')];
-    const out = tokenLimiter({ maxInputTokens: 1, keepSystem: false }).processInput!({ messages }, ctx) as any;
-    expect(out.messages).not.toContainEqual(messages[0]);
-    expect(out.messages).toContainEqual(messages[2]);
+    const out = tokenLimiter({ maxInputTokens: 10, keepSystem: false }).processInput!({ messages }, ctx) as any;
+    expect(out.messages).toEqual([messages[2]]);
   });
 
-  it('input.system (the separate system-prompt field) is never trimmed', () => {
-    const longSystem = 'S'.repeat(4000);
-    const out = tokenLimiter({ maxInputTokens: 5 }).processInput!({ system: longSystem, messages: [u('hi')] }, ctx) as any;
-    expect(out.system).toBe(longSystem);
+  it('input.system (the separate system-prompt field) counts and is never trimmed: older turns go instead', () => {
+    const system = 'S'.repeat(40); // ~10 tokens
+    const messages = [u('x'.repeat(400)), a('ok'), u('hi')];
+    const out = tokenLimiter({ maxInputTokens: 15 }).processInput!({ system, messages }, ctx) as any;
+    expect(out.system).toBe(system);
+    expect(out.messages).toEqual([messages[2]]);
   });
 
-  it('no messages at all → input returned untouched even if system alone is over budget', () => {
-    const input = { system: 'S'.repeat(4000) };
-    const out = tokenLimiter({ maxInputTokens: 1 }).processInput!(input, ctx) as any;
-    expect(out).toEqual(input);
+  it('input.system alone over budget stops the run: nothing that can be dropped would make it fit', () => {
+    expect(() => tokenLimiter({ maxInputTokens: 1 }).processInput!({ system: 'S'.repeat(4000) }, ctx)).toThrow(ProcessorTripwire);
+  });
+
+  it('the current turn keeps the question, the tool call and the tool result together; older turns go whole', () => {
+    const call = { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'c1', toolName: 'price', input: { order: 7 } }] };
+    const result = { role: 'tool', content: [{ type: 'tool-result', toolCallId: 'c1', toolName: 'price', output: { type: 'text', value: 'P'.repeat(400) } }] };
+    const older = [u('o'.repeat(400)), a('old answer')];
+    const turn = [u('What is the price of order 7?'), call, result];
+    const out = tokenLimiter({ maxInputTokens: 150 }).processInput!({ messages: [...older, ...turn] }, ctx) as any;
+    expect(out.messages).toEqual(turn);
+  });
+
+  it('tokenLimit is the same trim under its own name', () => {
+    const messages = [u('o'.repeat(400)), a('old'), u('q'), a('answer'), u('now')];
+    const a1 = tokenLimit({ maxTokens: 5 }).processInput!({ messages }, ctx) as any;
+    const a2 = tokenLimiter({ maxInputTokens: 5 }).processInput!({ messages }, ctx) as any;
+    expect(a1.messages).toEqual(a2.messages);
+    expect(tokenLimit({ maxTokens: 5 }).name).toBe('token-limit');
   });
 });
 
@@ -92,12 +110,12 @@ describe("tokenLimiter — strategy: 'error'", () => {
 
 describe('tokenLimiter — custom countTokens', () => {
   it('honors a custom tokenizer instead of the char/4 default', () => {
-    // Custom counter: 1 token per message regardless of length → budget of 2 keeps only 2 messages.
+    // Custom counter: 1 token per message regardless of length. Budget 2: the current turn (1) fits, the
+    // older turn (user + answer = 2) does not, so it goes whole — never its answer without its question.
     const messages = [u('short'), a('short'), u('huge '.repeat(1000))];
     const proc = tokenLimiter({ maxInputTokens: 2, countTokens: () => 1 });
     const out = proc.processInput!({ messages }, ctx) as any;
-    // total = 3 tokens > 2 → oldest droppable (index 0) dropped; last user (index 2) + index 1 remain (2 tokens).
-    expect(out.messages).toEqual([messages[1], messages[2]]);
+    expect(out.messages).toEqual([messages[2]]);
   });
 
   it("custom countTokens=()=>0 → never over budget, strategy 'error' never throws", () => {

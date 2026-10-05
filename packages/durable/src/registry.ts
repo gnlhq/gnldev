@@ -1,4 +1,5 @@
 import { nestedAgentRunId } from './journal.js';
+import { seedLimits } from './limits.js';
 import { randomUUID } from 'node:crypto';
 
 let wfAnonCounter = 0; // runWorkflow's anon-fallback uniqueness within a process — see the warn below
@@ -8,14 +9,15 @@ import { stepCountIs, tool as aiTool, jsonSchema } from 'ai';
 import { runDurable, streamDurable, assertRunIdSafe } from './run.js';
 import type { StreamBreach } from './run.js';
 import { resolveModel, withModelFallback, type FallbackCandidate } from './model-router.js';
-import { createAgentTool, runSubAgent } from './agent-tool.js';
+import { delegationTool, runDelegated, type ChildFrame, childOutcome } from './agent-tool.js';
+import { assertNoCallerSystemMessage } from './request-body.js';
 import { runNetworkAdmitted as runNetworkCore, type NetworkResult, type NetworkTarget } from './network.js';
 import { acquireRunLock } from './run-lock.js';
 import { claim as journalClaim, runKeys } from './journal.js';
 import { argsHash, derivedRunId, isDerivedRunId, DEPLOYMENT_SCOPE, type WorkScope, type WorkScopeKind } from './hash.js';
 import { RunBusyError, runBusyMessage, RunSweptError, RunInputMismatchError, RunOwnerMismatchError, ThreadOwnerMismatchError } from './errors.js';
 import { admitThreadRun } from './thread-owner.js';
-import { user, staff, callerOf, callerFromResourceId, userIdOf, resolveCaller, identityOf, runIdentity, admitRun, type Caller, type RunIdentity } from './run-identity.js';
+import { user, staff, callerOf, callerFromResourceId, userIdOf, resolveCaller, identityOf, runIdentity, admitRun, childIdentity, requestOf, type Caller, type RunIdentity } from './run-identity.js';
 import { recordIdemConflict } from './idem-ledger.js';
 import { runScoreSample, assertDistinctScorerNames, scoreRunMemoized } from './scoring.js';
 import { recordRunScores } from './metrics.js';
@@ -31,6 +33,8 @@ import type { Memory } from './memory.js';
 import type { ModelInput, ToolSet } from './types.js';
 import type { Processor } from './processor.js';
 import type { RunLimits } from './limits.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { refuseCreateGnlNames, refuseRunNames, WORKFLOW_RUN_NAMES } from './option-names.js';
 
 // Registry/DI: a single top-level `createGnl({...})` factory. Register agents/tools, run durably by name.
 
@@ -48,6 +52,11 @@ export const GNL_ORG_ID_KEY = '__gnl_orgId';
 export const GNL_THREAD_ID_KEY = '__gnl_threadId';
 /** The server's seal for an operator/system call: an EXPLICIT staff caller (run-identity.ts). */
 export const GNL_STAFF_KEY = '__gnl_staff';
+/**
+ * Set by sealRequestContext (non-enumerable): this call came through a door — a request — not from the
+ * host's own code. The engine refuses a system message on such a call (request-body.ts).
+ */
+export const GNL_DOOR_KEY = '__gnl_door';
 
 /**
  * Plain keys the SERVER also derives, and which a client therefore must not be able to supply.
@@ -59,7 +68,7 @@ export const GNL_STAFF_KEY = '__gnl_staff';
  * that has not configured `org` — a body carrying `context: { org: 'victim' }` reached those functions
  * verbatim. The seal existed to close exactly that class and missed the one key it had published.
  */
-const RESERVED_CONTEXT_KEYS = [GNL_RESOURCE_ID_KEY, GNL_ORG_ID_KEY, GNL_THREAD_ID_KEY, GNL_STAFF_KEY, 'org'] as const;
+const RESERVED_CONTEXT_KEYS = [GNL_RESOURCE_ID_KEY, GNL_ORG_ID_KEY, GNL_THREAD_ID_KEY, GNL_STAFF_KEY, GNL_DOOR_KEY, 'org'] as const;
 
 /**
  * Writes an OWN property, ignoring the prototype chain.
@@ -87,6 +96,11 @@ function define(target: RequestContext, key: string, value: unknown): void {
   Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
 }
 
+/** Whether a request context was sealed by a door (see GNL_DOOR_KEY). */
+function cameThroughDoor(context: RequestContext | undefined): boolean {
+  return context !== undefined && (context as Record<string, unknown>)[GNL_DOOR_KEY] === true;
+}
+
 /**
  * P1.7 seals a request context against the cross-organization hijack class where a
  * client-supplied `context.__gnl_resourceId`/`__gnl_orgId`/`__gnl_threadId` in the request body would
@@ -99,6 +113,7 @@ function define(target: RequestContext, key: string, value: unknown): void {
  * ALWAYS overwrites the three reserved keys — even a key `server` has NO value for is stripped from the
  * client-supplied context (deleted, never left as `undefined` either): a spoofed key must not survive by
  * omission just because the server didn't happen to supply that particular field this call.
+ * @internal — door plumbing shared by the GNL doors; gnl builds its argument, no host writes it.
  */
 export function sealRequestContext(
   ctx: RequestContext,
@@ -152,6 +167,9 @@ export function sealRequestContext(
   }
   if (server.threadId !== undefined) define(sealed, GNL_THREAD_ID_KEY, server.threadId);
   if (server.staff === true && server.resourceId === undefined) define(sealed, GNL_STAFF_KEY, true);
+  // "This call came through a door": NOT enumerable, so the context a host's dynamic agent reads is the
+  // one it always was (spread, JSON and equality do not see it) — the engine reads it by name in run()/stream().
+  Object.defineProperty(sealed, GNL_DOOR_KEY, { value: true, enumerable: false, writable: false, configurable: false });
   return sealed;
 }
 
@@ -351,6 +369,7 @@ export interface AgentConfig {
  * agent didn't GIVE `orgs` → GLOBAL, everyone sees it (existing behavior, backward-compatible).
  * caller is NOT org-bound (operator / auth off → undefined) → sees everything.
  * otherwise: visible only if the caller's org is in the agent's `orgs` list.
+ * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
  */
 export function agentVisibleToOrg(cfg: { orgs?: string[] }, callerOrgId: string | undefined): boolean {
   if (!cfg.orgs?.length) return true; // global agent
@@ -688,6 +707,8 @@ export interface RunOptions {
   toolPolicy?: 'strict' | 'strict-critical';
   /** FAZ-4 (critical profile) — see run.ts RunOptions for full semantics; forwarded verbatim. */
   strictInput?: boolean;
+  /** See RunDurableArgs.trustRecordedInput — the host vouches for an older recorded input. Ignored on a door's call. */
+  trustRecordedInput?: boolean;
   conflictLedger?: boolean;
   auditOnReject?: 'best-effort' | 'require';
   /** Replay-disclosure policy (see CreateGnlConfig.replayDisclosure); this per-call value wins. */
@@ -839,7 +860,38 @@ function toolsDeclaringEffectClass(config: CreateGnlConfig): string[] {
   return [...found].sort();
 }
 
+/**
+ * What a sub-agent's run takes from the run that delegated to it. TOTAL over RunOptions: an option
+ * added to RunOptions does not compile until it says here whether it crosses the delegation — the
+ * hand-picked copy this replaces carried four of thirty, and a protection added later never reached a
+ * sub-agent (measured: cancellation, tool timeouts, processors, scorers, the preset's run lock).
+ *
+ * 'inherit' — a protection or a decision the parent runs under; the child runs under it too.
+ * 'own'     — the child's: its id, its task, its agent's model/system/tools, its own run lock (the
+ *             preset takes one per run), its replay mode.
+ * 'frame'   — comes down in the delegation frame, not as an option: whom it runs for, the parent's
+ *             cancellation and approvals (agent-tool.ts ChildFrame).
+ */
+const CHILD_RUN_POLICY = {
+  runId: 'own', workKey: 'own', prompt: 'own', messages: 'own', model: 'own', temperature: 'own', topP: 'own',
+  system: 'own', tools: 'own', lock: 'own', replay: 'own', trustRecordedInput: 'own',
+  threadId: 'frame', resourceId: 'frame', caller: 'frame', approvals: 'frame', abortSignal: 'frame',
+  context: 'inherit', limits: 'inherit', toolPolicy: 'inherit', strictInput: 'inherit', conflictLedger: 'inherit',
+  auditOnReject: 'inherit', replayDisclosure: 'inherit', channel: 'inherit', tombstonePolicy: 'inherit', actor: 'inherit',
+  timeouts: 'inherit', exclusiveModelStep: 'inherit', onBlocked: 'inherit',
+} as const satisfies Record<keyof RunOptions, 'inherit' | 'own' | 'frame'>;
+
+/** A child's run options: what it inherits from the parent's, plus its own. */
+function childRunOptions(parent: RunOptions, own: RunOptions): RunOptions {
+  const inherited: Record<string, unknown> = {};
+  for (const k of Object.keys(CHILD_RUN_POLICY) as (keyof RunOptions)[]) {
+    if (CHILD_RUN_POLICY[k] === 'inherit' && parent[k] !== undefined) inherited[k] = parent[k];
+  }
+  return { ...(inherited as RunOptions), ...own };
+}
+
 export function createGnl(config: CreateGnlConfig) {
+  refuseCreateGnlNames(config);
   // Task 3 (opt-in): run BEFORE anything else — a version-skewed suite should be caught up front, not
   // after agents/tools are already wired against a possibly-incompatible sibling package.
   if (config.checkSuiteConsistency) {
@@ -993,39 +1045,41 @@ export function createGnl(config: CreateGnlConfig) {
     return out;
   }
 
-  /** C5: converts `a.agents` names into `agent_<name>` tools (model factory that freezes fallback into the nested runId).
-   * If `limits` is given (the parent's RunOptions.limits), it's inherited by the sub-agent AS-IS. */
   /**
-   * `identity` — devredilen işin SAHİBİ. Taint, limits ve toolPolicy bu sınırı yıllardır geçiyordu;
-   * kimlik geçmiyordu, yani "devret" sessizce "koruma katmanını kapat" anlamına geliyordu. Alt koşum
-   * sahipsiz doğunca ownershipDenied `!owner` dalında geçiyor, actor kilidi ateşlemiyor ve
-   * purgeResource o koşumu kişi silme talebinde hiç bulamıyor.
+   * `a.agents` names as `agent_<name>` tools. A sub-agent is a run of the engine like any other — the
+   * same `runAgent` a direct run goes through, so it has every protection that run has (its own
+   * processors, scorers, sub-agents, guard, preset) — born one frame below the run that delegated:
+   * that run's caller, cancellation and approvals come down in the frame, the protections it runs
+   * under come down as options (CHILD_RUN_POLICY), and taint crosses both ways (agent-tool.ts).
    */
-  async function buildSubAgentTools(names: string[] | undefined, rc: RequestContext, limits?: RunLimits, toolPolicy?: 'strict' | 'strict-critical', identity?: { actor?: string; channel?: string }): Promise<ToolSet> {
+  function buildSubAgentTools(names: string[] | undefined, rc: RequestContext, parentOpts: RunOptions): ToolSet {
     const out: ToolSet = {};
     for (const subName of names ?? []) {
       const sub = agent(subName); // early, clear error if not registered
-      out[`agent_${subName}`] = createAgentTool(
-        {
-          journal,
-          model: async (nestedRunId) => materializeModel(await resolveDyn(sub.model, rc), nestedRunId),
-          tools: sub.tools ? await resolveDyn(sub.tools, rc) : undefined,
-          system: sub.system ? await resolveDyn(sub.system, rc) : undefined,
-          guard: sub.guard,
-          maxSteps: sub.maxSteps,
-          limits,
-          ...(identity?.actor ? { actor: identity.actor } : {}),
-          ...(identity?.channel ? { channel: identity.channel } : {}),
-          ...(toolPolicy ? { toolPolicy } : {}), // FAZ-4 K12: the JSDoc's 'toolPolicy also to sub-agents' is now true
+      out[`agent_${subName}`] = delegationTool(
+        sub.description ?? `Delegate a task to the '${subName}' agent`,
+        journal,
+        async (task, nestedRunId, frame) => {
+          const r = await runAgent(subName, childRunOptions(parentOpts, { runId: nestedRunId, prompt: task, context: rc }), frame);
+          return { text: r.text, interrupts: r.interrupts, steps: r.steps };
         },
-        // The description field flows to both the network router and the agent-as-tool introduction (single source).
-        { description: sub.description ?? `Delegate a task to the '${subName}' agent` },
+        { agent: subName },
       );
     }
     return out;
   }
 
   async function run(name: string, opts: RunOptions) {
+    return runAgent(name, opts);
+  }
+
+  /**
+   * The one birth of an agent run. A direct run (`run`) has no frame; a sub-agent's run has the frame
+   * its delegation hands down — whom it runs for, the parent's cancellation and approvals — and is
+   * otherwise the same run: same preset, same gates, same processors, scorers and sub-agents.
+   */
+  async function runAgent(name: string, opts: RunOptions, frame?: ChildFrame) {
+    refuseRunNames(`run('${name}')`, opts);
     if (config.preset === 'critical') {
       opts = {
         ...opts,
@@ -1053,9 +1107,11 @@ export function createGnl(config: CreateGnlConfig) {
     // P1.7: a server-sealed resourceId/threadId (sealRequestContext) ALWAYS wins over opts.resourceId/
     // opts.threadId when present — see the RunOptions.resourceId/threadId precedence note below.
     const serverIdentity = serverIdentityOf(rc);
-    const caller = callerOfCall(rc, opts);
+    assertNoCallerSystemMessage({ ...opts, fromDoor: cameThroughDoor(opts.context) });
+    // A child runs for the caller of the run that delegated; that run already passed every door gate.
+    const caller = frame ? frame.identity : callerOfCall(rc, opts);
     const effectiveResourceId = userIdOf(caller);
-    const effectiveThreadId = serverIdentity.threadId ?? opts.threadId;
+    const effectiveThreadId = frame ? frame.identity.threadId : (serverIdentity.threadId ?? opts.threadId);
     // THE GATE (package #3), before the model is resolved and therefore before anything touches the
     // journal: from here on `runId` is the run's id — either the raw one the caller passed or the one
     // the engine derived from their workKey. The scope comes from the AGENT, not from the call: which
@@ -1074,9 +1130,9 @@ export function createGnl(config: CreateGnlConfig) {
     const model = await materializeModel(opts.model ?? (await resolveDyn(a.model, rc)), runId);
     const agentTools = a.tools ? await resolveDyn(a.tools, rc) : undefined;
     // Sub-agent and workflow tools take the caller from the CALL (options.gnl), not from here.
-    const subTools = await buildSubAgentTools(a.agents, rc, opts.limits, opts.toolPolicy, {
+    const subTools = buildSubAgentTools(a.agents, rc, {
+      ...opts,
       ...((serverIdentity.resourceId ?? opts.actor) ? { actor: serverIdentity.resourceId ?? opts.actor } : {}),
-      ...(opts.channel ? { channel: opts.channel } : {}),
     });
     const wfTools = buildWorkflowTools(a.workflows, {
       ...((serverIdentity.resourceId ?? opts.actor) ? { actor: serverIdentity.resourceId ?? opts.actor } : {}),
@@ -1098,11 +1154,15 @@ export function createGnl(config: CreateGnlConfig) {
       runId,
       journal: journal,
       agentName: name,
+      origin: cameThroughDoor(opts.context) ? 'door' : 'host',
+      ...(opts.trustRecordedInput === true && !cameThroughDoor(opts.context) ? { trustRecordedInput: true } : {}),
       model,
       tools: runTools,
       system: effectiveSystem,
       guard: a.guard,
-      memory: memoryArg,
+      // A child works on a task, not on the conversation: it neither reads the thread's history nor
+      // writes its own exchange into it. The thread still names whose work it is (ownership).
+      memory: frame ? undefined : memoryArg,
       threadId: effectiveThreadId,
       caller,
       // SAHİPLİK DAMGASI — ÖNCELİK BURADA KURULUR: mühürlü kimlik kazanır, çağıranın beyanı değil.
@@ -1113,7 +1173,7 @@ export function createGnl(config: CreateGnlConfig) {
       // opts.actor SİLİNMEDİ, geri plana alındı: mühür kurmayan hostlar (kendi rotasını yazan
       // uygulamalar, CLI, testler) için tek kimlik kanalı odur — ama yalnız mühürlü kimlik YOKKEN.
       ...((serverIdentity.resourceId ?? opts.actor) ? { actor: serverIdentity.resourceId ?? opts.actor } : {}),
-      approvals: opts.approvals,
+      approvals: frame?.approvals ?? opts.approvals,
       stopWhen: stepCountIs(a.maxSteps ?? 12),
       ...(opts.temperature != null ? { temperature: opts.temperature } : {}),
       ...(opts.topP != null ? { topP: opts.topP } : {}),
@@ -1133,7 +1193,7 @@ export function createGnl(config: CreateGnlConfig) {
       ...(opts.replay ? { replay: opts.replay } : {}),
       ...(opts.timeouts ? { timeouts: opts.timeouts } : {}),
       ...(opts.exclusiveModelStep ? { exclusiveModelStep: opts.exclusiveModelStep } : {}),
-      ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}), // P0.2: see RunOptions.abortSignal
+      ...((frame?.abortSignal ?? opts.abortSignal) ? { abortSignal: frame?.abortSignal ?? opts.abortSignal } : {}), // P0.2: see RunOptions.abortSignal; a child stops with its parent
       // The declaration travels with the run so package #2's writer can freeze it into `:input`:
       // the id is opaque, and the answer to "which run was the invoice job?" has to live somewhere
       // a person can read. Only present when the id was DERIVED — a raw runId declared nothing.
@@ -1171,7 +1231,10 @@ export function createGnl(config: CreateGnlConfig) {
     // best-effort by contract: a learning failure must never fail an otherwise-successful run.
     // stream() has no auto-pass (a stream returns before completion); hosts call
     // gnl.suggestions.generateFor from their finish hook when they want streamed runs to learn.
-    if (suggestionsApi && config.suggestions?.generate && result.interrupts.length === 0) {
+    // A sub-agent's run applies the person's lessons (above) but does not learn: what it did comes back
+    // in its parent's answer, and the parent's run is the one the person had — one learning pass per
+    // request, not one per delegation, and no lesson drawn from a task a model wrote for another.
+    if (suggestionsApi && config.suggestions?.generate && result.interrupts.length === 0 && !frame) {
       try {
         await suggestionsApi.generateFor({
           runId,
@@ -1199,6 +1262,7 @@ export function createGnl(config: CreateGnlConfig) {
   // P1.6b: streamed runs' materialized-metrics recording lives in streamDurable's onFinish (run.ts,
   // next to recordRunUsage) — the former TODO here is closed; no backfill dependency remains.
   async function stream(name: string, opts: RunOptions) {
+    refuseRunNames(`stream('${name}')`, opts);
     if (config.preset === 'critical') {
       opts = {
         ...opts,
@@ -1225,6 +1289,7 @@ export function createGnl(config: CreateGnlConfig) {
     const rc = opts.context ?? {};
     // P1.7: same server-identity precedence as run() above — see RunOptions.threadId/resourceId JSDoc.
     const serverIdentity = serverIdentityOf(rc);
+    assertNoCallerSystemMessage({ ...opts, fromDoor: cameThroughDoor(opts.context) });
     const caller = callerOfCall(rc, opts);
     const effectiveResourceId = userIdOf(caller);
     const effectiveThreadId = serverIdentity.threadId ?? opts.threadId;
@@ -1244,9 +1309,9 @@ export function createGnl(config: CreateGnlConfig) {
     const model = await materializeModel(opts.model ?? (await resolveDyn(a.model, rc)), runId);
     const agentTools = a.tools ? await resolveDyn(a.tools, rc) : undefined;
     // Sub-agent and workflow tools take the caller from the CALL (options.gnl), not from here.
-    const subTools = await buildSubAgentTools(a.agents, rc, opts.limits, opts.toolPolicy, {
+    const subTools = buildSubAgentTools(a.agents, rc, {
+      ...opts,
       ...((serverIdentity.resourceId ?? opts.actor) ? { actor: serverIdentity.resourceId ?? opts.actor } : {}),
-      ...(opts.channel ? { channel: opts.channel } : {}),
     });
     const wfTools = buildWorkflowTools(a.workflows, {
       ...((serverIdentity.resourceId ?? opts.actor) ? { actor: serverIdentity.resourceId ?? opts.actor } : {}),
@@ -1265,6 +1330,8 @@ export function createGnl(config: CreateGnlConfig) {
       runId,
       journal: journal,
       agentName: name,
+      origin: cameThroughDoor(opts.context) ? 'door' : 'host',
+      ...(opts.trustRecordedInput === true && !cameThroughDoor(opts.context) ? { trustRecordedInput: true } : {}),
       model,
       tools: runTools,
       system: effectiveSystem,
@@ -1377,7 +1444,7 @@ export function createGnl(config: CreateGnlConfig) {
     if (effectiveThreadId) await admitThreadRun(journal, resolvedMemory, effectiveThreadId, caller);
     // SAHİP KAYDI — iş akışındakiyle AYNI desen, aynı anahtar, aynı ilk-yazan-kazanır.
     //
-    // Alt-ajanlar kimliği zaten devralıyordu (aşağıda runSubAgent'a iniyor); sahipsiz kalan ROUTER'IN
+    // Alt-ajanlar kimliği zaten devralıyordu (aşağıda alt koşumun çerçevesine iniyor); sahipsiz kalan ROUTER'IN
     // KENDİ koşumuydu — ve `<runId>:net:route/step` kayıtları görev metnini ve alt-ajan çıktılarını
     // taşıyor, yani kişisel veri. Sahibi yazılmayınca `purgeResource` o koşumu hiç saymıyor ve
     // `ownershipDenied` sahibi bulamayıp sessizce geçiyordu.
@@ -1404,56 +1471,26 @@ export function createGnl(config: CreateGnlConfig) {
     });
     const netIdentity = runIdentity(acting, runId, effectiveThreadId ? { threadId: effectiveThreadId } : {});
     // Targets are set up BEFORE the router model → an unregistered agent gives a clear error before model resolution.
-    // Sub-agent call semantics are CENTRALIZED in runSubAgent (same path as agent-tool; interrupts propagate upward).
+    // A network's sub-agent is born like any agent run (runAgent), one frame below the network run; interrupts propagate upward.
     const targets: Record<string, NetworkTarget> = {};
     for (const subName of net.agents) {
       const sub = agent(subName); // early, clear error if not registered
       targets[subName] = {
         description: sub.description,
-        run: async (task, nestedRunId) =>
-          runSubAgent(
-            {
-              journal,
-              model: async (rid) => materializeModel(await resolveDyn(sub.model, rc), rid),
-              tools: sub.tools ? await resolveDyn(sub.tools, rc) : undefined,
-              system: sub.system ? await resolveDyn(sub.system, rc) : undefined,
-              guard: sub.guard,
-              maxSteps: sub.maxSteps,
-              // FAZ-7: the critical preset now reaches the network path's sub-agents with the two
-              // protections that MAP here (tool policy + the duplicate ladder). Locks/fingerprints
-              // are per-run concerns of the CALLER's entry point, not of nested delegations.
-              // Matris sub-agent'a da iner (denetçi K6 — F7'nin 'ladder maps to sub-agents' emsali):
-              // assistant'ın 'para sorar' vaadi delegasyonda warn'a düşemez, headless'ın DLQ reddi kaybolamaz.
-              limits: config.preset
-                ? { sideEffectDuplicates: { byClass: PRESET_MATRIX[config.preset], default: PRESET_DEFAULT[config.preset] }, ...(opts.limits ?? {}) }
-                : opts.limits,
-              ...(config.preset === 'critical' ? { toolPolicy: 'strict-critical' as const } : {}),
-              // ONAY KANALI — ve BİLİNEN SINIRI. Bu kanal insanın yüzeye çıkan sorularına verdiği
-              // cevaptır: askıya düşen alt ajanın interrupt'ı ÇOCUĞUN kendi toolCallId'siyle
-              // yüzeye çıkar, insan onu cevaplar, cevap buradan geri iner. Sorun tek haritanın
-              // PAYLAŞILAN id uzayında: iki alt ajanın sağlayıcı-id'leri çakışabilir (ikisi de
-              // `call_0` üretebilir), yani bir alt ajana verilen onay ötekinin aynı adlı çağrısını
-              // da açabilir.
-              // durable-tool'daki kardeş kanal bunu kesişimle daraltıyor (nestedApprovalsFor:
-              // haritadan yalnız ÇOCUĞUN sentinel'inde listelenen id'ler iner). Burada aynısı
-              // uygulanamıyor, çünkü ağ kaydı çocuk interrupt listesi TUTMUYOR — daraltmanın
-              // dayanacağı liste yok. Davranış bilerek değiştirilmedi; sınır burada yazılı dursun.
-              approvals: opts.approvals,
-              // KİMLİK, taint ile aynı sınırdan. Ağ yolu, agent-as-tool'un kardeşi ve aynı boşluğu
-              // taşıyordu: yönlendirilen iş sahipsiz doğuyordu. Yönlendirme bir kimlik değişimi
-              // değil — router hangi ajanı seçerse seçsin, iş hâlâ aynı kişinin işi.
-              ...(effectiveActor ? { actor: effectiveActor } : {}),
-              ...(opts.channel ? { channel: opts.channel } : {}),
-              // The network router runs under this run's id — carry its taint into each sub-agent.
-              parentRunId: runId,
-            },
-            task,
-            nestedRunId,
-            netIdentity,
-          ),
+        // The same birth as an agent-as-tool child (runAgent), one frame below the network run.
+        run: (task, nestedRunId) =>
+          runDelegated(journal, runId, nestedRunId, requestOf(netIdentity), async () => {
+            const r = await runAgent(subName, childRunOptions(
+              { limits: opts.limits, context: rc, ...(effectiveActor ? { actor: effectiveActor } : {}), ...(opts.channel ? { channel: opts.channel } : {}) },
+              { runId: nestedRunId, prompt: task },
+            ), { identity: childIdentity(netIdentity, nestedRunId), parentRunId: runId, ...(opts.approvals ? { approvals: opts.approvals } : {}) });
+            return { text: r.text, interrupts: r.interrupts, ...childOutcome(r.steps) };
+          }),
       };
     }
     const routerModel = await materializeModel(await resolveDyn(net.router, rc), runId);
+    // The network's limits are the request's: its children measure them here (limits.ts registerSubRun).
+    if (opts.limits) await seedLimits(journal, runId);
     return runNetworkCore({
       runId,
       journal,
@@ -1619,6 +1656,7 @@ export function createGnl(config: CreateGnlConfig) {
   }
 
   async function runWorkflow(name: string, input: unknown, opts?: WorkflowRunOpts): Promise<WorkflowRunResult> {
+    refuseUnknownNames(`runWorkflow('${name}')`, opts, WORKFLOW_RUN_NAMES);
     const wf = config.workflows?.[name];
     if (!wf) throw new Error(`workflow '${name}' is not registered`);
     // THE GATE (package #3), and the one door whose "neither half" answer is ALLOW: `runWorkflow` has

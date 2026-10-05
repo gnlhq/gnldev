@@ -225,7 +225,9 @@ describe('@gnldev/server SSE', () => {
         };
       },
     };
-    const api = createRestApi({ journal: new InMemoryJournal(), agents: { loop: { model: loopMock, tools, maxSteps: 10 } } });
+    // The default duplicate ladder is now 'suspend' and would ask before the loop forms; this test is
+    // about the loop limit's stream contract, so the server keeps the ladder at 'warn' (a server limit).
+    const api = createRestApi({ journal: new InMemoryJournal(), agents: { loop: { model: loopMock, tools, maxSteps: 10 } } }, { limits: { sideEffectDuplicates: 'warn' } });
 
     const res = await call(api, '/agents/loop/stream', {
       method: 'POST',

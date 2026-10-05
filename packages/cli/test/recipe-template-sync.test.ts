@@ -72,10 +72,12 @@ describe('scaffold sources: commented-out code is still code', () => {
     expect(text).toContain('// export const mcpToolset: ToolSet = await handle.tools();');
   });
 
-  it('the charge tool\'s cross-run hint uncomments into the real option name', () => {
+  it('the charge tool says how far its key holds, with the real option name', () => {
     const text = recipeContents(RECIPES['idempotency-tool']!);
+    // A key without a window is refused (gnlTool/durableTool), so the window is code, not a hint — and
     // `IdempotencyWindow` is not an option on anything; the tool declaration reads `idempotencyWindow`.
-    expect(text).toContain("// idempotencyWindow: 'cross-run' as const,");
+    expect(text).toContain("  idempotencyWindow: 'cross-run' as const,");
+    expect(text).not.toContain("// idempotencyWindow:");
   });
 });
 

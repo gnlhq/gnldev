@@ -38,6 +38,7 @@
   },
   "dependencies": {
     "@gnldev/auth": "workspace:^",
+    "@gnldev/options": "workspace:^",
     "hono": "^4.13.2"
   },
   "peerDependencies": {
@@ -48,7 +49,7 @@
     "ai": "^7.0.0",
     "zod": "^3.25.0"
   },
-  "author": "Karaca Yılmaz (https://gnl.dev)",
+  "author": "Karaca Y\u0131lmaz (https://gnl.dev)",
   "homepage": "https://gnl.dev",
   "bugs": {
     "url": "https://github.com/gnlhq/gnldev/issues"

@@ -96,6 +96,7 @@ function sameParty(a: Caller, b: Caller): boolean {
  * for ayse started ayse's run and was never told. The `resourceId` shorthand keeps its documented
  * precedence (P1.7: a sealed identity overrides it): it is the field a request body reaches, and the
  * seal is there to overrule exactly that.
+ * @internal — door plumbing shared by the GNL doors; gnl builds its argument, no host writes it.
  */
 export function resolveCaller(seal: SealFields, declared?: { resourceId?: string; caller?: Caller }): Caller {
   let named: Caller | undefined;
@@ -116,17 +117,38 @@ export function resolveCaller(seal: SealFields, declared?: { resourceId?: string
   return sealed;
 }
 
-export function runIdentity(c: Caller, runId: string, place: { threadId?: string; parentRunId?: string } = {}): RunIdentity {
-  return { ...callerOf(c), runId, ...(place.threadId ? { threadId: place.threadId } : {}), ...(place.parentRunId ? { parentRunId: place.parentRunId } : {}) };
+/** @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it. */
+export function runIdentity(c: Caller, runId: string, place: { threadId?: string; parentRunId?: string; requestRunId?: string } = {}): RunIdentity {
+  return {
+    ...callerOf(c), runId,
+    ...(place.threadId ? { threadId: place.threadId } : {}),
+    ...(place.parentRunId ? { parentRunId: place.parentRunId } : {}),
+    ...(place.requestRunId ? { requestRunId: place.requestRunId } : {}),
+  };
 }
 
-/** A child's identity: the parent's caller, the child's placement. */
+/**
+ * The request a run belongs to: the run the request started (`requestRunId`), or the run itself when
+ * nothing delegated it. THE one reading — the request's dedup window, duplicate markers and limits are
+ * all keyed by it.
+ */
+export function requestOf(identity: Pick<RunIdentity, 'runId' | 'requestRunId'>): string {
+  return identity.requestRunId ?? identity.runId;
+}
+
+/**
+ * A child's identity: the parent's caller, the child's placement.
+ * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
+ */
 export function childIdentity(parent: RunIdentity, childRunId: string, threadId?: string): RunIdentity {
   const thread = threadId ?? parent.threadId;
-  return runIdentity(parent, childRunId, { ...(thread ? { threadId: thread } : {}), parentRunId: parent.runId });
+  return runIdentity(parent, childRunId, { ...(thread ? { threadId: thread } : {}), parentRunId: parent.runId, requestRunId: requestOf(parent) });
 }
 
-/** The tool-execution context the engine passes for a run (`options.gnl`). */
+/**
+ * The tool-execution context the engine passes for a run (`options.gnl`).
+ * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
+ */
 export function toolContextFor(identity: RunIdentity): GnlToolContext {
   return { identity, runId: identity.runId, ...(identity.parentRunId ? { parentRunId: identity.parentRunId } : {}) };
 }
@@ -294,6 +316,7 @@ export type RunDecision = 'allow' | 'deny' | 'missing';
  *  - an end user reaches a run whose owner IS that user — never an ownerless (staff) run;
  *  - `unknown` reaches only a run that was itself born `unknown` (a direct engine caller that never
  *    named anyone continuing its own work) — never a user's or staff's.
+ * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
  */
 export function decideRunAccess(owner: RunOwner, caller: Caller): RunDecision {
   if (owner.state === 'unreadable') return 'deny';
@@ -418,6 +441,22 @@ export function assertRunTarget(record: unknown, requested: RunTarget, runId: st
 }
 
 /**
+ * THE refusal for a caller who may not act on a run: names nobody in the sentence (the owner is in
+ * `detail`), and — only when the call named nobody at all — says how to name someone. A host resuming
+ * a user's run from its own backend (an approval button) without a `caller` met this sentence and no
+ * way through; measured on the support-desk example, whose approval never refunded.
+ */
+export function runOwnerRefusal(runId: string, recorded: Caller, requested: Caller): RunOwnerMismatchError {
+  const hint = requested.kind === 'unknown'
+    ? ' This call named nobody: pass `caller` — `STAFF` when your own backend acts as an operator (an approval, a resume), or the user it acts for.'
+    : '';
+  return new RunOwnerMismatchError(
+    `@gnldev/durable: run '${runId}' belongs to a different subject. A run acts for the owner recorded at its start.${hint}`,
+    { runId, owner: ownerLabel(recorded), requested: ownerLabel(requested) },
+  );
+}
+
+/**
  * THE ENTRY of a run, for every kind: read the owner once, decide, and — for a run that does not exist
  * yet, when `birth` is given — record the owner at once (`claimRunOwner`). Returns who the run acts
  * for (`actingCaller`). Refuses with the store's own error when the owner cannot be read, and with
@@ -434,11 +473,7 @@ export async function admitRun(
 ): Promise<{ acting: Caller; owner: RunOwner }> {
   const owner = await runOwnerOf(journal, runId);
   if (owner.state === 'unreadable') throw owner.error;
-  const refuse = (recorded: Caller) =>
-    new RunOwnerMismatchError(
-      `@gnldev/durable: run '${runId}' belongs to a different subject. A run acts for the owner recorded at its start.`,
-      { runId, owner: ownerLabel(recorded), requested: ownerLabel(caller) },
-    );
+  const refuse = (recorded: Caller) => runOwnerRefusal(runId, recorded, caller);
   const acting = actingCaller(owner, caller);
   if (!acting) throw refuse(owner.state === 'owned' ? owner.owner : UNKNOWN);
   const requested = runTargetOf(birth);

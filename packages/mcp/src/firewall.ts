@@ -5,6 +5,8 @@
 import { claim } from '@gnldev/durable';
 import type { Guard, GuardCall, GuardDecision, Journal, JournalReader } from '@gnldev/durable';
 import type { McpToolSummary } from './index.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { MCP_FIREWALL_NAMES } from './option-names.js';
 
 /** Journal key for the pinned description hash — invisible to parseJournalKey (not a model/tool). */
 export function mcpPinKey(server: string, toolName: string): string {
@@ -65,6 +67,7 @@ function matches(name: string, patterns: ReadonlyArray<string | RegExp> | undefi
  *     can't be counted, it isn't blocked).
  */
 export function mcpFirewall(opts: McpFirewallOptions): Guard {
+  refuseUnknownNames('mcpFirewall', opts, MCP_FIREWALL_NAMES);
   const { server, journal, allow, deny, maxCallsPerRun } = opts;
 
   return async (call: GuardCall): Promise<GuardDecision> => {

@@ -37,6 +37,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@gnldev/options": "workspace:^",
     "@gnldev/workflow": "workspace:^"
   },
   "peerDependencies": {
@@ -45,7 +46,7 @@
   "devDependencies": {
     "@gnldev/durable": "workspace:*"
   },
-  "author": "Karaca Yılmaz (https://gnl.dev)",
+  "author": "Karaca Y\u0131lmaz (https://gnl.dev)",
   "homepage": "https://gnl.dev",
   "bugs": {
     "url": "https://github.com/gnlhq/gnldev/issues"

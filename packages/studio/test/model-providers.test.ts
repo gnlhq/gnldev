@@ -53,14 +53,14 @@ describe('GET /model-providers', () => {
     // pricing page — surfaces that already exist and that they have to use anyway.
     const journal = new InMemoryJournal();
     await journal.put(PRICING_KEY, { models: { 'nvidia/llama-3.3-70b': { inputPer1M: 0.2, outputPer1M: 0.6 } } });
-    const body = await providers(createStudioApi({ reader: journal, journal }));
+    const body = await providers(createStudioApi({ reader: journal }));
     expect(body.models, 'a priced model did not reach the suggestion list').toContain('nvidia/llama-3.3-70b');
   });
 
   it('does not repeat an id that arrives from both places', async () => {
     const journal = new InMemoryJournal();
     await journal.put(PRICING_KEY, { models: { 'x/y': { inputPer1M: 1, outputPer1M: 1 } } });
-    const app = createStudioApi({ reader: journal, journal, modelSuggestions: ['x/y'] } as never);
+    const app = createStudioApi({ reader: journal, modelSuggestions: ['x/y'] } as never);
     expect((await providers(app)).models.filter((m) => m === 'x/y')).toHaveLength(1);
   });
 

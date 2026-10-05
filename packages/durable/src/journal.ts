@@ -2,7 +2,7 @@
 // The core uses this in-memory; the SQLite/Postgres adapters implement the same interface.
 
 import type { Guard } from './guard.js';
-import type { RunLimits } from './limits.js';
+import type { RunLimits, ToolSeat } from './limits.js';
 import type { Processor } from './processor.js';
 import { stableStringify } from './hash.js';
 import { isVersionedKey, upgradeFormat } from './format.js';
@@ -59,6 +59,12 @@ export type ToolJournalRecord = (
   | { status: 'running'; startedAt: number; attempts?: number; toolName?: string }
 ) & {
   /**
+   * Set on a delegation's success (`agent_<name>`, a network target): the call handed work to a child
+   * run and did none itself. Limits count the child's calls, not the hand-over — the same work run
+   * directly would show only the child's calls (limits.ts recordToolOutcome/seedFromHistory).
+   */
+  delegation?: true;
+  /**
    * Set on a SHADOW copy written under `${runId}:tool:` for a record whose authoritative key is not
    * run-scoped — today only the `cross-run` idempotency window (`xrun:args-…`). Holds that key.
    *
@@ -73,7 +79,26 @@ export type ToolJournalRecord = (
    * record made one run's rollback refund a charge another run was still relying on.
    */
   mirrorOf?: string;
+  /**
+   * The call that EXECUTED it, on a request-window record (`runKeys.toolRequest`): which run, and which
+   * of that run's calls. The record is the request's — every call under it dedups against it — but the
+   * action was this one call's: that call's mirror is what its run unwinds (compensateRun), counts
+   * (limits seed) and erases (purgeRun). A mirror written for a deduplicated call carries the same
+   * stamp and is told apart by its own toolCallId — three calls, one execution, one unwind (measured:
+   * keyed by run alone, all three mirrors were unwound).
+   */
+  ranBy?: { runId: string; toolCallId: string };
 };
+
+/**
+ * Whether a run's tool entry is the mirror of a request-window record that THIS call executed
+ * (`ranBy`). The one predicate the unwind, the limits seed and the erasure read — `suffix` is the
+ * entry's key after `${runId}:tool:`, which for a mirror is the call's toolCallId.
+ */
+export function executedHere(record: { mirrorOf?: string; ranBy?: { runId: string; toolCallId: string } } | undefined, runId: string, suffix: string): boolean {
+  return typeof record?.mirrorOf === 'string' && runKeys.isToolRequest(record.mirrorOf) &&
+    record.ranBy?.runId === runId && record.ranBy.toolCallId === suffix;
+}
 
 /**
  * Every optional concurrency primitive
@@ -143,8 +168,11 @@ export interface Journal {
    * (SQL UPSERT arithmetic / Redis HINCRBYFLOAT). Kills two ailments of get→put at once: the
    * lost-update race (two workers read the same value and add, one gets overwritten) and the hot-row
    * read-modify-write cost. Negative delta = decrement. budget.ts uses this when supported.
+   * Resolves to the new value of each field it was given — what this increment made it, so a caller can
+   * take a share of a limit in one step (limits.ts takeToolSeat). The built-in adapters return it; a
+   * custom one that resolves to nothing keeps working, and callers that need the value fall back.
    */
-  incrBy?(key: string, fields: Record<string, number>): Promise<void>;
+  incrBy?(key: string, fields: Record<string, number>): Promise<Record<string, number> | void>;
   /** H8a: read counter fields written via incrBy (undefined if absent). */
   getCounters?(key: string): Promise<Record<string, number> | undefined>;
   /**
@@ -281,6 +309,27 @@ export const runKeys = {
    * "Different work" tombstones (`semtomb-*`, see semantic-dup.ts) live here too: FOUR families,
    * one purgeThread sweep, one lifecycle — the thread's dedup state dies with the thread.
    */
+  /**
+   * The REQUEST idempotency window ('run', the default): the record a call's arguments (or business key)
+   * resolve to for the whole request — the run the request started and every sub-agent under it. It
+   * lives outside every run's key space, like `toolCrossRun`/`toolThread`: it is the request's, not a
+   * step of whichever run happened to execute it. That run stamps `ranBy` and keeps a mirror
+   * (`mirrorOf`), which is how the run's timeline, its unwind and its erasure find it.
+   */
+  toolRequest: (requestRunId: string, toolName: string, hash: string) => {
+    assertNoColonInToolName(toolName);
+    return `${runKeys.toolRequestPrefix(requestRunId)}${toolName}-${hash}`;
+  },
+  /** Every request-window record of one request (`toolRequest`) — `args-` closes the prefix, so run 'a'
+   *  never reaches run 'a:b''s. */
+  toolRequestPrefix: (requestRunId: string) => `xreq:${requestRunId}:args-`,
+  /** Whether a key is a request-window record (`toolRequest`). */
+  isToolRequest: (key: string) => key.startsWith('xreq:'),
+  /** The same request-window record, in another request's window (a fork is a request of its own). */
+  toolRequestIn: (key: string, requestRunId: string): string | undefined => {
+    const m = /^xreq:.*:(args-[^:]*)$/.exec(key);
+    return m ? `xreq:${requestRunId}:${m[1]}` : undefined;
+  },
   toolThread: (threadId: string, toolName: string, hash: string) => {
     assertThreadId(threadId);
     assertNoColonInToolName(toolName);
@@ -436,7 +485,12 @@ export async function frozenGet<T>(journal: Journal, key: string, compute: () =>
 
 /** Context of a durable run: journal, run, optional policy and approvals. */
 import type { RunIdentity } from './identity-types.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { LIST_KEYS_NAMES, LIST_STALE_RUNS_NAMES } from './option-names.js';
 export interface DurableCtx {
+  /** The maxToolCalls seats this run's calls hold, by toolCallId (limits.ts takeToolSeat) — so the
+   *  write that counts a call can give its seat back in the same step. @internal */
+  seats?: Map<string, ToolSeat>;
   /**
    * Set by callers that have NO approvals channel — `withIdempotency` runs outside runDurable, and the
    * toolCallId it names is a fresh one on every attempt, so `approvals[id] = true` could never have
@@ -641,6 +695,13 @@ export interface RunSummary {
    * them: no call path accepts a workKey until package #3.
    */
   workKey?: string;
+  /**
+   * The run that started this one, when it is a child (a sub-agent, a network target): from the same
+   * `:input` entry. A person's run list read with `topLevel` shows their requests, not every sub-agent
+   * each request started (measured on a ward round list: 56 of 68 rows were sub-agents). Absent on
+   * top-level runs and on runs recorded by an earlier version.
+   */
+  parentRunId?: string;
 }
 
 /** Journal read surface (timeline / time-travel / studio). */
@@ -706,6 +767,8 @@ export interface JournalReader {
      * with a page, like every other filter here.
      */
     workKey?: string;
+    /** Only runs no other run started (`RunSummary.parentRunId` absent). Same filter-before-slice contract. */
+    topLevel?: boolean;
   }): Promise<{ items: RunSummary[]; nextCursor?: string }>;
 }
 
@@ -716,6 +779,7 @@ export type RunListQuery = {
   agent?: string;
   resourceId?: string;
   workKey?: string;
+  topLevel?: boolean;
 };
 
 /**
@@ -753,7 +817,7 @@ function pageFromArray(all: RunSummary[], q?: RunListQuery): { items: RunSummary
   const filtered = all.filter(
     (r) => (q?.status ? r.status === q.status : true) && (q?.agent ? r.agent === q.agent : true)
       && (q?.resourceId ? r.resourceId === q.resourceId : true)
-      && (q?.workKey ? r.workKey === q.workKey : true),
+      && (q?.workKey ? r.workKey === q.workKey : true) && (q?.topLevel ? !r.parentRunId : true),
   );
   const start = q?.cursor ? Number(q.cursor) || 0 : 0;
   const lim = q?.limit ?? 50;
@@ -982,10 +1046,12 @@ export class InMemoryJournal implements Journal, JournalReader {
 
   // H8a: structurally atomic counter in single-threaded JS.
   private counters = new Map<string, Record<string, number>>();
-  async incrBy(key: string, fields: Record<string, number>): Promise<void> {
+  async incrBy(key: string, fields: Record<string, number>): Promise<Record<string, number>> {
     const cur = this.counters.get(key) ?? {};
-    for (const [f, d] of Object.entries(fields)) cur[f] = (cur[f] ?? 0) + d;
+    const after: Record<string, number> = {};
+    for (const [f, d] of Object.entries(fields)) after[f] = cur[f] = (cur[f] ?? 0) + d;
     this.counters.set(key, cur);
+    return after;
   }
   async getCounters(key: string): Promise<Record<string, number> | undefined> {
     const c = this.counters.get(key);
@@ -1029,6 +1095,7 @@ export class InMemoryJournal implements Journal, JournalReader {
 
   // H8b: in-memory last-activity scan (test/dev — already in RAM).
   async listStaleRuns(cutoffTs: number, opts?: { includeSuspended?: boolean }): Promise<string[]> {
+    refuseUnknownNames('listStaleRuns', opts, LIST_STALE_RUNS_NAMES);
     const last = new Map<string, { ts: number; suspended: boolean }>();
     for (const [key, value] of this.store) {
       const p = parseJournalKey(key);
@@ -1075,6 +1142,7 @@ export class InMemoryJournal implements Journal, JournalReader {
   }
 
   async listKeys(prefix: string, opts?: { limit?: number }): Promise<string[]> {
+    refuseUnknownNames('listKeys', opts, LIST_KEYS_NAMES);
     const limit = opts?.limit;
     if (limit === undefined) return this.keys().filter((k) => k.startsWith(prefix));
     const out: string[] = [];
@@ -1150,13 +1218,14 @@ export class InMemoryJournal implements Journal, JournalReader {
       // see it on its own.
       const out = this.store.get(`${runId}:outcome`) as { status?: RunOutcomeRecord['status'] } | undefined;
       const s = summarizeRun(runId, entries, out as never);
-      const inp = this.store.get(`${runId}:input`) as { threadId?: string; agent?: string; resourceId?: string; workKey?: string } | undefined;
+      const inp = this.store.get(`${runId}:input`) as { threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string } | undefined;
       return {
         ...s,
         ...(inp?.threadId ? { threadId: inp.threadId } : {}),
         ...(inp?.agent ? { agent: inp.agent } : {}),
         ...(inp?.resourceId ? { resourceId: inp.resourceId } : {}),
         ...(inp?.workKey ? { workKey: inp.workKey } : {}),
+        ...(inp?.parentRunId ? { parentRunId: inp.parentRunId } : {}),
       };
     });
   }
@@ -1175,6 +1244,7 @@ export class InMemoryJournal implements Journal, JournalReader {
     if (q?.agent) all = all.filter((r) => r.agent === q.agent);
     if (q?.resourceId) all = all.filter((r) => r.resourceId === q.resourceId);
     if (q?.workKey) all = all.filter((r) => r.workKey === q.workKey);
+    if (q?.topLevel) all = all.filter((r) => !r.parentRunId);
     const start = q?.cursor ? Number(q.cursor) || 0 : 0;
     const limit = q?.limit ?? 50;
     const items = all.slice(start, start + limit);

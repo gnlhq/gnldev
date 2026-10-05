@@ -77,3 +77,22 @@ describe('@gnldev/workflow maturity', () => {
     expect((r2 as any).output).toEqual({ ok: true });
   });
 });
+
+describe('sleep takes an absolute time and refuses anything else', () => {
+  // Measured before: NaN, undefined and a string date made `Date.now() < untilMs`
+  // false, so the step did not wait and the workflow went straight on; Infinity slept forever.
+  it('a value that is not a time is refused when the step is built, naming it and the way out', () => {
+    for (const bad of [NaN, undefined, '2099-01-01', Infinity, -Infinity, new Date('nope')]) {
+      expect(() => sleep('wait', bad as any), String(bad)).toThrow(/sleep\('wait'\) needs an absolute time.*Date\.now\(\) \+ ms/s);
+    }
+  });
+  it('epoch milliseconds and a Date both wait until that time', async () => {
+    for (const until of [Date.now() + 60_000, new Date(Date.now() + 60_000)]) {
+      const journal = memJournal();
+      const wf = workflow<unknown>().then(sleep('wait', until) as any);
+      const r = await wf.runResumable({}, { runId: 'z' + Math.random(), journal });
+      expect(r.status).toBe('suspended');
+      expect((r as any).reason).toEqual({ kind: 'time', untilMs: +until });
+    }
+  });
+});

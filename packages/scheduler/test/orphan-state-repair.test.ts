@@ -44,7 +44,8 @@ describe('scheduleWorkflow — yetim durum onarımı', () => {
     await scheduleWorkflow(j, { id: 't', name: 'wf', every: 60_000 }, 0);
     // Durum kaydı kaybolur (yanlış kapsamlı bir temizlik).
     await j.deletePrefix('sched:state:t'); // durum kaydı kaybolur
-    expect(await listTriggers(j)).toEqual([]); // görünmez: onarımın önündeki asıl mesele bu
+    // Was invisible here ([]), which was the real issue in front of the repair. Listed now: failed, with the way out.
+    expect(await listTriggers(j)).toMatchObject([{ id: 't', status: 'failed', lastError: expect.stringMatching(/state is missing/) }]);
 
     await scheduleWorkflow(j, { id: 't', name: 'wf', every: 60_000 }, 100_000);
 

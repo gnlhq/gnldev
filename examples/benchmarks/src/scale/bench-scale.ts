@@ -14,7 +14,7 @@ import { toJournal, semKey } from '@gnldev/durable';
 const DIM = 2048;
 if (!process.env.DATABASE_URL) console.warn('DATABASE_URL is not set — falling back to a local Postgres on 127.0.0.1:5544.');
 const storage = new PostgresStorage({ connectionString: process.env.DATABASE_URL ?? 'postgres://gnl:gnl@127.0.0.1:5544/gnl' });
-const journal = toJournal(storage.runs);
+const journal = toJournal(storage);
 
 function fakeVec(seed: number): number[] {
   const v = new Array(DIM).fill(0);

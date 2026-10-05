@@ -102,6 +102,7 @@ async function claimTaint(journal: Journal, key: string, rec: RunTaint, what: st
  * tool-result processor (e.g. a prompt-injection detector) can set taint DYNAMICALLY for content its
  * heuristics flag even when the tool itself wasn't declared untrusted. Never throws (advisory-write
  * discipline, same as incidents) — but the ENFORCEMENT read is on the load-bearing path.
+ * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
  */
 export async function markRunTainted(
   journal: Journal,

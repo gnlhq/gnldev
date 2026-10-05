@@ -31,11 +31,6 @@ vi.mock('../src/config.js', () => ({
   loadConfig: async () => ({ journal: { listRuns: async () => [] } }),
 }));
 
-vi.mock('../src/memory.js', () => ({
-  devMemoryFactory: () => ({}),
-  devStudioMemory: () => ({}),
-}));
-
 vi.mock('../src/dev-server.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../src/dev-server.js')>();
   return { ...real, resolveAuthProvider: async () => undefined }; // no auth resolves — the risky case

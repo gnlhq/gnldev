@@ -95,6 +95,11 @@ for `{ reader }`:
   `StudioAppOptions extends StudioApiOptions` with one extra field, `apiBase`.
 - `createStudioAdmin({ apiBase? })` — the admin HTML on its own, for an API mounted elsewhere.
 
+**Where the routes are.** `createStudioApi` serves the API at its own root; `createStudioApp` serves the
+UI at `/` and the same API under **`/api`**. Every path in this README is relative to the API root:
+`POST /users/:id/revoke` is `POST /api/users/:id/revoke` behind `createStudioApp` (and behind
+`gnl dev`, which mounts it at `/studio`: `POST /studio/api/users/:id/revoke`).
+
 `StudioApiOptions` is one option per surface, and a surface is off until you pass its option:
 
 | Option | Turns on |
@@ -167,7 +172,7 @@ import { createJournalUserStore } from '@gnldev/auth-ee';
 
 // `storage`: the root storage your agents run on.
 const users = createJournalUserStore(storage.runs);
-createStudioApi({ reader: toJournal(storage.runs), users, userErasure: { storage, erasers: [jobEraser(storage)] } });
+createStudioApi({ reader: toJournal(storage), users, userErasure: { storage, erasers: [jobEraser(storage)] } });
 ```
 
 The answer carries the erasure report: `{ ok, id, erased: { journalRows, memoryThreads, … }, complete }`.
@@ -191,7 +196,7 @@ legal hold, or an erasure you run elsewhere). A user id is never handed to someo
 the auth-ee stores give every new user a fresh random id, even for the same email.
 
 ### Playground endpoints (when `gnl` is given, write-gated)
-`GET /api/agents` · `POST /api/agents/:name/run` · `POST /api/agents/:name/stream` (SSE — same schema as
+`GET /agents` · `POST /agents/:name/run` · `POST /agents/:name/stream` (SSE — same schema as
 [`@gnldev/server`](../server)).
 
 ### Dead-letter (when `events` is given)

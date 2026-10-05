@@ -20,6 +20,8 @@ import { runKeys, type Journal } from './journal.js';
 import { identityOf, runIdentity, toolContextFor, UNKNOWN, type Caller } from './run-identity.js';
 import { argsHash } from './hash.js';
 import type { AnyTool, ToolSet } from './types.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { RELEASE_CLAIM_NAMES, WITH_IDEMPOTENCY_NAMES } from './option-names.js';
 
 export interface WithIdempotencyOptions {
   /** The journal that records exactly-once tool outcomes (e.g. `new SqliteStorage(path).runs`, or `new InMemoryJournal()`). */
@@ -53,6 +55,7 @@ export interface WithIdempotencyOptions {
  * side effect only ONCE — in a plain AI SDK loop, without `runDurable`. See `WithIdempotencyOptions`.
  */
 export function withIdempotency<T extends ToolSet>(tools: T, opts: WithIdempotencyOptions): T {
+  refuseUnknownNames('withIdempotency', opts, WITH_IDEMPOTENCY_NAMES);
   const window: 'run' | 'cross-run' = opts.window ?? 'cross-run';
   // MINIMAL ctx: journal + runId only. No `blockedAsSentinel` → standalone throw semantics (documented
   // honest limit). runId is irrelevant in the cross-run window (the journal key is runId-free), and
@@ -122,6 +125,7 @@ export async function releaseFailedClaim(
     threadId?: string;
   },
 ): Promise<boolean> {
+  refuseUnknownNames('releaseFailedClaim', opts, RELEASE_CLAIM_NAMES);
   // CAS, not a delete. The first version read the record, checked it said 'failed', and then deleted —
   // and the gap between those two steps is a double charge: a concurrent retry (a tool marked
   // `idempotent: true`, or one whose recover() hook resolved the failure) can succeed in that window,

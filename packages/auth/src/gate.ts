@@ -4,6 +4,7 @@
 // used to need Hono's `Context` type in its own signature, which quietly tied its Hono version to
 // ours — the same coupling the factories dropped when they stopped returning a Hono app. Everything
 // the gate reads (method, path, headers, query) is on `Request`; nothing was lost by narrowing.
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 import type { AuthContext, AuthProvider, Decision, Principal } from './types.js';
 import { bindsIdentity } from './adapter.js';
 import { openSurfaceGuard, type HostRuleAuth, type OpenSurfaceRefusal } from './open-surface.js';
@@ -106,6 +107,7 @@ export function permissionContext(req: Request, permission: string): { path: str
 }
 
 export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
+  refuseUnknownNames('makeGate', opts, GATE_NAMES);
   // Fail-open audit at SETUP time: in production, a providerless gate can only be set up with the deliberate flag.
   // (If left to request time, the error would blow up on the first request after deploy — an early, clear failure was preferred.)
   if (!provider && process.env.NODE_ENV === 'production' && opts?.allowOpenAccess !== true) {
@@ -197,3 +199,5 @@ export function makeGate(provider?: AuthProvider, opts?: GateOptions): Gate {
     },
   };
 }
+
+const GATE_NAMES = optionNames<GateOptions>()(['allowOpenAccess', 'allowedHosts', 'allowCrossSite']);

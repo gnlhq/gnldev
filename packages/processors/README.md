@@ -43,6 +43,14 @@ await runDurable({
   itself runs with the arguments the model wrote; the journal's model-step record keeps the raw step,
   as `result.steps` does.
 - `tokenLimit(...)` · `promptInjectionDetector(...)` · `outputLimit(...)`
+  - `tokenLimit({ maxTokens })` is `tokenLimiter({ maxInputTokens })`: one trim. It drops whole turns (a
+    user message and everything up to the next one), oldest first, and never cuts the current turn — a
+    model shown a tool result without its question, or a question without its result, answers from the
+    part it has. When the current turn alone is over the limit, the run stops with a `ProcessorTripwire`.
+  - `promptInjectionDetector` stops the run when what the caller wrote (prompt, user messages) matches; a
+    matching **tool result** taints the run instead (`markRunTainted`), so the side effect after it is
+    refused under `limits.taintedSideEffects: 'block'`. Mark a tool that reads the outside world
+    `untrusted: true` for every result of it to taint — that, not the regex list, is the defense.
 - `piiTextRedactor(opts?) → (text: string) => string` — the same masking as `piiRedactor`, as a plain
   string function, for text that never passes through a processor at all. A `Processor` only sees
   `processInput`/`processOutput`/`processToolResult`; a run's failure message is written by

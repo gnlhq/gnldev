@@ -125,7 +125,7 @@ describe('live stream sentinel masking', () => {
     ]);
 
     const chunk = out.find((c) => c.type === 'data-gnl-interrupt');
-    expect(chunk.data.interrupts.map((i: any) => i.toolCallId)).toEqual(['child-a', 'child-b']);
+    expect(chunk.data.interrupts.map((i: any) => i.toolCallId)).toEqual(['parent-1/child-a', 'parent-1/child-b']);
     expect(chunk.data.interrupts.map((i: any) => i.toolName)).toEqual(['chargeCard', 'wire']);
     expect(chunk.data.interrupts[0].args).toEqual({ amount: 5000 });
     // Both questions reach the browser or neither is answerable: dropping the tail would leave the

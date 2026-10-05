@@ -30,6 +30,8 @@ import type { Memory } from './memory.js';
 import { recordOwner, userIdOf, type SubjectViewBrand } from './run-identity.js';
 import { threadOwnerOf } from './thread-owner.js';
 import { isOrganizationKey } from './organization.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { SUBJECT_JOURNAL_NAMES, SUBJECT_MEMORY_NAMES } from './option-names.js';
 
 /** @gnldev/workflow's run registry: one `wfrun:<runId>` row per workflow run. */
 const WF_REGISTRY = 'wfrun:';
@@ -62,6 +64,7 @@ function view<T extends object>(target: T, overrides: Record<PropertyKey, unknow
 }
 
 export function withSubjectJournal<J extends Journal & Partial<JournalReader>>(journal: J, subject: string, opts: SubjectViewOptions = {}): J & SubjectViewBrand {
+  refuseUnknownNames('withSubjectJournal', opts, SUBJECT_JOURNAL_NAMES);
   if (!subject) throw new Error('@gnldev/durable: withSubjectJournal needs a non-empty subject');
   const foreignKey = (key: string) => opts.root === true && isOrganizationKey(key);
   // ONE owner lookup per run for the view's lifetime (a view is built per request): the key rule
@@ -133,6 +136,7 @@ export function withSubjectJournal<J extends Journal & Partial<JournalReader>>(j
 }
 
 export function withSubjectMemory<M extends Memory>(memory: M, subject: string, opts: SubjectMemoryOptions): M {
+  refuseUnknownNames('withSubjectMemory', opts, SUBJECT_MEMORY_NAMES);
   if (!subject) throw new Error('@gnldev/durable: withSubjectMemory needs a non-empty subject');
   if (!opts?.journal) throw new Error('@gnldev/durable: withSubjectMemory needs the raw journal that holds the thread owner records (`{ journal }`)');
   const foreign = (threadId: string) => opts.root === true && isOrganizationKey(threadId);

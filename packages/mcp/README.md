@@ -395,6 +395,12 @@ cross-site check only. Over stdio, or called in process without a request, nothi
 a caller it resolved nobody for — see `identify` above — so on that server, the way in for a browser on
 another site is a token `identify` accepts.)
 
+**Its protections, printed when it is built.** `createMcpServer` prints a short block — whether callers are named
+(`identify`), which hosts an anonymous caller may use (`allowedHosts`), whether other sites may call it
+(`allowCrossSite`) — as `createRestApi` prints its own matrix — to standard error, never standard output, which a stdio server speaks JSON-RPC on; `protectionsBanner: false`
+silences it. Its last row says the host rule and the cross-site check are not checked for a message with no HTTP
+request (stdio, in process).
+
 ## Running MCP safely (`mcpFirewall`)
 
 **Threat model.** MCP tool definitions (`name`/`description`/`inputSchema`) are **untrusted data coming from the server** — market data points to 30+ CVEs in the last 60 days:

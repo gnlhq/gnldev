@@ -186,8 +186,9 @@ export const chargeOrder = {
   description: 'Charge a customer order (has a real side effect — must run exactly once).',
   idempotency: 'args' as const,
   idempotencyKey: (args: any) => String(args.orderId),
-  // Uncomment to dedup across runs too (retried jobs / re-triggered agents):
-  // idempotencyWindow: 'cross-run' as const,
+  // How far the key holds is your call, and GNL asks for it: 'cross-run' charges an order once for
+  // every request (a retried job, a re-triggered agent); 'run' would hold for one request only.
+  idempotencyWindow: 'cross-run' as const,
   execute: async ({ orderId, amount }: { orderId: string; amount: number }) => {
     ledger.charges.push({ orderId, amount });
     return { charged: amount, orderId, receipt: \`rcpt_\${orderId}\` };
@@ -659,7 +660,7 @@ import config from '../gnl.config.js';
 export async function exportTrace(runId: string): Promise<void> {
   // \`toJournal\` and not \`storage.runs\` directly: exporting READS the run back, and the run store's
   // write interface does not promise that. Same bridge src/app.ts hands to Studio.
-  await exportRun(toJournal(config.storage!.runs), runId, {
+  await exportRun(toJournal(config.storage!), runId, {
     endpoint: process.env.OTEL_ENDPOINT ?? 'http://localhost:4318/v1/traces',
     serviceName: process.env.OTEL_SERVICE_NAME ?? 'gnl-app',
     redact: piiTextRedactor(),

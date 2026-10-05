@@ -56,6 +56,7 @@ export function noteVerdict(req: Request, ctx: AuthContext, verdict: Decision): 
  * Record that THIS request is being refused, and why. Call it where the refusal is decided — the
  * response it goes with may be a 404 that hides the reason from the caller; the record must not hide it.
  * The first refusal wins: it is the one the caller got.
+ * @internal — door plumbing shared by the GNL doors; gnl builds its argument, no host writes it.
  */
 export function markRefusal(req: Request, reason: RefusalReason, opts: { detail?: string; principal?: Principal | null } = {}): void {
   if (opts.principal !== undefined) notePrincipal(req, opts.principal);

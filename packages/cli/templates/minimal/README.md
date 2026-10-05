@@ -42,9 +42,10 @@ src/tools/           one file per tool    — charge-order.ts (sideEffect + idem
 test/proof.test.ts   the duplicate-call proof you just ran
 ```
 
-Growing: `gnl add memory | auth | rag | mcp | workflow` writes the file and prints the one line to
-add to `gnl.config.ts`. Folders appear as you need them (`src/workflows/`, `src/models/`, …) — none
-are created empty.
+Growing: `gnl add memory | auth | rag | mcp | workflow` writes the file and wires it into
+`gnl.config.ts` — the lines `gnl init --features` would have written. If you have reshaped the config
+by hand it is left alone and the lines are printed; `gnl doctor` names any feature written but not
+wired. Folders appear as you need them (`src/workflows/`, `src/models/`, …) — none are created empty.
 
 ## Going live: a real model
 

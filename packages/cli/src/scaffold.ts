@@ -23,6 +23,8 @@ import { RECIPES, FEATURE_IDS, E2E_FEATURE, recipeContents, defaultVariants, con
 import { DEFAULT_ANSWERS, type InitAnswers } from './init-answers.js';
 import { IDENTITY_FILE } from './identity-file.js';
 import { hostById, APP_FILE, hostReadme, type HostMode } from './hosts.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { SCAFFOLD_OPTS_NAMES } from './option-names.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -251,6 +253,76 @@ function copyTemplate(dir: string, template: TemplateName, name: string): void {
   }
 }
 
+/** The line a config's `gnl add` fields follow — written by `generateConfig`, found by `wireRecipe`. */
+const FIELDS_ANCHOR = '  // Features `gnl add` wires go here, one per line.';
+
+/**
+ * Wires one recipe into a config `generateConfig` wrote, as `gnl init --features <id>` would have
+ * written it: adding a feature later and picking it at init give the same file. `gnl add` printed
+ * the lines instead, and an unwired recipe is a feature that silently does nothing — measured: after
+ * `gnl add rag` the config never named `searchDocs`, and neither `gnl dev` nor `gnl doctor` said so.
+ *
+ * Returns `undefined` when the config no longer has the shape this writes (it was edited by hand);
+ * the caller then prints the lines, as before. The config is the reader's file, so this only ever
+ * inserts — it never rewrites a line it did not write.
+ */
+export function wireRecipe(config: string, r: Pick<Recipe, 'wiring'>): string | undefined {
+  const w = configWiring(r);
+  if (!w || BASE_IMPORTS.includes(w.import.trim())) return config;
+  // A config saved with CRLF endings keeps them: the inserted lines take the file's own ending.
+  const eol = config.includes('\r\n') ? '\r\n' : '\n';
+  const lines = config.split(eol);
+  const code = w.code.trim();
+  const imp = w.import.trim();
+  if (!lines.includes(imp)) {
+    let last = -1;
+    for (let i = 0; i < lines.length && (lines[i]!.startsWith('import ') || last === -1); i++) if (lines[i]!.startsWith('import ')) last = i;
+    if (last === -1) return undefined;
+    lines.splice(last + 1, 0, imp);
+  }
+  if (w.place === 'agentTool') {
+    const at = lines.findIndex((l) => l.startsWith('  agents: { '));
+    if (at === -1) return undefined;
+    const line = lines[at]!;
+    const withTools = /assistant: \{ \.\.\.assistant, tools: \{ ([^}]*) \} \}/.exec(line);
+    if (withTools) {
+      const have = withTools[1]!.split(', ');
+      if (!have.includes(code)) lines[at] = line.replace(withTools[0], `assistant: { ...assistant, tools: { ${[...have, code].join(', ')} } }`);
+    } else if (line.startsWith('  agents: { assistant, ')) {
+      lines[at] = line.replace('  agents: { assistant, ', `  agents: { assistant: { ...assistant, tools: { ${code} } }, `);
+    } else return undefined;
+  } else {
+    if (lines.includes(`  ${code},`)) return lines.join(eol);
+    const commented = lines.indexOf(`  // ${code},`);
+    if (commented !== -1) lines[commented] = `  ${code},`;
+    else {
+      const anchorAt = lines.indexOf(FIELDS_ANCHOR);
+      if (anchorAt === -1) return undefined;
+      let end = anchorAt + 1;
+      while (end < lines.length && /^  \S.*,$/.test(lines[end]!) && !lines[end]!.startsWith('  //')) end++;
+      lines.splice(end, 0, `  ${code},`);
+    }
+  }
+  return lines.join(eol);
+}
+
+/**
+ * Recipe files in a project that its config never imports: a feature `gnl add` wrote but could not
+ * wire (the config was edited out of shape), or whose lines were later removed. Such a feature does
+ * nothing, silently; `gnl doctor` names them. Read from the config's TEXT — the import specifier the
+ * recipe's wiring uses — so it holds for a config this CLI did not write.
+ */
+export function unwiredRecipes(projectDir: string, configText: string): Recipe[] {
+  // A commented-out import wires nothing: read the text with its comments removed.
+  const code = configText.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  return Object.values(RECIPES).filter((r) => {
+    const w = configWiring(r);
+    if (!w || !existsSync(join(projectDir, r.file))) return false;
+    const spec = /from\s+['"]([^'"]+)['"]/.exec(w.import)?.[1];
+    return spec !== undefined && !code.includes(spec);
+  });
+}
+
 /** The lines every generated gnl.config.ts imports after its storage line — the base's own wiring. */
 const BASE_IMPORTS: readonly string[] = [
   "import type { CreateGnlConfig } from '@gnldev/durable';",
@@ -303,7 +375,7 @@ export function generateConfig(recipes: Recipe[], answers: InitAnswers = DEFAULT
     ? `assistant: { ...assistant, tools: { ${agentTools.join(', ')} } }`
     : 'assistant';
   const agentsLine = `  agents: { ${assistantEntry}, 'charge-demo': { ...chargeDemo, tools: { chargeOrder } } },`;
-  const fieldLines = configFields.map((c) => `  ${c},`);
+  const fieldLines = configFields.filter((c) => c !== 'memoryFactory').map((c) => `  ${c},`);
   // `subjects` is the CLI's own field (GnlDevConfig), not durable's — it declares nothing to the
   // engine and is read by exactly one thing: the protections matrix, which uses it to print an
   // honest `○ identity` instead of the `?` a config that says nothing earns.
@@ -364,21 +436,18 @@ export function generateConfig(recipes: Recipe[], answers: InitAnswers = DEFAULT
         "  // skeleton), wire it into your route, and change this to 'end-users'.",
         "  subjects: 'internal',",
       ]),
-    ...(wroteMemory
-      ? []
-      : [
-        '',
-        '  // CONVERSATION MEMORY, and the asymmetry it closes. `gnl dev` DERIVES a memory store from',
-        '  // `storage` so the Playground has threads; `src/app.ts` — the file you deploy — does not. So',
-        '  // conversations remember on your machine and quietly forget in production. `gnl add memory`',
-        '  // writes src/memory.ts; then import it above and uncomment this line.',
-        '  // memoryFactory,',
-      ]),
-    ...(fieldLines.length ? ['', ...fieldLines] : []),
+    '',
+    '  // CONVERSATION MEMORY. `gnl dev` and `src/app.ts` — the file you deploy — run this same config,',
+    '  // so a conversation remembers in both or in neither. Off until this line is on: `gnl add memory`',
+    '  // writes src/memory.ts and turns it on.',
+    wroteMemory ? '  memoryFactory,' : '  // memoryFactory,',
+    '',
+    FIELDS_ANCHOR,
+    ...fieldLines,
     '',
     '  // RETENTION is not scheduled by anything here, deliberately. Runs stay — and a run holds the',
     '  // prompt it was given — until something sweeps them: `gnl sweep --older-than 30d` from cron or',
-    '  // your scheduler, or `sweepRuns(toJournal(storage.runs), { olderThanMs: 30 * 864e5 })` in your own job. One',
+    '  // your scheduler, or `sweepRuns(toJournal(storage), { olderThanMs: 30 * 864e5 })` in your own job. One',
     '  // person\'s data is erased with `eraseSubject`, not by waiting.',
     ...(endUsers
       ? [
@@ -480,6 +549,7 @@ function scaffoldFeatures(dir: string, name: string, features: string[], forceE2
  * otherwise         → copy templates/minimal verbatim, optionally add the e2e test.
  */
 export function scaffold(targetDir: string, opts: ScaffoldOptions = {}): ScaffoldResult {
+  refuseUnknownNames('scaffold', opts, SCAFFOLD_OPTS_NAMES);
   const dir = resolve(targetDir);
   if (existsSync(dir) && readdirSync(dir).length) throw new Error(`gnl: target directory is not empty: ${dir}`);
   const name = opts.name ?? basename(dir);

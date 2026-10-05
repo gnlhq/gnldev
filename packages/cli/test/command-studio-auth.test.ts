@@ -34,7 +34,6 @@ vi.mock('../src/runtime.js', async (importOriginal) => {
 const { InMemoryStorage } = await import('@gnldev/durable');
 const cfg = { agents: {}, journal: new InMemoryStorage().runs, auth: { admin: { token: 'a-real-secret-token' } } };
 vi.mock('../src/config.js', () => ({ loadConfig: async () => cfg }));
-vi.mock('../src/memory.js', () => ({ devMemoryFactory: () => ({}), devStudioMemory: () => ({}) }));
 
 import { studioCommand } from '../src/commands/studio.js';
 

@@ -68,6 +68,7 @@ export type MigrationCheckResult =
  * SqliteStorage, PostgresStorage, or any future adapter shaped the same way, with zero import coupling to
  * which concrete adapters exist. Storages without a schema (RedisStorage, InMemoryStorage) get an honest
  * "not supported" result instead of a crash. This is the entry point a CLI or CI script calls.
+ * @internal — a storage adapter's conformance helper; its argument is the adapter.
  */
 export async function runMigrationCheck(storage: {
   name?: string;

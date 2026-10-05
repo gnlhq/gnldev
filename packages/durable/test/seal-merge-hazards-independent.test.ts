@@ -17,7 +17,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { InMemoryJournal } from '../src/journal.js';
 import {
   createGnl, sealRequestContext, serverIdentityOf,
-  GNL_ORG_ID_KEY, GNL_RESOURCE_ID_KEY, GNL_THREAD_ID_KEY,
+  GNL_ORG_ID_KEY, GNL_RESOURCE_ID_KEY, GNL_THREAD_ID_KEY, GNL_DOOR_KEY,
 } from '../src/registry.js';
 import { createMockModel, finalTextResult } from './mock.js';
 
@@ -225,7 +225,8 @@ describe('the seal is not distinguishable from the assignment it replaced', () =
 
   // `defineProperty` can produce a descriptor assignment never would (non-enumerable, non-writable),
   // and that would be visible to JSON.stringify, spread, structuredClone and Object.keys — all of which
-  // this context passes through. On a CLEAN prototype the two must be byte-identical.
+  // this context passes through. On a CLEAN prototype the two must be byte-identical through all four;
+  // the one own property assignment would not have made is the non-enumerable door marker.
   it.each([
     ['a full server identity', { a: 1, keep: 'me' }, { orgId: 'acme', resourceId: 'u1', threadId: 't1' }],
     ['an org only', { a: 1 }, { orgId: 'acme' }],
@@ -236,8 +237,10 @@ describe('the seal is not distinguishable from the assignment it replaced', () =
     const viaAssign = sealByAssignment(structuredClone(ctx) as never, server as never);
 
     expect(Object.keys(viaDefine), 'property order changed').toEqual(Object.keys(viaAssign));
-    expect(Object.getOwnPropertyDescriptors(viaDefine), 'the descriptors differ from what assignment produced')
-      .toEqual(Object.getOwnPropertyDescriptors(viaAssign));
+    // One deliberate difference: the door marker, which the engine reads by name and nothing else sees.
+    const { [GNL_DOOR_KEY]: door, ...descriptors } = Object.getOwnPropertyDescriptors(viaDefine);
+    expect(door, 'the door marker').toEqual({ value: true, enumerable: false, writable: false, configurable: false });
+    expect(descriptors, 'the descriptors differ from what assignment produced').toEqual(Object.getOwnPropertyDescriptors(viaAssign));
     expect(JSON.stringify(viaDefine)).toBe(JSON.stringify(viaAssign));
     expect({ ...viaDefine }).toEqual({ ...viaAssign });
     expect(structuredClone(viaDefine)).toEqual(structuredClone(viaAssign));

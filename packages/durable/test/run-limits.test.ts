@@ -11,6 +11,9 @@ import { getRunCost } from '../src/cost.js';
 import { RunLimitExceededError, ToolLoopDetectedError } from '../src/limits.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
+// The default duplicate ladder is now 'suspend': an undeclared tool repeated with identical arguments is
+// asked about. These tests repeat the same call on purpose to isolate the limits, so they keep the
+// duplicate ladder at 'warn'.
 describe('Run limits (cost ceiling + loop detection + fan-out inheritance)', () => {
   it('RunLimitExceededError on maxTokens overflow; journal stays consistent; limit can be raised and the SAME runId resumed', async () => {
     const journal = new InMemoryJournal();
@@ -37,7 +40,7 @@ describe('Run limits (cost ceiling + loop detection + fan-out inheritance)', () 
       runDurable({
         runId: 'r1', journal, model: model(), tools: { noop },
         prompt: 'start', stopWhen: stepCountIs(10),
-        limits: { maxTokens: 20 },
+        limits: { sideEffectDuplicates: 'warn', maxTokens: 20 },
       }),
     ).rejects.toBeInstanceOf(RunLimitExceededError);
 
@@ -52,7 +55,7 @@ describe('Run limits (cost ceiling + loop detection + fan-out inheritance)', () 
       await runDurable({
         runId: 'r1', journal, model: model(), tools: { noop },
         prompt: 'start', stopWhen: stepCountIs(10),
-        limits: { maxTokens: 20 },
+        limits: { sideEffectDuplicates: 'warn', maxTokens: 20 },
       });
       throw new Error('expected error did not throw');
     } catch (e) {
@@ -65,7 +68,7 @@ describe('Run limits (cost ceiling + loop detection + fan-out inheritance)', () 
     const resumed = await runDurable({
       runId: 'r1', journal, model: model(), tools: { noop },
       prompt: 'start', stopWhen: stepCountIs(10),
-      limits: { maxTokens: 1000 },
+      limits: { sideEffectDuplicates: 'warn', maxTokens: 1000 },
     });
     expect(resumed.text).toContain('Done');
     expect(calls).toEqual(['run', 'run']); // only 1 more time (total 2 — no double run)
@@ -115,7 +118,7 @@ describe('Run limits (cost ceiling + loop detection + fan-out inheritance)', () 
       runDurable({
         runId: 'r3', journal, model, tools: { noop },
         prompt: 'start', stopWhen: stepCountIs(10),
-        limits: { maxToolCalls: 2 },
+        limits: { sideEffectDuplicates: 'warn', maxToolCalls: 2 },
       }),
     ).rejects.toBeInstanceOf(RunLimitExceededError);
     // Only 2 calls (the limit) ACTUALLY ran; the 3rd call was blocked WITHOUT BEING EXECUTED (prospective gate).
@@ -144,7 +147,7 @@ describe('Run limits (cost ceiling + loop detection + fan-out inheritance)', () 
       runDurable({
         runId: 'r4', journal, model, tools: { stuck },
         prompt: 'loop', stopWhen: stepCountIs(20),
-        limits: { loopDetection: { maxRepeats: 3 } },
+        limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 3 } },
       }),
     ).rejects.toBeInstanceOf(ToolLoopDetectedError);
 
@@ -159,7 +162,7 @@ describe('Run limits (cost ceiling + loop detection + fan-out inheritance)', () 
           return toolCallResult('stuck', `call-x-${done + 1}`, {});
         }), tools: { stuck },
         prompt: 'loop', stopWhen: stepCountIs(20),
-        limits: { loopDetection: { maxRepeats: 3 } },
+        limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 3 } },
       });
       throw new Error('expected error did not throw');
     } catch (e) {
@@ -184,7 +187,8 @@ describe('Run limits (cost ceiling + loop detection + fan-out inheritance)', () 
     const res = await runDurable({
       runId: 'r5', journal, model, tools: { stuck },
       prompt: 'loop', stopWhen: stepCountIs(20),
-      // limits was NOT given AT ALL → loop detection off, no maxTokens/maxToolCalls either.
+      // No loop detection, no maxTokens/maxToolCalls — only the duplicate ladder kept at 'warn'.
+      limits: { sideEffectDuplicates: 'warn' },
     });
     expect(res.text).toContain('Done');
     expect(realRuns).toBe(5); // none were blocked

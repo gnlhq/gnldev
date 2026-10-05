@@ -1,11 +1,18 @@
-// P2 "TokenLimiter" — a fuller sibling of `tokenLimit` (safety.ts).
-// `tokenLimit` keeps only the newest messages that fit the budget (simple sliding window); `tokenLimiter`
-// adds a pluggable `countTokens` (same convention as @gnldev/memory's `approxTokens`: char/4 heuristic by
-// default), an explicit oldest-first trim strategy that always protects the system message(s) + the
-// LAST user message, and an 'error' strategy (ProcessorTripwire) for callers who'd rather fail loudly
-// than silently drop context.
+// P2 "TokenLimiter" — the one trim of the processors package; `tokenLimit` (safety.ts) is this with defaults.
+//
+// THE UNIT IS A TURN: a user message and everything after it up to the next user message (the
+// assistant's answer, its tool calls, their results). The CURRENT turn — from the last user message on —
+// is never cut: cut, the model sees a tool result without the question it answers, or the question
+// without the result it asked for, and answers from the part it has. Measured on the per-message trims
+// this replaces: one kept the question and dropped the tool result, the other kept the result and dropped
+// the question, and an older one sent nothing. Older turns are dropped whole, oldest first. When the
+// current turn alone is over the budget nothing can be dropped to make it fit, and the run stops with a
+// ProcessorTripwire that says so, rather than sending the model half a turn.
 import { ProcessorTripwire, recordProcessorReport } from '@gnldev/durable';
+import { messageText } from './message-text.js';
 import type { Processor, ProcessorCtx, ProcessorInput } from '@gnldev/durable';
+import { refuseUnknownNames } from '@gnldev/options';
+import { TOKEN_LIMITER_NAMES } from './option-names.js';
 
 export interface TokenLimiterOptions {
   /** Token budget for the whole input (system + messages). */
@@ -16,7 +23,8 @@ export interface TokenLimiterOptions {
    */
   countTokens?: (text: string) => number;
   /**
-   * 'trim-oldest' (default): drops the oldest non-protected messages until under budget.
+   * 'trim-oldest' (default): drops the oldest turns, whole, until under budget. The current turn (from
+   *   the last user message on) is never dropped; if it alone is over budget, throws `ProcessorTripwire`.
    * 'error': throws `ProcessorTripwire` instead of trimming — the run stops.
    */
   strategy?: 'trim-oldest' | 'error';
@@ -33,32 +41,26 @@ function approxTokens(s: string): number {
   return Math.ceil((s?.length ?? 0) / 4);
 }
 
-function msgText(m: any): string {
-  if (typeof m?.content === 'string') return m.content;
-  if (Array.isArray(m?.content)) {
-    return m.content.filter((p: any) => typeof p?.text === 'string').map((p: any) => p.text).join(' ');
-  }
-  return '';
-}
-
-function lastUserIndex(messages: any[]): number {
-  for (let i = messages.length - 1; i >= 0; i--) if (messages[i]?.role === 'user') return i;
-  return -1;
+/**
+ * Where each turn starts: index 0 (whatever precedes the first user message is a turn of its own) and
+ * every user message. The last start is the current turn.
+ */
+function turnStarts(messages: readonly any[]): number[] {
+  const starts = [0];
+  messages.forEach((m, i) => { if (i > 0 && m?.role === 'user') starts.push(i); });
+  return starts;
 }
 
 /**
- * tokenLimiter — estimates total input tokens (system + messages); over `maxInputTokens`:
- * 'trim-oldest' (default): drops the OLDEST non-protected messages (index 0 = oldest, matching the
- *   convention used by `tokenLimit`/`toolSearch`) one at a time until under budget or no candidates
- *   remain. Protected (NEVER dropped): `role: 'system'` messages (if `keepSystem`, default true) and
- *   the LAST `role: 'user'` message (a run must always keep the request it's actually answering).
- *   `input.system` (the separate system-prompt field) is never trimmed — if it alone exceeds the
- *   budget, trimming messages cannot help; this is a best-effort trim, not a hard guarantee of
- *   staying under budget.
+ * tokenLimiter — estimates total input tokens (`input.system` + messages); over `maxInputTokens`:
+ * 'trim-oldest' (default): drops older turns, whole and oldest first, keeping the newest turns that fit.
+ *   Never dropped: the current turn, `role: 'system'` messages (if `keepSystem`, default true) and
+ *   `input.system`. If what can never be dropped is already over the budget, throws `ProcessorTripwire`.
  * 'error': throws `ProcessorTripwire` (run stops) instead of trimming anything.
  * Deterministic (pure function of the input + countTokens) → no journaling needed.
  */
 export function tokenLimiter(opts: TokenLimiterOptions): Processor {
+  refuseUnknownNames('tokenLimiter', opts, TOKEN_LIMITER_NAMES);
   const countTokens = opts.countTokens ?? approxTokens;
   const strategy = opts.strategy ?? 'trim-oldest';
   const keepSystem = opts.keepSystem ?? true;
@@ -70,7 +72,7 @@ export function tokenLimiter(opts: TokenLimiterOptions): Processor {
     processInput(input: ProcessorInput, ctx: ProcessorCtx) {
       const messages = input.messages ?? [];
       const systemTokens = typeof input.system === 'string' ? countTokens(input.system) : 0;
-      const msgTokens = messages.map((m) => countTokens(msgText(m)));
+      const msgTokens = messages.map((m) => countTokens(messageText(m)));
       const total = systemTokens + msgTokens.reduce((a, b) => a + b, 0);
 
       if (total <= opts.maxInputTokens) return input;
@@ -84,32 +86,38 @@ export function tokenLimiter(opts: TokenLimiterOptions): Processor {
         );
       }
 
-      // 'trim-oldest': system alone over budget → nothing left to trim (input.system is never touched).
-      if (!messages.length) return input;
-
-      const lastUser = lastUserIndex(messages);
-      const protectedIdx = new Set<number>();
-      if (lastUser >= 0) protectedIdx.add(lastUser);
-      if (keepSystem) {
-        messages.forEach((m, i) => { if (m?.role === 'system') protectedIdx.add(i); });
+      // 'trim-oldest', by whole turns. `fixed` is what is never dropped: input.system, kept system
+      // messages, and the current turn.
+      const starts = turnStarts(messages);
+      const current = starts[starts.length - 1]!;
+      const pinned = (i: number) => i >= current || (keepSystem && messages[i]?.role === 'system');
+      const keep = messages.map((_, i) => pinned(i));
+      const fixed = msgTokens.reduce((n, t, i) => (keep[i] ? n + t : n), systemTokens);
+      if (fixed > opts.maxInputTokens) {
+        void recordProcessorReport(ctx, 'token-limiter', 'input', { totalTokens: total, currentTurnTokens: fixed, maxInputTokens: opts.maxInputTokens });
+        throw new ProcessorTripwire(
+          `The current turn alone is ~${fixed} tokens, over the ${opts.maxInputTokens} limit. Nothing older can be dropped to make it fit, and `
+          + 'cutting the turn would show the model a question without its tool result, or a result without its question. '
+          + 'Raise the limit, or have the tool return less.',
+          'token-limiter',
+          { totalTokens: total, currentTurnTokens: fixed, maxInputTokens: opts.maxInputTokens },
+        );
       }
-
-      const keep = new Array(messages.length).fill(true);
-      let remaining = total;
-      let droppedCount = 0;
-      for (let i = 0; i < messages.length && remaining > opts.maxInputTokens; i++) {
-        if (protectedIdx.has(i)) continue;
-        keep[i] = false;
-        remaining -= msgTokens[i]!;
-        droppedCount++;
+      let used = fixed;
+      for (let t = starts.length - 2; t >= 0; t--) {
+        const end = starts[t + 1]!;
+        let cost = 0;
+        for (let i = starts[t]!; i < end; i++) if (!keep[i]) cost += msgTokens[i]!;
+        if (used + cost > opts.maxInputTokens) break; // the turns kept stay contiguous with the current one
+        used += cost;
+        for (let i = starts[t]!; i < end; i++) keep[i] = true;
       }
-
-      if (droppedCount === 0) return input; // everything remaining was protected — nothing droppable
-      const kept = messages.filter((_, i) => keep[i]);
+      const droppedCount = keep.filter((k) => !k).length;
+      if (droppedCount === 0) return input;
       void recordProcessorReport(ctx, 'token-limiter', 'input', {
-        droppedCount, totalTokens: total, remainingTokens: remaining, maxInputTokens: opts.maxInputTokens,
+        droppedCount, totalTokens: total, remainingTokens: used, maxInputTokens: opts.maxInputTokens,
       });
-      return { ...input, messages: kept };
+      return { ...input, messages: messages.filter((_, i) => keep[i]) };
     },
   };
 }

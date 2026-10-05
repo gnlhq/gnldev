@@ -1,10 +1,10 @@
 // The README's quickstart, exactly as written, against the case the README itself calls the
 // dominant real-world duplicate: the model re-plans the same call under a NEW toolCallId.
 //
-// `sideEffect: true` alone does not stop that. The default duplicate policy is `'warn'`
-// (durable-tool.ts: `ctx.limits?.sideEffectDuplicates ?? 'warn'`), which records an incident, warns,
-// and then executes. Stopping it needs either `idempotency: 'args'` on the tool or
-// `limits.sideEffectDuplicates: 'block'` on the run.
+// `sideEffect: true` alone does not run it twice. The default duplicate policy is `'suspend'`
+// (durable-tool.ts DEFAULT_DUP_ACTION): the identical keyless repeat is NOT executed and the run stops
+// for a human — "the same charge again by mistake" and "two charges on purpose" look identical without
+// a key. Making the repeat answer itself needs `idempotency: 'args'` (or an `idempotencyKey`) on the tool.
 //
 // This test exists so the README cannot drift back: if the quickstart's configuration stops being
 // sufficient for its own headline scenario, this fails.
@@ -49,7 +49,21 @@ function chargeTool(extra: Record<string, unknown> = {}) {
 }
 
 describe("the README quickstart's own headline scenario", () => {
-  it('sideEffect alone does NOT stop a re-planned duplicate — it warns and charges again', async () => {
+  it('sideEffect alone does NOT charge a re-planned duplicate — the default asks a human first', async () => {
+    const { chargeCard, charges } = chargeTool();
+    const res = await runDurable({
+      runId: 'dup-suspend',
+      journal: new InMemoryStorage().runs,
+      model: replansTheSameCharge(),
+      tools: { chargeCard },
+      prompt: 'charge it',
+    });
+    expect(charges()).toBe(1);                       // the documented default, made visible
+    expect(res.interrupts).toHaveLength(1);          // the repeat waits for a human
+    expect(res.interrupts[0]).toMatchObject({ toolCallId: 'call-B', toolName: 'chargeCard' });
+  });
+
+  it("'warn' (asked for) is the old permissive answer — it warns and charges again", async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { chargeCard, charges } = chargeTool();
     await runDurable({
@@ -57,9 +71,10 @@ describe("the README quickstart's own headline scenario", () => {
       journal: new InMemoryStorage().runs,
       model: replansTheSameCharge(),
       tools: { chargeCard },
+      limits: { sideEffectDuplicates: 'warn' },
       prompt: 'charge it',
     });
-    expect(charges()).toBe(2);                       // the documented default, made visible
+    expect(charges()).toBe(2);
     expect(warn).toHaveBeenCalled();                 // not silent, but not prevented either
     warn.mockRestore();
   });

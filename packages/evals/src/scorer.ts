@@ -1,5 +1,7 @@
 // Scorer interface + rule-based built-ins (deterministic → same sample, same score).
 
+import { refuseUnknownNames } from '@gnldev/options';
+import { EMBEDDING_SIMILARITY_OPTS_NAMES } from './option-names.js';
 export interface ScoreSample {
   /** The output being scored (usually the agent's final text). */
   output: string;
@@ -120,6 +122,7 @@ export function embeddingSimilarity(
   embed: (text: string) => Promise<number[]>,
   opts?: { threshold?: number },
 ): Scorer {
+  refuseUnknownNames('embeddingSimilarity', opts, EMBEDDING_SIMILARITY_OPTS_NAMES);
   return {
     name: 'embedding-similarity',
     fingerprint: optionsFingerprint('embedding-similarity', { threshold: opts?.threshold }),

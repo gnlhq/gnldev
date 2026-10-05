@@ -5,7 +5,7 @@
   "engines": {
     "node": ">=22.13.0"
   },
-  "description": "Durable background-task queue + worker on @gnldev/durable. Jobs run as durable runs → crash mid-job resumes exactly-once.",
+  "description": "Durable background-task queue + worker on @gnldev/durable. Jobs run as durable runs \u2192 crash mid-job resumes exactly-once.",
   "keywords": [
     "ai",
     "agent",
@@ -43,7 +43,7 @@
   "devDependencies": {
     "@gnldev/durable": "workspace:*"
   },
-  "author": "Karaca Yılmaz (https://gnl.dev)",
+  "author": "Karaca Y\u0131lmaz (https://gnl.dev)",
   "homepage": "https://gnl.dev",
   "bugs": {
     "url": "https://github.com/gnlhq/gnldev/issues"
@@ -55,5 +55,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "@gnldev/options": "workspace:^"
   }
 }

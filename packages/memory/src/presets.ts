@@ -4,11 +4,14 @@
 // `createOmRecallTool`) is ALSO opt-in — neither preset below auto-registers the recall tool in
 // `loadContext`'s `out.tools` the way the WM update tool is, so turning on `observationalMemory` here does
 // not silently hand the model a new tool. Callers who want it wire `createOmRecallTool` themselves.
+import { storageOf } from '@gnldev/durable';
 import type { Storage } from '@gnldev/durable';
 import type { Embed } from './keys.js';
 import { AgentMemory } from './agent-memory.js';
 import type { WorkingMemoryConfig } from './working-memory.js';
 import type { ObservationalMemoryConfig } from './observational.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { MEMORY_PRESET_NAMES, refuseMemoryBagNames } from './option-names.js';
 
 /**
  * Deterministic, dependency-free embed (token-hash → fixed size, L2-normalized → compatible with cosineSimilarity).
@@ -55,7 +58,10 @@ export interface MemoryPresetOptions {
  * Pre-configured AgentMemory (sensible defaults). `chat`: last 10 messages, no recall.
  * `recall`: last 8 messages + resource-scope recall (defaultEmbed). Does not touch the constructor.
  */
-export function memoryPreset(storage: Storage, kind: MemoryPresetKind = 'recall', opts: MemoryPresetOptions = {}): AgentMemory {
+export function memoryPreset(storageArg: Storage, kind: MemoryPresetKind = 'recall', opts: MemoryPresetOptions = {}): AgentMemory {
+  refuseUnknownNames('memoryPreset', opts, MEMORY_PRESET_NAMES);
+  refuseMemoryBagNames('memoryPreset', opts);
+  const storage = storageOf(storageArg, 'memoryPreset');
   // The old spelling is REFUSED, not quietly accepted. An alias would leave the collision in place in
   // every project that already wrote it, which is the whole thing the rename is undoing; and because
   // this argument is read once at wiring time, the refusal lands while someone is looking at the file

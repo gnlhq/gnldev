@@ -15,6 +15,9 @@ import { createMockModel, countToolResults, toolCallResult, finalTextResult } fr
 /** Did the conversation already carry a reflection nudge back to the model? */
 const sawNudge = (prompt: any[]) => JSON.stringify(prompt ?? []).includes('__gnl_reflected');
 
+// The default duplicate ladder is now 'suspend': an undeclared tool repeated with identical arguments
+// would be asked about before loop detection is ever reached. These tests isolate loop detection, so
+// every run here keeps the duplicate ladder at 'warn'.
 const makeStuck = (counter: { runs: number }) =>
   tool({
     description: 'tool that always does the same work',
@@ -39,7 +42,7 @@ describe('loop reflection (onRepeat: "reflect")', () => {
     const res = await runDurable({
       runId: 'refl-1', journal, model, tools: { stuck: makeStuck(counter) },
       prompt: 'loop', stopWhen: stepCountIs(20),
-      limits: { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+      limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
     });
 
     expect(res.text).toBe('Recovered.'); // the run did NOT stop — the nudge steered the model out
@@ -64,7 +67,7 @@ describe('loop reflection (onRepeat: "reflect")', () => {
       await runDurable({
         runId: 'refl-2', journal, model, tools: { stuck: makeStuck(counter) },
         prompt: 'loop', stopWhen: stepCountIs(20),
-        limits: { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+        limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
       });
       throw new Error('expected error did not throw');
     } catch (e) {
@@ -94,7 +97,7 @@ describe('loop reflection (onRepeat: "reflect")', () => {
     const res = await runDurable({
       runId: 'refl-3', journal, model, tools: { stuck: makeStuck(counter) },
       prompt: 'loop', stopWhen: stepCountIs(20),
-      limits: { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
+      limits: { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' } },
     });
 
     expect(res.text).toBe('Done.');
@@ -110,7 +113,7 @@ describe('loop reflection (onRepeat: "reflect")', () => {
       const done = countToolResults(prompt);
       return toolCallResult('stuck', `call-${done + 1}`, {});
     });
-    const limits = { loopDetection: { maxRepeats: 2, onRepeat: 'reflect' as const } };
+    const limits = { sideEffectDuplicates: 'warn', loopDetection: { maxRepeats: 2, onRepeat: 'reflect' as const } };
 
     const first = await runDurable({
       runId: 'refl-4', journal, model: model(), tools: { stuck: makeStuck(counter) },

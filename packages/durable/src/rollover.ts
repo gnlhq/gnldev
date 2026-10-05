@@ -36,6 +36,8 @@ import { runOwnerOf, claimRunOwner, UNKNOWN } from './run-identity.js';
 import { reconstructState } from './time-travel.js';
 import type { ReconstructSeed } from './time-travel.js';
 import type { Journal, JournalReader } from './journal.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { ROLLOVER_NAMES } from './option-names.js';
 
 export interface RolloverOptions {
   /**
@@ -180,6 +182,7 @@ export function toModelMessages(raw: unknown[]): unknown[] {
  * suspended tool works structurally but is not recommended — do the handoff at period close (when nothing is suspended).
  */
 export async function rolloverRun(journal: Journal, runId: string, opts?: RolloverOptions): Promise<RolloverResult> {
+  refuseUnknownNames('rolloverRun', opts, ROLLOVER_NAMES);
   const readRun = (journal as Partial<JournalReader>).readRun;
   if (typeof readRun !== 'function') {
     throw new Error(
@@ -218,6 +221,7 @@ export async function rolloverRun(journal: Journal, runId: string, opts?: Rollov
         agent?: string;
         workKey?: string;
         workScope?: WorkScope;
+        origin?: string;
       }
     >(runKeys.input(runId)),
     runKeys.input(runId),
@@ -268,6 +272,8 @@ export async function rolloverRun(journal: Journal, runId: string, opts?: Rollov
     ...(oldInput?.agent !== undefined ? { agent: oldInput.agent } : {}),
     ...(oldInput?.workKey !== undefined ? { workKey: oldInput.workKey } : {}),
     ...(oldInput?.workScope !== undefined ? { workScope: oldInput.workScope } : {}),
+    // Who supplied the input travels too: the next period continues the same input.
+    ...(oldInput?.origin !== undefined ? { origin: oldInput.origin } : {}),
   };
   // Born through the one start point (claimRunOwner): the owner is the SOURCE's, ownerless included.
   // First write wins; the loser of a race reports the winner's seed.

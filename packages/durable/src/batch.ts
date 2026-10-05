@@ -37,6 +37,8 @@ import { readXid, xidPlanOf, xidWhen, amountsDifferOf } from './xid.js';
 import { identityUnusableReason } from './semantic-dup.js';
 import { BatchPlanMismatchError } from './errors.js';
 import type { AnyTool } from './types.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { CREATE_BATCH_NAMES } from './option-names.js';
 
 export interface BatchConfig {
   /** Koşulacak araç — TÜM durable beyanlarıyla (sideEffect/recover/confirm/semanticIdentity/effectClass). */
@@ -138,6 +140,7 @@ function classify(out: unknown, replayed: boolean): { outcome: BatchItemOutcome;
 }
 
 export function createBatch(journal: Journal, cfg: BatchConfig) {
+  refuseUnknownNames('createBatch', cfg, CREATE_BATCH_NAMES);
   if (cfg.caller && cfg.resourceId !== undefined && userIdOf(cfg.caller) !== cfg.resourceId) {
     throw new Error('@gnldev/durable: batch was given both `caller` and a different `resourceId` — one owner per batch.');
   }

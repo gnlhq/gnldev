@@ -1,4 +1,4 @@
-import { childIdentity, identityOf, type RunIdentity } from './run-identity.js';
+import { childIdentity, identityOf, requestOf, type RunIdentity } from './run-identity.js';
 import { nestedAgentRunId } from './journal.js';
 import { tool, stepCountIs } from 'ai';
 import type { Tool } from 'ai';
@@ -7,8 +7,12 @@ import { runDurable } from './run.js';
 import { readRunTaint, markRunTainted } from './taint.js';
 import type { Journal } from './journal.js';
 import type { Guard, Interrupt } from './guard.js';
+import { addressedInterrupt as addressed, approvalsForChild } from './guard.js';
 import type { ModelInput, ToolSet } from './types.js';
 import type { RunLimits } from './limits.js';
+import { registerSubRun } from './limits.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { AGENT_TOOL_NAMES, REMOVED_AGENT_TOOL_NAMES, refuseRunLimitNames, AGENT_TOOL_OPTS_NAMES } from './option-names.js';
 
 /**
  * carry taint across the sub-agent runId boundary. Taint is keyed per-run, so a nested run
@@ -48,7 +52,7 @@ export interface AgentToolConfig {
   limits?: RunLimits;
   /**
    * WHOSE work the delegation is is NOT configured here: the nested run takes the caller of the
-   * run that called it — `options.gnl` for agent-as-tool, the `parent` argument of `runSubAgent` for a
+   * run that called it — `options.gnl` for agent-as-tool, the delegation frame (`ChildFrame`) for a
    * network. A sub-agent is the same request, one frame deeper; a static owner here was how a tool
    * built once at startup ran every user's delegation as nobody.
    */
@@ -66,149 +70,184 @@ export interface AgentToolConfig {
    * The runId of the parent that spawned this sub-agent. When the parent is tainted, its taint
    * is carried into the nested run so the sub-agent's side effects go through the SAME `taintedSideEffects`
    * ladder. The agent-as-tool path (`createAgentTool`) reads this per-call from `options.parentRunId`; the
-   * network path (`runNetwork` → `runSubAgent`) passes the router's runId here.
+   * network path (`runNetwork`, registry.ts) passes the router's runId in the frame.
    */
   parentRunId?: string;
 }
 
+/** What a delegation hands its child run: whom it runs for, what can stop it, which decisions came with it. */
+export interface ChildFrame {
+  /** The caller of the run that delegated, one frame deeper (`childIdentity`). */
+  identity: RunIdentity;
+  /** The delegating run — taint crosses to and from it. */
+  parentRunId?: string;
+  /** The delegating run's cancellation: aborting the parent stops the child. */
+  abortSignal?: AbortSignal;
+  /** require-approval decisions that came down with the delegation (a resume of a suspended child). */
+  approvals?: Record<string, boolean>;
+}
+
+/** Runs one child: the engine's own agent run for a registered agent, runDurable for a host-built one. */
+export type RunChild = (task: string, nestedRunId: string, frame: ChildFrame) => Promise<{ text: string; interrupts: Interrupt[]; steps?: readonly unknown[] }>;
+
 /**
- * The SINGLE source of sub-agent call semantics: run durably under the nested runId, return {text, interrupts}.
- * BOTH `createAgentTool` (static agent-as-tool) AND the registry's `runNetwork` (dynamic network) call
- * THIS — model resolution / maxSteps default / limits inheritance live in one place, the paths cannot silently diverge.
+ * What a delegation returns to the parent's model. `status` is read from the child's tool outcomes, not
+ * from its prose: the same agent run directly would have seen each failed call as a failed call, and a
+ * parent must be able to branch on it the same way.
+ *  - 'suspended': the child waits for a human (`interrupts`, addressed `<delegation call>/<child call>`).
+ *  - 'failed': at least one tool's LAST call in the child failed, was blocked, or was refused (`failed`).
+ *  - 'completed': every tool the child called ended in a result.
  */
-export async function runSubAgent(
-  config: AgentToolConfig,
-  task: string,
-  nestedRunId: string,
-  parent: RunIdentity,
-): Promise<{ text: string; interrupts: Interrupt[] }> {
-  const model = typeof config.model === 'function' ? await config.model(nestedRunId) : config.model;
-  // Carry the parent's taint into the nested run BEFORE it executes any tools.
-  await inheritParentTaint(config.journal, config.parentRunId, nestedRunId);
-  const res = await runDurable({
-    runId: nestedRunId,
-    journal: config.journal,
-    model,
-    tools: config.tools,
-    system: config.system,
-    guard: config.guard,
-    approvals: config.approvals,
-    prompt: task,
-    stopWhen: stepCountIs(config.maxSteps ?? 8),
-    limits: config.limits,
-    // The child's caller IS the parent's (one value, typed, required by this signature).
-    caller: childIdentity(parent, nestedRunId),
-    ...(parent.threadId ? { threadId: parent.threadId } : {}),
-    ...(config.actor ? { actor: config.actor } : {}),
-    ...(config.channel ? { channel: config.channel } : {}),
-    ...(config.toolPolicy ? { toolPolicy: config.toolPolicy } : {}),
-  } as any);
-  return { text: res.text, interrupts: res.interrupts };
+export interface DelegationResult {
+  status: 'completed' | 'failed' | 'suspended';
+  text: string;
+  interrupts: Interrupt[];
+  failed?: Array<{ tool: string; kind: 'error' | 'blocked' | 'denied'; message: string }>;
 }
 
 /**
- * Turns a sub-agent into an AI SDK tool → "agent-as-tool" for multi-agent setups.
- * Its execute runs a nested `runDurable` (nested runId = `agent:${toolCallId}`, the SAME journal).
- *
- * **Moat synergy (two levels of durability):** When used inside a parent `runDurable`, the parent's
- * `durableTool` memoizes this agent-tool's result → the ENTIRE sub-agent is SKIPPED on a parent resume
- * (exactly-once handoff). If the sub-agent crashes midway, it resumes from its own journal.
+ * A finished child's outcome, read from its tool outcomes — the agent-as-tool result and a network step
+ * both carry it, so a parent and a router branch on the same facts.
  */
-export function createAgentTool(
-  config: AgentToolConfig,
-  opts?: { description?: string },
-// The return type is DECLARED, not inferred. Left to inference, TypeScript emits a .d.ts that names
-// a pnpm-internal path inside @ai-sdk/provider-utils — a package we do not declare and should not
-// have to (TS2742). Naming the contract in types reachable through `ai`, the peer we already
-// require, keeps our published surface ours and our dependency list honest.
-): Tool<{ task: string }, { text: string; interrupts: Interrupt[] }> & { idempotent: boolean } {
-  // H7: the nested run is ITSELF durable → a repeated call replays from its own journal, produces
-  // no side effect → idempotent (smooth resume without getting stuck at the crash-window gate).
+export function childOutcome(steps: readonly unknown[] | undefined): { status: 'completed' | 'failed'; failed?: DelegationResult['failed'] } {
+  const failed = failedCalls(steps);
+  return { status: failed.length ? 'failed' : 'completed', ...(failed.length ? { failed } : {}) };
+}
+
+/** The child's failed calls: per tool, its last outcome — a failure followed by a success of the same tool is not one. */
+function failedCalls(steps: readonly unknown[] | undefined): NonNullable<DelegationResult['failed']> {
+  const last = new Map<string, { tool: string; kind: 'error' | 'blocked' | 'denied'; message: string } | null>();
+  for (const step of steps ?? []) {
+    for (const part of ((step as { content?: unknown[] }).content ?? []) as Array<Record<string, any>>) {
+      if (part.type === 'tool-error') {
+        last.set(part.toolName, { tool: part.toolName, kind: 'error', message: String(part.error?.message ?? part.error).slice(0, 300) });
+      } else if (part.type === 'tool-result') {
+        const out = part.output as Record<string, any> | undefined;
+        const block = out?.__gnl_blocked ?? out?.__gnl_limit_exceeded;
+        if (block) last.set(part.toolName, { tool: part.toolName, kind: 'blocked', message: String(block.message ?? block.code ?? 'blocked').slice(0, 300) });
+        else if (out?.__denied) last.set(part.toolName, { tool: part.toolName, kind: 'denied', message: String(out.reason ?? 'denied').slice(0, 300) });
+        else last.set(part.toolName, null);
+      }
+    }
+  }
+  return [...last.values()].filter((f): f is NonNullable<typeof f> => f !== null);
+}
+
+
+/**
+ * Taint across the delegation boundary, both ways, around one child run. Down: a tainted parent's child
+ * starts tainted, so its side effects meet the same `taintedSideEffects` ladder. Up: content the child
+ * read taints the parent too — otherwise the parent acting on what the child brought back (a payment
+ * after the child read a web page) skipped the ladder (measured: the payment ran).
+ */
+export async function runDelegated<R>(journal: Journal, parentRunId: string | undefined, nestedRunId: string, requestRunId: string, run: () => Promise<R>): Promise<R> {
+  // The child's work is the request's work from its first step: the parent's budget sees it in flight.
+  if (parentRunId) await registerSubRun(journal, parentRunId, nestedRunId, requestRunId);
+  await inheritParentTaint(journal, parentRunId, nestedRunId);
+  try {
+    return await run();
+  } finally {
+    // A child that read untrusted content and then failed still read it.
+    await raiseChildTaint(journal, nestedRunId, parentRunId);
+  }
+}
+
+async function raiseChildTaint(journal: Journal, childRunId: string, parentRunId: string | undefined): Promise<void> {
+  if (!parentRunId) return;
+  const t = await readRunTaint(journal, childRunId);
+  if (!t) return;
+  await markRunTainted(journal, parentRunId, {
+    toolCallId: t.toolCallId,
+    toolName: t.toolName,
+    source: t.source,
+    reason: `raised by sub-agent run '${childRunId}'${t.reason ? `: ${t.reason}` : ''}`,
+  });
+}
+
+/**
+ * The agent-as-tool contract, written once: the nested runId, the child's identity, taint both ways,
+ * the parent's cancellation, and a suspended child surfacing as the parent's question. What RUNS the
+ * child is the caller's: the engine hands its own agent run (every protection a direct run has), a host
+ * building a sub-agent from parts hands runDurable.
+ */
+export function delegationTool(
+  description: string,
+  journal: Journal,
+  runChild: RunChild,
+  base: { parentRunId?: string; approvals?: Record<string, boolean>; agent?: string } = {},
+): Tool<{ task: string }, DelegationResult> & { idempotent: boolean; delegation: true } {
   return Object.assign(tool({
-    description: opts?.description ?? 'Delegate a task to an expert sub-agent',
+    description,
     inputSchema: z.object({ task: z.string().describe('the task/question to give the sub-agent') }),
     execute: async ({ task }, options: any) => {
-      // Ebeveynin insan cevapları — durable-tool bunları `gnlApprovals` olarak iletiyor. Bu satır
-      // olmadan alt koşum bir insan kapısında sonsuza dek askıda kalırdı: soru sorulur, cevap
-      // ebeveyne verilir, çocuğa hiç ulaşmaz.
-      //
-      // `gnlApprovals` ARTIK EBEVEYNİN TÜM HARİTASI DEĞİL: durable-tool onu bu çağrının kayıtlı
-      // sentinel'indeki çocuk soru kimlikleriyle sınırlıyor (bkz. nestedApprovalsFor). Sebep
-      // ölçülebilir bir çakışma: ardışık id üreten sağlayıcılarda ('call_0', 'call_1'…) iki koşumun
-      // id uzayı aynıdır, ve ebeveynin KENDİ bir çağrısına verilmiş "evet" çocuğun bambaşka bir
-      // insan-kapılı çağrısını sessizce açabiliyordu. `config.approvals` — host'un bu alt ajan için
-      // AÇIKÇA yapılandırdığı onaylar — sınırlamanın dışında; oradaki niyet zaten çocuğa aittir.
-      const inheritedApprovals = { ...(config.approvals ?? {}), ...(options?.gnlApprovals ?? {}) };
-      // Scope the sub-agent's run to its PARENT — see nestedAgentRunId for why, and for why this
-      // must stay derivable from (parentRunId, toolCallId) alone. network.ts has always keyed on
-      // the parent (`net:${runId}:${i}`); this is the same shape.
-      const parentRunId = config.parentRunId ?? options?.parentRunId;
+      const approvals = { ...approvalsForChild(options?.toolCallId, base.approvals), ...(options?.gnlApprovals ?? {}) };
+      const parentRunId = base.parentRunId ?? options?.parentRunId;
       const nestedRunId = nestedAgentRunId(parentRunId, options?.toolCallId);
-      const model = typeof config.model === 'function' ? await config.model(nestedRunId) : config.model;
-      // The parent runId is injected into the tool's execute options by durable-tool.ts. If the
-      // parent is tainted, carry that taint into the nested run before it runs any side-effect tool.
-      await inheritParentTaint(config.journal, parentRunId, nestedRunId);
-      const res = await runDurable({
-        runId: nestedRunId,
-        journal: config.journal,
-        model,
-        tools: config.tools,
-        system: config.system,
-        guard: config.guard,
-        prompt: task,
-        stopWhen: stepCountIs(config.maxSteps ?? 8),
-        limits: config.limits,
-        approvals: inheritedApprovals,
-        // Aynı devir, agent-as-tool yolunda. (Yukarıdaki kardeşiyle tek fark nestedRunId'nin nereden
-        // geldiği; kimlik açısından ikisi de aynı isteğin bir kare derinidir.)
-        //
-        // The PARENT's identity, as durable-tool hands it over (`options.gnl`). Called by hand without
-        // it, the child is `unknown` — closed, never open.
-        caller: childIdentity(identityOf(options), nestedRunId),
-        ...(identityOf(options).threadId ? { threadId: identityOf(options).threadId } : {}),
-        ...(config.actor ? { actor: config.actor } : {}),
-        ...(config.channel ? { channel: config.channel } : {}),
-        ...(config.toolPolicy ? { toolPolicy: config.toolPolicy } : {}),
-      } as any);
-      // ÇOCUĞUN SORUSU EBEVEYNE ÇIKAR.
-      //
-      // Alt koşum bir insan kapısına çarptığında (confirm/guard/duplicate/semantic/taint) askıya
-      // giriyor — ama ebeveyn bunu görmüyordu: `interrupts` sıradan bir araç çıktısı olarak dönüyor,
-      // `hasSuspend` ise yalnız `__gnl_suspend` arıyor. Sonuç ölçüldü: ebeveyn `completed`,
-      // `interrupts: []`, çocuk ise `suspended`. Yani insan kapısı çalıştı ve İNSANA ULAŞMADI —
-      // "son söz insanda" vaadinin sessizce boşa çıktığı hâl.
-      //
-      // Sentinel ebeveynin KENDİ toolCallId'siyle üretiliyor (askı mekanizması onunla anahtarlanır),
-      // ama soruyu doğuran ÇOCUK çağrıları `nested` alanında duruyor: cevap veren kişi neyi
-      // onayladığını görebilmeli, ve onay o çağrı kimlikleriyle geri gelecek (tek harita, ayrı
-      // eşleme yok — bkz. gnlApprovals).
-      if (res.interrupts?.length) {
-        const first = res.interrupts[0]!;
+      const identity = childIdentity(identityOf(options), nestedRunId);
+      const res = await runDelegated(journal, parentRunId, nestedRunId, requestOf(identity), () =>
+        runChild(task, nestedRunId, { identity, ...(parentRunId ? { parentRunId } : {}), ...(options?.abortSignal ? { abortSignal: options.abortSignal } : {}), approvals }));
+      const interrupts = (res.interrupts ?? []).map((i) => addressed(options?.toolCallId, i));
+      if (interrupts.length) {
+        const first = interrupts[0]!;
         return {
+          status: 'suspended',
           text: res.text,
-          interrupts: res.interrupts,
+          interrupts,
           __gnl_suspend: {
             toolCallId: options?.toolCallId,
             toolName: 'agent',
             args: { task },
             kind: 'nested',
             reason:
-              `A delegated sub-agent stopped for a human: ${first.reason ?? 'approval required'} ` +
-              `(nested run '${nestedRunId}', ${res.interrupts.length} pending). Answer with the nested toolCallId(s).`,
-            // Çocuğun interrupt'ları TAM hâliyle saklanıyor (`args`/`semPair` dahil): run.ts bu
-            // listeden yüzeye çıkan soruyu kuruyor, ve insan neyi onayladığını görebilmeli —
-            // kırpılmış bir kayıt "bir alt ajan durdu" bildirimine geri döner. Aynı liste askı
-            // kolunun tek karar kaynağı (bkz. durable-tool `nestedAnswered`) ve ebeveynin onay
-            // haritasından çocuğa NEYİN inebileceğini de bu liste sınırlıyor.
-            nested: { runId: nestedRunId, interrupts: res.interrupts.map((i) => ({ toolCallId: i.toolCallId, toolName: i.toolName, args: i.args, reason: i.reason, ...(i.semPair ? { semPair: i.semPair } : {}) })) },
+              `The ${base.agent ? `'${base.agent}' ` : ''}sub-agent stopped for a human: ${first.reason ?? 'approval required'}` +
+              `${interrupts.length > 1 ? ` (${interrupts.length} questions)` : ''}. Answer with the addressed toolCallId(s).`,
+            // The child's interrupts are kept WHOLE (`args`/`semPair` included): run.ts builds the
+            // surfaced question from this list, and a human must see what they approve. The same list
+            // is the suspend arm's only source of truth (durable-tool `nestedAnswered`) and bounds what
+            // may come down from the parent's approval map.
+            nested: { runId: nestedRunId, ...(base.agent ? { agent: base.agent } : {}), interrupts: interrupts.map((i) => ({ toolCallId: i.toolCallId, toolName: i.toolName, args: i.args, reason: i.reason, ...(i.semPair ? { semPair: i.semPair } : {}), ...(i.delegatedTo ? { delegatedTo: i.delegatedTo } : {}) })) },
           },
         } as any;
       }
-      return { text: res.text, interrupts: res.interrupts };
+      return { ...childOutcome(res.steps), text: res.text, interrupts: [] };
     },
-    // `idempotent` KALDIRILDI değil, KOŞULLU: alt koşum kendi journal'ından replay ettiği için
-    // tekrar çağrı yan etki üretmiyor — bu doğru. Ama askı hâlinde ebeveynin kaydı 'suspended'
-    // olur ve onay geldiğinde durable-tool'un askı kolu yeniden çalıştırır; idempotent bayrağı o
-    // kolu engellemiyor (o, çökme-penceresi kapısı için).
-  }), { idempotent: true });
+    // Idempotent because the child replays from its own journal; a suspended child is re-run by
+    // durable-tool's suspend arm when the approval arrives.
+  }), { idempotent: true, delegation: true as const });
+}
+
+/**
+ * A sub-agent a host builds from parts, without createGnl. It runs through runDurable with what the
+ * config gives it; a registered agent's sub-agents run through the engine instead (registry.ts), with
+ * every protection of a direct run.
+ */
+export function createAgentTool(
+  config: AgentToolConfig,
+  opts?: { description?: string },
+): Tool<{ task: string }, DelegationResult> & { idempotent: boolean; delegation: true } {
+  refuseUnknownNames('createAgentTool', config, AGENT_TOOL_NAMES, REMOVED_AGENT_TOOL_NAMES);
+  refuseUnknownNames('createAgentTool', opts, AGENT_TOOL_OPTS_NAMES);
+  refuseRunLimitNames('createAgentTool: limits', config.limits);
+  return delegationTool(opts?.description ?? 'Delegate a task to an expert sub-agent', config.journal, async (task, nestedRunId, frame) => {
+    const model = typeof config.model === 'function' ? await config.model(nestedRunId) : config.model;
+    const res = await runDurable({
+      runId: nestedRunId,
+      journal: config.journal,
+      model,
+      tools: config.tools,
+      system: config.system,
+      guard: config.guard,
+      prompt: task,
+      stopWhen: stepCountIs(config.maxSteps ?? 8),
+      limits: config.limits,
+      approvals: frame.approvals,
+      caller: frame.identity,
+      ...(frame.identity.threadId ? { threadId: frame.identity.threadId } : {}),
+      ...(frame.abortSignal ? { abortSignal: frame.abortSignal } : {}),
+      ...(config.actor ? { actor: config.actor } : {}),
+      ...(config.channel ? { channel: config.channel } : {}),
+      ...(config.toolPolicy ? { toolPolicy: config.toolPolicy } : {}),
+    } as any);
+    return { text: res.text, interrupts: res.interrupts, steps: res.steps };
+  }, { ...(config.parentRunId ? { parentRunId: config.parentRunId } : {}), ...(config.approvals ? { approvals: config.approvals } : {}) });
 }

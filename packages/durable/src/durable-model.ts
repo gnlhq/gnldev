@@ -1,4 +1,5 @@
 import { wrapLanguageModel, simulateReadableStream } from 'ai';
+import { requestOf } from './run-identity.js';
 import type { LanguageModelV4, LanguageModelV4CallOptions, LanguageModelV4Middleware } from '@ai-sdk/provider';
 import { argsHash } from './hash.js';
 import { claim, ctxGet, runKeys } from './journal.js';
@@ -9,6 +10,8 @@ import { RunBusyError } from './errors.js';
 import { withTimeout } from './timeout.js';
 import type { DurableCtx } from './journal.js';
 import type { JournalReader } from './journal.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { DURABLE_MODEL_NAMES, EXCLUSIVE_STEP_NAMES } from './option-names.js';
 
 /**
  * Wraps the model: RECORDS every LLM response into the journal keyed by (runId, stepIndex);
@@ -277,6 +280,8 @@ function assertReplayEntryPoint(hit: unknown, expected: 'generate' | 'stream', k
 }
 
 export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?: DurableModelOptions): LanguageModelV4 {
+  refuseUnknownNames('withDurableModel', opts, DURABLE_MODEL_NAMES);
+  refuseUnknownNames('withDurableModel: exclusiveStep', opts?.exclusiveStep, EXCLUSIVE_STEP_NAMES);
   let step = 0;
   const middleware: LanguageModelV4Middleware = {
     specificationVersion: 'v4',
@@ -299,7 +304,7 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
         // repeatedly without the limit CHANGING, it re-throws IMMEDIATELY at the SAME step (progress
         // does NOT LEAK); deterministic (same result) since the journal did NOT CHANGE. If the limit
         // is raised, this point is passed through.
-        if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits);
+        if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId);
         return hit as Awaited<ReturnType<typeof doGenerate>>;
       }
 
@@ -317,6 +322,8 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       // spend). A run canceled from anywhere (server ?durable=true, cancelAgentRun) stops here at its
       // next model-step boundary regardless of which worker is executing it.
       await assertNotCanceled(ctx.journal, ctx.runId);
+      // A new step spends budget: none left (the request's — a sibling may have used it), no step.
+      if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId, 'before');
       await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
       let result: Awaited<ReturnType<typeof doGenerate>>;
       try {
@@ -336,7 +343,7 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       // Checked AFTER the step is SUCCESSFULLY journaled (journal is already consistent) —
       // RunLimitExceededError is thrown from here on breach; since it's OUTSIDE the try/catch, it does
       // NOT MARK the claim as 'failed' (the step genuinely succeeded, only the run's CONTINUATION is being stopped).
-      if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits);
+      if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId);
       return result;
     },
     // Streaming: record/replay stream chunks (reconstruct with simulateReadableStream).
@@ -355,7 +362,7 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
         await warnOnModelDivergence(ctx, claimKey, key, reqHash, 'model stream step');
         step++;
         // SAME replay-recheck as generate (see wrapGenerate) — does not leak progress.
-        if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits);
+        if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId);
         return {
           stream: simulateReadableStream({ chunks: completeIfTruncated(hit), initialDelayInMs: 0, chunkDelayInMs: 0 }),
           ...hit.rest,
@@ -368,6 +375,8 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       // spend). A run canceled from anywhere (server ?durable=true, cancelAgentRun) stops here at its
       // next model-step boundary regardless of which worker is executing it.
       await assertNotCanceled(ctx.journal, ctx.runId);
+      // A new step spends budget: none left (the request's — a sibling may have used it), no step.
+      if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId, 'before');
       await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
       let result: Awaited<ReturnType<typeof doStream>>;
       try {
@@ -446,7 +455,7 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
           await ctx.journal.put(runKeys.model(ctx.runId, myStep), stampFormat({ parts, rest })); // H13
           await ctx.journal.put(claimKey, { status: 'succeeded', startedAt: Date.now(), reqHash });
           // SAME post-hoc check as generate (see wrapGenerate) — the step is already journaled.
-          if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits);
+          if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId);
         },
       });
       return { stream: (stream as any).pipeThrough(recorder), ...rest } as any;

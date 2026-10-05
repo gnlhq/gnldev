@@ -26,8 +26,11 @@ const vec = await cache.getOrCompute({ text: 'hello' }, () => embed('hello'));
 ```
 
 ## API
-- `createCache(store: CacheStore, namespace = 'default', opts?: { onError?(op, err) }) → Cache`
-  — the first argument is a **`CacheStore`** (`storage.cache`), not a journal.
+- `createCache(store: CacheStore | Storage, namespace = 'default', opts?: { onError?(op, err) }) → Cache`
+  — pass the storage (its `cache` port is used) or `storage.cache`. Anything that cannot hold a value is
+  refused here, not at the first call: a run journal (`storage.runs`) or an object without
+  `get`/`set`/`delete` throws a `TypeError` naming what is missing, and a storage with no cache port
+  throws `CapabilityError`. Best-effort covers a store that is *down*, not one that is *wrong*.
 - `cache.get(key)` · `cache.set(key, value, opts?)` · `cache.getOrCompute(key, compute, opts?)`
   — the trailing `opts` is `{ ttlMs? }`, honoured by stores whose capability is `'ttl'`
   (SQLite/Postgres/Redis; `InMemory` is `'full'`).
@@ -41,6 +44,20 @@ Studio's Cache view is a wrapper over these last two (`packages/studio/src/serve
 
 `key` can be any value (hashed stably with `argsHash`). Values are wrapped as `{ v }` before storing,
 which is how a cached `undefined` stays distinguishable from a miss.
+
+## Concurrent misses (single-flight)
+Callers that miss the same key at the same time share **one** `compute()`: 10 concurrent
+`getOrCompute('k', embed)` calls run `embed` once and all receive its value. If that compute rejects,
+every caller that joined it gets the same rejection, nothing is stored, and the next call computes again.
+`stats().misses` counts computes; a caller that joined one counts as a hit. Every caller gets its own
+copy — the one the store hands out, as on a hit — so what one caller does to its value no other sees. An
+`invalidate(key)` drops the compute in flight: a call after it computes again, and the value the earlier
+compute returns is not stored.
+
+The guarantee is **per process** (per store object, across every `createCache` over it). The `CacheStore`
+port has no atomic claim, so two processes or workers sharing one database each compute once, then read
+each other's value afterwards. A slow compute is not cut short by `ttlMs`; the TTL starts when the value
+is written.
 
 ## How it works
 The content-hash key is independent of the run id, so the cache outlives a single run's lifetime. It's

@@ -38,7 +38,7 @@ await consumer.poll();   // or consumer.start()
   and `meta` is read from that id. A payload that carries its own "owner" field — a forwarded webhook,
   say — is delivered as bytes, never read as someone's. A system `id` or a topic cannot start with the
   owned-name marker (`~o~`), so no caller can spell one either.
-- `createConsumer(work, topic, handler, { name, pollMs?, backoff?, maxPollMs?, maxAttempts?, retryDelayMs? }) → { poll, start, stop }`
+- `createConsumer(work, topic, handler, { name, pollMs?, backoff?, maxPollMs?, maxAttempts?, retryDelayMs?, leaseMs?, maxHoldMs? }) → { poll, start, stop }`
   — `name` is required to separate fan-out acks; `maxAttempts`/`retryDelayMs` govern the dead-letter below.
 - `eventEraser(work)` erases one person's events on every topic, with every consumer's ack, attempt and
   dead-letter marker for them, without knowing a topic or consumer name. Pass it to `eraseSubject` from
@@ -95,8 +95,20 @@ its own layer, which is the load-bearing repair; the topic is escaped here as we
 implement it, and an escaped namespace is self-disambiguating under any implementation.
 
 ## Retries + dead-letter (`maxAttempts`, `retryDelayMs`)
-A handler that keeps throwing is retried on a spaced-out schedule, and after `maxAttempts` failed
-attempts the event is **quarantined** (dead-lettered) for that consumer instead of retried forever.
+A handler that keeps throwing is retried on a spaced-out schedule, and after `maxAttempts` attempts the
+event is **quarantined** (dead-lettered) for that consumer instead of retried forever.
+
+**An attempt is counted when it starts**, so one the process died in counts too: a handler that takes its
+process down every time (an out-of-memory, a kill) is quarantined after `maxAttempts` starts with "the
+event did not finish in N attempts", not started forever. `attempts` in `listDeadEvents` counts attempts
+started. While a handler runs, the event is **held** for `leaseMs` (default 5 minutes) and a heartbeat
+renews the hold every `leaseMs / 3`: no other poll under the same consumer name — another process, a 0.9
+consumer included — hands it out meanwhile, and a slow handler is not taken for a dead one. When a
+process dies the event waits out the hold, then its next start counts. `maxHoldMs` (default: no limit)
+caps how long one attempt may be held, so a handler that hangs in a live process is eventually
+quarantined; a handler that legitimately runs longer than it is started again — set it well above the
+slowest handler. Two processes that start an event's very first attempt at the same moment may both
+run it (no create-if-absent in the store); delivery is at-least-once either way.
 
 - `maxAttempts` (default **8**) — the same `qatt → qfail` dead-letter shape as
   [@gnldev/queue](../queue/README.md)'s `maxAttempts`, here `evtatt → evtdead`. `Infinity` disables

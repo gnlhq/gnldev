@@ -11,9 +11,11 @@
 // a plain `Workflow` map) actually knows how to call `runResumable` again for that run.
 import { claim, createPollLoop, withOrg } from '@gnldev/durable';
 import type { PollLoop } from '@gnldev/durable';
-import { assertRootJournal } from './root-journal.js';
+import { rootJournal } from './root-journal.js';
 import { listWorkflowRuns } from '@gnldev/workflow';
 import type { JournalLike, WorkflowRunStatus } from '@gnldev/workflow';
+import { refuseUnknownNames } from '@gnldev/options';
+import { CREATE_WORKFLOW_WAKER_NAMES } from './option-names.js';
 
 /**
  * Per-run wake ticket key. Includes `updatedAt` so a run that later re-suspends (sleep/waitFor
@@ -100,10 +102,12 @@ export interface WorkflowWaker {
  * dangling timer after `stop()`).
  */
 export function createWorkflowWaker(opts: WorkflowWakerOptions): WorkflowWaker {
-  const { journal, resume } = opts;
+  refuseUnknownNames('createWorkflowWaker', opts, CREATE_WORKFLOW_WAKER_NAMES);
+  const { resume } = opts;
+  let { journal } = opts;
   // The waker scans the ROOT registry and reaches organizations through `orgs` (R18): handed an
   // organization's journal it would scan only that partition, and `orgs` would nest a scope inside it.
-  assertRootJournal(journal, 'createWorkflowWaker');
+  journal = rootJournal(journal, 'createWorkflowWaker');
   const intervalMs = opts.intervalMs ?? 5000;
   const jitterMs = opts.jitterMs ?? 0;
   const wakeEvented = opts.wakeEvented ?? false;

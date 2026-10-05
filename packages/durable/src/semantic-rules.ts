@@ -294,6 +294,7 @@ function evaluateField(field: string, rawA: string, rawB: string, cfg: SemanticR
  * Every field is evaluated even after a conflict is found, because the trace is the operator's only
  * window into why a candidate went the way it did — a partial trace answers "it was dropped" but not
  * "by what".
+ * @internal — the semantic gate's own reader; a host gives the rules in `limits.sideEffectDuplicates.semantic.rules`, checked there.
  */
 export function runRuleLadder(
   keys: string[],
@@ -315,7 +316,10 @@ export function runRuleLadder(
   return allMatch ? { kind: 'match', trace } : { kind: 'gray', trace };
 }
 
-/** Resolves the `rules` field of the semantic config into a usable ruleset (`true` → defaults). */
+/**
+ * Resolves the `rules` field of the semantic config into a usable ruleset (`true` → defaults).
+ * @internal — the semantic gate's own reader; a host gives the rules in `limits.sideEffectDuplicates.semantic.rules`, checked there.
+ */
 export function rulesConfigOf(rules: true | SemanticRulesConfig | undefined): SemanticRulesConfig | undefined {
   if (rules === undefined) return undefined;
   if (rules === true) return DEFAULT_RULES;

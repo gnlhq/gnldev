@@ -20,6 +20,7 @@
 import { streamSSE } from 'hono/streaming';
 import type { Context } from 'hono';
 import { agentStreamEvents, interruptsFromSteps, LIMIT_ERROR_CODES } from '@gnldev/durable';
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 
 export { interruptsFromSteps };
 
@@ -69,7 +70,10 @@ export interface PipeAgentStreamOptions {
 }
 
 /** Writes @gnldev/durable's agent stream events as SSE with resumable ids. Returns a Hono Response. */
+const PIPE_STREAM_NAMES = optionNames<PipeAgentStreamOptions>()(['lastEventId']);
+
 export function pipeAgentStream(c: Context, runId: string, result: any, opts?: PipeAgentStreamOptions) {
+  refuseUnknownNames('pipeAgentStream', opts, PIPE_STREAM_NAMES);
   const lastEventId = opts?.lastEventId;
   return sseResponse(c, async (stream) => {
     let nextId = 0; // deterministic: the same runId replays the same events, so the same ids

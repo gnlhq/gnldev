@@ -80,7 +80,8 @@ const tools = {
     tool({ description: 'Charge an order', inputSchema: z.object({ orderId: z.string() }), execute: chargeCard }),
     {
       idempotency: 'args',                       // default: 'call' (toolCallId-keyed, unchanged)
-      // or dedup by a logical key: idempotencyKey: (input) => input.orderId,
+      // or dedup by a logical key, saying how far it holds:
+      // idempotencyKey: (input) => input.orderId, idempotencyWindow: 'cross-run',
     },
   ),
 };
@@ -170,7 +171,7 @@ on either. The table below covers the ones you interact with directly.
 | **`@gnldev/otel`** | `exportRunToOtlp` + **`otlpPresets`** (Langfuse/Braintrust/Honeycomb/Datadog/Collector + generic API-key OTLP) · **live mode** (`@gnldev/otel/live`) |
 | **`@gnldev/queue`** | durable job queue + worker · **lock renewal via heartbeat** (prevents takeover during long-running handlers) + opt-in empty-poll backoff |
 | **`@gnldev/events`** | event bus (fan-out) — exactly-once marking + at-least-once delivery; handlers must be idempotent · **dead-letter** (`maxAttempts`/`retryDelayMs` spaced retries, then per-consumer quarantine — `listDeadEvents`/`retryDeadEvent`, visible and releasable in Studio) · opt-in empty-poll backoff |
-| **`@gnldev/a2a`** | remote agent (cross-network dedup — the same runId replays) · **opt-in HMAC-SHA256-signed requests** (`createA2ATool({ secret })` ↔ `createRestApi({ a2aSecret })`, replay resistance via a timestamp window) |
+| **`@gnldev/a2a`** | remote agent (cross-network dedup — the same runId replays) · **opt-in HMAC-SHA256-signed requests** (`createA2ATool({ secret })` ↔ `createRestApi(config, { a2aSecret })`, replay resistance via a timestamp window) |
 | **`@gnldev/cache`** | cross-run cache |
 | **`@gnldev/studio`** | inspector **+ Playground**: pick agent → prompt → streaming response → approval · time-travel/fork + cost/trace/metrics/diff · admin/API separation + role-based auth |
 | **`@gnldev/client`** | type-safe REST/SSE client (framework-agnostic core) + React hooks (`@gnldev/client/react`: `useGnlAgent`/`useChat`) |

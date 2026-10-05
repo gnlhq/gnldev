@@ -246,8 +246,10 @@ export interface SchedulerTrigger {
   attempts: number;
   maxAttempts: number;
   fireCount: number;
-  status: 'pending' | 'done' | 'failed';
+  status: 'pending' | 'done' | 'failed' | 'paused';
   misfire: 'skip' | 'catchup';
+  /** The IANA zone a cron is read in; absent = UTC. */
+  tz?: string;
   /**
    * The failed workflow's own error text — withheld without `payloads:read`, because the workflow
    * ran on `input` and its message can quote it (same reasoning as `DeadEvent.error`).

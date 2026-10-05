@@ -34,7 +34,7 @@ const mkModel = () => ({
 /** Constructs the host and returns the identity line of the banner it printed. */
 function identityLine(opts: Record<string, unknown>): string {
   const lines: string[] = [];
-  const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { lines.push(a.join(' ')); });
+  const spy = vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => { lines.push(a.join(' ')); });
   try {
     createRestApi(
       { storage: new InMemoryStorage(), memory: false, agents: { a: { model: mkModel() as never } } } as never,

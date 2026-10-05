@@ -17,6 +17,8 @@
 import type { DecisionPoint, JournalReader } from '@gnldev/durable';
 import { buildDecisionSequence } from '@gnldev/durable';
 import { optionsFingerprint, type Scorer, type ScoreResult, type ScoreSample } from './scorer.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { CREATE_TRAJECTORY_SCORER_NAMES, SCORE_TRAJECTORY_OPTS_NAMES, TRAJECTORY_SCORER_FOR_OPTS_NAMES, SCORE_TOOL_SEQUENCE_OPTS_NAMES } from './option-names.js';
 
 export interface TrajectoryWeights {
   /** Weight of the ordered-subsequence-match dimension (`expectedTools`). */
@@ -119,6 +121,7 @@ function dimBudget(toolNames: string[], maxToolCalls: number | undefined): Dim |
  * every active dimension's contribution + violations, joined by ` | `.
  */
 export function scoreToolSequence(toolNames: string[], opts: TrajectoryScorerOptions): ScoreResult {
+  refuseUnknownNames('scoreToolSequence', opts, SCORE_TOOL_SEQUENCE_OPTS_NAMES);
   const dims = [
     dimOrder(toolNames, opts.expectedTools),
     dimRequired(toolNames, opts.requiredTools),
@@ -163,6 +166,7 @@ function toolNamesOf(sample: TrajectorySample): string[] | undefined {
  * hand-built trajectories); use `scoreTrajectory`/`trajectoryScorerFor` to score from a run's journal.
  */
 export function createTrajectoryScorer(opts: TrajectoryScorerOptions = {}): Scorer {
+  refuseUnknownNames('createTrajectoryScorer', opts, CREATE_TRAJECTORY_SCORER_NAMES);
   const name = opts.name ?? 'trajectory';
   return {
     name,
@@ -186,6 +190,7 @@ export function createTrajectoryScorer(opts: TrajectoryScorerOptions = {}): Scor
  * Scorer itself — a one-shot function; see `trajectoryScorerFor` for the Scorer adapter.
  */
 export async function scoreTrajectory(reader: JournalReader, runId: string, opts: TrajectoryScorerOptions = {}): Promise<ScoreResult> {
+  refuseUnknownNames('scoreTrajectory', opts, SCORE_TRAJECTORY_OPTS_NAMES);
   const entries = await reader.readRun(runId);
   const points = buildDecisionSequence(entries);
   return scoreToolSequence(toolNamesFromDecisionPoints(points), opts);
@@ -198,6 +203,7 @@ export async function scoreTrajectory(reader: JournalReader, runId: string, opts
  * scorers — no special-casing needed at the call site.
  */
 export function trajectoryScorerFor(reader: JournalReader, opts: TrajectoryScorerOptions = {}): Scorer {
+  refuseUnknownNames('trajectoryScorerFor', opts, TRAJECTORY_SCORER_FOR_OPTS_NAMES);
   const name = opts.name ?? 'trajectory';
   return {
     name,

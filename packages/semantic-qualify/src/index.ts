@@ -25,9 +25,11 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import {
   renderJudgePrompt, parseJudgeVerdict, JUDGE_PROMPT_VERSION,
-  JUDGE_MIN_RECALL, JUDGE_MAX_FP,
+  JUDGE_MIN_RECALL, JUDGE_MAX_FP, JUDGE_MIN_PAIRS,
 } from '@gnldev/durable';
 import type { JudgeCert } from '@gnldev/durable';
+import { refuseUnknownNames } from '@gnldev/options';
+import { QUALIFY_JUDGE_NAMES } from './option-names.js';
 
 export interface FixturePair {
   id: string;
@@ -167,9 +169,11 @@ export function sampleEvenly(pairs: FixturePair[], limit?: number): FixturePair[
  * MISSED by a single pair rather than only by a landslide. Measured before this existed: `--limit 4`
  * sampled one pair per label and a perfect judge earned a certificate on a denominator of 1.
  */
-const MIN_BAR_PAIRS = 5;
+/** @gnldev/durable's JUDGE_MIN_PAIRS: the bench and the runtime check hold one number. */
+const MIN_BAR_PAIRS = JUDGE_MIN_PAIRS;
 
 export async function qualifyJudge(opts: QualifyOptions): Promise<QualifyReport> {
+  refuseUnknownNames('qualifyJudge', opts, QUALIFY_JUDGE_NAMES);
   const paths = opts.fixtures ?? defaultFixturePaths();
   const pairs = sampleEvenly(loadFixtures(paths), opts.limit);
   const fixtureSetId = fixtureSetIdOf(pairs);
@@ -336,6 +340,9 @@ export async function qualifyJudge(opts: QualifyOptions): Promise<QualifyReport>
             judgePromptVersion: JUDGE_PROMPT_VERSION,
             paraphraseRecall: Number(paraphraseRecall.toFixed(4)),
             nearMissFp: Number(nearMissFp.toFixed(4)),
+            paraphrasePairs: par?.n ?? 0,
+            nearMissAnswered: nm?.answered ?? 0,
+            nearMissPairs: nm?.n ?? 0,
             passedAt: opts.now ?? Date.now(),
           },
         }

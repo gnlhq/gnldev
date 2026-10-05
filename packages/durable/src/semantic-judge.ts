@@ -33,6 +33,8 @@ import type { Journal } from './journal.js';
 import type { SemDupRecord, SemPlan } from './semantic-dup.js';
 import { SEM_RULESET_VERSION } from './semantic-rules.js';
 import type { RuleTrace } from './semantic-rules.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { JUDGE_CONFIG_NAMES } from './option-names.js';
 
 /** Bumped when the rendered prompt changes — invalidates every cert and every cached verdict,
  *  because both were produced under the old wording. */
@@ -46,6 +48,13 @@ export const JUDGE_CANONICAL_MAX = 512;
  *  numbers the runtime enforces (one source of truth, not two). */
 export const JUDGE_MIN_RECALL = 0.7;
 export const JUDGE_MAX_FP = 0.05;
+/**
+ * The smallest denominator at which the bars above are still bars: below it one answer swings a rate
+ * past them. The qualification bench refuses to issue under it, and a certificate that does not show
+ * it met it — a hand-written one, or one from before certificates carried their counts — is refused
+ * here, because a recall of 1.0 over 4 pairs and over 200 used to read the same.
+ */
+export const JUDGE_MIN_PAIRS = 5;
 export const JUDGE_CERT_MAX_AGE_MS = 180 * 24 * 3_600_000;
 
 export const DEFAULT_JUDGE_TIMEOUT_MS = 8_000;
@@ -72,6 +81,20 @@ export interface JudgeCert {
   judgePromptVersion: string;
   paraphraseRecall: number;
   nearMissFp: number;
+  /** How many paraphrase pairs `paraphraseRecall` was measured over. At least JUDGE_MIN_PAIRS. */
+  paraphrasePairs: number;
+  /**
+   * How many near-miss pairs the judge answered with a verdict — the coverage floor: at least
+   * JUDGE_MIN_PAIRS, or the false-alarm bar was never exercised. NOT the rate's denominator: an
+   * unanswered pair raises no question at runtime, so `nearMissFp` is over every pair put
+   * (`nearMissPairs`), which is the rate an operator will see.
+   */
+  nearMissAnswered: number;
+  /**
+   * How many near-miss pairs were put to the judge — the count `nearMissFp` rests on. Written by the
+   * bench since this field existed; a certificate without it is still accepted.
+   */
+  nearMissPairs?: number;
   passedAt: number;
 }
 
@@ -183,6 +206,7 @@ export function parseJudgeVerdict(raw: string): JudgeVerdict | undefined {
 // ── config-time validation (THROW — an unqualified judge must be impossible to ship) ──────────
 
 export function validateJudgeConfig(j: SemanticJudgeConfig, now = Date.now()): { warnings: string[] } {
+  refuseUnknownNames('validateJudgeConfig', j, JUDGE_CONFIG_NAMES);
   const warnings: string[] = [];
   if (typeof j.complete !== 'function') {
     throw new Error(
@@ -207,6 +231,25 @@ export function validateJudgeConfig(j: SemanticJudgeConfig, now = Date.now()): {
     throw new Error(
       `@gnldev/durable: the qualification certificate was issued against judge prompt version '${cert.judgePromptVersion}', this build renders version '${JUDGE_PROMPT_VERSION}' — the exam measured a different question, so it must be re-sat.`,
     );
+  }
+  for (const [field, n] of [['paraphrasePairs', cert.paraphrasePairs], ['nearMissAnswered', cert.nearMissAnswered]] as const) {
+    if (!(Number.isInteger(n) && n >= JUDGE_MIN_PAIRS)) {
+      throw new Error(
+        `@gnldev/durable: the qualification certificate's ${field} is ${n === undefined ? 'missing' : n} — a rate needs at least ${JUDGE_MIN_PAIRS} pairs behind it to mean what the bar says. Re-run @gnldev/semantic-qualify; certificates it issues carry their counts.`,
+      );
+    }
+  }
+  if (cert.nearMissPairs !== undefined && !(Number.isInteger(cert.nearMissPairs) && cert.nearMissPairs >= cert.nearMissAnswered)) {
+    throw new Error(
+      `@gnldev/durable: the qualification certificate's nearMissPairs is ${String(cert.nearMissPairs)} — the near-miss pairs put to the judge, a whole number no smaller than those it answered (${cert.nearMissAnswered}). Re-run @gnldev/semantic-qualify.`,
+    );
+  }
+  for (const [field, r] of [['paraphraseRecall', cert.paraphraseRecall], ['nearMissFp', cert.nearMissFp]] as const) {
+    if (!(typeof r === 'number' && r >= 0 && r <= 1)) {
+      throw new Error(
+        `@gnldev/durable: the qualification certificate's ${field} is ${r === undefined ? 'missing' : JSON.stringify(r)} — a rate is a number from 0 to 1 (0.95, not 95). Re-run @gnldev/semantic-qualify; the certificates it issues carry their rates as fractions.`,
+      );
+    }
   }
   if (!(cert.paraphraseRecall >= JUDGE_MIN_RECALL)) {
     throw new Error(

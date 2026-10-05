@@ -15,6 +15,10 @@ import { trace, context, SpanKind, SpanStatusCode, type Span, type Context } fro
 import { priceFor, costOf, DEFAULT_PRICING } from '@gnldev/durable';
 import type { ModelPricing } from '@gnldev/durable';
 import { flattenUsage } from '@gnldev/durable';
+import { serviceResource } from './sdk-resource.js';
+import { resourceOptionsOf } from './resource.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { LIVE_OBSERVABILITY_NAMES } from './option-names.js';
 
 export interface LiveCost {
   inputTokens: number;
@@ -33,8 +37,10 @@ export interface LiveObservabilityOptions {
   endpoint?: string;
   /** Price table for cost calculation (default DEFAULT_PRICING). */
   pricing?: Record<string, ModelPricing>;
-  /** service.name span attribute. */
+  /** `service.name` on the resource of every span (what a trace backend groups by). Default `'gnl'`. */
   serviceName?: string;
+  /** More resource attributes (`deployment.environment`, …). `serviceName` wins over a `service.name` here. */
+  resourceAttributes?: Record<string, string | number | boolean>;
   /** Sampling rate 0..1 (default 1 = all). instrument() kicks in with this probability. */
   sampleRate?: number;
   /** Called with the current running total cost after every model call (live budget alarm). */
@@ -107,12 +113,13 @@ interface ToolEmit {
 }
 
 export function liveObservability(opts: LiveObservabilityOptions = {}): LiveObservability {
+  refuseUnknownNames('liveObservability', opts, LIVE_OBSERVABILITY_NAMES);
   const pricing = opts.pricing ?? DEFAULT_PRICING;
   const sampleRate = opts.sampleRate ?? 1;
   const exporter = opts.exporter ?? (opts.endpoint ? otlpExporterSync(opts.endpoint) : new InMemorySpanExporter());
   // OpenTelemetry JS 2.x removed `provider.addSpanProcessor()`: a processor can no longer be
   // attached after construction, it is declared with the provider. Passed via `spanProcessors`.
-  const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
+  const provider = new BasicTracerProvider({ resource: serviceResource(resourceOptionsOf(opts)), spanProcessors: [new SimpleSpanProcessor(exporter)] });
   const tracer = provider.getTracer('@gnldev/otel/live');
 
   const roots = new Map<string, { span: Span; ctx: Context }>();
@@ -138,7 +145,7 @@ export function liveObservability(opts: LiveObservabilityOptions = {}): LiveObse
       const span = tracer.startSpan('agent.run', {
         kind: SpanKind.INTERNAL,
         startTime,
-        attributes: clean({ 'gnl.run_id': runId, 'service.name': opts.serviceName }),
+        attributes: clean({ 'gnl.run_id': runId }),
       });
       r = { span, ctx: trace.setSpan(context.active(), span) };
       roots.set(runId, r);

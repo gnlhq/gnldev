@@ -156,6 +156,12 @@ export class FakeRedis implements RedisLike {
       for (const z of desc.zadds ?? []) await this.zadd(z.key, z.score, z.member); // H8b activity touch parity
       return 1;
     }
+    // incrBy over several fields (INCR_FIELDS_LUA, marker `gnl:incr-fields`): KEYS = [hash], ARGV = field/delta pairs.
+    if (script.includes('gnl:incr-fields')) {
+      const out: string[] = [];
+      for (let i = 1; i < args.length; i += 2) out.push(await this.hincrbyfloat(String(args[0]), String(args[i]), Number(args[i + 1])));
+      return out;
+    }
     // WorkStore.append (WORK_APPEND_LUA, marker `gnl:work-append`): KEYS = [counter, record], ARGV = [record].
     // Existing record → 0 and no number taken; else INCR the counter and write the record numbered.
     if (script.includes('gnl:work-append')) {

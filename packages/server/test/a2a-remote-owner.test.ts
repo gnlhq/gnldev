@@ -8,7 +8,6 @@
 // reads the user from the run's identity channel and names her to the remote (`resourceId`).
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, createGnl, runOwnerOf, toJournal, user, staff } from '@gnldev/durable';
-import { stepCountIs } from 'ai';
 import { createRestApi } from '../src/index.js';
 import { createA2ATool } from '../../a2a/src/index.js';
 
@@ -40,7 +39,7 @@ describe('a2a: whose is the remote run', () => {
     it(`service credential as ${kind}: the remote run belongs to the calling run's end user`, async () => {
       const r = remote(kind);
       const tool = createA2ATool({ endpoint: 'http://remote', agentName: 'worker', fetchImpl: r.fetchImpl, headers: { authorization: 'Bearer svc' } });
-      const local = createGnl({ storage: new InMemoryStorage(), agents: { a: { model: delegating, tools: { remote: tool }, stopWhen: stepCountIs(3) } } } as never);
+      const local = createGnl({ storage: new InMemoryStorage(), agents: { a: { model: delegating, tools: { remote: tool }, maxSteps: 3 } } } as never);
       const out = await local.run('a', { runId: 'local-1', prompt: 'hi', caller: user('u-ayse') });
       const steps = JSON.stringify((out as { steps?: unknown }).steps ?? out);
       const remoteIds = (await r.storage.runs.listKeys!('')).filter((k) => k.endsWith(':input')).map((k) => k.slice(0, -':input'.length));
@@ -68,7 +67,7 @@ describe('a2a: whose is the remote run', () => {
       const r = remote(kind);
       const tool = createA2ATool({ endpoint: 'http://remote', agentName: 'worker', fetchImpl: r.fetchImpl, headers: { authorization: 'Bearer svc' } });
       const model = delegatingWith({ task: 'x', resourceId: 'u-ayse' });
-      const local = createGnl({ storage: new InMemoryStorage(), agents: { a: { model, tools: { remote: tool }, stopWhen: stepCountIs(3) } } } as never);
+      const local = createGnl({ storage: new InMemoryStorage(), agents: { a: { model, tools: { remote: tool }, maxSteps: 3 } } } as never);
       await local.run('a', { runId: 'local-m', prompt: 'hi', caller: user('u-mallory') });
       expect(await remoteOwners(r)).toEqual(['user:u-mallory']);
     });
@@ -78,7 +77,7 @@ describe('a2a: whose is the remote run', () => {
     for (const [kind, want] of [['operator', ['staff']], ['application', []]] as const) {
       const r = remote(kind);
       const tool = createA2ATool({ endpoint: 'http://remote', agentName: 'worker', fetchImpl: r.fetchImpl, headers: { authorization: 'Bearer svc' } });
-      const local = createGnl({ storage: new InMemoryStorage(), agents: { a: { model: delegating, tools: { remote: tool }, stopWhen: stepCountIs(3) } } } as never);
+      const local = createGnl({ storage: new InMemoryStorage(), agents: { a: { model: delegating, tools: { remote: tool }, maxSteps: 3 } } } as never);
       await local.run('a', { runId: 'local-s', prompt: 'hi', caller: staff() });
       expect(await remoteOwners(r), kind).toEqual(want);
     }

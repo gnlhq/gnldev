@@ -122,7 +122,7 @@ describe('standalone chat door, root user naming acme\'s space (no door check th
 });
 
 // ONE ERROR, ONE ANSWER ON EVERY DOOR. `ReservedThreadIdError` is answered through @gnldev/durable's
-// `reservedIdFailure`: 400, `code: 'thread_id_reserved'`, `detail.threadId`. Measured before (round 5):
+// `requestRefusal`: 400, `code: 'thread_id_reserved'`, `detail.threadId`. Measured before (round 5):
 // Studio's GET /threads/:id/messages and /working-memory answered 500; Studio PATCH/DELETE and the
 // chat and AG-UI routes 400 with no `code`; only REST said `thread_id_reserved`, from its own copy of
 // the `org:` test and its own sentence.

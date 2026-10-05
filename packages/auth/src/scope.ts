@@ -125,6 +125,7 @@ export type AssignabilityResult = { ok: true } | { ok: false; reason: string };
  * NOT grant the `platform-admin` role (a cross-org SCOPE escalation) nor the `'*'` all-permissions
  * grant (its permission-axis equivalent). Ordinary org roles/permissions stay inside the assigner's
  * org (the target keeps its `orgId`), so they are not a cross-org escalation and remain assignable.
+ * @internal — @gnldev/auth-ee plumbing: compares a role grant with the assigner's; both are built by gnl.
  */
 export function assertAssignablePrivileges(
   assigner: Principal | null | undefined,

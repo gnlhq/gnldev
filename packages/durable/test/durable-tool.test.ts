@@ -27,7 +27,9 @@ describe('durableTool — exactly-once', () => {
   it('different toolCallId → runs every time', async () => {
     const journal = new InMemoryJournal();
     let calls = 0;
-    const dt = durableTool({ execute: async () => ++calls }, { journal, runId: 'r1' });
+    // The default duplicate ladder is now 'suspend' (an identical keyless repeat is asked about); this
+    // test isolates the toolCallId-keyed record, so the ladder stays at 'warn'.
+    const dt = durableTool({ execute: async () => ++calls }, { journal, runId: 'r1', limits: { sideEffectDuplicates: 'warn' } } as any);
 
     await dt.execute!({}, { toolCallId: 'a' });
     await dt.execute!({}, { toolCallId: 'b' });

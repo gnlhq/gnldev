@@ -27,6 +27,32 @@ export interface Interrupt {
   reason?: string;
   /** FAZ-6: set when the suspension came from the semantic dup gate — the approval writes the 'different work' tombstone from this. */
   semPair?: { priorHash: string };
+  /**
+   * Set when a sub-agent asked: which one (`agent`, when registered by name) and its run. Kept out of
+   * `reason`, which a person reads: the question said "nested run 'agent:<id>:call-<uuid>'" to a nurse
+   * approving a dose (measured, in a chat UI). `via` is the next hop when that sub-agent delegated too.
+   */
+  delegatedTo?: { runId: string; agent?: string; via?: Interrupt['delegatedTo'] };
+}
+
+/**
+ * A child's interrupt, addressed from the parent: `<delegation toolCallId>/<child toolCallId>`. Two children
+ * number their calls independently (`call_0` each), so the child's own id names nothing at the parent —
+ * one approval for `call_0` approved both (measured). Deeper levels prefix again on the way up.
+ */
+export const addressedId = (delegationCallId: string | undefined, id: string): string =>
+  delegationCallId === undefined || id.startsWith(`${delegationCallId}/`) ? id : `${delegationCallId}/${id}`;
+
+export const addressedInterrupt = (delegationCallId: string | undefined, i: Interrupt): Interrupt =>
+  delegationCallId === undefined ? i : { ...i, toolCallId: addressedId(delegationCallId, i.toolCallId) };
+
+/** The decisions meant for one delegation, in its child's own id space (the inverse of `addressed`). */
+export function approvalsForChild(delegationCallId: string | undefined, approvals: Record<string, boolean> | undefined): Record<string, boolean> {
+  const out: Record<string, boolean> = {};
+  if (!approvals || delegationCallId === undefined) return out;
+  const prefix = `${delegationCallId}/`;
+  for (const [id, v] of Object.entries(approvals)) if (id.startsWith(prefix)) out[id.slice(prefix.length)] = v;
+  return out;
 }
 
 /** Suspend signal returned in place of tool execute (the loop stops via stopWhen). */

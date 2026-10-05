@@ -4,8 +4,10 @@
 // own durable guarantee. Time = DATA (nextRunAt in the journal) → resolve-then-freeze, replay-safe.
 import { acquireRunLock, argsHash, createPollLoop, orgPrefix, ownedName, ownedPrefix, ownerOfName, stableStringify, user, staff, UNKNOWN } from '@gnldev/durable';
 import type { Journal, Caller } from '@gnldev/durable';
-import { cronNeverFires, nextCronTime } from './cron.js';
-import { assertRootJournal } from './root-journal.js';
+import { canonicalTimeZone, cronNeverFires, nextCronTime } from './cron.js';
+import { rootJournal } from './root-journal.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { SCHEDULE_WORKFLOW_INPUT_NAMES, POLL_SCHEDULER_OPTS_NAMES, CREATE_SCHEDULER_OPTS_NAMES, MOVE_TRIGGER_TO_NAMES } from './option-names.js';
 
 export { nextCronTime, parseField } from './cron.js';
 export { createWorkflowWaker } from './workflow-waker.js';
@@ -37,8 +39,15 @@ export interface ScheduleSpec {
   at?: number;
   /** Period (ms) — repeats every interval. */
   every?: number;
-  /** 5-field cron (UTC, minute resolution) — repeats on every match. */
+  /** 5-field cron (minute resolution) — repeats on every match. Read in UTC, or in `tz` when given. */
   cron?: string;
+  /**
+   * The IANA time zone `cron` is read in (`'Europe/Berlin'`, `'America/New_York'`). Without it, UTC.
+   * Only for `cron` — `every` is a period and `at` an instant, so a zone would mean nothing there and
+   * is refused. On a DST day a wall time that does not exist fires once, shifted forward by the gap
+   * (02:30 → 03:30); one that happens twice fires once, at the first — unless the hour field is `*`.
+   */
+  tz?: string;
   /** Max attempts on failure (default 5). */
   maxAttempts?: number;
   /**
@@ -86,6 +95,8 @@ interface TriggerDef {
   resourceId?: string;
   orgId?: string;
   ownerKind?: 'staff';
+  /** Canonical IANA zone for a cron; absent = UTC (and absent on every definition written before it existed). */
+  tz?: string;
 }
 
 /** The caller a trigger's recorded owner stands for — the ONE reading every fire uses. */
@@ -115,7 +126,12 @@ interface TriggerState {
   nextRunAt: number;
   attempts: number;
   fireCount: number;
-  status: 'pending' | 'done' | 'failed';
+  /**
+   * THE ONE ANSWER to "does this trigger fire": only `'pending'` (and due) does. `'paused'` is kept and
+   * waits for `resumeTrigger`; `'removed'` is gone (`unscheduleWorkflow`) and is read as absent by
+   * everything but the fire counter.
+   */
+  status: 'pending' | 'done' | 'failed' | 'paused' | 'removed';
   /** Set by `moveTrigger` on the retired system trigger: the owned id it now lives under. */
   movedTo?: string;
   /**
@@ -163,8 +179,25 @@ function stateBelongsTo(state: TriggerState, def: TriggerDef): boolean {
  *     Writing the state FIRST would not do: the poller would fire the OLD definition with the new
  *     state (a `done` one-shot fires again).
  */
-async function writeTrigger(journal: Journal, id: string, def: TriggerDef, state: TriggerState): Promise<TriggerState> {
+async function writeTrigger(journal: Journal, id: string, def: TriggerDef, state: TriggerState): Promise<TriggerState>;
+/**
+ * The same writer, for a TRANSITION of a trigger whose stored definition stays: a fire's outcome, a
+ * pause, a resume, a removal. Only the state changes, so one write is the whole unit — a CAS against
+ * the state the caller read (`expected`). Returns `null` when somebody else wrote the state in between
+ * (another poller's fire, an operator's pause): the caller re-reads and decides again, it never
+ * overwrites a transition it did not see. A journal without `putIfMatch` gets a plain put — the same
+ * documented fallback as the fire lock.
+ */
+async function writeTrigger(journal: Journal, id: string, def: TriggerDef, state: TriggerState, expected: TriggerState): Promise<TriggerState | null>;
+async function writeTrigger(journal: Journal, id: string, def: TriggerDef, state: TriggerState, expected?: TriggerState): Promise<TriggerState | null> {
   const stamped: TriggerState = { ...state, of: definitionFingerprint(def) };
+  if (expected !== undefined) {
+    if (!journal.putIfMatch) {
+      await journal.put(STATE(id), stamped);
+      return stamped;
+    }
+    return (await journal.putIfMatch(STATE(id), expected, stamped)) ? stamped : null;
+  }
   if (journal.applyBatch) {
     await journal.applyBatch({ puts: [{ key: DEF(id), value: def }, { key: STATE(id), value: stamped }] });
   } else {
@@ -290,6 +323,10 @@ function definitionProblem(def: TriggerDef): string | undefined {
   }
   if (!Number.isInteger(def.maxAttempts) || def.maxAttempts < 1) return `maxAttempts must be an integer of at least 1, got ${String(def.maxAttempts)}`;
   if (def.misfire !== 'skip' && def.misfire !== 'catchup') return `misfire must be 'skip' or 'catchup', got ${JSON.stringify(def.misfire)}`;
+  if (def.tz !== undefined) {
+    if (def.kind !== 'cron') return `tz is only for cron (a time zone means nothing to ${def.kind === 'at' ? 'an instant' : 'a period'}), got tz ${JSON.stringify(def.tz)} with ${def.kind}`;
+    if (canonicalTimeZone(def.tz) === undefined) return `tz ${JSON.stringify(def.tz)} is not a time zone this runtime knows (an IANA name, e.g. 'Europe/Berlin')`;
+  }
   return undefined;
 }
 
@@ -304,6 +341,10 @@ function definitionOf(spec: ScheduleSpec, id: string, owner: ReturnType<typeof t
     );
   }
   const kind: Kind = given[0]!;
+  // The canonical spelling, so two spellings of one zone are one spec; an unknown zone is kept as given
+  // and refused by definitionProblem below. Absent when not given, so a definition stored before `tz`
+  // existed keeps its fingerprint.
+  const tz = spec.tz === undefined ? undefined : (canonicalTimeZone(spec.tz) ?? spec.tz);
   const def: TriggerDef = {
     name: spec.name,
     input: spec.input,
@@ -312,6 +353,7 @@ function definitionOf(spec: ScheduleSpec, id: string, owner: ReturnType<typeof t
     maxAttempts: spec.maxAttempts ?? 5,
     misfire: spec.misfire ?? 'skip',
     ...owner,
+    ...(tz !== undefined ? { tz } : {}),
   };
   const problem = definitionProblem(def);
   if (problem) throw new Error(`@gnldev/scheduler: trigger '${id}' — ${problem}. Nothing was written.`);
@@ -324,7 +366,7 @@ function definitionOf(spec: ScheduleSpec, id: string, owner: ReturnType<typeof t
  * data. Measured: printing both specs put another caller's trigger input into the refusal.
  */
 function definitionDiff(stored: TriggerDef, given: TriggerDef): string {
-  const fields = (['name', 'input', 'maxAttempts', 'misfire', 'resourceId', 'orgId', 'ownerKind'] as const)
+  const fields = (['name', 'input', 'maxAttempts', 'misfire', 'resourceId', 'orgId', 'ownerKind', 'tz'] as const)
     .filter((k) => stableStringify(stored[k] ?? null) !== stableStringify(given[k] ?? null));
   const schedule = stored.kind !== given.kind ? `the schedule (${stored.kind} → ${given.kind})`
     : stableStringify(stored.value) !== stableStringify(given.value) ? `the ${given.kind} value` : undefined;
@@ -335,7 +377,7 @@ function definitionDiff(stored: TriggerDef, given: TriggerDef): string {
 function firstRunAt(def: TriggerDef, now: number): number {
   if (def.kind === 'at') return def.value as number;
   if (def.kind === 'every') return now + (def.value as number);
-  return nextCronTime(def.value as string, now);
+  return nextCronTime(def.value as string, now, def.tz);
 }
 /**
  * Computes the next fire time. `prevSlot` = the PLANNED slot that just fired (state.nextRunAt) —
@@ -354,7 +396,7 @@ function computeNext(def: TriggerDef, prevSlot: number, now: number): number {
   // where the scan starts from: 'catchup' starts from the last planned slot (finds the next missed one,
   // may be due immediately), 'skip' starts from the current time (skips everything missed, jumps to the
   // next future match).
-  return def.misfire === 'catchup' ? nextCronTime(def.value as string, prevSlot) : nextCronTime(def.value as string, now);
+  return nextCronTime(def.value as string, def.misfire === 'catchup' ? prevSlot : now, def.tz);
 }
 function backoff(attempts: number): number {
   return Math.min(1000 * 2 ** (attempts - 1), 60_000);
@@ -399,7 +441,8 @@ async function fireCountAfterLoss(journal: Journal, id: string): Promise<number>
  * otherwise (see `ScheduleSpec.ifExists`).
  */
 export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, now: number = Date.now()): Promise<string> {
-  assertRootJournal(journal, 'scheduleWorkflow');
+  refuseUnknownNames('scheduleWorkflow', input, SCHEDULE_WORKFLOW_INPUT_NAMES);
+  journal = rootJournal(journal, 'scheduleWorkflow');
   const owner = triggerOwnerOf(input);
   const spec: ScheduleSpec = { ...input, caller: undefined, resourceId: owner.resourceId, orgId: owner.orgId };
   // Checked when the trigger is set: found at fire time, a bad id is maxAttempts failures and a dead
@@ -419,6 +462,19 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
     throw new Error(`@gnldev/scheduler: trigger '${id}' — ifExists must be 'refuse', 'replace' or 'keep', got ${JSON.stringify(ifExists)}. Nothing was written.`);
   }
   const stored = await journal.get<TriggerDef>(DEF(id));
+  if (stored !== undefined) {
+    // A REMOVED trigger is absent (`unscheduleWorkflow`): registering the id again is a new trigger,
+    // whatever its spec and whatever `ifExists` says. Only its fire counter survives, moved past every
+    // run id the removed one used — a reused id would replay a finished run instead of firing.
+    const prev = await journal.get<TriggerState>(STATE(id));
+    if (prev?.status === 'removed') {
+      await writeTrigger(journal, id, def, {
+        nextRunAt: firstRunAt(def, now), attempts: 0,
+        fireCount: Math.max(prev.fireCount, await fireCountAfterLoss(journal, id)), status: 'pending',
+      });
+      return id;
+    }
+  }
   const storedProblem = stored === undefined ? undefined : definitionProblem(stored);
   // "Already scheduled" is an answer only for the SAME spec. For a different one it was the silent
   // failure: 0.9 stored `{ at }`, the host now passes `{ every }`, and the one-shot that had already
@@ -441,7 +497,8 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
       nextRunAt: firstRunAt(def, now),
       attempts: 0,
       fireCount: Math.max(prev?.fireCount ?? 0, await fireCountAfterLoss(journal, id)),
-      status: 'pending',
+      // A pause is the operator's, not the spec's: a new spec does not lift it.
+      status: prev?.status === 'paused' ? 'paused' : 'pending',
     });
     console.warn(
       storedProblem !== undefined
@@ -485,6 +542,21 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
       });
       console.warn(
         `[scheduler] half-written trigger repaired (trigger ${id}, workflow ${spec.name}) — 'sched:state:${id}' was computed for a different definition than the stored one (a registration stopped between its two writes). A state for the stored definition was written: nextRunAt=${state.nextRunAt}, attempts=0, fireCount=${state.fireCount}.`,
+      );
+      return id;
+    }
+    if (current !== undefined && !Number.isFinite(current.nextRunAt) && (current.status === 'pending' || current.status === 'failed' || current.status === 'paused')) {
+      // NO VALID TIME: the poller failed it (or would), since it cannot fire from there. Registering the
+      // same spec is the way out it names — and a host registers on every boot, so a restart repairs it.
+      // The time comes from the definition; a pause stays the operator's.
+      const state = await writeTrigger(journal, id, stored, {
+        ...current,
+        nextRunAt: firstRunAt(stored, now),
+        attempts: 0,
+        status: current.status === 'paused' ? 'paused' : 'pending',
+      });
+      console.warn(
+        `[scheduler] trigger ${id} had no valid next time (${String(current.nextRunAt)}) — set from its definition by this scheduleWorkflow call: nextRunAt=${state.nextRunAt}, status=${state.status}.`,
       );
       return id;
     }
@@ -538,13 +610,15 @@ export async function pollScheduler(
   journal: Journal,
   runner: WorkflowRunner,
   now: number = Date.now(),
-  opts: { owner?: string; retryMs?: number; budgetGuard?: BudgetGuard; lockTtlMs?: number; runnerForOrg?: RunnerForOrg } = {},
+  opts: { owner?: string; retryMs?: number; budgetGuard?: BudgetGuard; lockTtlMs?: number; runnerForOrg?: RunnerForOrg; onInvalidTime?: InvalidTimePolicy } = {},
 ): Promise<PollResult> {
-  assertRootJournal(journal, 'pollScheduler');
+  refuseUnknownNames('pollScheduler', opts, POLL_SCHEDULER_OPTS_NAMES);
+  journal = rootJournal(journal, 'pollScheduler');
   if (!journal.listKeys) throw new Error('@gnldev/scheduler: journal.listKeys is required (trigger enumeration)');
   const owner = opts.owner ?? `sched-${Math.random().toString(36).slice(2, 8)}`;
   const retryMs = opts.retryMs ?? 30_000;
   const lockTtlMs = opts.lockTtlMs ?? 60_000;
+  const onInvalidTime = invalidTimePolicy(opts.onInvalidTime, 'pollScheduler');
   const out: PollResult = { fired: 0, rescheduled: 0, failed: 0, skipped: 0 };
 
   const defKeys = await journal.listKeys('sched:def:');
@@ -552,29 +626,64 @@ export async function pollScheduler(
     const id = dkey.slice('sched:def:'.length);
     const def = await journal.get<TriggerDef>(DEF(id));
     const state = await journal.get<TriggerState>(STATE(id));
-    if (!def || !state || state.status !== 'pending' || now < state.nextRunAt) continue;
+    // A definition with NO state is invisible otherwise: skipped here, dropped by listTriggers. 0.9.0
+    // wrote one for a cron it then refused (`'99 * * * *'`, `'hello'`): it never fires and nothing says
+    // so, forever if the host no longer registers that id. An invalid one is failed here, created only if
+    // its state is still absent, so it shows in listTriggers and Studio with the reason. A VALID one is left
+    // to the registration that repairs it (the next scheduleWorkflow for the id — a host that registers on
+    // boot does it on start); listTriggers shows it meanwhile. Writing a state for it here would stop that
+    // repair, which leaves a definition that has a state alone.
+    if (def && !state) {
+      const orphanProblem = definitionProblem(def);
+      if (orphanProblem !== undefined) {
+        const failed: TriggerState = { nextRunAt: 0, attempts: 0, fireCount: await fireCountAfterLoss(journal, id), status: 'failed', of: definitionFingerprint(def) };
+        const won = journal.putIfAbsent ? await journal.putIfAbsent(STATE(id), failed) : (await journal.put(STATE(id), failed), true);
+        if (won) {
+          await journal.put(FAIL(id), { error: invalidDefinitionError(orphanProblem), at: now });
+          console.warn(`[scheduler] trigger ${id} has an invalid definition and no state (${orphanProblem}) — marked failed, not fired.`);
+          out.failed++;
+        }
+      }
+      continue;
+    }
+    if (!def || !state || state.status !== 'pending') continue;
 
-    // A stored definition that cannot fire (only 0.9.0 could write one — `scheduleWorkflow` now
-    // refuses it): firing it would run the workflow and then throw in computeNext, or fire on every
-    // poll for `every: 0`. The trigger is failed, with the reason and the way out, and the loop goes
-    // on to the next trigger instead of stopping at this one.
+    // Two questions, asked in this order: can this stored trigger fire at all, and is it time. A
+    // trigger that cannot fire is answered on the first poll that sees it, whatever its time says.
+    //
+    // Its DEFINITION cannot fire — only 0.9.0 could store one (`scheduleWorkflow` now refuses it):
+    // firing it would run the workflow and then throw in computeNext, or fire on every poll for
+    // `every: 0`. Failed, with the reason and the way out.
     const problem = definitionProblem(def);
     if (problem !== undefined) {
-      // Stamped with the definition it failed FOR: the corrected registration then replaces both
-      // halves, and if it stops between them the state still names the bad definition — which the
-      // same-spec path reads as half-written and repairs (see writeTrigger).
-      const failed: TriggerState = { ...state, status: 'failed', of: definitionFingerprint(def) };
-      const won = journal.putIfMatch ? await journal.putIfMatch(STATE(id), state, failed) : (await journal.put(STATE(id), failed), true);
-      if (won) {
-        await journal.put(FAIL(id), {
-          error: `the trigger definition cannot fire: ${problem}. Call scheduleWorkflow again with a valid spec for this id; it replaces the stored definition.`,
-          at: now,
-        });
+      // Stamped with the definition it failed FOR (writeTrigger): the corrected registration then
+      // replaces both halves, and if it stops between them the state still names the bad definition —
+      // which the same-spec path reads as half-written and repairs.
+      if (await failTrigger(journal, id, def, state, now, invalidDefinitionError(problem))) {
         console.warn(`[scheduler] trigger ${id} has an invalid definition (${problem}) — marked failed, not fired.`);
         out.failed++;
       }
       continue;
     }
+    // Its definition is valid but its stored next time is not a number — a state no registration
+    // writes (a foreign writer, a hand edit). It is never fired from that state: a fire computes the next
+    // slot FROM the stored time, so an `every` fired on every poll and an `at` fired before its time
+    // (measured, 15 of 15). By default it is failed, visible, with the way out; `onInvalidTime: 'repair'`
+    // sets the time from the definition instead and fires at that time.
+    if (!Number.isFinite(state.nextRunAt)) {
+      if (onInvalidTime === 'repair') {
+        const repaired = await writeTrigger(journal, id, def, { ...state, nextRunAt: firstRunAt(def, now) }, state);
+        if (repaired) {
+          console.warn(`[scheduler] trigger ${id} had no valid next time (${String(state.nextRunAt)}) — set from its definition to ${repaired.nextRunAt} (onInvalidTime: 'repair'), not fired.`);
+          out.rescheduled++;
+        }
+      } else if (await failTrigger(journal, id, def, state, now, `the trigger's stored next time is not a number (${String(state.nextRunAt)}). Call scheduleWorkflow again for this id (a restart that registers it does): its time is set from the definition. Or pass onInvalidTime: 'repair' to the scheduler.`)) {
+        console.warn(`[scheduler] trigger ${id} has no valid next time (${String(state.nextRunAt)}) — marked failed, not fired.`);
+        out.failed++;
+      }
+      continue;
+    }
+    if (!isDue(state, now)) continue;
 
     const runId = `sched:${id}:${state.fireCount}`;
     // The fire lock, on its OWN key — see FIRE_LOCK. `runId` below is the RUN's name and is passed to
@@ -626,14 +735,18 @@ export async function pollScheduler(
     // — the same fallback as run-lock.ts / claim()).
     // Every state the poller writes names the definition it was computed from (see writeTrigger), so
     // a state the poller has touched once is never mistaken for a half-written one.
-    const of = definitionFingerprint(def);
+    //
+    // PAUSED DURING THE FIRE is the one lost CAS that is not a competing poller: `pauseTrigger` changed
+    // only the status, so the counter and attempts this fire was computed from are still the stored ones.
+    // The outcome is then recorded UNDER the pause (counter advanced, still paused) — discarding it would
+    // make resume fire the same run id again, a finished run replayed instead of the next occurrence.
     const commit = async (computed: TriggerState, what: string): Promise<boolean> => {
-      const next: TriggerState = { ...computed, of };
-      if (!journal.putIfMatch) {
-        await journal.put(STATE(id), next);
-        return true;
+      if (await writeTrigger(journal, id, def, computed, state)) return true;
+      const current = await journal.get<TriggerState>(STATE(id));
+      if (current?.status === 'paused' && current.fireCount === state.fireCount && current.attempts === state.attempts) {
+        const underPause: TriggerState = { ...computed, status: computed.status === 'pending' ? 'paused' : computed.status };
+        if (await writeTrigger(journal, id, def, underPause, current)) return true;
       }
-      if (await journal.putIfMatch(STATE(id), state, next)) return true;
       console.warn(`[scheduler] stale state write rejected (trigger ${id}, ${what}) — another poller advanced this trigger; this poller's result is DISCARDED.`);
       return false;
     };
@@ -736,6 +849,37 @@ export async function pollScheduler(
   return out;
 }
 
+/** THE ONE ANSWER to "does this trigger fire now" — read by the poller, and by nothing that writes. */
+function isDue(state: TriggerState, now: number): boolean {
+  // Time only. Whether the stored trigger CAN fire is asked first, of every pending trigger (pollScheduler).
+  return now >= state.nextRunAt;
+}
+
+/** The reason, with the way out, for a stored definition that cannot fire. */
+function invalidDefinitionError(problem: string): string {
+  return `the trigger definition cannot fire: ${problem}. Call scheduleWorkflow again with a valid spec for this id; it replaces the stored definition.`;
+}
+
+/** What the poller does with a valid trigger whose stored next time is not a number. */
+export type InvalidTimePolicy = 'fail' | 'repair';
+
+function invalidTimePolicy(v: unknown, fn: string): InvalidTimePolicy {
+  if (v === undefined) return 'fail';
+  if (v === 'fail' || v === 'repair') return v;
+  throw new TypeError(`@gnldev/scheduler: ${fn} — onInvalidTime must be 'fail' or 'repair', got ${JSON.stringify(v)}.`);
+}
+
+/**
+ * The ONE way the poller fails a stored trigger it cannot fire: the state goes `failed` (through
+ * writeTrigger, a CAS against the state read) and the reason, with the way out, is the trigger's
+ * `lastError` in listTriggers and Studio. `false` when another poller changed the state first.
+ */
+async function failTrigger(journal: Journal, id: string, def: TriggerDef, state: TriggerState, now: number, error: string): Promise<boolean> {
+  if (!(await writeTrigger(journal, id, def, { ...state, status: 'failed' }, state))) return false;
+  await journal.put(FAIL(id), { error, at: now });
+  return true;
+}
+
 /** Introspection view of a single trigger (for the Studio Scheduler view). */
 export interface TriggerInfo {
   id: string;
@@ -749,8 +893,11 @@ export interface TriggerInfo {
   attempts: number;
   maxAttempts: number;
   fireCount: number;
-  status: 'pending' | 'done' | 'failed';
+  /** `'paused'`: kept, not fired, until `resumeTrigger`. A removed trigger is not listed at all. */
+  status: 'pending' | 'done' | 'failed' | 'paused';
   misfire: MisfirePolicy;
+  /** The IANA zone a cron is read in; absent = UTC. */
+  tz?: string;
   /** The end user this trigger works for (absent: the system's). */
   resourceId?: string;
   /** The organization this trigger works in. */
@@ -781,7 +928,7 @@ export interface TriggerInfo {
  * results sorted alphabetically by id (stable list order).
  */
 export async function listTriggers(journal: Journal): Promise<TriggerInfo[]> {
-  assertRootJournal(journal, 'listTriggers');
+  journal = rootJournal(journal, 'listTriggers');
   if (!journal.listKeys) throw new Error('@gnldev/scheduler: listTriggers requires journal.listKeys (trigger enumeration)');
   const defKeys = await journal.listKeys('sched:def:');
   const out: TriggerInfo[] = [];
@@ -789,7 +936,25 @@ export async function listTriggers(journal: Journal): Promise<TriggerInfo[]> {
     const id = dkey.slice('sched:def:'.length);
     const def = await journal.get<TriggerDef>(DEF(id));
     const state = await journal.get<TriggerState>(STATE(id));
-    if (!def || !state) continue; // inconsistent/partial record (theoretical) — skip
+    if (!def) continue;
+    if (!state) {
+      // A definition whose state is gone (a too-wide purge or a retention sweep) does not fire, and was
+      // dropped here as a "partial record" — invisible in Studio too. Shown as failed, with the way out;
+      // nothing is written (see pollScheduler). An invalid one gets its own state from the poller.
+      const problem = definitionProblem(def);
+      out.push({
+        id, name: def.name, kind: def.kind, value: def.value, input: def.input,
+        nextRunAt: 0, attempts: 0, maxAttempts: def.maxAttempts, fireCount: 0, status: 'failed', misfire: def.misfire,
+        ...(def.tz !== undefined ? { tz: def.tz } : {}),
+        ...(def.resourceId !== undefined ? { resourceId: def.resourceId } : {}),
+        ...(def.orgId !== undefined ? { orgId: def.orgId } : {}),
+        lastError: problem !== undefined
+          ? invalidDefinitionError(problem)
+          : 'its state is missing (a too-wide purge or a retention sweep is the usual cause), so it does not fire. scheduleWorkflow for this id repairs it — a host that registers its triggers on boot does it on the next start.',
+      });
+      continue;
+    }
+    if (state.status === 'removed') continue; // unscheduled: gone, whatever records it left behind
     const info: TriggerInfo = {
       id,
       name: def.name,
@@ -802,6 +967,7 @@ export async function listTriggers(journal: Journal): Promise<TriggerInfo[]> {
       fireCount: state.fireCount,
       status: state.status,
       misfire: def.misfire,
+      ...(def.tz !== undefined ? { tz: def.tz } : {}),
       ...(def.resourceId !== undefined ? { resourceId: def.resourceId } : {}),
       ...(def.orgId !== undefined ? { orgId: def.orgId } : {}),
       ...(state.movedTo !== undefined ? { movedTo: state.movedTo } : {}),
@@ -825,6 +991,120 @@ export async function listTriggers(journal: Journal): Promise<TriggerInfo[]> {
   return out.sort((a, b) => a.id.localeCompare(b.id));
 }
 
+// ─── Remove, pause, resume ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Names a scheduled trigger the way `scheduleWorkflow` named it: the `id` you gave (or the workflow
+ * name, if you gave none), within its owner — pass the same `caller` / `resourceId` / `orgId`.
+ */
+export interface TriggerRef {
+  id: string;
+  caller?: Caller;
+  resourceId?: string;
+  orgId?: string;
+}
+
+/** What a transition does to a trigger: a new state, or an answer without a write. */
+type Decision = TriggerState | boolean;
+
+/**
+ * Every operator transition, one way: read both halves, decide, write the state through `writeTrigger`
+ * as a CAS against what was read. A lost CAS (a poller recorded a fire in between) re-reads and decides
+ * again on the new state, so a transition never overwrites a fire it did not see — the fire counter in
+ * particular never moves backwards, which would point a later fire at a finished run.
+ */
+async function transitionTrigger(
+  journal: Journal,
+  fn: string,
+  ref: TriggerRef,
+  decide: (def: TriggerDef, state: TriggerState) => Decision,
+): Promise<{ id: string; def?: TriggerDef; state?: TriggerState; done: boolean }> {
+  journal = rootJournal(journal, fn);
+  if (typeof ref?.id !== 'string' || ref.id === '') {
+    throw new TypeError(`@gnldev/scheduler: ${fn} needs the trigger's id (a non-empty string) — the one scheduleWorkflow was given, or the workflow name.`);
+  }
+  const owner = triggerOwnerOf(ref);
+  if (owner.orgId !== undefined) orgPrefix(owner.orgId);
+  const id = ownedName(ref.id, { resourceId: owner.resourceId, orgId: owner.orgId });
+  for (let tries = 0; tries < 8; tries++) {
+    const def = await journal.get<TriggerDef>(DEF(id));
+    const state = await journal.get<TriggerState>(STATE(id));
+    if (!def || !state) return { id, ...(def ? { def } : {}), done: false };
+    const next = decide(def, state);
+    if (typeof next === 'boolean') return { id, def, state, done: next };
+    if (await writeTrigger(journal, id, def, next, state)) return { id, def, state: next, done: true };
+  }
+  throw new Error(`@gnldev/scheduler: ${fn}('${id}') — the trigger's state changed on every one of 8 reads (a poller firing it in a tight loop?). Nothing was changed; call it again.`);
+}
+
+/**
+ * Removes a trigger: it never fires again and `listTriggers` no longer shows it. Returns `true` when it
+ * was removed by this call, `false` when there was nothing to remove (no such trigger, or already removed).
+ *
+ * A fire already in flight finishes — the run is not aborted — and its result is not recorded: the
+ * removal wins the state's CAS, so a late fire cannot bring the trigger back.
+ *
+ * The record stays as a tombstone (`status: 'removed'`) rather than being deleted: deleting the two
+ * halves is two writes, and a definition left without its state is what the next boot's
+ * `scheduleWorkflow` repairs — the trigger would come back. Calling `scheduleWorkflow` for the id again
+ * is a new trigger (any spec), with run ids the removed one never used. If your boot code registers the
+ * trigger, remove that registration too, or the next boot schedules it again — which is what it says.
+ * `triggerEraser` deletes a person's tombstones with the rest of their triggers.
+ */
+export async function unscheduleWorkflow(journal: Journal, ref: TriggerRef): Promise<boolean> {
+  const r = await transitionTrigger(journal, 'unscheduleWorkflow', ref, (_def, state) =>
+    state.status === 'removed' ? false : { ...state, status: 'removed' });
+  if (!r.done && r.def !== undefined && r.state === undefined) {
+    // A definition whose state was lost (a too-wide purge): invisible now, re-created by the next boot.
+    // Write the tombstone so it stays removed.
+    await writeTrigger(journal, r.id, r.def, { nextRunAt: 0, attempts: 0, fireCount: await fireCountAfterLoss(journal, r.id), status: 'removed' });
+    return true;
+  }
+  return r.done;
+}
+
+/**
+ * Stops a trigger from firing until `resumeTrigger`, keeping its schedule, counter and attempts.
+ * Returns `true` when the trigger is paused (also when it already was), `false` when there is nothing
+ * to pause: no such trigger, or one that is removed, `done` or `failed`.
+ *
+ * Re-registering the same spec on boot does not lift a pause, and neither does `ifExists: 'replace'`.
+ * A fire already in flight finishes and is recorded under the pause (its counter advances, the
+ * trigger stays paused), so resuming never runs that occurrence a second time.
+ */
+export async function pauseTrigger(journal: Journal, ref: TriggerRef): Promise<boolean> {
+  return (await transitionTrigger(journal, 'pauseTrigger', ref, (_def, state) =>
+    state.status === 'paused' ? true : state.status !== 'pending' ? false : { ...state, status: 'paused' })).done;
+}
+
+/**
+ * Lets a paused trigger fire again. Returns `true` when it is pending (also when it was not paused),
+ * `false` when there is nothing to resume: no such trigger, or one that is removed, `done` or `failed`.
+ *
+ * NO CATCH-UP. The occurrences that fell inside the pause are not run, whatever `misfire` says: the
+ * pause was the decision not to run them, and `misfire` is for occurrences missed because no poller
+ * ran. The next fire is the schedule's first slot after `now` — on the same grid for `every`, the next
+ * match for `cron`. A one-shot (`at`) whose time passed during the pause fires once, right away:
+ * skipping its only occurrence would be deleting it.
+ */
+export async function resumeTrigger(journal: Journal, ref: TriggerRef, now: number = Date.now()): Promise<boolean> {
+  return (await transitionTrigger(journal, 'resumeTrigger', ref, (def, state) => {
+    if (state.status === 'pending') return true;
+    if (state.status !== 'paused') return false;
+    return { ...state, status: 'pending', nextRunAt: resumedRunAt(def, state, now) };
+  })).done;
+}
+
+/** The first slot after `now` (see `resumeTrigger`) — the schedule's grid, never the missed slots. */
+function resumedRunAt(def: TriggerDef, state: TriggerState, now: number): number {
+  if (def.kind === 'at' || state.nextRunAt > now) return state.nextRunAt;
+  if (def.kind === 'every') {
+    const interval = def.value as number;
+    return state.nextRunAt + interval * (Math.floor((now - state.nextRunAt) / interval) + 1);
+  }
+  return nextCronTime(def.value as string, now, def.tz);
+}
+
 export interface Scheduler {
   poll(now?: number): Promise<PollResult>;
   start(): void;
@@ -844,14 +1124,16 @@ export interface Scheduler {
 export function createScheduler(
   journal: Journal,
   runner: WorkflowRunner,
-  opts: { pollMs?: number; owner?: string; retryMs?: number; backoff?: boolean; maxPollMs?: number; budgetGuard?: BudgetGuard; lockTtlMs?: number; runnerForOrg?: RunnerForOrg } = {},
+  opts: { pollMs?: number; owner?: string; retryMs?: number; backoff?: boolean; maxPollMs?: number; budgetGuard?: BudgetGuard; lockTtlMs?: number; runnerForOrg?: RunnerForOrg; onInvalidTime?: InvalidTimePolicy } = {},
 ): Scheduler {
-  assertRootJournal(journal, 'createScheduler');
+  refuseUnknownNames('createScheduler', opts, CREATE_SCHEDULER_OPTS_NAMES);
+  journal = rootJournal(journal, 'createScheduler');
+  const onInvalidTime = invalidTimePolicy(opts.onInvalidTime, 'createScheduler');
   const pollMs = opts.pollMs ?? 1000;
   const backoffOn = opts.backoff ?? false;
   const maxPollMs = opts.maxPollMs ?? pollMs * 32;
   const poll = (now: number = Date.now()) =>
-    pollScheduler(journal, runner, now, { owner: opts.owner, retryMs: opts.retryMs, budgetGuard: opts.budgetGuard, lockTtlMs: opts.lockTtlMs, runnerForOrg: opts.runnerForOrg });
+    pollScheduler(journal, runner, now, { owner: opts.owner, retryMs: opts.retryMs, budgetGuard: opts.budgetGuard, lockTtlMs: opts.lockTtlMs, runnerForOrg: opts.runnerForOrg, onInvalidTime });
 
   // Phase 8.1: the tick/backoff/"polling" flag loop now lives in @gnldev/durable's shared createPollLoop
   // (it used to be triplicated across queue/events/scheduler) — behavior is identical: pollScheduler only
@@ -888,7 +1170,8 @@ export async function moveTrigger(
   fromId: string,
   to: Pick<ScheduleSpec, 'caller' | 'resourceId' | 'orgId'>,
 ): Promise<string | null> {
-  assertRootJournal(journal, 'moveTrigger');
+  refuseUnknownNames('moveTrigger', to, MOVE_TRIGGER_TO_NAMES);
+  journal = rootJournal(journal, 'moveTrigger');
   const from = ownerOfName(fromId);
   if (from.resourceId !== undefined || from.orgId !== undefined) {
     throw new TypeError(`@gnldev/scheduler: moveTrigger('${fromId}') — that trigger already has an owner; only a system trigger is moved.`);
@@ -913,13 +1196,8 @@ export async function moveTrigger(
     await writeTrigger(journal, toId, toDef ?? ({ ...rest, ...owner } satisfies TriggerDef), carried);
   }
   if (state.status === 'pending') {
-    const retired: TriggerState = { ...state, status: 'done', movedTo: toId };
-    if (journal.putIfMatch) {
-      if (!(await journal.putIfMatch(STATE(fromId), state, retired))) {
-        throw new Error(`@gnldev/scheduler: moveTrigger('${fromId}') — the trigger fired while it was being moved; stop the pollers and run it again.`);
-      }
-    } else {
-      await journal.put(STATE(fromId), retired);
+    if (!(await writeTrigger(journal, fromId, def, { ...state, status: 'done', movedTo: toId }, state))) {
+      throw new Error(`@gnldev/scheduler: moveTrigger('${fromId}') — the trigger fired while it was being moved; stop the pollers and run it again.`);
     }
   }
   return toId;
@@ -940,7 +1218,7 @@ export interface SubjectEraser {
  * Refuses a journal that cannot `deletePrefix` rather than report a partial erasure as done.
  */
 export function triggerEraser(journal: Journal): SubjectEraser {
-  assertRootJournal(journal, 'triggerEraser');
+  journal = rootJournal(journal, 'triggerEraser');
   return {
     name: 'triggers',
     async erase(owner) {

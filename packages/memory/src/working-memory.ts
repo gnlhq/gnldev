@@ -2,6 +2,8 @@
 // The tool is wrapped with durableTool inside runDurable → the merge result is journaled (exactly-once; no double-write on resume).
 import { tool } from 'ai';
 import { z } from 'zod';
+import { refuseUnknownNames } from '@gnldev/options';
+import { WORKING_MEMORY_NAMES } from './option-names.js';
 
 export interface WorkingMemoryConfig {
   /** Structured WM schema (zod). Also determines the updateWorkingMemory input. */
@@ -36,6 +38,7 @@ export function createWorkingMemoryTool(opts: {
 
 /** Dump the current WM + schema/template into the system message (a `<working_memory>` tag, the common pattern). */
 export function renderWorkingMemorySystem(current: Record<string, unknown>, cfg: WorkingMemoryConfig): string {
+  refuseUnknownNames('workingMemory', cfg, WORKING_MEMORY_NAMES);
   const body = cfg.template ?? JSON.stringify(current, null, 2);
   const shape = cfg.schema && (cfg.schema as any).shape ? Object.keys((cfg.schema as any).shape) : [];
   const fields = shape.length ? `\nFields: ${shape.join(', ')}` : '';

@@ -80,6 +80,7 @@ export function inputText(input: unknown): string | undefined {
  * THE sample a scorer is given, from whatever a runner has: `input` in any shape a run or case takes
  * (read as text by `inputText`), and the other fields as they are. A field with nothing in it is left
  * out rather than set to `undefined`, so a scorer's `'input' in sample` means what it says.
+ * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
  */
 export function scoreSample(fields: {
   output: string;
@@ -156,6 +157,7 @@ export async function recordRunOutput(journal: Journal, runId: string, text: str
  *
  * `input` overrides the frozen question (scoreRun's `opts.input`, for a wrapped prompt). A journal that
  * cannot be read by key (a bare reader) gives no question rather than a wrong one, and no `:output`.
+ * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
  */
 export async function runScoreSample(
   journal: { get?: Journal['get'] },

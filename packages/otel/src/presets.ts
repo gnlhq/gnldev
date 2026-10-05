@@ -4,6 +4,8 @@
 // GNL never sends to an endpoint on its own — a preset only produces CONFIGURATION (pure functions).
 // Endpoint addresses are the defaults from the provider's documentation; every preset has an `endpoint` override.
 import type { ExportRunToOtlpOptions } from './otlp.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { LANGFUSE_NAMES, API_KEY_OTLP_NAMES, BRAINTRUST_NAMES, HONEYCOMB_NAMES, DATADOG_AGENT_NAMES, COLLECTOR_NAMES } from './option-names.js';
 
 type Overrides = Partial<Pick<ExportRunToOtlpOptions, 'endpoint' | 'serviceName' | 'resourceAttributes'>>;
 
@@ -56,6 +58,7 @@ export function langfuse(opts: {
   /** Base URL for self-hosted (e.g. 'https://langfuse.acme.internal'). */
   baseUrl?: string;
 } & Overrides): ExportRunToOtlpOptions {
+  refuseUnknownNames('langfuse', opts, LANGFUSE_NAMES);
   const base = opts.baseUrl ?? (opts.region === 'us' ? 'https://us.cloud.langfuse.com' : 'https://cloud.langfuse.com');
   return {
     endpoint: opts.endpoint ?? otlpEndpoint(base, '/api/public/otel/v1/traces'),
@@ -69,6 +72,7 @@ export function langfuse(opts: {
  * `endpoint` is REQUIRED — unlike the other presets this has no hardcoded provider default, so it
  * works with any OTLP/HTTP collector that authenticates via an `x-api-key`-style header. */
 export function apiKeyOtlp(opts: { endpoint: string; apiKey: string; project?: string; projectHeader?: string } & Overrides): ExportRunToOtlpOptions {
+  refuseUnknownNames('apiKeyOtlp', opts, API_KEY_OTLP_NAMES);
   return {
     endpoint: opts.endpoint,
     headers: { 'x-api-key': opts.apiKey, ...(opts.project ? { [opts.projectHeader ?? 'x-project']: opts.project } : {}) },
@@ -79,6 +83,7 @@ export function apiKeyOtlp(opts: { endpoint: string; apiKey: string; project?: s
 
 /** Braintrust: Bearer + x-bt-parent (project). */
 export function braintrust(opts: { apiKey: string; project: string } & Overrides): ExportRunToOtlpOptions {
+  refuseUnknownNames('braintrust', opts, BRAINTRUST_NAMES);
   return {
     endpoint: opts.endpoint ?? 'https://api.braintrust.dev/otel/v1/traces',
     headers: { authorization: `Bearer ${opts.apiKey}`, 'x-bt-parent': `project_name:${opts.project}` },
@@ -89,6 +94,7 @@ export function braintrust(opts: { apiKey: string; project: string } & Overrides
 
 /** Honeycomb: x-honeycomb-team (+ optional dataset — for classic accounts). */
 export function honeycomb(opts: { apiKey: string; dataset?: string } & Overrides): ExportRunToOtlpOptions {
+  refuseUnknownNames('honeycomb', opts, HONEYCOMB_NAMES);
   return {
     endpoint: opts.endpoint ?? 'https://api.honeycomb.io/v1/traces',
     headers: { 'x-honeycomb-team': opts.apiKey, ...(opts.dataset ? { 'x-honeycomb-dataset': opts.dataset } : {}) },
@@ -99,6 +105,7 @@ export function honeycomb(opts: { apiKey: string; dataset?: string } & Overrides
 
 /** Datadog: via the local Datadog Agent's OTLP receiver (OTLP ingest must be enabled on the Agent). */
 export function datadogAgent(opts: { host?: string; port?: number } & Overrides = {}): ExportRunToOtlpOptions {
+  refuseUnknownNames('datadogAgent', opts, DATADOG_AGENT_NAMES);
   const host = opts.host ?? 'localhost';
   const port = opts.port ?? 4318;
   return {
@@ -110,6 +117,7 @@ export function datadogAgent(opts: { host?: string; port?: number } & Overrides 
 
 /** Generic OTel Collector / Jaeger / Tempo: just give the base URL (`/v1/traces` is appended). */
 export function collector(opts: { baseUrl: string; headers?: Record<string, string> } & Overrides): ExportRunToOtlpOptions {
+  refuseUnknownNames('collector', opts, COLLECTOR_NAMES);
   return {
     endpoint: opts.endpoint ?? otlpEndpoint(opts.baseUrl, '/v1/traces'),
     headers: opts.headers,

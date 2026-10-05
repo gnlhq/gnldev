@@ -1,6 +1,8 @@
 import { runScoreSample, scoreRunMemoized, assertDistinctScorerNames } from '@gnldev/durable';
 import type { JournalReader, Journal, JournalEntry } from '@gnldev/durable';
 import type { Scorer, ScoreResult, ScoreSample } from './scorer.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { SCORE_RUN_OPTS_NAMES } from './option-names.js';
 
 export interface ScoreRunResult {
   runId: string;
@@ -46,6 +48,7 @@ export async function scoreRun(
   scorers: Scorer[],
   opts: ScoreRunOptions = {},
 ): Promise<ScoreRunResult> {
+  refuseUnknownNames('scoreRun', opts, SCORE_RUN_OPTS_NAMES);
   assertDistinctScorerNames(scorers, '@gnldev/evals scoreRun');
   const entries = await reader.readRun(runId);
   const j = reader as Partial<Journal>;

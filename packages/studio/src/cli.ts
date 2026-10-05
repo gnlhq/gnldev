@@ -37,41 +37,17 @@ async function main(): Promise<void> {
   if (configPath) {
     // -config: load gnl.config → createGnl + Playground (run agents in the browser / streaming).
     const { pathToFileURL } = await import('node:url');
-    const { resolve, dirname, join } = await import('node:path');
-    const { createRequire } = await import('node:module');
+    const { resolve } = await import('node:path');
     const configFile = resolve(configPath);
-    const projectDir = dirname(configFile);
     const mod: any = await import(pathToFileURL(configFile).href);
     const cfg = mod.default ?? mod.config ?? mod;
     const { createGnl } = await import('@gnldev/durable');
-    // Dev default: if the config has storage, derive memory so Playground conversations become threads —
-    // this is what powers the History sidebar (thread list + resume). @gnldev/studio deliberately does NOT
-    // depend on @gnldev/memory (it stays lean; memory is optional), so it's resolved dynamically from the
-    // PROJECT (the dir gnl.config lives in) — the same "resolved from the project" pattern @gnldev/cli's
-    // runtime.ts uses (createRequire from projectDir, NOT from @gnldev/studio's own location, so a real
-    // project's `node_modules/@gnldev/memory` is found). Absent/unresolvable → the Playground still runs,
-    // just without the thread list (prior behavior, no crash).
-    let memory: StudioAppOptions['memory'] | undefined;
-    let memoryFactory: ((storage: unknown) => unknown) | undefined;
-    if (cfg.storage) {
-      const req = createRequire(join(projectDir, 'noop.js'));
-      const mem: any = await (async () => {
-        try { return await import(pathToFileURL(req.resolve('@gnldev/memory')).href); }
-        catch { return undefined; }
-      })();
-      if (mem?.memoryPreset) {
-        // Handed over as it is: Studio's memory type is picked from @gnldev/durable's `Memory`, which
-        // AgentMemory implements. The hand-written adapter that stood here forwarded six methods and
-        // missed the seventh, so this command's "delete messages after" answered 501.
-        memory = mem.memoryPreset(cfg.storage, 'chat');
-        // createGnl's memoryFactory is what makes Playground RUNS write to a thread (the view above only
-        // reads). Respect a user-provided factory in the config; otherwise use the 'chat' preset.
-        memoryFactory = cfg.memoryFactory ?? ((storage: unknown) => mem.memoryPreset(storage, 'chat'));
-      } else {
-        console.warn('gnl studio: config has storage but @gnldev/memory could not be resolved — Playground works, but the thread list/history is off. Install @gnldev/memory in the project to enable it.');
-      }
-    }
-    const gnl = createGnl(memoryFactory ? { ...cfg, memoryFactory } : cfg);
+    // The config as given — the one the project deploys. This used to hand the Playground a memory
+    // store derived from `storage` when the config had none, so conversations remembered here and
+    // forgot after deploy; `gnl dev` and `gnl studio` (@gnldev/cli) stopped for the same reason. The
+    // History sidebar reads the engine's own memory: on when the config has one, off when it does not.
+    const gnl = createGnl(cfg);
+    const memory: StudioAppOptions['memory'] | undefined = gnl.memory;
     const reader = cfg.storage ? toJournal(cfg.storage.runs) : cfg.journal;
     // The Playground renders a form from each tool's input schema, which is the only thing that needs
     // the AI SDK. Loaded here rather than at the top of the file so the inspector path stays `ai`-free.

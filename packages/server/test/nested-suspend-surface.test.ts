@@ -96,7 +96,8 @@ describe('SSE: iç içe askıda çocuğun kimliği yüzeye çıkar', () => {
     const interrupt = events.find((e) => e.event === 'interrupt');
     expect(interrupt, 'askı hiç yüzeye çıkmadı').toBeDefined();
     const ids = (interrupt!.data.interrupts as Array<{ toolCallId?: string }>).map((i) => i.toolCallId);
-    expect(ids, 'ekranda vekil id gösteriliyor — onay sessiz no-op\'a düşer').toEqual([CHILD_TCID]);
+    // The child's question, addressed from the parent: `<delegation call>/<child call>`.
+    expect(ids, 'ekranda vekil id gösteriliyor — onay sessiz no-op\'a düşer').toEqual([`${PROXY_TCID}/${CHILD_TCID}`]);
     expect(ids).not.toContain(PROXY_TCID);
     expect(charges.n).toBe(0);
   });

@@ -1,6 +1,8 @@
 import type { JournalReader } from './journal.js';
 import { DEFAULT_PRICING, priceFor, costOf, effectivePricingTable, type ModelPricing } from './pricing.js';
 import { flattenUsage, finishReasonText } from './sdk-compat.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { RUN_COST_NAMES } from './option-names.js';
 
 // Cost ledger & trace export — computed POST-HOC from the journal → exact, deterministic, replayable.
 // (As opposed to a typical "approximate/async" cost guard: ours is derived verbatim from journaled usage.)
@@ -73,6 +75,7 @@ export function modelRecordFacts(value: unknown): { usage: unknown; modelId: str
 }
 
 export function usageAndCostFromModelValue(value: unknown, opts: RunCostOptions = {}): ModelStepUsage | undefined {
+  refuseUnknownNames('usageAndCostFromModelValue', opts, RUN_COST_NAMES);
   const table = opts.pricing ?? DEFAULT_PRICING;
   const facts = modelRecordFacts(value);
   if (!facts.usage) return undefined;
@@ -103,6 +106,7 @@ export async function getRunCost(
   runId: string,
   opts: RunCostOptions = {},
 ): Promise<RunCost> {
+  refuseUnknownNames('getRunCost', opts, RUN_COST_NAMES);
   // The journal's `__pricing__` document, when the caller did not hand us a table. Provider list prices
   // change on their own schedule, and a table compiled into this package can only be corrected by
   // shipping a release — the wrong loop for someone whose ceiling is mispriced today.

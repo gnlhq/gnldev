@@ -21,6 +21,8 @@ import type {
 // P2-migrate schema introspection/migration façade — see migrate.ts's header.
 import { tablesFromDDL } from './migrate.js';
 import type { SchemaCheckResult, SchemaMigrationResult, MissingColumn } from './migrate.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { ADOPT_INTO_ORG_NAMES, MIGRATE_SCHEMA_NAMES } from './option-names.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
 
@@ -135,6 +137,14 @@ function retryOnBusy<T>(fn: () => T): T {
  * is safe to repeat — a single statement — instead of leaving it to each caller to get right.
  */
 class BusyRetryDatabase {
+  /**
+   * Prepared statements, by their SQL. Every call prepared its SQL afresh: profiled on a fan-out of 200
+   * sub-agents, `prepare` was 36% of busy time — the same few SELECTs, compiled again on every read.
+   * A statement here is only ever `run`/`get`/`all` to completion (never iterated), so reusing one is
+   * safe. Bounded: dynamic SQL (an IN list of variable length) cannot grow it without limit.
+   */
+  private readonly statements = new Map<string, any>();
+  private static readonly MAX_STATEMENTS = 256;
   constructor(readonly inner: any) {}
   exec(sql: string): unknown {
     // Multi-statement `exec` is used ONLY for BEGIN/COMMIT/ROLLBACK, pragmas and the idempotent
@@ -142,14 +152,19 @@ class BusyRetryDatabase {
     return retryOnBusy(() => this.inner.exec(sql));
   }
   prepare(sql: string): { run: (...a: any[]) => any; get: (...a: any[]) => any; all: (...a: any[]) => any } {
-    const stmt = retryOnBusy(() => this.inner.prepare(sql));
+    let stmt = this.statements.get(sql);
+    if (stmt === undefined) {
+      stmt = retryOnBusy(() => this.inner.prepare(sql));
+      if (this.statements.size >= BusyRetryDatabase.MAX_STATEMENTS) this.statements.delete(this.statements.keys().next().value!);
+      this.statements.set(sql, stmt);
+    }
     return {
       run: (...a: any[]) => retryOnBusy(() => stmt.run(...a)),
       get: (...a: any[]) => retryOnBusy(() => stmt.get(...a)),
       all: (...a: any[]) => retryOnBusy(() => stmt.all(...a)),
     };
   }
-  close(): void { this.inner.close(); }
+  close(): void { this.statements.clear(); this.inner.close(); }
 }
 
 function offset(q?: ListQuery): { start: number; limit: number } {
@@ -377,6 +392,7 @@ export class SqliteStorage implements Storage {
    * trailing colon, matching what `withOrgStorage` writes.
    */
   async adoptIntoOrg(orgId: string, opts?: { dryRun?: boolean; allowUnregistered?: boolean; allowInFlight?: boolean }): Promise<AdoptIntoOrgResult> {
+    refuseUnknownNames('adoptIntoOrg', opts, ADOPT_INTO_ORG_NAMES);
     const prefix = orgPrefix(orgId);               // throws on '' or a ':'-bearing id — one guard, shared
     await assertOrgRegistered(this.runs, orgId, opts?.allowUnregistered);
     await assertNoRunsInFlight(this.runs, opts?.allowInFlight);
@@ -544,6 +560,7 @@ export class SqliteStorage implements Storage {
    * source of truth). `dryRun: true` returns the statements it WOULD run without touching the DB.
    */
   async migrateSchema(opts?: { dryRun?: boolean }): Promise<SchemaMigrationResult> {
+    refuseUnknownNames('migrateSchema', opts, MIGRATE_SCHEMA_NAMES);
     const check = await this.checkSchema();
     const expected = tablesFromDDL(DDL);
     const ddlStatements = DDL.split(';').map((s) => s.trim()).filter(Boolean);
@@ -811,8 +828,13 @@ class SqliteRunJournal implements RunJournal {
   }
 
   /** H8a: engine-internal atomic counter (UPSERT arithmetic) — lost-update is impossible. */
-  async incrBy(key: string, fields: Record<string, number>): Promise<void> {
-    this.incrByCore(key, fields);
+  async incrBy(key: string, fields: Record<string, number>): Promise<Record<string, number>> {
+    const st = this.db.prepare(
+      'INSERT INTO gnl_counters (key, field, value) VALUES (?, ?, ?) ON CONFLICT(key, field) DO UPDATE SET value = value + excluded.value RETURNING value',
+    );
+    const after: Record<string, number> = {};
+    for (const [f, d] of Object.entries(fields)) after[f] = Number((st.get(key, f, d) as { value: number }).value);
+    return after;
   }
   /** SYNC core of incrBy — shared with applyBatch (await-free transaction requirement). */
   private incrByCore(key: string, fields: Record<string, number>): void {
@@ -951,13 +973,14 @@ class SqliteRunJournal implements RunJournal {
       : '';
     const statusParams: unknown[] = [];
     const toSummary = (r: RunRow): RunSummary => {
-      const input = r.input_val ? deserialize<{ threadId?: string; agent?: string; resourceId?: string; workKey?: string }>(r.input_val) : undefined;
+      const input = r.input_val ? deserialize<{ threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string }>(r.input_val) : undefined;
       return {
         runId: r.run_id, status: deriveRunStatus(!!r.suspended, outcomeOfRow(r)), modelSteps: r.model_steps, toolCalls: r.tool_calls,
         ...(input?.threadId ? { threadId: input.threadId } : {}),
         ...(input?.agent ? { agent: input.agent } : {}),
         ...(input?.resourceId ? { resourceId: input.resourceId } : {}),
         ...(input?.workKey ? { workKey: input.workKey } : {}),
+        ...(input?.parentRunId ? { parentRunId: input.parentRunId } : {}),
       };
     };
     // `agent`, `resourceId` and `workKey` share ONE path: none is a column, all three live inside the
@@ -965,7 +988,7 @@ class SqliteRunJournal implements RunJournal {
     // rather than three so a request carrying more than one cannot take a branch that applies only
     // some of them — and so the filter-BEFORE-slice contract (JournalReader.listRunsPaged) is
     // satisfied once, not per filter.
-    if (q?.agent || q?.resourceId || q?.workKey) {
+    if (q?.agent || q?.resourceId || q?.workKey || q?.topLevel) {
       const rows = this.db.prepare(
         `SELECT r.run_id, r.model_steps, r.tool_calls, r.suspended, r.failed, r.running, r.canceled,
                 (SELECT value FROM gnl_run_journal WHERE key = r.run_id || ':input') AS input_val
@@ -973,7 +996,7 @@ class SqliteRunJournal implements RunJournal {
       ).all(...statusParams) as RunRow[];
       const all = rows.map(toSummary)
         .filter((r) => (q.agent ? r.agent === q.agent : true) && (q.resourceId ? r.resourceId === q.resourceId : true)
-          && (q.workKey ? r.workKey === q.workKey : true));
+          && (q.workKey ? r.workKey === q.workKey : true) && (q.topLevel ? !r.parentRunId : true));
       return pageOf(all.slice(start, start + limit), start, limit, all.length);
     }
     const total = (this.db.prepare(`SELECT COUNT(*) AS n FROM gnl_runs${statusWhere}`).get(...statusParams) as { n: number }).n;

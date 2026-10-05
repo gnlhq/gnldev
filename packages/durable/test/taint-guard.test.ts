@@ -57,7 +57,7 @@ const taintWarns = (spy: ReturnType<typeof vi.spyOn>) =>
   spy.mock.calls.filter((c) => String(c[0]).includes('untrusted external content'));
 
 describe('taint-aware guard (taintedSideEffects)', () => {
-  it('counterfactual: the SAME flow is silent when the source is unmarked, and NAMED when marked (default "warn")', async () => {
+  it('counterfactual: the SAME flow is silent when the source is unmarked, and ASKED ABOUT when marked (default "suspend")', async () => {
     // Unmarked → no taint, no warn — the feature costs nothing until a source is declared.
     const warn1 = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const j1 = new InMemoryJournal();
@@ -68,15 +68,14 @@ describe('taint-aware guard (taintedSideEffects)', () => {
     expect(await readRunTaint(j1, 'tc-1')).toBeUndefined();
     vi.restoreAllMocks();
 
-    // Marked → the POST-taint send is named (executes — 'warn' changes no behavior), with provenance.
-    const warn2 = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Marked → the POST-taint send is NOT executed: the run stops for a human, with provenance.
     const j2 = new InMemoryJournal();
     const c2 = { fetches: 0, sends: 0 };
-    await runDurable({ runId: 'tc-2', journal: j2, model: sandwichModel(), tools: makeTools(c2, { untrusted: true }), prompt: 'go', stopWhen: stepCountIs(10) });
-    expect(c2.sends).toBe(2); // 'warn' prevents nothing — silence is what it kills
-    const warns = taintWarns(warn2);
-    expect(warns).toHaveLength(1); // ONLY the post-taint send (call-3), not the pre-taint one
-    expect(String(warns[0][0])).toContain("'fetchPage' (call-2)"); // provenance: the exact source
+    const res2 = await runDurable({ runId: 'tc-2', journal: j2, model: sandwichModel(), tools: makeTools(c2, { untrusted: true }), prompt: 'go', stopWhen: stepCountIs(10) });
+    expect(c2.sends).toBe(1); // ONLY the pre-taint send ran
+    expect(res2.interrupts).toHaveLength(1); // the post-taint send (call-3) waits for a human
+    expect(res2.interrupts[0]).toMatchObject({ toolCallId: 'call-3', toolName: 'sendMoney' });
+    expect(String(res2.interrupts[0]!.reason)).toContain("'fetchPage' (call-2)"); // provenance: the exact source
     const taint = await readRunTaint(j2, 'tc-2');
     expect(taint).toMatchObject({ toolCallId: 'call-2', toolName: 'fetchPage', source: 'tool' });
   });
@@ -214,10 +213,11 @@ describe('taint-aware guard (taintedSideEffects)', () => {
       if (done === 0) return toolCallResult('sendMoney', 'call-1', { iban: 'X' });
       return finalTextResult('Done.');
     });
-    await runDurable({ runId: 'td-1', journal, model, tools: makeTools(counters, { untrusted: false }), prompt: 'go', stopWhen: stepCountIs(10) });
-    expect(counters.sends).toBe(1); // default 'warn' — executed
-    expect(taintWarns(warn)).toHaveLength(1);
-    expect(String(taintWarns(warn)[0][0])).toContain("'injection-detector'"); // dynamic provenance
+    const res = await runDurable({ runId: 'td-1', journal, model, tools: makeTools(counters, { untrusted: false }), prompt: 'go', stopWhen: stepCountIs(10) });
+    expect(counters.sends).toBe(0); // default 'suspend' — not executed, asked about
+    expect(res.interrupts).toHaveLength(1);
+    expect(String(res.interrupts[0]!.reason)).toContain("'injection-detector'"); // dynamic provenance
+    expect(taintWarns(warn)).toHaveLength(0); // a question, not a console line
   });
 
   it("read-only tools (idempotent: true) are never gated, even fully tainted with 'block'", async () => {
@@ -242,7 +242,9 @@ describe('taint-aware guard (taintedSideEffects)', () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const journal = new InMemoryJournal();
     const counters = { fetches: 0, sends: 0 };
-    await runDurable({ runId: 'ti-1', journal, model: sandwichModel(), tools: makeTools(counters, { untrusted: true }), prompt: 'go', stopWhen: stepCountIs(10) });
+    // The rung is set explicitly: this test is about the provenance in the record, not the default
+    // (which is now 'suspend' — pinned in the counterfactual above).
+    await runDurable({ runId: 'ti-1', journal, model: sandwichModel(), tools: makeTools(counters, { untrusted: true }), prompt: 'go', stopWhen: stepCountIs(10), limits: { taintedSideEffects: 'warn' } });
     const incidents = await readIncidents(journal, 'ti-1');
     expect(incidents).toHaveLength(1);
     expect(incidents[0]).toMatchObject({ source: 'taint-guard', action: 'warn', toolName: 'sendMoney', toolCallId: 'call-3' });

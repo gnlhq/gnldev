@@ -29,7 +29,7 @@ export function buildServer(opts: {
   // and `exportRun`/`getRunCost` take the older `JournalReader`; `toJournal` is the adapter that
   // exists for exactly this, and passing the raw journal is a type error rather than a silent
   // mismatch — the examples had no typecheck to report it until now.
-  const journal = toJournal(storage.runs);
+  const journal = toJournal(storage);
   const app = new Hono();
 
   // K1: gnl.run/resume (messages, approve) are called without try/catch — a double-clicked approval or

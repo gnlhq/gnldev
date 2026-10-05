@@ -48,10 +48,9 @@ describe('normalizeAuth on an unrecognised object', () => {
     expect(normalizeAuth(undefined)).toBeUndefined();
   });
 
-  it('the old behaviour really was allow-all, so this is a fix and not a rename', async () => {
-    // Reconstructed through the public helper: fromReadWrite over an object with neither direction is
-    // exactly what normalizeAuth used to build from a credential map.
-    const asItWas = fromReadWrite({ admin: { token: 's3cret' } } as never);
-    expect(await asItWas.authorize(null as never, req(), ctx)).toEqual({ allow: true });
+  it('fromReadWrite, which used to build that allow-all provider from a credential map, refuses it too', () => {
+    // fromReadWrite over an object with neither direction is exactly what normalizeAuth used to build
+    // from a credential map, and it allowed everything. A name that is no direction is refused now.
+    expect(() => fromReadWrite({ admin: { token: 's3cret' } } as never)).toThrow(/auth: `admin` is not an option/);
   });
 });

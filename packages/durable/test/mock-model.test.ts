@@ -80,12 +80,15 @@ describe('the mock models emit finishReason as {unified, raw}', () => {
     expect(r.content[0].type).toBe('text');
   });
 
-  it('toolCallingModel doStream: the finish part carries finishReason.unified === "stop"', async () => {
-    const { stream } = await chargeModel.doStream({ prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] });
-    const finishPart = (await drain(stream)).find((p) => p.type === 'finish');
-    expect(finishPart).toBeTruthy();
-    expect(typeof finishPart.finishReason).toBe('object');
-    expect(finishPart.finishReason.unified).toBe('stop');
+  // Both turns, because the stream follows the same script as doGenerate: the first turn calls the
+  // tool ('tool-calls'), the turn after a tool result answers ('stop'). It used to say 'stop' on the
+  // first turn — the streamed half of the script never called the tool.
+  it('toolCallingModel doStream: the finish part carries finishReason.unified on both turns', async () => {
+    const first = (await drain((await chargeModel.doStream({ prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })).stream)).find((p) => p.type === 'finish');
+    expect(typeof first?.finishReason).toBe('object');
+    expect(first.finishReason.unified).toBe('tool-calls');
+    const after = (await drain((await chargeModel.doStream({ prompt: AFTER_TOOL_PROMPT })).stream)).find((p) => p.type === 'finish');
+    expect(after.finishReason.unified).toBe('stop');
   });
 
   // Guards the OTHER half of the same v4 migration, which is what made the finish-reason half easy to

@@ -1,6 +1,8 @@
 import { createRequire } from 'node:module';
 import { vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, VECTOR_DOCUMENT_KEY, vectorFilterDocument } from '@gnldev/durable';
 import type { VectorStore, VectorItem, VectorMatch, QueryOptions, DeleteWhere } from './vector-store.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { POSTGRES_VECTOR_STORE_NAMES, QUERY_NAMES } from './option-names.js';
 
 /** Minimal pg.Pool surface — injectable for tests/custom setups (same pattern as PostgresJournal). */
 export interface PoolLike {
@@ -41,6 +43,7 @@ export class PostgresVectorStore implements VectorStore {
   private ready?: Promise<void>;
 
   constructor(opts: PostgresVectorStoreOptions = {}) {
+    refuseUnknownNames('PostgresVectorStore', opts, POSTGRES_VECTOR_STORE_NAMES);
     this.table = opts.table ?? 'gnl_vectors';
     this.dimension = opts.dimension;
     this.index = opts.index ?? 'hnsw';
@@ -160,6 +163,7 @@ export class PostgresVectorStore implements VectorStore {
    * limited to vector + minScore (keywordWeight is IGNORED even if given). This is a documented, deliberate limit.
    */
   async query(embedding: number[], topK: number, opts?: QueryOptions): Promise<VectorMatch[]> {
+    refuseUnknownNames('query', opts, QUERY_NAMES);
     await this.ensureReady(embedding.length);
     const scope = vectorQueryScope(opts);
     if (scope.none) return [];

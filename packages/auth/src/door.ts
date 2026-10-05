@@ -3,6 +3,7 @@
 // A door (the chat and AG-UI routes, an MCP server) has a web Request and the application's `identify`.
 // It asks `identify` once and maps the answer with `engineCallerOf` — the one mapping (ADR-0002) — so
 // the same principal is the same caller whichever door the request came in through.
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 import type { AuthProvider, Principal } from './types.js';
 import { callerKind, engineCallerOf, type EngineCaller, type Identify } from './scope.js';
 import { markRefusal, notePrincipal, noteVerdict, credentialRejected, CREDENTIAL_REJECTED } from './decision.js';
@@ -116,6 +117,53 @@ export interface DoorGateOptions {
    * (an MCP server over stdio, spawned by its one client, is a legitimate door with no `identify`).
    */
   restMount?: string;
+  /**
+   * Print this door's protections when it is built (default `true`), as @gnldev/server prints its own —
+   * to standard error (`printProtections`). `false` when something else already prints them.
+   */
+  protectionsBanner?: boolean;
+  /**
+   * When the host and cross-site rows are NOT checked, said on the block itself — a door that also
+   * serves messages with no HTTP request (MCP over stdio, a call in process) has nothing to read them
+   * from, and a `✓` with no qualifier would claim a check that never runs there.
+   */
+  uncheckedWhen?: string;
+}
+
+/**
+ * Where every door's protections block goes: standard error, the stream for diagnostics. Not standard
+ * output — an MCP server over stdio speaks JSON-RPC on it, and a CLI's output may be piped into another
+ * program. Measured: a stdio MCP server built with `createMcpServer` put 4 non-JSON lines on the
+ * JSON-RPC channel, and the MCP SDK's client reported 4 parse errors before `initialize`. One function,
+ * so the doors and @gnldev/server cannot disagree about it.
+ */
+export function printProtections(lines: readonly string[]): void {
+  console.error(lines.join('\n'));
+}
+
+/**
+ * The protections only the door decides, one line each: whether callers are named, which hosts an
+ * anonymous caller may address it by, and whether another site may call it from a browser. @gnldev/
+ * server printed its matrix at startup and the standalone doors (chat, AG-UI, MCP, A2A) printed
+ * nothing, so how a door was protected was visible only by reading the code that built it.
+ */
+export function doorProtectionLines(opts: Pick<DoorGateOptions, 'door' | 'identify' | 'allowedHosts' | 'allowCrossSite' | 'uncheckedWhen'>): string[] {
+  const hosts = opts.allowedHosts === true
+    ? '○ host rule    any host — `allowedHosts: true`'
+    : opts.allowedHosts?.length
+      ? `✓ host rule    anonymous callers: localhost, IP addresses, ${opts.allowedHosts.join(', ')} (+ GNL_ALLOWED_HOSTS)`
+      : '✓ host rule    anonymous callers: localhost and IP addresses only (+ GNL_ALLOWED_HOSTS)';
+  return [
+    `gnl ${opts.door} — door protections   ✓ on · ○ off`,
+    opts.identify
+      ? '  ✓ identity     `identify` names each caller; a named caller skips the two rows below'
+      : '  ○ identity     no `identify` — every caller is anonymous and runs as nobody',
+    `  ${hosts}`,
+    opts.allowCrossSite
+      ? '  ○ cross-site   another site may call it from a browser — `allowCrossSite: true`'
+      : '  ✓ cross-site   refused for anonymous callers from another site',
+    ...(opts.uncheckedWhen ? [`  · not checked  host rule and cross-site, for ${opts.uncheckedWhen}`] : []),
+  ];
 }
 
 /** What a door answers when it refuses: the status and the JSON body. */
@@ -144,6 +192,8 @@ export type DoorAdmission = { principal: Principal | undefined; caller: EngineCa
  * does a door with a `restMount` and no `identify` in production.
  */
 export function doorGate(opts: DoorGateOptions): (req: Request, ask?: { named?: unknown; permission?: string }) => Promise<DoorAdmission> {
+  refuseUnknownNames('doorGate', opts, DOOR_GATE_NAMES);
+  if (opts.protectionsBanner !== false) printProtections(doorProtectionLines(opts));
   if (opts.restMount !== undefined && process.env.NODE_ENV === 'production' && !opts.identify) {
     throw new Error(
       `[gnl ${opts.door}] no \`identify\` in production: this door has no auth of its own, so every caller would run the model ` +
@@ -165,3 +215,5 @@ export function doorGate(opts: DoorGateOptions): (req: Request, ask?: { named?: 
     return who;
   };
 }
+
+const DOOR_GATE_NAMES = optionNames<DoorGateOptions>()(['door', 'identify', 'authorize', 'allowedHosts', 'allowCrossSite', 'restMount', 'protectionsBanner', 'uncheckedWhen']);

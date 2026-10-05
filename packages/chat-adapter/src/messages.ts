@@ -18,6 +18,7 @@ import { reconstructState, settleModelContent } from '@gnldev/durable';
 import type { Interrupt, JournalEntry, ReconstructSeed } from '@gnldev/durable';
 import type { UIMessage } from 'ai';
 import { maskSentinelOutput } from './sentinel-mask.js';
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 
 export interface ToUIMessagesOptions {
   /**
@@ -59,6 +60,7 @@ function textFromContent(content: unknown): string {
  * their own `UIMessage` — they're merged into the owning assistant message's tool part.
  */
 export function toUIMessages(entries: JournalEntry[], opts: ToUIMessagesOptions = {}): UIMessage[] {
+  refuseUnknownNames('toUIMessages', opts, optionNames<ToUIMessagesOptions>()(['seed', 'runId']));
   const runId = opts.runId ?? 'run';
   const { messages } = reconstructState(entries, entries.length, opts.seed);
 

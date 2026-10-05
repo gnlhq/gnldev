@@ -11,6 +11,8 @@
 // other, so an org purge sweeps them exactly).
 import { randomUUID } from 'node:crypto';
 import type { Journal } from './journal.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { READ_IDEM_LEDGER_NAMES } from './option-names.js';
 
 export interface IdemConflictRecord {
   at: number;
@@ -64,6 +66,7 @@ export async function readIdemLedger(
   journal: Journal,
   opts: { runId?: string } = {},
 ): Promise<IdemConflictRecord[]> {
+  refuseUnknownNames('readIdemLedger', opts, READ_IDEM_LEDGER_NAMES);
   if (typeof journal.listKeys !== 'function') {
     throw new Error(
       "@gnldev/durable: readIdemLedger requires the journal to implement `listKeys` — without it the ledger cannot be enumerated (an empty answer would misread as 'no conflicts').",

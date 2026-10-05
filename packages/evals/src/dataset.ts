@@ -12,6 +12,8 @@
 import { memoizeScoring, scoreSample, assertDistinctScorerNames, scorerFingerprint } from '@gnldev/durable';
 import type { Journal } from '@gnldev/durable';
 import type { Scorer, ScoreResult } from './scorer.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { EVAL_DATASET_NAMES } from './option-names.js';
 
 export interface DatasetCase {
   id: string;
@@ -137,6 +139,7 @@ async function runPool<T, R>(items: T[], concurrency: number, worker: (item: T, 
 }
 
 export async function evalDataset(opts: EvalDatasetOptions): Promise<EvalDatasetResult> {
+  refuseUnknownNames('evalDataset', opts, EVAL_DATASET_NAMES);
   const { dataset, run, scorers, journal, itemTimeoutMs, signal } = opts;
   assertDistinctScorerNames(scorers, '@gnldev/evals evalDataset');
   const scope = opts.scope ?? dataset.id;

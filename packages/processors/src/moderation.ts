@@ -1,5 +1,8 @@
 import { ProcessorTripwire, recordProcessorReport } from '@gnldev/durable';
 import type { Processor, ProcessorInput, ProcessorOutput, ProcessorCtx } from '@gnldev/durable';
+import { callerText } from './message-text.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { MODERATION_PROCESSOR_NAMES } from './option-names.js';
 
 export interface ModerationOptions {
   /**
@@ -7,21 +10,8 @@ export interface ModerationOptions {
    * (see `moderationProcessor` JSDoc). Not a real security boundary.
    */
   blocklist: string[];
-  /** input/output/both (default: 'both'). */
+  /** input/output/both (default: 'both'). `input` reads what the caller wrote — the prompt and the user messages; `output` the model's final text. */
   on?: 'input' | 'output' | 'both';
-}
-
-function collectText(input: ProcessorInput): string {
-  const parts: string[] = [];
-  if (typeof input.system === 'string') parts.push(input.system);
-  if (typeof input.prompt === 'string') parts.push(input.prompt);
-  for (const m of input.messages ?? []) {
-    if (typeof m?.content === 'string') parts.push(m.content);
-    else if (Array.isArray(m?.content)) {
-      for (const p of m.content) if (typeof p?.text === 'string') parts.push(p.text);
-    }
-  }
-  return parts.join('\n').toLowerCase();
 }
 
 function firstHit(text: string, blocklist: string[]): string | null {
@@ -50,6 +40,7 @@ function firstHit(text: string, blocklist: string[]): string | null {
  *   }
  */
 export function moderationProcessor(opts: ModerationOptions): Processor {
+  refuseUnknownNames('moderationProcessor', opts, MODERATION_PROCESSOR_NAMES);
   const on = opts.on ?? 'both';
   const proc: Processor = { name: 'moderation' };
 
@@ -57,7 +48,7 @@ export function moderationProcessor(opts: ModerationOptions): Processor {
     // Synchronous throw is PRESERVED (see safety.ts promptInjectionDetector, same rationale) — recordProcessorReport
     // is called fire-and-forget (best-effort, swallows errors), doesn't break the tripwire's synchronous behavior.
     proc.processInput = (input: ProcessorInput, ctx: ProcessorCtx) => {
-      const hit = firstHit(collectText(input), opts.blocklist);
+      const hit = firstHit(callerText(input), opts.blocklist);
       if (hit) {
         void recordProcessorReport(ctx, 'moderation', 'input', { hit });
         throw new ProcessorTripwire(`Input blocked by moderation: "${hit}"`, 'moderation', { hit });

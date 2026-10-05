@@ -20,7 +20,7 @@ const texts = async (s: InMemoryStorage) => (await s.vectors!.query([1, 0, 0], 5
 describe('erasure takes a thread\'s observations, however they were labelled', () => {
   it('an observation indexed while the thread was anonymous goes when its later owner is erased', async () => {
     const storage = new InMemoryStorage();
-    const memory: any = memoryPreset(storage as any, 'chat', { observationalMemory: { model: echo, omVectors: { store: storage.vectors!, embed } } as any });
+    const memory: any = memoryPreset(storage as any, 'chat', { observationalMemory: { observerModel: echo, omVectors: { store: storage.vectors!, embed } } as any });
     const gnl = createGnl({ storage, memory, agents: { a: { model: echo } } } as any);
     await gnl.run('a', { runId: 'anon1', prompt: 'my IBAN is TR55-AYSE', threadId: 'T' });
     await memory.indexObservationVector('T', 0, 1, obs('o1', 'OBS-BEFORE-CLAIM: IBAN TR55-AYSE', 1, 'T'));
@@ -43,7 +43,7 @@ describe('erasure takes a thread\'s observations, however they were labelled', (
       let mem: any;
       const cfg: any = scopeConfigToOrg({
         storage,
-        memoryFactory: (s: any) => (mem = memoryPreset(s, 'chat', { observationalMemory: { model: echo, omVectors: { store: s.vectors, embed } } as any })),
+        memoryFactory: (s: any) => (mem = memoryPreset(s, 'chat', { observationalMemory: { observerModel: echo, omVectors: { store: s.vectors, embed } } as any })),
         agents: { a: { model: echo } },
       } as any, org);
       return { gnl: createGnl(cfg.config), mem: () => mem };

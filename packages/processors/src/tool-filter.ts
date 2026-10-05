@@ -1,4 +1,6 @@
 import type { Processor } from '@gnldev/durable';
+import { refuseUnknownNames } from '@gnldev/options';
+import { TOOL_FILTER_NAMES } from './option-names.js';
 
 export interface ToolFilterOptions {
   /** Only these tools are visible (whitelist). If given, `deny` is ignored. */
@@ -15,6 +17,7 @@ export interface ToolFilterOptions {
  * (e.g. role-based visibility). Prefer `guard` to block side effects.
  */
 export function toolFilter(opts: ToolFilterOptions): Processor {
+  refuseUnknownNames('toolFilter', opts, TOOL_FILTER_NAMES);
   return {
     name: 'tool-filter',
     processTools(tools: Record<string, any>) {

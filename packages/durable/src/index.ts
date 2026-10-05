@@ -39,9 +39,9 @@ export {
   DivergenceError, RunBusyError, SideEffectRetryBlockedError, RetryLimitExceededError,
   ReplicationNotAcknowledgedError, SuiteVersionMismatchError, RunThreadMismatchError, RunTargetMismatchError,
   RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, RunSweptError, BatchPlanMismatchError,
-  CALLER_CONFLICT_CODES, callerConflictCode, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, FOREIGN_PARTY_DETAIL_FIELDS,
+  CALLER_CONFLICT_CODES, callerConflictCode, callerConflictAnswer, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, FOREIGN_PARTY_DETAIL_FIELDS,
   BLOCKED_ERROR_CODES, blockedErrorCode, upstreamFailure, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES,
-  RESERVED_ID_ERROR_CODES, reservedIdFailure,
+  RESERVED_ID_ERROR_CODES, REQUEST_ERROR_CODES, requestRefusal,
   // The HTTP status of every wire code, for a client or a door that maps a code to a response.
   WIRE_ERROR_STATUS,
   // The error→note→help formatter. Exported because the refusals a user actually meets are split
@@ -102,7 +102,9 @@ export type { RunDurableArgs, StreamDurableArgs, DurableResult, ResumeAgentConfi
 // K1/W1 (B): sentinel→error conversion helper for code that consumes streamDurable directly.
 export { streamFinishError } from './run.js';
 // Greenfield storage contracts (ports + Storage + capability + composite).
-export { CapabilityError, requireCapability, composite, toJournal, matchFilter, visibleToSubject, SHARED_ONLY, vectorWriteBatch, vectorQueryScope, vectorDeletePlan, vectorDeleteMatcher, vectorInOrganization, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorMetadataMatches, OBSERVATION_VECTOR_KEY, VECTOR_DOCUMENT_KEY, vectorDocumentOf, vectorFilterDocument, vectorItemCopy, assertSameVectorOwner, assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, orgVectorId, VECTOR_PARTITION, VECTOR_ALL_PARTITIONS, type VectorAllPartitionsOption, assertRootOutsideOrganizations, ReservedVectorNameError, assertRootVectorNames, type VectorPartitionOption } from './storage.js';
+// The one reader of a run's limits and of a budget limit, for a door that takes them as its own options.
+export { refuseRunLimitNames, refuseBudgetLimitNames, refuseConfigNames, PROJECT_CONFIG_NAMES } from './option-names.js';
+export { threadRecordOwner, CapabilityError, requireCapability, portOf, storageOf, journalOf, isStorage, composite, toJournal, matchFilter, visibleToSubject, SHARED_ONLY, vectorWriteBatch, vectorQueryScope, vectorDeletePlan, vectorDeleteMatcher, vectorInOrganization, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorMetadataMatches, OBSERVATION_VECTOR_KEY, VECTOR_DOCUMENT_KEY, vectorDocumentOf, vectorFilterDocument, vectorItemCopy, assertSameVectorOwner, assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, orgVectorId, VECTOR_PARTITION, VECTOR_ALL_PARTITIONS, type VectorAllPartitionsOption, assertRootOutsideOrganizations, ReservedVectorNameError, assertRootVectorNames, type VectorPartitionOption } from './storage.js';
 // ADR-0002: the caller a door hands the engine, the one identity channel to tools and child runs, and
 // the one answer to "does this run exist, and whose is it" (run-identity.ts).
 export {
@@ -132,7 +134,7 @@ export { acquireLease, releaseLease, readLease } from './lease.js';
 export type { Lease } from './lease.js';
 export type { RunIncident } from './incidents.js';
 export type { Processor, ProcessorInput, ProcessorOutput, ProcessorCtx, ProcessorToolResult, ProcessorToolError, ProcessorReport, ProcessorStepInput, ProcessorStepOverride, ProcessorStepOutput } from './processor.js';
-export { createAgentTool, runSubAgent } from './agent-tool.js';
+export { createAgentTool } from './agent-tool.js';
 export type { AgentToolConfig } from './agent-tool.js';
 export { createGnl, agentVisibleToOrg, sealRequestContext, serverIdentityOf, GNL_RESOURCE_ID_KEY, GNL_ORG_ID_KEY, GNL_THREAD_ID_KEY, GNL_STAFF_KEY } from './registry.js';
 // Package #5: the HTTP surfaces resolve the SAME tuple the doors resolve, because they need the id
@@ -178,7 +180,7 @@ export type { SemanticRulesConfig, RuleId, RuleClass, RuleDir, RuleTrace, Ladder
 // score it against the EXACT numbers the runtime enforces. Two copies would be two contracts.
 export {
   renderJudgePrompt, parseJudgeVerdict, validateJudgeConfig, semJudgeKey,
-  JUDGE_PROMPT_VERSION, JUDGE_CANONICAL_MAX, JUDGE_MIN_RECALL, JUDGE_MAX_FP, JUDGE_CERT_MAX_AGE_MS,
+  JUDGE_PROMPT_VERSION, JUDGE_CANONICAL_MAX, JUDGE_MIN_RECALL, JUDGE_MAX_FP, JUDGE_MIN_PAIRS, JUDGE_CERT_MAX_AGE_MS,
 } from './semantic-judge.js';
 export type { SemanticJudgeConfig, JudgeCert, JudgeVerdict, JudgeOutcome, JudgeCause, SemJudgeRecord } from './semantic-judge.js';
 // Heyet matrisi: kullanım profili × yan-etki sınıfı tekrar politikası.
@@ -254,3 +256,5 @@ export { runMigrationCheck, tablesFromDDL } from './migrate.js';
 export type { SchemaCheckResult, SchemaMigrationResult, MissingColumn, MigratableStorage, MigrationCheckResult } from './migrate.js';
 export { agentStreamEvents, interruptsFromSteps, type AgentStreamEvent, type AgentStreamCodes } from './agent-stream.js';
 export type { StreamSurface, StreamSurfaceInput } from './stream-surface.js';
+// The one reading of a request body as a JSON object, for every door.
+export { readJsonObject, callerMessagesProblem, CallerSystemMessageError, type JsonObjectBody } from './request-body.js';

@@ -115,20 +115,19 @@ bölümüne bakın. Tek yanlış cevap yüksek sesle söylenmeyi hak ediyor:
 İstek gövdesinden okunan bir kullanıcı, çağıranın canı kimi isterse onu söylemesidir. Kendi
 doğrulanmış oturumunuzdan okuyun.
 
-## 5. Dağıtmadan önce: `─` satırı
+## 5. Dağıtmadan önce: bellek
 
-`gnl dev`'i tekrar çalıştırın ve matriste bir `─` arayın:
+`gnl dev` config'inizi olduğu gibi çalıştırır — `src/app.ts`'nin dağıttığı config'in aynısını — yani
+matrisin burada söylediği, üretimde olanla aynıdır. Belleği olmayan bir config şunu yazar:
 
 ```text
-  ─ thread gate      memory derived from storage           default
-      memory is on HERE (gnl dev) and off in src/app.ts — `gnl add memory`
+  ○ thread gate      no memory — threadId carries nothing                default
 ```
 
-`─` şu demek: **bunu bu süreç açtı, dağıtımınızda olmayacak.** `gnl dev`, Playground'un thread'i olsun
-diye `storage`'dan bir bellek türetir; asıl dağıttığınız dosya olan `src/app.ts` türetmez. Aynı
-config, iki davranış: konuşmalar sizin makinenizde hatırlar, üretimde sessizce unutur.
-
-Her `─` bu şekildedir. Bu ekranda asla göndermemeniz gereken tek işaret odur.
+ve bir konuşma ne Playground'da ne dağıtımdan sonra hatırlanır. `gnl add memory`, `src/memory.ts`'yi
+yazar ve `gnl.config.ts`'ye bağlar; bu, ikisinde birden belleği açar. (`gnl dev` eskiden yalnızca
+Playground için bir bellek türetir ve bunu `─` ile işaretlerdi: burada açık, üretimde kapalı. Artık
+türetmiyor.)
 
 ---
 

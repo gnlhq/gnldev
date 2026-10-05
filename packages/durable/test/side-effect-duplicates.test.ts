@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable, resumeRun } from '../src/run.js';
 import { DuplicateSideEffectError, ToolLoopDetectedError } from '../src/limits.js';
+import { readIncidents } from '../src/incidents.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
 afterEach(() => vi.restoreAllMocks());
@@ -39,8 +40,7 @@ const dupWarns = (spy: ReturnType<typeof vi.spyOn>) =>
   spy.mock.calls.filter((c) => String(c[0]).includes('EXECUTE AGAIN'));
 
 describe('side-effect duplicate guard (sideEffectDuplicates)', () => {
-  it("DEFAULT (no limits at all) = 'warn': the duplicate still EXECUTES (zero behavior change) but the incident is NAMED with both exits", async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  it("DEFAULT (no limits at all) = 'suspend': the duplicate is NOT executed — a human is asked, the incident is journaled, the question names the way out", async () => {
     const journal = new InMemoryJournal();
     const counter = { runs: 0 };
     const res = await runDurable({
@@ -48,8 +48,27 @@ describe('side-effect duplicate guard (sideEffectDuplicates)', () => {
       prompt: 'go', stopWhen: stepCountIs(10),
       // NO limits passed — this is the safe-by-DEFAULT claim itself
     });
+    expect(counter.runs).toBe(1); // the identical keyless repeat did not run
+    expect(res.interrupts).toHaveLength(1);
+    expect(res.interrupts[0]).toMatchObject({ toolName: 'charge', toolCallId: 'call-2' });
+    const reason = String(res.interrupts[0]!.reason);
+    expect(reason).toContain("'charge'");
+    expect(reason).toContain('sideEffect: false'); // an undeclared tool is told how to say it changes nothing
+    const incidents = await readIncidents(journal, 'dw-1');
+    expect(incidents).toEqual([expect.objectContaining({ source: 'duplicate-guard', action: 'suspend', toolName: 'charge', toolCallId: 'call-2' })]);
+  });
+
+  it("'warn' (asked for): the duplicate still EXECUTES but the incident is NAMED with both exits", async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const journal = new InMemoryJournal();
+    const counter = { runs: 0 };
+    const res = await runDurable({
+      runId: 'dw-1w', journal, model: repeatThenFinish(2), tools: { charge: makeCharge(counter) },
+      prompt: 'go', stopWhen: stepCountIs(10),
+      limits: { sideEffectDuplicates: 'warn' },
+    });
     expect(res.text).toBe('Done.');
-    expect(counter.runs).toBe(2); // behavior unchanged — 'warn' prevents nothing, silence is what it kills
+    expect(counter.runs).toBe(2); // 'warn' prevents nothing, silence is what it kills
     const warns = dupWarns(warn);
     expect(warns).toHaveLength(1); // exactly the duplicate (call-2), not the first call
     const msg = String(warns[0][0]);
@@ -58,7 +77,7 @@ describe('side-effect duplicate guard (sideEffectDuplicates)', () => {
     expect(msg).toContain("idempotency: 'args'"); // exit 2: must never duplicate → args-dedup
   });
 
-  it("counterfactual 'off': the SAME scenario is silent (the warn above is caused by the guard, not ambient)", async () => {
+  it("counterfactual 'off': the SAME scenario is silent (the question and the warn above are caused by the guard, not ambient)", async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const journal = new InMemoryJournal();
     const counter = { runs: 0 };
@@ -245,11 +264,13 @@ describe('side-effect duplicate guard (sideEffectDuplicates)', () => {
   it('replay safety: re-running a completed warn-mode run re-executes nothing and does NOT re-warn', async () => {
     const journal = new InMemoryJournal();
     const counter = { runs: 0 };
-    await runDurable({ runId: 'rp-1', journal, model: repeatThenFinish(2), tools: { charge: makeCharge(counter) }, prompt: 'go', stopWhen: stepCountIs(10) });
+    // 'warn' is asked for: it is no longer the default (that is 'suspend', pinned above).
+    const limits = { sideEffectDuplicates: 'warn' as const };
+    await runDurable({ runId: 'rp-1', journal, model: repeatThenFinish(2), tools: { charge: makeCharge(counter) }, prompt: 'go', stopWhen: stepCountIs(10), limits });
     expect(counter.runs).toBe(2);
 
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const again = await runDurable({ runId: 'rp-1', journal, model: repeatThenFinish(2), tools: { charge: makeCharge(counter) }, prompt: 'go', stopWhen: stepCountIs(10) });
+    const again = await runDurable({ runId: 'rp-1', journal, model: repeatThenFinish(2), tools: { charge: makeCharge(counter) }, prompt: 'go', stopWhen: stepCountIs(10), limits });
     expect(again.text).toBe('Done.');
     expect(counter.runs).toBe(2); // exactly-once across replay
     expect(dupWarns(warn)).toHaveLength(0); // the fast-path short-circuits before the guard

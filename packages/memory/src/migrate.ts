@@ -10,6 +10,8 @@ import {
   legacyWorkingMemoryScope, workingMemoryScope, findReservedRootThreads, isOrganizationKey, purgeThread, threadOwnerKey,
   toJournal, orgStorageScopeOf, type MemoryStore, type MessageAppend, type MessageRecord, type Storage,
 } from '@gnldev/durable';
+import { refuseUnknownNames } from '@gnldev/options';
+import { MIGRATE_WM_NAMES, MIGRATE_ROOT_THREADS_NAMES } from './option-names.js';
 
 export interface MigrateWorkingMemoryOptions {
   /** The people whose `res:<id>` record to move. Omitted: every owner of a thread the store lists. */
@@ -39,6 +41,7 @@ export interface MigrateWorkingMemoryReport {
  * organization is migrated on its own and none reaches another's records.
  */
 export async function migrateWorkingMemoryKeys(store: MemoryStore, opts: MigrateWorkingMemoryOptions = {}): Promise<MigrateWorkingMemoryReport> {
+  refuseUnknownNames('migrateWorkingMemoryKeys', opts, MIGRATE_WM_NAMES);
   let threadIds = opts.threadIds;
   let resourceIds = opts.resourceIds;
   if (threadIds === undefined || resourceIds === undefined) {
@@ -116,6 +119,7 @@ export interface MigrateReservedRootThreadsReport {
  * `storage` is the ROOT storage. Tell the thread's user the new id: their client still holds the old one.
  */
 export async function migrateReservedRootThreads(storage: Storage, opts: MigrateReservedRootThreadsOptions = {}): Promise<MigrateReservedRootThreadsReport> {
+  refuseUnknownNames('migrateReservedRootThreads', opts, MIGRATE_ROOT_THREADS_NAMES);
   if (orgStorageScopeOf(storage) !== undefined) {
     throw new Error('@gnldev/memory: migrateReservedRootThreads takes the root storage — an organization\'s view has no root threads');
   }

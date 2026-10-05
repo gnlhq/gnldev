@@ -44,15 +44,13 @@ describe('createAgentTool: the child runs as the parent\'s user', () => {
     expect(childSaw).not.toContain('AYSE invoice');
   });
 
-  it('the parent\'s user outranks a static one in the config', async () => {
-    const { childOwner } = await delegate('mehmet', 'someone-else');
-    expect(childOwner).toBe('mehmet');
+  it('a config that still names a user is refused, saying where the user comes from', async () => {
+    await expect(delegate('mehmet', 'someone-else')).rejects.toThrow(/createAgentTool: `resourceId` was removed: a sub-agent runs as its parent's caller/);
   });
 
   // Candidate B: a delegation has no configured owner any more — the child IS its parent's principal.
   // A parent that names nobody is `unknown`, and so is its child: born ownerless, never 'svc'.
   it('a parent with no user makes an ownerless (unknown) child — a config cannot name one', async () => {
-    expect((await delegate(undefined, 'svc')).childOwner).toBeUndefined();
     expect((await delegate(undefined)).childOwner).toBeUndefined();
   });
 });

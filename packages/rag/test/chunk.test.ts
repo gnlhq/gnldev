@@ -27,7 +27,8 @@ describe('chunkText — recursive (default)', () => {
 
   it('overlap: each chunk (except the first) starts with the tail of the previous one', () => {
     const text = `${PARA(200, 'a')}\n\n${PARA(200, 'b')}\n\n${PARA(200, 'c')}`;
-    const chunks = chunkText(text, { size: 220, overlap: 50 });
+    // `size` counts the overlap: 200 + 50 fits in 250 (at 220 the overlap pushed chunks to 250).
+    const chunks = chunkText(text, { size: 250, overlap: 50 });
     expect(chunks.length).toBe(3);
     expect(chunks[1]!.text.startsWith('a'.repeat(50))).toBe(true);
     expect(chunks[2]!.text.startsWith('b'.repeat(50))).toBe(true);
@@ -93,5 +94,31 @@ describe('chunkDocuments', () => {
     const hits = await store.query(await embed('bbbb'), 1);
     expect(hits[0]!.id).toBe('kb#1'); // b-dense chunk
     expect((hits[0]!.metadata as any).__gnlDoc).toBe('kb');
+  });
+});
+
+describe('the overlap is fitted under size, not reserved', () => {
+  const sentence = (i: number) => `Sentence number ${i} says something about the order and the payment.`;
+  const para = (n: number, from: number) => Array.from({ length: n }, (_, k) => sentence(from + k)).join(' ');
+
+  it('a paragraph a little under size is one chunk, not two (the chunk count does not double)', () => {
+    const paras = Array.from({ length: 20 }, (_, i) => para(16, i * 16)); // ~1,100 characters each
+    expect(paras.every((p) => p.length > 1000 && p.length < 1200)).toBe(true);
+    const chunks = chunkText(paras.join('\n\n'));
+    expect(chunks.length).toBeLessThanOrEqual(paras.length + 1);
+    expect(Math.max(...chunks.map((c) => c.text.length))).toBeLessThanOrEqual(1200);
+  });
+
+  it('no chunk is longer than size and none repeats more than overlap, on prose with no paragraph breaks', () => {
+    const text = para(400, 0);
+    for (const [size, overlap] of [[1200, 120], [250, 50], [200, 50]] as const) {
+      const chunks = chunkText(text, { size, overlap }).map((c) => c.text);
+      expect(Math.max(...chunks.map((c) => c.length)), `${size}/${overlap}`).toBeLessThanOrEqual(size);
+      for (let i = 1; i < chunks.length; i++) {
+        let shared = 0;
+        for (let k = Math.min(chunks[i - 1]!.length, chunks[i]!.length); k > 0; k--) if (chunks[i - 1]!.endsWith(chunks[i]!.slice(0, k))) { shared = k; break; }
+        expect(shared, `${size}/${overlap} #${i}`).toBeLessThanOrEqual(overlap);
+      }
+    }
   });
 });

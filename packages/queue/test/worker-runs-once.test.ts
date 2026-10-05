@@ -68,7 +68,7 @@ describe('worker: "finished?" is answered under the lease', () => {
     await runA;
 
     expect(effects).toEqual(['B']); // was ['B', 'A']
-    expect((await listJobs(storage.work!))[0]).toMatchObject({ status: 'done', attempts: 0 });
+    expect((await listJobs(storage.work!))[0]).toMatchObject({ status: 'done', attempts: 1 }); // B's one attempt
   });
 
   it('the same for a dead letter: B failed it at its last attempt — A does not hand it to the handler once more', async () => {
@@ -98,7 +98,7 @@ describe('worker: "finished?" is answered under the lease', () => {
     expect(await w.runOnce()).toBe(true);
     expect(await w.runOnce()).toBe(true);
     expect(n).toBe(2);
-    expect((await listJobs(storage.work!))[0]).toMatchObject({ status: 'done', attempts: 1 });
+    expect((await listJobs(storage.work!))[0]).toMatchObject({ status: 'done', attempts: 2 }); // attempts started
   });
 });
 

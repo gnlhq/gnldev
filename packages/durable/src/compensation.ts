@@ -22,11 +22,13 @@
 //    space (xrun:*) and are NOT unwound here — a shared-window action belongs to no single run, and
 //    reverting it while unwinding ONE run could invalidate OTHER runs that legitimately deduped onto
 //    it. Sub-agent (agent:*) nested runs are also not recursed in v1 (documented; v1.1).
-import { claim, parseJournalKey, runKeys } from './journal.js';
+import { claim, parseJournalKey, runKeys, executedHere } from './journal.js';
 import { orgScopeOf, orgPrefix } from './organization.js';
 import { upgradeFormat } from './format.js';
 import type { Journal, JournalReader, ToolJournalRecord } from './journal.js';
 import type { AnyTool } from './types.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { COMPENSATE_RUN_NAMES } from './option-names.js';
 
 /** The run was unwound (compensateRun condemned it) — it can never be resumed, forked, or allowed to
  *  execute further side effects (see assertNotCompensated call sites + the durable-tool mid-flight gate). */
@@ -145,6 +147,7 @@ export async function compensateRun(
   runId: string,
   opts: { journal: Journal & Partial<JournalReader>; tools?: Record<string, AnyTool>; dryRun?: boolean },
 ): Promise<CompensationReport> {
+  refuseUnknownNames('compensateRun', opts, COMPENSATE_RUN_NAMES);
   const { journal, tools = {}, dryRun = false } = opts;
   if (typeof journal.readRun !== 'function') {
     throw new Error('@gnldev/durable compensateRun: the journal does not support readRun — cannot enumerate the run');
@@ -164,7 +167,10 @@ export async function compensateRun(
     // unwind, which is why its real record lives outside the run's key space at all. The shadow only
     // gives the run a history and the operator something to approve; unwinding it here would refund a
     // charge another run is still relying on. See ToolJournalRecord.mirrorOf.
-    if (record.mirrorOf !== undefined) continue;
+    // A request-window record is the exception (journal.ts ranBy): the request's runs dedup against it,
+    // but the action belongs to the run that executed it, and that run's unwind is its unwind — the
+    // sub-agent that booked is the one whose rollback cancels. Every other run's mirror stays skipped.
+    if (record.mirrorOf !== undefined && !executedHere(record, runId, e.key.slice(prefix.length))) continue;
     // denied/reflected/suspended never EXECUTED anything → nothing to unwind, not even reported.
     if (record.status === 'succeeded' || record.status === 'failed' || record.status === 'running') {
       work.push({ suffix: e.key.slice(prefix.length), record });

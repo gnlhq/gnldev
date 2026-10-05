@@ -1,6 +1,7 @@
 // Backward compatibility: wraps the old {read,write} predicate pair (StudioAuth / examples/app) into an AuthProvider.
 import type { AuthProvider, Decision, AuthContext, Principal } from './types.js';
 import { callerKind } from './scope.js';
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 
 /** Old role-based hook: read = GET (viewer), write = POST/PUT/PATCH/DELETE (admin). */
 export interface ReadWriteAuth {
@@ -38,13 +39,18 @@ export function bindsIdentity(auth: AuthProvider | undefined): boolean {
  * read Studio's runs, and a page on another site swept Studio's retention. The doors had the same hole
  * twice before (`identify` passed; `identify` answered an object), each time a question about the
  * configuration or the shape answered in place of one about the request.
+ * @internal — door plumbing shared by the GNL doors; gnl builds its argument, no host writes it.
  */
 export function carriesIdentity(source: { principal?: Principal | null }): boolean {
   return callerKind(source.principal) !== 'unnamed';
 }
 
+const READ_WRITE_NAMES = optionNames<ReadWriteAuth>()(['read', 'write']);
+
 /** {read,write} → AuthProvider. If there's no fn in that direction, it's unrestricted (preserves the existing `!fn || fn(c)` behavior). */
 export function fromReadWrite(rw: ReadWriteAuth): AuthProvider {
+  // A missing direction is unrestricted, so a misspelled one (`wirte`) would open it to everyone.
+  refuseUnknownNames('auth', rw, READ_WRITE_NAMES);
   return {
     bindsIdentity: false,
     authenticate() {
@@ -90,6 +96,8 @@ export function normalizeAuth(auth?: AuthProvider | ReadWriteAuth): AuthProvider
   // this whole function exists to move to startup.
   const sides = (['read', 'write'] as const).filter((k) => rw[k] !== undefined);
   if (sides.length > 0) {
+    // A {read, write} pair: a third name is a misspelled direction, and a missing direction is open.
+    refuseUnknownNames('auth', rw, READ_WRITE_NAMES);
     const bad = sides.filter((k) => typeof rw[k] !== 'function');
     if (bad.length === 0) return fromReadWrite(rw);
     throw new TypeError(

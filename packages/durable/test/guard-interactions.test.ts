@@ -188,11 +188,25 @@ describe('duplicate-guard × taint-guard composition', () => {
     return { fetchPage, charge: makeCharge(counter) };
   };
 
-  it("both at default 'warn': the tainted duplicate executes ONCE more with BOTH incidents journaled (nothing masks anything)", async () => {
+  it("both at the defaults ('suspend'): the first send after the taint is asked about — nothing is sent", async () => {
+    const journal = new InMemoryJournal();
+    const counter = { runs: 0 };
+    const res = await runDurable({ runId: 'cb-0', journal, model: comboModel(), tools: comboTools(counter), prompt: 'x', stopWhen: stepCountIs(10) });
+    expect(counter.runs).toBe(0);
+    expect(res.interrupts).toHaveLength(1);
+    expect(res.interrupts[0]).toMatchObject({ toolCallId: 'call-2' });
+    const incidents = await readIncidents(journal, 'cb-0');
+    expect(incidents.map((i) => [i.source, i.action, i.toolCallId])).toEqual([['taint-guard', 'suspend', 'call-2']]);
+  });
+
+  it("both at 'warn' (asked for): the tainted duplicate executes ONCE more with BOTH incidents journaled (nothing masks anything)", async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const journal = new InMemoryJournal();
     const counter = { runs: 0 };
-    await runDurable({ runId: 'cb-1', journal, model: comboModel(), tools: comboTools(counter), prompt: 'x', stopWhen: stepCountIs(10) });
+    await runDurable({
+      runId: 'cb-1', journal, model: comboModel(), tools: comboTools(counter), prompt: 'x', stopWhen: stepCountIs(10),
+      limits: { sideEffectDuplicates: 'warn', taintedSideEffects: 'warn' },
+    });
     expect(counter.runs).toBe(2); // warn mode: both sends executed
     const call3 = (await readIncidents(journal, 'cb-1')).filter((i) => i.toolCallId === 'call-3');
     // The SAME call drew BOTH observations — the guards are orthogonal, neither swallows the other.

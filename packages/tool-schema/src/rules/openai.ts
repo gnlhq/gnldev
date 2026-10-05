@@ -12,24 +12,17 @@ import { walk, stripStringFormats } from './util.js';
  *
  * Why: the AI SDK's OpenAI provider silently rejects e.g. a Zod `.url()` (→ format:'uri') schema.
  *
- * The predicate has three terms because a request can arrive naming the provider in three places,
- * and each was added for a reason worth writing down:
+ * The predicate has two terms, because a request can name the provider in two places:
  *
- * `provider.includes('openai')` — the direct case.
- * `modelId.includes('openai')` — a gateway reports itself as the provider and puts the real one
- *    inside the model id (`{provider: 'openrouter', modelId: 'openai/gpt-4o'}`). That form is used
- *    throughout this repo, so without this term every gateway-routed OpenAI call would skip the
- *    transform and fail on the first `.url()` in a tool schema.
- * `provider.includes('groq')` — groq serves an OpenAI-compatible API and says so in its own base
- * URL, `https://api.groq.com/openai/v1`. It therefore rejects the same schemas for the same
- *    reason and needs the same treatment. This is not an insight about groq; it is groq's published
- *    description of itself, and any implementation reading that documentation lands here. It is
- *    listed separately only because the provider string a user passes is `'groq'`, not `'openai'`,
- *    so neither term above catches it. Covered by `test/tool-schema.test.ts` ("groq provider is
- *    also caught").
- *
- * Note that groq is not a dependency here and never has been: the term exists so a caller who
- * brings their own groq provider is handled, not because this package integrates one.
+ * `OPENAI_STRICT_PROVIDERS.has(provider)` — a provider that serves this API under its own id: OpenAI,
+ *    Azure OpenAI (`azure`), groq (`https://api.groq.com/openai/v1`, groq's own description of itself).
+ *    A list of ids, not `provider.includes('openai')`: that guess missed Azure. groq is not a dependency
+ *    here; the entry exists so a caller who brings their own groq provider is handled.
+ * `modelId.includes('openai')` — a gateway reports itself as the provider and puts the real one inside
+ *    the model id (`{provider: 'openrouter', modelId: 'openai/gpt-4o'}`). That form is used throughout
+ *    this repo, so without this term every gateway-routed OpenAI call would skip the transform and fail
+ *    on the first `.url()` in a tool schema. It also matches an OpenAI model another API serves
+ *    (`bedrock/openai.gpt-oss-…`).
  */
 /**
  * Widens a schema so it also accepts `null` — the second half of "everything is required".
@@ -129,10 +122,17 @@ function mergeObjectAllOf(node: any): boolean {
   return true;
 }
 
+/**
+ * The providers that serve OpenAI's strict structured-output API — the API this rule answers to,
+ * listed by provider id rather than guessed from a name. It matched `provider.includes('openai')`,
+ * which missed Azure OpenAI (the same API under the id `azure`): a schema strict mode refuses went
+ * to Azure untransformed.
+ */
+export const OPENAI_STRICT_PROVIDERS: ReadonlySet<string> = new Set(['openai', 'openai-compatible', 'azure', 'groq']);
+
 export const openaiStrict: ToolSchemaRule = {
   name: 'openai-strict',
-  shouldApply: (m) =>
-    m.provider.includes('openai') || m.modelId.includes('openai') || m.provider.includes('groq'),
+  shouldApply: (m) => OPENAI_STRICT_PROVIDERS.has(m.provider) || m.modelId.includes('openai'),
   transform(schema: JsonSchema, _model, ctx?: ShapeContext) {
     // Two passes, because the second needs an answer the first has to produce: which object nodes are
     // BRANCHES of an `allOf` that could not be merged. `walk` visits a branch on its own and cannot

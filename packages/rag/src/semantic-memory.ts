@@ -6,6 +6,8 @@ import { cosineSimilarity } from 'ai';
 import { matchFilter, memKey, semanticLogKey, appendToJournalLog, readJournalLog } from '@gnldev/durable';
 import type { Memory, Journal } from '@gnldev/durable';
 import type { Embed } from './vector-store.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { SEMANTIC_MEMORY_NAMES, SEMANTIC_GET_MESSAGES_NAMES } from './option-names.js';
 
 export interface SemanticMemoryOptions {
   journal: Journal;
@@ -62,6 +64,7 @@ export class SemanticMemory implements Memory {
   private topK: number;
 
   constructor(opts: SemanticMemoryOptions) {
+    refuseUnknownNames('SemanticMemory', opts, SEMANTIC_MEMORY_NAMES);
     this.journal = opts.journal;
     this.embed = opts.embed;
     this.recentN = opts.recentN ?? 6;
@@ -78,6 +81,7 @@ export class SemanticMemory implements Memory {
   }
 
   async getMessages(threadId: string, opts?: SemanticGetMessagesOptions): Promise<any[]> {
+    refuseUnknownNames('getMessages', opts, SEMANTIC_GET_MESSAGES_NAMES);
     const log = await this.load(threadId);
     if (log.length <= this.recentN) return log.map((e) => e.message);
     const recentStart = log.length - this.recentN;

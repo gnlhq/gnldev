@@ -3,6 +3,8 @@
 // it does NOT RUN AGAIN on resume (drift impossible). Non-deterministic processors journal via `ctx.step`.
 import { runKeys } from './journal.js';
 import type { Journal } from './journal.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { PROCESSOR_RETRY_NAMES } from './option-names.js';
 
 export interface ProcessorInput {
   system?: string;
@@ -262,6 +264,7 @@ export class ProcessorRetry extends Error {
   ) {
     super(`retry requested by processor '${processor}': ${feedback}`);
     this.name = 'ProcessorRetry';
+    refuseUnknownNames('ProcessorRetry', opts, PROCESSOR_RETRY_NAMES);
   }
 }
 

@@ -71,7 +71,9 @@ await section('@gnldev/memory — schema working memory + tool', async () => {
   const mem = new AgentMemory({ storage, embed, workingMemory: { schema: z.object({ name: z.string().optional() }) } });
   const m = () => agentModel('updateWorkingMemory', 'wm1', { name: 'Ada' }, 'saved');
   await runDurable({ runId: 'mem-1', journal, model: m(), memory: mem, threadId: 'cust-7', prompt: 'save my name' });
-  const wm = await storage.memory!.getWorkingMemory('cust-7') as any;
+  // Read through the memory's own API: the store's key layout is the memory's business, not the app's.
+  const raw = await mem.getWorkingMemory('cust-7');
+  const wm = raw === undefined ? undefined : JSON.parse(raw);
   assert(wm?.name === 'Ada', 'WM was not written');
   return `working memory = ${JSON.stringify(wm)}`;
 });

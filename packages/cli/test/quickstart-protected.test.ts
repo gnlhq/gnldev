@@ -23,20 +23,15 @@ const repoRoot = join(import.meta.dirname, '..', '..', '..');
 const pages = ['docs/QUICKSTART-PROTECTED.md', 'docs/QUICKSTART-PROTECTED.tr.md'];
 
 /**
- * Every matrix the page is allowed to quote from.
- *
- * TWO of them, because the page shows two screens and they legitimately differ: the one `gnl init`
- * prints for the recommended answers, and the one `gnl dev` prints when it has DERIVED a memory store
- * the project's own config does not carry. Section 5 is entirely about the second — the `─` row — so a
- * check that only knew the first would reject the very line that section exists to teach.
+ * Every matrix the page is allowed to quote from: the one `gnl init` prints for the recommended
+ * answers. `gnl dev` runs the same config as given, so it prints no row this one lacks — the `─`
+ * matrix a derived dev-only memory used to print is gone with the derivation, and a page still
+ * quoting it is teaching a screen nobody sees.
  */
 function quotableMatrices(): string {
   const shape = { storage: new (class SqliteStorage {})(), preset: DEFAULT_ANSWERS.preset, subjects: DEFAULT_ANSWERS.identity };
   const ctx = { surface: 'gnl init', identity: identityRow(shape as never, false) };
-  return [
-    formatProtections(describeProtections(shape as never, ctx)).join('\n'),
-    formatProtections(describeProtections(shape as never, { ...ctx, surface: 'gnl dev', devOnly: { memory: true } })).join('\n'),
-  ].join('\n');
+  return formatProtections(describeProtections(shape as never, ctx)).join('\n');
 }
 
 describe.each(pages)('%s', (rel) => {

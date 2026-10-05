@@ -65,7 +65,9 @@ describe('duplicate-toolCallId proof test — model calls the same tool 5x in a 
     let calls = 0;
     const tools = { charge: { execute: async () => { calls++; return { charged: 20, seq: calls }; } } };
 
-    await runDurable({ runId: 'r7261-call', journal, model: multiCallModel(), tools, stopWhen: stepCountIs(6), prompt: 'x' });
+    // The default duplicate ladder is now 'suspend'; this test documents the call-mode KEY alone (no
+    // dedup by arguments), so the ladder stays at 'warn' — the pair to the args-mode test above.
+    await runDurable({ runId: 'r7261-call', journal, model: multiCallModel(), tools, stopWhen: stepCountIs(6), prompt: 'x', limits: { sideEffectDuplicates: 'warn' } });
 
     expect(calls).toBe(5); // behavior BEFORE/AFTER the is IDENTICAL — no regression
   });
@@ -121,6 +123,7 @@ describe('args idempotency — custom idempotencyKey (e.g. orderId)', () => {
     const dt = durableTool(
       {
         idempotencyKey: (args: any) => args.orderId, // IMPLIES 'args' mode
+        idempotencyWindow: 'run', // this test is about one request
         execute: async (args: any) => { calls++; return { ok: true, orderId: args.orderId }; },
       },
       { journal, runId: 'r-key' },

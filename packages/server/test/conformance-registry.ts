@@ -137,7 +137,7 @@ function world() {
     memoryFactory: (src: any) => new BasicMemory(src.runs ?? src),
     agents: {
       a: { model: echo },
-      l: { model: lookupModel, tools: { lookup }, stopWhen: stepCountIs(3) },
+      l: { model: lookupModel, tools: { lookup }, maxSteps: 3 },
     },
     workflows: {
       w: workflow<any>().then(step('draft', async ({ input }: any) => `draft:${input?.s ?? ''}`)).then(waitForResume<{ ok: boolean }>('approve')),
@@ -347,7 +347,7 @@ export const BIRTHS: Record<string, Birth> = {
     },
   },
   'agent-tool child': {
-    sites: ['durable/src/run.ts'], starters: ['createAgentTool', 'runSubAgent'],
+    sites: ['durable/src/run.ts'], starters: ['createAgentTool'],
     start: async (w, who) => {
       const e = ctxOf(w, who);
       const helper = createAgentTool({ journal: e.journal, model: echo } as never);

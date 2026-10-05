@@ -66,7 +66,7 @@ describe('studio /semantic-guard + suspendedAt', () => {
     const embed = async (texts: string[]) => texts.map(() => [1, 0, 0]);
     const cert = {
       v: 1 as const, fixtureSetId: 'fx', judgeModelId: 'jm', judgePromptVersion: '1',
-      paraphraseRecall: 0.9, nearMissFp: 0.02, passedAt: Date.now(),
+      paraphraseRecall: 0.9, nearMissFp: 0.02, paraphrasePairs: 20, nearMissAnswered: 20, passedAt: Date.now(),
     };
     const limits = {
       sideEffectDuplicates: {
@@ -102,7 +102,7 @@ describe('studio /semantic-guard + suspendedAt', () => {
     const embed = async (texts: string[]) => texts.map(() => [1, 0, 0]);
     const cert = {
       v: 1 as const, fixtureSetId: 'fx', judgeModelId: 'jm', judgePromptVersion: '1',
-      paraphraseRecall: 0.9, nearMissFp: 0.02, passedAt: Date.now(),
+      paraphraseRecall: 0.9, nearMissFp: 0.02, paraphrasePairs: 20, nearMissAnswered: 20, passedAt: Date.now(),
     };
     const limits = {
       sideEffectDuplicates: {

@@ -11,6 +11,8 @@ import type { Journal } from '@gnldev/durable';
 import type { Scorer } from './scorer.js';
 import { evalDataset } from './dataset.js';
 import type { Dataset, EvalRunner, EvalDatasetResult } from './dataset.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { RUN_EXPERIMENT_NAMES } from './option-names.js';
 
 export interface DatasetVersion {
   version: number;
@@ -111,6 +113,7 @@ export function createDatasetsManager(journal: Journal) {
    * case-memoization is already journaled; this layer also deduplicates the experiment META record).
    */
   async function runExperiment(opts: RunExperimentOptions): Promise<ExperimentRecord> {
+    refuseUnknownNames('runExperiment', opts, RUN_EXPERIMENT_NAMES);
     const now = opts.now ?? Date.now();
     let dsv: DatasetVersion | undefined;
     if (opts.dataset) dsv = await saveDataset(opts.dataset, now);

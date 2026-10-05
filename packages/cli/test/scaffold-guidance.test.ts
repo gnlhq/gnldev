@@ -6,8 +6,8 @@
 //   preset      — a tool's `effectClass` is read ONLY through a profile. With none, a tool that
 //                 declared itself `transactional` behaves exactly like one that declared nothing,
 //                 and nothing anywhere says so.
-//   memory      — `gnl dev` DERIVES a memory store from `storage`; `src/app.ts` does not. Threads
-//                 work on the developer's machine and quietly stop working after deploy.
+//   memory      — off until `gnl add memory` turns the config's line on. `gnl dev` and `src/app.ts`
+//                 run the same config, so a conversation remembers in both or in neither.
 //   retention   — nothing sweeps on its own. A run holds the prompt it was given, indefinitely,
 //                 until a human or a cron entry runs `gnl sweep`.
 //
@@ -50,7 +50,7 @@ describe.each(TEMPLATES)('the %s template\'s gnl.config.ts', (template) => {
     expect(cfg).toContain('effectClass');
   });
 
-  it('names the dev/prod memory asymmetry and how to close it', () => {
+  it('says memory is off until `gnl add memory`, and how to turn it on', () => {
     const cfg = written();
     expect(cfg).toContain('// memoryFactory,');
     expect(cfg).toContain('src/app.ts');

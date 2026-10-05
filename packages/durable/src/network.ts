@@ -14,6 +14,7 @@ import type { Interrupt } from './guard.js';
 import { toolDescriptionText } from './types.js';
 import { admitRun, UNKNOWN } from './run-identity.js';
 import type { Caller } from './identity-types.js';
+import { refuseNetworkRunNames } from './option-names.js';
 
 /** The router's single-turn decision: either give a task to an agent OR write the final answer. */
 export type RouteDecision =
@@ -24,9 +25,9 @@ export type RouteDecision =
 export interface NetworkTarget {
   /** Definition the router sees when choosing an agent (if absent, only the name is listed). */
   description?: string;
-  /** Durably runs the given task under a nested runId (the registry wires this to runSubAgent).
+  /** Durably runs the given task under a nested runId (the registry wires this to the engine's own agent run, one frame below the network run).
    * If `interrupts` is non-empty, the sub-agent is suspended — the network step does NOT FREEZE, the interrupt is propagated upward. */
-  run(task: string, nestedRunId: string): Promise<{ text: string; interrupts?: Interrupt[] }>;
+  run(task: string, nestedRunId: string): Promise<{ text: string; interrupts?: Interrupt[]; status?: 'completed' | 'failed'; failed?: Array<{ tool: string; kind: string; message: string }> }>;
 }
 
 export interface RunNetworkOptions {
@@ -126,6 +127,11 @@ export interface NetworkStep {
   agent: string;
   task: string;
   text: string;
+  /** The sub-agent's outcome, read from its tool outcomes (agent-tool.ts childOutcome) — not its prose:
+   *  a sub-agent whose tool failed and whose model wrote "I handled it" is 'failed'. Absent on a vetoed
+   *  step and on steps recorded by an earlier version. */
+  status?: 'completed' | 'failed';
+  failed?: Array<{ tool: string; kind: string; message: string }>;
 }
 
 export interface NetworkResult {
@@ -162,7 +168,7 @@ export const netKeys = {
 /** Steps-so-far digest — shared by the router prompt AND the observer's `onRouteStart` notification. */
 function summarizeHistory(history: NetworkStep[]): string {
   return history.length
-    ? history.map((h) => `[${h.i}] agent=${h.agent} task="${h.task}" → result: ${h.text}`).join('\n')
+    ? history.map((h) => `[${h.i}] agent=${h.agent} task="${h.task}" → ${h.status === 'failed' ? `FAILED (${(h.failed ?? []).map((f) => `${f.tool}: ${f.message}`).join('; ')}), ` : ''}result: ${h.text}`).join('\n')
     : '(no steps yet)';
 }
 
@@ -255,6 +261,7 @@ async function decideOnce(opts: RunNetworkOptions, history: NetworkStep[], force
  * freezes into the journal → calling again with the same runId (resume) returns the same result without an LLM (exactly-once).
  */
 export async function runNetwork(opts: RunNetworkOptions): Promise<NetworkResult> {
+  refuseNetworkRunNames(opts);
   requireAgents(opts);
   // A run birth like every other (run-identity.ts admitRun): the owner is recorded before the first
   // row, a run someone else owns is refused, and a re-entry acts for the recorded owner. Without it
@@ -346,7 +353,7 @@ export async function runNetworkAdmitted(opts: RunNetworkOptions): Promise<Netwo
             interrupts: r.interrupts, suspended: { i, agent: decision.agent, task: decision.task },
           };
         }
-        res = { agent: decision.agent, task: decision.task, text: r.text };
+        res = { agent: decision.agent, task: decision.task, text: r.text, ...(r.status ? { status: r.status } : {}), ...(r.failed ? { failed: r.failed } : {}) };
         if (!(await claim(opts.journal, stepKey, { v: res }))) {
           res = (await opts.journal.get<{ v: Omit<NetworkStep, 'i'> }>(stepKey))!.v; // read the race winner
         }

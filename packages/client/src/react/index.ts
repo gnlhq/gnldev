@@ -5,6 +5,7 @@ import { appendUserMessage,
   startTurn, applyRunResult, applyStreamEvent, initialChatState } from '../accumulator.js';
 import type { ChatMessage, ChatState } from '../accumulator.js';
 import type { Interrupt, RunInput, RunResult } from '../types.js';
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 
 export interface UseGnlAgent {
   messages: ChatMessage[];
@@ -148,7 +149,10 @@ export interface UseChatOptions {
   resourceId?: string;
 }
 
+const USE_CHAT_NAMES = optionNames<UseChatOptions>()(['stream', 'threadId', 'resourceId']);
+
 export function useChat(client: GnlClient, name: string, opts: UseChatOptions = {}): UseChat {
+  refuseUnknownNames('useChat', opts, USE_CHAT_NAMES);
   const agent = useGnlAgent(client, name);
   const [input, setInput] = useState('');
   const useStream = opts.stream ?? true;

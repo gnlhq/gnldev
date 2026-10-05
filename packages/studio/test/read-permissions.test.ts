@@ -57,7 +57,7 @@ function rbacApi() {
     capabilities: () => ({ sso: true, rbac: true, audit: true, multiOrganization: true, users: true, plan: 'pro' }),
   };
   const j = new InMemoryJournal();
-  return createStudioApi({ reader: j, journal: j, auth: auth as never, org: {} });
+  return createStudioApi({ reader: j, auth: auth as never, org: {} });
 }
 
 const ROUTES = {
@@ -122,7 +122,7 @@ describe('named read permissions', () => {
     // action alone and never looks at `permission` — cannot tell that the routes were named.
     const j = new InMemoryJournal();
     const app = createStudioApi({
-      reader: j, journal: j, org: {},
+      reader: j, org: {},
       auth: roleAuth({ admin: { token: 'A', orgId: 'acme' }, viewer: { token: 'V', orgId: 'acme' } }),
     }) as never;
     for (const path of Object.values(ROUTES)) expect(await status(app, 'V', path), `free viewer lost ${path}`).toBe(200);
@@ -259,7 +259,7 @@ describe('knowledge search is gated on the data permission, not the configuratio
       },
       capabilities: () => ({ sso: true, rbac: true, audit: true, multiOrganization: true, users: true, plan: 'pro' }),
     };
-    return createStudioApi({ reader: j, journal: j, auth: auth as never, org: {}, vectors }) as never;
+    return createStudioApi({ reader: j, auth: auth as never, org: {}, vectors }) as never;
   };
   const search = (app: never, who: string) => call(app, '/knowledge/search', {
     method: 'POST', headers: { authorization: `Bearer ${who}`, 'content-type': 'application/json' },

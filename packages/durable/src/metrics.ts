@@ -11,6 +11,8 @@ import type { Journal, JournalBatch, JournalReader } from './journal.js';
 import { summarizeRun, runKeys, listRunsArray } from './journal.js';
 import { getRunCost } from './cost.js';
 import { METRICS_SHARDS, shardSuffix, sumShards } from './counter-shard.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { METRICS_SUMMARY_NAMES } from './option-names.js';
 
 /**
  * P1.6b: money is accumulated as INTEGER micro-USD (`costUsdMicros = round(usd × 1e6)`) — float
@@ -197,6 +199,7 @@ export interface MetricsRunRow {
  *    stays the story for this backend; a custom third-party journal without these is unaffected/unbroken),
  * the reader doesn't implement `readRun` (can't compute per-run stats),
  * the run was already recorded (claim lost — idempotent, not an error).
+ * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
  */
 export async function recordRunMetrics(
   journal: Journal,
@@ -468,6 +471,7 @@ export async function readMetricsSummary(
   journal: Journal,
   opts: { days?: number } = {},
 ): Promise<{ all: Record<string, number> | undefined; byDay: MetricsDayEntry[] }> {
+  refuseUnknownNames('readMetricsSummary', opts, METRICS_SUMMARY_NAMES);
   if (typeof journal.getCounters !== 'function') return { all: undefined, byDay: [] };
   /**
    * `days: 0` asks for the `all` bucket and nothing else — for a caller that wants the running

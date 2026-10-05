@@ -10,6 +10,8 @@ import type { Journal, JournalEntry, RunSummary, JournalReader, RunStatus } from
 import { VectorOwnerConflictError } from './errors.js';
 import { assertOwnerId, isWellFormed, OwnerIdError } from './owned-name.js';
 import { ORG_KEY_PREFIX, isOrganizationKey, parseOrganizationKey, orgSpaceSql, prefixSql } from './organization.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { COMPOSITE_NAMES } from './option-names.js';
 
 // ── Common ──────────────────────────────────────────────────────────────────
 
@@ -63,6 +65,8 @@ export interface ListQuery {
    * contract as `agent`/`resourceId`, and the same honest cost — no adapter has a column for it.
    */
   workKey?: string;
+  /** Only runs no other run started (`RunSummary.parentRunId` absent). Same filter-before-slice contract. */
+  topLevel?: boolean;
 }
 
 // ── 1) RunJournal = the PRESERVED journal ──────────────────────────────────────
@@ -85,6 +89,16 @@ export interface RunJournal {
 }
 
 // ── 2) MemoryStore = derived/queryable conversation artifacts (NOT replay state) ──
+
+/**
+ * Whose thread a thread RECORD names: its `resourceId`, or nobody. A thread a run started with no
+ * resource is indexed with `resourceId: ''` (the column is NOT NULL) so it is listed; '' names nobody,
+ * exactly as no record does, so ownership reads the same as before the entry existed.
+ * @internal — storage plumbing: reads a stored thread record.
+ */
+export function threadRecordOwner(rec: { resourceId?: string } | undefined): string | undefined {
+  return rec?.resourceId || undefined;
+}
 
 export interface ThreadRecord {
   id: string;
@@ -127,6 +141,7 @@ export interface Observation {
   condensed?: boolean;
 }
 
+/** @internal — the storage port's own query options: gnl's memory builds them, an adapter reads them. */
 export interface RecallOptions {
   topK?: number;
   threshold?: number;
@@ -174,7 +189,7 @@ export type MemoryPartition = { kind: 'root' } | { kind: 'org'; prefix: string }
 
 /**
  * A root-scope caller named a thread in the organizations' reserved space. Thrown by a root-scope
- * `AgentMemory`, and answered `400 thread_id_reserved` on every door through `reservedIdFailure`
+ * `AgentMemory`, and answered `400 thread_id_reserved` on every door through `requestRefusal`
  * (errors.ts): such an id is an
  * organization's physical thread id, and a root caller that could use it would read that thread, or
  * write a thread INTO that organization's partition.
@@ -483,7 +498,10 @@ export interface VectorItem extends VectorDoc {
 export interface VectorMatch extends VectorDoc {
   score: number;
 }
-/** Narrows which documents a query may be answered from — see `VectorStore.query`. */
+/**
+ * Narrows which documents a query may be answered from — see `VectorStore.query`.
+ * @internal — the storage port's own query options: gnl's readers build them, an adapter reads them.
+ */
 export interface VectorQueryOptions extends VectorPartitionOption, VectorAllPartitionsOption {
   /**
    * Only documents in this namespace are eligible. Omitted means the ROOT's documents: every
@@ -649,6 +667,7 @@ export function vectorItemCopy(it: VectorItem): VectorItem {
 /**
  * An upsert updates a document; it does not move it to another owner, label or partition. The one
  * rule every store applies before writing over an existing id.
+ * @internal — storage adapter plumbing.
  */
 export function assertSameVectorOwner(
   existing: { namespace?: unknown; owner?: unknown; shared?: unknown } | undefined,
@@ -679,6 +698,7 @@ export const SHARED_ONLY = '';
  * A `visibleTo` or `namespace` holding a lone surrogate names nobody (no document can carry one,
  * `vectorWriteBatch`), but Postgres would compare it as U+FFFD and answer with someone else's
  * documents; so it reads here as what it means in every store: the general shelf, or nothing.
+ * @internal — storage adapter plumbing.
  */
 export function vectorQueryScope(opts: ({ namespace?: string; visibleTo?: string } & VectorPartitionOption & VectorAllPartitionsOption) | undefined): { namespace?: string; visibleTo?: string; none: boolean; outsideOrganizations: boolean } {
   if (opts) assertRootVectorNames(opts);
@@ -694,7 +714,10 @@ export function vectorQueryScope(opts: ({ namespace?: string; visibleTo?: string
   return out;
 }
 
-/** The one reading of `VectorQueryOptions.visibleTo`, shared by every implementation that filters in code. */
+/**
+ * The one reading of `VectorQueryOptions.visibleTo`, shared by every implementation that filters in code.
+ * @internal — storage adapter plumbing.
+ */
 export function visibleToSubject(doc: { owner?: string; shared?: boolean }, visibleTo: string | undefined): boolean {
   return visibleTo === undefined || doc.shared === true || (doc.owner !== undefined && doc.owner === visibleTo);
 }
@@ -815,6 +838,7 @@ export class ReservedVectorNameError extends Error {
  * partition and ids under it, nothing else in the reserved space; a call without one names none of it.
  * Run by `vectorWriteBatch` (each item), `vectorQueryScope` and `vectorDeletePlan`, so every store
  * that runs the vector write rule refuses the same calls.
+ * @internal — storage adapter plumbing.
  */
 export function assertRootVectorNames(call: { namespace?: unknown; ids?: readonly unknown[] } & VectorPartitionOption): void {
   const granted = call[VECTOR_PARTITION];
@@ -1180,7 +1204,22 @@ export type StoreName = keyof CapabilityMatrix;
  * bridge for consumers like studio that expect a non-paginated reader. get/put/putIfAbsent/listKeys are
  * forwarded → studio sees it as "writable" (fork/resume works). (A true paginated studio integration is a later step.)
  */
-export function toJournal(runs: RunJournal): Journal & JournalReader {
+/**
+ * THE one answer to "is this the whole Storage" — read by toJournal, portOf, storageOf, journalOf and
+ * eraseSubject alike, so every function gives the same answer for the same value.
+ */
+export function isStorage(x: unknown): x is Storage {
+  const o = x as Record<string, unknown> | null | undefined;
+  return typeof o === 'object' && o !== null && typeof o.capabilities === 'object' && o.capabilities !== null
+    && typeof o.runs === 'object' && o.runs !== null;
+}
+
+/**
+ * The journal view every reader takes (Studio's `reader`, `exportRun`, `sweepRuns`, …), from a
+ * `Storage` or from its `runs` port; anything else is refused naming what it is.
+ */
+export function toJournal(source: RunJournal | Storage): Journal & JournalReader {
+  const runs: RunJournal = portOf(source, 'runs', 'toJournal');
   const j: Journal & JournalReader = {
     get: (k) => runs.get(k),
     put: (k, v) => runs.put(k, v),
@@ -1233,6 +1272,69 @@ export function requireCapability(storage: Storage, store: StoreName): void {
   }
 }
 
+/** The methods that make a value a port of each kind — what `portOf` checks before trusting it. */
+const PORT_METHODS = { runs: ['get', 'put', 'readRun'], work: ['append', 'put', 'ackOnce'], cache: ['get', 'set', 'delete'] } as const;
+type Ports = { runs: RunJournal; work: WorkStore; cache: CacheStore };
+
+/** What a wrong handle is, when it is a part of a storage — the one description every refusal uses. */
+function partOf(o: Record<string, unknown>): string | undefined {
+  if (typeof o.append === 'function' && typeof o.ackOnce === 'function') return 'a work port (storage.work)';
+  if (typeof o.readRun === 'function') return 'a run journal (storage.runs)';
+  if (typeof o.get === 'function' && typeof o.set === 'function' && typeof o.delete === 'function') return 'a cache port (storage.cache)';
+  return undefined;
+}
+
+/**
+ * THE reading of "the storage, or one of its ports" for every function that needs a port: the
+ * Storage itself (its port is taken, `requireCapability` refusing one it lacks) or the port. Anything
+ * else is refused naming what it is and the two calls that work.
+ */
+export function portOf<P extends keyof Ports>(arg: unknown, port: P, call: string): Ports[P] {
+  if (arg === null || typeof arg !== 'object') {
+    throw new TypeError(`${call} needs the storage or its ${port} port, got ${arg === null ? 'null' : typeof arg}. Pass the storage, or storage.${port}.`);
+  }
+  if (isStorage(arg)) {
+    if (port !== 'runs') requireCapability(arg, port as StoreName);
+    return arg[storePortKey(port as StoreName)] as unknown as Ports[P];
+  }
+  const o = arg as Record<string, unknown>;
+  const missing = PORT_METHODS[port].filter((m) => typeof o[m] !== 'function');
+  if (missing.length) {
+    const was = partOf(o);
+    throw new TypeError(
+      `${call}: the value passed has no ${missing.join('/')} method${missing.length > 1 ? 's' : ''} — ` +
+        (was ? `it is ${was}, not the ${port} port.` : `it is not a ${port} port.`) +
+        ` Pass the storage, or storage.${port}.`,
+    );
+  }
+  return arg as Ports[P];
+}
+
+/** The same for a function that needs the whole Storage (several of its ports). */
+export function storageOf(arg: unknown, call: string): Storage {
+  if (isStorage(arg)) return arg;
+  const o = arg as Record<string, unknown> | null | undefined;
+  const was = o && typeof o === 'object' ? (partOf(o) ? ` — this is ${partOf(o)}` : '') : ` — got ${o === null ? 'null' : typeof o}`;
+  throw new TypeError(`${call} needs the whole storage (it reads more than one of its ports)${was}. Pass the storage itself.`);
+}
+
+/**
+ * The same for a function that takes a key/value journal (the scheduler): the Storage gives its
+ * journal view, a journal is taken as it is, and a work or cache port is refused naming it.
+ */
+export function journalOf(arg: unknown, call: string): Journal {
+  if (isStorage(arg)) return toJournal(arg);
+  if (arg === null || typeof arg !== 'object') {
+    throw new TypeError(`${call} needs the storage or a journal, got ${arg === null ? 'null' : typeof arg}. Pass the storage, or toJournal(storage).`);
+  }
+  const o = arg as Record<string, unknown>;
+  const was = partOf(o);
+  if ((was !== undefined && was !== 'a run journal (storage.runs)') || typeof o.get !== 'function' || typeof o.put !== 'function') {
+    throw new TypeError(`${call}: ${was ? `the value passed is ${was}, not a journal` : 'the value passed has no get/put — it is not a journal'}. Pass the storage, or toJournal(storage).`);
+  }
+  return arg as unknown as Journal;
+}
+
 function storePortKey(store: StoreName): keyof Storage {
   // capability name → Storage port field (all under the same name; a helper for narrowing the type).
   return store as keyof Storage;
@@ -1253,6 +1355,7 @@ export interface CompositeConfig {
  * overridden port is also called (init: all of them; close: unique storages, once each).
  */
 export function composite(cfg: CompositeConfig): Storage {
+  refuseUnknownNames('composite', cfg, COMPOSITE_NAMES);
   const ov = cfg.overrides ?? {};
   const pick = <K extends Exclude<StoreName, 'runs'>>(k: K): Storage => ov[k] ?? cfg.default;
 

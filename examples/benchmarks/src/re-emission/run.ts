@@ -48,7 +48,7 @@ interface Scenario { id: string; persona: string; turns: Turn[] }
 const { scenarios } = JSON.parse(readFileSync(here('../../data/re-emission/scenarios.json'), 'utf8')) as { scenarios: Scenario[] };
 
 const storage = new PostgresStorage({ connectionString: process.env.DATABASE_URL ?? 'postgres://gnl:gnl@127.0.0.1:5544/gnl' });
-const journal = toJournal(storage.runs);
+const journal = toJournal(storage);
 const RUN = Date.now().toString(36);
 
 // The judge certificate is HAND-FILLED with the scores this judge configuration had when the run was
@@ -58,7 +58,7 @@ const RUN = Date.now().toString(36);
 let judgeCalls = 0;
 const judgeCert: JudgeCert = {
   v: 1, fixtureSetId: '7fe686bc058884cf', judgeModelId: 'openai/gpt-oss-20b', judgePromptVersion: '1',
-  paraphraseRecall: 0.933, nearMissFp: 0.04, passedAt: Date.now(),
+  paraphraseRecall: 0.933, nearMissFp: 0.04, paraphrasePairs: 20, nearMissAnswered: 20, passedAt: Date.now(),
 };
 const judgeComplete = async ({ system, user }: { system: string; user: string }): Promise<string> => {
   judgeCalls++;

@@ -259,16 +259,26 @@ describe('@gnldev/events — the attempt counter vs. a concurrent release', () =
   it('an event another process already delivered is not quarantined behind its back', async () => {
     const work = new InMemoryStorage().work;
     // Two processes, ONE consumer name (the supported way to scale a consumer horizontally).
-    // P2 delivers and acks while P1's attempt is still in flight; P1's failure then arrives late.
-    const p2 = createConsumer(work, 'dup', () => {}, { name: 'A', maxAttempts: 1, retryDelayMs: 0 });
+    // While P1's attempt runs it HOLDS the event, so P2 does not deliver it — first pinned below. Once
+    // P1 has held it for longer than `maxHoldMs` the hold runs out: P2 delivers and acks, and P1's
+    // failure then arrives late.
+    // maxAttempts 2: the attempt that ran out of hold counted, so P2's delivery is the second.
+    const p2 = createConsumer(work, 'dup', () => {}, { name: 'A', maxAttempts: 2, retryDelayMs: 0, leaseMs: 30, maxHoldMs: 30 });
+    const seenByP2: number[] = [];
     let raced = false;
     const p1 = createConsumer(work, 'dup', async () => {
-      if (!raced) { raced = true; expect(await p2.poll()).toBe(1); }
+      if (!raced) {
+        raced = true;
+        seenByP2.push(await p2.poll()); // held while it runs → 0
+        await new Promise((r) => setTimeout(r, 80)); // past maxHoldMs: the hold has run out
+        seenByP2.push(await p2.poll()); // → 1, delivered and acked
+      }
       throw new Error('p1 lost the race');
-    }, { name: 'A', maxAttempts: 1, retryDelayMs: 0 });
+    }, { name: 'A', maxAttempts: 2, retryDelayMs: 0, leaseMs: 30, maxHoldMs: 30 });
     await emit(work, 'dup', { id: 'p' }, { id: 'p' });
 
     expect(await p1.poll()).toBe(0); // P2 already marked it; P1 counts nothing
+    expect(seenByP2).toEqual([0, 1]);
     expect(await work.get('evtack:dup:A:p')).toBeDefined(); // the event WAS delivered
     // ...so there is nothing to give up on. A dead-letter record here is a page at 3am for an
     // event that succeeded, and permanent audit history for a failure that never happened.

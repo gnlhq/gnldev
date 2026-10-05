@@ -589,7 +589,7 @@ describe('FAZ-6 audit fixes', () => {
 
 const certOf = (over: Record<string, unknown> = {}) => ({
   v: 1 as const, fixtureSetId: 'fx-test', judgeModelId: 'j-model', judgePromptVersion: '1',
-  paraphraseRecall: 0.95, nearMissFp: 0.01, passedAt: Date.now(), ...over,
+  paraphraseRecall: 0.95, nearMissFp: 0.01, paraphrasePairs: 20, nearMissAnswered: 20, passedAt: Date.now(), ...over,
 });
 
 describe('FAZ-7 rule ladder (deterministic, no judge)', () => {

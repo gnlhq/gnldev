@@ -9,7 +9,6 @@
 //  - Ş3: observational-memory vectors were written with no owner and no namespace, so the erasure,
 //    which deletes documents by owner, left "AYSE-OBSERVATION: diabetic, IBAN TR55".
 import { describe, it, expect } from 'vitest';
-import { stepCountIs } from 'ai';
 import {
   InMemoryStorage, createGnl, user, eraseSubject, withOrgStorage, scopeConfigToOrg, workingMemoryScope, toJournal, staff,
   type Storage, type VectorStore,
@@ -49,7 +48,7 @@ const wmOpts = { workingMemory: { scope: 'resource' as const } };
 describe('Ş1: a memory kept in another storage than the one erased', () => {
   async function world(memoryStorage: Storage, storage: Storage) {
     const memory = memoryPreset(memoryStorage as any, 'chat', wmOpts);
-    const gnl = createGnl({ storage, memory, agents: { w: { model: writer({ iban: 'TR55-AYSE' }), stopWhen: stepCountIs(3) } } } as any);
+    const gnl = createGnl({ storage, memory, agents: { w: { model: writer({ iban: 'TR55-AYSE' }), maxSteps: 3 } } } as any);
     await gnl.run('w', { runId: 'ay1', prompt: 'r', threadId: 'ayse-thread', caller: user('u-ayse') });
     await gnl.run('w', { runId: 'bo1', prompt: 'r', threadId: 'bob-thread', caller: user('u-bob') });
   }
@@ -99,7 +98,7 @@ describe('Ş1: a memory kept in another storage than the one erased', () => {
     const storage = new InMemoryStorage();
     const other = new InMemoryStorage();
     for (const org of ['acme', 'globex']) {
-      const cfg = scopeConfigToOrg({ storage, memoryFactory: () => memoryPreset(withOrgStorage(other, org) as any, 'chat', wmOpts), agents: { w: { model: writer({ iban: `IBAN-${org}` }), stopWhen: stepCountIs(3) } } } as any, org);
+      const cfg = scopeConfigToOrg({ storage, memoryFactory: () => memoryPreset(withOrgStorage(other, org) as any, 'chat', wmOpts), agents: { w: { model: writer({ iban: `IBAN-${org}` }), maxSteps: 3 } } } as any, org);
       await createGnl(cfg.config).run('w', { runId: `r-${org}`, prompt: 'r', threadId: 't', caller: user('u-ayse', org) });
     }
     const report = await eraseSubject(storage, 'u-ayse', { orgId: 'acme', memory: other });
@@ -300,7 +299,7 @@ describe('Ş3: observational-memory vectors belong to the thread\'s owner', () =
 
   it('through the engine (the panel probe): the observation of Ayse\'s run goes with her, bob\'s stays', async () => {
     const storage = new InMemoryStorage();
-    const memory: any = memoryPreset(storage as any, 'chat', { observationalMemory: { model: echoSys, omVectors: { store: storage.vectors as any, embed } } as any });
+    const memory: any = memoryPreset(storage as any, 'chat', { observationalMemory: { observerModel: echoSys, omVectors: { store: storage.vectors as any, embed } } as any });
     const gnl = createGnl({ storage, memory, agents: { a: { model: echoSys } } } as any);
     await gnl.run('a', { runId: 'ay1', prompt: 'hi', threadId: 'ayse-thread', caller: user('u-ayse') });
     await gnl.run('a', { runId: 'bo1', prompt: 'hi', threadId: 'bob-thread', caller: user('u-bob') });

@@ -31,7 +31,7 @@ describe('recall provenance', () => {
     const storage = new InMemoryStorage();
     const mem = new AgentMemory({
       storage, embed, recentN: 2, recall: { topK: 1 },
-      workingMemory: { enabled: true },
+      workingMemory: {},
     });
     await mem.append('th', [u('refund policy is thirty days'), u('filler one'), u('filler two'), u('recent a'), u('recent b')]);
     await mem.setWorkingMemory('th', 'user prefers refunds in store credit');

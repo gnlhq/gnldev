@@ -11,6 +11,10 @@ import { trace, context, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 import { getRunCost } from '@gnldev/durable';
 import type { JournalReader, ModelPricing } from '@gnldev/durable';
 import { traceIdFor, spanIdFor, QueueIdGenerator, mapEntry } from './spans.js';
+import { serviceResource } from './sdk-resource.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { EXPORT_RUN_OPTS_NAMES } from './option-names.js';
+import { resourceOptionsOf } from './resource.js';
 
 export interface ExportRunOptions {
   /** A ready-made OTEL SpanExporter (InMemorySpanExporter for tests). If not given, falls back to the endpoint or the default. */
@@ -21,8 +25,10 @@ export interface ExportRunOptions {
   pricing?: Record<string, ModelPricing>;
   /** Default when the journal has no model id. */
   modelId?: string;
-  /** service.name attribute. */
+  /** `service.name` on the resource of every span (what a trace backend groups by). Default `'gnl'`. */
   serviceName?: string;
+  /** More resource attributes (`deployment.environment`, …). `serviceName` wins over a `service.name` here. */
+  resourceAttributes?: Record<string, string | number | boolean>;
   /**
    * Applied to every free-text attribute this exporter emits. Today that is exactly one value — a
    * failed run's `outcome.error`, which reaches both the `gnl.error` attribute and the root span's
@@ -73,6 +79,7 @@ export async function exportRun(
   runId: string,
   opts: ExportRunOptions = {},
 ): Promise<ExportRunResult> {
+  refuseUnknownNames('exportRun', opts, EXPORT_RUN_OPTS_NAMES);
   const entries = await reader.readRun(runId);
   // The run's recorded outcome. Without it, a run that DIED — a 401 on the first call, a cost ceiling —
   // produced no error-bearing entry and was therefore exported as OK with $0 of cost: the single most
@@ -82,6 +89,11 @@ export async function exportRun(
     ? await (reader as unknown as { get<T>(k: string): Promise<T | undefined> })
         .get<{ status?: string; error?: string }>(`${runId}:outcome`).catch(() => undefined)
     : undefined;
+  // A run with no journal entries and no outcome did not happen — exporting it produced a root span
+  // marked OK and `completed` for a runId nothing ever ran under. Refused, before any span is made.
+  if (entries.length === 0 && outcome === undefined) {
+    throw new Error(`@gnldev/otel: run '${runId}' has no journal entries and no outcome — there is nothing to export (a mistyped runId, another organization's journal, or a run already swept).`);
+  }
   const runFailed = outcome?.status === 'failed';
   const runCanceled = outcome?.status === 'canceled';
   // The one free-text value that leaves this exporter — see `redact` on the options for why the
@@ -106,7 +118,7 @@ export async function exportRun(
 
   // OpenTelemetry JS 2.x removed `provider.addSpanProcessor()`: a processor can no longer be
   // attached after construction, it is declared with the provider. Passed via `spanProcessors`.
-  const provider = new BasicTracerProvider({ idGenerator, spanProcessors: [new SimpleSpanProcessor(exporter)] });
+  const provider = new BasicTracerProvider({ idGenerator, resource: serviceResource(resourceOptionsOf(opts)), spanProcessors: [new SimpleSpanProcessor(exporter)] });
   const tracer = provider.getTracer('@gnldev/otel');
 
   const cost = await getRunCost(reader, runId, { pricing: opts.pricing, modelId: opts.modelId });
@@ -127,7 +139,6 @@ export async function exportRun(
       'gnl.cost_usd': cost.costUsd,
       'gnl.model_calls': cost.modelCalls,
       'gnl.tool_calls': cost.toolCalls,
-      ...(opts.serviceName ? { 'service.name': opts.serviceName } : {}),
     },
   });
   const parentCtx = trace.setSpan(context.active(), root);
@@ -203,3 +214,5 @@ export type {
 // Named observability presets (Langfuse/Braintrust/Honeycomb/Datadog/Collector) + a generic
 // API-key-authenticated OTLP/HTTP preset for any other provider.
 export { otlpPresets, langfuse, apiKeyOtlp, braintrust, honeycomb, datadogAgent, collector } from './presets.js';
+export { serviceResourceAttributes, type ServiceResourceOptions } from './resource.js';
+export { serviceResource } from './sdk-resource.js';

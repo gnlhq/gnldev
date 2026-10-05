@@ -2,6 +2,8 @@
 // On crash→resume, COMPLETED steps do NOT run again (exactly-once); resumes from where it left off.
 // Structurally compatible with @gnldev/durable's Journal (JournalLike) — zero dependency for the package.
 
+import { refuseUnknownNames } from '@gnldev/options';
+import { STEP_OPTS_NAMES, WAIT_FOR_RESUME_OPTS_NAMES, CANCEL_WORKFLOW_RUN_OPTS_NAMES, LIST_WORKFLOW_RUNS_OPTS_NAMES, LOOP_NAMES, RUN_RESUMABLE_NAMES } from './option-names.js';
 export interface JournalLike {
   get<T = unknown>(key: string): Promise<T | undefined>;
   put(key: string, value: unknown): Promise<void>;
@@ -17,7 +19,7 @@ export interface JournalLike {
    * Journal.incrBy). Saves the retry counter from get→put's lost-update race. If undefined,
    * falls back to the existing path.
    */
-  incrBy?(key: string, fields: Record<string, number>): Promise<void>;
+  incrBy?(key: string, fields: Record<string, number>): Promise<Record<string, number> | void>;
   /** Optional: read counter fields written via incrBy (undefined if absent). */
   getCounters?(key: string): Promise<Record<string, number> | undefined>;
   /**
@@ -223,6 +225,7 @@ export function step<I = any, O = any>(
   run: (input: I, ctx: StepCtx) => Promise<O>,
   opts?: StepDurability<I, O>,
 ): Step<I, O> {
+  refuseUnknownNames('step', opts, STEP_OPTS_NAMES);
   return opts ? { id, run, durability: opts } : { id, run };
 }
 
@@ -795,6 +798,7 @@ export class Workflow<I = any, O = any> {
     cond: (output: O, iter: number) => boolean,
     opts: { id?: string; maxIters?: number } = {},
   ): Workflow<I, O> {
+    refuseUnknownNames('loop', opts, LOOP_NAMES);
     const id = opts.id ?? `loop#${this.steps.length}`;
     const max = opts.maxIters ?? 100;
     const composite: Step<O, O> = {
@@ -819,6 +823,7 @@ export class Workflow<I = any, O = any> {
     cond: (output: O, iter: number) => boolean,
     opts: { id?: string; maxIters?: number } = {},
   ): Workflow<I, O> {
+    refuseUnknownNames('dowhile', opts, LOOP_NAMES);
     return this.loop(run, cond, { id: opts.id ?? `dowhile#${this.steps.length}`, maxIters: opts.maxIters });
   }
 
@@ -828,6 +833,7 @@ export class Workflow<I = any, O = any> {
     cond: (output: O, iter: number) => boolean,
     opts: { id?: string; maxIters?: number } = {},
   ): Workflow<I, O> {
+    refuseUnknownNames('dountil', opts, LOOP_NAMES);
     return this.loop(run, (o, i) => !cond(o, i), { id: opts.id ?? `dountil#${this.steps.length}`, maxIters: opts.maxIters });
   }
 
@@ -889,6 +895,7 @@ export class Workflow<I = any, O = any> {
       workflowName?: string;
     } = {},
   ): Promise<WorkflowResult<O>> {
+    refuseUnknownNames('runResumable', opts, RUN_RESUMABLE_NAMES);
     const ctx = withIdentity(entry);
     const limit = opts.maxSteps ?? Infinity;
     const journal = ctx.journal;
@@ -974,13 +981,25 @@ export function suspendWorkflow(waitId: string, reason?: unknown): never {
   throw new WorkflowSuspended(waitId, reason);
 }
 
-/** Durable step that waits until a specific time (scheduled). Suspends if the time hasn't elapsed yet. */
-export function sleep(id: string, untilMs: number): Step {
+/**
+ * Durable step that waits until a specific time (scheduled). Suspends if the time hasn't elapsed yet.
+ * `untilMs` is an absolute time — epoch milliseconds, or a `Date` — and is checked here: a value that is
+ * not one (`NaN`, `undefined`, a string, `Infinity`) used to make `Date.now() < untilMs` false, so the
+ * step did not wait at all and nothing said so.
+ */
+export function sleep(id: string, untilMs: number | Date): Step {
+  const at = untilMs instanceof Date ? untilMs.getTime() : untilMs;
+  if (typeof at !== 'number' || !Number.isFinite(at)) {
+    throw new TypeError(
+      `@gnldev/workflow: sleep('${id}') needs an absolute time — epoch milliseconds or a Date — got ${untilMs instanceof Date ? 'an invalid Date' : typeof untilMs === 'string' ? JSON.stringify(untilMs) : String(untilMs)}. ` +
+        'For a delay, pass Date.now() + ms; to wait until someone resumes the run, use waitForResume.',
+    );
+  }
   return {
     id,
     run: async () => {
-      if (Date.now() < untilMs) suspendWorkflow(id, { kind: 'time', untilMs });
-      return { sleptUntil: untilMs };
+      if (Date.now() < at) suspendWorkflow(id, { kind: 'time', untilMs: at });
+      return { sleptUntil: at };
     },
   };
 }
@@ -1002,6 +1021,7 @@ export function waitForResume<T = unknown>(
   id: string,
   opts: { validate?: (v: unknown) => T; reason?: unknown } = {},
 ): Step<any, T> {
+  refuseUnknownNames('waitForResume', opts, WAIT_FOR_RESUME_OPTS_NAMES);
   const gate: Step<any, T> = {
     id,
     run: async (_input, ctx) => {
@@ -1186,6 +1206,7 @@ export async function cancelWorkflowRun(
   runId: string,
   opts: { reason?: unknown } = {},
 ): Promise<boolean> {
+  refuseUnknownNames('cancelWorkflowRun', opts, CANCEL_WORKFLOW_RUN_OPTS_NAMES);
   const st = await journal.get<WorkflowRunStatus>(statusKey(runId));
   if (st?.status === 'completed') return false;
   await journal.put(canceledKey(runId), { at: Date.now(), ...(opts.reason !== undefined ? { reason: opts.reason } : {}) });
@@ -1217,6 +1238,7 @@ export async function listWorkflowRuns(
   journal: JournalLike,
   opts: { status?: WorkflowRunStatus['status'] } = {},
 ): Promise<WorkflowRunStatus[]> {
+  refuseUnknownNames('listWorkflowRuns', opts, LIST_WORKFLOW_RUNS_OPTS_NAMES);
   if (typeof journal.listKeys !== 'function') {
     throw new Error("@gnldev/workflow: listWorkflowRuns requires the journal to implement `listKeys` (see JournalLike) — without it the registry cannot be enumerated.");
   }

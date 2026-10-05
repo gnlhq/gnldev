@@ -246,7 +246,7 @@ describe('createGnl runNetwork integration', () => {
     });
     const res = await gnl.runNetwork('destek', { runId: 'n1', task: 'question' });
     expect(res.text).toBe('result: expert answer');
-    expect(res.steps).toEqual([{ i: 0, agent: 'uzman', task: 'answer the question', text: 'expert answer' }]);
+    expect(res.steps).toEqual([{ i: 0, agent: 'uzman', task: 'answer the question', text: 'expert answer', status: 'completed' }]);
     // The sub-agent's own journal was created under a deterministic nested runId.
     const nested = await journal.readRun(netKeys.nestedRunId('n1', 0));
     expect(nested.length).toBeGreaterThan(0);

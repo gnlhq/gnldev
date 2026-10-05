@@ -2,6 +2,8 @@
 import type { CreateGnlConfig } from '@gnldev/durable';
 import { readFileSync } from 'node:fs';
 import { parseEnv } from 'node:util';
+import { refuseUnknownNames } from '@gnldev/options';
+import { DEFINE_CONFIG_NAMES } from './option-names.js';
 
 /**
  * A static credential — structurally `Cred` from `@gnldev/auth`, declared here instead of imported.
@@ -130,6 +132,7 @@ export interface GnlDevConfig extends CreateGnlConfig {
 
 /** Inside gnl.config.ts: `export default defineConfig({...})`. Identity function, only for typing. */
 export function defineConfig(config: GnlDevConfig): GnlDevConfig {
+  refuseUnknownNames('defineConfig', config, DEFINE_CONFIG_NAMES);
   return config;
 }
 
@@ -187,5 +190,9 @@ export async function loadConfig(path: string): Promise<GnlDevConfig> {
   }
   const cfg = mod.default ?? mod.config ?? mod;
   if (!cfg?.journal && !cfg?.storage) throw new Error(`gnl: '${path}' is not a valid gnl.config (storage or journal required).`);
+  // The file need not go through defineConfig (a plain `export default {}` is a config too), so the
+  // names are checked where the file is read as well — for the exported config object only: a module
+  // read as a whole may carry other named exports of its own.
+  if (mod.default ?? mod.config) refuseUnknownNames(`gnl.config (${path})`, cfg, DEFINE_CONFIG_NAMES);
   return cfg as GnlDevConfig;
 }

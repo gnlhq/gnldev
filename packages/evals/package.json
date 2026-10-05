@@ -5,7 +5,7 @@
   "engines": {
     "node": ">=22.13.0"
   },
-  "description": "Scorers + LLM-judge for @gnldev/durable. scoreRun reads the journal trace → deterministic, replayable scoring.",
+  "description": "Scorers + LLM-judge for @gnldev/durable. scoreRun reads the journal trace \u2192 deterministic, replayable scoring.",
   "keywords": [
     "ai",
     "agent",
@@ -45,7 +45,7 @@
     "@gnldev/durable": "workspace:*",
     "ai": "^7.0.0"
   },
-  "author": "Karaca Yılmaz (https://gnl.dev)",
+  "author": "Karaca Y\u0131lmaz (https://gnl.dev)",
   "homepage": "https://gnl.dev",
   "bugs": {
     "url": "https://github.com/gnlhq/gnldev/issues"
@@ -57,5 +57,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "@gnldev/options": "workspace:^"
   }
 }

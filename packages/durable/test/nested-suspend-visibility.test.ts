@@ -22,6 +22,8 @@ import { createMockModel, finalTextResult, toolCallResult, countToolResults } fr
 
 const TCID = 'call-devret';
 const CHILD_TCID = 'alt-call-1';
+/** The child's question, addressed from the parent: `<delegation call>/<child call>` (guard.ts addressedInterrupt). */
+const ASKED = `${TCID}/${CHILD_TCID}`;
 
 /** Ana ajan bir kez alt ajanı çağırır; alt ajan onay isteyen bir aracı çağırır. */
 function setup(journal: InMemoryJournal, counter?: { n: number }, childTcid = CHILD_TCID) {
@@ -69,7 +71,7 @@ describe('alt ajanın askısı görünür', () => {
     const journal = new InMemoryJournal();
     const r = await setup(journal).run('ana', { runId: 'ns-2', prompt: 'devret' } as never);
     const it0 = r.interrupts[0] as any;
-    expect(it0?.toolCallId, 'yüzeydeki kimlik cevaplanabilir değil').toBe(CHILD_TCID);
+    expect(it0?.toolCallId, 'yüzeydeki kimlik cevaplanabilir değil').toBe(ASKED);
     expect(it0?.toolName).toBe('paraGonder');
     // Bağlam kaybolmasın: insan bunun bir alt ajandan geldiğini okuyabilmeli.
     expect(String(it0?.reason)).toContain('sub-agent');
@@ -103,7 +105,7 @@ describe('alt ajanın askısı görünür', () => {
     await setup(journal, counter).run('ana', { runId: 'ns-5', prompt: 'devret' } as never);
     const r2 = await setup(journal, counter).run('ana', { runId: 'ns-5', prompt: 'devret', approvals: { [TCID]: true } } as never);
     expect(r2.interrupts.length, 'vekil onayı askıyı çözmüş — soru hâlâ cevaplanmamışken').toBeGreaterThan(0);
-    expect(r2.interrupts[0]!.toolCallId).toBe(CHILD_TCID);
+    expect(r2.interrupts[0]!.toolCallId).toBe(ASKED);
     expect(counter.n, 'vekil onayı yan etkiyi çalıştırdı').toBe(0);
     const child = nestedAgentRunId('ns-5', TCID);
     expect((await journal.get<{ status?: string }>(`${child}:tool:${CHILD_TCID}`))?.status).toBe('suspended');
@@ -119,7 +121,7 @@ describe('alt ajanın askısı görünür', () => {
     await setup(journal, counter).run('ana', { runId: 'ns-6', prompt: 'devret' } as never);
     const r2 = await setup(journal, counter).run('ana', { runId: 'ns-6', prompt: 'devret', approvals: { [TCID]: false } } as never);
     expect(r2.interrupts.length, 'vekil reddi soruyu yuttu').toBeGreaterThan(0);
-    expect(r2.interrupts[0]!.toolCallId).toBe(CHILD_TCID);
+    expect(r2.interrupts[0]!.toolCallId).toBe(ASKED);
     expect((await journal.get<{ status?: string }>(`ns-6:tool:${TCID}`))?.status)
       .toBe('suspended'); // 'denied' DEĞİL — vekile verilen ret ebeveyni kapatmaz
     expect(counter.n).toBe(0);
@@ -201,7 +203,7 @@ describe('iç içe askı: onayın re-POST\'u büyümüş gövdeyle', () => {
     const counter = { n: 0 };
     const r1 = await setup(journal, counter).run('ana', { runId: parentRunId, messages: ilkGovde } as never);
     const asked = (r1.interrupts[0] as any).toolCallId;
-    expect(asked).toBe(CHILD_TCID);
+    expect(asked).toBe(ASKED);
 
     const r2 = await setup(journal, counter).run(
       'ana',

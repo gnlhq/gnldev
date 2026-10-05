@@ -175,7 +175,7 @@ export async function loadStudioAi(projectDir: string): Promise<typeof StudioAi>
   return (await resolveFromProject('@gnldev/studio/ai', projectDir)) as typeof StudioAi;
 }
 
-/** The project's @gnldev/memory — memoryPreset (default dev studio/playground memory, optional). */
+/** The project's @gnldev/memory — memoryPreset (optional). */
 export async function loadMemory(projectDir: string): Promise<typeof Memory> {
   return (await resolveFromProject('@gnldev/memory', projectDir)) as typeof Memory;
 }

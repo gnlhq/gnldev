@@ -7,9 +7,10 @@
 import { randomUUID } from 'node:crypto';
 import {
   acquireRunLock, requireCapability, createPollLoop, orgPrefix, withOrgStorage, orgStorageScopeOf, ownedName, ownedPrefix,
-  claimRunOwner, runDurable, user, staff, UNKNOWN, toJournal, ownerOfName, assertRootWorkForErasure,
-} from '@gnldev/durable';
+  claimRunOwner, runDurable, user, staff, UNKNOWN, toJournal, ownerOfName, assertRootWorkForErasure, portOf, storageOf } from '@gnldev/durable';
 import type { Storage, WorkStore, RunJournal, LogRecord, Caller, RunDurableArgs, DurableResult } from '@gnldev/durable';
+import { refuseUnknownNames } from '@gnldev/options';
+import { ENQUEUE_OPTIONS_NAMES, RETRY_JOB_OPTS_NAMES, CREATE_WORKER_OPTS_NAMES, MOVE_JOB_TO_NAMES } from './option-names.js';
 
 /** What `ctx.run` takes: `runDurable`'s arguments without the four the job already decides. */
 export type JobRunArgs = RunDurableArgs extends infer A ? (A extends unknown ? Omit<A, 'journal' | 'runId' | 'caller' | 'resourceId'> : never) : never;
@@ -50,6 +51,12 @@ export interface JobCtx {
    * (both overridable). What `enqueue(ctx.storage.work, …)` looks like it does, and did not.
    */
   enqueue(type: string, payload: unknown, opts?: EnqueueOptions): Promise<string>;
+  /**
+   * Aborted when the job is cancelled (`cancelJob`) while this handler runs. The worker notices on its
+   * heartbeat tick (every `ttlMs/3`), so with `heartbeat: false` it is never aborted. `ctx.run` already
+   * passes it on to the run; a handler doing other long work checks it itself.
+   */
+  signal: AbortSignal;
 }
 
 /** Whose a job is. Kept beside the payload, never inside it: a payload is the handler's, this is the queue's. */
@@ -67,6 +74,13 @@ export interface EnqueueOptions extends JobOwner {
    * this nor `resourceId`, the job's run is `unknown`: never staff by omission.
    */
   caller?: Caller;
+  /**
+   * Not before this time (epoch ms or a `Date`). Stored in the job record itself, so it is written in
+   * the same append as the job: no crash can leave the job without it. Compared with the run journal's
+   * clock when it has one (`now()`), else the worker's. An idempotent re-enqueue of the same id keeps
+   * the first record's `runAt`.
+   */
+  runAt?: number | Date;
 }
 
 /**
@@ -74,7 +88,51 @@ export interface EnqueueOptions extends JobOwner {
  * written by `retryJob` only: the durable run the retried dead letter was using, which the retry
  * continues (absent → the job's own `job:<id>`).
  */
-type JobRecord = { type: string; payload: unknown; ownerKind?: 'staff'; runId?: string } & JobOwner;
+type JobRecord = { type: string; payload: unknown; ownerKind?: 'staff'; runId?: string; runAt?: number } & JobOwner;
+
+/**
+ * The per-job KV markers that make up a job's state. `qdone`/`qfail`/`qcancel` are terminal; `qtry` is
+ * the attempt record (`TryRecord`); `qatt` is the attempt count a worker before 0.10 wrote.
+ * One list, read by `moveJob` (copies them) and `jobEraser` (deletes them, with the lease's `qown`).
+ */
+const STATE_MARKERS = ['qdone', 'qfail', 'qcancel', 'qatt', 'qtry'] as const;
+
+/**
+ * A job's attempts, in ONE record under its own key (`qtry`): how many STARTED, and after a failure the
+ * earliest time of the next one. An attempt is counted when it starts, so one the process died in counts
+ * too: counted when it failed, a job that killed its worker every time ran forever (measured: started 8
+ * times with maxAttempts 3, attempts 0, still pending). One write, because WorkStore has no batch and two
+ * keys (a count and a time) left a crash between them. `qatt`, the bare count a worker before 0.10
+ * writes, is read and never written, so such a worker's attempts still count during a rolling deploy.
+ */
+type TryRecord = { attempts: number; notBefore: number };
+async function attemptsOf(work: WorkStore, jobId: string): Promise<TryRecord> {
+  const t = await work.get<TryRecord>(`qtry:${jobId}`);
+  const old = await work.get<unknown>(`qatt:${jobId}`);
+  return { attempts: Math.max(t?.attempts ?? 0, typeof old === 'number' ? old : 0), notBefore: t?.notBefore ?? 0 };
+}
+
+/**
+ * Done, dead-lettered or cancelled — the ONE reading of "this job is finished", used by the worker
+ * (before the lease and under it), `cancelJob`, and nowhere else.
+ */
+async function isTerminal(work: WorkStore, jobId: string): Promise<boolean> {
+  return (
+    (await work.get(`qdone:${jobId}`)) !== undefined ||
+    (await work.get(`qfail:${jobId}`)) !== undefined ||
+    (await work.get(`qcancel:${jobId}`)) !== undefined
+  );
+}
+
+/**
+ * The earliest time a job may run: the later of its `runAt` (in the record, set by `enqueue`) and the
+ * retry delay in its attempt record (set by the worker after a failed attempt). The ONE reading of "when is this job
+ * eligible" — a delayed job and a job in retry backoff are the same thing to the worker.
+ */
+async function notBeforeOf(work: WorkStore, job: LogRecord<JobRecord>): Promise<number> {
+  const runAt = typeof job.payload.runAt === 'number' ? job.payload.runAt : 0;
+  return Math.max(runAt, (await attemptsOf(work, job.id)).notBefore);
+}
 
 /** The durable run a job record executes as — the ONE reading (worker, `retryJob`). */
 function runIdOfJob(job: LogRecord<JobRecord>): string {
@@ -160,13 +218,40 @@ export interface QueueWorkerOptions {
    */
   maxRenewFailures?: number;
   onError?: (err: unknown, jobId: string) => void;
+  /**
+   * The wait before the next attempt of a failed job, in ms: a number, or `(attempt, err) => ms` where
+   * `attempt` is the number of attempts so far (1 after the first failure). Default 0 (the next
+   * poll). The worker records the resulting time in the job's attempt record (`qtry`), so every worker in the
+   * fleet honours it, across restarts. `retryDelayMs: (n) => 1000 * 2 ** (n - 1)` is exponential backoff.
+   */
+  retryDelayMs?: number | ((attempt: number, err: unknown) => number);
+  /**
+   * How many jobs this worker runs at once after `start()` (default 1). Each slot is its own poll loop,
+   * so a slot takes the next job as soon as its own finishes. Two slots never run one job: each job is
+   * taken under its lease. `runOnce`/`drain` are unaffected (one job per call).
+   */
+  concurrency?: number;
+  /**
+   * At most this many jobs of a type run at once, across EVERY worker on this storage — e.g.
+   * `{ 'send-email': 2 }`. Enforced with that many leases in the run journal (`qslot:<type>:<k>`), kept
+   * alive by the heartbeat and reclaimed after `ttlMs` if a worker dies, so a crash never leaks a slot.
+   * A job that finds no free slot is skipped until one frees. Give every worker the same number: a
+   * worker with a smaller one uses only the first slots, a worker with a larger one uses more.
+   */
+  typeConcurrency?: Record<string, number>;
 }
 
 export interface JobStatus extends JobOwner {
   id: string;
   type: string;
-  status: 'pending' | 'done' | 'failed';
+  status: 'pending' | 'done' | 'failed' | 'cancelled';
+  /**
+   * Attempts STARTED, counted as each begins: a job done on its first try shows 1, and an attempt the
+   * process died in counts. A dead letter shows `maxAttempts`.
+   */
   attempts: number;
+  /** A pending job that may not run yet (its `runAt`, or its retry delay): the earliest time it may. */
+  notBefore?: number;
 }
 
 /**
@@ -211,11 +296,13 @@ async function countUpTo(work: WorkStore, ns: string, limit: number): Promise<nu
  * letter instead of one error to the caller.
  */
 export async function enqueue(
-  work: WorkStore,
+  workArg: WorkStore,
   type: string,
   payload: unknown,
   options: EnqueueOptions = {},
 ): Promise<string> {
+  refuseUnknownNames('enqueue', options, ENQUEUE_OPTIONS_NAMES);
+  const work = portOf(workArg, 'work', 'enqueue');
   return appendJob(work, type, payload, options);
 }
 
@@ -243,6 +330,10 @@ async function appendJob(
   if (opts.resourceId !== undefined && (typeof opts.resourceId !== 'string' || opts.resourceId === '')) {
     throw new Error(`@gnldev/queue: invalid resourceId '${String(opts.resourceId)}' — must be a non-empty string, or omitted for a system job`);
   }
+  const runAt = opts.runAt instanceof Date ? opts.runAt.getTime() : opts.runAt;
+  if (runAt !== undefined && !Number.isFinite(runAt)) {
+    throw new TypeError(`@gnldev/queue: invalid runAt '${String(opts.runAt)}' — an epoch-ms number or a valid Date`);
+  }
   if (opts.maxDepth != null) {
     // Counted per organization: one organization filling the queue refused every other one's work.
     // Read from the organization's own depth index, so an organization with 5 jobs pays for 5 records,
@@ -262,6 +353,7 @@ async function appendJob(
     ...(opts.orgId !== undefined ? { orgId: opts.orgId } : {}),
     ...(ownerKind ? { ownerKind } : {}),
     ...(runId !== undefined ? { runId } : {}),
+    ...(runAt !== undefined ? { runAt } : {}),
   };
   // A caller's id is a name within its owner (`ownedName`): the log is one for every organization. The
   // id returned is the stored one — what `retryJob` and `listJobs` speak.
@@ -292,18 +384,24 @@ async function listAll<T>(work: WorkStore, ns: string): Promise<LogRecord<T>[]> 
 }
 
 /** Summary of all jobs (pending/done/failed + attempt count). */
-export async function listJobs(work: WorkStore): Promise<JobStatus[]> {
+export async function listJobs(workArg: WorkStore): Promise<JobStatus[]> {
+  const work = portOf(workArg, 'work', 'listJobs');
   const jobs = await listAll<JobRecord>(work, 'qjob');
   const out: JobStatus[] = [];
   for (const j of jobs) {
     const done = await work.get(`qdone:${j.id}`);
     const fail = await work.get(`qfail:${j.id}`);
-    const attempts = (await work.get<number>(`qatt:${j.id}`)) ?? 0;
+    const cancelled = await work.get(`qcancel:${j.id}`);
+    const { attempts } = await attemptsOf(work, j.id);
+    // A job cancelled while it ran, and which then finished, ran: `done` wins over `cancelled`.
+    const status = done ? 'done' : fail ? 'failed' : cancelled !== undefined ? 'cancelled' : 'pending';
+    const notBefore = status === 'pending' ? await notBeforeOf(work, j) : 0;
     out.push({
       id: j.id,
       type: j.payload.type,
-      status: done ? 'done' : fail ? 'failed' : 'pending',
+      status,
       attempts,
+      ...(notBefore > 0 ? { notBefore } : {}),
       ...(j.payload.resourceId !== undefined ? { resourceId: j.payload.resourceId } : {}),
       ...(j.payload.orgId !== undefined ? { orgId: j.payload.orgId } : {}),
     });
@@ -331,7 +429,7 @@ async function findJob(
 
 /**
  * Retries a dead-letter (qfail — has reached `maxAttempts`) job: appends a NEW job record with its
- * original type/payload/owner (append-only log — the old record AND its qfail/qatt markers are NOT
+ * original type/payload/owner (append-only log — the old record AND its qfail/qtry markers are NOT
  * MODIFIED/DELETED, the dead-letter history stays permanent for audit). Returns the new job's id.
  *
  * THE RETRY CONTINUES THE DEAD LETTER'S RUN. The new record carries the dead letter's durable run id
@@ -354,10 +452,12 @@ async function findJob(
  * to prevent.
  */
 export async function retryJob(
-  work: WorkStore,
+  workArg: WorkStore,
   id: string,
   opts: { maxDepth?: number; newRun?: boolean } = {},
 ): Promise<string | null> {
+  refuseUnknownNames('retryJob', opts, RETRY_JOB_OPTS_NAMES);
+  const work = portOf(workArg, 'work', 'retryJob');
   const rec = await findJob(work, id);
   if (!rec) return null;
   const fail = await work.get(`qfail:${id}`);
@@ -373,6 +473,25 @@ export async function retryJob(
   );
 }
 
+/**
+ * Cancels a job that has not finished: no worker starts it after this returns `true`. A job running at
+ * that moment is not killed — its handler's `ctx.signal` is aborted on the worker's next heartbeat tick,
+ * and if the handler completes anyway the job is reported `done` (it ran), else `cancelled`.
+ *
+ * The cancel is the `qcancel:<id>` marker, written with `ackOnce` (one writer wins), and it is terminal:
+ * the same `isTerminal` reading the worker re-checks under its lease. Returns `false` (no-op) for an
+ * unknown id or a job already done, dead-lettered or cancelled. A cancelled job is not a dead letter, so
+ * `retryJob` does not take it; enqueue it again under a new id to run it after all.
+ *
+ * During a rolling deploy a worker older than this marker does not read it and may still run the job.
+ */
+export async function cancelJob(workArg: WorkStore, id: string): Promise<boolean> {
+  const work = portOf(workArg, 'work', 'cancelJob');
+  if (!(await findJob(work, id))) return false;
+  if (await isTerminal(work, id)) return false;
+  return work.ackOnce(`qcancel:${id}`);
+}
+
 export interface Worker {
   /** Claims and runs one pending job. Returns true if a job was processed. */
   runOnce(): Promise<boolean>;
@@ -383,10 +502,12 @@ export interface Worker {
 }
 
 export function createWorker(
-  storage: Storage,
+  storageArg: Storage,
   handlers: Record<string, JobHandler>,
   opts: QueueWorkerOptions = {},
 ): Worker {
+  refuseUnknownNames('createWorker', opts, CREATE_WORKER_OPTS_NAMES);
+  const storage = storageOf(storageArg, 'createWorker');
   requireCapability(storage, 'work');
   const work = storage.work!;
   const runs: RunJournal = storage.runs;
@@ -397,6 +518,39 @@ export function createWorker(
   const backoffOn = opts.backoff ?? true;
   const maxPollMs = opts.maxPollMs ?? pollMs * 32;
   const maxRenewFailures = opts.maxRenewFailures ?? 3;
+  const concurrency = opts.concurrency ?? 1;
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    throw new TypeError(`@gnldev/queue: concurrency must be a positive integer, got ${String(opts.concurrency)}`);
+  }
+  for (const [type, n] of Object.entries(opts.typeConcurrency ?? {})) {
+    if (!Number.isInteger(n) || n < 1) {
+      throw new TypeError(`@gnldev/queue: typeConcurrency['${type}'] must be a positive integer, got ${String(n)}`);
+    }
+  }
+  const journal = toJournal(runs);
+  /** The clock eligibility is judged by: the journal's own (`now()`), else this process's. */
+  const now = async (): Promise<number> => (journal.now ? journal.now() : Date.now());
+  const retryDelay = (attempt: number, err: unknown): number => {
+    let ms: number;
+    try {
+      ms = typeof opts.retryDelayMs === 'function' ? opts.retryDelayMs(attempt, err) : (opts.retryDelayMs ?? 0);
+    } catch (e) {
+      // A throwing delay function must not keep the attempt from being counted (that would retry forever).
+      console.warn('[queue] retryDelayMs threw; retrying without a delay:', e);
+      return 0;
+    }
+    return Number.isFinite(ms) && ms > 0 ? ms : 0;
+  };
+  /** A free fleet-wide slot for `type`, or `null` when all are held. No limit → a no-op slot. */
+  async function acquireSlot(type: string): Promise<{ renew(): Promise<boolean>; release(): Promise<void> } | null> {
+    const limit = opts.typeConcurrency?.[type];
+    if (limit === undefined) return { renew: async () => true, release: async () => {} };
+    for (let k = 0; k < limit; k++) {
+      const slot = await acquireRunLock(runs, `qslot:${type}:${k}`, owner, ttlMs);
+      if (slot) return { renew: () => slot.renew(ttlMs), release: () => slot.release() };
+    }
+    return null;
+  }
   // Queue-wide scan cursor (WorkStore KV): persistently tracks the position "all jobs before this
   // point are terminal (done/fail)" → subsequent polls never re-scan earlier pages (5.1: starvation +
   // O(n)-per-poll fix). If a job is still pending (awaiting retry / locked) the cursor does NOT PASS
@@ -405,9 +559,13 @@ export function createWorker(
   // the cursor is a record's position now, so an erasure or a slow producer clock cannot move it).
   const QCURSOR = 'qcursor';
 
-  /** Done or dead-lettered — the ONE reading of "this job is finished", before the lease and under it. */
-  async function isTerminal(jobId: string): Promise<boolean> {
-    return (await work.get(`qdone:${jobId}`)) !== undefined || (await work.get(`qfail:${jobId}`)) !== undefined;
+  /**
+   * May this job start now? Finished (`isTerminal`) or not yet eligible (`notBeforeOf`) → no. Asked
+   * before the lease as a cheap filter and AGAIN under it, where the answer is the one that counts.
+   */
+  async function mayStart(job: LogRecord<JobRecord>): Promise<'finished' | 'waiting' | 'ready'> {
+    if (await isTerminal(work, job.id)) return 'finished';
+    return (await notBeforeOf(work, job)) > (await now()) ? 'waiting' : 'ready';
   }
 
   async function runOnce(): Promise<boolean> {
@@ -417,8 +575,10 @@ export function createWorker(
       let allTerminal = true;
       for (const job of page.items) {
         // A cheap pre-filter only. It decides nothing: see the re-check under the lease below.
-        if (await isTerminal(job.id)) continue;
-        allTerminal = false;
+        const before = await mayStart(job);
+        if (before === 'finished') continue;
+        allTerminal = false; // a waiting job is not finished: the cursor must not pass it
+        if (before === 'waiting') continue;
         const runId = runIdOfJob(job); // `job:<id>`, or the run a retried dead letter continues
         // THE LEASE'S KEY — deliberately NOT the runId.
         //
@@ -450,7 +610,16 @@ export function createWorker(
         // time. Measured on Postgres with 3 workers: 3-5% of jobs ran twice (0.9.0 too), side effects
         // outside `ctx.run` included. A finisher writes `qdone`/`qfail` BEFORE it releases (or its
         // lease expires), so under the lease the answer cannot change any more.
-        if (await isTerminal(job.id)) {
+        // The same holds for "not yet": a failed attempt writes its retry delay before it releases, so a
+        // worker that read the job as ready just before that failure sees the retry delay here.
+        if ((await mayStart(job)) !== 'ready') {
+          await lock.release();
+          continue;
+        }
+        // The fleet-wide per-type limit: taken after the job's lease (so a slot is never held for a
+        // job this worker lost), given back with it.
+        const slot = await acquireSlot(job.payload.type);
+        if (!slot) {
           await lock.release();
           continue;
         }
@@ -492,8 +661,14 @@ export function createWorker(
         let lockLost = false;
         let consecutiveRenewFailures = 0;
         let heartbeat: ReturnType<typeof setInterval> | undefined;
+        const cancel = new AbortController();
         if (heartbeatOn) {
           heartbeat = setInterval(() => {
+            // A cancel requested while the handler runs reaches it here, as `ctx.signal`.
+            if (!cancel.signal.aborted) {
+              work.get(`qcancel:${job.id}`).then((c) => { if (c !== undefined) cancel.abort(new Error(`@gnldev/queue: job ${job.id} was cancelled`)); }, () => {});
+            }
+            slot.renew().catch(() => {}); // a lost slot only loosens the limit until this job ends; never fails it
             lock
               .renew(ttlMs)
               .then((ok) => {
@@ -523,6 +698,15 @@ export function createWorker(
           return work.putIfMatch(fencingKey, lock.token, lock.token);
         };
         try {
+          // The attempt is counted when it STARTS: a process that dies while the handler runs (a crash,
+          // an OOM, a kill) has used an attempt too. Counted at the end, such a job never reached maxAttempts.
+          const started = await attemptsOf(work, job.id);
+          if (started.attempts >= maxAttempts) {
+            if (await stillOwns()) await work.put(`qfail:${job.id}`, { error: `the job did not finish in ${started.attempts} attempts (the process stopped while it ran)`, attempts: started.attempts });
+            return true;
+          }
+          if (!(await stillOwns())) return false;
+          await work.put(`qtry:${job.id}`, { attempts: started.attempts + 1, notBefore: started.notBefore });
           const handler = handlers[job.payload.type];
           if (!handler) {
             if (await stillOwns()) await work.put(`qfail:${job.id}`, { error: `no handler: ${job.payload.type}` });
@@ -548,14 +732,20 @@ export function createWorker(
           await handler(rec.payload, {
             journal: scoped.runs, jobId: job.id, runId, storage: scoped, caller,
             ...(orgId !== undefined ? { orgId } : {}),
-            run: (args) => runDurable({ ...args, journal: toJournal(scoped.runs), runId, caller }),
+            run: (args) => runDurable({
+              ...args,
+              abortSignal: args.abortSignal ? AbortSignal.any([args.abortSignal, cancel.signal]) : cancel.signal,
+              journal: toJournal(scoped.runs), runId, caller,
+            }),
             enqueue: (type, payload, o) => enqueue(work, type, payload, followUp(o)),
+            signal: cancel.signal,
           });
           if (await stillOwns()) await work.put(`qdone:${job.id}`, { at: Date.now(), ok: true });
         } catch (err) {
           if (await stillOwns()) {
-            const n = ((await work.get<number>(`qatt:${job.id}`)) ?? 0) + 1;
-            await work.put(`qatt:${job.id}`, n);
+            const n = (await attemptsOf(work, job.id)).attempts; // this attempt was counted when it started
+            const delay = n < maxAttempts ? retryDelay(n, err) : 0;
+            await work.put(`qtry:${job.id}`, { attempts: n, notBefore: delay > 0 ? (await now()) + delay : 0 });
             if (n >= maxAttempts) {
               await work.put(`qfail:${job.id}`, { error: String((err as any)?.message ?? err), attempts: n });
             }
@@ -564,6 +754,7 @@ export function createWorker(
           // swallowed: the worker loop continues; the job (unless qfail) retries on the next turn → crash-resume.
         } finally {
           if (heartbeat) clearInterval(heartbeat);
+          await slot.release();
           // While lockLost=true (a real takeover), release() is naturally a no-op because this
           // worker's token no longer matches the current record (see run-lock.ts mkLock.release) —
           // it never overwrites the lock of the worker that took over. On a transient renew error
@@ -603,13 +794,16 @@ export function createWorker(
   // createPollLoop (it was triplicated across queue/events/scheduler) — behavior is identical: if
   // runOnce() does NOT CLAIM a job (false) the interval grows ×2 while backoffOn (cap maxPollMs);
   // resets to pollMs once a job is claimed.
-  const loop = createPollLoop(runOnce, { pollMs, backoff: backoffOn, maxPollMs });
+  // `concurrency` = that many independent loops over the same `runOnce`. Rejected alternative: one
+  // loop running `concurrency` jobs per tick with Promise.all — a tick then lasts as long as its
+  // slowest job, and the other slots sit idle behind it.
+  const loops = Array.from({ length: concurrency }, () => createPollLoop(runOnce, { pollMs, backoff: backoffOn, maxPollMs }));
 
   return {
     runOnce,
     drain,
-    start: loop.start,
-    stop: loop.stop,
+    start: () => { for (const l of loops) l.start(); },
+    stop: () => { for (const l of loops) l.stop(); },
   };
 }
 
@@ -627,7 +821,9 @@ export function createWorker(
  *
  * Returns the owned id, or `null` when there is no such job. Refuses an id that already has an owner.
  */
-export async function moveJob(work: WorkStore, fromId: string, to: Omit<EnqueueOptions, 'id' | 'maxDepth'>): Promise<string | null> {
+export async function moveJob(workArg: WorkStore, fromId: string, to: Omit<EnqueueOptions, 'id' | 'maxDepth'>): Promise<string | null> {
+  refuseUnknownNames('moveJob', to, MOVE_JOB_TO_NAMES);
+  const work = portOf(workArg, 'work', 'moveJob');
   const from = ownerOfName(fromId);
   if (from.resourceId !== undefined || from.orgId !== undefined) {
     throw new TypeError(`@gnldev/queue: moveJob('${fromId}') — that job already has an owner; only a system job is moved.`);
@@ -640,12 +836,12 @@ export async function moveJob(work: WorkStore, fromId: string, to: Omit<EnqueueO
   if (!old) return null;
   const toId = ownedName(fromId, { resourceId: owner.resourceId, orgId: owner.orgId });
   // Markers FIRST: a worker that saw the owned job before its markers would run a finished job again.
-  for (const m of ['qdone', 'qfail', 'qatt'] as const) {
+  for (const m of STATE_MARKERS) {
     const v = await work.get(`${m}:${fromId}`);
     if (v !== undefined && (await work.get(`${m}:${toId}`)) === undefined) await work.put(`${m}:${toId}`, v);
   }
   await enqueue(work, old.payload.type, old.payload.payload, { ...to, id: fromId });
-  if ((await work.get(`qdone:${fromId}`)) === undefined && (await work.get(`qfail:${fromId}`)) === undefined) {
+  if (!(await isTerminal(work, fromId))) {
     await work.put(`qdone:${fromId}`, { at: Date.now(), movedTo: toId });
   }
   return toId;
@@ -658,8 +854,8 @@ export interface SubjectEraser {
 }
 
 /**
- * Erase one person's jobs: the job records and their depth-index records, the `qdone`/`qfail`/`qatt`/
- * `qown` markers (a `qfail` holds the handler's error text), the worker's lease locks in the root
+ * Erase one person's jobs: the job records and their depth-index records, the state markers
+ * (`STATE_MARKERS`) and `qown` (a `qfail` holds the handler's error text), the worker's lease locks in the root
  * journal, and the job runs themselves (`job:<owned id>` in the organization's journal).
  *
  * Found by the id prefix the engine wrote (`ownedPrefix`), never by payload. Refuses, rather than
@@ -668,7 +864,8 @@ export interface SubjectEraser {
  *
  * Pass it to `eraseSubject({ …, erasers: [jobEraser(storage)] }, id)`, or call `.erase(owner)`.
  */
-export function jobEraser(storage: Storage): SubjectEraser {
+export function jobEraser(storageArg: Storage): SubjectEraser {
+  const storage = storageOf(storageArg, 'jobEraser');
   return {
     name: 'jobs',
     async erase(owner) {
@@ -685,7 +882,7 @@ export function jobEraser(storage: Storage): SubjectEraser {
       }
       const prefix = ownedPrefix(owner);
       let n = await work.deleteIdPrefix(prefix);
-      for (const m of ['qdone', 'qfail', 'qatt', 'qown']) n += await work.deletePrefix(`${m}:${prefix}`);
+      for (const m of [...STATE_MARKERS, 'qown']) n += await work.deletePrefix(`${m}:${prefix}`);
       // The lease lock lives in the ROOT journal (`job:<id>:lease:lock`); the run in the job's organization.
       n += await root.deletePrefix(`job:${prefix}`);
       if (owner.orgId !== undefined) n += await scoped.deletePrefix(`job:${prefix}`);

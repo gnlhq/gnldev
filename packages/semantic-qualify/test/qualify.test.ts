@@ -42,6 +42,11 @@ describe('qualification bench', () => {
       v: 1, judgeModelId: 'test-model', judgePromptVersion: JUDGE_PROMPT_VERSION,
       paraphraseRecall: 1, nearMissFp: 0, passedAt: 1,
     });
+    // The counts the rates rest on, as measured on this set — what the runtime checks against its floor.
+    expect(r.cert!.paraphrasePairs).toBe(SET.filter((p: any) => p.label === 'dup-paraphrase').length);
+    expect(r.cert!.nearMissAnswered).toBeGreaterThan(0);
+    // The rate's denominator travels with it: every near-miss pair put, answered or not.
+    expect(r.cert!.nearMissPairs).toBe(10);
     expect(r.cert!.fixtureSetId).toMatch(/^[0-9a-f]{16}$/);
     // and the runtime must actually accept it (round-trip pin)
     validateJudgeConfig({ complete: async () => 'SAME', judgeModelId: 'test-model', qualification: r.cert! });

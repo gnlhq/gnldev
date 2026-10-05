@@ -1,5 +1,7 @@
 import { cosineSimilarity } from 'ai';
 import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, vectorInOrganization, vectorDocumentOf, vectorFilterDocument, type VectorAllPartitionsOption } from '@gnldev/durable';
+import { refuseUnknownNames } from '@gnldev/options';
+import { INDEX_DOCUMENTS_OPTS_NAMES, QUERY_NAMES } from './option-names.js';
 
 export interface VectorDoc {
   id: string;
@@ -152,6 +154,7 @@ export class InMemoryVectorStore implements VectorStore {
   }
 
   async query(embedding: number[], topK: number, opts?: QueryOptions): Promise<VectorMatch[]> {
+    refuseUnknownNames('query', opts, QUERY_NAMES);
     const w = opts?.keywordWeight ?? 0;
     const hybrid = w > 0 && !!opts?.text;
     const scope = vectorQueryScope(opts);
@@ -184,10 +187,56 @@ export class InMemoryVectorStore implements VectorStore {
   }
 }
 
-/** Embeds documents and writes them to the store (namespace carried over via VectorDoc). */
-export async function indexDocuments(store: VectorStore, embed: Embed, docs: VectorDoc[]): Promise<void> {
-  const items: VectorItem[] = await Promise.all(
-    docs.map(async (d) => ({ ...d, embedding: await embed(d.text) })),
-  );
+/** How a batch of texts is embedded. */
+export interface EmbedOptions {
+  /**
+   * The most `embed` calls in flight at once. Default 8: an ingest of up to 8 chunks runs as before,
+   * a bigger one no longer opens one request per chunk. A positive integer, or `Infinity` for no bound.
+   */
+  concurrency?: number;
+}
+
+const DEFAULT_EMBED_CONCURRENCY = 8;
+
+/**
+ * Embeds `docs` with at most `concurrency` calls in flight — the one place every ingest path embeds
+ * a batch (`indexDocuments`, `ingestDocuments`). Results stay in the order of `docs`.
+ *
+ * Every chunk used to be embedded at once: measured, `indexDocuments` over 200 documents had 200
+ * `embed` calls in flight, and one 100-chunk document through `ingestDocuments` had 100 — a provider's
+ * rate limit or the process's memory decided how big an ingest could be. On the first failure no new
+ * call starts; the rejection waits for the calls already running, so nothing is left running behind it.
+ */
+export async function embedDocuments<D extends VectorDoc>(embed: Embed, docs: D[], opts?: EmbedOptions): Promise<(D & { embedding: number[] })[]> {
+  const concurrency = opts?.concurrency ?? DEFAULT_EMBED_CONCURRENCY;
+  if (!(concurrency === Infinity || (Number.isInteger(concurrency) && concurrency >= 1))) {
+    throw new Error(`@gnldev/rag: concurrency must be a positive integer or Infinity (got ${String(concurrency)})`);
+  }
+  const out = new Array<D & { embedding: number[] }>(docs.length);
+  let next = 0;
+  let failure: { error: unknown } | undefined;
+  const worker = async () => {
+    while (failure === undefined && next < docs.length) {
+      const i = next++;
+      const doc = docs[i]!;
+      try {
+        out[i] = { ...doc, embedding: await embed(doc.text) };
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, docs.length) }, worker));
+  if (failure) throw failure.error;
+  return out;
+}
+
+/**
+ * Embeds documents (at most `opts.concurrency` at once, see `EmbedOptions`) and writes them to the
+ * store (namespace carried over via VectorDoc).
+ */
+export async function indexDocuments(store: VectorStore, embed: Embed, docs: VectorDoc[], opts?: EmbedOptions): Promise<void> {
+  refuseUnknownNames('indexDocuments', opts, INDEX_DOCUMENTS_OPTS_NAMES);
+  const items: VectorItem[] = await embedDocuments(embed, docs, opts);
   await store.upsert(items);
 }

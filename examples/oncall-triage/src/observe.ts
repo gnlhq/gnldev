@@ -40,7 +40,7 @@ export const RUNBOOK_RULES = {
 
 /** Scores a finished run against one of the rule sets above. */
 export async function scoreIncident(storage: any, runId: string, rules: { requiredTools?: readonly string[]; forbiddenTools?: readonly string[]; maxToolCalls?: number }) {
-  const reader = toJournal(storage.runs);
+  const reader = toJournal(storage);
   return scoreRun(reader, runId, [
     trajectoryScorerFor(reader, {
       requiredTools: rules.requiredTools as string[] | undefined,
@@ -60,7 +60,7 @@ export async function scoreIncident(storage: any, runId: string, rules: { requir
  * The agent in this example reads production logs; that is not a trace to export unfiltered.
  */
 export async function traceIncident(storage: any, runId: string, endpoint?: string) {
-  return exportRun(toJournal(storage.runs), runId, {
+  return exportRun(toJournal(storage), runId, {
     endpoint: endpoint ?? process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
     serviceName: 'oncall-triage',
     redact: piiTextRedactor(),

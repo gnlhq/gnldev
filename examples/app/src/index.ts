@@ -27,7 +27,7 @@ const { app } = buildServer({ storage, gnl, resume, memory, state });
 // if STUDIO_ADMIN is set, fork/resume require an `x-studio-admin` header (viewer read stays open).
 const ADMIN = process.env.STUDIO_ADMIN;
 app.mount('/studio', createStudioApp({
-  reader: toJournal(storage.runs),
+  reader: toJournal(storage),
   apiBase: '/studio',
   resume: async (runId, approvals) => { const r = await resume(runId, approvals); return { text: r.text, interrupts: r.interrupts }; },
   // Memory/Threads view: two SEPARATE listings, matching Memory.listThreads/listAllThreads. They were

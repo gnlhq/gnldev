@@ -25,9 +25,12 @@ await runDurable({ runId: 'r1', journal, model, tools: { searchPolicy }, prompt:
 ```
 
 ## API
-- `InMemoryVectorStore` · `indexDocuments(store, embed, docs)` · `VectorStore` interface (plug in your own
-  backend)
-- `ingestDocuments(store, embed, docs, chunkOptions?)` — chunk, embed and write whole documents so each
+- `InMemoryVectorStore` · `indexDocuments(store, embed, docs, { concurrency? })` · `VectorStore` interface
+  (plug in your own backend)
+- Embedding runs at most `concurrency` `embed` calls at once (default 8, `Infinity` for no bound), in
+  `indexDocuments` and across every document of one `ingestDocuments` call. On a failure no new call
+  starts and nothing is written.
+- `ingestDocuments(store, embed, docs, { strategy?, size?, overlap?, concurrency? })` — chunk, embed and write whole documents so each
   document's stored chunks are exactly one version of it: when the call resolves or rejects, a document
   holds all of its new chunks or all of its previous ones, never a mix and never nothing. The new
   chunks are written first, as a new generation (ids `<id>#<i>@<generation>`, `metadata.__gnlGen`);
@@ -46,8 +49,11 @@ await runDurable({ runId: 'r1', journal, model, tools: { searchPolicy }, prompt:
 - `chunkDocuments(docs, opts?)` — ids `<docId>#<i>` (the bare id for a one-chunk document); every chunk
   carries the trail `metadata: { __gnlDoc: docId, __gnlChunk: i }` beside your own metadata, which is
   left as it was. `%` and `#` in a document id are escaped in chunk ids, so no document id is another's
-  chunk id.
-- `createRagTool({ store, embed, topK?, namespace?, filter?, rerank?, rerankTopK?, description? })` → AI SDK tool
+  chunk id. No chunk is longer than `size`, overlap included: each chunk repeats as much of the previous one as
+  fits, up to `overlap`; a cut never splits a surrogate pair.
+- `createRagTool({ store, embed, topK?, namespace?, filter?, rerank?, rerankTopK?, description? })` → AI SDK
+  tool. Each hit is `{ id, documentId, text, score, metadata? }`: `id` is the stored record (a chunk id
+  for a chunked document), `documentId` the document it belongs to — what the model cites.
 - `llmReranker({ model })` → `Reranker`
 - `SemanticMemory` — vector-based recall (memory integration). Concurrent turns on one thread keep
   every message: appends go through `appendToJournalLog` (@gnldev/durable), which is safe across

@@ -88,7 +88,7 @@
 //    returns normally (BEFORE memory/recordRunUsage). Because nothing was written to the journal, a
 //    blocked call is re-evaluated FROM SCRATCH on the NEXT attempt once the limit is RAISED (replay
 //    regenerates the same toolCallId) — no approval is REQUIRED (DIFFERENT from guard's require-approval).
-import { claim, runKeys, nestedAgentRunId } from './journal.js';
+import { claim, runKeys, nestedAgentRunId, executedHere } from './journal.js';
 import { usageAndCostFromModelValue, type RunCostOptions } from './cost.js';
 import { effectivePricingTable } from './pricing.js';
 import type { Journal, JournalReader, ToolJournalRecord } from './journal.js';
@@ -119,6 +119,13 @@ export interface RunLimits {
    *  its effect then threw counts — a failed READ-ONLY tool does not). Denied/suspended/reflected (never
    *  executed) do not count. */
   maxToolCalls?: number;
+  /**
+   * How many tool calls may EXECUTE at the same time in this request — the agent's own and every
+   * sub-agent's under it. A call over the cap waits for a slot (it is not refused) before it claims
+   * its record, so a long wait cannot be mistaken for a crash. A delegation takes no slot (its child's
+   * calls do): one that did would deadlock a cap of 1 on its own child. Default: no cap.
+   */
+  maxConcurrency?: number;
   /**
    * Loop detection (opt-in, a separate field — OFF if not provided): if the same tool + same argsHash
    * ran SUCCESSFULLY `maxRepeats` times in a row, the NEXT identical repeat is blocked WITHOUT RUNNING.
@@ -470,6 +477,9 @@ interface LimitChain {
   /** toolCallIds seen from this run's tool entries — candidates for fan-out inheritance
    *  (`agent:${toolCallId}`); `sumSubRuns` sums these RECURSIVELY with O(1) `get`s (no readRun). */
   subRunIds: string[];
+  /** Child runs registered by id when their delegation STARTED (`registerSubRun`) — the network's
+   *  children too, whose ids are not derived from a toolCallId. Absent on older chains → []. */
+  childRunIds?: string[];
 }
 
 function emptyCounters(): LimitCounters {
@@ -526,10 +536,16 @@ async function readCounters(store: LimitsStore, runId: string): Promise<LimitCou
  *  impossible — see the FIX note at the top of the file); otherwise/on failure falls back to get→put
  *  (the SAME pattern as budget.ts's `addUsage` — SINGLE-PROCESS safe fallback, documented bound). Zero
  *  deltas are SKIPPED to reduce noise. */
-async function incrCounters(store: LimitsStore, runId: string, delta: Partial<LimitCounters>): Promise<void> {
+async function incrCounters(store: LimitsStore, runId: string, delta: Partial<LimitCounters>, requestRunId?: string, givesBackSeat = false): Promise<void> {
   const clean: Record<string, number> = {};
   for (const [k, v] of Object.entries(delta)) if (v) clean[k] = v;
   if (Object.keys(clean).length === 0) return;
+  // The request's total moves with every run's own count (see requestTotals); modelStepsSeen is a run's
+  // own bookkeeping and does not sum. A call that held a seat there gives it back in the same step.
+  if (requestRunId !== undefined) {
+    const { modelStepsSeen: _own, ...spend } = clean;
+    if (Object.keys(spend).length) await addToRequest(store, requestRunId, givesBackSeat ? { ...spend, [SEATS]: -1 } : spend);
+  }
   if (typeof store.incrBy === 'function') {
     try {
       await store.incrBy(countersKey(runId), clean);
@@ -575,6 +591,179 @@ const CHAIN_CAS_ATTEMPTS = 3;
  * INTERMEDIATE update may be overwritten under distributed multi-worker contention — the SAME as the
  * "advisory" bound documented at the top of the file.
  */
+/**
+ * A delegation that has STARTED is part of its parent's budget. `sumSubRuns` found children only through
+ * the parent's finished tool calls — for a delegation, when the child had already finished — so a child
+ * (or a sibling) measuring the request's budget mid-flight saw none of the work in progress below it
+ * (measured: limit 2, four restarts). And a network's children were never found at all: their ids are
+ * not derived from a toolCallId (measured: limit 2, four tool calls). Every delegation registers its
+ * child here by id, at birth — when the parent's limits are in play, i.e. its chain exists: a run with
+ * limits seeds it at its first model step or tool gate, before it can delegate (a network run, which
+ * has neither, seeds it at its start — `seedLimits`). No chain, no limits: nothing to register, and
+ * no history scan per child (measured: seeding here, 200 parallel children scanned the parent 200 times).
+ * @internal — engine plumbing (agent-tool.ts runDelegated).
+ */
+export async function registerSubRun(journal: unknown, parentRunId: string, childRunId: string, requestRunId?: string): Promise<void> {
+  const store = journal as LimitsStore;
+  if (typeof store.get !== 'function' || typeof store.put !== 'function') return;
+  // The registry serves the walk (sumSubRuns), which a request with a kept total never takes: every child
+  // adds to that total itself. Measured: 200 children writing one parent key cost 978 reads and 587
+  // compare-and-set writes on Postgres.
+  if (requestRunId !== undefined && (await hasRequestTotal(store, requestRunId))) return;
+  if ((await readChain(store, parentRunId)) === undefined) return;
+  await writeChainCas(store, parentRunId, (chain) => (chain.childRunIds?.includes(childRunId) ? chain : { ...chain, childRunIds: [...(chain.childRunIds ?? []), childRunId] }));
+}
+
+/**
+ * A SEAT for one tool call under `maxToolCalls`, taken atomically right before it executes and given
+ * back once its outcome is journaled. The gate (checkToolGate) counts calls that have FINISHED, so
+ * calls issued in parallel all passed it before any finished (measured: limit 5, twelve ran — run
+ * directly or through sub-agents alike). Seats close that window: a call runs only if the request's
+ * finished calls plus the seats held now are under the limit. Held at the request's root, like the
+ * budget it measures. A delegation takes no seat (its child's calls do — see recordToolOutcome).
+ * @internal — engine plumbing (durable-tool.ts).
+ */
+export async function takeToolSeat(journal: unknown, requestRunId: string, limits: RunLimits | undefined): Promise<{ ok: boolean; seat?: ToolSeat }> {
+  if (limits?.maxToolCalls == null) return { ok: true };
+  const store = journal as LimitsStore;
+  if (typeof store.get !== 'function' || typeof store.put !== 'function') return { ok: true };
+  const root = requestRunId;
+  // One atomic step on the request's total: the increment says which seat this call got and, in the same
+  // step, how many calls have finished — so parallel calls never retry against each other (measured: a
+  // bounded compare-and-set retry refused all but 22 of 200 parallel calls with the limit far away), and
+  // a finished call, which gives its seat back in the step that counts it (recordToolOutcome), is never
+  // seen twice. A seat past the limit is given back at once.
+  if (typeof store.incrBy === 'function' && (await hasRequestTotal(store, root))) {
+    const after = await store.incrBy(requestKey(root), { succeededToolCalls: 0, [SEATS]: 1 });
+    if (after && typeof after[SEATS] === 'number' && typeof after.succeededToolCalls === 'number') {
+      if (after.succeededToolCalls + after[SEATS] <= limits.maxToolCalls) return { ok: true, seat: 'request' };
+      await store.incrBy(requestKey(root), { [SEATS]: -1 });
+      return { ok: false };
+    }
+    // A custom incrBy that does not return the values: undo, and take the seat by compare-and-set.
+    await store.incrBy(requestKey(root), { [SEATS]: -1 });
+  }
+  // A request an earlier version started keeps no total, and a custom incrBy may not say its values: the
+  // seat is a compare-and-set on its own key. A finished call is counted before its seat is given back,
+  // so a call at the limit's edge may be refused while another finishes — never one past the limit.
+  const key = seatsKey(root);
+  for (;;) {
+    const done = (await requestSpend(store, root, {})).succeededToolCalls;
+    const current = await store.get<{ held: number }>(key);
+    const held = current?.held ?? 0;
+    if (done + held >= limits.maxToolCalls) return { ok: false };
+    const next = { held: held + 1 };
+    if (current === undefined) {
+      if (typeof store.putIfAbsent === 'function') { if (await store.putIfAbsent(key, next)) return { ok: true, seat: 'own-key' }; continue; }
+    } else if (typeof store.putIfMatch === 'function') {
+      // A lost race means another call took a seat: read again — refusing here would refuse a call the
+      // limit admits.
+      if (await store.putIfMatch(key, current, next)) return { ok: true, seat: 'own-key' };
+      continue;
+    }
+    warnCasFallback(store, '`putIfAbsent`/`putIfMatch`');
+    await store.put(key, next);
+    return { ok: true, seat: 'own-key' };
+  }
+}
+
+/** Gives a seat back (see takeToolSeat) — for a call whose outcome did not give it back.
+ *  @internal — engine plumbing (durable-tool.ts). */
+export async function releaseToolSeat(journal: unknown, requestRunId: string, seat: ToolSeat): Promise<void> {
+  const store = journal as LimitsStore;
+  if (seat === 'request') {
+    if (typeof store.incrBy === 'function') await store.incrBy(requestKey(requestRunId), { [SEATS]: -1 });
+    return;
+  }
+  if (typeof store.get !== 'function' || typeof store.put !== 'function') return;
+  const key = seatsKey(requestRunId);
+  for (;;) {
+    const current = await store.get<{ held: number }>(key);
+    if (!current || current.held <= 0) return;
+    const next = { held: current.held - 1 };
+    if (typeof store.putIfMatch === 'function') { if (await store.putIfMatch(key, current, next)) return; continue; }
+    await store.put(key, next);
+    return;
+  }
+}
+
+/** Where a maxToolCalls seat is held: in the request's total, or (see takeToolSeat) on its own key. */
+export type ToolSeat = 'request' | 'own-key';
+/** The seats field of the request's total. Written after succeededToolCalls in every step that moves
+ *  both, so a store that locks field by field (Postgres) takes them in one order. */
+const SEATS = 'seats';
+
+
+const SEAT_CAS_ATTEMPTS = 20;
+
+/**
+ * A slot under `maxConcurrency` (RunLimits): waits until fewer than the cap of this request's tool
+ * calls are executing, then takes one. Slots are named by their holder and stamped, so a process that
+ * died holding one does not hold it forever: a slot older than `staleMs` is not counted.
+ * Returns false only when `signal` aborted the wait. @internal — engine plumbing (durable-tool.ts).
+ */
+export async function takeConcurrencySlot(
+  journal: unknown, requestRunId: string, limits: RunLimits | undefined,
+  holder: string, staleMs: number, signal?: AbortSignal,
+): Promise<boolean> {
+  const cap = limits?.maxConcurrency;
+  if (cap == null) return true;
+  const store = journal as LimitsStore;
+  if (typeof store.get !== 'function' || typeof store.put !== 'function') return true;
+  const key = slotsKey(requestRunId);
+  for (let wait = 5; ; wait = Math.min(wait * 2, 100)) {
+    if (signal?.aborted) return false;
+    const now = Date.now();
+    const current = await store.get<Record<string, number>>(key);
+    const live = Object.entries(current ?? {}).filter(([h, at]) => h !== holder && now - at < staleMs);
+    if (live.length < cap) {
+      const next = Object.fromEntries([...live, [holder, now]]);
+      if (current === undefined) {
+        if (typeof store.putIfAbsent === 'function' ? await store.putIfAbsent(key, next) : (await store.put(key, next), true)) return true;
+      } else if (typeof store.putIfMatch === 'function') {
+        if (await store.putIfMatch(key, current, next)) return true;
+      } else {
+        warnCasFallback(store, '`putIfMatch`');
+        await store.put(key, next);
+        return true;
+      }
+      continue; // lost a race for the slot — read again at once
+    }
+    await new Promise((r) => setTimeout(r, wait));
+  }
+}
+
+/** Gives a slot back (see takeConcurrencySlot). @internal — engine plumbing (durable-tool.ts). */
+export async function releaseConcurrencySlot(journal: unknown, requestRunId: string, limits: RunLimits | undefined, holder: string): Promise<void> {
+  if (limits?.maxConcurrency == null) return;
+  const store = journal as LimitsStore;
+  if (typeof store.get !== 'function' || typeof store.put !== 'function') return;
+  const key = slotsKey(requestRunId);
+  for (let attempt = 0; attempt < SEAT_CAS_ATTEMPTS * 3; attempt++) {
+    const current = await store.get<Record<string, number>>(key);
+    if (!current || !(holder in current)) return;
+    const { [holder]: _gone, ...next } = current;
+    if (typeof store.putIfMatch === 'function') { if (await store.putIfMatch(key, current, next)) return; continue; }
+    await store.put(key, next);
+    return;
+  }
+}
+
+const slotsKey = (runId: string): string => runKeys.proc(runId, 'limits-slots');
+const seatsKey = (runId: string): string => runKeys.proc(runId, 'limits-seats');
+
+/**
+ * Seeds a run's limit state before it delegates, for a run that delegates without a model step or tool
+ * gate of its own (a network: its router is not a durable tool call). See registerSubRun.
+ * @internal — engine plumbing (registry.ts runNetwork).
+ */
+export async function seedLimits(journal: unknown, runId: string): Promise<void> {
+  const store = journal as LimitsStore;
+  if (typeof (store as unknown as JournalReader).readRun !== 'function' || typeof store.get !== 'function') return;
+  if ((await readChain(store, runId)) !== undefined) return;
+  await ensureSeeded(store as unknown as JournalReader, store, runId, { pricing: await effectivePricingTable(store as never) }, undefined, runId);
+}
+
 async function writeChainCas(
   store: LimitsStore,
   runId: string,
@@ -633,11 +822,13 @@ function applyToolOutcomeToChain(
   status: ToolJournalRecord['status'] | undefined,
 ): LimitChain {
   const subRunIds = chain.subRunIds.includes(toolCallId) ? chain.subRunIds : [...chain.subRunIds, toolCallId];
+  // The registered children are not part of the loop chain: a reset of the chain keeps them.
+  const kids = chain.childRunIds?.length ? { childRunIds: chain.childRunIds } : {};
   if (status === 'succeeded') {
     if (chain.lastToolName === toolName && chain.lastArgsHash === argsHash) {
       return { ...chain, subRunIds, consecutiveRepeats: chain.consecutiveRepeats + 1 };
     }
-    return { lastToolName: toolName, lastArgsHash: argsHash, consecutiveRepeats: 1, subRunIds };
+    return { lastToolName: toolName, lastArgsHash: argsHash, consecutiveRepeats: 1, subRunIds, ...kids };
   }
   // A 'reflected' record must NOT break the chain — the nudge is ABOUT this
   // very chain; resetting it would hand the model a fresh window of maxRepeats identical executions
@@ -657,7 +848,7 @@ function applyToolOutcomeToChain(
   }
   // EVERY FAILED/denied/suspended record BREAKS the chain — SAME as the original backward-scan
   // algorithm (the old version of limits.ts): stop at the first record where `v.status !== 'succeeded'`.
-  return { lastToolName: undefined, lastArgsHash: undefined, consecutiveRepeats: 0, subRunIds };
+  return { lastToolName: undefined, lastArgsHash: undefined, consecutiveRepeats: 0, subRunIds, ...kids };
 }
 
 /**
@@ -703,11 +894,13 @@ async function seedFromHistory(
     // limits added afterwards) and could not produce one; a narrower marker distinguishing the two
     // shadows was written and then removed, because a schema field justified only by an unmeasured
     // scenario is a liability. If such a case turns up, this is the line to split.
-    if (v?.mirrorOf !== undefined) continue;
+    // ...except the request-window record this run executed (journal.ts ranBy): it lives outside the run's
+    // key space, so its mirror is the only trace the scan can count — the live rule counted it here.
+    if (v?.mirrorOf !== undefined && !executedHere(v as never, runId, e.key.slice(prefix.length))) continue;
     // MUST match recordToolOutcome's live-increment rule EXACTLY so a first-encounter
     // seed reconstructs the SAME count — a succeeded call OR a failed SIDE-EFFECT attempt (the failed
     // record carries `sideEffect`; older records without it fall back to not-counted, matching pre-C3).
-    if (v?.status === 'succeeded' || (v?.status === 'failed' && v.sideEffect === true)) counters.succeededToolCalls++;
+    if ((v?.status === 'succeeded' && v.delegation !== true) || (v?.status === 'failed' && v.sideEffect === true)) counters.succeededToolCalls++;
     chain = applyToolOutcomeToChain(chain, toolCallId, (v as any)?.toolName, (v as any)?.argsHash, v?.status);
   }
   return { counters, chain };
@@ -722,12 +915,74 @@ async function seedFromHistory(
  * call's own contribution — the winner must NOT apply it AGAIN, to avoid double counting — see the early
  * return in `recordToolOutcome`).
  */
+/**
+ * THE REQUEST'S SPEND, KEPT AT ITS ROOT. Measuring a request's budget used to walk every run under it on
+ * every check — every tool call and every model step re-read each sub-agent's counters (profiled:
+ * `sumSubRuns` 41% of busy time; 200 sub-agents on Sqlite 3.4x slower than before the request was
+ * measured at all). Every run now adds its spend to one key at the request's root as it counts it, and a
+ * check reads that one key. The key is created when the ROOT first meets its limits — before it can
+ * delegate — so it holds the whole request. A request started by an earlier version has no such key:
+ * it keeps the walk (`sumSubRuns`), which is slower and still right.
+ */
+const requestKey = (requestRunId: string): string => runKeys.proc(requestRunId, '__gnl_limits_request');
+
+async function requestTotals(store: LimitsStore, requestRunId: string): Promise<LimitCounters | undefined> {
+  const raw = typeof store.getCounters === 'function'
+    ? await store.getCounters(requestKey(requestRunId))
+    : typeof store.get === 'function' ? await store.get<Record<string, number>>(requestKey(requestRunId)) : undefined;
+  if (!raw || !raw.created) return undefined;
+  return { modelStepsSeen: 0, totalTokens: raw.totalTokens ?? 0, costUsd: raw.costUsd ?? 0, succeededToolCalls: raw.succeededToolCalls ?? 0 };
+}
+
+async function bumpRequest(store: LimitsStore, requestRunId: string, fields: Record<string, number>): Promise<void> {
+  if (typeof store.incrBy === 'function') {
+    try { await store.incrBy(requestKey(requestRunId), fields); return; } catch { /* the legacy path below */ }
+  }
+  if (typeof store.get !== 'function' || typeof store.put !== 'function') return;
+  const cur = (await store.get<Record<string, number>>(requestKey(requestRunId))) ?? {};
+  const next: Record<string, number> = { ...cur };
+  for (const [k, v] of Object.entries(fields)) next[k] = (next[k] ?? 0) + v;
+  await store.put(requestKey(requestRunId), next);
+}
+
+/** Adds to the request's total — only once it exists: an earlier version's request keeps the walk. */
+async function addToRequest(store: LimitsStore, requestRunId: string, spend: Record<string, number>): Promise<void> {
+  if (!(await hasRequestTotal(store, requestRunId))) return;
+  await bumpRequest(store, requestRunId, spend);
+}
+
+/**
+ * Whether the request keeps a total. Once kept it stays kept (it is created once, at the root's first
+ * step, and never unset), so a yes is remembered per store and the question costs no read after it.
+ */
+async function hasRequestTotal(store: LimitsStore, requestRunId: string): Promise<boolean> {
+  const known = requestsWithTotal.get(store as object);
+  if (known?.has(requestRunId)) return true;
+  if (!(await requestTotals(store, requestRunId))) return false;
+  if (known) { if (known.size >= KNOWN_REQUESTS_MAX) known.clear(); known.add(requestRunId); }
+  else requestsWithTotal.set(store as object, new Set([requestRunId]));
+  return true;
+}
+const requestsWithTotal = new WeakMap<object, Set<string>>();
+const KNOWN_REQUESTS_MAX = 10_000;
+
+/** The request's spend: its total where one is kept, else the walk over its runs. */
+async function requestSpend(store: LimitsStore, requestRunId: string, opts: RunCostOptions): Promise<{ totalTokens: number; costUsd: number; succeededToolCalls: number }> {
+  const kept = await requestTotals(store, requestRunId);
+  if (kept) return kept;
+  const own = (await readCounters(store, requestRunId)) ?? emptyCounters();
+  const chain = (await readChain(store, requestRunId)) ?? emptyChain();
+  const sub = await sumSubRuns(store, requestRunId, chain.subRunIds, opts, new Set([requestRunId]), chain.childRunIds);
+  return { totalTokens: own.totalTokens + sub.totalTokens, costUsd: own.costUsd + sub.costUsd, succeededToolCalls: own.succeededToolCalls + sub.succeededToolCalls };
+}
+
 async function ensureSeeded(
   reader: JournalReader,
   store: LimitsStore,
   runId: string,
   opts: RunCostOptions,
   unpriced?: Set<string>,
+  requestRunId?: string,
 ): Promise<boolean> {
   if ((await readChain(store, runId)) !== undefined) return false; // already seeded
   if (typeof reader.readRun !== 'function') return false; // fail-open
@@ -737,13 +992,20 @@ async function ensureSeeded(
     ? await store.putIfAbsent(key, seeded.chain)
     : await claim(store as Journal, key, seeded.chain);
   if (!won) return false; // another call already seeded it — fall through to the normal increment path
-  await incrCounters(store, runId, seeded.counters);
+  if (requestRunId !== undefined && requestRunId === runId) {
+    // The root meets its limits: the request's total starts here, with what the root already spent.
+    const c = seeded.counters;
+    await bumpRequest(store, runId, { created: 1, totalTokens: c.totalTokens ?? 0, costUsd: c.costUsd ?? 0, succeededToolCalls: c.succeededToolCalls ?? 0 });
+    await incrCounters(store, runId, seeded.counters);
+  } else {
+    await incrCounters(store, runId, seeded.counters, requestRunId);
+  }
   return true;
 }
 
 /**
  * FAN-OUT INHERITANCE (W1 design decision — see apiOrNotes): RECURSIVELY sums the usage of a
- * runId's sub-agent (agent-tool.ts `createAgentTool`/`runSubAgent`) runs. Sub-agent runIds are
+ * runId's sub-agent (agent-tool.ts `delegationTool`, the network path) runs. Sub-agent runIds are
  * DETERMINISTICALLY derived (`agent:${toolCallId}`, the SAME pattern as agent-tool.ts). O(1) `get`(s)
  * are read from EACH sub-run's OWN counter/chain key (since the sub-run inherits the SAME `limits`
  * through agent-tool.ts, it already kept a cumulative total DURING its own run) → the total cost is
@@ -790,27 +1052,36 @@ async function sumSubRuns(
   subRunIds: string[],
   opts: RunCostOptions,
   seen: Set<string>,
+  childRunIds: string[] = [],
 ): Promise<{ totalTokens: number; costUsd: number; succeededToolCalls: number }> {
   const absent = absentFor(store);
   let totalTokens = 0;
   let costUsd = 0;
   let succeededToolCalls = 0;
-  for (const toolCallId of subRunIds) {
-    // Both shapes: the parent-scoped id a sub-agent uses now, and the bare legacy one still present
-    // in journals written before it was scoped. A miss costs one O(1) `get` and sums 0.
-    const candidates = [nestedAgentRunId(parentRunId, toolCallId), `agent:${toolCallId}`];
+  // Per toolCallId both shapes: the parent-scoped id a sub-agent uses now, and the bare legacy one still
+  // present in journals written before it was scoped; plus children registered by id. A miss costs one
+  // O(1) `get` and sums 0.
+  // A child registered at BIRTH (childRunIds) may simply not have spent yet: a miss there is "not yet",
+  // never "never". Caching it as absent — the rule for a FINISHED call's candidate shapes, below — hid
+  // every sub-agent from the budget for good (measured: four sub-agents spent 120 tokens, the request
+  // counted 0 of them).
+  const groups: { ids: string[]; live: boolean }[] = [
+    ...subRunIds.map((toolCallId) => ({ ids: [nestedAgentRunId(parentRunId, toolCallId), `agent:${toolCallId}`], live: false })),
+    ...childRunIds.map((id) => ({ ids: [id], live: true })),
+  ];
+  for (const { ids: candidates, live } of groups) {
     for (const nestedRunId of new Set(candidates)) {
       if (seen.has(nestedRunId)) continue;
-      if (absent.has(nestedRunId)) continue; // proven absent on an earlier step — see absentNestedRuns
+      if (!live && absent.has(nestedRunId)) continue; // proven absent on an earlier step — see absentNestedRuns
       seen.add(nestedRunId);
       const nested = await readCounters(store, nestedRunId); // O(1) — the sub-run already kept this DURING its own run
-      if (!nested) { absent.add(nestedRunId); continue; } // the sub-agent never ran → harmless 0, and never will
+      if (!nested) { if (!live) absent.add(nestedRunId); continue; } // a finished call's sub-agent that never ran → 0, and never will
       totalTokens += nested.totalTokens;
       costUsd += nested.costUsd;
       succeededToolCalls += nested.succeededToolCalls;
       const nestedChain = await readChain(store, nestedRunId);
-      if (nestedChain?.subRunIds.length) {
-        const grand = await sumSubRuns(store, nestedRunId, nestedChain.subRunIds, opts, seen); // multi-level fan-out
+      if (nestedChain?.subRunIds.length || nestedChain?.childRunIds?.length) {
+        const grand = await sumSubRuns(store, nestedRunId, nestedChain.subRunIds, opts, seen, nestedChain.childRunIds); // multi-level fan-out
         totalTokens += grand.totalTokens;
         costUsd += grand.costUsd;
         succeededToolCalls += grand.succeededToolCalls;
@@ -915,6 +1186,13 @@ export async function enforceStepLimits(
   runId: string,
   limits: RunLimits | undefined,
   opts: RunCostOptions = {},
+  // The request the run belongs to (run-identity.ts requestOf): its budget is measured there.
+  requestRunId: string = runId,
+  // 'after' a step: the budget is exceeded when spend went PAST it. 'before' a new step: when nothing is
+  // left (spend REACHED it) — the next step can only go past. Checked only after, a parent and its
+  // sub-agents each spent one more step on a budget a sibling had already used up (measured: 90 tokens
+  // on a 60-token budget through sub-agents, 75 directly).
+  when: 'after' | 'before' = 'after',
 ): Promise<void> {
   if (!limits || (limits.maxCostUsd == null && limits.maxTokens == null)) return;
   if (typeof reader.readRun !== 'function') { reportUnenforceableLimits(reader, limits); return; } // fail-open (or throw under strict)
@@ -929,11 +1207,11 @@ export async function enforceStepLimits(
   if (!opts.pricing) opts = { ...opts, pricing: await effectivePricingTable(reader as never) };
 
   const unpriced = new Set<string>();
-  await ensureSeeded(reader, store, runId, opts, unpriced); // seeds with a SINGLE readRun on first encounter (no-op afterward)
+  await ensureSeeded(reader, store, runId, opts, unpriced, requestRunId); // seeds with a SINGLE readRun on first encounter (no-op afterward)
   let counters = (await readCounters(store, runId)) ?? emptyCounters();
   const delta = await computeModelStepsDelta(store, runId, counters.modelStepsSeen, opts, unpriced); // O(1) targeted get — no readRun
   if (delta) {
-    await incrCounters(store, runId, delta);
+    await incrCounters(store, runId, delta, requestRunId);
     counters = {
       ...counters,
       modelStepsSeen: counters.modelStepsSeen + (delta.modelStepsSeen ?? 0),
@@ -942,12 +1220,11 @@ export async function enforceStepLimits(
     };
   }
 
-  const chain = (await readChain(store, runId)) ?? emptyChain();
-  const subtotal = await sumSubRuns(store, runId, chain.subRunIds, opts, new Set([runId]));
-  const totalTokens = counters.totalTokens + subtotal.totalTokens;
-  const costUsd = counters.costUsd + subtotal.costUsd;
+  const spend = await requestSpend(store, requestRunId, opts);
+  const totalTokens = spend.totalTokens;
+  const costUsd = spend.costUsd;
 
-  if (limits.maxTokens != null && totalTokens > limits.maxTokens) {
+  if (limits.maxTokens != null && (when === 'before' ? totalTokens >= limits.maxTokens : totalTokens > limits.maxTokens)) {
     throw new RunLimitExceededError(
       `@gnldev/durable: run '${runId}' exceeded the maxTokens limit (${limits.maxTokens}) with ${totalTokens} tokens`,
       { kind: 'maxTokens', value: totalTokens, limit: limits.maxTokens },
@@ -975,7 +1252,7 @@ export async function enforceStepLimits(
       );
     }
   }
-  if (limits.maxCostUsd != null && costUsd > limits.maxCostUsd) {
+  if (limits.maxCostUsd != null && (when === 'before' ? costUsd >= limits.maxCostUsd : costUsd > limits.maxCostUsd)) {
     throw new RunLimitExceededError(
       `@gnldev/durable: run '${runId}' exceeded the maxCostUsd limit ($${limits.maxCostUsd}) at $${costUsd.toFixed(4)}`,
       { kind: 'maxCostUsd', value: costUsd, limit: limits.maxCostUsd },
@@ -1016,6 +1293,9 @@ export async function checkToolGate(
   toolName: string,
   hash: string,
   limits: RunLimits | undefined,
+  // The request the run belongs to (run-identity.ts requestOf): a sub-agent's limits are the REQUEST's,
+  // measured at its root — the parent's calls, every sibling's and this run's — as for the agent run directly.
+  requestRunId: string = runId,
 ): Promise<ToolGateBreach | undefined> {
   if (!limits) return undefined;
   if (typeof reader.readRun !== 'function') { reportUnenforceableLimits(reader, limits); return undefined; } // fail-open (or throw under strict)
@@ -1032,7 +1312,7 @@ export async function checkToolGate(
   // correctly afterwards cannot undo it, and because `unpriced` stayed empty the "no price for this
   // model" warning did not fire either. Measured: a step the document prices at $300 left a maxCostUsd
   // of $0.01 unenforced, silently.
-  await ensureSeeded(reader, store, runId, { pricing: await effectivePricingTable(reader as never) });
+  await ensureSeeded(reader, store, runId, { pricing: await effectivePricingTable(reader as never) }, undefined, requestRunId);
   const chain = (await readChain(store, runId)) ?? emptyChain();
 
   if (maxRepeats != null && maxRepeats > 0) {
@@ -1068,9 +1348,7 @@ export async function checkToolGate(
   }
 
   if (limits.maxToolCalls != null) {
-    const counters = (await readCounters(store, runId)) ?? emptyCounters();
-    const subtotal = await sumSubRuns(store, runId, chain.subRunIds, {}, new Set([runId]));
-    const succeededToolCalls = counters.succeededToolCalls + subtotal.succeededToolCalls;
+    const succeededToolCalls = (await requestSpend(store, requestRunId, {})).succeededToolCalls;
     if (succeededToolCalls >= limits.maxToolCalls) {
       return {
         kind: 'maxToolCalls',
@@ -1114,21 +1392,31 @@ export async function recordToolOutcome(
   // C4: passed through so this enforcement point can warn/throw when limits are configured but the
   // journal lacks `readRun` (optional — direct callers that omit it keep the old fail-open behavior).
   limits?: RunLimits,
-): Promise<void> {
-  if (typeof journal.get !== 'function' || typeof journal.put !== 'function') return; // cannot write → skip silently
+  // A delegation's success (journal.ts `delegation`): its child's calls are counted in the child's run.
+  delegation = false,
+  // The request the run belongs to: its total moves with this count (see requestTotals).
+  requestRunId?: string,
+  // The seat this call holds (takeToolSeat). One held in the request's total is given back in the step
+  // that counts the call; returns true when it was.
+  seat?: ToolSeat,
+): Promise<boolean> {
+  if (typeof journal.get !== 'function' || typeof journal.put !== 'function') return false; // cannot write → skip silently
 
   if ((await readChain(journal, runId)) === undefined) {
-    if (typeof journal.readRun !== 'function') { if (limits) reportUnenforceableLimits(journal, limits); return; } // fail-open (or throw under strict)
+    if (typeof journal.readRun !== 'function') { if (limits) reportUnenforceableLimits(journal, limits); return false; } // fail-open (or throw under strict)
     // Same reason as the tool gate above: this seeding decides the recorded cost of every earlier step.
-    const won = await ensureSeeded(journal as JournalReader, journal, runId, { pricing: await effectivePricingTable(journal as never) });
-    if (won) return; // seeding ALREADY included THIS call's own outcome — double counting prevented
+    const won = await ensureSeeded(journal as JournalReader, journal, runId, { pricing: await effectivePricingTable(journal as never) }, undefined, requestRunId);
+    if (won) return false; // seeding ALREADY included THIS call's own outcome — double counting prevented
     // we lost (another concurrent call seeded it) → fall through to the normal (steady-state) increment path
   }
 
   // succeededToolCalls now counts ATTEMPTS for side-effect tools: every 'succeeded' call PLUS every
   // 'failed' SIDE-EFFECT call (an executed-then-threw effect). This can only make maxToolCalls STRICTER.
-  if (status === 'succeeded' || (status === 'failed' && sideEffect)) {
-    await incrCounters(journal, runId, { succeededToolCalls: 1 }); // H8a: ATOMIC — lossless under parallel calls
+  const counted = (status === 'succeeded' && !delegation) || (status === 'failed' && sideEffect);
+  const givesBackSeat = counted && seat === 'request' && requestRunId !== undefined;
+  if (counted) {
+    await incrCounters(journal, runId, { succeededToolCalls: 1 }, requestRunId, givesBackSeat); // H8a: ATOMIC — lossless under parallel calls
   }
   await writeChainCas(journal, runId, (chain) => applyToolOutcomeToChain(chain, toolCallId, toolName, hash, status));
+  return givesBackSeat;
 }

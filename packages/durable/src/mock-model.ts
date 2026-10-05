@@ -10,6 +10,8 @@
 // <provider>` are the road off of them.
 
 import type { ModelInput } from './types.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { TOOL_CALLING_MODEL_NAMES } from './option-names.js';
 
 /** AI SDK 7 reads nested token counts; a flat `{inputTokens: 1}` reads as undefined through its
  *  accessors, so any cost or token ceiling would count a mock as free. */
@@ -42,39 +44,59 @@ function toolResultsSeen(prompt: unknown[]): number {
   return n;
 }
 
-function streamOf(text: string): { stream: ReadableStream } {
+type Part = { type: 'text'; text: string } | { type: 'tool-call'; toolCallId: string; toolName: string; input: string };
+type Turn = { content: Part[]; finishReason: ReturnType<typeof finish> };
+
+/**
+ * The ONE answer of a mock turn, read by both of its doors: `doGenerate` returns it, `doStream`
+ * streams it. They used to decide separately, and `toolCallingModel` called its tool only from
+ * `doGenerate` — so every streaming door (chat, AG-UI, `streamDurable`) showed a tool that never ran.
+ */
+function generated(turn: Turn) {
+  return { content: turn.content, finishReason: turn.finishReason, usage, warnings: [] };
+}
+function streamed(turn: Turn): { stream: ReadableStream } {
   return {
     stream: new ReadableStream({
       start(c) {
         c.enqueue({ type: 'stream-start', warnings: [] });
-        c.enqueue({ type: 'text-start', id: '1' });
-        for (const ch of text) c.enqueue({ type: 'text-delta', id: '1', delta: ch });
-        c.enqueue({ type: 'text-end', id: '1' });
-        c.enqueue({ type: 'finish', finishReason: finish('stop'), usage });
+        turn.content.forEach((part, i) => {
+          if (part.type === 'tool-call') { c.enqueue(part); return; }
+          const id = String(i + 1);
+          c.enqueue({ type: 'text-start', id });
+          for (const ch of part.text) c.enqueue({ type: 'text-delta', id, delta: ch });
+          c.enqueue({ type: 'text-end', id });
+        });
+        c.enqueue({ type: 'finish', finishReason: turn.finishReason, usage });
         c.close();
       },
     }),
   };
 }
+/** A model whose every turn is `script(prompt)`, answered the same way called or streamed. */
+function scripted(modelId: string, script: (prompt: unknown[]) => Turn): ModelInput {
+  return {
+    specificationVersion: 'v4',
+    provider: 'mock',
+    modelId,
+    supportedUrls: {},
+    doGenerate: async ({ prompt }: { prompt: unknown[] }) => generated(script(prompt)),
+    doStream: async ({ prompt }: { prompt: unknown[] }) => streamed(script(prompt)),
+    // Cast, and worth one line: these are hand-built spec-v4 objects, so they satisfy the provider
+    // CONTRACT (mock-model.test.ts drives both through `ai`'s own generateText) without satisfying
+    // the SDK's declared interface structurally. Returning `unknown` instead put the cast in every
+    // scaffolded project — measured: a fresh `gnl init --serving own` did not typecheck, because
+    // `AgentConfig.model` is `ModelInput` and `unknown` is not assignable to it.
+  } as unknown as ModelInput;
+}
+const said = (text: string): Turn => ({ content: [{ type: 'text', text }], finishReason: finish('stop') });
 
 /**
  * Echoes the last user message back. The smallest thing that lets `pnpm dev` work with no key:
  * the run is journaled, the thread is real, Studio shows a timeline — only the words are silly.
  */
 export function echoModel(): ModelInput {
-  return {
-    specificationVersion: 'v4',
-    provider: 'mock',
-    modelId: 'echo',
-    supportedUrls: {},
-    doGenerate: async ({ prompt }: { prompt: unknown[] }) => ({
-      content: [{ type: 'text', text: `echo: ${lastUserText(prompt)}` }],
-      finishReason: finish('stop'),
-      usage,
-      warnings: [],
-    }),
-    doStream: async ({ prompt }: { prompt: unknown[] }) => streamOf(`echo: ${lastUserText(prompt)}`),
-  };
+  return scripted('echo', (prompt) => said(`echo: ${lastUserText(prompt)}`));
 }
 
 export interface ToolCallingModelOptions {
@@ -99,36 +121,17 @@ export interface ToolCallingModelOptions {
  * it answers with `doneText`. Gives a scaffold a REAL tool call to inspect in Studio, keyless.
  */
 export function toolCallingModel(opts: ToolCallingModelOptions = {}): ModelInput {
+  refuseUnknownNames('toolCallingModel', opts, TOOL_CALLING_MODEL_NAMES);
   const toolName = opts.toolName ?? 'chargeOrder';
   const input = JSON.stringify(opts.input ?? { orderId: 'order-1', amount: 42 });
   const calls = opts.calls ?? 1;
   const doneText = opts.doneText ?? 'Order charged once. Run the same work again — it will not charge twice.';
-  return {
-    specificationVersion: 'v4',
-    provider: 'mock',
-    modelId: 'demo',
-    supportedUrls: {},
-    doGenerate: async ({ prompt }: { prompt: unknown[] }) => {
-      if (toolResultsSeen(prompt) === 0) {
-        return {
-          content: Array.from({ length: calls }, (_, i) => ({
-            type: 'tool-call',
-            toolCallId: `call-${i + 1}`,
-            toolName,
-            input,
-          })),
+  return scripted('demo', (prompt) =>
+    toolResultsSeen(prompt) === 0
+      ? {
+          content: Array.from({ length: calls }, (_, i) => ({ type: 'tool-call' as const, toolCallId: `call-${i + 1}`, toolName, input })),
           finishReason: finish('tool-calls'),
-          usage,
-          warnings: [],
-        };
-      }
-      return { content: [{ type: 'text', text: doneText }], finishReason: finish('stop'), usage, warnings: [] };
-    },
-    doStream: async () => streamOf(doneText),
-    // Cast, and worth one line: these are hand-built spec-v4 objects, so they satisfy the provider
-    // CONTRACT (mock-model.test.ts drives both through `ai`'s own generateText) without satisfying
-    // the SDK's declared interface structurally. Returning `unknown` instead put the cast in every
-    // scaffolded project — measured: a fresh `gnl init --serving own` did not typecheck, because
-    // `AgentConfig.model` is `ModelInput` and `unknown` is not assignable to it.
-  } as unknown as ModelInput;
+        }
+      : said(doneText),
+  );
 }

@@ -18,7 +18,7 @@
 //    the cross-org isolation conformance suite. They all passed the moment they were wired up, which
 //    is the worst version of this: nothing was broken, so nothing would ever have raised a flag.
 //
-// 3) A door package that needs another door package. ADR-0002 point 0: chat-adapter, agui and mcp
+// 3) A door package that needs another door package. ADR-0002 point 0: chat-adapter, agui, mcp and a2a
 //    each work on their own, without any other door and without a composition package (server,
 //    studio). @gnldev/agui depended on @gnldev/server for two error codes and one type, so installing
 //    agui alone pulled in server (measured with `npm install` of the packed tarballs). Nothing failed:
@@ -38,7 +38,13 @@
 //    manifest calls side-effect free, in a fresh process, and fails on any observable top-level
 //    effect. It needs a build (`pnpm -r build`), which CI runs first.
 //
-// The shape all four share: the failure is INVISIBLE rather than loud, so the only defence is a
+// 5) An example nothing runs. The README sends a newcomer to `pnpm demo`; the showcase printed
+//    "21/22" there for a working-memory section that read the store's key layout, and the support
+//    desk's approval button never refunded (its resume named no caller). Both type-checked and every
+//    gate was green, because typecheck is all CI did with examples. Each example now carries a test
+//    under `examples/<name>/test/`, which the root `vitest run` collects — or a reason here why not.
+//
+// The shape all five share: the failure is INVISIBLE rather than loud, so the only defence is a
 // check that goes looking. That is what this file is.
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { join, dirname, relative } from 'node:path';
@@ -109,7 +115,9 @@ for (const name of readdirSync(pkgDir)) {
 // ── 3. door packages that need another door ───────────────────────────────────────────────────────
 // Directory name → what it may never need. A door may use durable and auth (the shared contract and
 // the shared functions), never a sibling door and never a package that composes the doors.
-const DOORS = ['chat-adapter', 'agui', 'mcp'];
+// a2a is a door twice over: its server half (`@gnldev/a2a/server`) serves agents, and @gnldev/server
+// depends on a2a — so a2a needing server back, even for a type, would be a cycle.
+const DOORS = ['chat-adapter', 'agui', 'mcp', 'a2a'];
 const FORBIDDEN = new Set(['@gnldev/server', '@gnldev/studio', ...DOORS.map((d) => `@gnldev/${d}`)]);
 // What a consumer installs. devDependencies are not installed by a consumer, so they are not checked.
 const INSTALLED = ['dependencies', 'peerDependencies', 'optionalDependencies'];
@@ -207,6 +215,24 @@ if (toProbe.length && !unbuilt.length) {
   }
 }
 
+// ── 5. examples nothing runs ──────────────────────────────────────────────────────────────────────
+/** An example with no test, and why that is right. Anything not listed here needs `test/`. */
+const EXAMPLE_NO_TEST = {
+  benchmarks: 'measurement scripts: each run prints numbers for a person to compare, there is no fixed answer to assert',
+  'react-client': 'a browser UI over @gnldev/client; the server it talks to is @gnldev/server, tested in its package',
+};
+const untested = [];
+const exDir = join(root, 'examples');
+if (existsSync(exDir)) for (const name of readdirSync(exDir)) {
+  const dir = join(exDir, name);
+  if (!statSync(dir).isDirectory() || !existsSync(join(dir, 'package.json'))) continue;
+  let count = 0;
+  const testDir = join(dir, 'test');
+  if (existsSync(testDir)) for (const file of walk(testDir)) if (/\.test\.tsx?$/.test(file)) count++;
+  if (count === 0 && !(name in EXAMPLE_NO_TEST)) untested.push(name);
+  if (count > 0 && name in EXAMPLE_NO_TEST) untested.push(`${name} (has tests now — remove it from EXAMPLE_NO_TEST)`);
+}
+
 // ── report ────────────────────────────────────────────────────────────────────────────────────────
 let failed = false;
 
@@ -233,6 +259,14 @@ if (coupled.length) {
   console.error('\n  Fix: move what it needs down to @gnldev/durable or @gnldev/auth, which every door already');
   console.error('  depends on, and import it from there. A developer who installs only this door must get a');
   console.error('  working door.\n');
+}
+
+if (untested.length) {
+  failed = true;
+  console.error('\n✗ an example nothing runs — typecheck proves it compiles, not that it does what its README says:\n');
+  for (const name of untested) console.error(`    examples/${name}`);
+  console.error('\n  Fix: add examples/<name>/test/<name>.test.ts asserting what the README promises (the root');
+  console.error('  `vitest run` collects it), or, if there is nothing to assert, list it in EXAMPLE_NO_TEST with why.\n');
 }
 
 if (dirty.length) {

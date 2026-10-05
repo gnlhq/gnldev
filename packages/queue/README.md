@@ -28,6 +28,46 @@ const worker = createWorker(storage, {
 await worker.runOnce();   // or worker.start() (poll loop)
 ```
 
+## Delays, retries, cancelling, concurrency
+
+```ts
+import { enqueue, createWorker, cancelJob } from '@gnldev/queue';
+import { InMemoryStorage } from '@gnldev/durable';
+declare function sendReminder(p: unknown, signal: AbortSignal): Promise<void>;
+const storage = new InMemoryStorage();
+
+// Not before a time (epoch ms or a Date). Stored in the job record, so it survives restarts.
+const id = await enqueue(storage.work!, 'remind', { to: 'a' }, { runAt: Date.now() + 60 * 60_000 });
+
+// Changed your mind: no worker starts it after this returns true.
+await cancelJob(storage.work!, id);
+
+createWorker(storage, { remind: async (p, ctx) => sendReminder(p, ctx.signal) }, {
+  retryDelayMs: (attempt) => 1_000 * 2 ** (attempt - 1), // 1s, 2s, 4s… between failed attempts
+  concurrency: 4, // this worker runs up to 4 jobs at once
+  typeConcurrency: { remind: 2 }, // at most 2 `remind` jobs at once across ALL workers
+});
+```
+
+- **`retryDelayMs`** (number or `(attempt, err) => ms`, default 0): after a failed attempt the job may
+  not run again before `now + delay`. The time is stored with the job (`qtry:<id>`), so every worker
+  honours it, also after a restart. The last attempt dead-letters without waiting.
+- **Attempts are counted when they start**, so an attempt the process died in counts too: a handler that
+  takes its worker down every time is dead-lettered after `maxAttempts` starts, not started forever.
+  `listJobs()` reports attempts started (a job done on its first try shows 1).
+- **`runAt`**: compared with the run journal's clock when it has one (`now()`), else the worker's. A
+  waiting job does not hold up the jobs behind it. Re-enqueuing the same id keeps the first `runAt`.
+- **`cancelJob(work, id)`** → `true` if it cancelled the job, `false` for an unknown or already finished
+  one. A job that is running is not killed: its `ctx.signal` aborts on the worker's next heartbeat tick
+  (`ttlMs/3`; never with `heartbeat: false`), and `ctx.run` passes that signal on. If the handler
+  finishes anyway the job shows `done`; otherwise `cancelled`. `retryJob` does not take a cancelled job.
+- **`concurrency`** (default 1): that many independent poll loops in one worker, after `start()`.
+  `runOnce`/`drain` still run one job per call, and `drain` runs only what is eligible now.
+- **`typeConcurrency`**: a per-type limit for the whole fleet, kept as that many leases in the run
+  journal. A dead worker's slot frees after `ttlMs`. Give every worker the same numbers.
+- `listJobs` shows `status: 'cancelled'` and, for a job that is waiting, `notBefore`.
+- During a rolling deploy, a 0.9 worker on the same storage ignores `runAt`, retry delays and cancels.
+
 ## Jobs for an end user
 
 A job can say whose it is. The job's run belongs to that owner, and the handler does not pass it on:
@@ -88,7 +128,7 @@ finds the moved job.
 
 ### Erasing a person
 
-`jobEraser(storage)` removes one person's jobs: the records, the `qdone`/`qfail`/`qatt`/`qown` markers
+`jobEraser(storage)` removes one person's jobs: the records, the `qdone`/`qfail`/`qcancel`/`qtry`/`qatt`/`qown` markers
 (`qfail` holds the handler's error text), the worker's lease locks, and the job runs. Hand it to
 `eraseSubject` from `@gnldev/durable` together with the other packages' erasers. `eraseSubject` takes
 the storage itself and erases every store it holds (runs, threads, working memory, documents, owned
@@ -101,7 +141,7 @@ import { eventEraser } from '@gnldev/events';
 import { InMemoryStorage, eraseSubject, toJournal } from '@gnldev/durable';
 
 const storage = new InMemoryStorage();
-const journal = toJournal(storage.runs);
+const journal = toJournal(storage);
 await eraseSubject(storage, 'ayse', {
   orgId: 'acme',
   erasers: [jobEraser(storage), triggerEraser(journal), eventEraser(storage.work!)],
@@ -112,13 +152,14 @@ The work store needs `deleteIdPrefix` and `deletePrefix`. A store without them m
 rather than report a partial erasure as done.
 
 ## API
-- `enqueue(work, type, payload, { id?, maxDepth?, caller?, resourceId?, orgId? }) → jobId` — `work` is `storage.work`.
+- `enqueue(work, type, payload, { id?, maxDepth?, caller?, resourceId?, orgId?, runAt? }) → jobId` — `work` is `storage.work`.
   `caller` is an engine `Caller` (`user(id, org)`, `staff(org?)`); `resourceId`/`orgId` are its shorthand.
-- `createWorker(storage, handlers, opts?) → { runOnce, drain, start, stop }` — `opts`: `owner`, `ttlMs` (stale lock reclaim), `pollMs`, `maxAttempts`, `onError`, `backoff`, `maxPollMs`, `heartbeat`, `maxRenewFailures` (after this many heartbeat renewals fail in a row — default 3 — the worker treats the lock as lost rather than risk running the job twice)
-- `JobCtx` gives the handler `{ journal, jobId, runId, caller, run, storage, orgId?, enqueue }`. `ctx.run(args)` is
+- `createWorker(storage, handlers, opts?) → { runOnce, drain, start, stop }` — `opts`: `owner`, `ttlMs` (stale lock reclaim), `pollMs`, `maxAttempts`, `onError`, `backoff`, `maxPollMs`, `heartbeat`, `maxRenewFailures` (after this many heartbeat renewals fail in a row — default 3 — the worker treats the lock as lost rather than risk running the job twice), `retryDelayMs`, `concurrency`, `typeConcurrency`
+- `JobCtx` gives the handler `{ journal, jobId, runId, caller, run, storage, orgId?, enqueue, signal }`. `ctx.run(args)` is
   `runDurable` on `journal`/`runId` as `caller` — it keeps the side effect at-most-once and the run the owner's.
 - `listJobs(work)` shows each job's `resourceId`/`orgId` next to its status.
 - `retryJob(work, id)` re-enqueues a dead letter for the same owner.
+- `cancelJob(work, id)` cancels a job that has not finished (see above).
 - `moveJob(work, id, owner)` gives a pre-upgrade system job its owner, without doubling it.
 - `jobEraser(storage)` erases one person's jobs (see above).
 
@@ -132,7 +173,7 @@ same key, and a handler that locked its own `ctx.runId` was refused by the worke
 it, on every attempt, until the job dead-lettered without ever running.
 
 ## Heartbeat + empty-poll backoff (both on by default)
-`heartbeat`: if a job's handler runs longer than `ttlMs`, the lock TTL can expire before the handler finishes, letting a second worker take over the same job and run it twice — `createWorker` prevents this by `renew`ing the lock every `ttlMs/3` while the handler runs. If a real takeover is detected (fencing token mismatch), this worker does NOT WRITE `qdone`/`qfail`/`qatt`, so it doesn't clobber the result of the worker that took over. Can be disabled with `heartbeat: false` (recommended only for test/debug).
+`heartbeat`: if a job's handler runs longer than `ttlMs`, the lock TTL can expire before the handler finishes, letting a second worker take over the same job and run it twice — `createWorker` prevents this by `renew`ing the lock every `ttlMs/3` while the handler runs. If a real takeover is detected (fencing token mismatch), this worker does NOT WRITE `qdone`/`qfail`/`qtry`, so it doesn't clobber the result of the worker that took over. Can be disabled with `heartbeat: false` (recommended only for test/debug).
 `backoff`: if `runOnce()` claims no job, the next poll interval starts at `pollMs` and grows ×2 (cap `maxPollMs ?? pollMs*32`); it resets to `pollMs` once a job is claimed — prevents a poll storm on an empty queue. `backoff: false` reverts to the old constant-interval behavior.
 
 ## License

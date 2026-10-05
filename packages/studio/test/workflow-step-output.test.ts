@@ -13,7 +13,6 @@ function makeApp(journal: InMemoryJournal) {
   const defs = new Map<string, WorkflowDef>([['m', { name: 'm', steps: [{ id: 'x', agentName: 'a', prompt: 'p' }] }]]);
   return createStudioApi({
     reader: journal,
-    journal,
     gnl: { listAgents: () => [], run: async () => ({ text: 'x' }), listWorkflows: () => [], runWorkflow: async () => ({ runId: 'r', steps: [] }) },
     // A compiled workflow whose steps return a void and a record-shaped value.
     compileWorkflow: (() =>

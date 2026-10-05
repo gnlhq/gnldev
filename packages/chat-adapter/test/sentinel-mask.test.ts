@@ -41,8 +41,9 @@ describe('maskSentinelOutput', () => {
         },
       },
     });
-    expect(interrupts!.map((i) => i.toolCallId)).toEqual(['child-a', 'child-b']);
-    expect(interrupt!.toolCallId).toBe('child-a'); // and this is exactly why reading it is deprecated
+    // Addressed from the parent: `<delegation call>/<child call>` (two children both number from call_0).
+    expect(interrupts!.map((i) => i.toolCallId)).toEqual(['parent-1/child-a', 'parent-1/child-b']);
+    expect(interrupt!.toolCallId).toBe('parent-1/child-a'); // and this is exactly why reading it is deprecated
     // The tool output placeholder still belongs to the suspended (parent) call.
     expect(display).toMatchObject({ pending: 'approval', toolName: 'agent' });
   });

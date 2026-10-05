@@ -5,7 +5,7 @@ import { Hono, type Context } from 'hono';
 import { sseResponse } from './sse.js';
 
 import { STUDIO_ERROR_CODES } from './error-codes.js';
-import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, reservedIdFailure, eraseSubject, subjectRuns, toJournal, decodeStepRecord } from '@gnldev/durable';
+import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, requestRefusal, eraseSubject, subjectRuns, toJournal, decodeStepRecord, readJsonObject } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
 import type { JournalReader, Journal, Memory, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
@@ -13,6 +13,17 @@ import { listTriggers } from '@gnldev/scheduler';
 import { mountSpa, notBuiltHtml } from './spa.js';
 import { openapiSpec, swaggerHtml } from './swagger.js';
 import { pipeAgentStream } from './sse.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { CREATE_STUDIO_API_NAMES, CREATE_STUDIO_ADMIN_NAMES, CREATE_STUDIO_APP_NAMES, refuseStudioBagNames } from './option-names.js';
+
+/**
+ * The request body as a JSON object (@gnldev/durable `readJsonObject`), or the 400 that says it is not
+ * one. A body that was not JSON used to be read as `{}` and fail on a field it seemed to lack.
+ */
+async function jsonBody(c: Context): Promise<{ ok: true; value: Record<string, unknown> } | { ok: false; response: Response }> {
+  const read = readJsonObject(await c.req.text());
+  return read.ok ? read : { ok: false, response: c.json({ error: read.error, code: read.code }, 400) };
+}
 
 /**
  * Is this `<runId>:wf:<rest>` key a STEP, or one of the engine's bookkeeping records?
@@ -2628,7 +2639,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!writable) return c.json({ error: 'org management requires a writable journal' }, 501);
     if (!multiOrganizationEnabled) return c.json({ error: 'multi-org is not enabled (single org)' }, 501);
     { const denied = requirePlatformAdmin(c, 'an org-bound identity cannot create a new org'); if (denied) return denied; }
-    const body = (await c.req.json().catch(() => ({}))) as { id?: string; label?: string };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { id?: string; label?: string };
     const id = String(body.id ?? '').trim();
     if (!id) return c.json({ error: 'id is required' }, 400);
     if (id.includes(':')) return c.json({ error: "invalid org: cannot contain ':'" }, 400);
@@ -2770,7 +2782,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allowP(c.req.raw, 'users:write'))) return deny(c.req.raw, 'write');
     if (!opts.users) return c.json({ error: 'user management is not enabled (the host must provide a userStore)' }, 501);
     const own = principalOf(c.req.raw)?.orgId;
-    const body = (await c.req.json().catch(() => ({}))) as { email?: string; name?: string; roles?: string[]; permissions?: string[]; orgId?: string; kind?: unknown; ttlMs?: number; expiresAt?: number };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { email?: string; name?: string; roles?: string[]; permissions?: string[]; orgId?: string; kind?: unknown; ttlMs?: number; expiresAt?: number };
     if (body.kind !== undefined && !isPrincipalKind(body.kind)) {
       return c.json({ error: 'kind must be one of operator, application, subject' }, 400);
     }
@@ -2987,7 +3000,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
         return c.json({ error: `you can only update members of your own org ('${own}')` }, 403);
       }
     }
-    const body = (await c.req.json().catch(() => ({}))) as { roles?: string[]; permissions?: string[]; kind?: unknown };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { roles?: string[]; permissions?: string[]; kind?: unknown };
     if (body.kind !== undefined && !isPrincipalKind(body.kind)) {
       return c.json({ error: 'kind must be one of operator, application, subject' }, 400);
     }
@@ -3041,7 +3055,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       return refused(c, 'organization', c.json({ error: `unauthorized: identity is bound to org '${bound}', cannot manage the budget of '${id}'` }, 403));
     }
     if (id.includes(':')) return c.json({ error: "invalid org: cannot contain ':'" }, 400);
-    const body = (await c.req.json().catch(() => ({}))) as { usdLimit?: number | null; tokenLimit?: number | null };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { usdLimit?: number | null; tokenLimit?: number | null };
     const usd = body.usdLimit;
     const tok = body.tokenLimit;
     for (const [k, v] of [['usdLimit', usd], ['tokenLimit', tok]] as const) {
@@ -3368,7 +3383,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!resume) return c.json({ error: 'fork requires resume' }, 501);
     if (!writable) return c.json({ error: 'fork requires a writable journal' }, 501);
     const id = decodeURIComponent(c.req.param('id'));
-    const body = (await c.req.json().catch(() => ({}))) as { step?: number; newRunId?: string };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { step?: number; newRunId?: string };
     // The same `${id}:input` visibility check cancel uses (persistInput is written by every
     // run()/stream() call). Without it fork answered 200 `{copiedModel: 0, copiedTool: 0}` for a run
     // the caller cannot see — a no-op reported as success, and a different answer than cancel gives
@@ -3389,6 +3405,9 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       const code = callerConflictCode(e);
       const err = e as { message?: string; detail?: unknown };
       if (code) return c.json({ error: err.message, code, ...(err.detail !== undefined ? { detail: err.detail } : {}) }, 409);
+      // A run whose recorded input the engine will not use (durable recordedInputProblem): 400 + its code.
+      const refused = requestRefusal(e);
+      if (refused) return c.json(refused.body, refused.status);
       return c.json({ error: err.message ?? String(e) }, 500);
     }
     await audit(c, 'fork', id, { step: body.step ?? 0, newRunId: fork.newRunId });
@@ -3399,7 +3418,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   app.post('/runs/:id/resume', async (c) => {
     if (!(await allowP(c.req.raw, 'run:write'))) return deny(c.req.raw, 'write');
     const id = decodeURIComponent(c.req.param('id'));
-    const body = (await c.req.json().catch(() => ({}))) as { approvals?: Record<string, boolean> };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { approvals?: Record<string, boolean> };
     // BATCH İŞ-2 (hakem Karar 2): batch-doğumlu run resumeRun'la RESUME EDİLMEZ (frozen :input yok —
     // entry-point dersinin batch hali). Studio'nun onayı yalnız KARARI journal'a claim'ler (düz
     // boolean, run.ts resolveApprovals'ın okuduğu şekil); koşum bir sonraki batch.run() çağrısında.
@@ -3456,6 +3476,9 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       const code = callerConflictCode(e);
       const err = e as { message?: string; detail?: unknown };
       if (code) return c.json({ error: err.message, code, ...(err.detail !== undefined ? { detail: err.detail } : {}) }, 409);
+      // A run whose recorded input the engine will not use (durable recordedInputProblem): 400 + its code.
+      const refused = requestRefusal(e);
+      if (refused) return c.json(refused.body, refused.status);
       return c.json({ error: err.message ?? String(e) }, 500);
     }
     // THE RECORD, NOT THE WISH. This used to audit `body.approvals` — what the caller ASKED for —
@@ -3530,7 +3553,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const id = decodeURIComponent(c.req.param('id'));
     // Also gated on the dryRun path: a preview still discloses another organization's saga plan.
     if (!(await runVisible(id))) return c.json({ error: `run '${id}' not found` }, 404);
-    const body = (await c.req.json().catch(() => ({}))) as { dryRun?: boolean };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { dryRun?: boolean };
     const report = (await compensate(id, { dryRun: !!body.dryRun }, callbackCtx(c))) as { entries?: { status: string }[] };
     if (!body.dryRun) {
       const counts: Record<string, number> = {};
@@ -3578,7 +3602,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
     if (!writable) return c.json({ error: 'regression requires a writable journal' }, 501);
     const id = decodeURIComponent(c.req.param('id'));
-    const body = (await c.req.json().catch(() => ({}))) as { model?: string; system?: string; newRunId?: string; memoryOff?: boolean };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { model?: string; system?: string; newRunId?: string; memoryOff?: boolean };
     if (!body.model) return c.json({ error: 'model is required (e.g. "openai/gpt-4o")' }, 400);
     let model: unknown;
     try {
@@ -3601,6 +3626,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       await audit(c, 'run.regression', id, { newRunId, model: body.model, divergentAt: report.diff.divergentAt, ...(body.memoryOff ? { memoryOff: true } : {}) });
       return c.json({ ok: true, ...report });
     } catch (e: any) {
+      const refused = requestRefusal(e);
+      if (refused) return c.json(refused.body, refused.status);
       return c.json({ error: String(e?.message ?? e) }, 400);
     }
   });
@@ -3635,7 +3662,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (typeof (rw as Partial<Journal>).deletePrefix !== 'function') {
       return c.json({ error: 'retention requires journal deletePrefix support' }, 501);
     }
-    const body = (await c.req.json().catch(() => ({}))) as { olderThanMs?: number; keepSuspended?: boolean; auditOlderThanMs?: number; suspendedTtlMs?: number; tombstones?: boolean };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { olderThanMs?: number; keepSuspended?: boolean; auditOlderThanMs?: number; suspendedTtlMs?: number; tombstones?: boolean };
     const olderThanMs = body.olderThanMs ?? opts.retention?.olderThanMs;
     if (olderThanMs == null) return c.json({ error: 'olderThanMs is required (body or the retention option)' }, 400);
     const keepSuspended = body.keepSuspended ?? opts.retention?.keepSuspended ?? true;
@@ -3717,7 +3745,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     // Root-level management: the policy is a SINGLE GLOBAL rule set for ALL orgs (org-unscoped) → a
     // bound identity could otherwise change everyone's guard. Only an unbound operator can do this.
     { const denied = requirePlatformAdmin(c, 'an org-bound identity cannot update the global policy (operator required)'); if (denied) return denied; }
-    const body = (await c.req.json().catch(() => null)) as { rules?: PolicyRule[]; ifVersion?: number } | null;
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { rules?: PolicyRule[]; ifVersion?: number } | null;
     if (!Array.isArray(body?.rules)) return c.json({ error: 'a rules array is required' }, 400);
     const ACTIONS = new Set(['allow', 'deny', 'require-approval']);
     for (const r of body.rules) {
@@ -3789,7 +3818,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     // Root-level management, exactly like the policy: pricing is ONE global table for every org, so a
     // bound identity could otherwise change what every other organization is billed at.
     { const denied = requirePlatformAdmin(c, 'an org-bound identity cannot update global pricing (operator required)'); if (denied) return denied; }
-    const body = (await c.req.json().catch(() => null)) as
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as
       { models?: Record<string, { inputPer1M?: unknown; outputPer1M?: unknown; cachedInputPer1M?: unknown }>; replace?: boolean; ifVersion?: number } | null;
     if (!body?.models || typeof body.models !== 'object' || Array.isArray(body.models)) {
       return c.json({ error: 'a models object is required' }, 400);
@@ -3890,7 +3920,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   app.post('/chat', async (c) => {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
     if (!chat) return c.json({ error: 'chat is not enabled' }, 501);
-    const body = (await c.req.json().catch(() => ({}))) as { message?: string; runId?: string };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { message?: string; runId?: string };
     if (!body.message) return c.json({ error: 'message is required' }, 400);
     try {
       return c.json({ ok: true, ...(await chat(String(body.message), { runId: body.runId }, callbackCtx(c))) });
@@ -3904,12 +3935,12 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
 
   /**
    * A thread id the memory refuses to name (`ReservedThreadIdError`: a root-scope memory asked for an
-   * id under `org:`), answered the way every door answers it — durable's `reservedIdFailure`, 400
+   * id under `org:`), answered the way every door answers it — durable's `requestRefusal`, 400
    * `thread_id_reserved`. Studio's thread reads let it escape as a 500; its writes and runs flattened
    * it to a 400 with no code.
    */
   function reservedIdResponse(c: Context, e: unknown): Response | undefined {
-    const f = reservedIdFailure(e);
+    const f = requestRefusal(e);
     return f ? c.json(f.body, f.status) : undefined;
   }
   /**
@@ -4029,7 +4060,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     { const denied = requirePlatformAdmin(c, 'an org-bound identity cannot approve an agent (operator required)'); if (denied) return denied; }
     if (!writable) return c.json({ error: 'agent registry requires a writable journal' }, 501);
     const name = decodeURIComponent(c.req.param('name'));
-    const body = (await c.req.json().catch(() => ({}))) as { note?: string };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { note?: string };
     const rec = await approveAgent(rawReader as unknown as Journal, name, actorOf(c), body.note);
     await audit(c, 'agent.approve', name, body.note !== undefined ? { note: body.note } : undefined);
     return c.json({ ok: true, record: rec });
@@ -4040,7 +4072,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     { const denied = requirePlatformAdmin(c, 'an org-bound identity cannot block an agent (operator required)'); if (denied) return denied; }
     if (!writable) return c.json({ error: 'agent registry requires a writable journal' }, 501);
     const name = decodeURIComponent(c.req.param('name'));
-    const body = (await c.req.json().catch(() => ({}))) as { note?: string };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { note?: string };
     const rec = await blockAgent(rawReader as unknown as Journal, name, actorOf(c), body.note);
     await audit(c, 'agent.block', name, body.note !== undefined ? { note: body.note } : undefined);
     return c.json({ ok: true, record: rec });
@@ -4053,7 +4086,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const name = decodeURIComponent(c.req.param('name'));
     const gated = await agentGate(c, name);
     if (gated) return gated;
-    const body = (await c.req.json().catch(() => ({}))) as any;
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as any;
     if (!body.runId) return c.json({ error: 'runId is required (idempotency key)' }, 400);
     { const denied = requireScopedThread(c, body.threadId); if (denied) return denied; }
     const playCtx = callbackCtx(c, body.resourceId);
@@ -4102,7 +4136,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const name = decodeURIComponent(c.req.param('name'));
     const gated = await agentGate(c, name);
     if (gated) return gated;
-    const body = (await c.req.json().catch(() => ({}))) as any;
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as any;
     if (!body.runId) return c.json({ error: 'runId is required (idempotency key)' }, 400);
     { const denied = requireScopedThread(c, body.threadId); if (denied) return denied; }
     const playCtx = callbackCtx(c, body.resourceId);
@@ -4154,7 +4189,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
     if (!gnl?.runTool) return c.json({ error: 'tool execution is not enabled' }, 501);
     const name = decodeURIComponent(c.req.param('name'));
-    const body = (await c.req.json().catch(() => ({}))) as { input?: unknown; durable?: boolean; approve?: { runId: string; toolCallId: string; approved: boolean } };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { input?: unknown; durable?: boolean; approve?: { runId: string; toolCallId: string; approved: boolean } };
     const r = await gnl.runTool(name, body.input, { durable: !!body.durable, approve: body.approve }, callbackCtx(c));
     await audit(c, 'tool.exec', name, { durable: !!body.durable });
     return c.json(r.error ? { error: r.error, blocked: r.blocked, runId: r.runId } : { ok: true, result: r.result, runId: r.runId });
@@ -4202,7 +4238,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     { const denied = requireScopedMemory(c); if (denied) return denied; }
     const resolvedMemory = memoryFor(c);
     if (!resolvedMemory?.updateThread) return c.json({ error: 'updateThread is not supported' }, 501);
-    const patch = (await c.req.json().catch(() => ({}))) as { title?: string; metadata?: Record<string, unknown> };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const patch = parsedBody.value as { title?: string; metadata?: Record<string, unknown> };
     try {
       const thread = await resolvedMemory.updateThread(decodeURIComponent(c.req.param('id')), patch);
       await audit(c, 'thread.rename', decodeURIComponent(c.req.param('id')), patch);
@@ -4233,7 +4270,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     { const denied = requireScopedMemory(c); if (denied) return denied; }
     const resolvedMemory = memoryFor(c);
     if (!resolvedMemory?.truncateMessagesAfter) return c.json({ error: 'truncateMessagesAfter is not supported' }, 501);
-    const body = (await c.req.json().catch(() => ({}))) as { afterIndex?: unknown };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { afterIndex?: unknown };
     if (typeof body.afterIndex !== 'number' || !Number.isFinite(body.afterIndex)) {
       return c.json({ error: 'afterIndex (number) is required' }, 400);
     }
@@ -5082,7 +5120,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!ev?.release) {
       return c.json({ error: 'dead-event release is not supported (events not given or release not implemented)' }, 501);
     }
-    const body = (await c.req.json().catch(() => ({}))) as { topic?: unknown; consumer?: unknown; id?: unknown };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { topic?: unknown; consumer?: unknown; id?: unknown };
     const { topic, consumer, id } = body;
     if (typeof topic !== 'string' || !topic || typeof consumer !== 'string' || !consumer || typeof id !== 'string' || !id) {
       return c.json({ error: 'topic, consumer and id (non-empty strings) are all required — a dead-letter record is addressed by the triple, not by the event id' }, 400);
@@ -5114,7 +5153,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
     const ca = hostFor(c, 'cache');
     if (!ca?.invalidate) return c.json({ error: 'cache invalidate is not supported (cache not given or invalidate not implemented)' }, 501);
-    const body = (await c.req.json().catch(() => ({}))) as { key?: unknown };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { key?: unknown };
     // The org travels with it. With no key AND no organization the host wipes everything it knows —
     // measured from an acme-bound admin: `{ok:true,deleted:{removed:9}}`, every organization's cache
     // gone in one call. Studio cannot scope a host's cache itself; it can stop hiding whose request it
@@ -5175,7 +5215,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allowP(c.req.raw, 'payloads:read'))) return deny(c.req.raw, 'read');
     if (!vectors) return c.json([]);
     { const denied = requireScopedHost(c, 'vectors'); if (denied) return denied; }
-    const body = (await c.req.json().catch(() => ({}))) as { query?: string; topK?: number };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { query?: string; topK?: number };
     if (!body.query?.trim()) return c.json([]);
     // The host owns the index, so only the host can filter it — but it needs to know who asked.
     return c.json(await hostFor(c, 'vectors')!.search(body.query, body.topK, { orgId: callerOrg(c) }));
@@ -5202,7 +5243,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   app.post('/workflows/:name/run', async (c) => {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
     const name = decodeURIComponent(c.req.param('name'));
-    const body = (await c.req.json().catch(() => ({}))) as { input?: unknown; runId?: string; maxSteps?: number; dryRun?: boolean; resume?: Record<string, unknown> };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { input?: unknown; runId?: string; maxSteps?: number; dryRun?: boolean; resume?: Record<string, unknown> };
     // Try code-defined first.
     if (gnl?.runWorkflow) {
       const codeNames = gnl.listWorkflows ? (await gnl.listWorkflows()).map((w) => w.name) : [];
@@ -5261,7 +5303,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!writable || typeof rw.listKeys !== 'function') return c.json({ error: 'fork requires a writable journal (listKeys)' }, 501);
     const name = decodeURIComponent(c.req.param('name'));
     const src = decodeURIComponent(c.req.param('id'));
-    const body = (await c.req.json().catch(() => ({}))) as { upto?: number; newRunId?: string };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { upto?: number; newRunId?: string };
     // Step order: code workflow metadata → otherwise the managed definition.
     let stepIds: string[] | undefined;
     if (gnl?.listWorkflows) stepIds = (await gnl.listWorkflows()).find((w) => w.name === name)?.steps.map((s) => s.id);
@@ -5306,7 +5349,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
     if (!rw.listKeys || !rw.get) return c.json({ error: 'streaming requires a writable journal (listKeys+get)' }, 501);
     const name = decodeURIComponent(c.req.param('name'));
-    const body = (await c.req.json().catch(() => ({}))) as { input?: unknown; runId?: string };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { input?: unknown; runId?: string };
     const runId = body.runId || `wf-${name}-${Date.now()}`;
 
     // Code or managed? → pick the right starter. Both journal to `${runId}:wf:*` → poll-to-stream is shared.
@@ -5599,7 +5643,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     { const denied = requireScopedHost(c, 'workflowStore'); if (denied) return denied; }
     const wf = wfStoreFor(c);
     if (!wf) return c.json({ error: 'no workflow store is available' }, 501);
-    const body = (await c.req.json().catch(() => null)) as WorkflowDef | null;
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as unknown as WorkflowDef | null;
     if (!body?.name?.trim()) return c.json({ error: 'name is required' }, 400);
     const now = Date.now();
     const def: WorkflowDef = { ...body, steps: body.steps ?? [], createdAt: body.createdAt ?? now, updatedAt: now };
@@ -5614,7 +5659,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const wf = wfStoreFor(c);
     if (!wf) return c.json({ error: 'no workflow store is available' }, 501);
     const name = decodeURIComponent(c.req.param('name'));
-    const body = (await c.req.json().catch(() => null)) as Partial<WorkflowDef> | null;
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as Partial<WorkflowDef> | null;
     if (!body) return c.json({ error: 'invalid body' }, 400);
     const existing = await wf.get(name);
     const def: WorkflowDef = { ...existing, ...body, steps: body.steps ?? existing?.steps ?? [], name, updatedAt: Date.now(), createdAt: existing?.createdAt ?? Date.now() };
@@ -5654,7 +5700,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
     const store = agentStoreFor(c); // a bound identity manages only ITS OWN org's versions
     if (!store) return c.json({ error: 'agent versioning requires a writable journal (listKeys)' }, 501);
-    const body = (await c.req.json().catch(() => null)) as { name?: string; model?: string; system?: string; maxSteps?: number; note?: string } | null;
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { name?: string; model?: string; system?: string; maxSteps?: number; note?: string } | null;
     if (!body?.name?.trim() || !body?.model?.trim()) return c.json({ error: 'name and model are required' }, 400);
     const name = body.name.trim();
     // GOVERNANCE OVER CODE-DEFINED AGENTS (deliberate boundary — no-code builder is deferred):
@@ -5697,7 +5744,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const name = decodeURIComponent(c.req.param('name'));
     const rec = await store.get(name);
     if (!rec) return c.json({ error: `agent '${name}' not found` }, 404);
-    const body = (await c.req.json().catch(() => ({}))) as { version?: number };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { version?: number };
     const target = rec.versions.find((v) => v.version === body.version);
     if (!target) return c.json({ error: `version ${body.version} not found (available: ${rec.versions.map((v) => v.version).join(', ')})` }, 400);
 
@@ -5799,7 +5847,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     // Read-gated, but it still reads a RUN: a scorer's `reason` quotes the run it judged, so an
     // unscoped id hands another organization's prompt back to the caller through the explanation field.
     if (!(await runVisible(id))) return c.json({ error: `run '${id}' not found` }, 404);
-    const body = (await c.req.json().catch(() => ({}))) as { scorers?: string[]; expected?: string };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { scorers?: string[]; expected?: string };
     try {
       return c.json({ ok: true, ...(await scorers.score(id, body.scorers ?? [], { expected: body.expected })) });
     } catch (e: any) {
@@ -5814,7 +5863,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
     if (!datasets) return c.json({ error: 'datasets is not enabled' }, 501);
     const id = decodeURIComponent(c.req.param('id'));
-    const body = (await c.req.json().catch(() => ({}))) as { scorers?: string[] };
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { scorers?: string[] };
     try {
       return c.json({ ok: true, ...(await datasets.run(id, { scorers: body.scorers }, callbackCtx(c))) });
     } catch (e: any) {
@@ -5906,13 +5956,16 @@ function studioAppApp (input: JournalReader | StudioAppOptions): Hono {
  * Standalone:     serve({ fetch: createStudioApp(...).fetch })
  */
 export function createStudioApi (input: JournalReader | StudioApiOptions): FetchHandler {
+  if (!isReader(input)) { refuseUnknownNames('createStudioApi', input, CREATE_STUDIO_API_NAMES); refuseStudioBagNames('createStudioApi', input); }
   return toFetchHandler(studioApiApp(input));
 }
 export function createStudioAdmin (opts: { apiBase?: string } = {}): FetchHandler {
+  refuseUnknownNames('createStudioAdmin', opts, CREATE_STUDIO_ADMIN_NAMES);
   return toFetchHandler(studioAdminApp(opts));
 }
 
 export function createStudioApp (input: JournalReader | StudioAppOptions): FetchHandler {
+  if (!isReader(input)) { refuseUnknownNames('createStudioApp', input, CREATE_STUDIO_APP_NAMES); refuseStudioBagNames('createStudioApp', input); }
   return toFetchHandler(studioAppApp(input));
 }
 

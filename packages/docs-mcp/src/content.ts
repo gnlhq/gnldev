@@ -603,12 +603,12 @@ const r = await gnl.runNetwork('desk', { runId: 'n1', task: 'research and draft 
     package: `@gnldev/rag`,
     install: `import { ingestDocuments, deleteDocuments, chunkDocuments, PostgresVectorStore, GraphRag, createRagTool } from '@gnldev/rag';`,
     apis: [
-      `ingestDocuments(store, embed, docs, chunkOptions?) — chunk, embed, remove each document's previous chunks, write the new ones: re-indexing an edited document leaves exactly its current chunks (use this, not chunkDocuments + indexDocuments, for documents that change; needs a store with delete)`,
+      `ingestDocuments(store, embed, docs, { strategy?, size?, overlap?, concurrency? }) — chunk, embed (at most concurrency calls at once, default 8), remove each document's previous chunks, write the new ones: re-indexing an edited document leaves exactly its current chunks (use this, not chunkDocuments + indexDocuments, for documents that change; needs a store with delete)`,
       `deleteDocuments(store, ids, { namespace? }) — remove documents, every chunk of them`,
       `chunkText / chunkDocuments — recursive/markdown/character strategies, size/overlap, deterministic <docId>#<i> ids; indexDocuments(store, embed, chunks) only upserts, so a document that shrinks keeps its old tail chunks`,
       `PostgresVectorStore — a persistent pgvector store (pool or connectionString, dimension?, index: hnsw|ivfflat|none)`,
       `GraphRag — a similarity-graph VectorStore (threshold/hops/decay/seeds), a drop-in for createRagTool`,
-      `createRagTool({ store, embed, topK?, rerank? }) — journaled inside durable, so retrieval is exactly-once; a run with a resourceId is answered from shared docs + that user's own`,
+      `createRagTool({ store, embed, topK?, rerank? }) — hits are { id, documentId, text, score }; journaled inside durable, so retrieval is exactly-once; a run with a resourceId is answered from shared docs + that user's own`,
     ],
     example: `// label each doc: shared: true (everyone's) or owner: '<user id>' (one end user's); unlabelled = no end user sees it
 const store = new PostgresVectorStore({ connectionString: process.env.DATABASE_URL, index: 'hnsw' });

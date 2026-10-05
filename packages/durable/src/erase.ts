@@ -22,17 +22,19 @@
  * its own format, or a memory kept in some other database — comes in as an eraser.
  */
 import { purgeResource, purgeThread } from './retention.js';
-import { assertRootOutsideOrganizations } from './storage.js';
+import { threadRecordOwner, assertRootOutsideOrganizations } from './storage.js';
 import { ownedPrefix } from './owned-name.js';
 import { threadOwnerOf, threadOwnerKey } from './thread-owner.js';
 import { withOrg, isOrganizationKey, parseOrganizationKey, orgPrefix, ORG_KEY_PREFIX, ORG_RECORD_PRE } from './organization.js';
 import { orgVectorDelete, orgStorageScopeOf, withOrgStorage } from './org-storage.js';
-import { toJournal, workingMemoryScope, legacyWorkingMemoryScope, MEMORY_PARTITION } from './storage.js';
+import { toJournal, isStorage, workingMemoryScope, legacyWorkingMemoryScope, MEMORY_PARTITION } from './storage.js';
 import { memKey, MEM_LEAVES, OM_VECTOR_SOURCE, semanticLogKey } from './memory.js';
 import type { Memory } from './memory.js';
 import { runKeys } from './journal.js';
 import type { Journal } from './journal.js';
 import type { MemoryStore, Storage, WorkStore } from './storage.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { ERASE_SUBJECT_NAMES, RESERVED_ROOT_THREADS_NAMES, SUBJECT_RUNS_NAMES } from './option-names.js';
 
 /** One package's share of a person's erasure (`jobEraser`, `triggerEraser`, `eventEraser`), or a store outside the storage. */
 export interface SubjectEraser {
@@ -99,7 +101,7 @@ export function assertRootWorkForErasure(work: WorkStore | undefined, who: strin
 
 /** The memory store answering "whose thread", the one question `threadOwnerOf` asks a memory. */
 const ownerAsker = (store: MemoryStore): Memory =>
-  ({ getThreadResource: async (id: string) => (await store.getThread(id))?.resourceId }) as unknown as Memory;
+  ({ getThreadResource: async (id: string) => threadRecordOwner(await store.getThread(id)) }) as unknown as Memory;
 
 /** Does this store hold anything of the thread — its record, a message, or its working memory? */
 async function holdsThread(store: MemoryStore, threadId: string): Promise<boolean> {
@@ -209,6 +211,7 @@ async function reservedThreadsIn(store: MemoryStore, runs: Journal, resourceId?:
  * it `rootOnly`; anything else is listed as undecided, never guessed.
  */
 export async function findReservedRootThreads(storage: Storage, opts: { resourceId?: string } = {}): Promise<ReservedRootThread[]> {
+  refuseUnknownNames('findReservedRootThreads', opts, RESERVED_ROOT_THREADS_NAMES);
   if (orgStorageScopeOf(storage) !== undefined) {
     throw new Error('@gnldev/durable: findReservedRootThreads takes the root storage — an organization\'s view has no root threads');
   }
@@ -219,7 +222,7 @@ export async function findReservedRootThreads(storage: Storage, opts: { resource
 /** A storage handed in as `memory`: the root one, with a memory store; `storage` itself counts once. */
 function memoryHome(storage: Storage, memory: Storage | undefined): Storage | undefined {
   if (memory === undefined || memory === storage) return undefined;
-  if (!memory || typeof memory !== 'object' || !('runs' in memory) || !memory.memory) {
+  if (!isStorage(memory) || !memory.memory) {
     throw new TypeError('@gnldev/durable: eraseSubject\'s `memory` is the storage your memory was built over (`eraseSubject(storage, id, { memory: otherStorage })`), and it needs a memory store');
   }
   const scoped = orgStorageScopeOf(memory);
@@ -267,6 +270,7 @@ async function hasRunningClaim(runs: Journal, runId: string): Promise<boolean> {
  * that had authenticated before the revoke. Same scope rules as `eraseSubject`.
  */
 export async function subjectRuns(storage: Storage, resourceId: string, opts: { orgId?: string } = {}): Promise<SubjectRun[]> {
+  refuseUnknownNames('subjectRuns', opts, SUBJECT_RUNS_NAMES);
   if (typeof resourceId !== 'string' || resourceId === '') throw new TypeError('@gnldev/durable: subjectRuns needs the id of the person');
   if (orgStorageScopeOf(storage) !== undefined) {
     throw new Error('@gnldev/durable: subjectRuns takes the root storage; name the organization with `{ orgId }`, as for eraseSubject');
@@ -307,8 +311,9 @@ export async function subjectRuns(storage: Storage, resourceId: string, opts: { 
  * confine the delete to documents outside organizations) — and the same of the `memory` storage.
  */
 export async function eraseSubject(storage: Storage, resourceId: string, opts: EraseOptions = {}): Promise<EraseReport> {
+  refuseUnknownNames('eraseSubject', opts, ERASE_SUBJECT_NAMES);
   if (typeof resourceId !== 'string' || resourceId === '') throw new TypeError('@gnldev/durable: eraseSubject needs the id of the person to erase');
-  if (!storage || typeof storage !== 'object' || !('runs' in storage)) {
+  if (!isStorage(storage)) {
     throw new TypeError('@gnldev/durable: eraseSubject takes the storage itself (`eraseSubject(storage, id, { orgId, erasers })`), so no store it holds is left out');
   }
   const scoped = orgStorageScopeOf(storage);

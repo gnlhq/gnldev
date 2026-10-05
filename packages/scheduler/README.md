@@ -28,7 +28,8 @@ await scheduleWorkflow(journal, {
 setInterval(() => pollScheduler(journal, gnl), 30_000);
 ```
 
-Give exactly one of `at` (epoch ms), `every` (ms, greater than 0) or `cron` (5 fields, UTC). A spec that
+Give exactly one of `at` (epoch ms), `every` (ms, greater than 0) or `cron` (5 fields, UTC unless you
+give `tz` — see [Time zones](#time-zones)). A spec that
 could not fire — a cron with hour 25, `every: 0`, two of the three, `0 0 30 2 *` (there is no 30
 February) — is refused before anything is written. Whether a cron can fire does not depend on the date
 you ask: `0 0 29 2 *` fires on every leap day, four (across 2100, eight) years apart.
@@ -49,6 +50,63 @@ await scheduleWorkflow(journal, { id: 'nightly', name: 'report', cron: '0 4 * * 
 `'keep'` leaves the stored trigger as it is; or use a new id. A stored definition that cannot fire (left
 by 0.9.0) is replaced by the next valid registration whatever `ifExists` says, and the poller fails it
 instead of firing it.
+
+## Time zones
+
+`cron` is read in UTC unless the spec names an IANA zone in `tz`:
+
+```ts
+import { scheduleWorkflow } from '@gnldev/scheduler';
+import { InMemoryJournal } from '@gnldev/durable';
+const journal = new InMemoryJournal();
+
+await scheduleWorkflow(journal, { id: 'berlin-standup', name: 'standup', cron: '0 9 * * 1-5', tz: 'Europe/Berlin' });
+```
+
+That is 09:00 in Berlin all year. A UTC cron cannot say it: `0 8 * * *` UTC is 09:00 in Berlin on 155
+days of 2026 and 10:00 on the other 210. On the two DST days a year:
+
+- a wall time that does not exist (02:30 when clocks go 02:00 → 03:00) fires once, shifted forward by
+  the gap — 03:30. A daily job still runs that day.
+- a wall time that happens twice (02:30 when clocks go 03:00 → 02:00) fires once, at the first 02:30 —
+  unless the hour field is `*`. Then every real hour is its own occurrence: an hourly cron runs 25 times
+  on a 25-hour day.
+
+`tz` is only for `cron` (an `every` period and an `at` instant have no zone) and must be a zone the
+runtime knows; anything else is refused before a write. The canonical name is stored, so
+`'europe/berlin'` and `'Europe/Berlin'` are the same spec. Zone rules come from Node's own `Intl`.
+
+## Stop, pause, resume
+
+```ts
+import { unscheduleWorkflow, pauseTrigger, resumeTrigger } from '@gnldev/scheduler';
+import { InMemoryJournal } from '@gnldev/durable';
+const journal = new InMemoryJournal();
+
+await pauseTrigger(journal, { id: 'nightly-invoices' });        // kept, not fired
+await resumeTrigger(journal, { id: 'nightly-invoices' });       // fires again from the next slot
+await unscheduleWorkflow(journal, { id: 'nightly-invoices' });  // gone
+await unscheduleWorkflow(journal, { id: 'ayse-weekly', resourceId: 'ayse', orgId: 'acme' }); // an owned one
+```
+
+Name the trigger as you scheduled it: the `id` (or the workflow name, if you gave no id) and the same
+owner. Each returns `true` when the trigger is in the asked-for state and `false` when there was nothing
+to act on (no such trigger; or, for pause and resume, one that is removed, `done` or `failed`).
+
+- **Removing** makes the trigger never fire again and drops it from `listTriggers`. A fire already in
+  flight finishes (the run is not aborted), and its result is discarded, so it cannot bring the trigger
+  back. Scheduling the id again later is a new trigger, with run ids the old one never used. If your boot
+  code registers the trigger, remove that call too, or the next boot schedules it again.
+- **Pausing** keeps everything (schedule, fire count, attempts) and shows `status: 'paused'`. The
+  boot-time `scheduleWorkflow` call does not lift it, and neither does `ifExists: 'replace'`. A fire in
+  flight when you pause is recorded under the pause, so resuming never runs that occurrence again.
+- **Resuming does not catch up.** Occurrences that fell inside the pause are not run, whatever `misfire`
+  says: the pause was the decision not to run them (`misfire` is for occurrences missed because no
+  poller ran). The next fire is the first slot after the resume, on the same grid. A one-shot `at` whose
+  time passed during the pause fires once, right away: skipping its only occurrence would delete it.
+
+Each is a single write to the trigger's state, compared against the state it read, so it never
+overwrites a fire it did not see.
 
 ## Triggers for an end user
 
@@ -99,7 +157,7 @@ declare const gnl: { runWorkflow(n: string, i: unknown, o?: { runId?: string; ca
 declare const gnlFor: (orgId: string) => typeof gnl;
 
 createWorkflowWaker({
-  journal: toJournal(storage.runs),
+  journal: toJournal(storage),
   orgs: ['acme', 'globex'], // or a function, asked on every tick
   resume: async (runId, status, where) => {
     if (!status.workflowName) return; // recorded without its workflow's name: nothing to rebuild it from
@@ -146,6 +204,13 @@ takes longer than the TTL keeps its lock. That renewal is not cosmetic: the TTL 
 never renewed, so *any* workflow running longer than 60 s let its lock expire and a second poller
 re-fired the same trigger. Raise `lockTtlMs` if your triggers are long and your journal is slow;
 lowering it makes a genuinely dead worker's fire reclaimable sooner.
+
+**A stored trigger that cannot fire is answered on the first poll that sees it.** An invalid definition
+(only 0.9.0 could store one) is marked `failed` with the reason, shown as `lastError` in `listTriggers`
+and Studio. So is a valid one whose stored `nextRunAt` is not a number (a foreign writer, a hand edit):
+it is never fired from there, and calling `scheduleWorkflow` with the same spec — which a host does on
+every boot — sets its time from the definition. `onInvalidTime: 'repair'` (on `createScheduler` and
+`pollScheduler`; default `'fail'`) sets the time on the poll instead, logs it, and fires at that time.
 
 **Known limit — the fencing covers the state write, not the execution.** A `renew` that fails is
 logged and nothing else; `pollScheduler` does not abort the workflow it already started. So if the
@@ -205,6 +270,8 @@ replay sees the same schedule the original run saw.
 | `scheduleWorkflow` | Registers a cron / interval / `at` trigger |
 | `pollScheduler` | Fires whatever is due; call it from a loop or a cron container |
 | `listTriggers` | Everything currently registered |
+| `unscheduleWorkflow` | Removes a trigger |
+| `pauseTrigger`, `resumeTrigger` | Stops a trigger firing, and lets it fire again (no catch-up) |
 | `createScheduler` | The stateful wrapper, if you would rather hold an object than call functions |
 | `nextCronTime`, `parseField` | The cron arithmetic, exported for testing and for building your own UI |
 | `createWorkflowWaker` | Wakes a suspended workflow when its sleep or wait elapses |

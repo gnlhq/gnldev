@@ -2,6 +2,8 @@
 // Framework-agnostic core. For React hooks: `@gnldev/client/react`.
 import { parseSSEStream } from './sse.js';
 import type { AgentMeta, JournalEntry, RunInput, RunResult, RunSummary, StreamEvent, StreamHandlers } from './types.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { TOKEN_FROM_OPTS_NAMES, GNL_CLIENT_NAMES, LIST_RUNS_NAMES } from './option-names.js';
 
 export interface GnlClientOptions {
   /** @gnldev/server root URL (e.g. 'http://localhost:3000' or '.../studio/api' for studio). */
@@ -41,6 +43,7 @@ function expMsOf(token: string): number {
  * a logout.
  */
 export function tokenFrom(url: string, opts: { fetch?: typeof fetch } = {}): () => Promise<string | null> {
+  refuseUnknownNames('tokenFrom', opts, TOKEN_FROM_OPTS_NAMES);
   const f = opts.fetch ?? globalThis.fetch.bind(globalThis);
   return async () => {
     const res = await f(url, { method: 'POST', credentials: 'same-origin', headers: { accept: 'application/json' } });
@@ -147,8 +150,27 @@ async function asRunResult(res: Response, runId?: string): Promise<RunResult> {
   } as RunResult;
 }
 
+/** Content events of one run, by identity — see GnlClient.stream. Terminal events have none. */
+function replayKey(ev: StreamEvent, place: { step: number; n: Map<string, number> }): string | undefined {
+  const d = ev.data as { toolCallId?: string } | undefined;
+  if (ev.event === 'step-start') { place.step++; place.n.clear(); return `${place.step}:step-start`; }
+  if (ev.event === 'step-finish') return `${place.step}:step-finish`;
+  if (typeof d?.toolCallId === 'string' && ev.event.startsWith('tool-')) {
+    const k = `${ev.event}:${d.toolCallId}`;
+    const i = place.n.get(k) ?? 0; place.n.set(k, i + 1);
+    return `${place.step}:${k}:${i}`;
+  }
+  if (ev.event.startsWith('text-') || ev.event.startsWith('reasoning-') || ev.event === 'source' || ev.event === 'file') {
+    const i = place.n.get(ev.event) ?? 0; place.n.set(ev.event, i + 1);
+    return `${place.step}:${ev.event}:${i}`;
+  }
+  return undefined;
+}
+
 export class GnlClient {
   private baseUrl: string;
+  /** Per run (or work key), the content events already handed to the caller — see stream(). */
+  private seenEvents = new Map<string, Set<string>>();
   private headers: Record<string, string>;
   private _fetch: typeof fetch;
   private getToken?: GnlClientOptions['getToken'];
@@ -157,6 +179,7 @@ export class GnlClient {
   private refreshing?: Promise<string | null>;
 
   constructor(opts: GnlClientOptions) {
+    refuseUnknownNames('GnlClient', opts, GNL_CLIENT_NAMES);
     this.baseUrl = opts.baseUrl.replace(/\/$/, '');
     this.headers = { 'content-type': 'application/json', ...opts.headers };
     const f = opts.fetch ?? (globalThis.fetch ? globalThis.fetch.bind(globalThis) : undefined);
@@ -298,7 +321,30 @@ export class GnlClient {
       const err = await res.text().catch(() => '');
       throw new Error(`@gnldev/client: no stream body (HTTP ${res.status}) ${err}`);
     }
-    for await (const ev of parseSSEStream(res.body)) yield ev as StreamEvent;
+    // ONE RUN, SEEN ONCE. Streaming the same run again — the continuation after an approval, a reconnect —
+    // replays its finished part from the journal before anything new. Every replayed event used to reach
+    // the caller a second time (measured on an approval continuation: 6 tool calls and 5 results twice;
+    // a chat UI listed the doses as given again). Ids cannot say which events are old: the suspended step
+    // diverges at its own result (pass 1 `step-finish` where pass 2 has the approved `tool-result`), and
+    // parallel results may arrive in another order. An event's IDENTITY can: its step, and its tool call
+    // or its place in that step. Terminal events (interrupt, done, error, data) always pass.
+    const scope = runId ?? (input as { workKey?: string }).workKey;
+    const seen = scope === undefined ? undefined : (this.seenEvents.get(scope) ?? new Set<string>());
+    if (scope !== undefined && seen && !this.seenEvents.has(scope)) this.seenEvents.set(scope, seen);
+    const place = { step: -1, n: new Map<string, number>() };
+    let suspended = false;
+    for await (const raw of parseSSEStream(res.body)) {
+      const ev = raw as StreamEvent;
+      if (ev.event === 'interrupt') suspended = true;
+      const key = replayKey(ev, place);
+      if (key !== undefined && seen) {
+        if (seen.has(key)) continue;
+        seen.add(key);
+      }
+      yield ev;
+    }
+    // A run that finished without waiting for anyone will not be streamed again: forget it.
+    if (scope !== undefined && !suspended) this.seenEvents.delete(scope);
   }
 
   /**
@@ -346,9 +392,10 @@ export class GnlClient {
     return { runId };
   }
 
-  /** All run summaries (GET /runs). */
-  async listRuns(): Promise<RunSummary[]> {
-    return this.okJson<RunSummary[]>(await this._fetch(this.url('/runs'), { headers: this.headers }));
+  /** All run summaries (GET /runs). `topLevel`: requests only, not the sub-agents they started. */
+  async listRuns(opts: { topLevel?: boolean } = {}): Promise<RunSummary[]> {
+    refuseUnknownNames('listRuns', opts, LIST_RUNS_NAMES);
+    return this.okJson<RunSummary[]>(await this._fetch(this.url(opts.topLevel ? '/runs?topLevel=true' : '/runs'), { headers: this.headers }));
   }
 
   /** A run's journal timeline (GET /runs/:id). */

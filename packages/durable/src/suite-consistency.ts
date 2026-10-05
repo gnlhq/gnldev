@@ -15,6 +15,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { SuiteVersionMismatchError } from './errors.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { SUITE_CONSISTENCY_NAMES } from './option-names.js';
 
 /** The common suite packages checked when `packages` isn't given. Short names (WITHOUT the '@gnldev/'
  *  prefix) — resolved as `@gnldev/<name>`. A package that doesn't resolve (not installed in this project)
@@ -103,6 +105,7 @@ export interface AssertSuiteConsistentOptions {
  * packages/cli/src/runtime.ts's MIN_DURABLE/MIN_SERVER/MIN_STUDIO header comment).
  */
 export function assertSuiteConsistent(opts: AssertSuiteConsistentOptions = {}): void {
+  refuseUnknownNames('assertSuiteConsistent', opts, SUITE_CONSISTENCY_NAMES);
   const fromDir = opts.fromDir ?? process.cwd();
   const req = createRequire(join(fromDir, 'noop.js'));
   const durableVersion = findOwnVersion(dirname(fileURLToPath(import.meta.url)));

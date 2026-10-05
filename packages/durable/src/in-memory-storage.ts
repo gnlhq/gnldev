@@ -2,6 +2,7 @@
 // Zero-infra test storage (moat): per-storage bundles mimic this behavior.
 // Correctness matters, not perf (naive filter/sort). Date.now/Math.random are free to use here (runtime code).
 import { cosineSimilarity } from 'ai';
+import { serialize, deserialize, copyValue } from './serialize.js';
 import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from './storage.js';
 import { memoryPartitionOf, inMemoryPartition, type MemoryPartitionOption } from './storage.js';
 import { InMemoryJournal } from './journal.js';
@@ -14,6 +15,8 @@ import type {
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
   ThreadRecord, MessageRecord, MessageAppend, Observation, RecallOptions,
   AdoptIntoOrgResult, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord } from './storage.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { ADOPT_INTO_ORG_NAMES } from './option-names.js';
 
 let idc = 0;
 function genId(prefix: string): string {
@@ -88,6 +91,7 @@ class InMemoryRunJournal implements RunJournal {
     if (q?.agent) all = all.filter((r) => r.agent === q.agent);
     if (q?.resourceId) all = all.filter((r) => r.resourceId === q.resourceId);
     if (q?.workKey) all = all.filter((r) => r.workKey === q.workKey);
+    if (q?.topLevel) all = all.filter((r) => !r.parentRunId);
     return paginate(all, q);
   }
 }
@@ -379,7 +383,7 @@ class InMemoryWorkStore implements WorkStore {
       // new name's counter must not start below the records it now holds.
       const seq = Math.max(this.seqs.get(ns) ?? 0, log[log.length - 1]?.seq ?? 0) + 1;
       this.seqs.set(ns, seq);
-      log.push({ id: eid, payload, ts: Date.now(), seq });
+      log.push({ id: eid, payload: copyValue(payload), ts: Date.now(), seq });
       this.logs.set(ns, log);
     }
     return eid;
@@ -400,12 +404,13 @@ class InMemoryWorkStore implements WorkStore {
     const slice = log.slice(start, start + limit);
     const last = slice[slice.length - 1];
     return {
-      items: slice.map((r) => ({ id: r.id, payload: r.payload as T, ts: r.ts })),
+      items: slice.map((r) => ({ id: r.id, payload: copyValue(r.payload) as T, ts: r.ts })),
       nextCursor: start + limit < log.length && last ? encodeLogCursor(last) : undefined,
     };
   }
-  async get<T = unknown>(key: string) { return this.kv.has(key) ? (this.kv.get(key) as T) : undefined; }
-  async put(key: string, value: unknown) { this.kv.set(key, value); }
+  // Copies in and out, as the SQL work stores (serialized rows) do: see copyValue.
+  async get<T = unknown>(key: string) { return this.kv.has(key) ? copyValue(this.kv.get(key) as T) : undefined; }
+  async put(key: string, value: unknown) { this.kv.set(key, copyValue(value)); }
   async ackOnce(key: string): Promise<boolean> {
     if (this.kv.has(key)) return false;
     this.kv.set(key, true);
@@ -437,7 +442,7 @@ class InMemoryWorkStore implements WorkStore {
   async putIfMatch(key: string, expected: unknown, value: unknown): Promise<boolean> {
     if (!this.kv.has(key)) return false;
     if (stableStringify(this.kv.get(key)) !== stableStringify(expected)) return false;
-    this.kv.set(key, value);
+    this.kv.set(key, copyValue(value));
     return true;
   }
 }
@@ -447,15 +452,18 @@ class InMemoryCacheStore implements CacheStore {
   /** @internal — see Storage.adoptIntoOrg. */
   _rekey(f: (k: string) => string | undefined): number { return rekeyMap(this.m, f); }
 
-  private m = new Map<string, { v: unknown; exp?: number }>();
+  // Values are held SERIALIZED, as the SQLite and Postgres cache stores hold them: a store that kept
+  // the object itself handed every reader the same instance, so a caller's mutation of a cached value
+  // changed what the next reader got — measured: `["a","MUTATED"]` in memory, `["a"]` on SQLite.
+  private m = new Map<string, { v: string; exp?: number }>();
   async get<T = unknown>(key: string): Promise<T | undefined> {
     const e = this.m.get(key);
     if (!e) return undefined;
     if (e.exp != null && e.exp <= Date.now()) { this.m.delete(key); return undefined; }
-    return e.v as T;
+    return deserialize<T>(e.v);
   }
   async set(key: string, value: unknown, opts?: { ttlMs?: number }) {
-    this.m.set(key, { v: value, exp: opts?.ttlMs != null ? Date.now() + opts.ttlMs : undefined });
+    this.m.set(key, { v: serialize(value), exp: opts?.ttlMs != null ? Date.now() + opts.ttlMs : undefined });
   }
   async delete(key: string) { this.m.delete(key); }
 }
@@ -491,6 +499,7 @@ export class InMemoryStorage implements Storage {
    * idempotent.
    */
   async adoptIntoOrg(orgId: string, opts?: { dryRun?: boolean; allowUnregistered?: boolean; allowInFlight?: boolean }): Promise<AdoptIntoOrgResult> {
+    refuseUnknownNames('adoptIntoOrg', opts, ADOPT_INTO_ORG_NAMES);
     const prefix = orgPrefix(orgId);
     await assertOrgRegistered(this.runs, orgId, opts?.allowUnregistered);
     await assertNoRunsInFlight(this.runs, opts?.allowInFlight);

@@ -2,6 +2,8 @@
 // Both are durable: client calls are exactly-once within runDurable; server callTool is exactly-once via idempotencyKey.
 import { tool, jsonSchema } from 'ai';
 import { argsHash } from '@gnldev/durable';
+import { refuseUnknownNames } from '@gnldev/options';
+import { CREATE_MCP_TOOLS_OPTS_NAMES, CONNECT_MCP_INFO_NAMES, MCP_TOOLS_NAMES } from './option-names.js';
 
 export { createMcpServer, serveMcp, MCP_REFUSED } from './server.js';
 export type { McpServer, McpServerOptions, McpServerToolDef, McpCallerContext, McpToolRequestInfo, McpToolSetArg } from './server.js';
@@ -69,6 +71,7 @@ function toolsFromDefs(client: McpClientLike, defs: McpToolDef[], opts: McpTools
  * journaled (not re-called on resume). An optional prefix avoids name collisions.
  */
 export async function createMcpTools(client: McpClientLike, opts: McpToolsOptions = {}): Promise<Record<string, any>> {
+  refuseUnknownNames('createMcpTools', opts, CREATE_MCP_TOOLS_OPTS_NAMES);
   const { tools } = await client.listTools();
   return toolsFromDefs(client, tools, opts);
 }
@@ -78,6 +81,7 @@ export async function createMcpTools(client: McpClientLike, opts: McpToolsOption
  * The dynamic import is done via a string variable → build/bundle doesn't break if the SDK isn't installed.
  */
 export async function connectMcp(transport: any, info: { name?: string; version?: string } = {}): Promise<McpClientLike> {
+  refuseUnknownNames('connectMcp', info, CONNECT_MCP_INFO_NAMES);
   const mod = '@modelcontextprotocol/sdk/client/index.js';
   const { Client } = (await import(mod)) as any;
   const client = new Client({ name: info.name ?? 'gnl', version: info.version ?? '0.0.0' }, { capabilities: {} });
@@ -162,6 +166,7 @@ export interface McpToolsHandle {
  * also using `createMcpServer({ journal })`, SERVER-SIDE exactly-once also runs over the wire.
  */
 export function mcpTools(opts: McpToolsConnectOptions): McpToolsHandle {
+  refuseUnknownNames('mcpTools', opts, MCP_TOOLS_NAMES);
   let clientPromise: Promise<McpClientLike> | undefined;
   let listPromise: Promise<{ tools: McpToolDef[] }> | undefined;
 

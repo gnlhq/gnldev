@@ -24,6 +24,7 @@ import type { AuthProvider, Principal, Decision, AuthContext, Cred } from './typ
 import { safeEqual } from './safe-equal.js';
 import { grantsAllow, isReadPermission } from './permission.js';
 import { PLATFORM_ADMIN_ROLE, subjectIdProblem } from './scope.js';
+import { refuseUnknownNames, optionNames } from '@gnldev/options';
 import { verifyJwt, MIN_SUBJECT_SECRET_BYTES, MAX_SUBJECT_TTL_SEC, MAX_REVOCABLE_SUBJECT_TTL_SEC } from './jwt.js';
 
 /** The reserved role naming the application credential class (see `CLIENT_WRITES`). */
@@ -187,7 +188,15 @@ function credValues(cred?: Cred): { headers: Set<string>; tokens: Set<string> } 
  * `{ admin, viewer }` behaves exactly as it did before `superAdmin`/`client` existed — the two new
  * classes are additive, and a config that names neither produces byte-identical decisions.
  */
-export function roleAuth(cfg: {
+export function roleAuth(cfg: RoleAuthConfig): AuthProvider | undefined {
+  refuseUnknownNames('roleAuth', cfg, ROLE_AUTH_NAMES);
+  for (const role of ['superAdmin', 'admin', 'client', 'viewer'] as const) refuseUnknownNames(`roleAuth: ${role}`, cfg[role], CRED_NAMES);
+  refuseUnknownNames('roleAuth: endUsers', cfg.endUsers, END_USER_TOKEN_NAMES);
+  return roleAuthProvider(cfg);
+}
+
+/** What `roleAuth` takes: a credential per class of caller, and the end users' token rule. */
+export interface RoleAuthConfig {
   /**
    * The PLATFORM operator: sees and manages every organization. Unbound by design, and says so —
    * this class carries the reserved `platform-admin` role, which is what the strict/org-isolation
@@ -201,7 +210,12 @@ export function roleAuth(cfg: {
   viewer?: Cred;
   /** End users holding a token your application signed for them. See `EndUserTokens`. */
   endUsers?: EndUserTokens;
-}): AuthProvider | undefined {
+}
+const ROLE_AUTH_NAMES = optionNames<RoleAuthConfig>()(['superAdmin', 'admin', 'client', 'viewer', 'endUsers']);
+const CRED_NAMES = optionNames<Cred>()(['token', 'user', 'pass', 'orgId', 'platformAdmin']);
+const END_USER_TOKEN_NAMES = optionNames<EndUserTokens>()(['secret', 'publicKey', 'issuer', 'audience', 'orgId', 'maxTtlSec', 'isRevoked']);
+
+function roleAuthProvider(cfg: RoleAuthConfig): AuthProvider | undefined {
   const superAdmin = credValues(cfg.superAdmin);
   const admin = credValues(cfg.admin);
   const client = credValues(cfg.client);
@@ -224,6 +238,8 @@ export function roleAuth(cfg: {
     return undefined;
   }
 
+  // What verifyJwt reads of the rule: `orgId` and `isRevoked` are this provider's, asked below.
+  const { orgId: _orgId, isRevoked: _isRevoked, ...jwtRule } = endUsers ?? {};
   /** The one user a verified token names, or null. Nothing but `sub` is taken from it. */
   const endUserOf = async (req: Request): Promise<Principal | null> => {
     if (!endUsers) return null;
@@ -233,7 +249,7 @@ export function roleAuth(cfg: {
     const now = Date.now();
     let claims: Record<string, unknown> | undefined;
     // `maxTtlSec` (default 1 hour) is enforced by verifyJwt: a token whose exp is further out is refused.
-    const verified = verifyJwt(token, { ...endUsers, maxTtlSec, onClaims: (c) => { claims = c; } }, now);
+    const verified = verifyJwt(token, { ...jwtRule, maxTtlSec, onClaims: (c) => { claims = c; } }, now);
     if (!verified?.id || !claims) return null;
     if (badSubject(verified.id)) return null;
     if (endUsers.isRevoked) {

@@ -3,6 +3,8 @@
 // scorers.ts. Every scorer here is a pure function of (output, expected) → same inputs, same score,
 // every call — unlike llm-judge, there is no cost and no non-determinism to worry about.
 import { optionsFingerprint, type Scorer } from './scorer.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { CONTENT_SIMILARITY_NAMES, KEYWORD_COVERAGE_NAMES, TEXTUAL_DIFFERENCE_NAMES, ANSWER_SIMILARITY_NAMES } from './option-names.js';
 
 // ── shared primitives ───────────────────────────────────────────────────────
 
@@ -86,6 +88,7 @@ function levenshtein(a: string, b: string): number {
  * content, 0.0 = no shared bigrams at all. Model-free, deterministic.
  */
 export function contentSimilarity(opts?: { name?: string }): Scorer {
+  refuseUnknownNames('contentSimilarity', opts, CONTENT_SIMILARITY_NAMES);
   const name = opts?.name ?? 'content-similarity';
   return {
     name,
@@ -109,6 +112,7 @@ export interface KeywordCoverageOptions {
  * AND no/empty `sample.expected`) → score 0 with a clear reason (not vacuously 1).
  */
 export function keywordCoverage(opts?: KeywordCoverageOptions): Scorer {
+  refuseUnknownNames('keywordCoverage', opts, KEYWORD_COVERAGE_NAMES);
   const name = opts?.name ?? 'keyword-coverage';
   return {
     name,
@@ -139,6 +143,7 @@ export function keywordCoverage(opts?: KeywordCoverageOptions): Scorer {
  * 1.0 = identical, 0.0 = maximally different (edit distance ≥ max length). Both empty → 1.0.
  */
 export function textualDifference(opts?: { name?: string }): Scorer {
+  refuseUnknownNames('textualDifference', opts, TEXTUAL_DIFFERENCE_NAMES);
   const name = opts?.name ?? 'textual-difference';
   return {
     name,
@@ -163,6 +168,7 @@ export function textualDifference(opts?: { name?: string }): Scorer {
  * unlike `exactMatch`). Both empty → 1.0; exactly one empty → 0.0.
  */
 export function answerSimilarity(opts?: { name?: string }): Scorer {
+  refuseUnknownNames('answerSimilarity', opts, ANSWER_SIMILARITY_NAMES);
   const name = opts?.name ?? 'answer-similarity';
   return {
     name,
