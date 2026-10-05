@@ -158,17 +158,29 @@ export class FakeRedis implements RedisLike {
     }
     // incrBy over several fields (INCR_FIELDS_LUA, marker `gnl:incr-fields`): KEYS = [hash], ARGV = field/delta pairs.
     if (script.includes('gnl:incr-fields')) {
+      // KEYS = [hash, index?], ARGV = field/delta pairs, then the index member when KEYS[2] is given.
+      const argv = args.slice(numKeys);
+      if (numKeys === 2) await this.zadd(String(args[1]), 0, String(argv.pop()));
       const out: string[] = [];
-      for (let i = 1; i < args.length; i += 2) out.push(await this.hincrbyfloat(String(args[0]), String(args[i]), Number(args[i + 1])));
+      for (let i = 0; i < argv.length; i += 2) out.push(await this.hincrbyfloat(String(args[0]), String(argv[i]), Number(argv[i + 1])));
       return out;
+    }
+    // KeyIndex fill (INDEX_FILL_LUA, marker `gnl:index-fill`): KEYS = [index], ARGV = members.
+    if (script.includes('gnl:index-fill')) {
+      for (const m of args.slice(1)) await this.zadd(String(args[0]), 0, String(m));
+      return args.length - 1;
     }
     // WorkStore.append (WORK_APPEND_LUA, marker `gnl:work-append`): KEYS = [counter, record], ARGV = [record].
     // Existing record → 0 and no number taken; else INCR the counter and write the record numbered.
     if (script.includes('gnl:work-append')) {
-      const [seqKey, recKey, rec] = [String(args[0]), String(args[1]), String(args[2])];
+      // KEYS = [counter, record, index?], ARGV = [record, member?]
+      const [seqKey, recKey] = [String(args[0]), String(args[1])];
+      const indexed = numKeys === 3;
+      const rec = String(args[numKeys]);
       if (this.live(recKey)) return 0;
       const n = Number(this.live(seqKey)?.val ?? 0) + 1;
       this.store.set(seqKey, { val: String(n) });
+      if (indexed) await this.zadd(String(args[2]), 0, String(args[numKeys + 1]));
       this.store.set(recKey, { val: `{"json":{"seq":${n},${rec.slice('{"json":{'.length)}` });
       return n;
     }
@@ -259,6 +271,24 @@ export class FakeRedis implements RedisLike {
     return out.map(([m]) => m);
   }
 
+  /** ZRANGEBYLEX mimic: members compared as UTF-8 bytes, as Redis does; `[x`/`(x`/`-`/`+`, optional LIMIT. */
+  async zrangebylex(key: string, min: string, max: string, ...args: (string | number)[]): Promise<string[]> {
+    const z = this.zsets.get(key);
+    if (!z) return [];
+    const inRange = lexRange(min, max);
+    const out = [...z.keys()].filter(inRange).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+    const li = args.findIndex((a) => String(a).toUpperCase() === 'LIMIT');
+    return li >= 0 ? out.slice(Number(args[li + 1]), Number(args[li + 1]) + Number(args[li + 2])) : out;
+  }
+  async zremrangebylex(key: string, min: string, max: string): Promise<number> {
+    const z = this.zsets.get(key);
+    if (!z) return 0;
+    const inRange = lexRange(min, max);
+    let n = 0;
+    for (const m of [...z.keys()]) if (inRange(m)) { z.delete(m); n++; }
+    return n;
+  }
+
   async zrem(key: string, ...members: string[]): Promise<number> {
     const z = this.zsets.get(key);
     if (!z) return 0;
@@ -266,6 +296,19 @@ export class FakeRedis implements RedisLike {
     for (const m of members) if (z.delete(m)) n++;
     return n;
   }
+}
+
+/** A ZRANGEBYLEX bound pair as a predicate on members, comparing UTF-8 bytes. */
+function lexRange(min: string, max: string): (m: string) => boolean {
+  const bound = (b: string, lower: boolean) => {
+    if (b === '-') return () => true;
+    if (b === '+') return () => true;
+    const v = Buffer.from(b.slice(1));
+    const incl = b[0] === '[';
+    return (m: string) => { const c = Buffer.compare(Buffer.from(m), v); return lower ? (incl ? c >= 0 : c > 0) : (incl ? c <= 0 : c < 0); };
+  };
+  const lo = bound(min, true); const hi = bound(max, false);
+  return (m) => lo(m) && hi(m);
 }
 
 /** Shortcut: create a FakeRedis with a fake clock (or the real clock). `withMulti=true` → a fake

@@ -977,17 +977,22 @@ describe.skipIf(!RUN)('REAL Postgres — MemoryStore conformance', () => {
 // This cannot be written against pg-mem, which has no connections to lose. It also cannot be written
 // as a unit test: the failure arrives on a socket, not through a call.
 describe.skipIf(!RUN)('REAL Postgres — a failover does not take the process with it', () => {
-  /** Terminates every backend on this database except the one doing the terminating. */
-  const killBackends = async (via: PgPool): Promise<number> => {
+  /** Terminates every backend on this database except the one doing the terminating — or, on a database
+   *  other test files share, only the backends named `app`: killing theirs failed them mid-query. */
+  const killBackends = async (via: PgPool, app?: string): Promise<number> => {
     const r = await via.query(
       `SELECT count(pg_terminate_backend(pid))::int AS n FROM pg_stat_activity
-       WHERE datname = current_database() AND pid <> pg_backend_pid()`,
+       WHERE datname = current_database() AND pid <> pg_backend_pid() AND ($1::text IS NULL OR application_name = $1)`,
+      [app ?? null],
     );
     return r.rows[0]?.n ?? 0;
   };
 
   it('writes in flight when the backend dies: the process survives and the journal stays honest', async () => {
-    const s = new PostgresStorage({ connectionString: PG_URL });
+    // The shared database: name this storage's connections so only they are terminated.
+    const app = `gnl-failover-${SEED}`;
+    const named = new URL(PG_URL); named.searchParams.set('application_name', app);
+    const s = new PostgresStorage({ connectionString: named.toString() });
     const killer = new PgPool({ connectionString: PG_URL });
     try {
       const runId = `${SEED}-failover-${Date.now().toString(36)}`;
@@ -1004,7 +1009,7 @@ describe.skipIf(!RUN)('REAL Postgres — a failover does not take the process wi
       const writes = Array.from({ length: N }, (_, i) =>
         s.runs.put(`${runId}:tool:t${i}`, { status: 'succeeded', output: { i } })
           .then(() => true).catch(() => false));
-      setTimeout(() => { void killBackends(killer); }, 40);
+      setTimeout(() => { void killBackends(killer, app); }, 40);
       const results = await Promise.all(writes);
 
       // Reaching this line at all is half the assertion: before the fix the process was gone.

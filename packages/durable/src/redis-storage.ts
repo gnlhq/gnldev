@@ -60,6 +60,11 @@ export interface RedisLike {
   zrangebyscore?(key: string, min: number | string, max: number | string): Promise<string[]>;
   /** OPTIONAL ZSET member removal (available in ioredis) — used by H8b deletePrefix to drop a dead run's summary from the ZSET. */
   zrem?(key: string, ...members: string[]): Promise<number>;
+  /** OPTIONAL ZSET range by member (available in ioredis) — with `zadd`, the key index (KeyIndex) that
+   *  lists a prefix without walking the database. Absent → the adapter lists by SCAN, as before. */
+  zrangebylex?(key: string, min: string, max: string, ...args: (string | number)[]): Promise<string[]>;
+  /** OPTIONAL ZSET removal by member range (available in ioredis) — the key index's half of a prefix delete. */
+  zremrangebylex?(key: string, min: string, max: string): Promise<number>;
   /** OPTIONAL pipeline/transaction (SAME shape as ioredis multi() — ChainableCommander) — to fold the
    *  +1 round-trip (separate ZADD call) that the H8b touch ZSET adds to put/putIfAbsent/putIfMatch into
    *  the SAME round-trip as the SET (or CAS). If absent (or zadd is absent), the existing separate-call
@@ -230,6 +235,135 @@ async function scanAll(client: RedisLike, match: string, limit?: number): Promis
 }
 function cmpStr(a: string, b: string): number { return a < b ? -1 : a > b ? 1 : 0; }
 
+const IDX = 'idx:';         // KeyIndex sorted sets, one per key space
+const IDX_STATE = 'idxstate'; // whether this store reads through its key indexes: 'on' | 'pending'
+/** The largest code point: `[p` to `[p` + this, compared as UTF-8 bytes, spans every key that starts with p. */
+const LEX_TOP = '\u{10FFFF}';
+const INDEX_FILL_LUA = `-- gnl:index-fill
+for i=1,#ARGV do redis.call('ZADD',KEYS[1],0,ARGV[i]) end return #ARGV`;
+const INDEX_FILL_CHUNK = 500;
+
+/**
+ * Whether this store's reads go through its key indexes (KeyIndex), decided once per store and kept in
+ * `<pfx>idxstate`. A version before the indexes writes keys they do not hold, so they can be trusted only
+ * when no such writer remains:
+ *   - a store with no run or work-log key yet when this version first touches it is new: 'on';
+ *   - a store holding such keys was written by an earlier version, which may still be running (a rolling
+ *     upgrade): 'pending' — reads stay SCANs, which see every key, and a warning names the way out:
+ *     once every process runs this version, `RedisStorage.rebuildKeyIndex()` adds the existing keys and
+ *     turns the indexes on, for every process sharing the store.
+ * Not supported: starting a NEW store with an earlier version's processes writing beside this one.
+ */
+class IndexGate {
+  private state?: Promise<'on' | 'pending'>;
+  private warned = false;
+  constructor(private client: RedisLike, private pfx: string, private spaces: string[]) {}
+  private get stateKey(): string { return this.pfx + IDX_STATE; }
+  /** Called before this process's first indexed write too, so its own keys never make a store look old. */
+  ready(): Promise<'on' | 'pending'> {
+    return (this.state ??= (async () => {
+      const known = await this.client.get(this.stateKey);
+      if (known === 'on' || known === 'pending') return known;
+      const old = await this.holdsData();
+      await this.client.set(this.stateKey, old ? 'pending' : 'on', 'NX');
+      return ((await this.client.get(this.stateKey)) as 'on' | 'pending' | null) ?? (old ? 'pending' : 'on');
+    })());
+  }
+  /** Reads may use the indexes. While pending, the stored state is read again, so a switch elsewhere is seen. */
+  async on(): Promise<boolean> {
+    if ((await this.ready()) === 'on') return true;
+    if ((await this.client.get(this.stateKey)) === 'on') { this.state = Promise.resolve('on'); return true; }
+    if (!this.warned) {
+      this.warned = true;
+      console.warn(
+        `@gnldev/durable redis: this store ('${this.pfx}') holds keys an earlier version wrote, so it lists them by SCAN, ` +
+          'which walks the whole Redis database. Once every process sharing it runs this version, call ' +
+          '`storage.rebuildKeyIndex()` once to list through the key index instead.',
+      );
+    }
+    return false;
+  }
+  async switchOn(indexes: KeyIndex[]): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+    for (const i of indexes) out[i.space] = await i.rebuild();
+    await this.client.set(this.stateKey, 'on');
+    this.state = Promise.resolve('on');
+    return out;
+  }
+  /** Whether any run or work-log key exists — one SCAN that stops at the first. */
+  private async holdsData(): Promise<boolean> {
+    const bases = this.spaces.map((sp) => this.pfx + sp);
+    let cursor: string | number = '0';
+    do {
+      const [next, keys] = await this.client.scan(cursor, 'MATCH', globEscape(this.pfx) + '*', 'COUNT', 1000);
+      if (keys.some((k) => bases.some((b) => k.startsWith(b)))) return true;
+      cursor = next;
+    } while (String(cursor) !== '0');
+    return false;
+  }
+}
+
+/**
+ * Lists one key space by prefix without walking the database. SCAN MATCH visits every key the Redis
+ * database holds, this store's or not: measured on a 10-call run, 44 ms with the database to itself,
+ * 270 ms beside 100 000 other keys and 2983 ms beside 1 000 000; a queue's 10 jobs 78 ms → 6318 ms; and
+ * a run among the application's own 300 000 old keys 53 → 1338 ms. The index is one sorted set per key
+ * space, every member scored 0, so members sort by their bytes and a prefix is one ZRANGEBYLEX.
+ *
+ * Invariant: every key of the space that exists is a member. A write adds its member in the same
+ * transaction (MULTI or script) or, on a client without one, BEFORE the key is written; a delete removes
+ * members after. So a member may outlive its key (a crash between the two steps), never the reverse —
+ * readers that fetch values skip a missing one. Whether reads may trust it is the IndexGate's call.
+ */
+class KeyIndex {
+  constructor(private client: RedisLike, private pfx: string, readonly space: string, private gate: IndexGate) {}
+  get key(): string { return this.pfx + IDX + this.space; }
+  private get base(): string { return this.pfx + this.space; }
+  member(full: string): string { return full.slice(this.base.length); }
+  /** The index needs both commands; without them every read is a SCAN, as before. */
+  get usable(): boolean { return !!(this.client.zadd && this.client.zrangebylex); }
+  /** Before this process's first write: the store's state is decided before its own keys exist. */
+  async beforeWrite(): Promise<void> { if (this.usable) await this.gate.ready(); }
+  /** For a client without MULTI: called before the key is written. */
+  async add(full: string): Promise<void> {
+    if (this.usable) await this.client.zadd!(this.key, 0, this.member(full));
+  }
+  /** One member, removed after its key was deleted. */
+  async drop(full: string): Promise<void> {
+    if (this.usable && this.client.zrem) await this.client.zrem(this.key, this.member(full));
+  }
+  /** Full keys of the space that start with `prefix` (members whose key may be gone included). */
+  async keys(prefix: string, limit?: number): Promise<string[]> {
+    if (!this.usable || !(await this.gate.on())) return scanAll(this.client, globEscape(this.base + prefix) + '*', limit);
+    const page = limit !== undefined ? ['LIMIT', 0, limit] : [];
+    const members = prefix
+      ? await this.client.zrangebylex!(this.key, `[${prefix}`, `[${prefix}${LEX_TOP}`, ...page)
+      : await this.client.zrangebylex!(this.key, '-', '+', ...page);
+    return members.map((m) => this.base + m);
+  }
+  /** Members under `prefix`, removed after their keys were deleted. */
+  async remove(prefix: string): Promise<void> {
+    if (!this.usable) return;
+    if (this.client.zremrangebylex) {
+      await (prefix ? this.client.zremrangebylex(this.key, `[${prefix}`, `[${prefix}${LEX_TOP}`) : this.client.zremrangebylex(this.key, '-', '+'));
+      return;
+    }
+    const gone = await scanAll(this.client, globEscape(this.base + prefix) + '*');
+    if (gone.length && this.client.zrem) await this.client.zrem(this.key, ...gone.map((k) => this.member(k)));
+  }
+  /** Adds every key of the space that exists (one SCAN). */
+  async rebuild(): Promise<number> {
+    if (!this.usable) return 0;
+    const keys = await scanAll(this.client, globEscape(this.base) + '*');
+    for (let i = 0; i < keys.length; i += INDEX_FILL_CHUNK) {
+      const chunk = keys.slice(i, i + INDEX_FILL_CHUNK).map((k) => this.member(k));
+      if (this.client.eval) await this.client.eval(INDEX_FILL_LUA, 1, this.key, ...chunk);
+      else for (const m of chunk) await this.client.zadd!(this.key, 0, m);
+    }
+    return keys.length;
+  }
+}
+
 // N+1 efficiency fix: instead of a sequential GET per key after SCAN, use a SINGLE (or a few chunked)
 // round-trip if the client supports `mget`. The returned array's ORDER matches `keys` one-to-one (mget
 // contract) → the caller can match by index. For very large key lists, split into MGET_CHUNK-sized
@@ -269,8 +403,11 @@ function isSuspended(p: { kind: string } | null, value: unknown): boolean {
 // H1 CAS Lua script: if GET==ARGV[1] then SET ARGV[2] → 1, else 0. The Redis script runs atomically →
 // this closes the race window between putIfMatch's JS-side comparison and the SET.
 /** HINCRBYFLOAT over ARGV's field/delta pairs, atomically; returns the new values in order. */
+/** KEYS = [hash, index?], ARGV = field/delta pairs, then the hash's index member when KEYS[2] is given. */
 const INCR_FIELDS_LUA = `-- gnl:incr-fields
-local out={} for i=1,#ARGV,2 do out[#out+1]=redis.call('HINCRBYFLOAT',KEYS[1],ARGV[i],ARGV[i+1]) end return out`;
+local n=#ARGV
+if KEYS[2] then redis.call('ZADD',KEYS[2],0,ARGV[n]) n=n-1 end
+local out={} for i=1,n,2 do out[#out+1]=redis.call('HINCRBYFLOAT',KEYS[1],ARGV[i],ARGV[i+1]) end return out`;
 const CAS_LUA = `if redis.call('GET',KEYS[1])==ARGV[1] then redis.call('SET',KEYS[1],ARGV[2]) return 1 else return 0 end`;
 
 /**
@@ -311,6 +448,7 @@ return n`;
 const WORK_APPEND_LUA = `-- gnl:work-append
 if redis.call('EXISTS',KEYS[2])==1 then return 0 end
 local s=redis.call('INCR',KEYS[1])
+if KEYS[3] then redis.call('ZADD',KEYS[3],0,ARGV[2]) end
 redis.call('SET',KEYS[2],'${NUMBERED_HEAD}'..s..','..string.sub(ARGV[1],${REC_HEAD.length + 1}))
 return s`;
 
@@ -402,7 +540,10 @@ class RedisRunJournal implements RunJournal {
     private pfx: string,
     private replicationWarning = true,
     private waitReplicas?: { replicas: number; timeoutMs: number; onTimeout?: 'throw' | 'warn' },
+    gate: IndexGate = new IndexGate(client, pfx, [RJ, WL, CTR]),
   ) {
+    this.index = new KeyIndex(client, pfx, RJ, gate);
+    this.counters = new KeyIndex(client, pfx, CTR, gate);
     if (client.eval) {
       this.applyBatch = async (batch: JournalBatch): Promise<boolean> => {
         const desc: { claim?: { key: string; value: string }; incrs?: { key: string; fields: Record<string, number> }[]; puts?: { key: string; value: string }[]; zadds?: { key: string; score: number; member: string }[] } = {};
@@ -415,20 +556,27 @@ class RedisRunJournal implements RunJournal {
           const owner = p?.runId ?? runIdOfKey(key, value);
           if (owner && client.zadd) zadds.push({ key: this.activityKey(), score: now, member: owner });
         };
+        const indexOf = (key: string) => { if (this.index.usable) zadds.push({ key: this.index.key, score: 0, member: key }); };
         if (batch.claim) {
           const p = parseJournalKey(batch.claim.key);
           desc.claim = { key: this.full(batch.claim.key), value: serialize(rjEnv(batch.claim.value, p, isSuspended(p, batch.claim.value), now)) };
           touchOf(batch.claim.key, p, batch.claim.value);
+          indexOf(batch.claim.key);
         }
-        if (batch.incrs?.length) desc.incrs = batch.incrs.map(({ key, fields }) => ({ key: this.pfx + CTR + key, fields }));
+        if (batch.incrs?.length) {
+          desc.incrs = batch.incrs.map(({ key, fields }) => ({ key: this.pfx + CTR + key, fields }));
+          if (this.counters.usable) for (const { key } of batch.incrs) zadds.push({ key: this.counters.key, score: 0, member: key });
+        }
         if (batch.puts?.length) {
           desc.puts = batch.puts.map(({ key, value }) => {
             const p = parseJournalKey(key);
             touchOf(key, p, value);
+            indexOf(key);
             return { key: this.full(key), value: serialize(rjEnv(value, p, isSuspended(p, value), now)) };
           });
         }
         if (zadds.length) desc.zadds = zadds;
+        await this.index.beforeWrite();
         const res = await client.eval!(APPLY_BATCH_LUA, 0, JSON.stringify(desc));
         return Number(res) === 1;
       };
@@ -450,14 +598,22 @@ class RedisRunJournal implements RunJournal {
       };
     }
   }
+  /** Lists this journal's keys by prefix (KeyIndex). */
+  readonly index: KeyIndex;
+  /** The counter hashes (incrBy), by prefix — what deletePrefix erases with the keys. */
+  readonly counters: KeyIndex;
   private ns = () => this.pfx + RJ;
   private full(key: string) { return this.ns() + key; }
+  /** A write and its index member in one MULTI (KeyIndex) — undefined when the client cannot. */
+  private indexedWrite(key: string): RedisPipeline | undefined {
+    return this.index.usable && this.client.multi ? this.client.multi().zadd(this.index.key, 0, key) : undefined;
+  }
   private activityKey(): string { return this.pfx + RJT; }
   /** H8b helper: does this run have a tool record that is CURRENTLY suspended? Only that run's OWN
    *  keys are scanned (unlike listRuns's full-keyspace scan) — listStaleRuns only calls this for
    *  stale CANDIDATES, so it does NOT incur full-keyspace cost. */
   private async isRunSuspended(runId: string): Promise<boolean> {
-    const keys = await scanAll(this.client, globEscape(this.ns() + runId + ':') + '*');
+    const keys = await this.index.keys(runId + ':');
     const values = await bulkGet(this.client, keys);
     for (const s of values) {
       if (s == null) continue;
@@ -560,6 +716,7 @@ class RedisRunJournal implements RunJournal {
     return values.map((s) => (s == null ? undefined : (deserialize<RjEnv>(s).v as T)));
   }
   async put(key: string, value: unknown): Promise<void> {
+    await this.index.beforeWrite();
     const p = parseJournalKey(key);
     // The ACTIVITY index must cover every run-scoped key, not just replayable entries: a run that died
     // before its first model step has only `:input` + a claim marker, and leaving those out of the ZSET
@@ -578,6 +735,14 @@ class RedisRunJournal implements RunJournal {
     // every put whenever p exists) → sending SET+ZADD in the SAME round-trip does NOT CHANGE behavior
     // (both would run in every case; it just drops from 2 RTT to 1 RTT). If canPipe() is false
     // (client.multi/zadd absent), the separate-call path below (old behavior, documented) runs UNCHANGED.
+    const tx = this.indexedWrite(key);
+    if (tx) {
+      tx.set(full, payload);
+      if (owner && this.client.zadd) tx.zadd(this.activityKey(), await this.now(), owner);
+      await tx.exec();
+      return;
+    }
+    await this.index.add(full);
     if (this.canPipe(owner)) {
       await this.client.multi!().set(full, payload).zadd(this.activityKey(), await this.now(), owner).exec();
       return;
@@ -588,6 +753,7 @@ class RedisRunJournal implements RunJournal {
   /** REQUIRED (exactly-once): ATOMIC CAS via SET NX — no get-then-set. First writer gets 'OK', later ones get null. */
   async putIfAbsent(key: string, value: unknown): Promise<boolean> {
     this.checkReplicationOnce(); // fire-and-forget — never awaited, never delays the claim
+    await this.index.beforeWrite();
     const p = parseJournalKey(key);
     // The ACTIVITY index must cover every run-scoped key, not just replayable entries: a run that died
     // before its first model step has only `:input` + a claim marker, and leaving those out of the ZSET
@@ -595,6 +761,17 @@ class RedisRunJournal implements RunJournal {
     const owner = p?.runId ?? runIdOfKey(key, value);
     const full = this.full(key);
     const payload = serialize(rjEnv(value, p, isSuspended(p, value), Date.now()));
+    const tx = this.indexedWrite(key);
+    if (tx) {
+      // The member is added whether or not SET NX wins: if it loses, the key exists and is a member already.
+      tx.set(full, payload, 'NX');
+      if (owner && this.client.zadd) tx.zadd(this.activityKey(), await this.now(), owner);
+      const results = await tx.exec();
+      const ok = results?.[1]?.[1] === 'OK';
+      if (ok) await this.waitForReplicas();
+      return ok;
+    }
+    await this.index.add(full);
     if (this.canPipe(owner)) {
       // PIPELINE — DOCUMENTED BEHAVIOR DIFFERENCE (in the SAFE DIRECTION): commands in a pipeline can't
       // be conditioned on each other's RESULT (without Lua) → the ZADD runs even if SET NX LOSES (the
@@ -677,17 +854,22 @@ class RedisRunJournal implements RunJournal {
     if (!this.client.hincrbyfloat) throw new Error('@gnldev/durable redis: client does not support hincrbyfloat');
     const entries = Object.entries(fields);
     const after: Record<string, number> = {};
-    if (entries.length > 1 && this.client.eval) {
+    const hash = this.pfx + CTR + key;
+    await this.counters.beforeWrite();
+    if (this.client.eval && (entries.length > 1 || this.counters.usable)) {
       // Several fields move together (a finished call's count and its seat — limits.ts): one script, so
-      // no reader sees one moved without the other.
-      const values = await this.client.eval(INCR_FIELDS_LUA, 1, this.pfx + CTR + key, ...entries.flat());
+      // no reader sees one moved without the other; the hash's index member rides in it (KeyIndex).
+      const values = this.counters.usable
+        ? await this.client.eval(INCR_FIELDS_LUA, 2, hash, this.counters.key, ...entries.flat(), this.counters.member(hash))
+        : await this.client.eval(INCR_FIELDS_LUA, 1, hash, ...entries.flat());
       if (!Array.isArray(values) || values.length !== entries.length) {
         throw new Error(`@gnldev/durable redis: incrBy's script returned ${JSON.stringify(values)}, not one value per field — the client's eval must run Lua as Redis does`);
       }
       entries.forEach(([f], i) => { after[f] = Number(values[i]); });
       return after;
     }
-    for (const [f, d] of entries) after[f] = Number(await this.client.hincrbyfloat(this.pfx + CTR + key, f, d));
+    await this.counters.add(hash);
+    for (const [f, d] of entries) after[f] = Number(await this.client.hincrbyfloat(hash, f, d));
     return after;
   }
   async getCounters(key: string): Promise<Record<string, number> | undefined> {
@@ -705,7 +887,7 @@ class RedisRunJournal implements RunJournal {
     return Number(sec) * 1000 + Math.floor(Number(usec) / 1000);
   }
   async listKeys(prefix: string, opts?: { limit?: number }): Promise<string[]> {
-    const keys = await scanAll(this.client, globEscape(this.ns() + prefix) + '*', opts?.limit);
+    const keys = await this.index.keys(prefix, opts?.limit);
     const cut = this.ns().length;
     return keys.map((k) => k.slice(cut));
   }
@@ -718,8 +900,10 @@ class RedisRunJournal implements RunJournal {
    *  runId (e.g. `mem-appended:<runId>` or `net:<runId>:` prefixes also pass through here) — in that
    *  case ZREM deletes a non-matching member (no-op, a harmless extra round-trip). */
   async deletePrefix(prefix: string): Promise<number> {
-    const keys = await scanAll(this.client, globEscape(this.ns() + prefix) + '*');
-    const n = keys.length ? await this.client.del(...keys) : 0;
+    const keys = await this.index.keys(prefix);
+    let n = 0;
+    for (let i = 0; i < keys.length; i += DEL_CHUNK) n += await this.client.del(...keys.slice(i, i + DEL_CHUNK));
+    await this.index.remove(prefix); // after the keys: a member may outlive its key, never the reverse
     if (this.client.zrem) {
       const rid = prefix.endsWith(':') ? prefix.slice(0, -1) : prefix;
       await this.client.zrem(this.activityKey(), rid);
@@ -729,8 +913,9 @@ class RedisRunJournal implements RunJournal {
     // an org purge (GDPR) must not leave `org:<id>:__usage__` behind, and rebuildMetrics's wipe must
     // not keep stale `__metrics__:` counters. Not included in the return count (parity with sqlite/pg,
     // which don't count the gnl_counters rows either).
-    const ctrKeys = await scanAll(this.client, globEscape(this.pfx + CTR + prefix) + '*');
-    if (ctrKeys.length) await this.client.del(...ctrKeys);
+    const ctrKeys = await this.counters.keys(prefix);
+    for (let i = 0; i < ctrKeys.length; i += DEL_CHUNK) await this.client.del(...ctrKeys.slice(i, i + DEL_CHUNK));
+    await this.counters.remove(prefix);
     return n;
   }
   /**
@@ -746,7 +931,7 @@ class RedisRunJournal implements RunJournal {
    *    the same path as the bulkGet from the N+1 efficiency fix.
    */
   async readRunStats(runId: string): Promise<{ entries: number; bytes: number }> {
-    const keys = await scanAll(this.client, globEscape(this.ns() + runId + ':') + '*');
+    const keys = await this.index.keys(runId + ':');
     const cut = this.ns().length;
     // As in readRun, only this run's model/tool entries are counted (input/proc/cfg are EXCLUDED) —
     // here, WITHOUT fetching the value, filtering is done via parseJournalKey on the key TEXT itself.
@@ -755,18 +940,21 @@ class RedisRunJournal implements RunJournal {
       return p != null && p.runId === runId;
     });
     if (relevant.length === 0) return { entries: 0, bytes: 0 };
+    // A member whose key is gone (KeyIndex) is not an entry: STRLEN answers 0 for it, MGET null.
     if (this.client.strlen) {
       let bytes = 0;
-      for (const k of relevant) bytes += await this.client.strlen(k);
-      return { entries: relevant.length, bytes };
+      let entries = 0;
+      for (const k of relevant) { const n = await this.client.strlen(k); if (n > 0) { bytes += n; entries++; } }
+      return { entries, bytes };
     }
     const values = await bulkGet(this.client, relevant);
     let bytes = 0;
-    for (const v of values) if (v != null) bytes += v.length;
-    return { entries: relevant.length, bytes };
+    let entries = 0;
+    for (const v of values) if (v != null) { bytes += v.length; entries++; }
+    return { entries, bytes };
   }
   async readRun(runId: string): Promise<JournalEntry[]> {
-    const keys = await scanAll(this.client, globEscape(this.ns() + runId + ':') + '*');
+    const keys = await this.index.keys(runId + ':');
     const cut = this.ns().length;
     const values = await bulkGet(this.client, keys);
     const entries: JournalEntry[] = [];
@@ -785,7 +973,7 @@ class RedisRunJournal implements RunJournal {
   async listRuns(q?: ListQuery): Promise<Page<RunSummary>> {
     // Brute-force: scan all rj: entries, summarize per run. Even if the same key is written twice (UPSERT)
     // it's a SINGLE Redis key → NOT DOUBLE-COUNTED (same result as sqlite touchRun's recompute semantics).
-    const keys = await scanAll(this.client, globEscape(this.ns()) + '*');
+    const keys = await this.index.keys('');
     const values = await bulkGet(this.client, keys);
     const cut = this.ns().length;
     const byRun = new Map<string, { m: number; t: number; s: boolean; c0: number }>();
@@ -880,7 +1068,11 @@ class RedisRunJournal implements RunJournal {
 
 // ── WorkStore (append-log + KV + CAS ack) ─────────────────────────────────────
 class RedisWorkStore implements WorkStore {
-  constructor(private client: RedisLike, private pfx: string) {}
+  /** Lists the log by namespace (KeyIndex); KV keys are read whole and need none. */
+  readonly log: KeyIndex;
+  constructor(private client: RedisLike, private pfx: string, gate: IndexGate = new IndexGate(client, pfx, [RJ, WL, CTR])) {
+    this.log = new KeyIndex(client, pfx, WL, gate);
+  }
   /** See `encNs`: the ns is escaped so the ns→key mapping is injective (`list` is an exact match). */
   private logNs = (ns: string) => `${this.pfx}${WL}${encNs(ns)}:`;
   private kvKey = (key: string) => `${this.pfx}${WK}${key}`;
@@ -900,11 +1092,15 @@ class RedisWorkStore implements WorkStore {
     const eid = id ?? `${ns}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
     const rec = serialize({ id: eid, payload, ts: Date.now() });
     const key = this.logNs(ns) + eid;
+    await this.log.beforeWrite();
     if (this.client.eval) {
-      await this.client.eval(WORK_APPEND_LUA, 2, this.seqKey(ns), key, rec);
+      // The record's index member is added in the same script (KeyIndex).
+      if (this.log.usable) await this.client.eval(WORK_APPEND_LUA, 3, this.seqKey(ns), key, this.log.key, rec, this.log.member(key));
+      else await this.client.eval(WORK_APPEND_LUA, 2, this.seqKey(ns), key, rec);
       return eid;
     }
     if ((await this.client.get(key)) !== null) return eid;
+    await this.log.add(key);
     const seq = Number((await this.client.get(this.seqKey(ns))) ?? 0) + 1;
     await this.client.set(this.seqKey(ns), String(seq));
     await this.client.set(key, numberedValue(rec, seq)!, 'NX');
@@ -925,7 +1121,9 @@ class RedisWorkStore implements WorkStore {
     // ambiguity, `:` is not a glob metacharacter. globEscape covers the WHOLE pattern including the
     // caller's `keyPrefix` — here and, since this round, at the other nine SCAN sites too (they used
     // to escape only their variable tail; see globEscape). See `encNs`.
-    const keys = await scanAll(this.client, globEscape(this.logNs(ns)) + '*');
+    // The index holds every record that exists when the read starts (KeyIndex: a record and its member
+    // are written in one script), so the same reasoning holds for it as for SCAN.
+    const keys = await this.log.keys(`${encNs(ns)}:`);
     const values = await bulkGet(this.client, keys);
     const rows: Array<LogRecord<T> & { seq: number; key: string; raw: string }> = [];
     values.forEach((raw, i) => { if (raw != null) rows.push({ ...readWorkValue<T>(raw), key: keys[i]!, raw }); });
@@ -1004,10 +1202,13 @@ class RedisWorkStore implements WorkStore {
    * that exactly when its plain form starts with the plain prefix.
    */
   async deletePrefix(prefix: string): Promise<number> {
-    const logKeys = await scanAll(this.client, globEscape(`${this.pfx}${WL}${encNs(prefix)}`) + '*');
+    const logKeys = await this.log.keys(encNs(prefix));
     const kvKeys = await scanAll(this.client, globEscape(`${this.pfx}${WK}${prefix}`) + '*');
     const all = [...new Set([...logKeys, ...kvKeys])];
-    return all.length ? await this.client.del(...all) : 0;
+    let n = 0;
+    for (let i = 0; i < all.length; i += DEL_CHUNK) n += await this.client.del(...all.slice(i, i + DEL_CHUNK));
+    await this.log.remove(encNs(prefix));
+    return n;
   }
   /**
    * Every log record whose ID starts with `idPrefix`, in every namespace (`WorkStore.deleteIdPrefix`).
@@ -1023,6 +1224,22 @@ class RedisWorkStore implements WorkStore {
    */
   async deleteIdPrefix(idPrefix: string): Promise<number> {
     const base = `${this.pfx}${WL}`;
+    const isMine = (k: string) => {
+      const rest = k.slice(base.length);
+      const colon = rest.indexOf(':');
+      return k.startsWith(base) && colon >= 0 && rest.slice(colon + 1).startsWith(idPrefix);
+    };
+    if (this.log.usable) {
+      // The log's own members, not the database: an id prefix can sit under any namespace.
+      const mine = (await this.log.keys('')).filter(isMine);
+      let deleted = 0;
+      for (let i = 0; i < mine.length; i += DEL_CHUNK) {
+        const chunk = mine.slice(i, i + DEL_CHUNK);
+        deleted += await this.client.del(...chunk);
+        if (this.client.zrem) await this.client.zrem(this.log.key, ...chunk.map((k) => this.log.member(k)));
+      }
+      return deleted;
+    }
     const match = `${globEscape(base)}*:${globEscape(idPrefix)}*`;
     let n = 0;
     let cursor: string | number = '0';
@@ -1100,6 +1317,8 @@ export class RedisStorage implements Storage {
   private client: RedisLike;
   /** The key prefix every sub-store shares — kept so `adoptIntoOrg` can scan the same keyspace. */
   private readonly pfx: string;
+  /** Whether reads go through the key indexes (IndexGate). */
+  private readonly indexGate: IndexGate;
   readonly runs: RunJournal;
   readonly work: WorkStore;
   readonly cache: CacheStore;
@@ -1141,12 +1360,25 @@ export class RedisStorage implements Storage {
         );
       });
     }
-    this.runs = new RedisRunJournal(this.client, pfx, opts.replicationWarning ?? true, opts.waitReplicas);
-    this.work = new RedisWorkStore(this.client, pfx);
+    this.indexGate = new IndexGate(this.client, pfx, [RJ, WL, CTR]);
+    this.runs = new RedisRunJournal(this.client, pfx, opts.replicationWarning ?? true, opts.waitReplicas, this.indexGate);
+    this.work = new RedisWorkStore(this.client, pfx, this.indexGate);
     this.cache = new RedisCacheStore(this.client, pfx);
     this.meta = new RedisMetaStore(this.client, pfx);
   }
   /** Redis is schemaless → no table setup; write schema_version idempotently (parity with sqlite/pg meta). */
+  /**
+   * Adds every existing run and work-log key to the key indexes and lists through them from now on, for
+   * every process sharing this store. Call it once after upgrading a store an earlier version wrote, when
+   * no process of that version remains (see IndexGate); calling it again is harmless. Returns how many
+   * keys each index holds.
+   */
+  async rebuildKeyIndex(): Promise<{ runs: number; work: number }> {
+    const runs = this.runs as RedisRunJournal;
+    const n = await this.indexGate.switchOn([runs.index, runs.counters, (this.work as RedisWorkStore).log]);
+    return { runs: (n[RJ] ?? 0) + (n[CTR] ?? 0), work: n[WL] ?? 0 };
+  }
+
   /**
    * See `Storage.adoptIntoOrg`.
    *
@@ -1237,16 +1469,20 @@ export class RedisStorage implements Storage {
         }
         // In their old order, written bare and numbered after the organization's last number.
         recs.sort(compareLogPosition);
-        for (const r of recs) await this.client.set(r.key, r.raw);
+        const log = (this.work as RedisWorkStore).log;
+        for (const r of recs) { await log.add(r.key); await this.client.set(r.key, r.raw); }
         await (this.work as RedisWorkStore)._number(to, recs);
-        for (const { src } of moves) await this.client.del(src);
+        for (const { src } of moves) { await this.client.del(src); await log.drop(src); }
       }
     }
     moved.work = logN;
 
     // [redis sub-namespace, store name, is it a hash]
     const SPACES: Array<[string, string, boolean]> = [[RJ, 'runs', false], [CTR, 'runs', true], [WK, 'work', false], [META, 'meta', false]];
+    const runsJ = this.runs as RedisRunJournal;
+    const indexOf = (space: string): KeyIndex | undefined => (space === RJ ? runsJ.index : space === CTR ? runsJ.counters : undefined);
     for (const [space, store, isHash] of SPACES) {
+      const index = indexOf(space);
       const full = this.pfx + space;
       const keys = await scanAll(globEscape(full) + '*');
       let n = 0;
@@ -1261,12 +1497,17 @@ export class RedisStorage implements Storage {
         if (isHash) {
           if (!this.client.hgetall || !this.client.hincrbyfloat) { skipped.add(space); n--; continue; }
           const fields = await this.client.hgetall(k);
+          await index?.add(dst);
           for (const [f, v] of Object.entries(fields)) await this.client.hincrbyfloat(dst, f, Number(v));
         } else {
           const v = await this.client.get(k);
-          if (v !== null) await this.client.set(dst, v);
+          if (v !== null) {
+            await index?.add(dst);
+            await this.client.set(dst, v);
+          }
         }
         await this.client.del(k);
+        await index?.drop(k);
       }
       moved[store] = (moved[store] ?? 0) + n;
     }

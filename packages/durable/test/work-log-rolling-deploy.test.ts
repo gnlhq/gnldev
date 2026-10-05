@@ -13,6 +13,10 @@
 //
 // Each case below writes the way 0.9.0 wrote — its exact statement or its exact value format, from a
 // separate connection, as the old process does — and reads the way this version reads.
+//
+// On Redis the store already holds a 0.9 record when this version first touches it, as it does in a real
+// rolling deploy: that is what keeps this version listing by SCAN (IndexGate) until every process is
+// upgraded. A NEW store started with 0.9 processes writing beside this version is not supported there.
 import { describe, it, expect, afterAll } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -76,7 +80,9 @@ function pgMemMixed(): Mixed {
   };
 }
 
-function redisMixed(client: any, prefix: string): Mixed {
+async function redisMixed(client: any, prefix: string): Promise<Mixed> {
+  // What the 0.9 process wrote before this version started (see the header).
+  await client.set(`${prefix}wl:${encNs('rolling:before')}:seed`, superjson.stringify({ id: 'seed', payload: 0, ts: 0 }), 'NX');
   const s = new RedisStorage({ client, keyPrefix: prefix });
   return {
     work: s.work!,
@@ -179,7 +185,7 @@ contract('redis (fake)', () => redisMixed(makeFakeRedis(), 'gnl:'));
 
 describe('rolling deploy — a 0.9 Redis reader parses what this version writes', () => {
   it('fake: every value (appended, and after this version has read the log) is a record 0.9 can parse', async () => {
-    const m = redisMixed(makeFakeRedis(), 'gnl:');
+    const m = await redisMixed(makeFakeRedis(), 'gnl:');
     const ns = freshNs();
     for (const id of range('new-', 5)) await m.work.append(ns, { v: 1 }, id);
     const shape = (xs: unknown[]) => xs.map((x: any) => [x.id, x.payload?.v, typeof x.ts]).sort();
@@ -212,8 +218,8 @@ describe('rolling deploy — Redis: a record numbered while a reader\'s SCAN is 
         return typeof v === 'function' ? v.bind(t) : v;
       },
     });
-    const r = redisMixed(client, 'gnl:');
-    const r2 = redisMixed(client, 'gnl:');
+    const r = await redisMixed(client, 'gnl:');
+    const r2 = await redisMixed(client, 'gnl:');
     const ns = freshNs();
     for (const id of range('new-', 60)) await r.work.append(ns, { v: 1 }, id);
     const first = await r.work.list(ns, { limit: 50 });

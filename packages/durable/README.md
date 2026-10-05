@@ -1067,6 +1067,10 @@ The exactly-once guarantee rests on one precondition: **storage never loses an a
 - **Redis:** since replication is always asynchronous, it is NOT RECOMMENDED for `runs` (the replay
   journal) in failover setups — use `composite()` to keep `runs` on Postgres and use Redis for
   `work`/`cache` (this is also how the adapter's capability design is meant to be used).
+- **Redis, listing:** the store lists a prefix through its own index (one sorted set per key space), so
+  a run costs the same beside a million other keys. A store an earlier version wrote lists by SCAN —
+  which walks the whole database — until every process runs this version and you call
+  `storage.rebuildKeyIndex()` once.
 - **SQLite:** meant for a single node; WAL mode gives sufficient filesystem durability.
 - **Outbound side effects:** the strongest end-to-end defense is using a provider-side **idempotency
   key** on tool calls (see the pattern in `test/idempotency-key.test.ts`) — regardless of the storage

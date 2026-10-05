@@ -276,6 +276,10 @@ and who is affected.
   `'cross-run'`.
 ### Added
 
+- **`RedisStorage.rebuildKeyIndex()`** (@gnldev/durable): adds the keys an earlier version wrote to the
+  Redis store's key indexes and lists through them from then on, for every process sharing the store
+  (see Fixed and Known limits). `RedisLike` gains two optional commands, `zrangebylex` and
+  `zremrangebylex` (ioredis has both); a client without them lists by SCAN, as before.
 - **`Journal.incrBy` resolves to the new value of each field it moved** (@gnldev/durable). The built-in
   stores return it (Postgres `RETURNING`, Sqlite `RETURNING`, Redis's reply); Redis moves several fields in
   one script, so no reader sees one moved without the other. A tool-call limit takes its seat with it
@@ -810,6 +814,17 @@ and who is affected.
 
 ### Fixed
 
+- **The Redis store walked the whole Redis database to list a prefix** (@gnldev/durable). Reading a run,
+  its approvals, a work-log namespace, a prefix (`listKeys`) or deleting one used `SCAN MATCH`, which
+  visits every key the database holds — other applications' too, and the store's own history. Measured:
+  a 10-call run 44 ms alone, 270 ms beside 100 000 other keys, 2983 ms beside 1 000 000; a queue's 10 jobs
+  78 → 6318 ms; a run among the store's own 300 000 old keys 53 → 1338 ms. A run walked the database 7
+  times. The store now keeps one sorted-set index per key space (runs, counters, work log), written in the
+  same transaction or script as each key, and a prefix is one `ZRANGEBYLEX`: 0 walks per run; with
+  1 000 000 other keys a run takes 37 ms and the queue's 10 jobs 73 ms. A store with no run or work-log
+  key when this version first touches it uses the index at once; a store an earlier version wrote keeps
+  SCAN until `rebuildKeyIndex()` (Known limits). Listing every run (`listRuns`) still reads every run key
+  of the store (300 000 keys: 2383 → 1160 ms).
 - **A request's budget was measured by walking every run under it, on every check**: profiled, 41% of busy
   time on a fan-out of 200 sub-agents. Every run now adds its spend to one total at the request's root as
   it counts it, and a check reads that one key. A request started by an earlier version keeps the walk.
@@ -1596,6 +1611,12 @@ and who is affected.
 
 ### Known limits
 
+- **A Redis store an earlier version wrote lists by SCAN until `rebuildKeyIndex()` is called.** An
+  earlier version writes keys the index does not hold, so while one may still be running (a rolling
+  upgrade) the store keeps SCAN, which sees every key, and warns once. When every process sharing the store
+  runs this version, call `storage.rebuildKeyIndex()` once (300 000 keys: 1.8 s); every process then lists
+  through the index. Starting a NEW store with an earlier version's processes writing beside this one is
+  not supported: the store is indexed at once and their keys would not be listed.
 - **A 0.9 process left running beside this version can hide one old chunk from a re-ingest.** The Postgres
   store of @gnldev/durable fills `gnl_vectors.doc` itself on every write; a 0.9 process does not. If a
   0.9 process rewrites an existing record so it belongs to another document, `doc` keeps the old value
