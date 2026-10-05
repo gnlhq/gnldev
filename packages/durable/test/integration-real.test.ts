@@ -987,13 +987,24 @@ describe.skipIf(!RUN)('REAL Postgres — a failover does not take the process wi
     );
     return r.rows[0]?.n ?? 0;
   };
+  /** The test's own raw pools get what the product gives its own: a listener on the pool and on every
+   *  connection. These tests terminate sessions on purpose, and the cleanup force-drops a database, so a
+   *  session of a helper pool can be terminated as it closes; without a listener that error is uncaught
+   *  and fails the run (seen in CI on the en_US.utf8 job, never reproduced locally — 0 of 40 runs). */
+  const quietPool = (connectionString: string): PgPool => {
+    const p = new PgPool({ connectionString });
+    p.on('error', () => {});
+    p.on('connect', (c: any) => { c.on('error', () => {}); });
+    return p;
+  };
 
   it('writes in flight when the backend dies: the process survives and the journal stays honest', async () => {
     // The shared database: name this storage's connections so only they are terminated.
     const app = `gnl-failover-${SEED}`;
     const named = new URL(PG_URL); named.searchParams.set('application_name', app);
     const s = new PostgresStorage({ connectionString: named.toString() });
-    const killer = new PgPool({ connectionString: PG_URL });
+    const killer = quietPool(PG_URL);
+    let kill: Promise<unknown> = Promise.resolve();
     try {
       const runId = `${SEED}-failover-${Date.now().toString(36)}`;
       const N = 120;
@@ -1009,7 +1020,7 @@ describe.skipIf(!RUN)('REAL Postgres — a failover does not take the process wi
       const writes = Array.from({ length: N }, (_, i) =>
         s.runs.put(`${runId}:tool:t${i}`, { status: 'succeeded', output: { i } })
           .then(() => true).catch(() => false));
-      setTimeout(() => { void killBackends(killer, app); }, 40);
+      kill = new Promise((r) => setTimeout(() => r(killBackends(killer, app).catch(() => 0)), 40));
       const results = await Promise.all(writes);
 
       // Reaching this line at all is half the assertion: before the fix the process was gone.
@@ -1030,6 +1041,7 @@ describe.skipIf(!RUN)('REAL Postgres — a failover does not take the process wi
       await expect(s.runs.put(`${runId}:tool:after`, { status: 'succeeded', output: 'after' }))
         .resolves.not.toThrow();
     } finally {
+      await kill; // the kill is not left running into the cleanup
       await killer.end();
       await (s as any).close?.();
     }
@@ -1042,17 +1054,18 @@ describe.skipIf(!RUN)('REAL Postgres — a failover does not take the process wi
   // again half a second later. In a fleet that is the copy which failed over and never came back.
   it('a boot interrupted by the failover does not leave the instance permanently dead', async () => {
     const dbName = `gnl_boot_${Date.now().toString(36)}`;
-    const admin = new PgPool({ connectionString: PG_URL });
+    const admin = quietPool(PG_URL);
     await admin.query(`CREATE DATABASE ${dbName}`);
     // A database of its own, because the boot can only be interrupted where there is DDL left to
     // run — against the shared one the schema already exists and there is no window to hit.
     const url = new URL(PG_URL); url.pathname = `/${dbName}`;
-    const killer = new PgPool({ connectionString: url.toString() });
+    const killer = quietPool(url.toString());
     const s = new PostgresStorage({ connectionString: url.toString() });
+    let kill: Promise<unknown> = Promise.resolve();
     try {
       await killer.query('SELECT 1');   // a session to terminate from, outside the pool under test
       const boot = s.runs.put('r:tool:a', { status: 'succeeded', output: 1 }).then(() => null, (e: Error) => e);
-      setTimeout(() => { void killBackends(killer); }, 8);
+      kill = new Promise((r) => setTimeout(() => r(killBackends(killer).catch(() => 0)), 8));
       const bootErr = await boot;
       // If the kill missed the window there is nothing to assert — say so rather than pass quietly.
       if (!bootErr) return;
@@ -1068,6 +1081,7 @@ describe.skipIf(!RUN)('REAL Postgres — a failover does not take the process wi
         'the instance never retried the schema after the backend came back',
       ).resolves.not.toThrow();
     } finally {
+      await kill; // the kill is not left running into the cleanup
       await killer.end();
       await (s as any).close?.();
       await admin.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`).catch(() => {});
