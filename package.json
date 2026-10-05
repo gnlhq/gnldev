@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "description": "gnl — a durable execution substrate for AI agents (monorepo)",
+  "license": "Apache-2.0",
   "scripts": {
     "build": "pnpm -r build",
     "pretest": "node scripts/check-dist-fresh.mjs",
@@ -18,19 +19,19 @@
     "check:option-docs": "node scripts/check-option-docs.mjs",
     "check:option-names": "node scripts/check-option-names.mjs"
   },
+  "packageManager": "pnpm@12.9.1",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "12.9.1",
+      "onFail": "download"
+    }
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^2.1.9",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
-  },
-  "license": "Apache-2.0",
-  "pnpm": {
-    "overrides": {
-      "fast-uri": ">=3.1.5 <4",
-      "ip-address": ">=10.3.1 <11",
-      "protobufjs": ">=7.6.5 <8"
-    }
   }
 }
