@@ -181,7 +181,7 @@ jobs:
       # skipped by default for want of a server, and absent from this line. `scripts/check-real-backends.mjs`
       # runs the same files locally — the two lists are meant to stay identical, since a repository
       # with no remote never reaches this job at all.
-      - run: pnpm exec vitest run packages/durable/test/integration-real.test.ts packages/durable/test/prefix-astral-postgres.test.ts packages/rag/test/postgres-vector-store.test.ts packages/otel/test/metrics-org-postgres.test.ts
+      - run: pnpm exec vitest run packages/durable/test/integration-real.test.ts packages/durable/test/prefix-astral-postgres.test.ts packages/rag/test/postgres-vector-store.test.ts packages/otel/test/metrics-org-postgres.test.ts packages/durable/test/run-cursor-parity.test.ts
       # A SEPARATE run, after the one above, as check-real-backends.mjs does: integration-real's
       # failover case terminates every backend on the database, and in the same vitest run it reached
       # these contracts' open pools (4 uncaught 57P01 errors, a red caused by the schedule).

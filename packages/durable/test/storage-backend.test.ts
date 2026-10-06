@@ -30,7 +30,10 @@ const thread = (id: string, resourceId: string, updatedAt: number): ThreadRecord
 // intended behaviour — but it means the racing assertion below cannot run here. Real proof of that path
 // belongs against a real server (integration-real.test.ts, GNL_INTEGRATION=1); this flag exists so the
 // gap is declared instead of quietly absent.
-type Caps = { exactCas: boolean; serialisesAppends: boolean };
+// rowValues=false: the SQL cannot compare rows — `(created_at, run_id) > (…)`, the keyset a run list's
+// second page reads (run-cursor.ts). Exactly pg-mem. The paging walks below stop after their first page
+// there; run-cursor-parity.test.ts walks the same filters on a real Postgres (the real-backend CI job).
+type Caps = { exactCas: boolean; serialisesAppends: boolean; rowValues?: boolean };
 const storages: [string, () => Storage, Caps][] = [['InMemoryStorage', () => new InMemoryStorage(), { exactCas: true, serialisesAppends: true }]];
 try {
   const probe = new SqliteStorage();
@@ -41,7 +44,7 @@ try {
 }
 // Postgres: fresh db per test via pg-mem (in-memory real SQL).
 const pgmemPool = () => { const { Pool } = newDb().adapters.createPg(); return new Pool(); };
-storages.push(['PostgresStorage(pg-mem)', () => new PostgresStorage({ pool: pgmemPool() }), { exactCas: false, serialisesAppends: false }]);
+storages.push(['PostgresStorage(pg-mem)', () => new PostgresStorage({ pool: pgmemPool() }), { exactCas: false, serialisesAppends: false, rowValues: false }]);
 // Redis: partial storage (runs/work/cache/meta='full/ttl'; memory/vectors='none'). Runs against a fake RedisLike;
 // those two ports are skipped in the conformance suite since they're overridden via composite (capability='none' → skip).
 storages.push(['RedisStorage(fake)', () => new RedisStorage({ client: makeFakeRedis() }), { exactCas: true, serialisesAppends: true }]);
@@ -93,6 +96,7 @@ for (const [name, make, caps] of storages) {
       const p1 = await b.runs.listRuns({ limit: 2 });
       expect(p1.items.length).toBe(2);
       expect(p1.nextCursor).toBeDefined();
+      if (caps.rowValues === false) return;
       const p2 = await b.runs.listRuns({ limit: 2, cursor: p1.nextCursor });
       const p3 = await b.runs.listRuns({ limit: 2, cursor: p2.nextCursor });
       expect(p3.nextCursor).toBeUndefined();
@@ -137,6 +141,7 @@ for (const [name, make, caps] of storages) {
       // Filter BEFORE slicing (the JournalReader.listRunsPaged contract): walking u-a's three runs at
       // limit 2 must yield exactly those three. An adapter that slices first and filters after returns
       // a short first page and a cursor that has already skipped past a match.
+      if (caps.rowValues === false) return;
       const seen: string[] = [];
       let cursor: string | undefined;
       do {
@@ -163,6 +168,7 @@ for (const [name, make, caps] of storages) {
 
       // Walk the 'completed' filter with limit:2 — cursor must land on EXACTLY the 3 completed runs
       // (never a suspended one, never fewer than 3 total across the walk).
+      if (caps.rowValues === false) return;
       const seen: string[] = [];
       let cursor: string | undefined;
       for (;;) {
@@ -193,7 +199,7 @@ for (const [name, make, caps] of storages) {
       const p1 = await b.runs.listRuns({ agent: 'alpha', limit: 1 });
       expect(p1.items.length).toBe(1);
       expect(p1.items[0]!.agent).toBe('alpha');
-      if (p1.nextCursor) {
+      if (p1.nextCursor && caps.rowValues !== false) {
         const p2 = await b.runs.listRuns({ agent: 'alpha', limit: 1, cursor: p1.nextCursor });
         expect(p2.items.every((r) => r.agent === 'alpha')).toBe(true);
         expect([...p1.items, ...p2.items].map((r) => r.runId).sort()).toEqual(['af-a1', 'af-a2']);

@@ -1,0 +1,192 @@
+import type { RunSummary, RunStatus } from './journal.js';
+
+/**
+ * Where a run listing stopped: the last run a page handed out — never a row number.
+ *
+ * A row number (`LIMIT … OFFSET n`) is what every adapter used to hand out, and it had two costs.
+ * A deep page paid for every row before it: on Postgres, 30 000 runs walked page by page took 71 s,
+ * because each page at offset k re-read and discarded k rows (a page at offset 15 000 cost 132 ms,
+ * the first page 3 ms). And a run inserted or deleted between two requests moved the window under
+ * the reader, so a walk could skip or repeat a run. A position keyed on the row itself has neither:
+ * `(created_at, run_id) > (at, runId)` is one index seek, and a run arriving or leaving elsewhere
+ * does not move it.
+ *
+ * - `runId` — the last run handed out. Every reader can place it.
+ * - `at` — that run's `created_at`, when the source keeps one in the order (Sqlite, Postgres). A
+ *   source that orders an array it built (InMemory, Redis) does not, and a database reader resolves
+ *   a position without it from the run itself.
+ * - `next` — the run the next page starts with, as the source saw it. An array source places the
+ *   cursor by it when the run above is gone (purged while the page was on screen).
+ * - `seen` — how many runs this listing has handed out so far. Used only when neither run is left
+ *   and the source cannot place the position any other way.
+ *
+ * The encoding is OPAQUE (see `Page`): callers pass `nextCursor` back verbatim.
+ */
+export interface RunPosition {
+  runId: string;
+  at?: number;
+  next?: string;
+  seen: number;
+}
+
+/** Which end a listing starts from. Ascending is the order runs were created in. */
+export type RunOrder = 'asc' | 'desc';
+
+// r1:<at>:<seen>:<length of runId>:<runId><next> — run ids may hold any character, so the first is
+// measured rather than delimited.
+const RUN_CURSOR = /^r1:(-?\d*):(\d+):(\d+):([\s\S]*)$/;
+
+/** The opaque `nextCursor` of a run listing — the same family as `WorkStore.list`'s `w1:` (storage.ts). */
+export function encodeRunCursor(p: RunPosition): string {
+  return `r1:${p.at ?? ''}:${p.seen}:${p.runId.length}:${p.runId}${p.next ?? ''}`;
+}
+
+/**
+ * The position a cursor names, or `undefined` for no cursor (the first page).
+ *
+ * Anything else is refused. `WorkStore.list` reads a cursor it never issued as "from the head",
+ * which is safe there because its consumers skip finished records; a run list has no such reader. A
+ * cursor answered with page one plus a fresh `nextCursor` looks like success, and a client that
+ * appends pages (the Studio's) then shows the same runs again and again. That includes the row
+ * numbers 0.10 and earlier handed out — they named a position in a window that has since moved, which
+ * is the very thing this cursor replaces.
+ */
+export function decodeRunCursor(cursor: string | undefined): RunPosition | undefined {
+  if (cursor === undefined || cursor === '') return undefined;
+  const fail = (): never => {
+    throw new TypeError(
+      `@gnldev/durable: '${cursor}' is not a run-list cursor — pass back a page's nextCursor verbatim, or omit it for the first page.` +
+        (/^\d+$/.test(cursor) ? ' Row-number cursors from @gnldev/durable 0.10 and earlier are no longer read.' : ''),
+    );
+  };
+  const m = RUN_CURSOR.exec(cursor);
+  const len = m ? Number(m[3]) : -1;
+  if (!m || len > m[4]!.length) return fail();
+  const next = m[4]!.slice(len);
+  return { runId: m[4]!.slice(0, len), seen: Number(m[2]), ...(m[1] ? { at: Number(m[1]) } : {}), ...(next ? { next } : {}) };
+}
+
+/** Whether `cursor` is one a run listing can read — for a door that answers a bad one with a 400. */
+export function isRunCursor(cursor: string): boolean {
+  try { decodeRunCursor(cursor); return true; } catch { return false; }
+}
+
+/** The filters every run listing applies, in one place. */
+export interface RunFilter {
+  status?: RunStatus;
+  agent?: string;
+  resourceId?: string;
+  workKey?: string;
+  topLevel?: boolean;
+}
+
+export function matchesRunFilter(r: RunSummary, q: RunFilter | undefined): boolean {
+  return (q?.status ? r.status === q.status : true) && (q?.agent ? r.agent === q.agent : true)
+    && (q?.resourceId ? r.resourceId === q.resourceId : true)
+    && (q?.workKey ? r.workKey === q.workKey : true) && (q?.topLevel ? !r.parentRunId : true);
+}
+
+/**
+ * One page of runs from an array already in ascending creation order — the shape InMemory, Redis
+ * and a legacy array reader produce. Filters before it slices (the listRunsPaged contract), and
+ * places the cursor by its run: the position after `runId`, wherever that run now sits. When that
+ * run is gone, the page starts at `next`; when both are gone, at `seen` — the best an array without
+ * creation times can do.
+ *
+ * @internal — engine plumbing shared with the Studio and server run lists; gnl builds its argument from a validated request, no host writes it.
+ */
+export function pageRunsFromArray(
+  ascending: readonly RunSummary[],
+  q?: RunFilter & { limit?: number; cursor?: string; order?: RunOrder },
+): { items: RunSummary[]; nextCursor?: string } {
+  const pos = decodeRunCursor(q?.cursor);
+  let list = ascending.filter((r) => matchesRunFilter(r, q));
+  if (q?.order === 'desc') list = list.reverse();
+  const limit = q?.limit ?? 50;
+  let start = 0;
+  if (pos) {
+    const i = list.findIndex((r) => r.runId === pos.runId);
+    const n = i >= 0 || pos.next === undefined ? -1 : list.findIndex((r) => r.runId === pos.next);
+    start = i >= 0 ? i + 1 : n >= 0 ? n : Math.min(pos.seen, list.length);
+  }
+  const items = list.slice(start, start + limit);
+  const last = items[items.length - 1];
+  const following = list[start + limit];
+  const seen = (pos?.seen ?? 0) + items.length;
+  return { items, ...(following && last ? { nextCursor: encodeRunCursor({ runId: last.runId, next: following.runId, seen }) } : {}) };
+}
+
+/** One run as a database listing reads it: its summary and the `created_at` the order is keyed on. */
+export interface KeyedRun {
+  summary: RunSummary;
+  at: number;
+}
+
+/**
+ * One page of runs from a table keyed on `(created_at, run_id)` — Sqlite's and Postgres's `gnl_runs`.
+ *
+ * Each read is an index seek past the cursor's run, never `OFFSET` over the runs before it. A filter
+ * the table has no column for (agent, resourceId, workKey, topLevel live in the `:input` blob) is
+ * applied to rows read forward in chunks from the cursor until the page is full — never to every
+ * row. One run past the page is read to know whether there is a next page, so the last page carries
+ * no cursor (the `Page` contract) rather than one that leads to an empty page.
+ *
+ * `read(where, params, dir, take, skip)` runs the adapter's SELECT; `ph(n)` writes its n-th bound
+ * parameter (`?n` for Sqlite, `$n` for Postgres). `skip` is non-zero only for a cursor whose run is gone
+ * and that carries no `created_at` — the one case a position must fall back to counting.
+ */
+export async function keysetRunPage(
+  q: (RunFilter & { limit?: number; cursor?: string; order?: RunOrder }) | undefined,
+  statusCond: string | undefined,
+  atOf: (runId: string) => number | undefined | Promise<number | undefined>,
+  read: (where: string, params: unknown[], dir: 'ASC' | 'DESC', take: number, skip: number) => KeyedRun[] | Promise<KeyedRun[]>,
+  ph: (n: number) => string = (n) => `?${n}`,
+): Promise<{ items: RunSummary[]; nextCursor?: string }> {
+  const limit = q?.limit ?? 50;
+  const desc = q?.order === 'desc';
+  const pos = decodeRunCursor(q?.cursor);
+  const unindexed = !!(q?.agent || q?.resourceId || q?.workKey || q?.topLevel);
+  // `inclusive`: the position is placed BY the next run (its own run is gone), so that run is listed.
+  let after: { at: number; runId: string; inclusive?: boolean } | undefined;
+  let skip = 0;
+  if (pos) {
+    const at = pos.at ?? (await atOf(pos.runId));
+    const nextAt = at === undefined && pos.next !== undefined ? await atOf(pos.next) : undefined;
+    if (at !== undefined) after = { at: Number(at), runId: pos.runId };
+    else if (nextAt !== undefined) after = { at: Number(nextAt), runId: pos.next!, inclusive: true };
+    else skip = pos.seen;
+  }
+  const take = unindexed ? Math.max(limit + 1, 200) : limit + 1;
+  let skipRows = unindexed ? 0 : skip;
+  let skipMatches = unindexed ? skip : 0;
+  const out: KeyedRun[] = [];
+  for (;;) {
+    const conds: string[] = statusCond ? [statusCond] : [];
+    const params: unknown[] = [];
+    if (after) {
+      // A row comparison, the one form both planners read as a single range on the (created_at, run_id)
+      // index. Written out as `created_at >= a AND (created_at > a OR run_id > b)` the Postgres plan
+      // depended on its statistics: 10 000 runs walked in 1.3 s before an ANALYZE, 0.15 s after; the
+      // row form took 0.13 s either way (and 30 000 runs 0.43 s).
+      const [cmp, cmpEq] = desc ? ['<', '<='] : ['>', '>='];
+      conds.push(`(r.created_at, r.run_id) ${after.inclusive ? cmpEq : cmp} (${ph(1)}, ${ph(2)})`);
+      params.push(after.at, after.runId);
+    }
+    const rows = await read(conds.length ? ` WHERE ${conds.join(' AND ')}` : '', params, desc ? 'DESC' : 'ASC', take, skipRows);
+    skipRows = 0;
+    for (const row of rows) {
+      after = { at: row.at, runId: row.summary.runId };
+      if (unindexed && !matchesRunFilter(row.summary, q)) continue;
+      if (skipMatches > 0) { skipMatches--; continue; }
+      out.push(row);
+      if (out.length > limit) break;
+    }
+    if (out.length > limit || rows.length < take) break;
+  }
+  const items = out.slice(0, limit);
+  const last = items[items.length - 1];
+  return {
+    items: items.map((r) => r.summary),
+    ...(out.length > limit && last ? { nextCursor: encodeRunCursor({ runId: last.summary.runId, at: last.at, next: out[limit]!.summary.runId, seen: (pos?.seen ?? 0) + items.length }) } : {}),
+  };
+}

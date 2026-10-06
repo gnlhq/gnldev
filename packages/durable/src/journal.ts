@@ -5,6 +5,7 @@ import type { Guard } from './guard.js';
 import type { RunLimits, ToolSeat } from './limits.js';
 import type { Processor } from './processor.js';
 import { stableStringify } from './hash.js';
+import { pageRunsFromArray, type RunOrder } from './run-cursor.js';
 import { isVersionedKey, upgradeFormat } from './format.js';
 
 export type ToolJournalRecord = (
@@ -769,6 +770,8 @@ export interface JournalReader {
     workKey?: string;
     /** Only runs no other run started (`RunSummary.parentRunId` absent). Same filter-before-slice contract. */
     topLevel?: boolean;
+    /** `'desc'` lists newest first; default `'asc'`. See `ListQuery.order`. */
+    order?: RunOrder;
   }): Promise<{ items: RunSummary[]; nextCursor?: string }>;
 }
 
@@ -780,6 +783,7 @@ export type RunListQuery = {
   resourceId?: string;
   workKey?: string;
   topLevel?: boolean;
+  order?: RunOrder;
 };
 
 /**
@@ -812,19 +816,6 @@ export async function listRunsArray(
   return items;
 }
 
-/** Filter + slice an array of runs with the SAME semantics listRunsPaged specifies. */
-function pageFromArray(all: RunSummary[], q?: RunListQuery): { items: RunSummary[]; nextCursor?: string } {
-  const filtered = all.filter(
-    (r) => (q?.status ? r.status === q.status : true) && (q?.agent ? r.agent === q.agent : true)
-      && (q?.resourceId ? r.resourceId === q.resourceId : true)
-      && (q?.workKey ? r.workKey === q.workKey : true) && (q?.topLevel ? !r.parentRunId : true),
-  );
-  const start = q?.cursor ? Number(q.cursor) || 0 : 0;
-  const lim = q?.limit ?? 50;
-  const next = start + lim;
-  return { items: filtered.slice(start, next), nextCursor: next < filtered.length ? String(next) : undefined };
-}
-
 /**
  * Accept a journal in EITHER shape and present the `JournalReader` contract: an array `listRuns()`
  * plus a real `listRunsPaged()`.
@@ -849,7 +840,7 @@ export function asReaderJournal<T extends object>(journal: T): T {
           // A RunJournal applies the filters itself and hands back a real page; a legacy array reader
           // ignores the query, so the same semantics are applied here instead.
           const res: unknown = await j.listRuns!(q);
-          return Array.isArray(res) ? pageFromArray(res as RunSummary[], q) : (res as { items: RunSummary[]; nextCursor?: string });
+          return Array.isArray(res) ? pageRunsFromArray(res as RunSummary[], q) : (res as { items: RunSummary[]; nextCursor?: string });
         };
       }
       const v = Reflect.get(target, prop, receiver);
@@ -1233,22 +1224,11 @@ export class InMemoryJournal implements Journal, JournalReader {
   /**
    * P0.3 paginated + filtered sibling of `listRuns()` above — see the
    * `JournalReader.listRunsPaged` JSDoc for the filter-semantics contract. In-memory reference
-   * implementation: derive the full array (already O(store size), same cost `listRuns()` pays), filter,
-   * then offset-paginate — mirroring the numeric cursor-as-offset convention every adapter's own
-   * `offset()`/`paginate()` helper uses (sqlite-storage.ts/postgres-storage.ts/redis-storage.ts/
-   * in-memory-storage.ts), so a cursor produced by one path is interchangeable with the others.
+   * implementation: derive the full array (already O(store size), same cost `listRuns()` pays), then
+   * page it with the cursor every run listing hands out (run-cursor.ts), so a cursor produced by one
+   * path is read by the others.
    */
   async listRunsPaged(q?: RunListQuery): Promise<{ items: RunSummary[]; nextCursor?: string }> {
-    let all = await this.listRuns();
-    if (q?.status) all = all.filter((r) => r.status === q.status);
-    if (q?.agent) all = all.filter((r) => r.agent === q.agent);
-    if (q?.resourceId) all = all.filter((r) => r.resourceId === q.resourceId);
-    if (q?.workKey) all = all.filter((r) => r.workKey === q.workKey);
-    if (q?.topLevel) all = all.filter((r) => !r.parentRunId);
-    const start = q?.cursor ? Number(q.cursor) || 0 : 0;
-    const limit = q?.limit ?? 50;
-    const items = all.slice(start, start + limit);
-    const next = start + limit;
-    return { items, nextCursor: next < all.length ? String(next) : undefined };
+    return pageRunsFromArray(await this.listRuns(), q);
   }
 }

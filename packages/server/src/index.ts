@@ -3,7 +3,7 @@
 import { Hono, type Context } from 'hono';
 import { toFetchHandler, type FetchHandler } from './handler.js';
 import { verifyA2ARequest } from '@gnldev/a2a';
-import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, cancelAgentRun, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, callerConflictAnswer, upstreamFailure, requestRefusal, assertRootThreadId, orgPrefix, withRootScope, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext, readJsonObject } from '@gnldev/durable';
+import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, cancelAgentRun, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, callerConflictAnswer, upstreamFailure, requestRefusal, assertRootThreadId, orgPrefix, withRootScope, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
 import type { CreateGnlConfig, Journal, JournalReader, BudgetLimit, UsageCostCache, RunLimits, ResolvedWorkIdentity, WorkScopeKind, StreamSurface as DurableStreamSurface, StreamSurfaceInput } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, callerKind, subjectIdProblem, actorIdOf, engineCallerOf, markRefusal, settleDecision, decisionNotRecorded, type AuthProvider, type ReadWriteAuth, type Principal, type PrincipalKind, type RefusalReason, refuseMisplacedOptions, doorOptionKeys, printProtections } from '@gnldev/auth';
 // P0.4 @gnldev/workflow is zero-dependency (see its package.json) — depending on it
@@ -2280,6 +2280,11 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     // A list rather than a chain of !==: this validation has lagged the vocabulary at every widening
     // ('failed', then 'running', now 'canceled'), and a chain invites the next one. The message is
     // built from the same list, so it can never advertise a smaller vocabulary than it accepts.
+    // A cursor the run listing cannot read is the caller's mistake, said as one — the listing itself
+    // throws on it rather than serving page one again (run-cursor.ts in @gnldev/durable).
+    if (cursor && !isRunCursor(cursor)) {
+      return c.json({ error: `invalid cursor '${cursor}': pass back the nextCursor from the previous page verbatim (row-number cursors from 0.10 and earlier are no longer read)` }, 400);
+    }
     const RUN_STATUSES = ['completed', 'suspended', 'failed', 'running', 'canceled'] as const;
     let status: (typeof RUN_STATUSES)[number] | undefined;
     if (statusRaw != null) {
@@ -2308,13 +2313,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     // genuinely absent. `source` is intentionally NOT stamped on the response — the shape stays
     // identical to the paged branch above ({items, nextCursor}) so callers don't need to branch on it.
     const all = await s.journal.listRuns();
-    const filtered = all.filter((r) => (status ? r.status === status : true) && (agent ? r.agent === agent : true)
-      && (resourceId ? r.resourceId === resourceId : true));
-    const start = cursor ? Number(cursor) || 0 : 0;
-    const lim = limit ?? 50;
-    const items = filtered.slice(start, start + lim);
-    const next = start + lim;
-    return c.json({ items, nextCursor: next < filtered.length ? String(next) : undefined });
+    return c.json(pageRunsFromArray(all, q));
   });
 
   /**

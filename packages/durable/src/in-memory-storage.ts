@@ -6,6 +6,7 @@ import { serialize, deserialize, copyValue } from './serialize.js';
 import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from './storage.js';
 import { memoryPartitionOf, inMemoryPartition, type MemoryPartitionOption } from './storage.js';
 import { InMemoryJournal } from './journal.js';
+import { pageRunsFromArray } from './run-cursor.js';
 import { stableStringify } from './hash.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
 import type { JournalEntry, RunSummary } from './journal.js';
@@ -24,7 +25,7 @@ function genId(prefix: string): string {
 }
 
 /**
- * Offset-cursor pagination (every list here except `WorkStore.list`, which is keyed — see the port).
+ * Offset-cursor pagination (every list here except `WorkStore.list` and `RunJournal.listRuns`, which are keyed).
  *
  * The note here used to say "real storages use a keyset cursor". They do not — postgres, sqlite and
  * redis all read the cursor as a row offset, exactly like this one. The line described an intention
@@ -82,17 +83,10 @@ class InMemoryRunJournal implements RunJournal {
   listStaleRuns(cutoffTs: number, opts?: { includeSuspended?: boolean }) { return this.journal.listStaleRuns(cutoffTs, opts); }
   readRunStats(runId: string) { return this.journal.readRunStats(runId); }
   deletePrefix(prefix: string) { return this.journal.deletePrefix(prefix); }
-  // P0.3 filter BEFORE paginate() slices — same "filter before slicing, not
-  // after" rule the real adapters follow (sqlite/postgres/redis-storage.ts), so a filtered page never
-  // desyncs from an unfiltered scan or drops matching items off a page boundary.
+  // Filtered before it is sliced, and paged by run rather than by row number (run-cursor.ts) — the
+  // same cursor every other run listing hands out.
   async listRuns(q?: ListQuery): Promise<Page<RunSummary>> {
-    let all = await this.journal.listRuns();
-    if (q?.status) all = all.filter((r) => r.status === q.status);
-    if (q?.agent) all = all.filter((r) => r.agent === q.agent);
-    if (q?.resourceId) all = all.filter((r) => r.resourceId === q.resourceId);
-    if (q?.workKey) all = all.filter((r) => r.workKey === q.workKey);
-    if (q?.topLevel) all = all.filter((r) => !r.parentRunId);
-    return paginate(all, q);
+    return pageRunsFromArray(await this.journal.listRuns(), q);
   }
 }
 

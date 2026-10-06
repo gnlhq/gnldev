@@ -5,7 +5,7 @@ import { Hono, type Context } from 'hono';
 import { sseResponse } from './sse.js';
 
 import { STUDIO_ERROR_CODES } from './error-codes.js';
-import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, requestRefusal, eraseSubject, subjectRuns, toJournal, decodeStepRecord, readJsonObject } from '@gnldev/durable';
+import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, requestRefusal, eraseSubject, subjectRuns, toJournal, decodeStepRecord, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
 import type { JournalReader, Journal, Memory, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
@@ -1946,58 +1946,25 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (limitRaw === undefined) return c.json(await reader.listRuns());
     const limit = Math.min(Math.max(Math.floor(Number(limitRaw)) || 0, 1), 500);
     /**
-     * The cursor is an ASCENDING anchor — the exclusive END of the window the next page will serve —
-     * NOT "how many newest rows to skip". The difference is the whole point.
+     * The cursor is the run listing's own (@gnldev/durable run-cursor.ts): the last run this list
+     * handed out, newest first.
      *
-     * THIS IS A TRADE, NOT A STRICT IMPROVEMENT. The two readings are duals, and each is wrong under
-     * the mutation the other survives:
+     * It replaced an ascending anchor that was a trade between two failures. A newest-first offset
+     * repeats rows when runs land between two requests (total=100/limit=20: page 1 = [80,100), five
+     * runs land, page 2 = [65,85) — five rows again); an ascending anchor repeats them when a sweep
+     * deletes old runs between two requests (10 runs/limit 3: page 1 = [010,009,008], sweep the 6
+     * oldest, page 2 = [010,009,008] again). A position keyed on the run is moved by neither.
      *
-     *   INSERT at the newest end   moves newest-first offsets   leaves ascending indices alone
-     *   DELETE at the oldest end   leaves newest-first offsets  moves ascending indices
-     *
-     * Under the old offset reading, every run written between two page requests pushed the window
-     * back toward rows already shown: measured at total=100/limit=20, page 1 serves [80,100); five
-     * runs land; page 2 computes 105-20=85 and serves [65,85) — five rows repeated.
-     *
-     * Under this one, a `sweepRuns` between two page requests renumbers everything above the deleted
-     * rows: measured at 10 runs/limit 3, page 1 = [010,009,008]; sweep the 6 oldest; page 2 comes
-     * back [010,009,008] again. The OLD code answered that same case correctly, because deleting from
-     * the oldest end does not move a row's distance from the newest end.
-     *
-     * The trade is taken because the two events are nothing alike in frequency: an insert happens on
-     * every single run, a sweep only when retention runs. It is still a trade — do not read the
-     * change as free.
-     *
-     * The clamp below is also a choice with a cost. It keeps a stale anchor inside the table, which
-     * turns "the window fell off the end" into "page 1 again": a repeat instead of a skip. Rows the
-     * reader has seen twice are recoverable; rows never shown are not.
-     *
-     * The only cursor that survives both is one keyed on the ROW (created_at + runId) rather than on
-     * a position. That needs a timestamp written by the database and a `createdAt` on RunSummary,
-     * neither of which exists yet. This is one half, not the whole.
-     *
-     * Two kinds of bad cursor, two answers — they are not the same event:
-     *
-     *   NOT A NUMBER AT ALL (`?cursor=zzz`)   → 400. The caller invented one, or is speaking a
-     *                                            vocabulary this server does not have.
-     *   A NUMBER OUT OF RANGE (`-5`, `9999`)  → first page / clamp. Stale but well-formed: a cursor
-     *                                            issued before a retention sweep is exactly this.
-     *
-     * The distinction is load-bearing. Answering an uninterpretable cursor with page 1 *and a fresh
-     * `nextCursor`* looks like success, and the Studio's infinite query appends pages without
-     * de-duplicating (`studio-ui/src/api.ts`), so the same rows enter the list again and again while
-     * the client dutifully follows a cursor that never advances. Measured before this guard:
-     * `?cursor=k_2026_r5` returned 200 with page 1 and a cursor of `"2"`.
-     *
-     * `2.7` floors to 2 and is honoured — a fractional cursor is nonsense we can still act on.
-     * Zero is never handed out: the last page reports no cursor rather than `'0'`.
+     * A cursor the listing cannot read is a 400, not page one. Page one with a fresh `nextCursor` looks
+     * like success, and the Studio's infinite query appends pages without de-duplicating
+     * (`studio-ui/src/api.ts`), so the same runs entered the list again and again — measured before
+     * the first guard: `?cursor=k_2026_r5` returned 200 with page 1. The row-number cursors of 0.10 and
+     * earlier get the same answer, with a message that says so; a reload starts a fresh list.
      */
-    const cursorRaw = c.req.query('cursor');
-    if (cursorRaw !== undefined && cursorRaw !== '' && !/^-?\d+(\.\d+)?$/.test(cursorRaw)) {
-      return c.json({ error: `invalid cursor '${cursorRaw}': pass back the nextCursor from the previous page verbatim` }, 400);
+    const cursorRaw = c.req.query('cursor') || undefined;
+    if (cursorRaw !== undefined && !isRunCursor(cursorRaw)) {
+      return c.json({ error: `invalid cursor '${cursorRaw}': pass back the nextCursor from the previous page verbatim (row-number cursors from 0.10 and earlier are no longer read — reload the list)` }, 400);
     }
-    const cursorNum = Math.floor(Number(cursorRaw));
-    const anchor = Number.isFinite(cursorNum) && cursorNum > 0 ? cursorNum : undefined;
     const statusRaw = c.req.query('status');
     // Same list-not-a-chain form as @gnldev/server's GET /runs — the two must accept the SAME
     // vocabulary or the Studio's own filter tabs 400 against a server that already understands them.
@@ -2008,91 +1975,43 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const status = statusRaw as (typeof RUN_STATUSES)[number] | undefined;
     const agent = c.req.query('agent') || undefined;
     const q = c.req.query('q') || undefined;
-    // API-01/API-09: prefer the engine push-down (listRunsPaged) — avoids materializing EVERY run (see
-    // journal.ts JournalReader.listRunsPaged / postgres-storage.ts's indexed `ORDER BY ... LIMIT`)
-    // just to slice out one page. listRunsPaged's own order is ASCENDING (oldest-first, mirroring the
-    // underlying `ORDER BY created_at`), but studio's contract here is "newest first" (see
-    // studio-ui/api.ts's RunsPage type) — so a window is taken from the ascending end and reversed
-    // locally, never the whole table. `total` (countRunsByStatus's push-down aggregate, the SAME
-    // source GET /metrics already uses below) is read ONLY to anchor the FIRST page; every page after
-    // that walks backwards from the cursor, so a concurrent insert cannot shift the window (see the
-    // cursor note above). Falls back to the legacy full-scan+reverse when
-    // either capability is missing (a bare custom JournalReader, or an adapter without a cheap status
-    // aggregate — e.g. Redis, see redis-storage.ts), when total couldn't be read, or (API-09) when an
-    // `agent`/`q` filter is active: countRunsByStatus has no per-agent/per-substring count, so there is
-    // no cheap way to learn the FILTERED total upfront (needed for the newest-first↔ascending conversion
-    // above) — those filters fall through to the in-memory path below, no worse than the engine's own
-    // agent handling (postgres-storage.ts also full-scans for `agent` — there's no indexed column for it).
+    // API-01/API-09: prefer the engine push-down (listRunsPaged, newest first) — one index seek per
+    // page instead of materializing every run. `total` comes from countRunsByStatus (the SAME source
+    // GET /metrics uses below). Falls back to the full scan when either capability is missing (a bare
+    // custom JournalReader, or an adapter without a cheap status aggregate — e.g. Redis), when the
+    // count could not be read, or (API-09) when an `agent`/`q` filter is active: countRunsByStatus has
+    // no per-agent/per-substring count, so the FILTERED total is only known from the scan.
     if (agent === undefined && q === undefined && typeof reader.listRunsPaged === 'function' && typeof rw.countRunsByStatus === 'function') {
       // NOTE: unlike a normal optional-capability call, this can't be `rw.countRunsByStatus().catch(...)`
       // under an active org (see the reader bridge above + organization.ts: countRunsByStatus is
       // deliberately NOT bridged per-org), the call resolves SYNCHRONOUSLY to `undefined` (not a
       // rejected promise, via `scopedNow().countRunsByStatus?.()`), and `.catch` on `undefined` throws.
-      // Captured once: the narrowing from the `typeof` guards above survives neither the awaits below
-      // nor the closures, and the re-anchor path calls both a second time.
-      const countRuns = rw.countRunsByStatus.bind(rw);
-      const paged = reader.listRunsPaged.bind(reader);
       let counted: Record<string, number> | undefined;
-      try { counted = await countRuns(); } catch { counted = undefined; }
+      try { counted = await rw.countRunsByStatus(); } catch { counted = undefined; }
       if (counted) {
         // API-09: total is the FILTERED count — countRunsByStatus's per-status breakdown already gives
-        // it for free when `status` is set; unfiltered, sum every status (unchanged from before).
+        // it for free when `status` is set; unfiltered, sum every status.
         const total = status ? (counted[status] ?? 0) : Object.values(counted).reduce((a, b) => a + b, 0);
-        // Clamped to `total`: a cursor issued before a retention sweep can point past the end, and an
-        // unclamped anchor would ask the engine for a window that no longer exists.
-        const window = (end: number) => {
-          const ascEnd = Math.min(end, total);
-          return { ascEnd, ascStart: Math.max(0, ascEnd - limit) };
-        };
-        const draw = async (w: { ascEnd: number; ascStart: number }) =>
-          w.ascEnd > w.ascStart
-            ? (await paged({ limit: w.ascEnd - w.ascStart, cursor: String(w.ascStart), ...(status ? { status } : {}) })).items.reverse()
-            : [];
-
-        let win = window(anchor ?? total);
-        let items = await draw(win);
-        // The count and the rows are two separate reads — two round-trips on Postgres — and a
-        // retention sweep can land BETWEEN them. Then `total` describes a table that no longer
-        // exists: it says 10, the window asks for rows 7-10, and the engine now holds 4. The answer
-        // was an empty page carrying `total: 10` — page one of a list that visibly has runs in it.
-        // The clamp above only fixes a cursor that went stale between REQUESTS; this is the same
-        // staleness inside one. Re-anchor once against what the engine actually returned; a second
-        // sweep in the same millisecond would need a third read, and at that point the honest answer
-        // is a short page rather than an unbounded retry loop.
-        if (items.length === 0 && win.ascStart > 0) {
-          const fresh = await Promise.resolve(countRuns()).catch(() => undefined);
-          const freshTotal = fresh
-            ? (status ? (fresh[status] ?? 0) : Object.values(fresh).reduce((a, b) => a + b, 0))
-            : total;
-          if (freshTotal > 0 && freshTotal !== total) {
-            win = window(freshTotal);
-            items = await draw(win);
-            return c.json({ items, nextCursor: win.ascStart > 0 ? String(win.ascStart) : undefined, total: freshTotal });
-          }
-        }
-        return c.json({ items, nextCursor: win.ascStart > 0 ? String(win.ascStart) : undefined, total });
+        const page = await reader.listRunsPaged({ order: 'desc', limit, ...(cursorRaw ? { cursor: cursorRaw } : {}), ...(status ? { status } : {}) });
+        return c.json({ items: page.items, nextCursor: page.nextCursor, total });
       }
     }
     const all = await reader.listRuns();
-    // API-09: status/agent/q filters applied server-side BEFORE reversing/slicing — `total` below
-    // therefore already reflects the FILTERED set, never the whole journal (the UI shows `total` in its
-    // search placeholder, and it must describe the same set as `items`).
+    // API-09: status/agent/q filters applied server-side BEFORE paging — `total` below therefore
+    // already reflects the FILTERED set, never the whole journal (the UI shows `total` in its search
+    // placeholder, and it must describe the same set as `items`).
     const needle = q?.toLowerCase();
     const filtered = all.filter((r) =>
       (status === undefined || r.status === status) &&
       (agent === undefined || r.agent === agent) &&
       (needle === undefined || r.runId.toLowerCase().includes(needle)),
     );
-    // Same ascending-anchor cursor as the push-down branch above, and it MUST be the same: the branch
-    // taken depends on capabilities and filters, so one pagination session can start here and continue
-    // there (countRunsByStatus is deliberately unbridged under an org and resolves to undefined). Two
-    // cursor vocabularies would then be read by the wrong reader and serve a silently wrong page.
-    // threadId now comes from listRuns itself (every adapter surfaces it from the run's invisible `:input`
-    // entry in a SINGLE read, see journal.ts RunSummary.threadId) — no ADDITIONAL N+1 read happens here.
-    const ascEnd = Math.min(anchor ?? filtered.length, filtered.length);
-    const ascStart = Math.max(0, ascEnd - limit);
-    const items = filtered.slice(ascStart, ascEnd).reverse(); // journal append order is ascending → reversed = newest first
-    return c.json({ items, nextCursor: ascStart > 0 ? String(ascStart) : undefined, total: filtered.length });
+    // The SAME cursor as the push-down branch above, and it must be: the branch taken depends on
+    // capabilities and filters, so one pagination session can start in one and continue in the other
+    // (countRunsByStatus is deliberately unbridged under an org). The cursor names its run, which both
+    // can place. threadId comes from listRuns itself (journal.ts RunSummary.threadId) — no N+1 read.
+    const page = pageRunsFromArray(filtered, { order: 'desc', limit, ...(cursorRaw ? { cursor: cursorRaw } : {}) });
+    return c.json({ items: page.items, nextCursor: page.nextCursor, total: filtered.length });
   });
   app.get('/runs/:id', async (c) =>
     (await allowP(c.req.raw, 'runs:read')) ? c.json(await reader.readRun(decodeURIComponent(c.req.param('id')))) : deny(c.req.raw, 'read'),
@@ -3299,7 +3218,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     let newest: [string, string, number, number] | null = null;
     if (total > 0 && typeof reader.listRunsPaged === 'function') {
       try {
-        const page = await reader.listRunsPaged({ limit: 1, cursor: String(total - 1) });
+        const page = await reader.listRunsPaged({ limit: 1, order: 'desc' });
         const r = page.items[0];
         if (r) newest = [r.runId, r.status, r.modelSteps, r.toolCalls];
       } catch { newest = null; }

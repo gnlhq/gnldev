@@ -9,6 +9,7 @@ import { createRequire } from 'node:module';
 import { statSync, existsSync } from 'node:fs';
 import { cosineSimilarity } from 'ai';
 import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus } from './journal.js';
+import { keysetRunPage } from './run-cursor.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, orgSpaceSql } from './organization.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
@@ -960,18 +961,16 @@ class SqliteRunJournal implements RunJournal {
    * be the fix if this ever becomes a bottleneck at scale.
    */
   async listRuns(q?: ListQuery): Promise<Page<RunSummary>> {
-    const { start, limit } = offset(q);
     // Five-way, still entirely in SQL and still on indexed columns — 'canceled' outranks 'suspended',
     // which outranks the rest of the recorded outcome, matching deriveRunStatus exactly (see
     // journal.ts), so a filtered page and an unfiltered scan can never disagree about the same run.
-    const statusWhere =
-      q?.status === 'canceled' ? ' WHERE canceled = 1'
-      : q?.status === 'suspended' ? ' WHERE canceled = 0 AND suspended = 1'
-      : q?.status === 'failed' ? ' WHERE canceled = 0 AND suspended = 0 AND failed = 1'
-      : q?.status === 'running' ? ' WHERE canceled = 0 AND suspended = 0 AND failed = 0 AND running = 1'
-      : q?.status === 'completed' ? ' WHERE canceled = 0 AND suspended = 0 AND failed = 0 AND running = 0'
-      : '';
-    const statusParams: unknown[] = [];
+    const statusCond =
+      q?.status === 'canceled' ? 'r.canceled = 1'
+      : q?.status === 'suspended' ? 'r.canceled = 0 AND r.suspended = 1'
+      : q?.status === 'failed' ? 'r.canceled = 0 AND r.suspended = 0 AND r.failed = 1'
+      : q?.status === 'running' ? 'r.canceled = 0 AND r.suspended = 0 AND r.failed = 0 AND r.running = 1'
+      : q?.status === 'completed' ? 'r.canceled = 0 AND r.suspended = 0 AND r.failed = 0 AND r.running = 0'
+      : undefined;
     const toSummary = (r: RunRow): RunSummary => {
       const input = r.input_val ? deserialize<{ threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string }>(r.input_val) : undefined;
       return {
@@ -983,29 +982,16 @@ class SqliteRunJournal implements RunJournal {
         ...(input?.parentRunId ? { parentRunId: input.parentRunId } : {}),
       };
     };
-    // `agent`, `resourceId` and `workKey` share ONE path: none is a column, all three live inside the
-    // `:input` blob, so all three are filtered after the summary is built. Written as a single branch
-    // rather than three so a request carrying more than one cannot take a branch that applies only
-    // some of them — and so the filter-BEFORE-slice contract (JournalReader.listRunsPaged) is
-    // satisfied once, not per filter.
-    if (q?.agent || q?.resourceId || q?.workKey || q?.topLevel) {
+    const atOf = (runId: string) =>
+      (this.db.prepare('SELECT created_at FROM gnl_runs WHERE run_id = ?').get(runId) as { created_at: number } | undefined)?.created_at;
+    return keysetRunPage(q, statusCond, atOf, (where, params, dir, take, skip) => {
       const rows = this.db.prepare(
-        `SELECT r.run_id, r.model_steps, r.tool_calls, r.suspended, r.failed, r.running, r.canceled,
+        `SELECT r.run_id, r.created_at, r.model_steps, r.tool_calls, r.suspended, r.failed, r.running, r.canceled,
                 (SELECT value FROM gnl_run_journal WHERE key = r.run_id || ':input') AS input_val
-         FROM gnl_runs r${statusWhere} ORDER BY r.created_at, r.run_id`,
-      ).all(...statusParams) as RunRow[];
-      const all = rows.map(toSummary)
-        .filter((r) => (q.agent ? r.agent === q.agent : true) && (q.resourceId ? r.resourceId === q.resourceId : true)
-          && (q.workKey ? r.workKey === q.workKey : true) && (q.topLevel ? !r.parentRunId : true));
-      return pageOf(all.slice(start, start + limit), start, limit, all.length);
-    }
-    const total = (this.db.prepare(`SELECT COUNT(*) AS n FROM gnl_runs${statusWhere}`).get(...statusParams) as { n: number }).n;
-    const rows = this.db.prepare(
-      `SELECT r.run_id, r.model_steps, r.tool_calls, r.suspended, r.failed, r.running, r.canceled,
-              (SELECT value FROM gnl_run_journal WHERE key = r.run_id || ':input') AS input_val
-       FROM gnl_runs r${statusWhere} ORDER BY r.created_at, r.run_id LIMIT ? OFFSET ?`,
-    ).all(...statusParams, limit, start) as RunRow[];
-    return pageOf(rows.map(toSummary), start, limit, total);
+         FROM gnl_runs r${where} ORDER BY r.created_at ${dir}, r.run_id ${dir} LIMIT ? OFFSET ?`,
+      ).all(...params, take, skip) as (RunRow & { created_at: number })[];
+      return rows.map((r) => ({ summary: toSummary(r), at: r.created_at }));
+    });
   }
 
   /**

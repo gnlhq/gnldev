@@ -126,7 +126,9 @@ try {
       'packages/rag/test/postgres-vector-store.test.ts',
       // Organization isolation for the metrics export: an in-memory journal addresses counters by
       // exact key, so the cross-tenant read this guards against cannot even be written against it.
-      'packages/otel/test/metrics-org-postgres.test.ts'], { env }).status === 0);
+      'packages/otel/test/metrics-org-postgres.test.ts',
+      // Run-list keyset paging: a row comparison pg-mem cannot parse, so its real coverage is here.
+      'packages/durable/test/run-cursor-parity.test.ts'], { env }).status === 0);
 
   // A SEPARATE vitest run, after the one above, on purpose. integration-real's failover case
   // terminates every backend on the database (`pg_terminate_backend` over pg_stat_activity), and

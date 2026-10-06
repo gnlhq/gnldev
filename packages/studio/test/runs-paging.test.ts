@@ -1,6 +1,6 @@
 // S4 pagination: GET /runs?limit=&cursor= → a Page envelope (newest first); no parameters → a flat array (backward-compatible).
 import { describe, it, expect, vi } from 'vitest';
-import { InMemoryJournal, purgeRun } from '@gnldev/durable';
+import { InMemoryJournal, purgeRun, pageRunsFromArray } from '@gnldev/durable';
 import type { RunSummary } from '@gnldev/durable';
 import { createStudioApi } from '../src/server.js';
 import { call } from './call.js';
@@ -32,24 +32,19 @@ describe('GET /runs pagination', () => {
     expect(p3.nextCursor).toBeUndefined(); // last page
   });
 
-  // The clamp exists because a cursor can outlive the rows it points past: `sweepRuns` deletes old
-  // runs, which is the one thing that DOES move an ascending anchor. Without it the route asks the
-  // engine for a window beyond the end. Nothing else pins it — remove the clamp and every other test
-  // here still passes.
-  it('a cursor pointing past the end lands on the first page, not on an empty one', async () => {
+  // A row number was the cursor of 0.10 and earlier. It named a position in a window that moves,
+  // which is what the run cursor replaced; reading it as one would serve some arbitrary stretch of the
+  // list. Refused, with a message that says why, so a list open across an upgrade reloads rather than
+  // appending page one again.
+  it('a row-number cursor from 0.10 is refused with a 400 that says so', async () => {
     const journal = new InMemoryJournal();
     await seedRuns(journal, 3);
     const app = createStudioApi({ reader: journal });
-
-    const far = await (await call(app, '/runs?limit=2&cursor=9999')).json();
-    expect(far.items.map((r: RunSummary) => r.runId)).toEqual(['run-3', 'run-2']);
-
-    // Zero is a real anchor — "the window ends at the oldest row" — but it is never handed out (the
-    // last page reports no cursor at all), so arriving with it means a hand-written or stale request.
-    // It is treated as absent for the same reason `-5` is: an empty list is a worse answer than the
-    // first page.
-    const zero = await (await call(app, '/runs?limit=2&cursor=0')).json();
-    expect(zero.items.map((r: RunSummary) => r.runId)).toEqual(['run-3', 'run-2']);
+    for (const old of ['9999', '0', '2']) {
+      const res = await call(app, `/runs?limit=2&cursor=${old}`);
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/0\.10/);
+    }
   });
 
   it('page items carry threadId (from the run\'s :input entry); absent if there is none', async () => {
@@ -75,18 +70,17 @@ describe('GET /runs pagination', () => {
     expect(res).toHaveLength(3);
   });
 
-  it('malformed limit/cursor values fall back to safe defaults', async () => {
+  it('a malformed limit falls back to a safe default; a malformed cursor is a 400', async () => {
     const journal = new InMemoryJournal();
     await seedRuns(journal, 3);
     const app = createStudioApi({ reader: journal });
-    // limit=abc → clamped to a minimum of 1; cursor=-5 → treated as absent, i.e. the FIRST page.
-    // Not "clamped to 0": under the ascending-anchor cursor, 0 is a real position meaning "the window
-    // ends at the oldest row", so clamping garbage to it would answer a malformed request with an
-    // empty list. See the cursor note in server.ts.
-    const res = await (await call(app, '/runs?limit=abc&cursor=-5')).json();
+    // limit=abc → clamped to a minimum of 1.
+    const res = await (await call(app, '/runs?limit=abc')).json();
     expect(res.items).toHaveLength(1);
     expect(res.items[0].runId).toBe('run-3');
     expect(res.total).toBe(3);
+    // A cursor is echoed, never written; one nobody handed out is a mistake to report, not a page.
+    expect((await call(app, '/runs?limit=abc&cursor=-5')).status).toBe(400);
   });
 
   // API-01: GET /runs used to call reader.listRuns() (materializing EVERY run) on every ?limit= page
@@ -106,12 +100,8 @@ describe('GET /runs pagination', () => {
           throw new Error('listRuns must not be called when listRunsPaged + countRunsByStatus are both available');
         }),
         readRun: vi.fn(async () => []),
-        listRunsPaged: vi.fn(async (q?: { limit?: number; cursor?: string }) => {
-          const start = q?.cursor ? Number(q.cursor) : 0;
-          const limit = q?.limit ?? 50;
-          const page = items.slice(start, start + limit);
-          return { items: page, nextCursor: start + limit < items.length ? String(start + limit) : undefined };
-        }),
+        // The real contract (run cursors, `order`), over an array the test controls.
+        listRunsPaged: vi.fn(async (q?: { limit?: number; cursor?: string; order?: 'asc' | 'desc' }) => pageRunsFromArray(items, q)),
         countRunsByStatus: vi.fn(async () => {
           const out: Record<string, number> = {};
           for (const r of items) out[r.status] = (out[r.status] ?? 0) + 1;
@@ -313,13 +303,7 @@ describe('GET /runs pagination', () => {
       const reader = {
         listRuns: vi.fn(async () => { throw new Error('must not be called — status is push-down-capable'); }),
         readRun: vi.fn(async () => []),
-        listRunsPaged: vi.fn(async (q?: { limit?: number; cursor?: string; status?: string }) => {
-          const filtered = q?.status ? fixture.filter((r) => r.status === q.status) : fixture;
-          const start = q?.cursor ? Number(q.cursor) : 0;
-          const limit = q?.limit ?? 50;
-          const page = filtered.slice(start, start + limit);
-          return { items: page, nextCursor: start + limit < filtered.length ? String(start + limit) : undefined };
-        }),
+        listRunsPaged: vi.fn(async (q?: { limit?: number; cursor?: string; status?: RunSummary['status']; order?: 'asc' | 'desc' }) => pageRunsFromArray(fixture, q)),
         countRunsByStatus: vi.fn(async () => ({ completed: 2, suspended: 1 })),
       };
       const app = createStudioApi({ reader: reader as any });
@@ -369,11 +353,7 @@ describe('GET /runs — what the coverage above misses', () => {
     return {
       listRuns: vi.fn(async () => { throw new Error('listRuns must not be called on the push-down path'); }),
       readRun: vi.fn(async () => []),
-      listRunsPaged: vi.fn(async (q?: { limit?: number; cursor?: string }) => {
-        const start = q?.cursor ? Number(q.cursor) : 0;
-        const limit = q?.limit ?? 50;
-        return { items: items.slice(start, start + limit), nextCursor: start + limit < items.length ? String(start + limit) : undefined };
-      }),
+      listRunsPaged: vi.fn(async (q?: { limit?: number; cursor?: string; order?: 'asc' | 'desc' }) => pageRunsFromArray(items, q)),
       countRunsByStatus: vi.fn(async () => ({ completed: items.length })),
     };
   }
@@ -422,12 +402,12 @@ describe('GET /runs — what the coverage above misses', () => {
    * If this fails and the opacity test above still passes, the encoding changed and that is allowed —
    * update this test. If the one above fails too, the change broke pagination itself.
    */
-  it('encoding note: the cursor is a numeric string today — that is not a promise', async () => {
+  it('encoding note: the cursor names a run today (`r1:`) — that is not a promise', async () => {
     const journal = new InMemoryJournal();
     await seedRuns(journal, 5);
     const app = createStudioApi({ reader: journal });
     const p1 = await (await call(app, '/runs?limit=2')).json();
-    expect(p1.nextCursor).toMatch(/^\d+$/);
+    expect(p1.nextCursor).toMatch(/^r1:/);
   });
 
   /**
@@ -446,8 +426,13 @@ describe('GET /runs — what the coverage above misses', () => {
     expect(res.status).toBe(400);
     expect((await res.json()).error).toMatch(/cursor/i);
 
-    // Well-formed but stale still works — the two cases must not collapse into one another.
-    expect((await (await call(app, '/runs?limit=2&cursor=9999')).json()).items).toHaveLength(2);
+    // Well-formed but stale still works — the two cases must not collapse into one another. Here the
+    // run the cursor names is purged between the two requests.
+    const p1 = await (await call(app, '/runs?limit=2')).json();
+    await purgeRun(journal, 'run-4');
+    const p2 = await (await call(app, `/runs?limit=2&cursor=${encodeURIComponent(p1.nextCursor)}`)).json();
+    // run-3 was the next run when page 1 was served; it is still there, so page 2 starts with it.
+    expect(p2.items.map((r: RunSummary) => r.runId)).toEqual(['run-3', 'run-2']);
   });
 
   /**

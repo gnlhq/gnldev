@@ -2,6 +2,7 @@
 // Drop-in: generateText -> runDurable. Composable: withDurableModel + durableTools.
 
 export { InMemoryJournal, parseJournalKey, assertThreadId, summarizeRun, claim, frozenGet, runKeys, deriveRunStatus, nestedAgentRunId, listRunsArray, asReaderJournal, runIdOfKey } from './journal.js';
+export { isRunCursor, pageRunsFromArray, type RunOrder } from './run-cursor.js';
 // H13 — journal format versioning: an API that keeps old records readable across SDK-major transitions.
 export { JOURNAL_FORMAT_VERSION, JournalFormatError, registerFormatUpgrade, stampFormat, upgradeFormat, isVersionedKey } from './format.js';
 export { acquireRunLock } from './run-lock.js';

@@ -17,6 +17,7 @@
 //   runs+work+cache default.
 import { createRequire } from 'node:module';
 import { runIdOfKey, parseJournalKey, deriveRunStatus } from './journal.js';
+import { pageRunsFromArray } from './run-cursor.js';
 import { stableStringify } from './hash.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
@@ -1061,8 +1062,8 @@ class RedisRunJournal implements RunJournal {
     if (q?.resourceId) all = all.filter((r) => r.resourceId === q.resourceId);
     if (q?.workKey) all = all.filter((r) => r.workKey === q.workKey);
     if (q?.topLevel) all = all.filter((r) => !r.parentRunId);
-    const { start, limit } = offset(q);
-    return pageOf(all, start, limit);
+    // Paged by run, not by row number (run-cursor.ts): the same cursor every run listing hands out.
+    return pageRunsFromArray(all, q);
   }
 }
 

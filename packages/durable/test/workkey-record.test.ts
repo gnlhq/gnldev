@@ -104,14 +104,16 @@ describe('workKey — the record (package #2)', () => {
 // The four adapters derive `RunSummary` fields by four different mechanisms (in-memory point read,
 // SQLite correlated subquery, Postgres LEFT JOIN, Redis single SCAN). A field that surfaces on one
 // and not another is how an operator's filter silently answers "no such run".
-const backends: Array<[string, () => Storage]> = [
+// The fourth element: whether the store can read a run list's second page — pg-mem cannot compare rows
+// (`(created_at, run_id) > (…)`, run-cursor.ts); run-cursor-parity.test.ts walks it on a real Postgres.
+const backends: Array<[string, () => Storage, boolean?]> = [
   ['in-memory', () => new InMemoryStorage()],
   ['sqlite', () => new SqliteStorage(':memory:')],
-  ['postgres', () => { const { Pool } = newDb().adapters.createPg(); return new PostgresStorage({ pool: new Pool() }); }],
+  ['postgres', () => { const { Pool } = newDb().adapters.createPg(); return new PostgresStorage({ pool: new Pool() }); }, false],
   ['redis', () => new RedisStorage({ client: makeFakeRedis() as never })],
 ];
 
-for (const [name, make] of backends) {
+for (const [name, make, pages = true] of backends) {
   describe(`workKey on RunSummary — ${name}`, () => {
     it('surfaces workKey from the `:input` entry and filters by it BEFORE slicing', async () => {
       const s = make();
@@ -132,14 +134,16 @@ for (const [name, make] of backends) {
 
       // Filter-before-slice: walking job-A at limit 2 must yield exactly those three, never a short
       // page whose cursor has already stepped past a match.
-      const seen: string[] = [];
-      let cursor: string | undefined;
-      do {
-        const page = await runs.listRuns({ workKey: 'job-A', limit: 2, ...(cursor ? { cursor } : {}) });
-        seen.push(...page.items.map((r) => r.runId));
-        cursor = page.nextCursor;
-      } while (cursor);
-      expect(seen.sort()).toEqual(['wa', 'wc', 'wd']);
+      if (pages) {
+        const seen: string[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await runs.listRuns({ workKey: 'job-A', limit: 2, ...(cursor ? { cursor } : {}) });
+          seen.push(...page.items.map((r) => r.runId));
+          cursor = page.nextCursor;
+        } while (cursor);
+        expect(seen.sort()).toEqual(['wa', 'wc', 'wd']);
+      }
       await (s as { close?: () => void }).close?.();
     });
 

@@ -8,6 +8,7 @@ import { memoryPartitionOf, memoryPartitionSql, type MemoryPartitionOption } fro
 import { createRequire } from 'node:module';
 import { cosineSimilarity } from 'ai';
 import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus } from './journal.js';
+import { keysetRunPage } from './run-cursor.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
 import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, vectorDocumentOf, vectorFilterDocument } from './storage.js';
@@ -1044,18 +1045,16 @@ class PgRunJournal implements RunJournal {
    * comment for the full rationale.
    */
   async listRuns(q?: ListQuery): Promise<Page<RunSummary>> {
-    const { start, limit } = offset(q);
     // Five-way, still on indexed columns, and in the SAME precedence deriveRunStatus applies
     // (canceled beats suspended beats the rest of the recorded outcome) so a filtered page cannot
     // disagree with a full scan.
-    const statusWhere =
-      q?.status === 'canceled' ? ' WHERE r.canceled = true'
-      : q?.status === 'suspended' ? ' WHERE r.canceled = false AND r.suspended = true'
-      : q?.status === 'failed' ? ' WHERE r.canceled = false AND r.suspended = false AND r.failed = true'
-      : q?.status === 'running' ? ' WHERE r.canceled = false AND r.suspended = false AND r.failed = false AND r.running = true'
-      : q?.status === 'completed' ? ' WHERE r.canceled = false AND r.suspended = false AND r.failed = false AND r.running = false'
-      : '';
-    const statusParams: unknown[] = [];
+    const statusCond =
+      q?.status === 'canceled' ? 'r.canceled = true'
+      : q?.status === 'suspended' ? 'r.canceled = false AND r.suspended = true'
+      : q?.status === 'failed' ? 'r.canceled = false AND r.suspended = false AND r.failed = true'
+      : q?.status === 'running' ? 'r.canceled = false AND r.suspended = false AND r.failed = false AND r.running = true'
+      : q?.status === 'completed' ? 'r.canceled = false AND r.suspended = false AND r.failed = false AND r.running = false'
+      : undefined;
     const toSummary = (x: any): RunSummary => {
       const input = x.input_val ? deserialize<{ threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string }>(x.input_val) : undefined;
       return {
@@ -1067,32 +1066,19 @@ class PgRunJournal implements RunJournal {
         ...(input?.parentRunId ? { parentRunId: input.parentRunId } : {}),
       };
     };
-    // `agent`, `resourceId` and `workKey` share ONE path: none is a column, all three live inside the
-    // `:input` blob, so all three are filtered after the summary is built. Written as a single branch
-    // rather than three so a request carrying more than one cannot take a branch that applies only
-    // some of them — and so the filter-BEFORE-slice contract (JournalReader.listRunsPaged) is
-    // satisfied once, not per filter.
-    if (q?.agent || q?.resourceId || q?.workKey || q?.topLevel) {
+    const atOf = async (runId: string) => {
+      const r = await this.q('SELECT created_at FROM gnl_runs WHERE run_id = $1', [runId]);
+      return r.rows[0] ? Number(r.rows[0].created_at) : undefined;
+    };
+    return keysetRunPage(q, statusCond, atOf, async (where, params, dir, take, skip) => {
       const r = await this.q(
-        `SELECT r.run_id, r.model_steps, r.tool_calls, r.suspended, r.failed, r.running, r.canceled, j.value AS input_val
-         FROM gnl_runs r LEFT JOIN gnl_run_journal j ON j.key = r.run_id || ':input'${statusWhere}
-         ORDER BY r.created_at, r.run_id`,
-        statusParams,
+        `SELECT r.run_id, r.created_at, r.model_steps, r.tool_calls, r.suspended, r.failed, r.running, r.canceled, j.value AS input_val
+         FROM gnl_runs r LEFT JOIN gnl_run_journal j ON j.key = r.run_id || ':input'${where}
+         ORDER BY r.created_at ${dir}, r.run_id ${dir} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        [...params, take, skip],
       );
-      const all = r.rows.map(toSummary)
-        .filter((x) => (q.agent ? x.agent === q.agent : true) && (q.resourceId ? x.resourceId === q.resourceId : true)
-          && (q.workKey ? x.workKey === q.workKey : true) && (q.topLevel ? !x.parentRunId : true));
-      return pageOf(all.slice(start, start + limit), start, limit, all.length);
-    }
-    const total = Number((await this.q(`SELECT COUNT(*) AS n FROM gnl_runs r${statusWhere}`, statusParams)).rows[0].n);
-    const limitIdx = statusParams.length + 1;
-    const r = await this.q(
-      `SELECT r.run_id, r.model_steps, r.tool_calls, r.suspended, r.failed, r.running, r.canceled, j.value AS input_val
-       FROM gnl_runs r LEFT JOIN gnl_run_journal j ON j.key = r.run_id || ':input'${statusWhere}
-       ORDER BY r.created_at, r.run_id LIMIT $${limitIdx} OFFSET $${limitIdx + 1}`,
-      [...statusParams, limit, start],
-    );
-    return pageOf(r.rows.map(toSummary), start, limit, total);
+      return r.rows.map((x: any) => ({ summary: toSummary(x), at: Number(x.created_at) }));
+    }, (n) => `$${n}`);
   }
 
   /**

@@ -7,6 +7,7 @@
 // core stays thin; concrete impls (in-memory/sqlite/postgres-storage) implement these ports.
 
 import type { Journal, JournalEntry, RunSummary, JournalReader, RunStatus } from './journal.js';
+import type { RunOrder } from './run-cursor.js';
 import { VectorOwnerConflictError } from './errors.js';
 import { assertOwnerId, isWellFormed, OwnerIdError } from './owned-name.js';
 import { ORG_KEY_PREFIX, isOrganizationKey, parseOrganizationKey, orgSpaceSql, prefixSql } from './organization.js';
@@ -29,8 +30,8 @@ import { COMPOSITE_NAMES } from './option-names.js';
  * is a change we intend to make, and the opacity above is what keeps it from being a breaking one.
  *
  * `WorkStore.list` is the first list that made it: its cursor is persisted by the queue and the
- * events consumer, so a window that shifts under the reader lost work (see `WorkStore.list`). The
- * other lists are still offsets.
+ * events consumer, so a window that shifts under the reader lost work (see `WorkStore.list`).
+ * `RunJournal.listRuns` is the second (see run-cursor.ts). The other lists are still offsets.
  */
 export interface Page<T> {
   items: T[];
@@ -67,6 +68,12 @@ export interface ListQuery {
   workKey?: string;
   /** Only runs no other run started (`RunSummary.parentRunId` absent). Same filter-before-slice contract. */
   topLevel?: boolean;
+  /**
+   * (RunJournal.listRuns only.) `'desc'` lists newest first — what a run list on a screen shows.
+   * Default `'asc'`, the order runs were created in. A cursor continues in the order it was handed
+   * out in; it is not a position a caller converts between the two.
+   */
+  order?: RunOrder;
 }
 
 // ── 1) RunJournal = the PRESERVED journal ──────────────────────────────────────

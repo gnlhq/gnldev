@@ -6,6 +6,7 @@
 // PRESERVED in the organization view (the same Journal interface). A highly requested feature that has no
 // counterpart in most agent frameworks.
 import { listRunsArray } from './journal.js';
+import { decodeRunCursor, encodeRunCursor } from './run-cursor.js';
 import type { Journal, JournalBatch, JournalReader, JournalEntry, RunSummary } from './journal.js';
 
 /** An organization-prefixed key. orgId must not contain ':' (it would break the key schema). */
@@ -274,10 +275,11 @@ export function orgScopeOf(journal: unknown): string | undefined {
  * underlying page cannot just be filtered and returned: that under-fills the requested `limit`, or —
  * combined with the underlying `nextCursor` — skips this caller's runs that fell in a page dominated by
  * others (the "filter after slicing" bug the P0.3 filter contract exists to avoid). So this WALKS the
- * source's pages forward (relying on the numeric cursor-as-offset convention every adapter's
- * `offset()`/`paginate()` helper uses), keeping what `keep` maps, until `limit` is reached or the source
- * is exhausted. Honest cost: a caller holding a small slice of a large shared keyspace pays for walking
- * the rest. Shared by `withOrg` (an organization's runs) and `withRootScope` (the root's).
+ * source's pages forward, keeping what `keep` maps, until `limit` is reached or the source is
+ * exhausted. Its cursor is a cursor of the SOURCE (run-cursor.ts), naming the last source run it
+ * read — kept or not — so the next page resumes right after it, whichever way the source orders.
+ * Honest cost: a caller holding a small slice of a large shared keyspace pays for walking the rest.
+ * Shared by `withOrg` (an organization's runs) and `withRootScope` (the root's).
  */
 async function walkRunPages(
   reader: Partial<JournalReader>,
@@ -287,25 +289,26 @@ async function walkRunPages(
 ): Promise<{ items: RunSummary[]; nextCursor?: string }> {
   const limit = q?.limit ?? 50;
   const chunk = Math.max(limit, 50); // read the underlying (mixed) store in reasonably sized chunks
-  let pos = q?.cursor ? Number(q.cursor) || 0 : 0;
+  let seen = decodeRunCursor(q?.cursor)?.seen ?? 0;
+  let cursor = q?.cursor;
   const items: RunSummary[] = [];
-  let nextCursor: string | undefined;
   for (;;) {
-    const page = await reader.listRunsPaged!.call(journal, { ...q, cursor: String(pos), limit: chunk });
-    let consumed = 0;
-    for (const r of page.items) {
-      consumed++;
+    const page = await reader.listRunsPaged!.call(journal, { ...q, cursor, limit: chunk });
+    for (let i = 0; i < page.items.length; i++) {
+      const r = page.items[i]!;
+      seen++;
       const mine = keep(r);
-      if (mine) {
-        items.push(mine);
-        if (items.length >= limit) { nextCursor = String(pos + consumed); break; }
+      if (!mine) continue;
+      items.push(mine);
+      if (items.length >= limit) {
+        const exhausted = i === page.items.length - 1 && !page.nextCursor;
+        const next = page.items[i + 1]?.runId;
+        return { items, ...(exhausted ? {} : { nextCursor: encodeRunCursor({ runId: r.runId, ...(next !== undefined ? { next } : {}), seen }) }) };
       }
     }
-    if (items.length >= limit) break;
-    if (!page.nextCursor) { nextCursor = undefined; break; } // underlying store exhausted
-    pos += page.items.length;
+    if (!page.nextCursor) return { items }; // underlying store exhausted
+    cursor = page.nextCursor;
   }
-  return { items, ...(nextCursor !== undefined ? { nextCursor } : {}) };
 }
 
 export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<JournalReader> {
