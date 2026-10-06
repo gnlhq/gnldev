@@ -9,6 +9,53 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+**A new thread no longer reads the store's other runs, and a run list resumes from its last run**
+(ADR-0006). Who may reach a thread is unchanged. When you upgrade from 0.10:
+
+- Once every process runs this version, call `await upgradeThreadRecords(journal)` once (each
+  organization view too), and on Redis `await storage.rebuildKeyIndex()`. Until then everything works
+  as in 0.10, at 0.10's speed.
+- A run list's `nextCursor` names a run, not a row number. Pass it back verbatim; a numeric cursor from
+  0.10 is refused.
+
+### Breaking
+
+- **A run list's cursor names its last run** (`listRuns`, `listRunsPaged`, `GET /runs`, the Studio).
+  0.10's numeric cursor is refused with a `TypeError` (400 from the server and the Studio) instead of
+  being read as a row number — it named a position in a window that moves. A Studio list left open
+  across the upgrade needs one reload. Code that built a cursor (`String(n)`) instead of passing one
+  back: pass `nextCursor` back, or use `order: 'desc'` for newest first.
+
+### Fixed
+
+- **A new thread's first run read every run in the store.** The thread gate looked for runs on the
+  thread whenever it had no owner record — which is every new thread, and every anonymous one. Now an
+  anonymous turn writes a `seen` marker, and a thread with neither record nor marker is new. The first
+  run on a new thread, 30 000 runs: Postgres 70 s → 15 ms, Sqlite 324 ms → 1 ms; Redis at 4 000 runs
+  9.4 s → 5 ms.
+- **Walking a run list was quadratic.** Postgres and Sqlite paged with `OFFSET`; a list now resumes
+  after its last run on the `(created_at, run_id)` index. 30 000 runs walked on Postgres: 71 s → 0.43 s.
+  Budget, metrics, sweep, doctor and the organization views walk the whole list.
+- **Redis read every run for every page.** It now keeps the order of runs (one sorted set, written in
+  the same atomic step as the run's keys) and reads only the page's runs: a page of 50 at 4 000 runs
+  119 ms → 2.2 ms.
+- **A run deleted between two pages made the next page skip a surviving run**, on every store.
+- **Redis listed a run adopted into an organization twice**, under its old and its new id.
+
+### Added
+
+- `upgradeThreadRecords(journal)`: writes the owner record or the `seen` marker for every thread an
+  earlier version left without one, then marks the store complete. Also `threadSeenKey`,
+  `THREAD_RECORDS_KEY`, `isRunCursor`, `RunOrder`.
+- `ListQuery.order: 'asc' | 'desc'` on every first-party store.
+- `RedisStorage.rebuildKeyIndex()` also fills the run order (`listedRuns` in its result).
+
+### Known limits
+
+- A process of 0.10 writing after the upgrade (a rolling deploy) writes no `seen` marker: its anonymous
+  thread reads as new. A named user's thread stays theirs; the first named user still claims an
+  anonymous one. Staff opening such a thread now claims it closed, where 0.10 left it open.
+
 ## [0.10.0] — 2026-10-05
 
 **A sub-agent keeps every guarantee the agent keeps, and the request is the unit** (ADR-0005): "once",
