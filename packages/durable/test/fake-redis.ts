@@ -145,7 +145,7 @@ export class FakeRedis implements RedisLike {
         claim?: { key: string; value: string };
         incrs?: { key: string; fields: Record<string, number> }[];
         puts?: { key: string; value: string }[];
-        zadds?: { key: string; score: number; member: string }[];
+        zadds?: { key: string; score: number; member: string; nx?: boolean }[];
       };
       if (desc.claim && this.live(desc.claim.key)) return 0; // claim already exists → whole batch is a no-op
       if (desc.claim) await this.set(desc.claim.key, desc.claim.value);
@@ -153,7 +153,10 @@ export class FakeRedis implements RedisLike {
         for (const [field, delta] of Object.entries(incr.fields)) await this.hincrbyfloat(incr.key, field, delta);
       }
       for (const p of desc.puts ?? []) await this.set(p.key, p.value);
-      for (const z of desc.zadds ?? []) await this.zadd(z.key, z.score, z.member); // H8b activity touch parity
+      for (const z of desc.zadds ?? []) {
+        if (z.nx && this.zsets.get(z.key)?.has(z.member)) continue; // ZADD NX: the run order keeps a run's first write
+        await this.zadd(z.key, z.score, z.member); // H8b activity touch parity
+      }
       return 1;
     }
     // incrBy over several fields (INCR_FIELDS_LUA, marker `gnl:incr-fields`): KEYS = [hash], ARGV = field/delta pairs.
@@ -164,6 +167,14 @@ export class FakeRedis implements RedisLike {
       const out: string[] = [];
       for (let i = 0; i < argv.length; i += 2) out.push(await this.hincrbyfloat(String(args[0]), String(argv[i]), Number(argv[i + 1])));
       return out;
+    }
+    // The run order (RUN_ORDER_LUA, marker `gnl:run-order`): KEYS = [order], ARGV = score/run pairs, ZADD NX.
+    if (script.includes('gnl:run-order')) {
+      const argv = args.slice(numKeys);
+      for (let i = 0; i < argv.length; i += 2) {
+        if (!this.zsets.get(String(args[0]))?.has(String(argv[i + 1]))) await this.zadd(String(args[0]), Number(argv[i]), String(argv[i + 1]));
+      }
+      return argv.length / 2;
     }
     // KeyIndex fill (INDEX_FILL_LUA, marker `gnl:index-fill`): KEYS = [index], ARGV = members.
     if (script.includes('gnl:index-fill')) {
@@ -287,6 +298,22 @@ export class FakeRedis implements RedisLike {
     let n = 0;
     for (const m of [...z.keys()]) if (inRange(m)) { z.delete(m); n++; }
     return n;
+  }
+
+  /** ZRANGE by rank: score order, ties by member bytes (as Redis), `stop` inclusive, negatives from the end. */
+  async zrange(key: string, start: number, stop: number): Promise<string[]> {
+    const z = this.zsets.get(key);
+    if (!z) return [];
+    const all = [...z].sort((a, b) => (a[1] - b[1]) || Buffer.compare(Buffer.from(a[0]), Buffer.from(b[0]))).map(([m]) => m);
+    const n = all.length;
+    const from = start < 0 ? Math.max(0, n + start) : start;
+    const to = stop < 0 ? n + stop : Math.min(stop, n - 1);
+    return from > to ? [] : all.slice(from, to + 1);
+  }
+  async zcard(key: string): Promise<number> { return this.zsets.get(key)?.size ?? 0; }
+  async zrank(key: string, member: string): Promise<number | null> {
+    const i = (await this.zrange(key, 0, -1)).indexOf(member);
+    return i < 0 ? null : i;
   }
 
   async zrem(key: string, ...members: string[]): Promise<number> {

@@ -17,7 +17,7 @@
 //   runs+work+cache default.
 import { createRequire } from 'node:module';
 import { runIdOfKey, parseJournalKey, deriveRunStatus } from './journal.js';
-import { pageRunsFromArray } from './run-cursor.js';
+import { pageRunsFromArray, decodeRunCursor, encodeRunCursor, matchesRunFilter } from './run-cursor.js';
 import { stableStringify } from './hash.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
@@ -66,6 +66,13 @@ export interface RedisLike {
   zrangebylex?(key: string, min: string, max: string, ...args: (string | number)[]): Promise<string[]>;
   /** OPTIONAL ZSET removal by member range (available in ioredis) — the key index's half of a prefix delete. */
   zremrangebylex?(key: string, min: string, max: string): Promise<number>;
+  /** OPTIONAL ZSET range by rank (available in ioredis) — with `zcard` and `eval`, the run order that
+   *  pages `listRuns` without reading every run. Absent → `listRuns` reads every run, as before. */
+  zrange?(key: string, start: number, stop: number): Promise<string[]>;
+  /** OPTIONAL ZSET size (available in ioredis) — the run order's length, for `listRuns`' next cursor. */
+  zcard?(key: string): Promise<number>;
+  /** OPTIONAL ZSET rank of a member (available in ioredis) — where a run-list cursor's run sits in the run order. */
+  zrank?(key: string, member: string): Promise<number | null>;
   /** OPTIONAL pipeline/transaction (SAME shape as ioredis multi() — ChainableCommander) — to fold the
    *  +1 round-trip (separate ZADD call) that the H8b touch ZSET adds to put/putIfAbsent/putIfMatch into
    *  the SAME round-trip as the SET (or CAS). If absent (or zadd is absent), the existing separate-call
@@ -258,14 +265,25 @@ const INDEX_FILL_CHUNK = 500;
 class IndexGate {
   private state?: Promise<'on' | 'pending'>;
   private warned = false;
-  constructor(private client: RedisLike, private pfx: string, private spaces: string[]) {}
-  private get stateKey(): string { return this.pfx + IDX_STATE; }
+  /**
+   * `stateName`, `slowPath` and `holds` make a second gate kept the same way (the run order, RunOrder),
+   * which asks the key index whether the store holds data instead of walking the database.
+   */
+  constructor(
+    private client: RedisLike,
+    private pfx: string,
+    private spaces: string[],
+    private stateName: string = IDX_STATE,
+    private slowPath = 'lists them by SCAN, which walks the whole Redis database',
+    private holds?: () => Promise<boolean>,
+  ) {}
+  private get stateKey(): string { return this.pfx + this.stateName; }
   /** Called before this process's first indexed write too, so its own keys never make a store look old. */
   ready(): Promise<'on' | 'pending'> {
     return (this.state ??= (async () => {
       const known = await this.client.get(this.stateKey);
       if (known === 'on' || known === 'pending') return known;
-      const old = await this.holdsData();
+      const old = await (this.holds ?? (() => this.holdsData()))();
       await this.client.set(this.stateKey, old ? 'pending' : 'on', 'NX');
       return ((await this.client.get(this.stateKey)) as 'on' | 'pending' | null) ?? (old ? 'pending' : 'on');
     })());
@@ -277,8 +295,8 @@ class IndexGate {
     if (!this.warned) {
       this.warned = true;
       console.warn(
-        `@gnldev/durable redis: this store ('${this.pfx}') holds keys an earlier version wrote, so it lists them by SCAN, ` +
-          'which walks the whole Redis database. Once every process sharing it runs this version, call ' +
+        `@gnldev/durable redis: this store ('${this.pfx}') holds keys an earlier version wrote, so it ${this.slowPath}. ` +
+          'Once every process sharing it runs this version, call ' +
           '`storage.rebuildKeyIndex()` once to list through the key index instead.',
       );
     }
@@ -287,9 +305,13 @@ class IndexGate {
   async switchOn(indexes: KeyIndex[]): Promise<Record<string, number>> {
     const out: Record<string, number> = {};
     for (const i of indexes) out[i.space] = await i.rebuild();
+    await this.markOn();
+    return out;
+  }
+  /** Turns the gate on, for every process sharing the store; the caller has filled what it guards. */
+  async markOn(): Promise<void> {
     await this.client.set(this.stateKey, 'on');
     this.state = Promise.resolve('on');
-    return out;
   }
   /** Whether any run or work-log key exists — one SCAN that stops at the first. */
   private async holdsData(): Promise<boolean> {
@@ -365,6 +387,70 @@ class KeyIndex {
   }
 }
 
+const RUN_ORDER = 'runs';           // the run order, `<pfx>idx:runs` (RunOrder)
+const RUN_ORDER_STATE = 'runidxstate'; // whether listRuns pages through it: 'on' | 'pending'
+/** KEYS[1] = the run order, ARGV = score/run pairs; a run already in it keeps its score. */
+const RUN_ORDER_LUA = `-- gnl:run-order
+for i=1,#ARGV,2 do redis.call('ZADD',KEYS[1],'NX',ARGV[i],ARGV[i+1]) end return #ARGV/2`;
+const RUN_ORDER_CHUNK = 500;
+/** Runs read per round by a filtered listRuns page: a page of a rare filter does not cost a round per run. */
+const LIST_FILTER_CHUNK = 200;
+/**
+ * RunOrder's gate: its own state, so a store 0.10 wrote (key indexes on, no run order) lists as before.
+ * Whether the store already holds run keys is asked of the key index (`hasRunKeys`), not of a SCAN.
+ */
+function runOrderGate(client: RedisLike, pfx: string, hasRunKeys: () => Promise<boolean>): IndexGate {
+  return new IndexGate(client, pfx, [RJ], RUN_ORDER_STATE, 'reads every run to list one page of them', hasRunKeys);
+}
+
+/**
+ * Every listed run, in listing order: one sorted set, member = runId, score = the time its first key
+ * was written (the envelope's `t`, which `put` keeps) — the Redis counterpart of gnl_runs' created_at
+ * and run_id ordering. Without it `listRuns` reads every key of every run to answer one page, and a
+ * caller walking the pages (listRunsArray, the thread gate) reads the store once per page.
+ *
+ * Written by every write whose key names a run (`listedRunOf`) in the same MULTI as the key, with
+ * ZADD NX: idempotent, needs no previous value, and the first write's time stays. A member may outlive
+ * its run's keys (a crash between a delete and its ZREM); readers skip a run with no key left.
+ * Whether reads may trust it is its own gate (`runidxstate`), since 0.10 wrote keys without it.
+ */
+class RunOrder {
+  constructor(private client: RedisLike, private pfx: string, readonly gate: IndexGate) {}
+  get key(): string { return this.pfx + IDX + RUN_ORDER; }
+  /** Needs the script, ranks and the key index it reads each run's keys through. */
+  get usable(): boolean {
+    const c = this.client;
+    return !!(c.eval && c.zrange && c.zcard && c.zrank && c.zadd && c.zrangebylex && c.zrem);
+  }
+  async beforeWrite(): Promise<void> { if (this.usable) await this.gate.ready(); }
+  async on(): Promise<boolean> { return this.usable && (await this.gate.on()); }
+  /** Adds `run` in a write's MULTI. */
+  addIn(tx: RedisPipeline, run: string, score: number): void { tx.eval(RUN_ORDER_LUA, 1, this.key, score, run); }
+  /** Adds `run`, for a write without MULTI: before the key, so a member may outlive a key, never the reverse. */
+  async add(run: string, score: number): Promise<void> {
+    if (this.usable) await this.client.eval!(RUN_ORDER_LUA, 1, this.key, score, run);
+  }
+  async addAll(scores: Map<string, number>): Promise<void> {
+    if (!this.usable) return;
+    const pairs = [...scores].flatMap(([run, t]) => [t, run]);
+    for (let i = 0; i < pairs.length; i += RUN_ORDER_CHUNK * 2) {
+      await this.client.eval!(RUN_ORDER_LUA, 1, this.key, ...pairs.slice(i, i + RUN_ORDER_CHUNK * 2));
+    }
+  }
+  /** Removes the runs that have no key left under `<run>:`, after their keys were deleted. */
+  async dropEmpty(runs: Iterable<string>, index: KeyIndex): Promise<void> {
+    if (!this.usable) return;
+    for (const run of runs) {
+      if ((await index.keys(run + ':', 1)).length === 0) await this.client.zrem!(this.key, run);
+    }
+  }
+  /** Run ids from rank `start`, `count` of them. */
+  range(start: number, count: number): Promise<string[]> { return this.client.zrange!(this.key, start, start + count - 1); }
+  size(): Promise<number> { return this.client.zcard!(this.key); }
+  /** A run's rank in the order, or undefined when it is not in it. */
+  async rank(run: string): Promise<number | undefined> { return (await this.client.zrank!(this.key, run)) ?? undefined; }
+}
+
 // N+1 efficiency fix: instead of a sequential GET per key after SCAN, use a SINGLE (or a few chunked)
 // round-trip if the client supports `mget`. The returned array's ORDER matches `keys` one-to-one (mget
 // contract) → the caller can match by index. For very large key lists, split into MGET_CHUNK-sized
@@ -401,6 +487,102 @@ function isSuspended(p: { kind: string } | null, value: unknown): boolean {
   return p?.kind === 'tool' && (value as ToolJournalRecord | undefined)?.status === 'suspended';
 }
 
+/** The recorded outcomes that make a run exist on their own (a write-ahead or a cancel can come first). */
+const LISTED_OUTCOMES = new Set(['failed', 'running', 'canceled', 'completed']);
+
+/**
+ * The run a write makes listable, if any — the same rule `RunSummaries.add` lists by: a model/tool
+ * entry, a versioned `:input`, or a recorded outcome. Every key it names starts with `<run>:`.
+ */
+function listedRunOf(key: string, value: unknown): string | null {
+  const owner = runIdOfKey(key, value);
+  if (owner) return owner;
+  if (key.endsWith(':outcome') && LISTED_OUTCOMES.has(String((value as { status?: unknown } | undefined)?.status))) {
+    return key.slice(0, -':outcome'.length);
+  }
+  return null;
+}
+/** The run a key may belong to, from its text alone (a delete has no values): entry, `:input`, `:outcome`. */
+function runOfKeyText(key: string): string | null {
+  const p = parseJournalKey(key);
+  if (p) return p.runId;
+  const m = /^(.*):(input|outcome)$/.exec(key);
+  return m ? m[1]! : null;
+}
+
+/** A run's tally while its keys are read: model steps, tool calls, a suspended tool, first write. */
+interface RunTally { m: number; t: number; s: boolean; c0: number }
+type RunInputMeta = { threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string };
+
+/**
+ * Run summaries from a set of journal keys and their values — the one summarizing rule both listing
+ * paths share (every key, or the keys of one page's runs). A run is attributed by its key's text, as
+ * every other adapter attributes it by the run_id column; a key a write named run R always starts
+ * `R:`, so reading `R:`'s keys is enough to summarize R (a key under `R:` that belongs to another run,
+ * a child's, is attributed to that run, not to R).
+ */
+class RunSummaries {
+  private readonly byRun = new Map<string, RunTally>();
+  private readonly inputs = new Map<string, RunInputMeta>();
+  private readonly outcomes = new Map<string, 'failed' | 'running' | 'canceled'>();
+
+  add(rawKey: string, e: RjEnv): void {
+    const p = parseJournalKey(rawKey);
+    if (p && e.k != null) {
+      const cur = this.byRun.get(p.runId) ?? { m: 0, t: 0, s: false, c0: e.t };
+      if (p.kind === 'model') cur.m++; else { cur.t++; if (e.s) cur.s = true; }
+      if (e.t < cur.c0) cur.c0 = e.t;
+      this.byRun.set(p.runId, cur);
+      return;
+    }
+    // AUDIT (threadId first-class): `:input` keys are not visible to parseJournalKey → the run is read
+    // from the key text (`<runId>:input`), in the same pass as every other key.
+    if (rawKey.endsWith(':input')) {
+      const inp = e.v as RunInputMeta | undefined;
+      if (inp) this.inputs.set(rawKey.slice(0, -':input'.length), inp);
+    }
+    // A run whose keys are ALL non-entry ones (it died before its first model step: `:input` plus a
+    // claim marker) is registered from the key text, with genuinely zero counts — otherwise it would be
+    // absent from every listing, and so from sweepRuns, leaving its persisted prompt outside retention.
+    const owner = runIdOfKey(rawKey, e.v);
+    if (owner) {
+      const cur = this.byRun.get(owner);
+      if (!cur) this.byRun.set(owner, { m: 0, t: 0, s: false, c0: e.t });
+      else if (e.t < cur.c0) cur.c0 = e.t;
+    }
+    // The run's recorded outcome — Redis has no column to index, so it is read from the decoded value
+    // rather than matched as text (an error MESSAGE routinely contains the word 'failed'; the record's
+    // own status field does not lie). The write-ahead, or a cancel ordered before the run started, can
+    // be a run's FIRST key: the run exists, so it still lists, with genuinely zero counts.
+    if (rawKey.endsWith(':outcome')) {
+      const runId = rawKey.slice(0, -':outcome'.length);
+      const st = (e.v as { status?: string } | undefined)?.status;
+      if (st === 'failed' || st === 'running' || st === 'canceled') this.outcomes.set(runId, st);
+      if (st !== undefined && LISTED_OUTCOMES.has(st) && !this.byRun.has(runId)) this.byRun.set(runId, { m: 0, t: 0, s: false, c0: e.t });
+    }
+  }
+  has(runId: string): boolean { return this.byRun.has(runId); }
+  /** Every run, in listing order: first write, then id (as gnl_runs' created_at, run_id). */
+  ids(): string[] {
+    return [...this.byRun.entries()].sort(([ra, va], [rb, vb]) => (va.c0 - vb.c0) || cmpStr(ra, rb)).map(([r]) => r);
+  }
+  summary(runId: string): RunSummary {
+    const v = this.byRun.get(runId)!;
+    const inp = this.inputs.get(runId);
+    const outcome = this.outcomes.get(runId);
+    return {
+      runId, status: deriveRunStatus(v.s, outcome ? { status: outcome } : null), modelSteps: v.m, toolCalls: v.t,
+      ...(inp?.threadId ? { threadId: inp.threadId } : {}),
+      ...(inp?.agent ? { agent: inp.agent } : {}),
+      ...(inp?.resourceId ? { resourceId: inp.resourceId } : {}),
+      ...(inp?.workKey ? { workKey: inp.workKey } : {}),
+      ...(inp?.parentRunId ? { parentRunId: inp.parentRunId } : {}),
+    };
+  }
+  /** The first-write time of every run, for filling the run order from keys an earlier version wrote. */
+  firstWrites(): Map<string, number> { return new Map([...this.byRun].map(([r, v]) => [r, v.c0])); }
+}
+/** The listRuns filters, one rule for both listing paths (filter BEFORE the page is cut). */
 // H1 CAS Lua script: if GET==ARGV[1] then SET ARGV[2] → 1, else 0. The Redis script runs atomically →
 // this closes the race window between putIfMatch's JS-side comparison and the SET.
 /** HINCRBYFLOAT over ARGV's field/delta pairs, atomically; returns the new values in order. */
@@ -491,7 +673,7 @@ for _, p in ipairs(desc.puts or {}) do
   redis.call('SET', p.key, p.value)
 end
 for _, z in ipairs(desc.zadds or {}) do
-  redis.call('ZADD', z.key, z.score, z.member)
+  if z.nx then redis.call('ZADD', z.key, 'NX', z.score, z.member) else redis.call('ZADD', z.key, z.score, z.member) end
 end
 return 1
 `;
@@ -545,24 +727,31 @@ class RedisRunJournal implements RunJournal {
   ) {
     this.index = new KeyIndex(client, pfx, RJ, gate);
     this.counters = new KeyIndex(client, pfx, CTR, gate);
+    this.order = new RunOrder(client, pfx, runOrderGate(client, pfx, async () => (await this.index.keys('', 1)).length > 0));
     if (client.eval) {
       this.applyBatch = async (batch: JournalBatch): Promise<boolean> => {
-        const desc: { claim?: { key: string; value: string }; incrs?: { key: string; fields: Record<string, number> }[]; puts?: { key: string; value: string }[]; zadds?: { key: string; score: number; member: string }[] } = {};
+        const desc: { claim?: { key: string; value: string }; incrs?: { key: string; fields: Record<string, number> }[]; puts?: { key: string; value: string }[]; zadds?: { key: string; score: number; member: string; nx?: boolean }[] } = {};
         // H8b parity: run-shaped keys written through applyBatch must ALSO touch the activity ZSET
         // (put/putIfAbsent do — see touch()); otherwise listStaleRuns would treat a run written only via
         // applyBatch as never-active and sweep it as stale. Collected here, applied inside the SAME Lua unit.
-        const zadds: { key: string; score: number; member: string }[] = [];
+        const zadds: { key: string; score: number; member: string; nx?: boolean }[] = [];
         const now = Date.now();
         const touchOf = (key: string, p: ReturnType<typeof parseJournalKey>, value: unknown) => {
           const owner = p?.runId ?? runIdOfKey(key, value);
           if (owner && client.zadd) zadds.push({ key: this.activityKey(), score: now, member: owner });
         };
         const indexOf = (key: string) => { if (this.index.usable) zadds.push({ key: this.index.key, score: 0, member: key }); };
+        // The run order rides in the same script, NX: a run already listed keeps its first write.
+        const orderOf = (key: string, value: unknown) => {
+          const run = listedRunOf(key, value);
+          if (run && this.order.usable) zadds.push({ key: this.order.key, score: now, member: run, nx: true });
+        };
         if (batch.claim) {
           const p = parseJournalKey(batch.claim.key);
           desc.claim = { key: this.full(batch.claim.key), value: serialize(rjEnv(batch.claim.value, p, isSuspended(p, batch.claim.value), now)) };
           touchOf(batch.claim.key, p, batch.claim.value);
           indexOf(batch.claim.key);
+          orderOf(batch.claim.key, batch.claim.value);
         }
         if (batch.incrs?.length) {
           desc.incrs = batch.incrs.map(({ key, fields }) => ({ key: this.pfx + CTR + key, fields }));
@@ -573,11 +762,13 @@ class RedisRunJournal implements RunJournal {
             const p = parseJournalKey(key);
             touchOf(key, p, value);
             indexOf(key);
+            orderOf(key, value);
             return { key: this.full(key), value: serialize(rjEnv(value, p, isSuspended(p, value), now)) };
           });
         }
         if (zadds.length) desc.zadds = zadds;
         await this.index.beforeWrite();
+        await this.order.beforeWrite();
         const res = await client.eval!(APPLY_BATCH_LUA, 0, JSON.stringify(desc));
         return Number(res) === 1;
       };
@@ -603,6 +794,8 @@ class RedisRunJournal implements RunJournal {
   readonly index: KeyIndex;
   /** The counter hashes (incrBy), by prefix — what deletePrefix erases with the keys. */
   readonly counters: KeyIndex;
+  /** Every listed run in listing order — what listRuns pages through (RunOrder). */
+  readonly order: RunOrder;
   private ns = () => this.pfx + RJ;
   private full(key: string) { return this.ns() + key; }
   /** A write and its index member in one MULTI (KeyIndex) — undefined when the client cannot. */
@@ -718,7 +911,9 @@ class RedisRunJournal implements RunJournal {
   }
   async put(key: string, value: unknown): Promise<void> {
     await this.index.beforeWrite();
+    await this.order.beforeWrite();
     const p = parseJournalKey(key);
+    const run = listedRunOf(key, value);
     // The ACTIVITY index must cover every run-scoped key, not just replayable entries: a run that died
     // before its first model step has only `:input` + a claim marker, and leaving those out of the ZSET
     // made it permanently invisible to listStaleRuns → sweepRuns never reached it.
@@ -740,10 +935,12 @@ class RedisRunJournal implements RunJournal {
     if (tx) {
       tx.set(full, payload);
       if (owner && this.client.zadd) tx.zadd(this.activityKey(), await this.now(), owner);
+      if (run && this.order.usable) this.order.addIn(tx, run, t);
       await tx.exec();
       return;
     }
     await this.index.add(full);
+    if (run) await this.order.add(run, t);
     if (this.canPipe(owner)) {
       await this.client.multi!().set(full, payload).zadd(this.activityKey(), await this.now(), owner).exec();
       return;
@@ -755,24 +952,30 @@ class RedisRunJournal implements RunJournal {
   async putIfAbsent(key: string, value: unknown): Promise<boolean> {
     this.checkReplicationOnce(); // fire-and-forget — never awaited, never delays the claim
     await this.index.beforeWrite();
+    await this.order.beforeWrite();
     const p = parseJournalKey(key);
     // The ACTIVITY index must cover every run-scoped key, not just replayable entries: a run that died
     // before its first model step has only `:input` + a claim marker, and leaving those out of the ZSET
     // made it permanently invisible to listStaleRuns → sweepRuns never reached it.
     const owner = p?.runId ?? runIdOfKey(key, value);
+    const run = listedRunOf(key, value);
     const full = this.full(key);
-    const payload = serialize(rjEnv(value, p, isSuspended(p, value), Date.now()));
+    const t = Date.now();
+    const payload = serialize(rjEnv(value, p, isSuspended(p, value), t));
     const tx = this.indexedWrite(key);
     if (tx) {
       // The member is added whether or not SET NX wins: if it loses, the key exists and is a member already.
+      // So is the run's: NX keeps the first write's time, and a run with no key is skipped by listRuns.
       tx.set(full, payload, 'NX');
       if (owner && this.client.zadd) tx.zadd(this.activityKey(), await this.now(), owner);
+      if (run && this.order.usable) this.order.addIn(tx, run, t);
       const results = await tx.exec();
       const ok = results?.[1]?.[1] === 'OK';
       if (ok) await this.waitForReplicas();
       return ok;
     }
     await this.index.add(full);
+    if (run) await this.order.add(run, t);
     if (this.canPipe(owner)) {
       // PIPELINE — DOCUMENTED BEHAVIOR DIFFERENCE (in the SAFE DIRECTION): commands in a pipeline can't
       // be conditioned on each other's RESULT (without Lua) → the ZADD runs even if SET NX LOSES (the
@@ -817,6 +1020,9 @@ class RedisRunJournal implements RunJournal {
     // made it permanently invisible to listStaleRuns → sweepRuns never reached it.
     const owner = p?.runId ?? runIdOfKey(key, value);
     const next = serialize(rjEnv(value, p, isSuspended(p, value), env.t)); // t is preserved
+    // A replacement can make a key name its run for the first time (an outcome's status): NX, before.
+    const run = listedRunOf(key, value);
+    if (run) { await this.order.beforeWrite(); await this.order.add(run, env.t); }
     if (this.client.eval) {
       if (this.canPipe(owner)) {
         // PIPELINE — same "safe-direction deviation" (see putIfAbsent comment): eval (CAS) + ZADD go in
@@ -905,6 +1111,11 @@ class RedisRunJournal implements RunJournal {
     let n = 0;
     for (let i = 0; i < keys.length; i += DEL_CHUNK) n += await this.client.del(...keys.slice(i, i + DEL_CHUNK));
     await this.index.remove(prefix); // after the keys: a member may outlive its key, never the reverse
+    // The runs those keys belonged to leave the run order once none of their keys is left.
+    const cut = this.ns().length;
+    const runs = new Set<string>();
+    for (const k of keys) { const r = runOfKeyText(k.slice(cut)); if (r !== null) runs.add(r); }
+    await this.order.dropEmpty(runs, this.index);
     if (this.client.zrem) {
       const rid = prefix.endsWith(':') ? prefix.slice(0, -1) : prefix;
       await this.client.zrem(this.activityKey(), rid);
@@ -971,99 +1182,83 @@ class RedisRunJournal implements RunJournal {
     entries.forEach((e, i) => { e.seq = i; });
     return entries;
   }
+  /**
+   * One page of runs. Through the run order (RunOrder), a page reads the keys of its own runs only:
+   * one ZRANGE, then each run's keys by prefix (sent together) and their values in one MGET. Filters
+   * (status, agent, resourceId, workKey, topLevel) are applied to each run as it is read, BEFORE the
+   * page is cut, walking the order from the cursor until the page is full: walking every page of a
+   * filtered listing reads each run once, and one page of a rare filter reads as far as its matches
+   * are. The cursor is a position in the run order. A store the run order cannot be trusted on yet
+   * (an earlier version wrote it, RunOrder's gate) reads every key, as before.
+   */
   async listRuns(q?: ListQuery): Promise<Page<RunSummary>> {
-    // Brute-force: scan all rj: entries, summarize per run. Even if the same key is written twice (UPSERT)
-    // it's a SINGLE Redis key → NOT DOUBLE-COUNTED (same result as sqlite touchRun's recompute semantics).
+    if (await this.order.on()) return this.listRunsInOrder(q);
     const keys = await this.index.keys('');
     const values = await bulkGet(this.client, keys);
+    const runs = this.summaries(keys, values);
+    // Paged by run, not by row number (run-cursor.ts): the same cursor every run listing hands out.
+    return pageRunsFromArray(runs.ids().map((r) => runs.summary(r)), q);
+  }
+  private summaries(keys: string[], values: (string | null)[]): RunSummaries {
     const cut = this.ns().length;
-    const byRun = new Map<string, { m: number; t: number; s: boolean; c0: number }>();
-    // AUDIT (threadId first-class): `:input` keys are not visible to parseJournalKey → the r/k fields
-    // in the RjEnv envelope they're written under are null (rjEnv(value, p=null, ...)). So runId is
-    // derived NOT from the ENVELOPE but from the raw key text itself (the `<runId>:input` suffix) —
-    // since SCAN already fetches ALL rj: keys in one pass (keys/values above), this is NOT a SEPARATE
-    // round-trip, it's part of the same scan.
-    const threadIds = new Map<string, string>();
-    const outcomes = new Map<string, 'failed' | 'running' | 'canceled'>();
-    const agents = new Map<string, string>();
-    const resourceIds = new Map<string, string>();
-    const workKeys = new Map<string, string>();
-    const parentRunIds = new Map<string, string>();
+    const runs = new RunSummaries();
     for (let i = 0; i < keys.length; i++) {
       const s = values[i];
-      if (s == null) continue;
-      const e = deserialize<RjEnv>(s);
-      if (e.r != null && e.k != null) {
-        const cur = byRun.get(e.r) ?? { m: 0, t: 0, s: false, c0: e.t };
-        if (e.k === 'model') cur.m++; else { cur.t++; if (e.s) cur.s = true; }
-        if (e.t < cur.c0) cur.c0 = e.t;
-        byRun.set(e.r, cur);
-        continue;
-      }
-      const rawKey = keys[i]!.slice(cut);
-      if (rawKey.endsWith(':input')) {
-        const runId = rawKey.slice(0, -':input'.length);
-        const inp = e.v as { threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string } | undefined;
-        if (inp?.threadId) threadIds.set(runId, inp.threadId);
-        if (inp?.agent) agents.set(runId, inp.agent);
-        if (inp?.resourceId) resourceIds.set(runId, inp.resourceId);
-        if (inp?.workKey) workKeys.set(runId, inp.workKey);
-        if (inp?.parentRunId) parentRunIds.set(runId, inp.parentRunId);
-      }
-      // A run whose keys are ALL non-entry ones (it died before its first model step: `:input` plus a
-      // claim marker) has nothing in the envelope's r/k fields, so it never reached byRun above and was
-      // absent from every listing — and therefore from sweepRuns too, leaving its persisted prompt
-      // outside the retention window. Register it from the key text, with genuinely zero counts.
-      const owner = runIdOfKey(rawKey, e.v);
-      if (owner) {
-        const cur = byRun.get(owner);
-        if (!cur) byRun.set(owner, { m: 0, t: 0, s: false, c0: e.t });
-        else if (e.t < cur.c0) cur.c0 = e.t;
-      }
-      // The run's recorded outcome, from the same scan — Redis has no column to index, so it is read
-      // from the decoded value rather than matched as text (an error MESSAGE routinely contains the
-      // word 'failed'; the record's own status field does not lie).
-      if (rawKey.endsWith(':outcome')) {
-        const runId = rawKey.slice(0, -':outcome'.length);
-        const st = (e.v as { status?: string } | undefined)?.status;
-        if (st === 'failed' || st === 'running' || st === 'canceled') outcomes.set(runId, st);
-        // The write-ahead can be a run's FIRST key (killed before `:input` landed) — and so can a
-        // cancel, which an operator may order against a run that has not started yet. Either way the
-        // run exists, so it still lists, with genuinely zero counts.
-        if ((st === 'failed' || st === 'running' || st === 'canceled' || st === 'completed') && !byRun.has(runId)) {
-          byRun.set(runId, { m: 0, t: 0, s: false, c0: e.t });
-        }
+      if (s != null) runs.add(keys[i]!.slice(cut), deserialize<RjEnv>(s));
+    }
+    return runs;
+  }
+  /**
+   * One page from the run order, positioned by the cursor's run (run-cursor.ts), never by a rank the
+   * caller carries: the run's rank is looked up (ZRANK), so a run inserted or deleted elsewhere does
+   * not move the page. Reads one run past the page to know whether a next page exists.
+   */
+  private async listRunsInOrder(q?: ListQuery): Promise<Page<RunSummary>> {
+    const limit = q?.limit ?? 50;
+    const desc = q?.order === 'desc';
+    const pos = decodeRunCursor(q?.cursor);
+    const filtered = !!(q?.status || q?.agent || q?.resourceId || q?.workKey || q?.topLevel);
+    const total = await this.order.size();
+    let at = desc ? total - 1 : 0;
+    if (pos) {
+      const r = await this.order.rank(pos.runId);
+      const n = r === undefined && pos.next !== undefined ? await this.order.rank(pos.next) : undefined;
+      if (r !== undefined) at = desc ? r - 1 : r + 1;
+      else if (n !== undefined) at = n;
+      else at = desc ? total - 1 - pos.seen : pos.seen;
+    }
+    const out: RunSummary[] = [];
+    while (out.length <= limit && (desc ? at >= 0 : at < total)) {
+      const want = filtered ? Math.max(limit + 1, LIST_FILTER_CHUNK) : limit + 1 - out.length;
+      const lo = desc ? Math.max(0, at - want + 1) : at;
+      const ids = await this.order.range(lo, (desc ? at : Math.min(total - 1, at + want - 1)) - lo + 1);
+      if (ids.length === 0) break;
+      if (desc) ids.reverse();
+      const keys = (await Promise.all(ids.map((r) => this.index.keys(r + ':')))).flat();
+      const runs = this.summaries(keys, await bulkGet(this.client, keys));
+      for (const r of ids) {
+        at += desc ? -1 : 1;
+        // A run with no key left (a crash between a delete and its ZREM) is not listed.
+        if (!runs.has(r)) continue;
+        const sum = runs.summary(r);
+        if (!matchesRunFilter(sum, q)) continue;
+        out.push(sum);
+        if (out.length > limit) break;
       }
     }
-    // P0.3 filters: listRuns is ALREADY a full brute-force SCAN here (Redis has no
-    // secondary index by status/agent — same "no cheap indexed status aggregate" limitation documented
-    // on countRunsByStatus above) — so status/agent filtering costs nothing EXTRA beyond the scan this
-    // path already pays; the only requirement is applying it BEFORE the offset/limit slice (pageOf),
-    // never after.
-    let all = [...byRun.entries()]
-      .sort(([ra, va], [rb, vb]) => (va.c0 - vb.c0) || cmpStr(ra, rb))
-      .map(([runId, v]): RunSummary => {
-        const threadId = threadIds.get(runId);
-        const agent = agents.get(runId);
-        const resourceId = resourceIds.get(runId);
-        const workKey = workKeys.get(runId);
-        const parentRunId = parentRunIds.get(runId);
-        return {
-          runId, status: deriveRunStatus(v.s, outcomes.has(runId) ? { status: outcomes.get(runId)! } : null), modelSteps: v.m, toolCalls: v.t,
-          ...(threadId ? { threadId } : {}),
-          ...(agent ? { agent } : {}),
-          ...(resourceId ? { resourceId } : {}),
-          ...(workKey ? { workKey } : {}),
-          ...(parentRunId ? { parentRunId } : {}),
-        };
-      });
-    if (q?.status) all = all.filter((r) => r.status === q.status);
-    if (q?.agent) all = all.filter((r) => r.agent === q.agent);
-    if (q?.resourceId) all = all.filter((r) => r.resourceId === q.resourceId);
-    if (q?.workKey) all = all.filter((r) => r.workKey === q.workKey);
-    if (q?.topLevel) all = all.filter((r) => !r.parentRunId);
-    // Paged by run, not by row number (run-cursor.ts): the same cursor every run listing hands out.
-    return pageRunsFromArray(all, q);
+    const items = out.slice(0, limit);
+    const last = items[items.length - 1];
+    const following = out[limit];
+    return { items, ...(following && last ? { nextCursor: encodeRunCursor({ runId: last.runId, next: following.runId, seen: (pos?.seen ?? 0) + items.length }) } : {}) };
+  }
+  /** Fills the run order from the keys an earlier version wrote, each run at its first write; returns how many runs. */
+  async rebuildRunOrder(): Promise<number> {
+    if (!this.order.usable) return 0;
+    const keys = await this.index.keys('');
+    const firsts = this.summaries(keys, await bulkGet(this.client, keys)).firstWrites();
+    await this.order.addAll(firsts);
+    await this.order.gate.markOn();
+    return firsts.size;
   }
 }
 
@@ -1369,15 +1564,16 @@ export class RedisStorage implements Storage {
   }
   /** Redis is schemaless → no table setup; write schema_version idempotently (parity with sqlite/pg meta). */
   /**
-   * Adds every existing run and work-log key to the key indexes and lists through them from now on, for
-   * every process sharing this store. Call it once after upgrading a store an earlier version wrote, when
-   * no process of that version remains (see IndexGate); calling it again is harmless. Returns how many
-   * keys each index holds.
+   * Adds every existing run and work-log key to the key indexes, and every run to the run order, and
+   * lists through them from now on, for every process sharing this store. Call it once after upgrading a
+   * store an earlier version wrote, when no process of that version remains (see IndexGate); calling it
+   * again is harmless. Returns how many keys each index holds and how many runs the run order holds.
    */
-  async rebuildKeyIndex(): Promise<{ runs: number; work: number }> {
+  async rebuildKeyIndex(): Promise<{ runs: number; work: number; listedRuns: number }> {
     const runs = this.runs as RedisRunJournal;
     const n = await this.indexGate.switchOn([runs.index, runs.counters, (this.work as RedisWorkStore).log]);
-    return { runs: (n[RJ] ?? 0) + (n[CTR] ?? 0), work: n[WL] ?? 0 };
+    const listedRuns = await runs.rebuildRunOrder();
+    return { runs: (n[RJ] ?? 0) + (n[CTR] ?? 0), work: n[WL] ?? 0, listedRuns };
   }
 
   /**
@@ -1482,6 +1678,9 @@ export class RedisStorage implements Storage {
     const SPACES: Array<[string, string, boolean]> = [[RJ, 'runs', false], [CTR, 'runs', true], [WK, 'work', false], [META, 'meta', false]];
     const runsJ = this.runs as RedisRunJournal;
     const indexOf = (space: string): KeyIndex | undefined => (space === RJ ? runsJ.index : space === CTR ? runsJ.counters : undefined);
+    // A moved run is listed under its new id, at its first write; the old id leaves the run order.
+    const movedRuns = new Map<string, number>();
+    const leftRuns = new Set<string>();
     for (const [space, store, isHash] of SPACES) {
       const index = indexOf(space);
       const full = this.pfx + space;
@@ -1505,6 +1704,14 @@ export class RedisStorage implements Storage {
           if (v !== null) {
             await index?.add(dst);
             await this.client.set(dst, v);
+            if (space === RJ) {
+              const env = deserialize<RjEnv>(v);
+              const run = listedRunOf(prefix + bare, env.v);
+              const first = run === null ? undefined : movedRuns.get(run);
+              if (run !== null && (first === undefined || env.t < first)) movedRuns.set(run, env.t);
+              const old = runOfKeyText(bare);
+              if (old !== null) leftRuns.add(old);
+            }
           }
         }
         await this.client.del(k);
@@ -1512,6 +1719,8 @@ export class RedisStorage implements Storage {
       }
       moved[store] = (moved[store] ?? 0) + n;
     }
+    await runsJ.order.addAll(movedRuns);
+    await runsJ.order.dropEmpty(leftRuns, runsJ.index);
     moved.cache = 0;
     // The vector port does not exist on this engine (capabilities.vectors === 'none'), so it is absent
     // from the report rather than reported as zero — see AdoptIntoOrgResult.
