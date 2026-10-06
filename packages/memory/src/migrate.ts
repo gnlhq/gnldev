@@ -7,7 +7,7 @@
  * thread deletion remove them either way — `legacyWorkingMemoryScope` in @gnldev/durable.)
  */
 import {
-  legacyWorkingMemoryScope, workingMemoryScope, findReservedRootThreads, isOrganizationKey, purgeThread, threadOwnerKey,
+  legacyWorkingMemoryScope, workingMemoryScope, findReservedRootThreads, isOrganizationKey, purgeThread, threadOwnerKey, threadSeenKey,
   toJournal, orgStorageScopeOf, type MemoryStore, type MessageAppend, type MessageRecord, type Storage,
 } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -160,6 +160,8 @@ export async function migrateReservedRootThreads(storage: Storage, opts: Migrate
     await moveThread(store, t.id, to);
     const owner = await runs.get(threadOwnerKey(t.id));
     if (owner !== undefined) await runs.put(threadOwnerKey(to), owner);
+    const seen = await runs.get(threadSeenKey(t.id));
+    if (seen !== undefined) await runs.put(threadSeenKey(to), seen);
     if (typeof runs.deletePrefix === 'function') await purgeThread(runs, t.id);
   }
   return report;

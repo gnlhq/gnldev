@@ -7,7 +7,7 @@
 // whose only runs were born `unknown` in this release (an anonymous first turn, R11) is claimed by the
 // first named user, as before.
 import { describe, it, expect } from 'vitest';
-import { InMemoryStorage, BasicMemory, createGnl, user, toJournal, threadOwnerOf, threadOwnerKey, assignThreadOwner, withSubjectMemory, STAFF } from '../src/index.js';
+import { InMemoryStorage, BasicMemory, createGnl, user, toJournal, threadOwnerOf, threadOwnerKey, THREAD_RECORDS_KEY, assignThreadOwner, withSubjectMemory, STAFF } from '../src/index.js';
 import { createMockModel, finalTextResult } from './mock.js';
 
 function world() {
@@ -75,6 +75,7 @@ describe('D-3: a thread with history and no derivable owner is closed to end use
     const { gnl, j } = world();
     await gnl.run('a', { runId: 'r1', prompt: 'x', threadId: 'T5', caller: user('u-ayse') });
     await j.deletePrefix(threadOwnerKey('T5'));
+    await j.deletePrefix(THREAD_RECORDS_KEY); // a store from before the record was never marked complete
     expect(await threadOwnerOf(j, undefined, 'T5')).toEqual({ exists: true, owner: 'u-ayse' });
   });
 });

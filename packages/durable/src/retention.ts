@@ -7,7 +7,7 @@ import { identityOnlyInput } from './run.js';
 import { workKeyHash } from './hash.js';
 import { MEM_LEAVES, OM_LEAVES, memKey, readJournalLogDated, semanticLogKey, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX } from './memory.js';
 import type { Memory } from './memory.js';
-import { threadOwnerOf, threadOwnerKey } from './thread-owner.js';
+import { threadOwnerOf, threadOwnerKey, threadSeenKey } from './thread-owner.js';
 import type { WorkScopeKind } from './hash.js';
 import type { Journal, JournalReader } from './journal.js';
 
@@ -637,6 +637,7 @@ export async function purgeThread(journal: Journal, threadId: string): Promise<n
     + (await purgeThreadNamespace(journal, SEMANTIC_LOG_PREFIX, threadId, threadIdOfSemKey));
   // The owner record names a person, and with the thread gone it guards nothing.
   if ((await journal.get(threadOwnerKey(threadId))) !== undefined) total += await del(threadOwnerKey(threadId));
+  if ((await journal.get(threadSeenKey(threadId))) !== undefined) total += await del(threadSeenKey(threadId));
 
   // The ownership traces pointing HERE. Once this thread's state is gone they identify nothing —
   // and they are not inert: `resthr:<resourceId>:<threadId>` names a person, so a dead pointer is a

@@ -28,7 +28,7 @@
  * one exception is kept on purpose: a thread whose only runs were born `unknown` under a versioned
  * record (an anonymous first turn in this release) is still claimed by the first named user (R11).
  */
-import { claim, runKeys } from './journal.js';
+import { claim, runKeys, listRunsArray } from './journal.js';
 import type { Journal, JournalReader, RunSummary } from './journal.js';
 import type { Memory } from './memory.js';
 import { ThreadOwnerMismatchError } from './errors.js';
@@ -36,6 +36,21 @@ import type { Caller } from './identity-types.js';
 import { recordOwner } from './run-identity.js';
 
 export const threadOwnerKey = (threadId: string): string => `thread:${threadId}:owner`;
+
+/**
+ * An anonymous thread's mark: the thread exists, and an `unknown` caller of this release opened it.
+ * Kept apart from the owner record so the record is still written once, by `claim` alone — the first
+ * named user claims an anonymous thread exactly as she would claim a new one, and a race between two
+ * of them is the same first-write-wins race, with no compare-and-set a journal may not have.
+ */
+export const threadSeenKey = (threadId: string): string => `thread:${threadId}:seen`;
+
+/**
+ * Written once a scope's every thread has its record or mark: by `upgradeThreadRecords`, or by the
+ * gate itself when it first meets a scope with no runs at all. From then on a thread with neither is
+ * new, and the gate never reads the scope's runs to find out.
+ */
+export const THREAD_RECORDS_KEY = 'thread:records:v1';
 
 export interface ThreadOwnership {
   /** Whether the thread exists at all. A thread that does not exist yet is the first caller's to open. */
@@ -49,7 +64,7 @@ export interface ThreadOwnership {
   staffClaimed?: boolean;
 }
 
-type ThreadOwnerRecord = { resourceId?: string; ownerKind?: 'staff' | 'unknown'; at?: number };
+type ThreadOwnerRecord = { resourceId?: string; ownerKind?: 'staff' | 'unknown'; at?: number; backfilled?: boolean; underivable?: boolean };
 
 /**
  * The one answer to "whose thread is this" — for the gate, the listing, the reading and the
@@ -75,37 +90,85 @@ export async function threadOwnerOf(journal: Journal, memory: Memory | undefined
     }
     return { exists: true, staffClaimed: rec.ownerKind !== 'unknown' };
   }
-  // Older threads, from before the record: the memory's own answer, then the runs, then the messages.
-  let derived: string | undefined;
-  let exists = false;
-  let anonymous = false;
   if (memory?.getThreadResource) {
-    derived = await memory.getThreadResource(threadId);
-    exists = derived !== undefined;
+    const owner = await memory.getThreadResource(threadId);
+    if (owner) return settle(journal, threadId, { derived: owner });
   }
-  if (!exists) {
-    const runs = await runsOnThread(journal, threadId);
+  if ((await journal.get(threadSeenKey(threadId))) !== undefined) return { exists: true, staffClaimed: false };
+  // Older threads, from before the record and the mark: the runs, then the messages. Read only while the
+  // scope still holds such threads — never once it is marked complete.
+  let exists = false;
+  let derived: string | undefined;
+  let anonymous = false;
+  if ((await journal.get(THREAD_RECORDS_KEY)) === undefined) {
+    const { runs, scopeEmpty } = await runsOnThread(journal, threadId);
+    if (scopeEmpty) await claim(journal, THREAD_RECORDS_KEY, { at: Date.now(), firstContact: true });
     if (runs.length) {
       exists = true;
-      const owners = new Set(runs.map((r) => r.resourceId));
-      if (owners.size === 1 && [...owners][0]) derived = [...owners][0]!;
-      else if (owners.size === 1) anonymous = await allBornUnknown(journal, runs);
+      ({ derived, anonymous } = await verdictOfRuns(journal, runs));
     }
   }
   // Messages with no owner anywhere: the thread exists and is nobody's. Asked only of a memory that
   // cannot name owners — one that can is the authority on its own threads.
   if (!exists && memory && !memory.getThreadResource && ((await memory.getMessages(threadId)) ?? []).length > 0) exists = true;
   if (!exists) return { exists: false };
-  // An anonymous first turn in this release: the first named user claims it (admitThreadRun). Not
-  // written — the claim is the record.
-  if (!derived && anonymous) return { exists: true, staffClaimed: false };
-  // LAZY BACKFILL, first write wins: the derived owner — or, when none can be derived, staff (closed to
-  // end users until an operator assigns it) — becomes the record, so a later sweep or claim cannot move it.
-  await claim(journal, key, derived
-    ? { at: Date.now(), resourceId: derived, backfilled: true }
+  return settle(journal, threadId, { derived, anonymous });
+}
+
+/** What a thread's runs say about its owner: one user's, or anonymous history of this release, or neither. */
+async function verdictOfRuns(journal: Journal, runs: RunSummary[]): Promise<{ derived?: string; anonymous: boolean }> {
+  const owners = new Set(runs.map((r) => r.resourceId));
+  if (owners.size === 1 && [...owners][0]) return { derived: [...owners][0]!, anonymous: false };
+  return { anonymous: owners.size === 1 && (await allBornUnknown(journal, runs)) };
+}
+
+/**
+ * LAZY BACKFILL, first write wins: the derived owner — or, when none can be derived, staff (closed to
+ * end users until an operator assigns it) — becomes the record, so a later sweep or claim cannot move
+ * it. Anonymous history of this release gets its mark instead: the first named user claims it.
+ */
+async function settle(journal: Journal, threadId: string, v: { derived?: string; anonymous?: boolean }): Promise<ThreadOwnership> {
+  if (!v.derived && v.anonymous) {
+    await claim(journal, threadSeenKey(threadId), { at: Date.now(), ownerKind: 'unknown', backfilled: true });
+    return { exists: true, staffClaimed: false };
+  }
+  const key = threadOwnerKey(threadId);
+  await claim(journal, key, v.derived
+    ? { at: Date.now(), resourceId: v.derived, backfilled: true }
     : { at: Date.now(), ownerKind: 'staff', backfilled: true, underivable: true });
   const now = await journal.get<ThreadOwnerRecord>(key);
   return { exists: true, ...(now?.resourceId ? { owner: now.resourceId } : { staffClaimed: now?.ownerKind !== 'unknown' }) };
+}
+
+/**
+ * Gives every thread in the scope its record or mark, from its runs, once — the derivation
+ * `threadOwnerOf` does lazily, thread by thread — then marks the scope complete, so no gate reads the
+ * runs again. Run it once after upgrading a store that holds threads from 0.10 or earlier; until then
+ * the gate still reads the runs for a thread it has no record or mark for, so nothing depends on it.
+ * The runs are read in one pass (one request for all of them, where the journal honours the limit).
+ */
+export async function upgradeThreadRecords(journal: Journal, memory?: Memory): Promise<{ threads: number; recorded: number; marked: number }> {
+  const all = await allRunsOnePass(journal);
+  const byThread = new Map<string, RunSummary[]>();
+  for (const r of all) if (r.threadId) byThread.set(r.threadId, [...(byThread.get(r.threadId) ?? []), r]);
+  let recorded = 0;
+  let marked = 0;
+  for (const [threadId, runs] of byThread) {
+    if ((await journal.get(threadOwnerKey(threadId))) !== undefined || (await journal.get(threadSeenKey(threadId))) !== undefined) continue;
+    const fromMemory = memory?.getThreadResource ? await memory.getThreadResource(threadId) : undefined;
+    const v = fromMemory ? { derived: fromMemory, anonymous: false } : await verdictOfRuns(journal, runs);
+    await settle(journal, threadId, v);
+    if (!v.derived && v.anonymous) marked++; else recorded++;
+  }
+  await journal.put(THREAD_RECORDS_KEY, { at: Date.now(), upgraded: true });
+  return { threads: byThread.size, recorded, marked };
+}
+
+async function allRunsOnePass(journal: Journal): Promise<RunSummary[]> {
+  const list = (journal as Partial<JournalReader> & { listRuns?: (q?: { cursor?: string; limit?: number }) => Promise<unknown> }).listRuns;
+  if (typeof list !== 'function') return [];
+  const LIMIT = Number.MAX_SAFE_INTEGER;
+  return listRunsArray({ listRuns: (q?: { cursor?: string }) => list.call(journal, { ...(q ?? {}), limit: LIMIT }) });
 }
 
 /**
@@ -149,16 +212,17 @@ export async function assignThreadOwner(journal: Journal, threadId: string, reso
  * `RunJournal`'s answers one page, so it is walked to the end — a thread's runs past the first page
  * are exactly the ones a partial read would miss.
  */
-async function runsOnThread(journal: Journal, threadId: string): Promise<RunSummary[]> {
+async function runsOnThread(journal: Journal, threadId: string): Promise<{ runs: RunSummary[]; scopeEmpty: boolean }> {
   const list = (journal as Partial<JournalReader> & { listRuns?: (q?: { cursor?: string; limit?: number }) => Promise<unknown> }).listRuns;
-  if (typeof list !== 'function') return [];
+  if (typeof list !== 'function') return { runs: [], scopeEmpty: false };
   const first = await list.call(journal);
-  if (Array.isArray(first)) return (first as RunSummary[]).filter((r) => r.threadId === threadId);
+  if (Array.isArray(first)) return { runs: (first as RunSummary[]).filter((r) => r.threadId === threadId), scopeEmpty: first.length === 0 };
   const out: RunSummary[] = [];
   let page = first as { items: RunSummary[]; nextCursor?: string };
+  const scopeEmpty = page.items.length === 0 && !page.nextCursor;
   for (;;) {
     out.push(...page.items.filter((r) => r.threadId === threadId));
-    if (!page.nextCursor) return out;
+    if (!page.nextCursor) return { runs: out, scopeEmpty };
     page = (await list.call(journal, { cursor: page.nextCursor })) as typeof page;
   }
 }
@@ -184,7 +248,15 @@ export async function admitThreadRun(journal: Journal, memory: Memory | undefine
   if (!o.exists || (o.owner === undefined && o.staffClaimed === false)) {
     if (caller.kind === 'user') o = await claimFor({ resourceId: caller.id });
     else if (caller.kind === 'staff' && !o.exists) o = await claimFor({ ownerKind: 'staff' });
-    else return o;
+    // Staff joining anonymous history: the history no longer names nobody, so the thread closes —
+    // the verdict the runs gave before the mark existed (no derivable owner → staff's, D-3).
+    else if (caller.kind === 'staff') o = await claimFor({ ownerKind: 'staff', backfilled: true, underivable: true });
+    else {
+      // An anonymous first turn claims nothing, but the thread now exists: its mark says so, so the
+      // next caller is answered from it rather than from the scope's runs.
+      if (caller.kind === 'unknown' && !o.exists) await claim(journal, threadSeenKey(threadId), { at: Date.now(), ownerKind: 'unknown' });
+      return o;
+    }
   }
   const refuse = (requested: string) => {
     throw new ThreadOwnerMismatchError(

@@ -61,6 +61,7 @@ describe('R12: a legacy thread\'s derived owner becomes its record on first read
     const { gnl, seen, j } = world('basic');
     await gnl.run('a', { runId: 'r1', prompt: 'my PIN is 4417', threadId: 't', resourceId: 'ayse' });
     await j.deletePrefix(threadOwnerKey('t')); // data written before the record existed
+    await j.deletePrefix(D.THREAD_RECORDS_KEY); // ...so the scope was never marked complete
     expect(await threadOwnerOf(j, undefined, 't')).toEqual({ exists: true, owner: 'ayse' }); // first read backfills
     expect((await j.get(threadOwnerKey('t')))?.resourceId).toBe('ayse');
     await sweepRuns(j, { olderThanMs: -60_000 });
