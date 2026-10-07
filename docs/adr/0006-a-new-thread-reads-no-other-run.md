@@ -49,7 +49,7 @@ thread from 0.6, a journal with only the required methods, a new thread among 10
 
 Chosen: the marker. The owner record keeps its meaning and is only ever written first-write-wins
 (`putIfAbsent`), as before; nothing new is asked of a custom journal. A store is marked complete
-(`thread:records:v1`) when it has no runs at first contact, or by `upgradeThreadRecords(journal)`;
+(`thread:records:v1`) when it has no runs at first contact, or by the `thread-records` step of `storage.upgrade()`;
 until then the gate keeps the walk, so correctness never depends on running the upgrade.
 
 ### D2 — how a run list resumes
@@ -79,7 +79,7 @@ Postgres in the real-backend CI job.
 Chosen: the run order. A page takes its runs from the order (placed by the cursor's run with `ZRANK`)
 and summarizes only those runs, with the same code the full read uses; its answers equal the full
 read's and Sqlite's for every filter, page size and both orders (`redis-run-order-parity.test.ts`).
-A store an earlier version wrote stays on the full read until `rebuildKeyIndex()`, as in 0.10.
+A store an earlier version wrote stays on the full read until the `key-index` step of `storage.upgrade()`, as in 0.10.
 
 ## Consequences
 
@@ -87,8 +87,8 @@ A store an earlier version wrote stays on the full read until `rebuildKeyIndex()
   refused with a `TypeError` (a 400 from the server and Studio) instead of being read as a row
   number. A Studio list open across the upgrade needs one reload.
 - `ListQuery.order: 'asc' | 'desc'` (Studio lists newest first without counting rows).
-- New: `upgradeThreadRecords(journal)`, `threadSeenKey`, `THREAD_RECORDS_KEY`, `isRunCursor`.
-  `rebuildKeyIndex()` also fills Redis's run order.
+- New: `storage.upgrade()` with steps `schema`, `key-index`, `thread-records` (`gnl upgrade`), `threadSeenKey`,
+  `THREAD_RECORDS_KEY`, `isRunCursor`. Redis's `key-index` step also fills the run order.
 - Fixed on the way: the skip after a delete (all stores); Redis listed a run adopted into an
   organization twice (under both ids).
 

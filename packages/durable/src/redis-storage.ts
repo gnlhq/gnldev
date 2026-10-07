@@ -30,6 +30,8 @@ import type { AdoptIntoOrgResult,
 import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision } from './storage.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { REDIS_STORAGE_NAMES, ADOPT_INTO_ORG_NAMES } from './option-names.js';
+import { runUpgrade, threadRecordsStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
+import { UPGRADE_NAMES } from './option-names.js';
 
 const SCHEMA_VERSION = '1';
 
@@ -258,7 +260,7 @@ const INDEX_FILL_CHUNK = 500;
  *   - a store with no run or work-log key yet when this version first touches it is new: 'on';
  *   - a store holding such keys was written by an earlier version, which may still be running (a rolling
  *     upgrade): 'pending' — reads stay SCANs, which see every key, and a warning names the way out:
- *     once every process runs this version, `RedisStorage.rebuildKeyIndex()` adds the existing keys and
+ *     once every process runs this version, `RedisStorage.upgrade()` adds the existing keys and
  *     turns the indexes on, for every process sharing the store.
  * Not supported: starting a NEW store with an earlier version's processes writing beside this one.
  */
@@ -297,7 +299,7 @@ class IndexGate {
       console.warn(
         `@gnldev/durable redis: this store ('${this.pfx}') holds keys an earlier version wrote, so it ${this.slowPath}. ` +
           'Once every process sharing it runs this version, call ' +
-          '`storage.rebuildKeyIndex()` once to list through the key index instead.',
+          '`storage.upgrade()` once to list through the key index instead.',
       );
     }
     return false;
@@ -1569,7 +1571,26 @@ export class RedisStorage implements Storage {
    * store an earlier version wrote, when no process of that version remains (see IndexGate); calling it
    * again is harmless. Returns how many keys each index holds and how many runs the run order holds.
    */
-  async rebuildKeyIndex(): Promise<{ runs: number; work: number; listedRuns: number }> {
+  /**
+   * See `Storage.upgrade`. Steps: `key-index` (what `IndexGate` waits for), then `thread-records`, which
+   * reads every run page by page and so needs the run order first — without it each page reads every key.
+   */
+  async upgrade(opts?: UpgradeOptions): Promise<UpgradeReport> {
+    refuseUnknownNames('RedisStorage.upgrade', opts, UPGRADE_NAMES);
+    const runs = this.runs as RedisRunJournal;
+    return runUpgrade('RedisStorage', [
+      {
+        name: 'key-index',
+        description: 'lists keys and runs through indexes instead of reading every key (when no process of 0.9/0.10 remains)',
+        pending: async () => runs.order.usable && !((await this.indexGate.on()) && (await runs.order.on())),
+        plan: async () => ({ reads: 'every key once' }),
+        run: async () => this.rebuildKeyIndex(),
+      },
+      threadRecordsStep(this, ['key-index']),
+    ], opts);
+  }
+  /** The `key-index` step. */
+  private async rebuildKeyIndex(): Promise<{ runs: number; work: number; listedRuns: number }> {
     const runs = this.runs as RedisRunJournal;
     const n = await this.indexGate.switchOn([runs.index, runs.counters, (this.work as RedisWorkStore).log]);
     const listedRuns = await runs.rebuildRunOrder();

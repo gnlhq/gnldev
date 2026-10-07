@@ -22,7 +22,9 @@ import { tablesFromDDL } from './migrate.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, orgSpaceSql } from './organization.js';
 import type { SchemaCheckResult, SchemaMigrationResult, MissingColumn } from './migrate.js';
 import { refuseUnknownNames } from '@gnldev/options';
-import { POSTGRES_STORAGE_NAMES, ADOPT_INTO_ORG_NAMES, MIGRATE_SCHEMA_NAMES, COMPACT_NAMES } from './option-names.js';
+import { POSTGRES_STORAGE_NAMES, ADOPT_INTO_ORG_NAMES, COMPACT_NAMES } from './option-names.js';
+import { runUpgrade, threadRecordsStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
+import { UPGRADE_NAMES } from './option-names.js';
 
 type QueryResult = { rows: any[]; rowCount?: number | null };
 type PoolClient = { query: (sql: string, params?: unknown[]) => Promise<QueryResult>; release?: (destroy?: boolean) => void };
@@ -692,8 +694,26 @@ export class PostgresStorage implements Storage {
    * `this.q`/`ensureReady()` — queries `this._pool` directly so it never implicitly runs the full DDL
    * first. `dryRun: true` returns the statements it WOULD run without touching the DB.
    */
-  async migrateSchema(opts?: { dryRun?: boolean }): Promise<SchemaMigrationResult> {
-    refuseUnknownNames('migrateSchema', opts, MIGRATE_SCHEMA_NAMES);
+  /**
+   * See `Storage.upgrade`. Steps: `schema` (the tables, columns and indexes this version expects —
+   * additive only), then `thread-records`.
+   */
+  async upgrade(opts?: UpgradeOptions): Promise<UpgradeReport> {
+    refuseUnknownNames('PostgresStorage.upgrade', opts, UPGRADE_NAMES);
+    return runUpgrade('PostgresStorage', [
+      {
+        name: 'schema',
+        description: 'adds the tables, columns and indexes this version expects (additive: never drops or renames)',
+        pending: async () => !(await this.checkSchema()).ok,
+        plan: async () => ({ statements: (await this.applySchemaGap({ dryRun: true })).statements }),
+        run: async () => ({ statements: (await this.applySchemaGap()).statements }),
+      },
+      threadRecordsStep(this, ['schema']),
+    ], opts);
+  }
+
+  /** The `schema` step: applies exactly the gap checkSchema reports (see above). */
+  private async applySchemaGap(opts?: { dryRun?: boolean }): Promise<SchemaMigrationResult> {
     const check = await this.checkSchema();
     const expected = tablesFromDDL(DDL);
     const statements: string[] = [];

@@ -7,6 +7,8 @@ import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from '
 import { memoryPartitionOf, inMemoryPartition, type MemoryPartitionOption } from './storage.js';
 import { InMemoryJournal } from './journal.js';
 import { pageRunsFromArray } from './run-cursor.js';
+import { runUpgrade, threadRecordsStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
+import { UPGRADE_NAMES } from './option-names.js';
 import { stableStringify } from './hash.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
 import type { JournalEntry, RunSummary } from './journal.js';
@@ -477,6 +479,11 @@ const ALL_FULL: CapabilityMatrix = { runs: 'full', memory: 'full', vectors: 'ful
 export class InMemoryStorage implements Storage {
   readonly name = 'in-memory';
   readonly capabilities = ALL_FULL;
+  /** See `Storage.upgrade`. One step, `thread-records` — for runs written into this store before its threads had marks. */
+  async upgrade(opts?: UpgradeOptions): Promise<UpgradeReport> {
+    refuseUnknownNames('InMemoryStorage.upgrade', opts, UPGRADE_NAMES);
+    return runUpgrade('InMemoryStorage', [threadRecordsStep(this)], opts);
+  }
   readonly runs = new InMemoryRunJournal();
   readonly memory = new InMemoryMemoryStore();
   readonly vectors = new InMemoryVectorStore();

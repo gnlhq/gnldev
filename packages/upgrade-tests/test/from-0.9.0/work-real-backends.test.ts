@@ -19,6 +19,12 @@ import { createWorker, jobEraser } from '@gnldev/queue';
 import * as S from '../../generate/shapes.mjs';
 import { FIXTURES_090 } from '../support.js';
 
+/** The `schema` step of `storage.upgrade()`: whether it ran, and the statements it applied (or, dry, would apply). */
+async function schemaStep(s: { upgrade(o: { only: ['schema']; dryRun?: boolean }): Promise<{ steps: Array<{ name: string; ran: boolean; detail?: Record<string, unknown> }> }> }, dryRun = false) {
+  const step = (await s.upgrade({ only: ['schema'], dryRun })).steps.find((x) => x.name === 'schema')!;
+  return { ran: step.ran, statements: (step.detail?.statements ?? []) as string[] };
+}
+
 const RUN = process.env.GNL_INTEGRATION === '1';
 const PG_URL = process.env.GNL_PG_URL ?? 'postgres://postgres:gnl@localhost:55432/gnl';
 const REDIS_URL = process.env.GNL_REDIS_URL ?? 'redis://localhost:6380';
@@ -148,7 +154,7 @@ describe.skipIf(!RUN).each([
       const pgStore = f.storage as PostgresStorage;
       expect(await pgStore.checkSchema()).toMatchObject({ ok: true, missingTables: [], missingColumns: [] });
       const again = (await f.reopen()) as PostgresStorage;
-      expect((await again.migrateSchema()).statements).toEqual([]);
+      expect((await schemaStep(again)).statements).toEqual([]);
     });
   }
 

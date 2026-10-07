@@ -23,7 +23,9 @@ import type {
 import { tablesFromDDL } from './migrate.js';
 import type { SchemaCheckResult, SchemaMigrationResult, MissingColumn } from './migrate.js';
 import { refuseUnknownNames } from '@gnldev/options';
-import { ADOPT_INTO_ORG_NAMES, MIGRATE_SCHEMA_NAMES } from './option-names.js';
+import { ADOPT_INTO_ORG_NAMES } from './option-names.js';
+import { runUpgrade, threadRecordsStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
+import { UPGRADE_NAMES } from './option-names.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
 
@@ -560,8 +562,26 @@ export class SqliteStorage implements Storage {
    * changes are deliberately out of scope, see migrate.ts's header (the run journal is the append-only
    * source of truth). `dryRun: true` returns the statements it WOULD run without touching the DB.
    */
-  async migrateSchema(opts?: { dryRun?: boolean }): Promise<SchemaMigrationResult> {
-    refuseUnknownNames('migrateSchema', opts, MIGRATE_SCHEMA_NAMES);
+  /**
+   * See `Storage.upgrade`. Steps: `schema` (the tables, columns and indexes this version expects —
+   * additive only), then `thread-records`.
+   */
+  async upgrade(opts?: UpgradeOptions): Promise<UpgradeReport> {
+    refuseUnknownNames('SqliteStorage.upgrade', opts, UPGRADE_NAMES);
+    return runUpgrade('SqliteStorage', [
+      {
+        name: 'schema',
+        description: 'adds the tables, columns and indexes this version expects (additive: never drops or renames)',
+        pending: async () => !(await this.checkSchema()).ok,
+        plan: async () => ({ statements: (await this.applySchemaGap({ dryRun: true })).statements }),
+        run: async () => ({ statements: (await this.applySchemaGap()).statements }),
+      },
+      threadRecordsStep(this, ['schema']),
+    ], opts);
+  }
+
+  /** The `schema` step: applies exactly the gap checkSchema reports (see above). */
+  private async applySchemaGap(opts?: { dryRun?: boolean }): Promise<SchemaMigrationResult> {
     const check = await this.checkSchema();
     const expected = tablesFromDDL(DDL);
     const ddlStatements = DDL.split(';').map((s) => s.trim()).filter(Boolean);

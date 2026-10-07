@@ -1,7 +1,7 @@
 // The Redis store lists a prefix through its key index, not by SCAN, which walks the whole database:
 // a 10-call run took 44 ms with the database to itself and 2983 ms beside 1 000 000 other keys; a
 // queue's 10 jobs 78 → 6318 ms. A store an earlier version wrote keeps SCAN until every process is
-// upgraded and `rebuildKeyIndex()` is called — an earlier version writes keys the index does not hold.
+// upgraded and `upgrade()` is called — an earlier version writes keys the index does not hold.
 import { describe, it, expect, vi, afterAll } from 'vitest';
 import { z } from 'zod';
 import superjson from 'superjson';
@@ -101,16 +101,16 @@ describe('a store an earlier version wrote', () => {
     stats.walks = 0;
     expect((await storage.runs!.readRun!('later-run')).map((e) => e.key)).toEqual(['later-run:model:0']);
     expect(stats.walks).toBeGreaterThan(0);
-    expect(warn.mock.calls.filter((c) => String(c[0]).includes('rebuildKeyIndex')).length).toBe(1);
+    expect(warn.mock.calls.filter((c) => String(c[0]).includes('storage.upgrade()')).length).toBe(1);
   });
-  it('after rebuildKeyIndex: the earlier keys are listed, every process sharing it switches, 0 walks', async () => {
+  it('after upgrade(): the earlier keys are listed, every process sharing it switches, 0 walks', async () => {
     const { client, stats } = counted();
     await oldRunKey(client, 'gnl:', 'old-run');
     const a = new RedisStorage({ client, keyPrefix: 'gnl:' });
     const b = new RedisStorage({ client, keyPrefix: 'gnl:' }); // another process
     await tenCalls(a, 'r1');
     expect(await b.runs!.readRun!('old-run')).toHaveLength(1); // b decides: pending
-    expect((await a.rebuildKeyIndex()).runs).toBeGreaterThan(10);
+    expect(((await a.upgrade({ only: ['key-index'] })).steps.find((x) => x.name === 'key-index')!.detail as any).runs).toBeGreaterThan(10);
     stats.walks = 0;
     expect((await b.runs!.readRun!('old-run')).map((e) => e.key)).toEqual(['old-run:model:0']);
     expect((await a.runs!.readRun!('r1')).length).toBeGreaterThan(10);

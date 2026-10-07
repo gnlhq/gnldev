@@ -231,6 +231,18 @@ export const doctorCommand: Command = {
     }
     console.log(d.formatProtections(rows, { title: bold('gnl protections') }).join('\n'));
     console.log('');
+    // A store an earlier version wrote answers correctly but at that version's speed until its steps
+    // run. Asked as a dry run: doctor never writes.
+    const store = config.storage;
+    if (typeof store?.upgrade === 'function') {
+      const pending = (await store.upgrade({ dryRun: true }).catch(() => undefined))?.steps.filter((s) => s.pending) ?? [];
+      if (pending.length) {
+        console.log(bold('upgrade pending'));
+        for (const s of pending) console.log(`  ${s.name}  ${dim(`— ${s.description}`)}`);
+        console.log(dim('  `gnl upgrade --list` shows what each step does; `gnl upgrade` runs them.'));
+        console.log('');
+      }
+    }
     console.log(bold('this journal'));
 
     if (!stamps.runsScanned) {

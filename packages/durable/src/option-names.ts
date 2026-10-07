@@ -240,6 +240,6 @@ export const JUDGE_CONFIG_NAMES = JUDGE_NAMES;
 type StorageAdopt = NonNullable<Parameters<import('./in-memory-storage.js').InMemoryStorage['adoptIntoOrg']>[1]>;
 export const ADOPT_INTO_ORG_NAMES = optionNames<StorageAdopt>()(['dryRun', 'allowUnregistered', 'allowInFlight']);
 export const COMPACT_NAMES = optionNames<NonNullable<Parameters<import('./postgres-storage.js').PostgresStorage['compact']>[0]>>()(['full']);
-export const MIGRATE_SCHEMA_NAMES = optionNames<NonNullable<Parameters<import('./postgres-storage.js').PostgresStorage['migrateSchema']>[0]>>()(['dryRun']);
+export const UPGRADE_NAMES = optionNames<import('./upgrade.js').UpgradeOptions>()(['only', 'dryRun']);
 export const LIST_KEYS_NAMES = optionNames<NonNullable<Parameters<import('./journal.js').InMemoryJournal['listKeys']>[1]>>()(['limit']);
 export const LIST_STALE_RUNS_NAMES = optionNames<NonNullable<Parameters<import('./journal.js').InMemoryJournal['listStaleRuns']>[1]>>()(['includeSuspended']);

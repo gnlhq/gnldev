@@ -64,8 +64,9 @@ tests for it are behavioural:
 
 The journal is append-only and forward-compatible on purpose: a record written by an older version
 stays readable, and a missing field means "the old behaviour", never "throw". Adapters add columns via
-`ALTER TABLE … IF NOT EXISTS`-style migrations at startup, and `checkSchema()` / `migrateSchema()`
-exist for deployments that would rather migrate out of band than have a process do it on boot.
+`ALTER TABLE … IF NOT EXISTS`-style migrations at startup, and `checkSchema()` / `storage.upgrade()`
+(`gnl upgrade`) exist for deployments that would rather migrate out of band than have a process do it
+on boot.
 
 The storage *ports* carry their own compatibility, separate from the data. A port can change while
 every table stays as it was, and then the question is not "can an old version read this row" but "does

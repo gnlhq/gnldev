@@ -124,7 +124,7 @@ for (const [name, mk] of clientsUnderTest) {
       await sqlite.runs.put('late:model:0', { text: 'x' });
       expect(await client.get(pfx + 'runidxstate')).toBe('pending');
       expect(await walk(now.runs, {}, 7)).toEqual(await walk(sqlite.runs, {}, 1000));
-      const res = await now.rebuildKeyIndex();
+      const res = (await now.upgrade({ only: ['key-index'] })).steps.find((x) => x.name === 'key-index')!.detail as any;
       expect(res.listedRuns).toBeGreaterThan(90);
       expect(await client.get(pfx + 'runidxstate')).toBe('on');
       for (const q of QUERIES) expect(await walk(now.runs, q, 7), JSON.stringify(q)).toEqual(await walk(sqlite.runs, q, 1000));

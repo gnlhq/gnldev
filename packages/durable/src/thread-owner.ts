@@ -46,7 +46,7 @@ export const threadOwnerKey = (threadId: string): string => `thread:${threadId}:
 export const threadSeenKey = (threadId: string): string => `thread:${threadId}:seen`;
 
 /**
- * Written once a scope's every thread has its record or mark: by `upgradeThreadRecords`, or by the
+ * Written once a scope's every thread has its record or mark: by `storage.upgrade()`, or by the
  * gate itself when it first meets a scope with no runs at all. From then on a thread with neither is
  * new, and the gate never reads the scope's runs to find out.
  */
@@ -140,35 +140,87 @@ async function settle(journal: Journal, threadId: string, v: { derived?: string;
   return { exists: true, ...(now?.resourceId ? { owner: now.resourceId } : { staffClaimed: now?.ownerKind !== 'unknown' }) };
 }
 
-/**
- * Gives every thread in the scope its record or mark, from its runs, once — the derivation
- * `threadOwnerOf` does lazily, thread by thread — then marks the scope complete, so no gate reads the
- * runs again. Run it once after upgrading a store that holds threads from 0.10 or earlier; until then
- * the gate still reads the runs for a thread it has no record or mark for, so nothing depends on it.
- * The runs are read in one pass (one request for all of them, where the journal honours the limit).
- */
-export async function upgradeThreadRecords(journal: Journal, memory?: Memory): Promise<{ threads: number; recorded: number; marked: number }> {
-  const all = await allRunsOnePass(journal);
-  const byThread = new Map<string, RunSummary[]>();
-  for (const r of all) if (r.threadId) byThread.set(r.threadId, [...(byThread.get(r.threadId) ?? []), r]);
-  let recorded = 0;
-  let marked = 0;
-  for (const [threadId, runs] of byThread) {
-    if ((await journal.get(threadOwnerKey(threadId))) !== undefined || (await journal.get(threadSeenKey(threadId))) !== undefined) continue;
-    const fromMemory = memory?.getThreadResource ? await memory.getThreadResource(threadId) : undefined;
-    const v = fromMemory ? { derived: fromMemory, anonymous: false } : await verdictOfRuns(journal, runs);
-    await settle(journal, threadId, v);
-    if (!v.derived && v.anonymous) marked++; else recorded++;
-  }
-  await journal.put(THREAD_RECORDS_KEY, { at: Date.now(), upgraded: true });
-  return { threads: byThread.size, recorded, marked };
+/** Whether a scope's every thread has its record or mark (`THREAD_RECORDS_KEY`), so its gate never reads runs. */
+export async function threadRecordsComplete(journal: Journal): Promise<boolean> {
+  return (await journal.get(THREAD_RECORDS_KEY)) !== undefined;
 }
 
-async function allRunsOnePass(journal: Journal): Promise<RunSummary[]> {
-  const list = (journal as Partial<JournalReader> & { listRuns?: (q?: { cursor?: string; limit?: number }) => Promise<unknown> }).listRuns;
-  if (typeof list !== 'function') return [];
-  const LIMIT = Number.MAX_SAFE_INTEGER;
-  return listRunsArray({ listRuns: (q?: { cursor?: string }) => list.call(journal, { ...(q ?? {}), limit: LIMIT }) });
+/** Runs read per page by `writeThreadRecords`. */
+const RECORD_PAGE = 1000;
+/** Threads `writeThreadRecords` settles at once. */
+const RECORD_WRITERS = 16;
+
+/**
+ * What one thread's runs said so far, kept per THREAD rather than per run — so the pass holds one small
+ * entry for each thread, never every run (holding every run summary took 1.4 GB at 1 000 000 runs). It
+ * is `verdictOfRuns` folded over the runs as they arrive: the same answer, in pieces.
+ */
+interface ThreadTally { owner: string | undefined; mixed: boolean; allBornUnknown: boolean }
+
+/**
+ * Gives every thread in the scope its record or mark, from its runs — the derivation `threadOwnerOf`
+ * does lazily, thread by thread — then marks the scope complete, so no gate reads the runs again.
+ * Reads the runs one page at a time. A thread's verdict needs ALL its runs and they arrive in creation
+ * order, not by thread, so a pass interrupted part-way starts again from the first page: every write
+ * here is first-write-wins, so running it again changes nothing that was already written.
+ * @internal — `storage.upgrade({ only: ['thread-records'] })` runs it.
+ */
+export async function writeThreadRecords(journal: Journal, memory?: Memory): Promise<{ threads: number; recorded: number; marked: number }> {
+  const tally = new Map<string, ThreadTally>();
+  for await (const page of runPages(journal)) {
+    for (const r of page) {
+      if (!r.threadId) continue;
+      // Born `unknown` under a versioned record: read only for a run that names nobody (allBornUnknown).
+      const unknownBorn = r.resourceId ? false : recordOwner(await journal.get(runKeys.input(r.runId)))?.kind === 'unknown';
+      const t = tally.get(r.threadId);
+      if (!t) { tally.set(r.threadId, { owner: r.resourceId, mixed: false, allBornUnknown: unknownBorn }); continue; }
+      if (t.owner !== r.resourceId) t.mixed = true;
+      t.allBornUnknown &&= unknownBorn;
+    }
+  }
+  let recorded = 0;
+  let marked = 0;
+  const one = async (threadId: string, t: ThreadTally) => {
+    if ((await journal.get(threadOwnerKey(threadId))) !== undefined || (await journal.get(threadSeenKey(threadId))) !== undefined) return;
+    const fromMemory = memory?.getThreadResource ? await memory.getThreadResource(threadId) : undefined;
+    const v = fromMemory ? { derived: fromMemory, anonymous: false }
+      : t.mixed ? { anonymous: false }
+      : t.owner ? { derived: t.owner, anonymous: false }
+      : { anonymous: t.allBornUnknown };
+    await settle(journal, threadId, v);
+    if (!v.derived && v.anonymous) marked++; else recorded++;
+  };
+  // Threads are independent and every write is first-write-wins, so a few go at once: one after another,
+  // 199 543 threads on Postgres took 269 s, nearly all of it waiting on round trips.
+  const queue = [...tally];
+  await Promise.all(Array.from({ length: RECORD_WRITERS }, async () => {
+    for (let next = queue.pop(); next; next = queue.pop()) await one(next[0], next[1]);
+  }));
+  await journal.put(THREAD_RECORDS_KEY, { at: Date.now(), upgraded: true });
+  return { threads: tally.size, recorded, marked };
+}
+
+/** A journal's runs, a page at a time, through whichever listing it has. */
+async function* runPages(journal: Journal): AsyncGenerator<RunSummary[]> {
+  const j = journal as Partial<JournalReader> & { listRuns?: (q?: { cursor?: string; limit?: number }) => Promise<unknown> };
+  if (typeof j.listRunsPaged === 'function') {
+    let cursor: string | undefined;
+    do {
+      const p = await j.listRunsPaged.call(journal, { limit: RECORD_PAGE, ...(cursor ? { cursor } : {}) });
+      yield p.items;
+      cursor = p.nextCursor;
+    } while (cursor);
+    return;
+  }
+  if (typeof j.listRuns !== 'function') return;
+  let page: unknown = await j.listRuns.call(journal, { limit: RECORD_PAGE });
+  for (;;) {
+    if (Array.isArray(page)) { yield page as RunSummary[]; return; } // an array reader hands every run at once
+    const p = page as { items: RunSummary[]; nextCursor?: string };
+    yield p.items;
+    if (!p.nextCursor) return;
+    page = await j.listRuns.call(journal, { cursor: p.nextCursor, limit: RECORD_PAGE });
+  }
 }
 
 /**

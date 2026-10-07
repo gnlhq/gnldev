@@ -20,6 +20,12 @@ import { PostgresStorage } from '../src/postgres-storage.js';
 import { InMemoryStorage } from '../src/in-memory-storage.js';
 import { runMigrationCheck } from '../src/migrate.js';
 
+/** The `schema` step of `storage.upgrade()`: whether it ran, and the statements it applied (or, dry, would apply). */
+async function schemaStep(s: { upgrade(o: { only: ['schema']; dryRun?: boolean }): Promise<{ steps: Array<{ name: string; ran: boolean; detail?: Record<string, unknown> }> }> }, dryRun = false) {
+  const step = (await s.upgrade({ only: ['schema'], dryRun })).steps.find((x) => x.name === 'schema')!;
+  return { ran: step.ran, statements: (step.detail?.statements ?? []) as string[] };
+}
+
 function pgmemPool() {
   const { Pool } = newDb().adapters.createPg();
   return new Pool();
@@ -43,7 +49,7 @@ describe('SqliteStorage schema tooling', () => {
     expect(check.missingColumns).toEqual([]);
   });
 
-  it('drift (missing column + missing table) → checkSchema reports exactly the gap; dryRun previews without applying; migrateSchema() closes it and the storage actually works after', async () => {
+  it('drift (missing column + missing table) → checkSchema reports exactly the gap; dryRun previews without applying; the schema step of upgrade() closes it and the storage actually works after', async () => {
     const storage = new SqliteStorage(':memory:');
     // simulate drift AFTER construction (the constructor already fully migrated this instance —
     // see the file header for why the "old db" has to be crafted post-construction for sqlite).
@@ -64,8 +70,8 @@ describe('SqliteStorage schema tooling', () => {
     expect(before.missingColumns.map((c) => c.column).sort()).toEqual(['canceled', 'failed', 'running', 'suspended_count']);
     expect(before.missingColumns.every((c) => c.table === 'gnl_runs')).toBe(true);
 
-    const dry = await storage.migrateSchema({ dryRun: true });
-    expect(dry.dryRun).toBe(true);
+    const dry = await schemaStep(storage, true);
+    expect(dry.ran).toBe(false);
     expect(dry.statements.length).toBeGreaterThan(0);
     expect(dry.statements.some((s) => /CREATE TABLE IF NOT EXISTS gnl_counters/i.test(s))).toBe(true);
     expect(dry.statements.some((s) => /ALTER TABLE gnl_runs ADD COLUMN suspended_count/i.test(s))).toBe(true);
@@ -74,8 +80,8 @@ describe('SqliteStorage schema tooling', () => {
     expect(stillBefore.ok).toBe(false);
     expect(stillBefore.missingTables).toEqual(['gnl_counters']);
 
-    const applied = await storage.migrateSchema();
-    expect(applied.dryRun).toBe(false);
+    const applied = await schemaStep(storage);
+    expect(applied.ran).toBe(true);
     expect(applied.statements.length).toBe(dry.statements.length);
 
     const after = await storage.checkSchema();
@@ -96,9 +102,9 @@ describe('SqliteStorage schema tooling', () => {
     expect(page.items.some((r) => r.runId === 'mig-run')).toBe(true);
   });
 
-  it('migrateSchema is a no-op (empty statements) when the schema is already current', async () => {
+  it('the schema step is a no-op (empty statements) when the schema is already current', async () => {
     const storage = new SqliteStorage(':memory:');
-    const res = await storage.migrateSchema();
+    const res = await schemaStep(storage);
     expect(res.statements).toEqual([]);
     expect((await storage.checkSchema()).ok).toBe(true);
   });
@@ -141,8 +147,8 @@ describe('PostgresStorage schema tooling (pg-mem)', () => {
       ['gnl_counters', 'gnl_run_journal', 'gnl_threads', 'gnl_messages', 'gnl_working_memory', 'gnl_observations', 'gnl_message_batches', 'gnl_vectors', 'gnl_work_log', 'gnl_work_kv', 'gnl_work_seq', 'gnl_cache'].sort(),
     );
 
-    const dry = await storage.migrateSchema({ dryRun: true });
-    expect(dry.dryRun).toBe(true);
+    const dry = await schemaStep(storage, true);
+    expect(dry.ran).toBe(false);
     expect(dry.statements.some((s) => /CREATE TABLE IF NOT EXISTS gnl_counters/i.test(s))).toBe(true);
     expect(dry.statements.some((s) => /ALTER TABLE gnl_runs ADD COLUMN IF NOT EXISTS suspended_count/i.test(s))).toBe(true);
     expect(dry.statements.some((s) => /ALTER TABLE gnl_runs ADD COLUMN IF NOT EXISTS failed/i.test(s))).toBe(true);
@@ -151,8 +157,8 @@ describe('PostgresStorage schema tooling (pg-mem)', () => {
     const stillBefore = await storage.checkSchema();
     expect(stillBefore.ok).toBe(false); // dry-run applied nothing
 
-    const applied = await storage.migrateSchema();
-    expect(applied.dryRun).toBe(false);
+    const applied = await schemaStep(storage);
+    expect(applied.ran).toBe(true);
     const after = await storage.checkSchema();
     expect(after.ok).toBe(true);
 

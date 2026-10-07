@@ -8,6 +8,12 @@ import { createRequire } from 'node:module';
 import { afterEach, expect, it } from 'vitest';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
 
+/** The `schema` step of `storage.upgrade()`: whether it ran, and the statements it applied (or, dry, would apply). */
+async function schemaStep(s: { upgrade(o: { only: ['schema']; dryRun?: boolean }): Promise<{ steps: Array<{ name: string; ran: boolean; detail?: Record<string, unknown> }> }> }, dryRun = false) {
+  const step = (await s.upgrade({ only: ['schema'], dryRun })).steps.find((x) => x.name === 'schema')!;
+  return { ran: step.ran, statements: (step.detail?.statements ?? []) as string[] };
+}
+
 // Through require: vite resolves a static `node:sqlite` import as a file called `sqlite` and fails.
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
@@ -101,8 +107,8 @@ export function itMigrates(file: string): void {
     expect(check, JSON.stringify(check)).toMatchObject({ ok: true, missingTables: [], missingColumns: [] });
     const first = schemaOf(f.path);
     const again = f.reopen();
-    expect((await again.migrateSchema()).statements).toEqual([]);
-    expect((await again.migrateSchema()).statements).toEqual([]);
+    expect((await schemaStep(again)).statements).toEqual([]);
+    expect((await schemaStep(again)).statements).toEqual([]);
     expect(schemaOf(f.path)).toEqual(first);
     // The additive work-store migration of [Unreleased] is there.
     const cols = rawQuery<{ name: string }>(f.path, 'PRAGMA table_info(gnl_work_log)').map((c) => c.name);

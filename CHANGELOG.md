@@ -12,14 +12,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 **A new thread no longer reads the store's other runs, and a run list resumes from its last run**
 (ADR-0006). Who may reach a thread is unchanged. When you upgrade from 0.10:
 
-- Once every process runs this version, call `await upgradeThreadRecords(journal)` once (each
-  organization view too), and on Redis `await storage.rebuildKeyIndex()`. Until then everything works
-  as in 0.10, at 0.10's speed.
+- Once every process runs this version, run `gnl upgrade` (or `await storage.upgrade()`) once. It
+  lists its steps first — `gnl upgrade --list` — and runs every pending one, or only those you name
+  (`--only thread-records`). Until then everything works as in 0.10, at 0.10's speed.
 - A run list's `nextCursor` names a run, not a row number. Pass it back verbatim; a numeric cursor from
   0.10 is refused.
 
 ### Breaking
 
+- **One way to upgrade a store: `storage.upgrade()`** (and `gnl upgrade`). `migrateSchema()` (Sqlite,
+  Postgres) and `rebuildKeyIndex()` (Redis) are no longer public — they are the `schema` and
+  `key-index` steps: `storage.upgrade({ only: ['schema'] })`, `storage.upgrade({ only: ['key-index'] })`.
+  `dryRun: true` reports each step's pending state and, for `schema`, the statements, and writes nothing.
 - **A run list's cursor names its last run** (`listRuns`, `listRunsPaged`, `GET /runs`, the Studio).
   0.10's numeric cursor is refused with a `TypeError` (400 from the server and the Studio) instead of
   being read as a row number — it named a position in a window that moves. A Studio list left open
@@ -44,11 +48,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- `upgradeThreadRecords(journal)`: writes the owner record or the `seen` marker for every thread an
-  earlier version left without one, then marks the store complete. Also `threadSeenKey`,
-  `THREAD_RECORDS_KEY`, `isRunCursor`, `RunOrder`.
+- `storage.upgrade({ only?, dryRun? })` on every first-party store, and `gnl upgrade [--list] [--only …]`;
+  `gnl doctor` lists pending steps. Steps: `schema` (Sqlite, Postgres), `key-index` (Redis),
+  `thread-records` (every store, the root scope and each registered organization). A step never runs
+  behind the caller's back: naming one whose prerequisite is still pending is refused, with the call
+  that runs both. `thread-records` reads runs one page at a time and keeps one small entry per thread
+  (it held every run summary: 1.4 GB at 1 000 000 runs); interrupted, it starts again — every write is
+  first-write-wins. Also `threadSeenKey`, `THREAD_RECORDS_KEY`, `isRunCursor`, `RunOrder`,
+  `UPGRADE_STEPS`.
 - `ListQuery.order: 'asc' | 'desc'` on every first-party store.
-- `RedisStorage.rebuildKeyIndex()` also fills the run order (`listedRuns` in its result).
+- Redis's `key-index` step also fills the run order (`listedRuns` in its detail).
 
 ### Known limits
 

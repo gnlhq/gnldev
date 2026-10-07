@@ -1128,6 +1128,14 @@ export interface Storage {
   init?(): Promise<void>;
   close?(): Promise<void>;
   /**
+   * Brings data an earlier version wrote up to this one: the steps this store has (`schema`,
+   * `key-index`, `thread-records` — see `UPGRADE_STEPS`), every pending one or those named in `only`.
+   * `dryRun` lists them and what each would do, writing nothing — what `gnl upgrade --list` prints.
+   * Each step is idempotent; until one has run, the store answers correctly at the earlier version's
+   * speed. A store with nothing to upgrade leaves it out.
+   */
+  upgrade?(opts?: import('./upgrade.js').UpgradeOptions): Promise<import('./upgrade.js').UpgradeReport>;
+  /**
    * H12 (optional): reclaiming DELETED space back to DISK (compaction). purge/sweep rows are logically
    * deleted but the engine does NOT RETURN empty pages to the OS (it reuses them → doesn't grow
    * unbounded, but the file doesn't shrink after a big purge). `compact` reclaims this space: SQLite

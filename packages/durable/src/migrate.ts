@@ -6,7 +6,7 @@
 // diffing, no "disable auto-init, run migrations out-of-band" production path (a pattern some other
 // storage adapters support). This module adds that surface ON TOP OF the exact same additive DDL the
 // adapters already run — nothing here is a new migration engine; it's introspection (checkSchema) plus a
-// deliberate, additive-only application of the gap (migrateSchema). exportSchema/checkSchema/migrateSchema
+// deliberate, additive-only application of the gap (`upgrade({ only: ['schema'] })`). exportSchema/checkSchema and the schema step
 // themselves live on SqliteStorage/PostgresStorage (sqlite-storage.ts / postgres-storage.ts) since they
 // need adapter-specific DDL + connections; this file holds the SHARED bits: the types, the DDL→expected-
 // schema parser (so "expected" can never drift from the DDL text the adapters actually execute), and the
@@ -56,7 +56,6 @@ export interface MigratableStorage {
   readonly name: string;
   exportSchema(): string[];
   checkSchema(): Promise<SchemaCheckResult>;
-  migrateSchema(opts?: { dryRun?: boolean }): Promise<SchemaMigrationResult>;
 }
 
 export type MigrationCheckResult =
