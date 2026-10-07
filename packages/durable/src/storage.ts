@@ -1129,7 +1129,7 @@ export interface Storage {
   close?(): Promise<void>;
   /**
    * Brings data an earlier version wrote up to this one: the steps this store has (`schema`,
-   * `key-index`, `thread-records` — see `UPGRADE_STEPS`), every pending one or those named in `only`.
+   * `key-index`, `thread-records`, `subject-index` — see `UPGRADE_STEPS`), every pending one or those named in `only`.
    * `dryRun` lists them and what each would do, writing nothing — what `gnl upgrade --list` prints.
    * Each step is idempotent; until one has run, the store answers correctly at the earlier version's
    * speed. A store with nothing to upgrade leaves it out.

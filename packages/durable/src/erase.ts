@@ -35,6 +35,7 @@ import type { Journal } from './journal.js';
 import type { MemoryStore, Storage, WorkStore } from './storage.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { ERASE_SUBJECT_NAMES, RESERVED_ROOT_THREADS_NAMES, SUBJECT_RUNS_NAMES } from './option-names.js';
+import { runsOfSubject, subjectIndexComplete, indexedIds } from './subject-index.js';
 
 /** One package's share of a person's erasure (`jobEraser`, `triggerEraser`, `eventEraser`), or a store outside the storage. */
 export interface SubjectEraser {
@@ -278,22 +279,15 @@ export async function subjectRuns(storage: Storage, resourceId: string, opts: { 
   const journal = toJournal(storage.runs);
   const outside = opts.orgId === undefined;
   const runs = outside ? journal : withOrg(journal, opts.orgId!);
-  const paged = (runs as unknown as {
-    listRunsPaged?: (q: { resourceId: string; limit: number; cursor?: string }) => Promise<{ items: Array<{ runId: string; threadId?: string }>; nextCursor?: string }>;
-  }).listRunsPaged;
-  if (typeof paged !== 'function') throw new Error('@gnldev/durable: subjectRuns needs a journal that lists runs by owner (listRunsPaged)');
+  if (typeof (runs as unknown as { listRunsPaged?: unknown }).listRunsPaged !== 'function') throw new Error('@gnldev/durable: subjectRuns needs a journal that lists runs by owner (listRunsPaged)');
   const out: SubjectRun[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await paged.call(runs, { resourceId, limit: 200, ...(cursor ? { cursor } : {}) });
-    for (const r of page.items) {
-      if (outside && isOrganizationKey(r.runId)) continue;
-      const outcome = await runs.get<{ status?: unknown }>(runKeys.outcome(r.runId));
-      const inFlight = outcome?.status === 'running' || (await hasRunningClaim(runs, r.runId));
-      out.push({ runId: r.runId, ...(r.threadId ? { threadId: r.threadId } : {}), inFlight });
-    }
-    cursor = page.nextCursor;
-  } while (cursor);
+  // From the person's index once the scope's is complete, by walking every run before (subject-index.ts).
+  for (const r of await runsOfSubject(runs, resourceId)) {
+    if (outside && isOrganizationKey(r.runId)) continue;
+    const outcome = await runs.get<{ status?: unknown }>(runKeys.outcome(r.runId));
+    const inFlight = outcome?.status === 'running' || (await hasRunningClaim(runs, r.runId));
+    out.push({ runId: r.runId, ...(r.threadId ? { threadId: r.threadId } : {}), inFlight });
+  }
   return out;
 }
 
@@ -362,8 +356,11 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
   const asker = stores[0] ? ownerAsker(stores[0].store) : undefined;
 
   // Threads first, while the owner records still exist: the ones this person owns, by the ONE question.
+  // From the person's index once the scope's is complete; before, every thread's owner record. Each is
+  // checked below with threadOwnerOf either way: the index names candidates, the record decides.
   const ownedByRecord = new Set<string>();
-  for (const k of (await runs.listKeys?.('thread:')) ?? []) if (k.endsWith(':owner')) ownedByRecord.add(k.slice('thread:'.length, -':owner'.length));
+  if (await subjectIndexComplete(runs)) for (const t of await indexedIds(runs, 'thread', resourceId)) ownedByRecord.add(t);
+  else for (const k of (await runs.listKeys?.('thread:')) ?? []) if (k.endsWith(':owner')) ownedByRecord.add(k.slice('thread:'.length, -':owner'.length));
   // Outside organizations, a thread under an `org:` id is the root's to erase only when it is CERTAINLY
   // the root's (`reservedThreadVerdict`); an organization's goes with that organization's erasure, and
   // an undecided one is reported, not deleted. Asked before `threadOwnerOf`, which would backfill.

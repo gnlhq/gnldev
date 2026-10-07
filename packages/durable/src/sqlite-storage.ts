@@ -24,7 +24,7 @@ import { tablesFromDDL } from './migrate.js';
 import type { SchemaCheckResult, SchemaMigrationResult, MissingColumn } from './migrate.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { ADOPT_INTO_ORG_NAMES } from './option-names.js';
-import { runUpgrade, threadRecordsStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
+import { runUpgrade, threadRecordsStep, subjectIndexStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
 import { UPGRADE_NAMES } from './option-names.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
@@ -577,6 +577,7 @@ export class SqliteStorage implements Storage {
         run: async () => ({ statements: (await this.applySchemaGap()).statements }),
       },
       threadRecordsStep(this, ['schema']),
+      subjectIndexStep(this, ['schema']),
     ], opts);
   }
 

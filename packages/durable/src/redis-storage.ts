@@ -30,7 +30,7 @@ import type { AdoptIntoOrgResult,
 import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision } from './storage.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { REDIS_STORAGE_NAMES, ADOPT_INTO_ORG_NAMES } from './option-names.js';
-import { runUpgrade, threadRecordsStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
+import { runUpgrade, threadRecordsStep, subjectIndexStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
 import { UPGRADE_NAMES } from './option-names.js';
 
 const SCHEMA_VERSION = '1';
@@ -1587,6 +1587,7 @@ export class RedisStorage implements Storage {
         run: async () => this.rebuildKeyIndex(),
       },
       threadRecordsStep(this, ['key-index']),
+      subjectIndexStep(this, ['key-index']),
     ], opts);
   }
   /** The `key-index` step. */

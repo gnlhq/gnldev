@@ -24,6 +24,7 @@
  */
 import { claim, runKeys, isVersionedRecord, type Journal } from './journal.js';
 import { stampFormat } from './format.js';
+import { indexSubject, unindexSubject, markSubjectIndexIfEmpty } from './subject-index.js';
 import { RunOwnerMismatchError, RunTargetMismatchError } from './errors.js';
 
 import type { Caller, RunIdentity, GnlToolContext, StaffCaller, UnknownCaller, UserCaller } from './identity-types.js';
@@ -362,8 +363,15 @@ export function ownerFields(c: Caller): { resourceId?: string; orgId?: string; o
 export async function claimRunOwner(journal: RawJournal, runId: string, caller: Caller, fields: Record<string, unknown> = {}): Promise<Caller> {
   assertRaw(journal, 'claimRunOwner');
   const key = runKeys.input(runId);
+  // The person's index entry goes in BEFORE the record (subject-index.ts): a crash between the two
+  // leaves an entry for no run, never a run the erasure cannot find.
+  await markSubjectIndexIfEmpty(journal);
+  const indexed = caller.kind === 'user' ? caller.id : undefined;
+  await indexSubject(journal, 'run', indexed, runId);
   await claim(journal, key, stampFormat({ at: Date.now(), ...fields, ...ownerFields(caller) }));
-  return recordOwner(await journal.get<OwnerRecord>(key)) ?? callerOf(caller);
+  const owner = recordOwner(await journal.get<OwnerRecord>(key)) ?? callerOf(caller);
+  if (indexed && (owner.kind !== 'user' || owner.id !== indexed)) await unindexSubject(journal, 'run', indexed, runId);
+  return owner;
 }
 
 /**

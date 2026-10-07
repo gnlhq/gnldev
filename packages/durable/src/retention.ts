@@ -25,6 +25,7 @@ import { orgPrefix, isOrganizationKey } from './organization.js';
 import type { PollLoop } from './polling.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { LOG_SWEEP_TARGET_NAMES, PURGE_RESOURCE_NAMES, PURGE_RUN_NAMES, RETENTION_SWEEPER_NAMES, SWEEP_LOG_NAMES, SWEEP_RUNS_NAMES, SWEEP_THREADS_NAMES } from './option-names.js';
+import { unindexSubject, subjectPrefix, runsOfSubject, subjectIndexComplete } from './subject-index.js';
 
 function requireDelete(journal: Journal): NonNullable<Journal['deletePrefix']> {
   if (typeof journal.deletePrefix !== 'function') {
@@ -283,10 +284,12 @@ export async function purgeRun(
   const del = requireDelete(journal);
   if (seen.has(runId)) return 0; // cycle/repeat safety
   seen.add(runId);
+  // BEFORE the delete: `<runId>:input` is one of the keys this function is about to remove, and it
+  // names the person whose index entry for this run goes with it (subject-index.ts).
+  const input = await journal.get<{ resourceId?: string; threadId?: string }>(runKeys.input(runId))
+    .catch(() => undefined);
+  await unindexSubject(journal, 'run', input?.resourceId, runId);
   if (opts.ownershipTrace) {
-    // BEFORE the delete: `<runId>:input` is one of the keys this function is about to remove.
-    const input = await journal.get<{ resourceId?: string; threadId?: string }>(runKeys.input(runId))
-      .catch(() => undefined);
     if (input?.resourceId && input.threadId) {
       await journal.put(ownershipTraceKey(input.resourceId, input.threadId), { at: Date.now() })
         .catch(() => {});  // best-effort: a trace that cannot be written must not block the sweep
@@ -520,12 +523,22 @@ export async function purgeResource(
   // Without `outsideOrganizations` this erasure is the id's in every partition: the grant says so, since
   // a root delete without a namespace is otherwise the root's alone (ADR-0001, `vectorDeletePlan`).
   if (opts.vectors) total += await opts.vectors.delete!({ owner: resourceId, ...(opts.outsideOrganizations ? { outsideOrganizations: true } : { [VECTOR_ALL_PARTITIONS]: true as const }) });
-  if (typeof paged !== 'function') return total;
+  const indexed = await subjectIndexComplete(journal);
+  if (typeof paged !== 'function' && !indexed) return total;
   const threads = new Set<string>();
   const runIds: string[] = [];
+  // Once the scope's subject index is complete, the person's runs are listed from it, each checked
+  // against its `:input` (subject-index.ts); before, by walking every run.
+  if (indexed) {
+    for (const r of await runsOfSubject(journal, resourceId)) {
+      if (opts.outsideOrganizations && isOrganizationKey(r.runId)) continue;
+      if (r.threadId) threads.add(r.threadId);
+      runIds.push(r.runId);
+    }
+  } else {
   let cursor: string | undefined;
   do {
-    const page = await paged.call(journal, { resourceId, limit: 200, ...(cursor ? { cursor } : {}) })
+    const page = await paged!.call(journal, { resourceId, limit: 200, ...(cursor ? { cursor } : {}) })
       .catch(() => ({ items: [] as Array<{ runId: string; threadId?: string }>, nextCursor: undefined as string | undefined }));
     for (const r of page.items) {
       if (opts.outsideOrganizations && isOrganizationKey(r.runId)) continue;
@@ -534,6 +547,7 @@ export async function purgeResource(
     }
     cursor = page.nextCursor;
   } while (cursor);
+  }
   // WHOSE THREADS. A run of this person's on a thread does not make the thread theirs: an older
   // release let a user attach a run to someone else's thread, and this function then deleted her
   // messages with his account. Asked BEFORE the runs go, because a thread opened before owner records
@@ -566,6 +580,8 @@ export async function purgeResource(
   for (const t of owned) total += await purgeThread(journal, t);
   // The trace names a person and must not outlive them. Last, so a failure above cannot strand it.
   total += await del(`${ownershipTraceKey(resourceId, '')}`);
+  // So does the person's index: every entry in it names them (subject-index.ts).
+  total += await del(subjectPrefix(resourceId));
   return total;
 }
 
@@ -636,7 +652,11 @@ export async function purgeThread(journal: Journal, threadId: string): Promise<n
     // SemanticMemory's log (@gnldev/rag) — the thread's messages, kept under their own prefix.
     + (await purgeThreadNamespace(journal, SEMANTIC_LOG_PREFIX, threadId, threadIdOfSemKey));
   // The owner record names a person, and with the thread gone it guards nothing.
-  if ((await journal.get(threadOwnerKey(threadId))) !== undefined) total += await del(threadOwnerKey(threadId));
+  const ownerRec = await journal.get<{ resourceId?: string }>(threadOwnerKey(threadId));
+  if (ownerRec !== undefined) {
+    await unindexSubject(journal, 'thread', ownerRec?.resourceId, threadId);
+    total += await del(threadOwnerKey(threadId));
+  }
   if ((await journal.get(threadSeenKey(threadId))) !== undefined) total += await del(threadSeenKey(threadId));
 
   // The ownership traces pointing HERE. Once this thread's state is gone they identify nothing —

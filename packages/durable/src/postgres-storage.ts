@@ -23,7 +23,7 @@ import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatform
 import type { SchemaCheckResult, SchemaMigrationResult, MissingColumn } from './migrate.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { POSTGRES_STORAGE_NAMES, ADOPT_INTO_ORG_NAMES, COMPACT_NAMES } from './option-names.js';
-import { runUpgrade, threadRecordsStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
+import { runUpgrade, threadRecordsStep, subjectIndexStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
 import { UPGRADE_NAMES } from './option-names.js';
 
 type QueryResult = { rows: any[]; rowCount?: number | null };
@@ -709,6 +709,7 @@ export class PostgresStorage implements Storage {
         run: async () => ({ statements: (await this.applySchemaGap()).statements }),
       },
       threadRecordsStep(this, ['schema']),
+      subjectIndexStep(this, ['schema']),
     ], opts);
   }
 

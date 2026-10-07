@@ -16,7 +16,9 @@ const { InMemoryStorage, RedisStorage, toJournal, admitThreadRun } = D as any;
 /** Each journal's storage, so a test upgrades the store the way a host does: `storage.upgrade()`. */
 const storageOf = new WeakMap<object, any>();
 const journalOf = (s: any) => { const j = toJournal(s.runs); storageOf.set(j, s); return j; };
-const upgrade = async (j: any) => { const s = storageOf.get(j); await s.init?.(); await s.upgrade(); };
+// Only the step this gate needs: the subject index has its own tests (erase-subject-index), and a second
+// pass over 1000 runs on pg-mem ran past the timeout under a loaded full suite.
+const upgrade = async (j: any) => { const s = storageOf.get(j); await s.init?.(); await s.upgrade({ only: ['thread-records'] }); };
 
 // A real server when the real-backend job provides one (GNL_REDIS_URL); the fake always.
 const REDIS_URL = process.env.GNL_REDIS_URL;
@@ -116,7 +118,9 @@ for (const [name, make] of stores) {
       expect(res.some((r) => typeof r !== 'string')).toBe(true);
     });
 
-    it('S7 a new thread does not read the store\'s other runs (1000 unrelated runs)', async () => {
+    // What S7 measures is reads, not time; seeding 1000 runs into pg-mem took 6.6 s alone and past 30 s
+    // in a loaded full suite, so its time limit is its own.
+    it('S7 a new thread does not read the store\'s other runs (1000 unrelated runs)', { timeout: 120_000 }, async () => {
       const raw = journalOf(make());
       await upgrade(raw);
       for (let i = 0; i < 1000; i += 100) await Promise.all(Array.from({ length: 100 }, (_, k) => raw.put(`u-${i + k}:model:0`, { text: 'x' })));

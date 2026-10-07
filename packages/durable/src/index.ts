@@ -163,7 +163,7 @@ export { withOrg, withRootScope, orgScopeOf, orgPrefix, isOrganizationKey, parse
 export { withOrgStorage, orgStorageScopeOf, scopeConfigToOrg } from './org-storage.js';
 export { MEMORY_PARTITION, memoryPartitionOf, inMemoryPartition, assertRootThreadId, ReservedThreadIdError, type MemoryPartition, type MemoryPartitionOption } from './storage.js';
 export { withSubjectJournal, withSubjectMemory, type SubjectViewOptions, type SubjectMemoryOptions } from './subject-view.js';
-export { threadOwnerOf, admitThreadRun, threadOwnerKey, threadSeenKey, THREAD_RECORDS_KEY, assignThreadOwner, recordThreadCreated, type ThreadOwnership } from './thread-owner.js';
+export { threadOwnerOf, admitThreadRun, threadOwnerKey, threadSeenKey, THREAD_RECORDS_KEY, copyThreadOwnership, assignThreadOwner, recordThreadCreated, type ThreadOwnership } from './thread-owner.js';
 export { ownedName, ownerOfName, assertSystemName, ownedPrefix, ownerIdProblem, assertOwnerId, OwnerIdError, RESERVED_OWNER_PREFIXES } from './owned-name.js';
 export { eraseSubject, subjectRuns, assertRootWorkForErasure, findReservedRootThreads, type ReservedRootThread, type EraseOptions, type EraseReport, type SubjectEraser, type SubjectRun } from './erase.js';
 export { orgPurgedKey, purgeRun, isRealRun, purgeThread, purgeResource, purgeBatch, purgeOrganization, purgeOrganizationWork, sweepRuns, sweepLog, sweepThreads, listOrphanThreadState, createRetentionSweeper } from './retention.js';

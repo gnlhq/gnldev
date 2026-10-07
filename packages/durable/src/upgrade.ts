@@ -11,11 +11,12 @@ import { toJournal, threadRecordOwner } from './storage.js';
 import { withOrg, withRootScope, ORG_RECORD_PRE } from './organization.js';
 import { withOrgStorage } from './org-storage.js';
 import { threadRecordsComplete, writeThreadRecords } from './thread-owner.js';
+import { subjectIndexComplete, writeSubjectIndex } from './subject-index.js';
 import type { Memory } from './memory.js';
 import type { MemoryStore } from './storage.js';
 
 /** Every upgrade step a first-party store can have, in the order `upgrade()` runs them. */
-export const UPGRADE_STEPS = ['schema', 'key-index', 'thread-records'] as const;
+export const UPGRADE_STEPS = ['schema', 'key-index', 'thread-records', 'subject-index'] as const;
 export type UpgradeStepName = (typeof UPGRADE_STEPS)[number];
 
 export interface UpgradeOptions {
@@ -124,6 +125,24 @@ export async function runUpgrade(who: string, steps: readonly UpgradeStep[], opt
 const ownerAsker = (store: MemoryStore): Memory =>
   ({ getThreadResource: async (id: string) => threadRecordOwner(await store.getThread(id)) }) as unknown as Memory;
 
+/** The scopes a step goes through: the root, and every registered organization. */
+async function upgradeScopes(storage: Storage): Promise<Array<{ name: string; journal: Journal; memory?: Memory }>> {
+  const j = toJournal(storage.runs);
+  const out: Array<{ name: string; journal: Journal; memory?: Memory }> = [];
+  const orgs: string[] = [];
+  if (typeof j.listKeys === 'function') {
+    for (const key of await j.listKeys(ORG_RECORD_PRE)) {
+      if ((await j.get(key)) != null) orgs.push(key.slice(ORG_RECORD_PRE.length));
+    }
+  }
+  out.push({ name: '(root)', journal: orgs.length ? withRootScope(j) : j, ...(storage.memory ? { memory: ownerAsker(storage.memory) } : {}) });
+  for (const org of orgs) {
+    const view = withOrgStorage(storage, org);
+    out.push({ name: org, journal: withOrg(j, org), ...(view.memory ? { memory: ownerAsker(view.memory) } : {}) });
+  }
+  return out;
+}
+
 /**
  * The `thread-records` step every store with runs has: gives each thread from an earlier version its
  * owner record or `seen` mark, in the root scope and in every registered organization, then marks each
@@ -132,23 +151,7 @@ const ownerAsker = (store: MemoryStore): Memory =>
  * @internal
  */
 export function threadRecordsStep(storage: Storage, requires?: readonly UpgradeStepName[]): UpgradeStep {
-  const root = (): Journal => toJournal(storage.runs);
-  async function scopes(): Promise<Array<{ name: string; journal: Journal; memory?: Memory }>> {
-    const j = root();
-    const out: Array<{ name: string; journal: Journal; memory?: Memory }> = [];
-    const orgs: string[] = [];
-    if (typeof j.listKeys === 'function') {
-      for (const key of await j.listKeys(ORG_RECORD_PRE)) {
-        if ((await j.get(key)) != null) orgs.push(key.slice(ORG_RECORD_PRE.length));
-      }
-    }
-    out.push({ name: '(root)', journal: orgs.length ? withRootScope(j) : j, ...(storage.memory ? { memory: ownerAsker(storage.memory) } : {}) });
-    for (const org of orgs) {
-      const view = withOrgStorage(storage, org);
-      out.push({ name: org, journal: withOrg(j, org), ...(view.memory ? { memory: ownerAsker(view.memory) } : {}) });
-    }
-    return out;
-  }
+  const scopes = () => upgradeScopes(storage);
   return {
     name: 'thread-records',
     description: "writes the mark older threads lack, so a new thread's first run stops reading the store's runs",
@@ -167,6 +170,39 @@ export function threadRecordsStep(storage: Storage, requires?: readonly UpgradeS
       for (const s of await scopes()) {
         if (await threadRecordsComplete(s.journal)) continue;
         done[s.name] = await writeThreadRecords(s.journal, s.memory);
+      }
+      return { scopes: done };
+    },
+  };
+}
+
+/**
+ * The `subject-index` step every store with runs has: indexes each person's runs and owned threads, in
+ * the root scope and every registered organization, then marks each scope complete — from then on an
+ * erasure lists one person's prefix instead of walking the store (subject-index.ts). Until a scope is
+ * complete erasure keeps the walk, so it never waits for this step.
+ * @internal
+ */
+export function subjectIndexStep(storage: Storage, requires?: readonly UpgradeStepName[]): UpgradeStep {
+  const scopes = () => upgradeScopes(storage);
+  return {
+    name: 'subject-index',
+    description: "indexes each person's runs and threads, so erasing a person stops reading the whole store",
+    ...(requires ? { requires } : {}),
+    async pending() {
+      for (const s of await scopes()) if (!(await subjectIndexComplete(s.journal))) return true;
+      return false;
+    },
+    async plan() {
+      const left: string[] = [];
+      for (const s of await scopes()) if (!(await subjectIndexComplete(s.journal))) left.push(s.name);
+      return { scopes: left, reads: 'every run and every thread owner record of each scope once, a page at a time' };
+    },
+    async run() {
+      const done: Record<string, { runs: number; threads: number }> = {};
+      for (const s of await scopes()) {
+        if (await subjectIndexComplete(s.journal)) continue;
+        done[s.name] = await writeSubjectIndex(s.journal);
       }
       return { scopes: done };
     },

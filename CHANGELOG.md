@@ -32,6 +32,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Erasing one person read the whole store.** `eraseSubject` found a person's runs by walking every
+  run, and the threads they own by opening every thread's owner record — 1 000 000 runs and 200 000
+  threads on Postgres: 425 966 queries and 90 s for one person with ~500 runs, 95% of them reading other
+  people's threads. A person now has an index: one key per run and per thread they own
+  (`subj:<person>:…`), written before the record it points at, checked against that record before
+  anything is erased, and removed with it (`purgeRun`, `purgeThread`, a thread given to someone else).
+  The same erasure: 24 630 queries, 7–16 s — the deletions themselves. The index is trusted only in a
+  scope that is complete: one this version opened, or one the `subject-index` step has run on; before,
+  erasure walks as it did. Writing a message costs one or two more queries (96 instead of 94).
 - **A new thread's first run read every run in the store.** The thread gate looked for runs on the
   thread whenever it had no owner record — which is every new thread, and every anonymous one. Now an
   anonymous turn writes a `seen` marker, and a thread with neither record nor marker is new. The first
@@ -50,7 +59,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `storage.upgrade({ only?, dryRun? })` on every first-party store, and `gnl upgrade [--list] [--only …]`;
   `gnl doctor` lists pending steps. Steps: `schema` (Sqlite, Postgres), `key-index` (Redis),
-  `thread-records` (every store, the root scope and each registered organization). A step never runs
+  `thread-records` and `subject-index` (every store, the root scope and each registered organization;
+  `subject-index` at 1 000 000 runs: 150 s, +138 MB). A step never runs
   behind the caller's back: naming one whose prerequisite is still pending is refused, with the call
   that runs both. `thread-records` reads runs one page at a time and keeps one small entry per thread
   (it held every run summary: 1.4 GB at 1 000 000 runs); interrupted, it starts again — every write is
@@ -61,6 +71,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Known limits
 
+- A process of 0.10 writing after `subject-index` has run (a rolling deploy) writes runs with no index
+  entry, and an erasure through the index does not find them. Run the step once no process of 0.10
+  remains — the same rule as the `key-index` step. A root holding organization records is not marked by
+  its first run; run the step there.
 - A process of 0.10 writing after the upgrade (a rolling deploy) writes no `seen` marker: its anonymous
   thread reads as new. A named user's thread stays theirs; the first named user still claims an
   anonymous one. Staff opening such a thread now claims it closed, where 0.10 left it open.

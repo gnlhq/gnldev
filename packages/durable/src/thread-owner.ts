@@ -28,12 +28,13 @@
  * one exception is kept on purpose: a thread whose only runs were born `unknown` under a versioned
  * record (an anonymous first turn in this release) is still claimed by the first named user (R11).
  */
-import { claim, runKeys, listRunsArray } from './journal.js';
+import { claim, runKeys, listRunsArray, runPages } from './journal.js';
 import type { Journal, JournalReader, RunSummary } from './journal.js';
 import type { Memory } from './memory.js';
 import { ThreadOwnerMismatchError } from './errors.js';
 import type { Caller } from './identity-types.js';
 import { recordOwner } from './run-identity.js';
+import { indexSubject, unindexSubject, markSubjectIndexIfEmpty } from './subject-index.js';
 
 export const threadOwnerKey = (threadId: string): string => `thread:${threadId}:owner`;
 
@@ -84,6 +85,7 @@ export async function threadOwnerOf(journal: Journal, memory: Memory | undefined
     if (rec.ownerKind !== 'staff' && memory?.getThreadResource) {
       const owner = await memory.getThreadResource(threadId);
       if (owner) {
+        await indexSubject(journal, 'thread', owner, threadId);
         await journal.put(key, { ...rec, resourceId: owner, upgradedAt: Date.now() });
         return { exists: true, owner };
       }
@@ -133,10 +135,12 @@ async function settle(journal: Journal, threadId: string, v: { derived?: string;
     return { exists: true, staffClaimed: false };
   }
   const key = threadOwnerKey(threadId);
+  await indexSubject(journal, 'thread', v.derived, threadId);
   await claim(journal, key, v.derived
     ? { at: Date.now(), resourceId: v.derived, backfilled: true }
     : { at: Date.now(), ownerKind: 'staff', backfilled: true, underivable: true });
   const now = await journal.get<ThreadOwnerRecord>(key);
+  if (v.derived && now?.resourceId !== v.derived) await unindexSubject(journal, 'thread', v.derived, threadId);
   return { exists: true, ...(now?.resourceId ? { owner: now.resourceId } : { staffClaimed: now?.ownerKind !== 'unknown' }) };
 }
 
@@ -167,7 +171,7 @@ interface ThreadTally { owner: string | undefined; mixed: boolean; allBornUnknow
  */
 export async function writeThreadRecords(journal: Journal, memory?: Memory): Promise<{ threads: number; recorded: number; marked: number }> {
   const tally = new Map<string, ThreadTally>();
-  for await (const page of runPages(journal)) {
+  for await (const page of runPages(journal, RECORD_PAGE)) {
     for (const r of page) {
       if (!r.threadId) continue;
       // Born `unknown` under a versioned record: read only for a run that names nobody (allBornUnknown).
@@ -200,28 +204,6 @@ export async function writeThreadRecords(journal: Journal, memory?: Memory): Pro
   return { threads: tally.size, recorded, marked };
 }
 
-/** A journal's runs, a page at a time, through whichever listing it has. */
-async function* runPages(journal: Journal): AsyncGenerator<RunSummary[]> {
-  const j = journal as Partial<JournalReader> & { listRuns?: (q?: { cursor?: string; limit?: number }) => Promise<unknown> };
-  if (typeof j.listRunsPaged === 'function') {
-    let cursor: string | undefined;
-    do {
-      const p = await j.listRunsPaged.call(journal, { limit: RECORD_PAGE, ...(cursor ? { cursor } : {}) });
-      yield p.items;
-      cursor = p.nextCursor;
-    } while (cursor);
-    return;
-  }
-  if (typeof j.listRuns !== 'function') return;
-  let page: unknown = await j.listRuns.call(journal, { limit: RECORD_PAGE });
-  for (;;) {
-    if (Array.isArray(page)) { yield page as RunSummary[]; return; } // an array reader hands every run at once
-    const p = page as { items: RunSummary[]; nextCursor?: string };
-    yield p.items;
-    if (!p.nextCursor) return;
-    page = await j.listRuns.call(journal, { cursor: p.nextCursor, limit: RECORD_PAGE });
-  }
-}
 
 /**
  * Whether every run on the thread was born `unknown` under a VERSIONED owner record — an anonymous
@@ -246,7 +228,25 @@ async function allBornUnknown(journal: Journal, runs: RunSummary[]): Promise<boo
  */
 export async function recordThreadCreated(journal: Journal, threadId: string, resourceId: string): Promise<void> {
   if (typeof resourceId !== 'string' || resourceId === '') return; // names nobody: nothing to record
+  await markSubjectIndexIfEmpty(journal);
+  await indexSubject(journal, 'thread', resourceId, threadId);
   await claim(journal, threadOwnerKey(threadId), { at: Date.now(), resourceId, created: true });
+}
+
+/**
+ * Gives a thread moved to a new id (memory's `migrateReservedRootThreads`) the owner record and mark of
+ * the old one — its owner's index entry first, as every owner write does (subject-index.ts). The old
+ * id's record, mark and entry go with the old thread (`purgeThread`).
+ * @internal — memory's thread migration; a host moves threads through it, not with this.
+ */
+export async function copyThreadOwnership(journal: Journal, from: string, to: string): Promise<void> {
+  const owner = await journal.get<ThreadOwnerRecord>(threadOwnerKey(from));
+  if (owner !== undefined) {
+    await indexSubject(journal, 'thread', owner.resourceId, to);
+    await journal.put(threadOwnerKey(to), owner);
+  }
+  const seen = await journal.get(threadSeenKey(from));
+  if (seen !== undefined) await journal.put(threadSeenKey(to), seen);
 }
 
 /**
@@ -256,7 +256,10 @@ export async function recordThreadCreated(journal: Journal, threadId: string, re
  */
 export async function assignThreadOwner(journal: Journal, threadId: string, resourceId: string): Promise<void> {
   if (typeof resourceId !== 'string' || resourceId === '') throw new TypeError('@gnldev/durable: assignThreadOwner needs a user id.');
+  const before = (await journal.get<ThreadOwnerRecord>(threadOwnerKey(threadId)))?.resourceId;
+  await indexSubject(journal, 'thread', resourceId, threadId);
   await journal.put(threadOwnerKey(threadId), { at: Date.now(), resourceId, assigned: true });
+  if (before && before !== resourceId) await unindexSubject(journal, 'thread', before, threadId);
 }
 
 /**
@@ -291,10 +294,15 @@ async function runsOnThread(journal: Journal, threadId: string): Promise<{ runs:
  *    pass. History whose owner cannot be derived is staff-claimed (threadOwnerOf) and closed.
  */
 export async function admitThreadRun(journal: Journal, memory: Memory | undefined, threadId: string, caller: Caller): Promise<ThreadOwnership> {
+  // Before this gate writes anything: a scope this version opens is indexed from its first key.
+  await markSubjectIndexIfEmpty(journal);
   let o = await threadOwnerOf(journal, memory, threadId);
   const claimFor = async (fields: ThreadOwnerRecord) => {
+    await indexSubject(journal, 'thread', fields.resourceId, threadId);
     await claim(journal, threadOwnerKey(threadId), { at: Date.now(), ...fields });
     const rec = await journal.get<ThreadOwnerRecord>(threadOwnerKey(threadId));
+    // Another claimant won the race: this caller's entry points at a thread that is not theirs.
+    if (fields.resourceId && rec?.resourceId !== fields.resourceId) await unindexSubject(journal, 'thread', fields.resourceId, threadId);
     return rec?.resourceId ? { exists: true, owner: rec.resourceId } : { exists: true, staffClaimed: rec?.ownerKind !== 'unknown' };
   };
   if (!o.exists || (o.owner === undefined && o.staffClaimed === false)) {

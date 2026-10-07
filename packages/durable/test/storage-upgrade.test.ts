@@ -112,6 +112,6 @@ describe('storage.upgrade() — a step is never run behind the caller\'s back', 
     expect(dry.steps.find((x) => x.name === 'key-index')?.pending).toBe(true);
     await expect(s.upgrade({ only: ['thread-records'] })).rejects.toThrow(/'thread-records' needs 'key-index' first.*only: \['key-index', 'thread-records'\]/);
     const both = await s.upgrade({ only: ['key-index', 'thread-records'] });
-    expect(both.steps.map((x) => [x.name, x.ran])).toEqual([['key-index', true], ['thread-records', true]]);
+    expect(both.steps.map((x) => [x.name, x.ran])).toEqual([['key-index', true], ['thread-records', true], ['subject-index', false]]);
   });
 });

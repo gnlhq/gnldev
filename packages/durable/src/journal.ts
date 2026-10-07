@@ -787,6 +787,33 @@ export type RunListQuery = {
 };
 
 /**
+ * A journal's runs, a page at a time, through whichever listing it has — for a pass over every run that
+ * must not hold them all at once (the upgrade steps).
+ * @internal
+ */
+export async function* runPages(journal: Journal, limit: number): AsyncGenerator<RunSummary[]> {
+  const j = journal as Partial<JournalReader> & { listRuns?: (q?: { cursor?: string; limit?: number }) => Promise<unknown> };
+  if (typeof j.listRunsPaged === 'function') {
+    let cursor: string | undefined;
+    do {
+      const p = await j.listRunsPaged.call(journal, { limit, ...(cursor ? { cursor } : {}) });
+      yield p.items;
+      cursor = p.nextCursor;
+    } while (cursor);
+    return;
+  }
+  if (typeof j.listRuns !== 'function') return;
+  let page: unknown = await j.listRuns.call(journal, { limit });
+  for (;;) {
+    if (Array.isArray(page)) { yield page as RunSummary[]; return; } // an array reader hands every run at once
+    const p = page as { items: RunSummary[]; nextCursor?: string };
+    yield p.items;
+    if (!p.nextCursor) return;
+    page = await j.listRuns.call(journal, { cursor: p.nextCursor, limit });
+  }
+}
+
+/**
  * Read EVERY run as an array, from a view whose `listRuns` may return either shape.
  *
  * `JournalReader.listRuns()` is declared as an array, but every first-party adapter's RunJournal
