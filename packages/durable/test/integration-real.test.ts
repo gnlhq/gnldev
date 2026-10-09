@@ -8,20 +8,18 @@
 //      (a fidelity limit) → putIfAbsent's "exactly one winner" contract is verified at the boolean
 //      level for the first time on real PG.
 //   2. REAL async parallelism — since node:sqlite is SYNCHRONOUS, single-process tests were serialized;
-//      pg/ioredis are async → two separate connection pools/clients genuinely race concurrently.
-//   3. Redis SET NX / PX TTL / MGET on a real server (fidelity check of the FakeRedis model).
-//   4. D4-real (P1.6b/P0.3 real-backend proof): applyBatch's REAL atomicity — a genuine Postgres
-//      transaction (BEGIN/COMMIT/ROLLBACK, not pg-mem's non-undoing ROLLBACK) and the real Redis Lua
-//      script (EVAL, not the fake-redis.ts simulation) — under real concurrent races AND a genuine
-//      mid-transaction failure; plus deletePrefix's GDPR counter-sweep fix and countRunsByStatus/getMany
-//      against real engines (storage-backend.test.ts only proves these against pg-mem/fake-redis).
+//      pg is async → two separate connection pools genuinely race concurrently.
+//   3. D4-real (P1.6b/P0.3 real-backend proof): applyBatch's REAL atomicity — a genuine Postgres
+//      transaction (BEGIN/COMMIT/ROLLBACK, not pg-mem's non-undoing ROLLBACK) — under real concurrent
+//      races AND a genuine mid-transaction failure; plus deletePrefix's GDPR counter-sweep fix and
+//      countRunsByStatus/getMany against a real engine (storage-backend.test.ts only proves these
+//      against pg-mem).
 import { createRequire } from 'node:module';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { stepCountIs } from 'ai';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { RedisStorage } from '../src/redis-storage.js';
 import { acquireRunLock } from '../src/run-lock.js';
-import { purgeResource, sweepRuns } from '../src/retention.js';
+import { purgeResource } from '../src/retention.js';
 import { toJournal } from '../src/index.js';
 import { runDurable } from '../src/run.js';
 import { RunBusyError } from '../src/errors.js';
@@ -32,7 +30,6 @@ import { Pool as PgPool } from 'pg';
 
 const RUN = process.env.GNL_INTEGRATION === '1';
 const PG_URL = process.env.GNL_PG_URL ?? 'postgres://postgres:gnl@localhost:55432/gnl';
-const REDIS_URL = process.env.GNL_REDIS_URL ?? 'redis://localhost:6380';
 
 // A unique key space per run → leftovers from previous runs don't pollute tests (no TRUNCATE needed).
 const SEED = `it${Date.now().toString(36)}`;
@@ -323,368 +320,51 @@ describe.skipIf(!RUN)('REAL Postgres — multi-pool CAS + run-lock + exactly-onc
     expect(vb).toBeUndefined();
     expect(vc).toEqual({ v: 3 });
   });
-});
 
-describe.skipIf(!RUN)('REAL Redis — SET NX / TTL / MGET (FakeRedis fidelity check)', () => {
-  let clientA: any;
-  let clientB: any; // SEPARATE connection — a real two-worker model
-  let a: RedisStorage;
-  let b: RedisStorage;
-
-  beforeAll(async () => {
-    const { default: Redis } = await import('ioredis');
-    clientA = new Redis(REDIS_URL, { maxRetriesPerRequest: 2 });
-    clientB = new Redis(REDIS_URL, { maxRetriesPerRequest: 2 });
-    a = new RedisStorage({ client: clientA, keyPrefix: `${SEED}:` });
-    b = new RedisStorage({ client: clientB, keyPrefix: `${SEED}:` });
-    await a.init();
-  }, 30_000);
-
-  afterAll(async () => {
-    await clientA?.quit();
-    await clientB?.quit();
-  });
-
-  it('a SET NX race across two separate connections: exactly one winner per round (20 rounds)', async () => {
-    for (let round = 0; round < 20; round++) {
-      const key = `cas:${round}:tool:t`;
-      const results = await Promise.all([a.runs.putIfAbsent(key, { w: 'a' }), b.runs.putIfAbsent(key, { w: 'b' })]);
-      expect(results.filter(Boolean).length).toBe(1);
-      expect(await a.runs.get(key)).toEqual(await b.runs.get(key));
-    }
-  });
-
-  it('listKeys with a limit is a bounded probe on real Redis (SCAN stops early)', async () => {
-    for (let i = 0; i < 50; i++) await a.runs.put(`probe:tool:c${i}`, { i });
-    const probe = await a.runs.listKeys('probe:', { limit: 2 });
-    expect(probe.length).toBeLessThanOrEqual(2);
-    expect(probe.length).toBeGreaterThan(0);
-    for (const k of probe) expect(k.startsWith('probe:')).toBe(true);
-    expect(await a.runs.listKeys('probe-none:', { limit: 2 })).toEqual([]);
-  });
-
-  it('ackOnce on real Redis: concurrent from two connections → exactly one true', async () => {
-    const results = await Promise.all([a.work.ackOnce('job-1'), b.work.ackOnce('job-1')]);
-    expect(results.filter(Boolean).length).toBe(1);
-  });
-
-  it('cache PX TTL on a real server: the key REALLY drops once the ttl elapses', async () => {
-    await a.cache.set('k', { v: 1 }, { ttlMs: 150 });
-    expect(await b.cache.get('k')).toEqual({ v: 1 }); // visible from the other connection
-    await sleep(300);
-    expect(await a.cache.get('k')).toBeUndefined(); // Redis dropped it itself (not a lazy-expire simulation)
-  });
-
-  it('H1: an expired lock takeover race across two connections → Lua CAS produces EXACTLY ONE winner (10 rounds)', async () => {
-    // Fidelity check of the FakeRedis.eval simulation: on a real server, EVAL (GET==ARGV[1] → SET
-    // ARGV[2]) runs atomically; the RjEnv-enveloped raw-string CAS pattern should produce exactly ONE
-    // winner across two concurrent ioredis connections. Takeovers run WITHOUT passing `now` → the H2
-    // TIME path is exercised too.
+  // The events package's delivery guarantee on a real server, two pools racing. These ran on the Redis
+  // WorkStore until that adapter was removed; Postgres is now the shared store they promise it on.
+  it('ackOnce from two pools at once → exactly one true (10 rounds)', async () => {
     for (let round = 0; round < 10; round++) {
-      const runId = `takeover:${round}`;
-      const dead = await acquireRunLock(a.runs, runId, 'old', -1000); // expires in the past → immediately expired
-      expect(dead).not.toBeNull();
-      const [lB, lC] = await Promise.all([
-        acquireRunLock(a.runs, runId, 'B', 60_000),
-        acquireRunLock(b.runs, runId, 'C', 60_000),
-      ]);
-      expect([lB, lC].filter((x) => x !== null).length).toBe(1); // NO split-brain
+      const results = await Promise.all([a.work.ackOnce(`${SEED}:job-${round}`), b.work.ackOnce(`${SEED}:job-${round}`)]);
+      expect(results.filter(Boolean).length).toBe(1);
     }
   });
 
-  it('H2: journal.now() returns a reasonable epoch ms from the real Redis TIME command', async () => {
-    const ms = await (a.runs as any).now();
-    expect(typeof ms).toBe('number');
-    expect(Number.isFinite(ms)).toBe(true);
-    expect(Math.abs(ms - Date.now())).toBeLessThan(60_000);
-  });
-
-  it('DISTRIBUTED PUBSUB: @gnldev/events on a real Redis WorkStore — fan-out to two workers, exactly-once', async () => {
-    // The GNL-design closure of the internal audit's "external pubsub backends" item: events already
-    // sits on the WorkStore port; RedisStorage.work='full' → pointing at Redis is enough. Two
-    // consumers on two SEPARATE connections (fan-out) must each receive EVERY event EXACTLY ONCE;
-    // two concurrent polls of the SAME consumer name (a racing replica) must NOT deliver twice
-    // (ackOnce CAS).
+  it('@gnldev/events on the Postgres WorkStore: fan-out to two workers, and racing replicas of one consumer count each event once', async () => {
+    const topic = `${SEED}-order`;
     const gotX: string[] = [];
     const gotY: string[] = [];
-    const cX = createConsumer(a.work, 'order', async (p: any) => { gotX.push(p.id); }, { name: 'reporter' });
-    const cY = createConsumer(b.work, 'order', async (p: any) => { gotY.push(p.id); }, { name: 'biller' });
-
-    await emit(a.work, 'order', { id: 's1' }, { id: 'e1' });
-    await emit(b.work, 'order', { id: 's2' }, { id: 'e2' });
-    await emit(a.work, 'order', { id: 's1' }, { id: 'e1' }); // idempotent emit → a single event
-
+    const cX = createConsumer(a.work, topic, async (p: any) => { gotX.push(p.id); }, { name: 'reporter' });
+    const cY = createConsumer(b.work, topic, async (p: any) => { gotY.push(p.id); }, { name: 'biller' });
+    await emit(a.work, topic, { id: 's1' }, { id: 'e1' });
+    await emit(b.work, topic, { id: 's2' }, { id: 'e2' });
+    await emit(a.work, topic, { id: 's1' }, { id: 'e1' }); // idempotent emit → one event
     await Promise.all([cX.poll(), cY.poll()]);
-    expect(gotX.sort()).toEqual(['s1', 's2']); // fan-out: EVERY consumer got EVERY event
+    expect(gotX.sort()).toEqual(['s1', 's2']); // fan-out: every consumer got every event
     expect(gotY.sort()).toEqual(['s1', 's2']);
-
-    // A racing replica of the same consumer (two connections, the SAME name) — the post-K2 contract:
-    // exactly-once MARKING + at-least-once DELIVERY. Under racing polls the HANDLER can run twice
-    // (the ack now happens AFTER the handler — the get pre-check doesn't close the race window, an
-    // idempotent handler is required; see the events/src/index.ts header). The CAS guarantee is on
-    // DELIVERY COUNT: only one wins ackOnce → the delivered total is exactly 2. The old expectation
-    // (dupGot exactly ['s1','s2']) belonged to the at-most-once era; the package's unit tests were
-    // updated, but this gated test was overlooked.
+    // Two replicas of ONE consumer on two pools: exactly-once MARKING, at-least-once DELIVERY (the
+    // handler may run on both; only one wins ackOnce per event, so the delivered count is exactly 2).
     const dupGot: string[] = [];
-    const r1 = createConsumer(a.work, 'order', async (p: any) => { dupGot.push(p.id); }, { name: 'replica' });
-    const r2 = createConsumer(b.work, 'order', async (p: any) => { dupGot.push(p.id); }, { name: 'replica' });
+    const r1 = createConsumer(a.work, topic, async (p: any) => { dupGot.push(p.id); }, { name: 'replica' });
+    const r2 = createConsumer(b.work, topic, async (p: any) => { dupGot.push(p.id); }, { name: 'replica' });
     const [d1, d2] = await Promise.all([r1.poll(), r2.poll()]);
-    expect(d1 + d2).toBe(2); // CAS: EXACTLY ONE replica won ackOnce for each event (double delivery does NOT COUNT)
-    expect([...new Set(dupGot)].sort()).toEqual(['s1', 's2']); // each event was processed at least once (no loss)
-    expect(dupGot.length).toBeLessThanOrEqual(4); // the handler runs at most once per replica
+    expect(d1 + d2).toBe(2);
+    expect([...new Set(dupGot)].sort()).toEqual(['s1', 's2']);
+    expect(dupGot.length).toBeLessThanOrEqual(4);
   });
 
-  it('WorkStore.list(ns) on a real Redis is an EXACT namespace match, not a prefix scan (parity with in-memory/sqlite/pg)', async () => {
-    // The port says `list(ns)` returns the records appended under EXACTLY that ns. InMemory keys a
-    // Map by ns and sqlite/pg run `WHERE ns = ?`, so the contract is theirs for free; this adapter
-    // has no ns column — it writes `<pfx>wl:<ns>:<id>` and reads a namespace back with SCAN MATCH.
-    // Measured here before `encNs`: `list('nspar')` also returned 'nspar:child''s record, and the
-    // two appends below collapsed onto ONE Redis key, so the second was refused by SET NX and lost
-    // WITHOUT AN ERROR. Both halves are adapter-level, so they are asserted with plain namespaces
-    // rather than through @gnldev/events — every WorkStore caller inherits them.
-    await a.work.append('nspar', { tag: 'PARENT' }, 'p-1');
-    await b.work.append('nspar:child', { tag: 'CHILD' }, 'c-1');
-    const parent = await a.work.list('nspar');
-    expect(parent.items.map((i) => i.id)).toEqual(['p-1']); // ['c-1','p-1'] = the child leaked in
-    expect((await b.work.list('nspar:child')).items.map((i) => i.id)).toEqual(['c-1']);
-
-    // The ns/id BOUNDARY: ('nsbnd:eu', 'x') and ('nsbnd', 'eu:x') are two different records that
-    // used to address the same key. append is first-write-wins, so the loser vanished silently.
-    await a.work.append('nsbnd:eu', { tag: 'A-first' }, 'x');
-    await b.work.append('nsbnd', { tag: 'B-PAID' }, 'eu:x');
-    expect((await b.work.list('nsbnd:eu')).items.map((i) => [i.id, (i.payload as any).tag]))
-      .toEqual([['x', 'A-first']]);
-    expect((await a.work.list('nsbnd')).items.map((i) => [i.id, (i.payload as any).tag]))
-      .toEqual([['eu:x', 'B-PAID']]); // [] or [['x','A-first']] = 'B-PAID' was never written
-  });
-
-  // The OTHER escape at the same SCAN sites, and the one that had nine unescaped call sites: the
-  // caller's `keyPrefix` is caller input (`new RedisStorage({ keyPrefix })`) and it went into the
-  // MATCH pattern raw everywhere except `work.list`. A prefix containing a glob metacharacter is
-  // therefore a PATTERN, and it matches the neighbouring store's keys.
-  //
-  // Run here rather than only on fake-redis.ts because the fake's globToRegExp implements `\`, `*`
-  // and `?` but NOT `[...]` — a character class is the form an operator would plausibly produce
-  // (`gnl:[prod]:`) and only a real Redis 7 actually interprets it. The `*` form is pinned without
-  // Docker in events/test/log-namespace.test.ts.
-  it('a glob metacharacter in keyPrefix does not read the store next door (REAL Redis MATCH)', async () => {
-    const meta = new RedisStorage({ client: clientA, keyPrefix: `${SEED}X[a]:` });
-    const neighbour = new RedisStorage({ client: clientB, keyPrefix: `${SEED}Xa:` });
-    await neighbour.runs.put('nrun:model:0', { who: 'NEIGHBOUR' });
-    await meta.runs.put('brun:model:0', { who: 'MINE' });
-
-    // MEASURED with the raw prefix on Redis 7: `['un:model:0']`. Not "my keys plus a stray" — the
-    // store sees ONLY the neighbour's key and NONE of its own, because `[a]` matches the single
-    // character `a` and therefore does not match the three literal characters `[a]` in this store's
-    // own keys. It is then sliced at MY (two bytes longer) prefix length, so `nrun:model:0` comes
-    // back as `un:model:0`: a journal key that exists in no store at all.
-    expect(await meta.runs.listKeys!('')).toEqual(['brun:model:0']);
-    expect(await meta.runs.readRun('nrun')).toEqual([]); // the neighbour's run is not mine
-    expect((await meta.runs.listRuns()).items.map((r) => r.runId)).toEqual(['brun']);
-    expect(await neighbour.runs.listKeys!('')).toEqual(['nrun:model:0']); // unharmed the other way
-    // deletePrefix scans too: a purge must not reach across the boundary either.
-    await meta.runs.deletePrefix!('nrun:');
-    expect(await neighbour.runs.get('nrun:model:0')).toEqual({ who: 'NEIGHBOUR' });
-  });
-
-  it('DISTRIBUTED PUBSUB: a `:` in a topic or consumer name does not collide on a real Redis WorkStore', async () => {
-    // The escaping in events' key builders is the fix for a MEASURED silent loss: `evtack:` and its
-    // siblings join (topic, consumer, id) with `:`, so `topic='a' + consumer='b:c'` and
-    // `topic='a:b' + consumer='c'` used to produce the SAME marker — one consumer's ack swallowed the
-    // other's event permanently, with no dead-letter row and no warning.
-    //
-    // The unit tests cover this on the in-memory store. This runs it where the keys are actually
-    // Redis keys, because that is the layer the escape has to survive: the escaped `%3A` travels
-    // through the client, the server's keyspace and back. Realistic names (`billing:eu`) are the
-    // reason escaping was chosen over rejecting `:` outright.
-    //
-    // TWO SCENARIOS, deliberately on different axes, because one set of ids cannot serve both.
-    //
-    // (1) THE NAMESPACE LEAK needs DISTINCT ids. This test used to give both events the id `inv-1`,
-    //     and an audit measured that it was passing for the wrong reason: `list('evt:inv')` returned
-    //     the foreign topic's record on 12 runs out of 12, and the only thing keeping it green was
-    //     that the leaked record carried the SAME id, so the first consumer's ack marker suppressed
-    //     it. Records sort by `(ts, id)`, so with the tie forced it went red on 4 runs in 10 — a
-    //     test that was simultaneously unstable AND blind to the leak it was named after.
-    //
-    // (2) THE ACK-MARKER SWAP needs the SAME id, and making every id distinct is what stopped this
-    //     test from proving the thing it is named after. A later audit measured that: with `enc`
-    //     deleted outright, NONE of the behavioural assertions below moved — the first red came from
-    //     a raw-Redis-key assertion, i.e. from mechanism. The two identities only alias when the
-    //     event id is shared, so scenario (2) below shares it, in its own topic pair (`ack`/`ack:eu`)
-    //     so that (1)'s no-tie property is untouched. It stays deterministic because it never relies
-    //     on ordering inside one namespace: the two ids live in two namespaces the ADAPTER keeps
-    //     apart, and the polls are sequential, so "the second consumer gets nothing" is a fixed
-    //     outcome rather than a race.
-    const seenP: string[] = [];
-    const seenQ: string[] = [];
-    const cP = createConsumer(a.work, 'inv', async (p: any) => { seenP.push(p.tag); }, { name: 'eu:mail' });
-    const cQ = createConsumer(b.work, 'inv:eu', async (p: any) => { seenQ.push(p.tag); }, { name: 'mail' });
-
-    await emit(a.work, 'inv', { tag: 'PLAIN-TOPIC' }, { id: 'inv-plain-1' });
-    await emit(b.work, 'inv:eu', { tag: 'COLON-TOPIC' }, { id: 'inv-eu-1' });
-
-    await cP.poll();
-    await cQ.poll();
-
-    // Neither consumer may receive the other's payload: `inv` and `inv:eu` are separate topics whose
-    // logs merely serialize to neighbouring key prefixes. With distinct ids no ack marker can mask a
-    // leak, so a leaked record shows up as an extra delivery here.
-    expect(seenP).toEqual(['PLAIN-TOPIC']);
-    expect(seenQ).toEqual(['COLON-TOPIC']);
-
-    // Exactly-once still holds for both (a fix that narrowed the scan into re-delivering is not green).
-    expect(await cP.poll()).toBe(0);
-    expect(await cQ.poll()).toBe(0);
-    expect(seenP).toEqual(['PLAIN-TOPIC']);
-    expect(seenQ).toEqual(['COLON-TOPIC']);
-
-    // (2) THE ACK-MARKER SWAP — the failure the `:`-in-a-consumer-name escape actually exists for,
-    // and the one the distinct ids above cannot reach. `evtack:` joins (topic, consumer, id) with
-    // `:`, so topic `ack` + consumer `eu:box` and topic `ack:eu` + consumer `box` BOTH render
-    // `evtack:ack:eu:box:<id>` — one marker for two identities, as soon as they share an event id.
-    // The two topics genuinely do share one here: an event id is caller-chosen and an order number,
-    // a request id or a UUIDv5 of a payload is routinely the same across a regional split.
-    // R polls first and writes the marker; S then finds its OWN event already "acked" and delivers
-    // NOTHING — poll() returns 0 forever, listDeadEvents is empty, nothing is logged.
-    const seenR: string[] = [];
-    const seenS: string[] = [];
-    const cR = createConsumer(a.work, 'ack', async (p: any) => { seenR.push(p.tag); }, { name: 'eu:box' });
-    const cS = createConsumer(b.work, 'ack:eu', async (p: any) => { seenS.push(p.tag); }, { name: 'box' });
-
-    await emit(a.work, 'ack', { tag: 'R-EVENT' }, { id: 'shared-1' });
-    await emit(b.work, 'ack:eu', { tag: 'S-EVENT' }, { id: 'shared-1' }); // the SAME id, on purpose
-
-    expect(await cR.poll()).toBe(1);
-    expect(await cS.poll()).toBe(1); // 0 = R's ack marker swallowed S's event
-    expect(seenR).toEqual(['R-EVENT']);
-    expect(seenS).toEqual(['S-EVENT']); // [] = the silent, permanent loss this escape removes
-    expect(await cR.poll()).toBe(0); // …and neither marker is so narrow that it stopped acking
-    expect(await cS.poll()).toBe(0);
-
-    // Mechanism corroboration ONLY — every claim above is already load-bearing without it. This
-    // states WHICH key the two identities would have had to share, so a future reader can see the
-    // alias rather than infer it from a delivery count.
-    expect(await a.work.get('evtack:ack:eu:box:shared-1')).toBeUndefined();
-
-    // The silent-loss half (F2), through the public API: `emit` returns an id for both, and both
-    // must actually be readable — under one topic each. Before the fix the second emit reported
-    // success and stored nothing, because topic `pay:eu` + id `k` had taken the same Redis key.
-    const e1 = await emit(a.work, 'pay:eu', { tag: 'A-first' }, { id: 'k' });
-    const e2 = await emit(b.work, 'pay', { tag: 'B-PAID' }, { id: 'eu:k' });
-    expect([e1, e2]).toEqual(['k', 'eu:k']); // both reported success before the fix as well
-    const seenPayEu: string[] = [];
-    const seenPay: string[] = [];
-    const cPayEu = createConsumer(a.work, 'pay:eu', async (p: any) => { seenPayEu.push(p.tag); }, { name: 'led' });
-    const cPay = createConsumer(b.work, 'pay', async (p: any) => { seenPay.push(p.tag); }, { name: 'led' });
-    await cPayEu.poll();
-    await cPay.poll();
-    expect(seenPayEu).toEqual(['A-first']);
-    expect(seenPay).toEqual(['B-PAID']); // [] = the second emit's payload never reached the server
-  });
-
-  it('readRun with real MGET: ordering + content correct (the bulkGet path)', async () => {
-    const runId = 'mget-run';
-    // Separate the timestamps against the Decision #4 tie-break flake (same note as PG — order = created_at, key).
-    await a.runs.put(`${runId}:model:0`, { s: 0 });
-    await sleep(5);
-    await a.runs.put(`${runId}:tool:t1`, { status: 'succeeded' });
-    await sleep(5);
-    await a.runs.put(`${runId}:model:1`, { s: 1 });
-    const entries = await b.runs.readRun(runId); // ioredis.mget on a real server
-    expect(entries).toHaveLength(3);
-    expect(entries.map((e) => e.kind)).toEqual(['model', 'tool', 'model']);
-  });
-
-  // D4-real (P1.6b Lua): the fake-redis.ts APPLY_BATCH_LUA mimic (test.storage-backend.test.ts /
-  // metrics.test.ts) is a JS simulation of the script's semantics — it cannot prove the REAL server
-  // actually runs `EVAL` atomically, nor that cjson.decode/HINCRBYFLOAT/ZADD behave as expected inside
-  // real Lua. Proven here against a real Redis EVAL.
-  it('D4-real (P1.6b Lua): applyBatch on REAL Redis — claim+incrs+puts land atomically across rj:/ctr:, and the activity ZSET is touched', async () => {
-    const runId = 'lua-batch-run';
-    const batch = {
-      claim: { key: `${runId}:tool:call-1`, value: { status: 'succeeded', output: 1 } },
-      incrs: [{ key: 'lua-batch:usage', fields: { runs: 1, tokens: 5 } }],
-      puts: [{ key: `${runId}:model:0`, value: { step: 0 } }],
-    };
-    expect(await (a.runs as any).applyBatch(batch)).toBe(true);
-    // rj: namespace — both the claim record and the plain put are readable (cross-connection read).
-    expect(await b.runs.get(batch.claim.key)).toEqual({ status: 'succeeded', output: 1 });
-    expect(await b.runs.get(`${runId}:model:0`)).toEqual({ step: 0 });
-    // ctr: namespace (HINCRBYFLOAT via the real Lua script).
-    expect(await (b.runs as any).getCounters('lua-batch:usage')).toEqual({ runs: 1, tokens: 5 });
-    // H8b parity: applyBatch's run-shaped keys (claim.key/puts[].key that parse as `<runId>:model|tool:*`)
-    // ALSO ZADD the activity ZSET inside the SAME Lua unit (see redis-storage.ts's `touchOf`) — same
-    // "future cutoff sees it, cutoff=0 doesn't" idiom as the H8 Postgres test above proves the ZADD fired.
-    const future = Date.now() + 60_000;
-    expect(await (b.runs as any).listStaleRuns(future)).toContain(runId);
-    expect(await (b.runs as any).listStaleRuns(0)).toEqual([]);
-  });
-
-  it('D4-real (P1.6b Lua): applyBatch — claim key EXISTS → the WHOLE batch is a no-op (rj: claim/put AND ctr: counter all untouched)', async () => {
-    const claimKey = 'lua-noop:claim';
-    await a.runs.put(claimKey, { pre: true });
-    const batch = {
-      claim: { key: claimKey, value: { at: 2 } },
-      incrs: [{ key: 'lua-noop:ctr', fields: { n: 1 } }],
-      puts: [{ key: 'lua-noop:row', value: { v: 1 } }],
-    };
-    expect(await (a.runs as any).applyBatch(batch)).toBe(false);
-    expect(await a.runs.get(claimKey)).toEqual({ pre: true }); // the PRE-EXISTING claim value, untouched
-    expect(await (a.runs as any).getCounters('lua-noop:ctr')).toBeUndefined(); // ctr: namespace never written
-    expect(await a.runs.get('lua-noop:row')).toBeUndefined(); // rj: put never written — the Lua script returned early
-  });
-
-  it('D4-real (P1.6b Lua): applyBatch atomicity under CONCURRENCY — two connections race the SAME claim key with different increments, exactly ONE batch lands', async () => {
-    for (let round = 0; round < 10; round++) {
-      const key = `batch-race:${round}`;
-      const batchA = {
-        claim: { key: `${key}:claim`, value: { w: 'a' } },
-        incrs: [{ key: `${key}:ctr`, fields: { n: 1 } }],
-        puts: [{ key: `${key}:row`, value: { from: 'a' } }],
-      };
-      const batchB = {
-        claim: { key: `${key}:claim`, value: { w: 'b' } },
-        incrs: [{ key: `${key}:ctr`, fields: { n: 100 } }],
-        puts: [{ key: `${key}:row`, value: { from: 'b' } }],
-      };
-      const results = await Promise.all([(a.runs as any).applyBatch(batchA), (b.runs as any).applyBatch(batchB)]);
-      expect(results.filter(Boolean).length).toBe(1); // exactly ONE batch landed on the real server
-      const counters = await (a.runs as any).getCounters(`${key}:ctr`);
-      const row = await a.runs.get<{ from: string }>(`${key}:row`);
-      const claimVal = await a.runs.get<{ w: string }>(`${key}:claim`);
-      if (results[0]) {
-        expect(claimVal?.w).toBe('a');
-        expect(counters).toEqual({ n: 1 });
-        expect(row?.from).toBe('a');
-      } else {
-        expect(claimVal?.w).toBe('b');
-        expect(counters).toEqual({ n: 100 });
-        expect(row?.from).toBe('b');
-      }
-    }
-  });
-
-  it('D4-real (GDPR fix): deletePrefix sweeps org usage + metrics counters on REAL Redis (ctr: namespace), leaves a neighbor org intact', async () => {
-    const org = 'gdpr-org';
-    await (a.runs as any).incrBy(`${org}:__usage__`, { runs: 3, costUsd: 1.5 });
-    await (a.runs as any).incrBy(`${org}:__metrics__:calls`, { n: 5 });
-    await a.runs.put(`${org}:r1:input`, { p: 'x' }); // an ordinary (non-counter) key under the same prefix
-    await (a.runs as any).incrBy('gdpr-neighbor:__usage__', { runs: 7 });
-    await (a.runs as any).deletePrefix(`${org}:`);
-    expect(await (b.runs as any).getCounters(`${org}:__usage__`)).toBeUndefined(); // swept (cross-connection read)
-    expect(await (b.runs as any).getCounters(`${org}:__metrics__:calls`)).toBeUndefined();
-    expect(await b.runs.get(`${org}:r1:input`)).toBeUndefined();
-    expect(await (b.runs as any).getCounters('gdpr-neighbor:__usage__')).toEqual({ runs: 7 }); // neighbor untouched
-  });
-
-  it('D4-real (P1.6b): getMany on REAL Redis — order-preserving, undefined for misses (cross-connection MGET)', async () => {
-    await a.runs.put('gm:a', { v: 1 });
-    await a.runs.put('gm:c', { v: 3 });
-    const [va, vb, vc] = await (b.runs as any).getMany(['gm:a', 'gm:b', 'gm:c']);
-    expect(va).toEqual({ v: 1 });
-    expect(vb).toBeUndefined();
-    expect(vc).toEqual({ v: 3 });
+  it('@gnldev/events on the Postgres WorkStore: a `:` in a topic or consumer name does not collide', async () => {
+    // topic 'a' + consumer 'b:c' and topic 'a:b' + consumer 'c' once built the same ack marker; one
+    // consumer's ack swallowed the other's event. Same event id on both sides, so only the escaping
+    // keeps them apart.
+    const seen: string[] = [];
+    await emit(a.work, `${SEED}-ack`, { who: 'P' }, { id: 'same' });
+    await emit(b.work, `${SEED}-ack:eu`, { who: 'Q' }, { id: 'same' });
+    const p = createConsumer(a.work, `${SEED}-ack`, async (x: any) => { seen.push(`P:${x.who}`); }, { name: 'eu:billing' });
+    const q = createConsumer(b.work, `${SEED}-ack:eu`, async (x: any) => { seen.push(`Q:${x.who}`); }, { name: 'billing' });
+    await p.poll();
+    await q.poll();
+    expect(seen.sort()).toEqual(['P:P', 'Q:Q']);
   });
 });
 
@@ -1118,43 +798,4 @@ describe.skipIf(!RUN)('REAL Postgres — a failover does not take the process wi
       await (s as any).close?.();
     }
   }, 20_000);
-});
-
-// The Redis half of the same question the Postgres failover test asks. The answer turned out
-// different, and the difference is worth pinning: `ioredis` handles a dropped connection itself, so
-// nothing here was broken — 200 writes in flight, every client dropped, the process lived and all
-// 200 landed after the automatic reconnect.
-//
-// What was missing was the sentence. The operator saw `[ioredis] Unhandled error event: Error: write
-// EPIPE` — a library complaining that nobody is listening, in a vocabulary that mentions neither the
-// engine nor whether anything was lost. The Postgres path explains itself; this one did not.
-describe.skipIf(!RUN)('REAL Redis — a dropped connection explains itself', () => {
-  it('the engine attaches its own error listener when the client is its own', async () => {
-    const { RedisStorage } = await import('../src/redis-storage.js');
-    const s = new RedisStorage({ connectionString: REDIS_URL });
-    try {
-      const client = (s as unknown as { client: { listenerCount: (e: string) => number } }).client;
-      expect(client.listenerCount('error'), 'no listener means ioredis prints its own warning instead')
-        .toBeGreaterThan(0);
-    } finally {
-      await (s as any).close?.();
-    }
-  }, 15_000);
-
-  it("a caller's own client and handler are left alone", async () => {
-    // Symmetry with the Postgres pool: the guard exists so that someone who brought their own
-    // connection and their own logging keeps both.
-    const { default: IORedis } = await import('ioredis');
-    const own = new IORedis(REDIS_URL, { lazyConnect: true });
-    const mine: Error[] = [];
-    own.on('error', (e: Error) => mine.push(e));
-    const { RedisStorage } = await import('../src/redis-storage.js');
-    const s = new RedisStorage({ client: own as any });
-    try {
-      expect(own.listenerCount('error'), 'the engine added a second listener over the caller\'s').toBe(1);
-    } finally {
-      await (s as any).close?.();
-      own.disconnect();
-    }
-  }, 15_000);
 });

@@ -85,12 +85,11 @@ look for the escaped form (`evtack:refunds:billing%3Aeu:…`), not the literal n
 
 **The append-log namespace `evt:<topic>` is escaped too**, and that one is not belt-and-braces.
 `WorkStore.list(ns)` is specified as a whole-value match — but the key a store *derives* from a
-namespace is not something this package can see. The shipped Redis adapter stored records at
-`wl:<ns>:<id>` and read a namespace back with a `SCAN MATCH wl:<ns>:*` prefix scan, so on a real
-Redis 7 a consumer of topic `orders` was delivered topic `orders:eu`'s events (it never subscribed),
-and `emit(topic: 'inv', { id: 'eu:x' })` returned an event id for a record `SET NX` had silently
-refused, because topic `inv:eu` + id `x` had already claimed the same key. That adapter is fixed at
-its own layer, which is the load-bearing repair; the topic is escaped here as well because
+namespace is not something this package can see. A store that keeps records at `wl:<ns>:<id>` and
+reads a namespace back with a prefix scan — GNL's own Redis adapter did, before it was removed — gives
+a consumer of topic `orders` topic `orders:eu`'s events (it never subscribed), and lets
+`emit(topic: 'inv', { id: 'eu:x' })` return an event id for a record the store silently refused,
+because topic `inv:eu` + id `x` had already claimed the same key. The topic is escaped here because
 `WorkStore` is a public port, addressing a record by a concatenated key is an ordinary way to
 implement it, and an escaped namespace is self-disambiguating under any implementation.
 

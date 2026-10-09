@@ -78,6 +78,61 @@ interface Seat {
   held: { id: string; seat: ToolSeat } | undefined;
   late: boolean;
   slot: string | undefined;
+  /** The tool record this call claimed: the raw value it replaced (`undefined`: there was none) and
+   *  the 'running' stamp it wrote. Given back if the call fails before its body starts. */
+  claim: { key: string; prior: unknown; stamp: unknown } | undefined;
+  /** The duplicate marker this call claimed in-flight before its body, given back with the claim. */
+  dup: { key: string; toolCallId: string } | undefined;
+  /** The tool's own execute has been called: from here on its effect may have happened. */
+  started: boolean;
+}
+
+/**
+ * What a claim given back leaves when there was no record before it. A row cannot be deleted
+ * (`put(key, undefined)` leaves it, and `putIfAbsent` then loses — see DupMarker.released), so this
+ * marker stands for "no record": the call reads it as absent and takes it over by compare-and-set.
+ * Same status as `releaseFailedClaim`'s tombstone; `notStarted` is what makes it read as absent.
+ */
+interface UnstartedRelease { status: 'released'; notStarted: true; releasedAt: number; toolName: string }
+
+const isUnstartedRelease = (v: unknown): boolean =>
+  typeof v === 'object' && v !== null &&
+  (v as { status?: unknown }).status === 'released' && (v as { notStarted?: unknown }).notStarted === true;
+
+/**
+ * A call failed after it claimed its record and before its body started — a storage error on the
+ * duplicate marker, the cross-run owner, a spent approval. Nothing ran, so nothing can have
+ * happened: the record goes back to what it was before this call claimed it, and the next attempt
+ * meets that state — none (it runs once), or an earlier failed or crashed attempt with its counter
+ * (the side-effect gate still applies to it). Left 'running', the claim refused every attempt as
+ * busy until it expired and then read as a crash that "may have run" — though it never ran.
+ *
+ * Compare-and-set against this call's own stamp: if the record moved on (a terminal written on the
+ * way out, a takeover after the claim expired), it is not ours to give back. A failure here leaves
+ * the claim as it was — the old, safe outcome: never a silent re-run.
+ */
+async function giveBackUnstartedClaim(ctx: DurableCtx, seat: Seat, toolName: string): Promise<void> {
+  const held = seat.claim!;
+  try {
+    const now = ctx.journal.now ? await ctx.journal.now() : Date.now();
+    const back = held.prior !== undefined
+      ? held.prior
+      : stampFormat({ status: 'released', notStarted: true, releasedAt: now, toolName } satisfies UnstartedRelease);
+    if (ctx.journal.putIfMatch) {
+      await ctx.journal.putIfMatch(held.key, held.stamp, back);
+    } else {
+      // Single-process fallback — the same documented bound as claim().
+      const cur = await ctx.journal.get<{ status?: string; startedAt?: number; attempts?: number }>(held.key);
+      const ours = held.stamp as { startedAt: number; attempts?: number };
+      if (cur?.status === 'running' && cur.startedAt === ours.startedAt && cur.attempts === ours.attempts) await ctx.journal.put(held.key, back);
+    }
+    // Released the way settleFailure releases it: a sentinel the next claim can take over.
+    if (seat.dup) {
+      await ctx.journal.put(seat.dup.key, { firstToolCallId: seat.dup.toolCallId, at: now, released: true } satisfies DupMarker);
+    }
+  } catch (err) {
+    console.warn(`@gnldev/durable: '${toolName}' failed before it ran, and its claim (${held.key}) could not be given back — it expires by its TTL:`, err);
+  }
 }
 
 interface DupMarker {
@@ -280,7 +335,7 @@ async function mirrorUnderRun(
   //
   // Unguarded, it was a double-charge. `writeToolTerminal` runs inside the try that wraps the tool
   // body, and that try's catch overwrites the record with `{status:'failed'}`. So a transient failure
-  // of the MIRROR — a Postgres connection reset, a Redis timeout, ENOSPC — landed in the catch and
+  // of the MIRROR — a Postgres connection reset, a statement timeout, ENOSPC — landed in the catch and
   // buried a charge that had already succeeded. Measured, same probe, one injected put rejection on
   // the mirror key: before this range the success path did ONE write and the retry replayed
   // `{"n":1}` with 1 side effect; with the mirror it recorded `{"status":"failed"}` and the next
@@ -572,9 +627,14 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // The maxToolCalls seat this call holds (limits.ts takeToolSeat): taken where the gate admits it,
       // given back when the call is over — here for every way out, by the attempt itself when a
       // timed-out attempt is still running (it settles later, and counts then).
-      const seat: Seat = { held: undefined, late: false, slot: undefined };
+      const seat: Seat = { held: undefined, late: false, slot: undefined, claim: undefined, dup: undefined, started: false };
       try {
         return await executeOnce(input, options, seat);
+      } catch (error) {
+        // Failed between its claim and its body: nothing ran, so the claim is given back (see
+        // giveBackUnstartedClaim). The error still leaves as it is — the caller is told it failed.
+        if (seat.claim && !seat.started) await giveBackUnstartedClaim(ctx, seat, toolName);
+        throw error;
       } finally {
         if (!seat.late) await releaseSeat(seat);
       }
@@ -730,6 +790,10 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       }
       let record = await ctxGet<ToolJournalRecord>(ctx, key);
       if (record) await assertCrossRunOwner(record);
+      // A claim given back before its body started stands for no record (giveBackUnstartedClaim):
+      // this call is a first attempt and meets every gate a first attempt meets. Whose it is was
+      // still checked above — the owner was written with the claim.
+      if (isUnstartedRelease(record)) record = undefined;
       if (record && (record.status === 'succeeded' || record.status === 'denied' || record.status === 'reflected')) {
         // M2 drift detector: if the argsHash of the succeeded record doesn't match the hash of the new
         // input the model produced on replay → non-determinism. Since the model middleware replays the
@@ -1629,12 +1693,22 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         if (record === undefined) {
           // `attempts: 1` from the very first claim: the crash ladder below counts takeovers, and a
           // counter that only starts existing at the first takeover is one attempt short of the truth.
-          const won = await claim(ctx.journal, key, stampFormat({ status: 'running', startedAt: nowTs, attempts: 1 }));
+          const stamp = stampFormat({ status: 'running', startedAt: nowTs, attempts: 1 });
+          const won = await claim(ctx.journal, key, stamp);
           if (won) {
+            seat.claim = { key, prior: undefined, stamp };
             if (ownerKey) await claimCrossRunOwner(ctx, toolName, hash);
             break claimLoop; // won → execute below
           }
-          record = upgradeFormat(await ctx.journal.get<ToolJournalRecord>(key), key); // H13
+          const raw = await ctx.journal.get<ToolJournalRecord>(key);
+          // The row holds a claim given back before its body started — "no record" that cannot be
+          // deleted. Taken by compare-and-set, as putIfAbsent takes an absent one.
+          if (isUnstartedRelease(raw) && (ctx.journal.putIfMatch ? await ctx.journal.putIfMatch(key, raw, stamp) : (await ctx.journal.put(key, stamp), true))) {
+            seat.claim = { key, prior: raw, stamp };
+            if (ownerKey) await claimCrossRunOwner(ctx, toolName, hash);
+            break claimLoop;
+          }
+          record = upgradeFormat(raw, key); // H13
           if (record) await assertCrossRunOwner(record);
           if (record && (record.status === 'succeeded' || record.status === 'denied' || record.status === 'reflected' || record.status === 'suspended')) {
             return await consumeExistingRecord(ctx, key, record, toolCallId);
@@ -1824,7 +1898,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         //
         // Two details this depends on, both learned the hard way:
         //   - `expected` must be the RAW value from journal.get(). Every adapter compares the
-        //     SERIALISED form (sqlite `value = ?`, postgres/redis serialize(expected), in-memory
+        //     SERIALISED form (sqlite `value = ?`, postgres serialize(expected), in-memory
         //     stableStringify), so an upgradeFormat'ed copy never matches and the CAS always loses.
         //   - Losing must not `continue` on a stale read: the loop would re-enter this branch and
         //     spin. Only 'args' mode loops here, which is the invariant stated above the loop.
@@ -1878,6 +1952,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           }
           continue claimLoop;
         }
+        seat.claim = { key, prior: rawBefore, stamp: takeover };
         break claimLoop; // reclaim complete → execute below
       }
 
@@ -1931,6 +2006,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           // Journal clock (K2, both ends) — staleness AND windowExpired compare against this stamp.
           firstToolCallId: toolCallId, at: ctx.journal.now ? await ctx.journal.now() : Date.now(), inFlight: true,
         }, dupTtl, dupCfg.ttlMs);
+        if (claimedDup) seat.dup = { key: dupKey, toolCallId };
         if (!claimedDup) {
           // A twin got here first. 'warn' is documented as permissive and stays that way; every
           // stricter policy means this call must not run.
@@ -1963,6 +2039,11 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
               `@gnldev/durable: side-effect tool '${toolName}' is already executing with identical ` +
               `arguments in ${dupWhere} — this concurrent duplicate was NOT EXECUTED`;
             await recordIncident(ctx.journal, ctx.runId, { at: Date.now(), source: 'duplicate-guard', action: 'block', toolName, toolCallId, message, detail });
+            // Blocked AFTER this call claimed its record: the body never starts, so the claim is given
+            // back. Left 'running', a replay of this call (a resume) met "being executed elsewhere" and
+            // then "may have run" for a call that provably ran nothing; given back, the replay meets the
+            // duplicate guard again and is blocked again.
+            if (seat.claim && !seat.started) { await giveBackUnstartedClaim(ctx, seat, toolName); seat.claim = undefined; }
             return { __gnl_limit_exceeded: { toolCallId, toolName, kind: 'duplicateSideEffect', message, detail } };
           }
           console.warn(
@@ -1990,22 +2071,28 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // out-of-band twin may have created the object meanwhile; denetçi K6). A failed/running
       // record's crash window still belongs to recover, never here.
       if (typeof tool.lookup === 'function' && sideEffect && (record === undefined || record.status === 'suspended')) {
+        let found: { exists: true; output: unknown } | { exists: false } | undefined;
         try {
-          const found = await tool.lookup(input, { idempotencyKey, toolCallId });
-          const ok = !!found && typeof found === 'object' && (found.exists === true ? 'output' in found : found.exists === false);
-          if (!ok) throw new TypeError(`lookup() must return {exists:true, output} or {exists:false}; got ${found === null ? 'null' : typeof found}`);
-          if (found.exists) {
-            await writeToolTerminal(ctx, key, {
-              status: 'succeeded', output: found.output, argsHash: hash, toolName,
-              ...(typeof tool.compensate === 'function' ? { input } : {}),
-            }, toolCallId, toolName, hash, dupKey, semPlan, xidPlan);
-            return found.output; // the effect already exists downstream — journaled, never re-fired
-          }
+          const answer = await tool.lookup(input, { idempotencyKey, toolCallId });
+          const ok = !!answer && typeof answer === 'object' && (answer.exists === true ? 'output' in answer : answer.exists === false);
+          if (!ok) throw new TypeError(`lookup() must return {exists:true, output} or {exists:false}; got ${answer === null ? 'null' : typeof answer}`);
+          found = answer;
         } catch (lookupErr) {
           // Fail-open, LOUDLY: proceeding as not-found is exactly today's behavior; a flaky lookup
           // must not block work it cannot decide about (contrast with recover, whose uncertainty
           // falls to the approval gate — there the effect MAY have fired; here it has not).
           console.warn(`@gnldev/durable: '${toolName}' lookup() failed for ${key} — proceeding as not-found:`, lookupErr);
+        }
+        // OUTSIDE the fail-open: once lookup has said the effect EXISTS, a failure to journal that answer
+        // is the journal's error, not lookup's. Read as "lookup failed, not found", it ran the body and
+        // fired the effect a second time (measured: a second charge on every store). It throws instead;
+        // the body has not started, so the claim is given back and a retry asks lookup again.
+        if (found?.exists) {
+          await writeToolTerminal(ctx, key, {
+            status: 'succeeded', output: found.output, argsHash: hash, toolName,
+            ...(typeof tool.compensate === 'function' ? { input } : {}),
+          }, toolCallId, toolName, hash, dupKey, semPlan, xidPlan);
+          return found.output; // the effect already exists downstream — journaled, never re-fired
         }
       }
       let output: unknown;
@@ -2110,6 +2197,9 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // tainted — its error body (also attacker-authorable) is covered without a post-hoc mark here.
         return thrown.rendersAsIs && journaledError === thrown.text ? error : maskedToolError(error, journaledError);
       };
+      // Set BEFORE the call: a synchronous throw from execute is already the body. From here on a
+      // failure may follow an effect, so the claim is never given back (giveBackUnstartedClaim).
+      seat.started = true;
       const p = Promise.resolve(original(input, execOpts));
       let pSettled = false;
       p.then(() => { pSettled = true; }, () => { pSettled = true; });

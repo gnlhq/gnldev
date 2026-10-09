@@ -38,7 +38,7 @@ export { usageAndCostFromModelValue, modelRecordFacts } from './cost.js';
 export type { ModelPricing, PricingDoc } from './pricing.js';
 export {
   DivergenceError, RunBusyError, SideEffectRetryBlockedError, RetryLimitExceededError,
-  ReplicationNotAcknowledgedError, SuiteVersionMismatchError, RunThreadMismatchError, RunTargetMismatchError,
+  SuiteVersionMismatchError, RunThreadMismatchError, RunTargetMismatchError,
   RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, RunSweptError, BatchPlanMismatchError,
   CALLER_CONFLICT_CODES, callerConflictCode, callerConflictAnswer, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, FOREIGN_PARTY_DETAIL_FIELDS,
   BLOCKED_ERROR_CODES, blockedErrorCode, upstreamFailure, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES,
@@ -122,8 +122,6 @@ export type { AdoptIntoOrgResult,
   Storage, CapabilityLevel, CapabilityMatrix, StoreName, CompositeConfig,
 } from './storage.js';
 export { InMemoryStorage } from './in-memory-storage.js';
-export { RedisStorage } from './redis-storage.js';
-export type { RedisLike, RedisStorageOptions } from './redis-storage.js';
 export type { Guard, GuardCall, GuardDecision, Interrupt, SuspendSentinel } from './guard.js';
 export { taintGuardian } from './guard.js';
 export { durableProcessorStep, createProcessorCtx, ProcessorTripwire, recordProcessorReport, readProcessorReports } from './processor.js';
@@ -250,8 +248,7 @@ export type {
   RegressionScorer, RegressionReportOptions, RegressionReport,
 } from './regression.js';
 // Persistent storage: `@gnldev/durable/sqlite` (SqliteStorage) · `@gnldev/durable/postgres`
-// (PostgresStorage) · `@gnldev/durable/redis` (RedisStorage — runs/work/cache/meta; memory/vectors are
-// overridden via composite). For a bare durable run use `new SqliteStorage(path).runs` (RunJournal = journal).
+// (PostgresStorage). For a bare durable run use `new SqliteStorage(path).runs` (RunJournal = journal).
 // P2-migrate schema introspection/migration façade — see migrate.ts.
 export { runMigrationCheck, tablesFromDDL } from './migrate.js';
 export { UPGRADE_STEPS, type UpgradeStepName, type UpgradeOptions, type UpgradeReport, type UpgradeStepReport } from './upgrade.js';

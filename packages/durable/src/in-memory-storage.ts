@@ -7,7 +7,7 @@ import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from '
 import { memoryPartitionOf, inMemoryPartition, type MemoryPartitionOption } from './storage.js';
 import { InMemoryJournal } from './journal.js';
 import { pageRunsFromArray } from './run-cursor.js';
-import { runUpgrade, threadRecordsStep, subjectIndexStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
+import { runUpgrade, threadRecordsStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
 import { UPGRADE_NAMES } from './option-names.js';
 import { stableStringify } from './hash.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
@@ -29,8 +29,8 @@ function genId(prefix: string): string {
 /**
  * Offset-cursor pagination (every list here except `WorkStore.list` and `RunJournal.listRuns`, which are keyed).
  *
- * The note here used to say "real storages use a keyset cursor". They do not — postgres, sqlite and
- * redis all read the cursor as a row offset, exactly like this one. The line described an intention
+ * The note here used to say "real storages use a keyset cursor". They do not — postgres and sqlite
+ * (and redis, while it existed) read the cursor as a row offset, exactly like this one. The line described an intention
  * as if it were the state of the code, which is the most expensive kind of comment: someone
  * reasoning about drift would have trusted the wrong adapter.
  */
@@ -73,6 +73,7 @@ class InMemoryRunJournal implements RunJournal {
   /** H1: delegates to InMemoryJournal.putIfMatch (stableStringify comparison, structurally atomic). */
   putIfMatch(k: string, e: unknown, v: unknown) { return this.journal.putIfMatch(k, e, v); }
   listKeys(p: string, opts?: { limit?: number }) { return this.journal.listKeys(p, opts); }
+  listOwnerRecords(resourceId: string, opts?: { prefix?: string }) { return this.journal.listOwnerRecords(resourceId, opts); }
   readRun(runId: string): Promise<JournalEntry[]> { return this.journal.readRun(runId); }
   // Capability parity with the real adapters (sqlite/postgres expose these as extra methods and
   // toJournal forwards whatever exists): the inner InMemoryJournal always had them, but this wrapper
@@ -482,7 +483,7 @@ export class InMemoryStorage implements Storage {
   /** See `Storage.upgrade`. One step, `thread-records` — for runs written into this store before its threads had marks. */
   async upgrade(opts?: UpgradeOptions): Promise<UpgradeReport> {
     refuseUnknownNames('InMemoryStorage.upgrade', opts, UPGRADE_NAMES);
-    return runUpgrade('InMemoryStorage', [threadRecordsStep(this), subjectIndexStep(this)], opts);
+    return runUpgrade('InMemoryStorage', [threadRecordsStep(this)], opts);
   }
   readonly runs = new InMemoryRunJournal();
   readonly memory = new InMemoryMemoryStore();

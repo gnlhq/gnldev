@@ -340,23 +340,19 @@ describe('subpath entries resolve with types', () => {
 import type { Storage, ModelInput } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
 import { PostgresStorage, type PostgresStorageOptions } from '@gnldev/durable/postgres';
-import { RedisStorage, type RedisStorageOptions } from '@gnldev/durable/redis';
 import { echoModel, toolCallingModel, type ToolCallingModelOptions } from '@gnldev/durable/mock';
 const sqlite: Storage = new SqliteStorage('runs.db');
 const inMemorySqlite: Storage = new SqliteStorage();
 declare const pgOpts: PostgresStorageOptions;
 const pg: Storage = new PostgresStorage(pgOpts);
-declare const redisOpts: RedisStorageOptions;
-const redis: Storage = new RedisStorage(redisOpts);
 const echo: ModelInput = echoModel();
 declare const toolOpts: ToolCallingModelOptions;
 const calling: ModelInput = toolCallingModel(toolOpts);
 const sqliteNotAny: IsAny<typeof SqliteStorage> = false;
 const pgNotAny: IsAny<typeof PostgresStorage> = false;
-const redisNotAny: IsAny<typeof RedisStorage> = false;
 const echoNotAny: IsAny<typeof echoModel> = false;
 const modelNotAny: IsAny<ReturnType<typeof echoModel>> = false;
-export { sqlite, inMemorySqlite, pg, redis, echo, calling, sqliteNotAny, pgNotAny, redisNotAny, echoNotAny, modelNotAny };
+export { sqlite, inMemorySqlite, pg, echo, calling, sqliteNotAny, pgNotAny, echoNotAny, modelNotAny };
 `;
   const cases = {
     base: BASE,
@@ -370,7 +366,7 @@ export { sqlite, inMemorySqlite, pg, redis, echo, calling, sqliteNotAny, pgNotAn
   let d: Record<keyof typeof cases, TypeDiagnostic[]>;
   beforeAll(() => { d = typeDiagnostics(__dirname, cases) as typeof d; }, COMPILE_TIMEOUT);
 
-  it('/sqlite, /postgres, /redis and /mock resolve to typed Storage classes and models', () => expect(d.base).toEqual([]));
+  it('/sqlite, /postgres and /mock resolve to typed Storage classes and models', () => expect(d.base).toEqual([]));
   it('an unknown subpath does not resolve', () => expect(codes(d.unknownSubpath)).toEqual([2307]));
   it("SqliteStorage's path is a string", () => expect(codes(d.sqliteNumericPath)).toEqual([2345]));
   it('a subpath does not re-export another', () => expect(codes(d.wrongExportFromSubpath)).toEqual([2305]));

@@ -2,7 +2,7 @@
 // The real-backend gate, runnable locally instead of only on a push.
 //
 // WHY THIS EXISTS, precisely. `.github/workflows/ci.yml` already has an `integration` job that brings
-// up Postgres (two collations) and Redis and runs the env-gated suite. It is well built and it would
+// up Postgres (two collations) and runs the env-gated suite. It is well built and it would
 // have caught the defect described below. It has also never run on this repository's work, because the
 // repository has no remote: development happens locally and the public snapshot is pushed separately.
 // A gate that only fires on `git push` protects nothing in a workflow with no push.
@@ -18,7 +18,7 @@
 // This script closes the loop the way it can be closed locally: bring the servers up, run every
 // env-gated test against them, tear the servers down.
 //
-//   node scripts/check-real-backends.mjs          # Postgres + Redis (+ the model provider if a key is set)
+//   node scripts/check-real-backends.mjs          # Postgres (+ the model provider if a key is set)
 //   node scripts/check-real-backends.mjs --failover  # also the kill-the-primary scenario
 //   node scripts/check-real-backends.mjs --keep      # leave the containers up afterwards
 //
@@ -39,7 +39,6 @@ const keep = args.has('--keep');
 const PG_URL = 'postgres://postgres:gnl@localhost:55432/gnl';
 // The `pgvector` service: same credentials, its own port (docker-compose.yml).
 const PGVECTOR_URL = 'postgres://postgres:gnl@localhost:55433/gnl';
-const REDIS_URL = 'redis://localhost:6380';
 
 const run = (cmd, argv, opts = {}) =>
   spawnSync(cmd, argv, { cwd: root, stdio: 'inherit', encoding: 'utf8', ...opts });
@@ -60,7 +59,7 @@ function composeCmd() {
 const compose = composeCmd();
 if (!compose) {
   console.error('check-real-backends: neither `docker compose` nor `docker-compose` is available.\n'
-    + '  These tests need a real Postgres and a real Redis — there is no in-process substitute that\n'
+    + '  These tests need a real Postgres — there is no in-process substitute that\n'
     + '  can prove transaction rollback or row locking. Install Docker, or run the suite on a machine\n'
     + '  that has it, before calling the real-backend gate passed.');
   process.exit(2);
@@ -102,7 +101,7 @@ function step(label, fn) {
 }
 
 try {
-  step('postgres + redis up', () => composeRun('docker-compose.yml', 'up', '-d').status === 0);
+  step('postgres up', () => composeRun('docker-compose.yml', 'up', '-d').status === 0);
   if (failures.length) throw new Error('compose up failed');
 
   for (const service of ['postgres', 'pgvector']) {
@@ -112,14 +111,14 @@ try {
     }
   }
 
-  // The env names matter and have been wrong before: the CI job originally exported PG_URL/REDIS_PORT,
+  // The env names matter and have been wrong before: the CI job originally exported PG_URL,
   // which the tests never read, so it connected to the built-in defaults and failed on a retry timeout
   // while looking like a real-backend run. These are the names integration-real.test.ts actually reads.
   // GNL_PGVECTOR_URL was missing until the erasure contract round: the real pgvector test listed below
   // was skipped by its own `skipIf` on every run of this gate, and the gate said nothing.
-  const env = { ...process.env, GNL_INTEGRATION: '1', GNL_PG_URL: PG_URL, GNL_PGVECTOR_URL: PGVECTOR_URL, GNL_REDIS_URL: REDIS_URL };
+  const env = { ...process.env, GNL_INTEGRATION: '1', GNL_PG_URL: PG_URL, GNL_PGVECTOR_URL: PGVECTOR_URL };
 
-  step('real Postgres + Redis (integration-real, prefix ranges, pgvector)', () =>
+  step('real Postgres (integration-real, prefix ranges, pgvector)', () =>
     run('pnpm', ['exec', 'vitest', 'run',
       'packages/durable/test/integration-real.test.ts',
       'packages/durable/test/prefix-astral-postgres.test.ts',
@@ -135,10 +134,10 @@ try {
   // vitest runs files in parallel: measured with these files in the list above, the kill reached the
   // vector contract's open pools and vitest reported 4 uncaught `57P01` errors — a red gate caused
   // by the schedule, not by any store.
-  step('real Postgres + Redis + pgvector (erasure, vector and owned-name contracts)', () =>
+  step('real Postgres + pgvector (erasure, vector and owned-name contracts)', () =>
     run('pnpm', ['exec', 'vitest', 'run',
-      // One erasure, every store: SQLite, pg-mem and FakeRedis run in the default suite; the real
-      // Postgres and real Redis rows (and the cross-store drift check over them) only run here.
+      // One erasure, every store: SQLite and pg-mem run in the default suite; the real Postgres row
+      // (and the cross-store drift check over it) only runs here.
       'packages/durable/test/erasure-store-contract.test.ts',
       // The vector write rule on a real Postgres and on rag's PostgresVectorStore over real pgvector.
       'packages/durable/test/vector-store-contract.test.ts',

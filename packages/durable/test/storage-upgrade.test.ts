@@ -3,9 +3,6 @@
 import { describe, it, expect } from 'vitest';
 import * as D from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
-import { RedisStorage } from '../src/redis-storage.js';
-import { makeFakeRedis } from './fake-redis.js';
-import superjson from 'superjson';
 import { threadOwnerKey, threadSeenKey, THREAD_RECORDS_KEY } from '../src/thread-owner.js';
 
 const { InMemoryStorage, toJournal, threadOwnerOf, withOrg } = D as any;
@@ -33,7 +30,6 @@ const THREADS = [...Array.from({ length: 10 }, (_, i) => `t-one-${i}`), 't-mixed
 const stores: [string, () => any][] = [
   ['memory', () => new InMemoryStorage()],
   ['sqlite', () => new SqliteStorage()],
-  ['redis (fake)', () => new RedisStorage({ client: makeFakeRedis(undefined, true) as never })],
 ];
 
 for (const [name, make] of stores) {
@@ -79,8 +75,10 @@ for (const [name, make] of stores) {
         expect(r.steps.find((x: any) => x.name === 'thread-records').ran).toBe(false);
         expect(await toJournal(s.runs).get(THREAD_RECORDS_KEY)).toBeUndefined();
       }
-      const missing = ['schema', 'key-index'].find((n) => !names.includes(n))!;
-      await expect(s.upgrade({ only: [missing] })).rejects.toThrow(/is not a step of this store\. Its steps:/);
+      // A step of another store (InMemory has no schema) — or, on a store with every step (Sqlite), the
+      // step that went with Redis: the command an operator who read an older guide would type.
+      const missing = ['schema', 'relations'].find((n) => !names.includes(n)) ?? 'key-index';
+      await expect(s.upgrade({ only: [missing] } as any)).rejects.toThrow(/is not a step of this store\. Its steps:/);
       await expect(s.upgrade({ olny: ['thread-records'] } as any)).rejects.toThrow(/only/);
     });
 
@@ -103,15 +101,17 @@ for (const [name, make] of stores) {
 }
 
 describe('storage.upgrade() — a step is never run behind the caller\'s back', () => {
-  it('Redis: thread-records alone, while key-index is pending, is refused and says how to run both', async () => {
-    const client = makeFakeRedis(undefined, true);
-    // A store an earlier version wrote: its keys are there before this version's first contact.
-    await client.set('u:rj:legacy:model:0', superjson.stringify({ v: { text: 'x' }, r: 'legacy', k: 'model', s: false, t: 1 }));
-    const s = new RedisStorage({ client: client as never, keyPrefix: 'u:' });
+  it('Sqlite: thread-records alone, while schema is pending, is refused and says how to run both', async () => {
+    const s = new SqliteStorage();
+    await seedOldThreads(toJournal(s.runs));
+    // A store whose schema an earlier version left behind: an index this version expects is missing
+    // (the constructor heals tables and columns, so the drift is made on the live connection).
+    (s as unknown as { db: { exec(sql: string): void } }).db.exec('DROP INDEX gnl_runs_resource');
     const dry = await s.upgrade({ dryRun: true });
-    expect(dry.steps.find((x) => x.name === 'key-index')?.pending).toBe(true);
-    await expect(s.upgrade({ only: ['thread-records'] })).rejects.toThrow(/'thread-records' needs 'key-index' first.*only: \['key-index', 'thread-records'\]/);
-    const both = await s.upgrade({ only: ['key-index', 'thread-records'] });
-    expect(both.steps.map((x) => [x.name, x.ran])).toEqual([['key-index', true], ['thread-records', true], ['subject-index', false]]);
+    expect(dry.steps.find((x) => x.name === 'schema')?.pending).toBe(true);
+    await expect(s.upgrade({ only: ['thread-records'] })).rejects.toThrow(/'thread-records' needs 'schema' first.*only: \['schema', 'thread-records'\]/);
+    const both = await s.upgrade({ only: ['schema', 'thread-records'] });
+    expect(both.steps.filter((x) => x.name !== 'relations' && x.name !== 'verify-relations').map((x) => [x.name, x.ran])).toEqual([['schema', true], ['thread-records', true]]);
+    expect(both.steps.find((x) => x.name === 'relations')?.ran).toBe(false); // not named, so not run
   });
 });

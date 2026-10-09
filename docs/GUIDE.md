@@ -177,7 +177,6 @@ graph TB
         A1["InMemory<br/>(test/dev)"]
         A2["SQLite<br/>(single machine,<br/>zero setup)"]
         A3["Postgres<br/>(multi-server<br/>production)"]
-        A4["Redis<br/>(fast queue/<br/>cache)"]
     end
     Storage --- Adapters
 ```
@@ -186,10 +185,11 @@ No adapter is REQUIRED to support every port — the **capability matrix** hones
 can offer, and with `composite()` (combinator), ports can be distributed across different engines:
 
 ```ts
-// Example: run journal on Postgres (durability), queue+cache on Redis (speed):
+// Example: everything on Postgres, thread memory on a local SQLite file — for a Postgres-compatible
+// server without pg_advisory_xact_lock, where Postgres turns its memory port off (see its boot warning):
 const storage = composite({
   default: new PostgresStorage({ connectionString: PG_URL }),
-  overrides: { work: redis, cache: redis }, // redis = new RedisStorage({...})
+  overrides: { memory: new SqliteStorage('memory.db') },
 });
 ```
 
@@ -198,10 +198,9 @@ const storage = composite({
 | InMemory | ✅ | ✅ | ✅ | ✅ | ✅ | Testing, prototyping. |
 | SQLite | ✅ | ✅ | ✅ (scan) | ✅ | ✅ | Single machine, zero setup (built into Node). |
 | Postgres | ✅ | ✅ | ✅ (scan) | ✅ | ✅ | Multi-server production. **Recommended journal.** |
-| Redis | ✅* | ❌ | ❌ | ✅ | ✅ (real TTL) | Queue/cache accelerator. *Not recommended for the journal in failover setups (see below). |
 
 The cells are the adapters' own `capabilities` matrices, verbatim (`postgres-storage.ts`,
-`sqlite-storage.ts`, `redis-storage.ts`, `in-memory-storage.ts`).
+`sqlite-storage.ts`, `in-memory-storage.ts`).
 
 > **`scan`, not pgvector.** The `vectors` port on the SQLite *and* Postgres adapters stores the
 > embedding as a TEXT column and ranks by cosine similarity **in JavaScript, over every eligible
@@ -316,8 +315,9 @@ id, so each part is rewritten before it is joined: `:` → `%3A` and `%` → `%2
 `billing:eu` on topic `refunds` is therefore stored under `evtack:refunds:billing%3Aeu:<id>`, and
 a `LIKE 'evtack:refunds:billing:eu:%'` finds nothing. The same escape reaches the log namespace in ⑧:
 topic `orders:eu` is stored as `gnl_work_log.ns = 'evt:orders%3Aeu'`. That one is not tidiness —
-`WorkStore.list(ns)` is a whole-value match here, but the Redis adapter derives a key from the
-namespace and used to read it back with a prefix scan, which handed one topic another's events.
+`WorkStore.list(ns)` is a whole-value match here, but a store that derives a key from the
+namespace and reads it back with a prefix scan (GNL's own Redis adapter did, before it was removed)
+hands one topic another's events.
 
 **⑩ `gnl_cache` — TTL-based cache.** `key, value, expires_at`. For reuse ACROSS runs (e.g., the
 embedding of the same text across two runs → compute it once). Expired entries aren't read and
@@ -767,7 +767,7 @@ buys the first list and costs the second.
 
 | Capability | What it means in practice |
 |---|---|
-| **At-most-once side effects** | A tool call already recorded as done is not run again — enforced with CAS, verified across two OS processes and against real Postgres/Redis in CI |
+| **At-most-once side effects** | A tool call already recorded as done is not run again — enforced with CAS, verified across two OS processes and against real Postgres in CI |
 | **Deterministic replay** | The same run reconstructs to the same result without calling the model again — the model's response is in the journal, not just the state |
 | **Time-travel + fork** | Jump to any past step and branch from there, visually in Studio |
 | **Model fallback is persistent** | The model that actually won is written to the journal; a resume sticks with it instead of re-rolling the dice |
@@ -797,7 +797,7 @@ Yes; most of the claims are proven with **live tests against real engines** — 
 themselves live under `packages/durable/test/`:
 
 - **Multi-server CAS race:** two separate Postgres connection pools write to the same key at the
-  same time → EXACTLY ONE winner every time (20 rounds + a 10-way burst). Same for Redis (SET NX).
+  same time → EXACTLY ONE winner every time (20 rounds + a 10-way burst).
 - **Live failover** (server replacement): the primary Postgres was **killed with SIGKILL**, a
   replica was promoted → 30/30 acknowledged writes preserved, the at-most-once guarantee held. (Precondition:
   synchronous replication (`synchronous_commit = on` with a synchronous standby); this guarantee does
@@ -834,7 +834,7 @@ the model again.
 Mistral... just write `'provider/model'`; provider packages are only loaded if actually used.
 
 **"What's the smallest possible starting point?"** `npm create gnl` → a working scaffold with
-SQLite single-file persistence, server, and Studio included. Moving to Postgres/Redis in
+SQLite single-file persistence, server, and Studio included. Moving to Postgres in
 production is a one-line `storage` change.
 
 ---
@@ -1137,9 +1137,9 @@ former; it's tested with the latter.
 | LLM abstraction | **Vercel AI SDK** (`ai`) | The most critical dependency: a SINGLE interface to OpenAI/Anthropic/Google/Mistral. `runDurable` is essentially a durable wrapper around `generateText` — no provider lock-in. |
 | Schema validation | Zod | Tool input schemas (shape-checking the parameters the LLM will send to a tool). |
 | Web framework | **Hono** | The HTTP layer for Server/Studio/auth. Hono instead of Express: runs identically on Node and at the edge (Cloudflare Workers), and is very small — the foundation of the "small edge bundle" claim. |
-| Storage | SQLite / PostgreSQL / Redis | The adapters from §5; all OPTIONAL dependencies (a driver you don't use is never loaded — lazy import). |
+| Storage | SQLite / PostgreSQL | The adapters from §5; all OPTIONAL dependencies (a driver you don't use is never loaded — lazy import). |
 | Serialization | superjson | Record-to-text conversion; unlike plain JSON, it doesn't lose types like `Date`. |
-| Testing | Vitest + pg-mem + Docker | 5,004 passing tests across 548 files (2026-09-14); pg-mem = an in-memory fake Postgres (fast); Docker compose files = REAL PG/Redis integration + a live failover scenario. |
+| Testing | Vitest + pg-mem + Docker | 5,004 passing tests across 548 files (2026-09-14); pg-mem = an in-memory fake Postgres (fast); Docker compose files = REAL PG integration + a live failover scenario. |
 | Bundling | — | Not needed: `createRestApi()` returns a web-standard fetch handler, so each platform bundles it the way it already bundles anything else. |
 | Studio UI | React + TanStack Query + Recharts | The panel's front end: UI + data fetching/caching + charts. |
 | Observability | OTLP/HTTP (hand-rolled, ~8KB) | Sends traces to external tools; a hand-written translator instead of the massive OTel SDK (the stay-thin philosophy). Live mode also optionally uses the OTel SDK. |

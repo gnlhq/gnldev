@@ -57,7 +57,7 @@ const GLOBALS = `declare global {
   const approve: any; const pass: any; const longText: any; const withOldModel: any;
   const withNewModel: any; const DAY: number; const GUN: number;
   const kontrolEt: any; const kuyrugaAt: any; const onayla: any; const gecir: any;
-  const uzunMetin: any; const redis: any;
+  const uzunMetin: any;
   // Stand-ins a doc block names after the prose has introduced them as the reader's own.
   const myEmbed: any; const myModel: any; const cert: any; const lookupCharge: any;
   const sweepLog: any; const RETENTION_MS: number; const sendMessage: any;
@@ -91,7 +91,7 @@ declare global {
   const Hono: typeof import('hono').Hono;
   // ── the reader's own code ────────────────────────────────────────────────
   const buildModel: any; const makeModel: any; const makeTools: any; const makeSwapiTools: any;
-  const SYSTEM: any; const bigToolset: any; const someRedisBackedStorage: any; const forkModel: any;
+  const SYSTEM: any; const bigToolset: any; const forkModel: any;
   const counter: any; const licenseKey: any; const fallback: any; const auth: any; const reader: any;
   const aiToolSchema: any;
   const runDurable: typeof import('@gnldev/durable').runDurable;
@@ -138,6 +138,7 @@ declare global {
   const purgeRun: typeof import('@gnldev/durable').purgeRun;
   const rolloverRun: typeof import('@gnldev/durable').rolloverRun;
   const PostgresStorage: typeof import('@gnldev/durable/postgres').PostgresStorage;
+  const SqliteStorage: typeof import('@gnldev/durable/sqlite').SqliteStorage;
   // REAL exports the READMEs use after their own prose has shown the import. Typed, not opaque, for
   // the reason this file argues at length above: an \`any\` ambient legitimises the sample instead of
   // checking it. gnlTool in particular is the durability declaration the dedup ladder is built on —

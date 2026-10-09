@@ -2,6 +2,7 @@
 
 - **Status:** Proposed, 2026-10-06
 - **Builds on:** ADR-0001 (end-user isolation), ADR-0005 (the request is the unit).
+- **Note:** the Redis store was removed later (CHANGELOG, Unreleased); its measurements here are history.
 
 ## Context
 

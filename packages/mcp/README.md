@@ -255,7 +255,7 @@ function sharedRateLimit(journal: Journal, o: { maxCalls: number; windowMs: numb
 createMcpServer({ tools, journal, rateLimit: sharedRateLimit(journal, { maxCalls: 100, windowMs: 60_000 }) });
 ```
 
-`incrBy` is atomic on every shipped storage (Redis `HINCRBYFLOAT`, Postgres/SQLite UPSERT arithmetic) — it is what `@gnldev/durable`'s own budget accounting uses. It is an OPTIONAL member of `Journal`, so a custom storage without it cannot use this recipe. `incrBy` then `getCounters` is two operations, so a concurrent caller can push the read above this call's own increment and refuse a call a perfectly serialised counter would have allowed: it errs toward refusing, which is the direction a limiter has to err in.
+`incrBy` is atomic on every shipped storage (Postgres/SQLite UPSERT arithmetic) — it is what `@gnldev/durable`'s own budget accounting uses. It is an OPTIONAL member of `Journal`, so a custom storage without it cannot use this recipe. `incrBy` then `getCounters` is two operations, so a concurrent caller can push the read above this call's own increment and refuse a call a perfectly serialised counter would have allowed: it errs toward refusing, which is the direction a limiter has to err in.
 
 Measured on two servers sharing one journal: the built-in counter let **each** allow its own `maxCalls` (6 calls for a limit of 3); the recipe above allowed 3 in total, and they were the first 3. Buckets from earlier windows are left in the journal — inert, but not free, which is the trade against the in-process version's sweep.
 

@@ -7,22 +7,20 @@
 // here (a drift test, not only a per-store test):
 //  - a person with runs, threads, documents, queued jobs, triggers and events is fully erased;
 //  - erasing `bob` leaves `bob:evil`, `bob%`, `bob_x` and another organization's `bob` intact;
-//  - an id holding SQL LIKE or Redis glob metacharacters (`%`, `_`, `*`, `?`, `[`, `\`) is a literal
+//  - an id holding SQL LIKE or glob metacharacters (`%`, `_`, `*`, `?`, `[`, `\`) is a literal
 //    prefix: its neighbour that a wildcard would match survives.
 //
-// Stores: durable InMemory, SQLite, Postgres (pg-mem), Redis (FakeRedis). With GNL_PG_URL also a real
-// Postgres; with GNL_REDIS_URL also a real Redis (the real-backend gate, `pnpm check:real`, sets both).
+// Stores: durable InMemory, SQLite, Postgres (pg-mem). With GNL_PG_URL also a real Postgres (the
+// real-backend gate, `pnpm check:real`, sets it).
 import { describe, it, expect, afterAll, beforeAll, vi } from 'vitest';
 import { newDb } from 'pg-mem';
 import pg from 'pg';
 import {
-  InMemoryStorage, RedisStorage, BasicMemory, composite, createGnl, scopeConfigToOrg, eraseSubject, toJournal, withOrgStorage, workingMemoryScope,
+  InMemoryStorage, BasicMemory, composite, createGnl, scopeConfigToOrg, eraseSubject, toJournal, withOrgStorage, workingMemoryScope,
   type Storage, type Journal,
 } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { makeFakeRedis } from './fake-redis.js';
-import type { RedisLike } from '../src/redis-storage.js';
 import { indexDocuments } from '../../rag/src/index.js';
 import { enqueue, createWorker, listJobs, jobEraser } from '../../queue/src/index.js';
 import { emit, createConsumer, eventEraser } from '../../events/src/index.js';
@@ -32,7 +30,6 @@ import { AgentMemory } from '../../memory/src/index.js';
 import { createMockModel, finalTextResult } from './mock.js';
 
 const PG_URL = process.env.GNL_PG_URL;
-const REDIS_URL = process.env.GNL_REDIS_URL;
 
 // The quarantine notices of the dead-lettering consumer are expected, one per person per store.
 beforeAll(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); vi.spyOn(console, 'error').mockImplementation(() => {}); });
@@ -68,7 +65,6 @@ const BACKENDS: Array<[string, () => Promise<Backend>]> = [
     };
   }],
   ['Postgres (pg-mem)', async () => pgBackend(new (newDb().adapters.createPg().Pool)())],
-  ['Redis (fake)', async () => redisBackend(makeFakeRedis(), 'gnl:')],
 ];
 if (PG_URL) {
   BACKENDS.push(['Postgres (real)', async () => {
@@ -83,21 +79,6 @@ if (PG_URL) {
     return pgBackend(pool);
   }]);
 }
-if (REDIS_URL) {
-  BACKENDS.push(['Redis (real)', async () => {
-    const { default: Redis } = await import('ioredis');
-    const client = new Redis(REDIS_URL) as unknown as RedisLike & { quit(): Promise<unknown> };
-    // A key prefix of its own, holding glob characters on purpose: the erasure's SCAN pattern must
-    // escape the prefix too, or it reads (and deletes) a neighbouring store's keys.
-    const pfx = `gnl-erase-[${process.pid}]*${seq++}:`;
-    ends.push(async () => {
-      const keys = await scanRaw(client, pfx);
-      if (keys.length) await client.del(...keys);
-      await client.quit();
-    });
-    return redisBackend(client, pfx);
-  }]);
-}
 
 async function pgBackend(pool: pg.Pool): Promise<Backend> {
   const storage = new PostgresStorage({ pool });
@@ -107,34 +88,6 @@ async function pgBackend(pool: pg.Pool): Promise<Backend> {
       ...(await pool.query('SELECT ns, id, payload FROM gnl_work_log')).rows.map((r) => `${r.ns}|${r.id}|${r.payload}`),
       ...(await pool.query('SELECT key, value FROM gnl_work_kv')).rows.map((r) => `${r.key}|${r.value}`),
     ],
-  };
-}
-
-const globEscape = (s: string) => s.replace(/[\\*?[\]]/g, (c) => '\\' + c);
-async function scanRaw(client: RedisLike, pfx: string): Promise<string[]> {
-  const out = new Set<string>();
-  let cursor: string | number = '0';
-  do {
-    const [next, keys] = await client.scan(cursor, 'MATCH', globEscape(pfx) + '*', 'COUNT', 1000);
-    for (const k of keys) out.add(k);
-    cursor = next;
-  } while (String(cursor) !== '0');
-  return [...out];
-}
-
-function redisBackend(client: RedisLike, pfx: string): Backend {
-  const redis = new RedisStorage({ client, keyPrefix: pfx, replicationWarning: false });
-  // Redis keeps no documents and no memory store: those come from another store, as `composite` documents.
-  const side = new InMemoryStorage();
-  const storage = composite({ default: redis, overrides: { vectors: side, memory: side } });
-  return {
-    storage,
-    rawWork: async () => {
-      const keys = (await scanRaw(client, pfx)).filter((k) => k.startsWith(`${pfx}wl:`) || k.startsWith(`${pfx}wk:`));
-      const out: string[] = [];
-      for (const k of keys) out.push(`${k}|${await client.get(k)}`);
-      return out;
-    },
   };
 }
 

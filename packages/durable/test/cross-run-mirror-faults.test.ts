@@ -12,7 +12,7 @@
 // not happen") cannot be used, because it did happen.
 //
 // Failure classes this covers are ordinary for the backends this framework targets: a Postgres
-// connection reset, a Redis timeout, ENOSPC.
+// connection reset, a statement timeout, ENOSPC.
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';

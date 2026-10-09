@@ -124,7 +124,7 @@ suspending. For those, use `runDurable`. Runnable example (no API key):
 
 **Node.js 22.13 or newer.** The default storage uses `node:sqlite`, which is only importable from 22.13 (it existed behind a flag from 22.5) — on an
 older runtime the first run fails with `ERR_UNKNOWN_BUILTIN_MODULE: No such built-in module: node:sqlite`. If you are on Node 20
-LTS, either upgrade or point `journal` at `@gnldev/durable/postgres` or `/redis` instead.
+LTS, either upgrade or point `journal` at `@gnldev/durable/postgres` instead.
 pnpm 10 is what the repository is developed and tested against.
 
 ## Quickstart (DX)
@@ -160,7 +160,7 @@ on either. The table below covers the ones you interact with directly.
 
 | Package | What |
 |---|---|
-| **`@gnldev/durable`** | Core: `runDurable`/`resumeRun`/`streamDurable` · `durableTool`/`withDurableModel` · journal (memory/**sqlite/postgres/redis**) · `createGnl` + model router · `createAgentTool` + **dynamic network (`runNetwork`, CAS-frozen routing)** · `getRunCost` · `reconstructState`/`forkRun` · run-lock (**atomic takeover: `putIfMatch`**) · `rolloverRun` (period rollover) · retention (`sweepRuns`/`sweepLog`/`sweepThreads` — journal-scoped only; the `WorkStore` queue/event log has no sweeper) · recursive `purgeRun` · disk reclaim via the storage's `compact()` · **`timeouts` (`modelStepMs`/`toolMs`/`claimTtlMs`) → `StepTimeoutError`** |
+| **`@gnldev/durable`** | Core: `runDurable`/`resumeRun`/`streamDurable` · `durableTool`/`withDurableModel` · journal (memory/**sqlite/postgres**) · `createGnl` + model router · `createAgentTool` + **dynamic network (`runNetwork`, CAS-frozen routing)** · `getRunCost` · `reconstructState`/`forkRun` · run-lock (**atomic takeover: `putIfMatch`**) · `rolloverRun` (period rollover) · retention (`sweepRuns`/`sweepLog`/`sweepThreads` — journal-scoped only; the `WorkStore` queue/event log has no sweeper) · recursive `purgeRun` · disk reclaim via the storage's `compact()` · **`timeouts` (`modelStepMs`/`toolMs`/`claimTtlMs`) → `StepTimeoutError`** |
 | **`@gnldev/memory`** | `AgentMemory`: recall (messageRange/threshold/filter/resource-scope) · schema working memory + `updateWorkingMemory` tool · thread CRUD/clone · observational memory (Observer/Reflector, pluggable tokenizer) · MessageList |
 | **`@gnldev/rag`** | vector store (dev: in-memory · **prod: pgvector**) · **`chunkText`/`chunkDocuments`** (recursive/markdown/character) · **`GraphRag`** (similarity-graph retrieval) · `createRagTool` · `llmReranker` · `SemanticMemory` |
 | **`@gnldev/workflow`** | then/parallel/branch · foreach/loop · **`retry` (declarative retry policy, counter kept in the journal)** · `wf.runResumable()` (a `Workflow` **method**, not a top-level export) + `sleep`/`waitFor` (evented/scheduled) |
@@ -211,7 +211,7 @@ A dependency you install runs code on your machine and in your build. GNL's post
 this repo today:
 - **Zero install scripts** — no `postinstall`/`preinstall` in any package.
 - **Minimal dependency surface** — the core (`@gnldev/durable`) has exactly **one** runtime dependency
-  (`superjson`); storage drivers (`pg`, `ioredis`) are optional peers you explicitly opt into.
+  (`superjson`); the storage driver (`pg`) is an optional peer you explicitly opt into.
 - **Signed, provenance-attested releases** (`npm publish --provenance`) are the publishing plan — no
   release happens outside CI.
 
@@ -241,7 +241,7 @@ serve({ fetch: createRestApi(config).fetch, port: Number(process.env.PORT ?? 300
 `node:http`, and on Deno, Bun or Workers the handler is already the shape those runtimes expect.
 
 **Journal warning:** `node:sqlite` doesn't work on serverless/edge runtimes → use a network-backed journal
-(`@gnldev/durable/postgres` or `/redis`, D1 on Cloudflare). `SqliteStorage` is only for long-lived Node
+(`@gnldev/durable/postgres`; GNL has no D1 store). `SqliteStorage` is only for long-lived Node
 processes.
 
 ## Honest positioning
@@ -289,7 +289,7 @@ gnl puts the dedup in the journal instead: keyed by `toolCallId` by default, by 
 logical key when you opt in, across runs when you ask for it — and when the outcome genuinely cannot
 be known (crash between the effect and its record) it **blocks and asks a human** rather than
 guessing in either direction. Correctness is the default, not a per-call-site obligation. The other
-practical difference: this is a library over storage you already run (`node:sqlite`, Postgres, Redis,
+practical difference: this is a library over storage you already run (`node:sqlite`, Postgres,
 your own adapter), not a platform to deploy onto. That adapter is a contract, not a shape: the
 `Storage` ports and what each one must guarantee — including that `MemoryStore.appendMessages` assigns
 `seq` itself, per thread and atomically — are specified in

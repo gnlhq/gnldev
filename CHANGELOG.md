@@ -17,12 +17,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`--only thread-records`). Until then everything works as in 0.10, at 0.10's speed.
 - A run list's `nextCursor` names a run, not a row number. Pass it back verbatim; a numeric cursor from
   0.10 is refused.
+- Postgres: this version adds three indexes (`gnl_runs_resource`, `gnl_runs_thread`,
+  `gnl_run_journal_owner`). Its processes build any that are missing when they boot, with a lock that
+  holds writers off for the length of the build. To build them without it, run
+  `gnl upgrade --only schema` (or `storage.upgrade({ only: ['schema'] })`) before the new processes
+  start: the `schema` step builds a missing index `CONCURRENTLY`. Processes of 0.10 keep working beside it.
+- Redis: this version has no Redis store. Move to Postgres (or Sqlite on one machine) — see Breaking.
 
 ### Breaking
 
+- **Redis is no longer a storage backend.** `@gnldev/durable/redis` and everything it exported are
+  gone: `RedisStorage`, `RedisLike`, `RedisStorageOptions`, `ReplicationNotAcknowledgedError` (only
+  Redis threw it), the `ioredis` peer dependency, and `ioredis` in `@gnldev/deploy`'s default
+  `external` list on node (an app that imports it itself passes `external`), and the warning
+  `preset: 'critical'` printed for a journal whose class name said Redis — your own Redis or Valkey
+  journal now gets none; for `critical`, use Postgres with a synchronous standby. Nothing else in GNL ran
+  on Redis — the queue, events, schedules, streams and locks read the store's ports — so the stores
+  are InMemory, Sqlite (one machine) and Postgres (several processes or machines). A store's records
+  are not carried across: finish or cancel a Redis store's open runs on 0.10, then point the
+  processes at Postgres. Why: Redis was the one store that kept none of the relation columns this
+  version adds, so erasing a person and "my runs" walked every run there; it carried its own key
+  index and run order, upgrade step and replication options to make up for having no query engine,
+  and every promise had to be proven a fourth time against a fake of it.
 - **One way to upgrade a store: `storage.upgrade()`** (and `gnl upgrade`). `migrateSchema()` (Sqlite,
-  Postgres) and `rebuildKeyIndex()` (Redis) are no longer public — they are the `schema` and
-  `key-index` steps: `storage.upgrade({ only: ['schema'] })`, `storage.upgrade({ only: ['key-index'] })`.
+  Postgres) is no longer public — it is the `schema` step: `storage.upgrade({ only: ['schema'] })`.
   `dryRun: true` reports each step's pending state and, for `schema`, the statements, and writes nothing.
 - **A run list's cursor names its last run** (`listRuns`, `listRunsPaged`, `GET /runs`, the Studio).
   0.10's numeric cursor is refused with a `TypeError` (400 from the server and the Studio) instead of
@@ -31,50 +49,121 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   back: pass `nextCursor` back, or use `order: 'desc'` for newest first.
 
 ### Fixed
+- **An organization's run list read the whole store.** `withOrg` found an organization's runs by
+  walking every run page and keeping its own, so an organization with few runs on a large store paid
+  for everyone else's — its first-contact thread probe and every unfiltered list: Sqlite, 200 000 root
+  runs, 661 ms and 4 000 page reads for an empty organization. It now asks for its own id range
+  (`ListQuery.runIdPrefix`), which Sqlite and Postgres read from the run id's index: 1 ms, one read, at
+  any size (Postgres, 1 000 000 runs: 0–2 ms). A journal of your own that ignores the filter stays
+  exact. This predates this release (0.10.0 has it too).
 
-- **Erasing one person read the whole store.** `eraseSubject` found a person's runs by walking every
-  run, and the threads they own by opening every thread's owner record — 1 000 000 runs and 200 000
+- **Erasing one person, or listing their runs, read the whole store.** A run's person and thread
+  lived only inside its `:input` record, and a thread's owner only inside its owner record, so
+  `eraseSubject` walked every run and opened every thread's owner record — 1 000 000 runs and 200 000
   threads on Postgres: 425 966 queries and 90 s for one person with ~500 runs, 95% of them reading other
-  people's threads. A person now has an index: one key per run and per thread they own
-  (`subj:<person>:…`), written before the record it points at, checked against that record before
-  anything is erased, and removed with it (`purgeRun`, `purgeThread`, a thread given to someone else).
-  The same erasure: 24 630 queries, 7–16 s — the deletions themselves. The index is trusted only in a
-  scope that is complete: one this version opened, or one the `subject-index` step has run on; before,
-  erasure walks as it did. Writing a message costs one or two more queries (96 instead of 94).
+  people's threads — and "my runs" (`listRunsPaged({ resourceId })`) walked every run too. On Sqlite and
+  Postgres they are now columns — `gnl_runs.resource_id`, `gnl_runs.thread_id`, `gnl_run_journal.owner`
+  — that the store fills in the same transaction as the record they come from, from one derivation
+  (`runRelationsOf`, `ownerColumnOf`), whoever writes the record: the engine, another package, your own
+  code. A row with no value (written before the columns, or by a 0.10 process during a rolling deploy)
+  is NOT skipped: every lookup by person or thread reads those rows too and decides them from the
+  record. So erasure and run lists are complete from the first boot, whether or not the `relations`
+  step has run; the step only makes them faster. A record that another writer rewrites without the
+  columns — a 0.10 process's `assignThreadOwner`, or a run's `:input` rewritten by an older process, a
+  raw put or plain SQL — goes back to "not placed" by triggers in the database (`gnl_owner_unplace`,
+  `gnl_run_unplace`, Sqlite and Postgres; on Postgres they name their own schema, so a data-only
+  restore or a write from another schema keeps them true), so the person and thread it now names still
+  find it. A Postgres that cannot create them (no plpgsql) never reads the relation columns and walks
+  the records. A boot that finds the triggers missing or disabled on a store that already holds
+  placements re-creates them and trusts no column until `gnl upgrade --only relations` has placed every
+  row again from its record. InMemory decides from the records as before.
+  Measured on Postgres, 1 000 000 runs (median): a person's first page 1.6 s → 4 ms, a person with 6
+  runs 16 s → 1 ms, deleting a thread with its runs 15 s → 41 ms, erasing a person 5.1 s → 4.8 s,
+  writing a message unchanged (22 ms, 96 queries); the `relations` step itself 5.5 min. Until that step
+  has run, a lookup by person or thread reads every unplaced row, like the listing before it and
+  slower: a person's first page 1.8 s, a person with 6 runs 30 s, deleting a thread 21 s, erasing a
+  person 31 s (0.10, which trusted its person index, 5.1 s). A Sqlite or Postgres process that finds
+  such runs says so once at boot (a `console.warn` naming the slow lookups); run
+  `gnl upgrade --only relations` once no 0.10 process writes to the store.
+- **An erasure whose run listing failed reported success.** `purgeResource` (which `eraseSubject` runs)
+  read a failing page of the person's runs as an empty one: it erased none of their runs and returned
+  a count. It now throws, and the request can be retried.
 - **A new thread's first run read every run in the store.** The thread gate looked for runs on the
   thread whenever it had no owner record — which is every new thread, and every anonymous one. Now an
   anonymous turn writes a `seen` marker, and a thread with neither record nor marker is new. The first
-  run on a new thread, 30 000 runs: Postgres 70 s → 15 ms, Sqlite 324 ms → 1 ms; Redis at 4 000 runs
-  9.4 s → 5 ms.
+  run on a new thread, 30 000 runs: Postgres 70 s → 15 ms, Sqlite 324 ms → 1 ms.
 - **Walking a run list was quadratic.** Postgres and Sqlite paged with `OFFSET`; a list now resumes
   after its last run on the `(created_at, run_id)` index. 30 000 runs walked on Postgres: 71 s → 0.43 s.
   Budget, metrics, sweep, doctor and the organization views walk the whole list.
-- **Redis read every run for every page.** It now keeps the order of runs (one sorted set, written in
-  the same atomic step as the run's keys) and reads only the page's runs: a page of 50 at 4 000 runs
-  119 ms → 2.2 ms.
 - **A run deleted between two pages made the next page skip a surviving run**, on every store.
-- **Redis listed a run adopted into an organization twice**, under its old and its new id.
+- **A storage error after a tool call's claim, before the tool ran, left the call stuck.** The error
+  (seen as Postgres serialization failures under `SERIALIZABLE`) reached the model as a tool error, but
+  the call's record stayed `running`: a retry was refused as busy until the claim expired, and then
+  counted as a crash that "may have run", so a side effect needed `recover()`, `idempotent: true` or an
+  approval. The tool had not run. Now the claim is given back — the record returns to what it was
+  before the call — and a retry runs the tool once. An error after the tool started is unchanged. This
+  predates this release (0.10.0 has it too).
+- **At the root, an organization's thread decided who owned the root's thread with the same id.**
+  Until the root scope was marked by `storage.upgrade()`, a thread with no owner record was judged by
+  the runs on it, and the root read those from the raw journal, which lists every organization's runs
+  too. A root user starting thread `T` was refused because acme's person ran on acme's `T`, and the
+  root got an owner record naming acme's person; a root erasure saw two owners on its person's old
+  thread and kept her journal-kept messages. The root's thread question now reads the root's runs only
+  (`withRootScope`, ADR-0001), for the engine's gate and every door that calls it, erasure, retention
+  and the `thread-records` upgrade alike. An organization's own gate and erasure still read its own
+  runs. This predates this release (0.10.0 has it too).
+- **A tool whose `lookup()` found the effect already done could run it again.** When `lookup()` said
+  the effect exists and journaling that answer failed (a storage error), the failure was read as
+  "lookup failed, proceeding as not-found" and the tool ran — a second charge. It now throws; the body
+  has not started, so the claim is given back and a retry asks `lookup()` again. This predates this
+  release (0.10.0 has it too).
+- **A concurrent duplicate blocked by `sideEffectDuplicates: 'block'` stayed claimed.** The blocked
+  call ran nothing but left its record `running`, so a resume replaying it was refused as busy and then
+  treated as "may have run". The claim is now given back; replayed, the call is blocked again. This
+  predates this release (0.10.0 has it too).
 
 ### Added
 
 - `storage.upgrade({ only?, dryRun? })` on every first-party store, and `gnl upgrade [--list] [--only …]`;
-  `gnl doctor` lists pending steps. Steps: `schema` (Sqlite, Postgres), `key-index` (Redis),
-  `thread-records` and `subject-index` (every store, the root scope and each registered organization;
-  `subject-index` at 1 000 000 runs: 150 s, +138 MB). A step never runs
+  `gnl doctor` lists pending steps. Steps: `schema` (Sqlite, Postgres — it now also adds an index an
+  existing table lacks, which it could not before, and rebuilds one a failed concurrent build left
+  INVALID — `checkSchema` reports it as missing), `thread-records` (every store,
+  the root scope and each registered organization), `relations` (Sqlite, Postgres: places the person
+  and thread of rows written before the columns, a page at a time, then refreshes the planner's
+  statistics; for speed only — 1 000 000 runs: 5 min on Postgres; a page Postgres aborts for a
+  deadlock or serialization failure is run again), `verify-relations` (Sqlite, Postgres: clears every
+  placement and places it again from its record; never pending on its own — run it by name after a
+  write the triggers did not see, see Known limits). A step never runs
   behind the caller's back: naming one whose prerequisite is still pending is refused, with the call
   that runs both. `thread-records` reads runs one page at a time and keeps one small entry per thread
   (it held every run summary: 1.4 GB at 1 000 000 runs); interrupted, it starts again — every write is
   first-write-wins. Also `threadSeenKey`, `THREAD_RECORDS_KEY`, `isRunCursor`, `RunOrder`,
   `UPGRADE_STEPS`.
 - `ListQuery.order: 'asc' | 'desc'` on every first-party store.
-- Redis's `key-index` step also fills the run order (`listedRuns` in its detail).
+- `ListQuery.threadId` / `listRunsPaged({ threadId })`: a thread's runs, on every first-party store
+  (Sqlite and Postgres by index).
+- `Journal.listOwnerRecords?(resourceId, { prefix? })`: the thread owner records that name a person —
+  what an erasure asks instead of opening every record. Optional: a journal without it is asked the
+  old way. `SchemaCheckResult.missingIndexes`.
 
 ### Known limits
+- What keeps the person/thread columns true is two triggers in the database. A write they do not see —
+  a session with `session_replication_role = replica` (a logical-replication apply worker),
+  `pg_restore --disable-triggers`, triggers disabled or dropped and re-created by hand between two
+  boots — can leave a run or a thread listed and erased as someone else's. A boot that finds them
+  missing, disabled, enabled only for replicas, or with a body that is not this version's repairs what
+  it can (it trusts no column until the `relations` step has placed every row again), but a write
+  between two healthy boots leaves no trace: after such a restore or replication, run
+  `gnl upgrade --only verify-relations`. A process that booted before the triggers were removed keeps
+  trusting the columns until it restarts.
+- At REPEATABLE READ or SERIALIZABLE, a write that meets the `relations` step on the same run is
+  refused (40001) rather than placed wrong; retry it.
+- A run with no `:input` — driven without `run()`, e.g. `withDurableModel` or a `durableTool` with a
+  ctx of its own — has no record that says whose it is, so it is never placed: every lookup by person
+  or thread reads it, and decides it is nobody's. Answers are exact; with many such runs those lookups
+  slow down (30 000 of them: a person's erasure ~1 s on Postgres). Runs started with `run()` are not
+  affected.
 
-- A process of 0.10 writing after `subject-index` has run (a rolling deploy) writes runs with no index
-  entry, and an erasure through the index does not find them. Run the step once no process of 0.10
-  remains — the same rule as the `key-index` step. A root holding organization records is not marked by
-  its first run; run the step there.
 - A process of 0.10 writing after the upgrade (a rolling deploy) writes no `seen` marker: its anonymous
   thread reads as new. A named user's thread stays theirs; the first named user still claims an
   anonymous one. Staff opening such a thread now claims it closed, where 0.10 left it open.

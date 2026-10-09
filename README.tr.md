@@ -122,7 +122,7 @@ testler: `packages/durable/test/with-idempotency.test.ts`.
 
 **Node.js 22.13 veya üstü.** Varsayılan depolama `node:sqlite` kullanıyor; modül 22.5'te bayrak arkasındaydı, import edilebilir hâle 22.13'te geldi —
 daha eski bir çalışma zamanında ilk koşu `ERR_UNKNOWN_BUILTIN_MODULE: No such built-in module: node:sqlite` ile başarısız olur.
-Node 20 LTS'teyseniz ya yükseltin ya da `journal`'ı `@gnldev/durable/postgres` veya `/redis`'e
+Node 20 LTS'teyseniz ya yükseltin ya da `journal`'ı `@gnldev/durable/postgres`'e
 yönlendirin. Depo pnpm 10 ile geliştiriliyor ve test ediliyor.
 
 ## Hızlı başlangıç (DX)
@@ -158,7 +158,7 @@ bağlı değil. Aşağıdaki tablo doğrudan kullandığınız paketleri kapsar.
 
 | Paket | Ne |
 |---|---|
-| **`@gnldev/durable`** | Çekirdek: `runDurable`/`resumeRun`/`streamDurable` · `durableTool`/`withDurableModel` · journal (memory/**sqlite/postgres/redis**) · `createGnl`+model-router · `createAgentTool` + **dinamik ağ (`runNetwork`, CAS-frozen routing)** · `getRunCost` · `reconstructState`/`forkRun` · run-lock (**atomik takeover: `putIfMatch`**) · `rolloverRun` (dönem devri) · retention (`sweepRuns`/`sweepLog`/`sweepThreads` — yalnız journal kapsamı; `WorkStore` kuyruk/olay defterinin süpürücüsü yok) · özyinelemeli `purgeRun` · disk geri kazanımı `compact()` · **`timeouts` (`modelStepMs`/`toolMs`/`claimTtlMs`) → `StepTimeoutError`** |
+| **`@gnldev/durable`** | Çekirdek: `runDurable`/`resumeRun`/`streamDurable` · `durableTool`/`withDurableModel` · journal (memory/**sqlite/postgres**) · `createGnl`+model-router · `createAgentTool` + **dinamik ağ (`runNetwork`, CAS-frozen routing)** · `getRunCost` · `reconstructState`/`forkRun` · run-lock (**atomik takeover: `putIfMatch`**) · `rolloverRun` (dönem devri) · retention (`sweepRuns`/`sweepLog`/`sweepThreads` — yalnız journal kapsamı; `WorkStore` kuyruk/olay defterinin süpürücüsü yok) · özyinelemeli `purgeRun` · disk geri kazanımı `compact()` · **`timeouts` (`modelStepMs`/`toolMs`/`claimTtlMs`) → `StepTimeoutError`** |
 | **`@gnldev/memory`** | `AgentMemory`: recall (messageRange/threshold/filter/resource-scope) · schema WM + `updateWorkingMemory` tool · thread CRUD/clone · observational memory (Observer/Reflector, pluggable tokenizer) · MessageList |
 | **`@gnldev/rag`** | vector store (dev: in-memory · **prod: pgvector**) · **`chunkText`/`chunkDocuments`** (recursive/markdown/character) · **`GraphRag`** (benzerlik-grafı retrieval) · `createRagTool` · `llmReranker` · `SemanticMemory` |
 | **`@gnldev/workflow`** | then/parallel/branch · foreach/loop · **`retry` (bildirimsel retry-policy, sayaç journal'da)** · `wf.runResumable()` (top-level export değil, `Workflow` **metodu**) + `sleep`/`waitFor` (evented/scheduled) |
@@ -210,7 +210,7 @@ Kurduğun bir bağımlılık, makinende ve derlemende kod çalıştırır. GNL'i
 doğrulanabilir duruşu:
 - **Sıfır install script** — hiçbir pakette `postinstall`/`preinstall` yok.
 - **Minimal bağımlılık yüzeyi** — çekirdeğin (`@gnldev/durable`) tam olarak **bir** runtime bağımlılığı var
-  (`superjson`); storage sürücüleri (`pg`, `ioredis`) açıkça opt-in olduğun opsiyonel peer'lar.
+  (`superjson`); storage sürücüsü (`pg`) açıkça opt-in olduğun opsiyonel bir peer.
 - **İmzalı, provenance-attested yayın** (`npm publish --provenance`) yayın planıdır — CI dışında yayın olmaz.
 
 ## Geliştirme
@@ -237,7 +237,7 @@ takılır — `@gnldev/server/node`'daki `toNodeHandler` onu Express, Fastify, K
 `node:http` ile birleştirir; Deno, Bun ve Workers'ta ise handler zaten o runtime'ların beklediği
 biçimdedir.
 
-**Journal uyarısı:** serverless/edge runtime'larda `node:sqlite` çalışmaz → ağ-tabanlı journal kullanın (`@gnldev/durable/postgres` veya `/redis`, Cloudflare'de D1). `SqliteStorage` yalnız uzun-ömürlü Node süreçleri içindir.
+**Journal uyarısı:** serverless/edge runtime'larda `node:sqlite` çalışmaz → ağ-tabanlı journal kullanın (`@gnldev/durable/postgres`; GNL'de D1 deposu yok). `SqliteStorage` yalnız uzun-ömürlü Node süreçleri içindir.
 
 ## Dürüst konumlandırma
 "Tam-donanımlı bir agent framework alternatifi" değil; **AI SDK için durability/correctness katmanı**: sağlam bir çekirdek (`@gnldev/durable`) +
@@ -284,7 +284,7 @@ gnl tekilleştirmeyi journal'a koyuyor: varsayılan olarak `toolCallId` ile, opt
 hash'i veya mantıksal bir anahtarla, istersen koşular arası — ve sonuç gerçekten bilinemediğinde
 (etki ile kaydı arasındaki çöküş) iki yönden birine tahmin yürütmek yerine **durup insana soruyor.**
 Doğruluk varsayılan, her çağrı yerinde ayrı bir yükümlülük değil. Diğer pratik fark: bu, zaten
-işlettiğin depolamanın üstünde bir kütüphane (`node:sqlite`, Postgres, Redis, kendi adaptörün),
+işlettiğin depolamanın üstünde bir kütüphane (`node:sqlite`, Postgres, kendi adaptörün),
 üzerine dağıtım yapacağın bir platform değil. Bu adaptör bir biçim değil, bir sözleşmedir:
 `Storage` portları ve her birinin neyi garanti etmesi gerektiği — `MemoryStore.appendMessages`'ın
 `seq`'i thread bazında ve atomik olarak kendisinin atması dahil —

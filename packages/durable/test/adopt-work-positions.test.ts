@@ -16,10 +16,9 @@
 // refuses the adoption before anything moves, in every store, with the same message.
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { newDb } from 'pg-mem';
-import { InMemoryStorage, RedisStorage, withOrgStorage, type Storage } from '../src/index.js';
+import { InMemoryStorage, withOrgStorage, type Storage } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { makeFakeRedis } from './fake-redis.js';
 import { enqueue, createWorker, jobEraser } from '../../queue/src/index.js';
 
 beforeAll(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
@@ -27,12 +26,10 @@ const ends: Array<() => Promise<unknown>> = [];
 afterAll(async () => { for (const e of ends.reverse()) await e(); });
 
 const PG_URL = process.env.GNL_PG_URL;
-const REDIS_URL = process.env.GNL_REDIS_URL;
 const STORES: Array<[string, () => Promise<Storage>]> = [
   ['in-memory', async () => new InMemoryStorage()],
   ['sqlite', async () => new SqliteStorage(':memory:')],
   ['postgres (pg-mem)', async () => { const { Pool } = newDb().adapters.createPg(); return new PostgresStorage({ pool: new Pool() }); }],
-  ['redis (fake)', async () => new RedisStorage({ client: makeFakeRedis() as never })],
 ];
 if (PG_URL) {
   STORES.push(['postgres (real)', async () => {
@@ -45,14 +42,6 @@ if (PG_URL) {
     const s = new PostgresStorage({ connectionString: url.toString() });
     ends.push(async () => { await s.close(); await admin.query(`DROP DATABASE IF EXISTS ${db}`); await admin.end(); });
     return s;
-  }]);
-}
-if (REDIS_URL) {
-  STORES.push(['redis (real)', async () => {
-    const { default: Redis } = await import('ioredis');
-    const c = new Redis(REDIS_URL);
-    ends.push(() => c.quit());
-    return new RedisStorage({ client: c as never, keyPrefix: `adopt-pos-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}:` });
   }]);
 }
 

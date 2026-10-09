@@ -1,15 +1,14 @@
 // maxToolCalls seats under many parallel calls. A seat taken by a bounded compare-and-set retry refused
-// all but 22 of 200 parallel calls with the limit a million away (measured on InMemory, Sqlite, Postgres
-// and Redis). The seat is now one atomic step on the request's total, and a finished call gives its seat
+// all but 22 of 200 parallel calls with the limit a million away (measured on InMemory, Sqlite and
+// Postgres). The seat is now one atomic step on the request's total, and a finished call gives its seat
 // back in the step that counts it: every call the limit admits runs, and no more. A custom store whose
 // incrBy does not return values keeps a compare-and-set seat: never past the limit, and every call runs
-// when the limit is far away. Postgres and Redis run when GNL_PG_URL / GNL_REDIS_URL are set.
+// when the limit is far away. Postgres runs when GNL_PG_URL is set.
 import { describe, it, expect, afterAll } from 'vitest';
 import { z } from 'zod';
 import { InMemoryStorage, createGnl, gnlTool, STAFF } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { RedisStorage } from '../src/redis-storage.js';
 import { createMockModel, toolCallResult, finalTextResult } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1 };
@@ -42,13 +41,6 @@ if (process.env.GNL_PG_URL) {
     const s = new PostgresStorage({ connectionString: url.toString() });
     ends.push(async () => { await s.close(); await admin.query(`DROP DATABASE IF EXISTS ${db}`); await admin.end(); });
     return s;
-  }]);
-}
-if (process.env.GNL_REDIS_URL) {
-  STORES.push(['redis (real)', async () => {
-    const { default: Redis } = await import('ioredis');
-    const c = new Redis(process.env.GNL_REDIS_URL!); ends.push(() => c.quit());
-    return new RedisStorage({ client: c as never, keyPrefix: `seat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}:` });
   }]);
 }
 

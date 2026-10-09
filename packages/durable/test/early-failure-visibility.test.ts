@@ -18,8 +18,6 @@ import { newDb } from 'pg-mem';
 import { runDurable, sweepRuns, InMemoryStorage, InMemoryJournal, runIdOfKey, listRunsArray } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { RedisStorage } from '../src/index.js';
-import { makeFakeRedis } from './fake-redis.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {} };
@@ -86,7 +84,6 @@ for (const [name, make] of [
   ['InMemoryJournal', () => new InMemoryJournal()],
   ['SqliteStorage.runs', () => new SqliteStorage().runs],
   ['PostgresStorage.runs (pg-mem)', () => pgStorage()],
-  ['RedisStorage.runs (fake)', () => new RedisStorage({ client: makeFakeRedis() }).runs],
 ] as [string, () => any][]) {
   describe(`a run that died before its first step (${name})`, () => {
     it('is visible to listRuns', async () => {

@@ -1978,7 +1978,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     // API-01/API-09: prefer the engine push-down (listRunsPaged, newest first) — one index seek per
     // page instead of materializing every run. `total` comes from countRunsByStatus (the SAME source
     // GET /metrics uses below). Falls back to the full scan when either capability is missing (a bare
-    // custom JournalReader, or an adapter without a cheap status aggregate — e.g. Redis), when the
+    // custom JournalReader, or an adapter without a cheap status aggregate), when the
     // count could not be read, or (API-09) when an `agent`/`q` filter is active: countRunsByStatus has
     // no per-agent/per-substring count, so the FILTERED total is only known from the scan.
     if (agent === undefined && q === undefined && typeof reader.listRunsPaged === 'function' && typeof rw.countRunsByStatus === 'function') {

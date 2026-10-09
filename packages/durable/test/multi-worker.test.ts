@@ -8,8 +8,8 @@
 //   - Concurrent calls WITHIN a single InMemoryJournal (single object) (TOCTOU, tool-claim, lock acquire/release/takeover).
 //   - exactly-once-intersection: real process-kill but SEQUENTIAL (child crashes → parent resumes), not concurrent.
 // What is NOT COVERED (this file adds it):
-//   - TWO SEPARATE storage instances connected to the SAME shared backend (same SQLite file / same pg-mem db /
-//     same FakeRedis client), writing to the SAME runId with Promise.all, TRULY concurrently.
+//   - TWO SEPARATE storage instances connected to the SAME shared backend (same SQLite file / same pg-mem db),
+//     writing to the SAME runId with Promise.all, TRULY concurrently.
 //
 // HONESTY NOTES (evidentiary strength):
 //   - InMemory: the "backend" IS the Map itself; there's no separate "connection" concept → j1===j2 (same object).
@@ -22,8 +22,6 @@
 //     also returns a row on conflict (known fidelity limitation — same note as in storage-backend.test.ts) →
 //     the putIfAbsent boolean is NOT RELIABLE. So for pg-mem we verify the DATA invariant (value preserved /
 //     single row) rather than the boolean; against real PG the boolean is correct (proven with SQL Sqlite above).
-//   - Redis (FakeRedis): ONE client shared by TWO RedisStorages. SET NX is genuinely atomic + async → the
-//     most faithful concurrency model of a shared backend.
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,11 +30,9 @@ import { stepCountIs } from 'ai';
 import { InMemoryJournal } from '../src/journal.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { RedisStorage } from '../src/redis-storage.js';
 import { runDurable } from '../src/run.js';
 import { acquireRunLock } from '../src/run-lock.js';
 import { RunBusyError } from '../src/errors.js';
-import { makeFakeRedis } from './fake-redis.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 import { newDb } from 'pg-mem';
 
@@ -108,18 +104,6 @@ const backends: SharedBackend[] = [
       const s = new PostgresStorage({ pool: new Pool() });
       await s.init();
       return { j1: s.runs, j2: s.runs, close: async () => { await s.close(); } };
-    },
-  },
-  {
-    name: 'Redis (FakeRedis, shared client, 2 storages)',
-    exactCas: true,
-    make: async () => {
-      const client = makeFakeRedis(); // SINGLE client → genuinely shared backend
-      const a = new RedisStorage({ client });
-      const b = new RedisStorage({ client });
-      await a.init();
-      await b.init();
-      return { j1: a.runs, j2: b.runs, close: async () => { await a.close(); } };
     },
   },
 ];

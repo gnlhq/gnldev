@@ -292,27 +292,18 @@ export async function emit(
  * its last and only variable component there, so that name is already unambiguous... a collision that
  * cannot happen"). The name is indeed unambiguous; the reasoning was still wrong, because it argued
  * about the NAME while the failure is in the KEY THE STORE DERIVES FROM IT, which this package cannot
- * see. `WorkStore.list(ns)` is specified as a whole-value match, but RedisWorkStore had no ns column:
- * it stored records at `wl:<ns>:<id>` and read a namespace back with a `SCAN MATCH wl:<ns>:*` PREFIX
- * scan. Measured on a real Redis 7: a consumer of topic `orders` was delivered topic `orders:eu`'s
- * events (it never subscribed), and `emit(topic='inv', id='eu:x')` returned an event id for a record
- * `SET NX` had silently refused, because topic `inv:eu` + id `x` had already taken the same key — no
- * dead-letter row, no log line, the loss class this escape exists to remove. (Pinned in
- * log-namespace.test.ts.)
+ * see. `WorkStore.list(ns)` is specified as a whole-value match, but a store with no ns column — GNL's
+ * own Redis adapter, since removed — keeps records at `wl:<ns>:<id>` and reads a namespace back with a
+ * `SCAN MATCH wl:<ns>:*` PREFIX scan. Measured on a real Redis 7: a consumer of topic `orders` was
+ * delivered topic `orders:eu`'s events (it never subscribed), and `emit(topic='inv', id='eu:x')`
+ * returned an event id for a record `SET NX` had silently refused, because topic `inv:eu` + id `x` had
+ * already taken the same key — no dead-letter row, no log line, the loss class this escape exists to
+ * remove. (Pinned in log-namespace.test.ts.)
  *
- * The adapter is fixed at its own layer (redis-storage.ts `encNs`) and that fix is the load-bearing
- * one — it restores the port contract for EVERY caller, not just this package. Escaping here changes
- * no behavior on any of the four shipped adapters once it has landed. It stays because `WorkStore` is
- * a PUBLIC port: a store that addresses a record by a concatenated key is an ordinary way to
- * implement it, ours did it for months, and an escaped namespace is self-disambiguating under any of
- * them. A rule with an exception clause is what failed here; this package now has the rule without it.
- *
- * `encNs` is a SECOND IMPLEMENTATION of this same three-line escape, and deliberately so: one escape
- * SHAPE (`%3A`/`%25`), two layers that must be able to fail independently. Sharing a symbol would
- * mean deleting either one silently reconfigures the other — the opposite of the defence in depth
- * the paragraph above argues for. The two are pinned separately, and the `%` half of each is what
- * distinguishes them: log-namespace.test.ts asserts it once through this package (a topic literally
- * named `inv%3Aeu`) and once straight against the adapter (a namespace named `a%3Ab`).
+ * The first-party stores (InMemory, Sqlite, Postgres) match a namespace whole, so escaping here
+ * changes no behavior on them. It stays because `WorkStore` is a PUBLIC port: a store that addresses
+ * a record by a concatenated key is an ordinary way to implement it, ours did it for months, and an
+ * escaped namespace is self-disambiguating under any of them.
  *
  * COST: a name (or event id) that actually contains `:` or `%` is now stored under a different key
  * than it was, and — since the namespace is escaped as well — a topic containing one is stored in a

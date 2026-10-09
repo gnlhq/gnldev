@@ -21,8 +21,6 @@ import {
 } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { RedisStorage } from '../src/index.js';
-import { makeFakeRedis } from './fake-redis.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {}, doStream: async () => { throw new Error('gen-only'); } };
@@ -37,7 +35,6 @@ const adapters: [string, () => any][] = [
   ['InMemoryJournal', () => new InMemoryJournal()],
   ['SqliteStorage.runs', () => new SqliteStorage().runs],
   ['PostgresStorage.runs (pg-mem)', () => new PostgresStorage({ pool: new (newDb().adapters.createPg().Pool)() }).runs],
-  ['RedisStorage.runs (fake)', () => new RedisStorage({ client: makeFakeRedis() }).runs],
 ];
 
 for (const [name, make] of adapters) {

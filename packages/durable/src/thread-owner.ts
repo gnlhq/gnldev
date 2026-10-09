@@ -28,13 +28,13 @@
  * one exception is kept on purpose: a thread whose only runs were born `unknown` under a versioned
  * record (an anonymous first turn in this release) is still claimed by the first named user (R11).
  */
-import { claim, runKeys, listRunsArray, runPages } from './journal.js';
+import { claim, runKeys, listRunsArray, runPages, listRunsWhere } from './journal.js';
 import type { Journal, JournalReader, RunSummary } from './journal.js';
 import type { Memory } from './memory.js';
 import { ThreadOwnerMismatchError } from './errors.js';
 import type { Caller } from './identity-types.js';
 import { recordOwner } from './run-identity.js';
-import { indexSubject, unindexSubject, markSubjectIndexIfEmpty } from './subject-index.js';
+import { orgScopeOf, withRootScope, rootScopeParentOf, isOrganizationKey } from './organization.js';
 
 export const threadOwnerKey = (threadId: string): string => `thread:${threadId}:owner`;
 
@@ -85,7 +85,6 @@ export async function threadOwnerOf(journal: Journal, memory: Memory | undefined
     if (rec.ownerKind !== 'staff' && memory?.getThreadResource) {
       const owner = await memory.getThreadResource(threadId);
       if (owner) {
-        await indexSubject(journal, 'thread', owner, threadId);
         await journal.put(key, { ...rec, resourceId: owner, upgradedAt: Date.now() });
         return { exists: true, owner };
       }
@@ -135,12 +134,10 @@ async function settle(journal: Journal, threadId: string, v: { derived?: string;
     return { exists: true, staffClaimed: false };
   }
   const key = threadOwnerKey(threadId);
-  await indexSubject(journal, 'thread', v.derived, threadId);
   await claim(journal, key, v.derived
     ? { at: Date.now(), resourceId: v.derived, backfilled: true }
     : { at: Date.now(), ownerKind: 'staff', backfilled: true, underivable: true });
   const now = await journal.get<ThreadOwnerRecord>(key);
-  if (v.derived && now?.resourceId !== v.derived) await unindexSubject(journal, 'thread', v.derived, threadId);
   return { exists: true, ...(now?.resourceId ? { owner: now.resourceId } : { staffClaimed: now?.ownerKind !== 'unknown' }) };
 }
 
@@ -171,7 +168,7 @@ interface ThreadTally { owner: string | undefined; mixed: boolean; allBornUnknow
  */
 export async function writeThreadRecords(journal: Journal, memory?: Memory): Promise<{ threads: number; recorded: number; marked: number }> {
   const tally = new Map<string, ThreadTally>();
-  for await (const page of runPages(journal, RECORD_PAGE)) {
+  for await (const page of runPages(scopeRuns(journal), RECORD_PAGE)) {
     for (const r of page) {
       if (!r.threadId) continue;
       // Born `unknown` under a versioned record: read only for a run that names nobody (allBornUnknown).
@@ -228,23 +225,18 @@ async function allBornUnknown(journal: Journal, runs: RunSummary[]): Promise<boo
  */
 export async function recordThreadCreated(journal: Journal, threadId: string, resourceId: string): Promise<void> {
   if (typeof resourceId !== 'string' || resourceId === '') return; // names nobody: nothing to record
-  await markSubjectIndexIfEmpty(journal);
-  await indexSubject(journal, 'thread', resourceId, threadId);
   await claim(journal, threadOwnerKey(threadId), { at: Date.now(), resourceId, created: true });
 }
 
 /**
  * Gives a thread moved to a new id (memory's `migrateReservedRootThreads`) the owner record and mark of
- * the old one — its owner's index entry first, as every owner write does (subject-index.ts). The old
- * id's record, mark and entry go with the old thread (`purgeThread`).
+ * the old one — the one owner of that copy, so a thread moved by any path carries both. The old id's
+ * record and mark go with the old thread (`purgeThread`).
  * @internal — memory's thread migration; a host moves threads through it, not with this.
  */
 export async function copyThreadOwnership(journal: Journal, from: string, to: string): Promise<void> {
   const owner = await journal.get<ThreadOwnerRecord>(threadOwnerKey(from));
-  if (owner !== undefined) {
-    await indexSubject(journal, 'thread', owner.resourceId, to);
-    await journal.put(threadOwnerKey(to), owner);
-  }
+  if (owner !== undefined) await journal.put(threadOwnerKey(to), owner);
   const seen = await journal.get(threadSeenKey(from));
   if (seen !== undefined) await journal.put(threadSeenKey(to), seen);
 }
@@ -256,18 +248,75 @@ export async function copyThreadOwnership(journal: Journal, from: string, to: st
  */
 export async function assignThreadOwner(journal: Journal, threadId: string, resourceId: string): Promise<void> {
   if (typeof resourceId !== 'string' || resourceId === '') throw new TypeError('@gnldev/durable: assignThreadOwner needs a user id.');
-  const before = (await journal.get<ThreadOwnerRecord>(threadOwnerKey(threadId)))?.resourceId;
-  await indexSubject(journal, 'thread', resourceId, threadId);
   await journal.put(threadOwnerKey(threadId), { at: Date.now(), resourceId, assigned: true });
-  if (before && before !== resourceId) await unindexSubject(journal, 'thread', before, threadId);
 }
 
 /**
- * Every run on a thread. Two shapes reach here: a Journal's `listRuns` answers an array; a storage
- * `RunJournal`'s answers one page, so it is walked to the end — a thread's runs past the first page
- * are exactly the ones a partial read would miss.
+ * The runs a scope's thread question may read: the scope's OWN. An organization's view (`withOrg`)
+ * already lists only that organization's runs. Anything else is the root, and the root journal
+ * physically holds every organization's runs too (`org:<id>:<runId>`), each with the BARE thread id
+ * the organization chose — so read raw, acme's thread `T` decided who owns the root's thread `T`: the
+ * gate refused a root user on a thread the root never had and wrote a root record naming acme's
+ * person, and a root erasure saw two owners on its person's thread and kept her messages (audit 4B-F1,
+ * 4B-F2). ADR-0001 says the root scope hides every organization's rows; `withRootScope` is the one
+ * owner of that rule, so the run reads go through it. Only the run READS: the records this module
+ * reads and writes (`thread:…`) are the root's own keys either way.
+ *
+ * Here, not at each caller: the engine's gate, the doors that call it (chat, AG-UI), the server's
+ * reads, retention, memory, erasure and the upgrade all ask through `threadOwnerOf` /
+ * `writeThreadRecords`, many of them with the raw journal on purpose (root management that is defined
+ * over every organization, like a sweep, needs it raw). The question "whose is this root thread" is
+ * the one place that must not see organizations, so it scopes itself. A view already root-scoped is
+ * returned as it is.
  */
-async function runsOnThread(journal: Journal, threadId: string): Promise<{ runs: RunSummary[]; scopeEmpty: boolean }> {
+function scopeRuns(journal: Journal): Journal {
+  return orgScopeOf(journal) !== undefined ? journal : withRootScope(journal);
+}
+
+/** Pages of the raw store the root's first-contact probe reads before it stops (see `scopeHoldsNoRun`). */
+const ROOT_PROBE_PAGES = 4;
+const ROOT_PROBE_PAGE = 200;
+
+/**
+ * Whether the scope holds no run at all — the evidence for its first-contact mark. An organization's
+ * view answers from one row of its own. The root's view would WALK the store's pages until it met a
+ * run of the root's own (`withRootScope` hides organizations' runs after reading them), so a root with
+ * a few old runs under a million newer organization runs paid a million-run walk on every new
+ * thread's gate. So the root reads at most `ROOT_PROBE_PAGES` raw pages: a root run in them, or the
+ * store ending, answers; otherwise it says "not empty". That is always safe — the mark is only a
+ * shortcut, and without it the gate keeps asking the index for the one thread's runs — and the
+ * root is then marked by `storage.upgrade()`, as any root with runs is.
+ */
+async function scopeHoldsNoRun(scope: Journal): Promise<boolean> {
+  const own = scope as Partial<JournalReader>;
+  if (orgScopeOf(scope) !== undefined) return (await own.listRunsPaged!.call(scope, { limit: 1 })).items.length === 0;
+  const raw = (rootScopeParentOf(scope) ?? scope) as Partial<JournalReader>;
+  let cursor: string | undefined;
+  for (let i = 0; i < ROOT_PROBE_PAGES; i++) {
+    // The first read is one row, as before: a single-tenant root answers from it.
+    const page = await raw.listRunsPaged!.call(raw, { limit: i === 0 ? 1 : ROOT_PROBE_PAGE, ...(cursor ? { cursor } : {}) });
+    if (page.items.some((r) => !isOrganizationKey(r.runId))) return false;
+    if (!page.nextCursor) return true;
+    cursor = page.nextCursor;
+  }
+  return false;
+}
+
+/**
+ * Every run on a thread, and whether the scope holds any run at all. A journal that lists runs by page
+ * is asked for this thread's runs (on Sqlite and Postgres an index read of the thread's placed rows and
+ * the rows not placed yet — never a walk of the store) and, separately, for one run of any kind. Older
+ * shapes are walked: a Journal's `listRuns` answers an array; a storage `RunJournal`'s answers one page,
+ * so it is walked to the end — a thread's runs past the first page are exactly the ones a partial read
+ * would miss.
+ */
+async function runsOnThread(scope: Journal, threadId: string): Promise<{ runs: RunSummary[]; scopeEmpty: boolean }> {
+  const journal = scopeRuns(scope);
+  const onThread = await listRunsWhere(journal, { threadId });
+  if (onThread !== undefined) {
+    if (onThread.length) return { runs: onThread, scopeEmpty: false };
+    return { runs: [], scopeEmpty: await scopeHoldsNoRun(scope) };
+  }
   const list = (journal as Partial<JournalReader> & { listRuns?: (q?: { cursor?: string; limit?: number }) => Promise<unknown> }).listRuns;
   if (typeof list !== 'function') return { runs: [], scopeEmpty: false };
   const first = await list.call(journal);
@@ -294,15 +343,10 @@ async function runsOnThread(journal: Journal, threadId: string): Promise<{ runs:
  *    pass. History whose owner cannot be derived is staff-claimed (threadOwnerOf) and closed.
  */
 export async function admitThreadRun(journal: Journal, memory: Memory | undefined, threadId: string, caller: Caller): Promise<ThreadOwnership> {
-  // Before this gate writes anything: a scope this version opens is indexed from its first key.
-  await markSubjectIndexIfEmpty(journal);
   let o = await threadOwnerOf(journal, memory, threadId);
   const claimFor = async (fields: ThreadOwnerRecord) => {
-    await indexSubject(journal, 'thread', fields.resourceId, threadId);
     await claim(journal, threadOwnerKey(threadId), { at: Date.now(), ...fields });
     const rec = await journal.get<ThreadOwnerRecord>(threadOwnerKey(threadId));
-    // Another claimant won the race: this caller's entry points at a thread that is not theirs.
-    if (fields.resourceId && rec?.resourceId !== fields.resourceId) await unindexSubject(journal, 'thread', fields.resourceId, threadId);
     return rec?.resourceId ? { exists: true, owner: rec.resourceId } : { exists: true, staffClaimed: rec?.ownerKind !== 'unknown' };
   };
   if (!o.exists || (o.owner === undefined && o.staffClaimed === false)) {

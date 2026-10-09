@@ -360,6 +360,12 @@ export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<J
   if (journal.listKeys) {
     out.listKeys = async (p, opts) => (await journal.listKeys!(prefix + p, opts)).map((k) => k.slice(prefix.length));
   }
+  // The person's owner records in THIS organization: the prefix goes down to the store, so another
+  // organization's record naming the same id — somebody else — is never read.
+  if (journal.listOwnerRecords) {
+    out.listOwnerRecords = async (rid, opts) =>
+      (await journal.listOwnerRecords!(rid, { prefix: prefix + (opts?.prefix ?? '') })).map((k) => k.slice(prefix.length));
+  }
   if (journal.deletePrefix) {
     out.deletePrefix = (p) => journal.deletePrefix!(prefix + p); // an organization can only delete its own scope
   }
@@ -401,8 +407,8 @@ export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<J
   // leak) — so it's left undefined; callers (studio's /metrics) fall back to the already org-safe
   // `listRuns`-based count.
   // H8b (stale run scan): the underlying result physically comes back as `org:<orgId>:<runId>`
-  // (parseJournalKey counts the ENTIRE prefixed key as the runId — see the run_id column/ZSET member in
-  // sqlite/postgres/redis-storage.ts). ONLY the ones belonging to THIS organization are FILTERED and the
+  // (parseJournalKey counts the ENTIRE prefixed key as the runId — see the run_id column in
+  // sqlite/postgres-storage.ts). ONLY the ones belonging to THIS organization are FILTERED and the
   // prefix is STRIPPED before returning — the same isolation pattern as readRun/listRuns (other
   // organizations' runs don't leak).
   if (journal.listStaleRuns) {
@@ -431,7 +437,12 @@ export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<J
   }
   // Paged: walked, not filtered per page — see `walkRunPages`.
   if (typeof reader.listRunsPaged === 'function') {
-    out.listRunsPaged = (q) => walkRunPages(reader, journal, q, (r) => (r.runId.startsWith(prefix) ? { ...r, runId: r.runId.slice(prefix.length) } : undefined));
+    // The organization's own range of the run id (`runIdPrefix`): Sqlite and Postgres read just that
+    // slice of their index, so an organization with few runs on a large store is not answered by
+    // walking everyone else's (measured: an empty organization's first page read 4 000 pages of
+    // 200 000 root runs, 661 ms). `keep` still decides each row — a journal that ignores the filter
+    // stays exact, and only walks.
+    out.listRunsPaged = (q) => walkRunPages(reader, journal, { ...q, runIdPrefix: prefix + (q?.runIdPrefix ?? '') }, (r) => (r.runId.startsWith(prefix) ? { ...r, runId: r.runId.slice(prefix.length) } : undefined));
   }
   // H8c (run size statistics): runId is prefixed, the result (entries/bytes) is independent of the
   // organization — returned as-is. If not bridged, retention/budget's stats path would silently disappear in the org view.
@@ -444,8 +455,11 @@ export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<J
 /** The journal a `withRootScope` view hides organizations' rows of. */
 const ROOT_SCOPE_OF = Symbol.for('@gnldev/durable.rootScopeOf');
 
-/** The journal behind a `withRootScope` view, or undefined if `journal` is not one. */
-function rootScopeParentOf(journal: unknown): Journal | undefined {
+/**
+ * The journal behind a `withRootScope` view, or undefined if `journal` is not one.
+ * @internal — thread-owner.ts probes the raw store under a root view in bounded pages.
+ */
+export function rootScopeParentOf(journal: unknown): Journal | undefined {
   return (journal as Record<symbol, Journal> | null | undefined)?.[ROOT_SCOPE_OF];
 }
 
@@ -459,7 +473,7 @@ function rootScopeParentOf(journal: unknown): Journal | undefined {
  * returned acme's journal (measured: the model's answer, the prompt). This is the one owner of that
  * rule for runs; a door hands it out wherever it serves the root scope.
  *
- * READS ONLY. `get`, `getMany`, `getCounters`, `listKeys`, `readRun`, `readRunStats`, `listRuns`,
+ * READS ONLY. `get`, `getMany`, `getCounters`, `listKeys`, `listOwnerRecords`, `readRun`, `readRunStats`, `listRuns`,
  * `listRunsPaged` and `listStaleRuns` answer as if no `org:` key existed (`isOrganizationKey`);
  * `countRunsByStatus` answers only while no organization holds a row — it counts every organization's
  * runs and takes no filter — and otherwise resolves `undefined` (a caller falls back to `listRuns`, as
@@ -492,6 +506,8 @@ export function withRootScope<J extends Partial<Journal> & Partial<JournalReader
     getCounters: j.getCounters && (async (key: string) => (hidden(key) ? undefined : j.getCounters!(key))),
     listKeys: j.listKeys && (async (p: string, o?: unknown) =>
       (hidden(p) ? [] : (await (j.listKeys as (pp: string, oo?: unknown) => Promise<string[]>)(p, o)).filter((k) => !hidden(k)))),
+    listOwnerRecords: j.listOwnerRecords && (async (rid: string, o?: { prefix?: string }) =>
+      (hidden(o?.prefix ?? '') ? [] : (await j.listOwnerRecords!(rid, o)).filter((k) => !hidden(k)))),
     readRun: j.readRun && (async (runId: string) => (hidden(runId) ? [] : j.readRun!(runId))),
     readRunStats: j.readRunStats && (async (runId: string) => (hidden(runId) ? { entries: 0, bytes: 0 } : j.readRunStats!(runId))),
     listRuns: j.listRuns && (async () =>

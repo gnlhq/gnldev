@@ -222,7 +222,6 @@ export const SEMANTIC_IDENTITY_NAMES = optionNames<NonNullable<import('./types.j
 export const CONFIRM_NAMES = optionNames<Extract<NonNullable<import('./types.js').ToolDurability['confirm']>, object>>()(['reason']);
 export const LOG_SWEEP_TARGET_NAMES = optionNames<import('./retention.js').LogSweepTarget>()(['ns', 'olderThanMs', 'markerFor', 'now']);
 export const PROCESSOR_RETRY_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./processor.js').ProcessorRetry>[2]>>()(['maxRetries']);
-export const REDIS_STORAGE_NAMES = optionNames<import('./redis-storage.js').RedisStorageOptions>()(['connectionString', 'client', 'keyPrefix', 'replicationWarning', 'waitReplicas']);
 export const POSTGRES_STORAGE_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./postgres-storage.js').PostgresStorage>[0]>>()(['connectionString', 'pool']);
 /** A sub-agent runs as its parent's caller; its config named an owner once, and that name is refused. */
 export const REMOVED_AGENT_TOOL_NAMES = {
@@ -242,4 +241,5 @@ export const ADOPT_INTO_ORG_NAMES = optionNames<StorageAdopt>()(['dryRun', 'allo
 export const COMPACT_NAMES = optionNames<NonNullable<Parameters<import('./postgres-storage.js').PostgresStorage['compact']>[0]>>()(['full']);
 export const UPGRADE_NAMES = optionNames<import('./upgrade.js').UpgradeOptions>()(['only', 'dryRun']);
 export const LIST_KEYS_NAMES = optionNames<NonNullable<Parameters<import('./journal.js').InMemoryJournal['listKeys']>[1]>>()(['limit']);
+export const LIST_OWNER_RECORDS_NAMES = optionNames<NonNullable<Parameters<import('./journal.js').InMemoryJournal['listOwnerRecords']>[1]>>()(['prefix']);
 export const LIST_STALE_RUNS_NAMES = optionNames<NonNullable<Parameters<import('./journal.js').InMemoryJournal['listStaleRuns']>[1]>>()(['includeSuspended']);

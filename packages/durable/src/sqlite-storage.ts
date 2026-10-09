@@ -8,8 +8,8 @@ import { memoryPartitionOf, memoryPartitionSql, type MemoryPartitionOption } fro
 import { createRequire } from 'node:module';
 import { statSync, existsSync } from 'node:fs';
 import { cosineSimilarity } from 'ai';
-import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus } from './journal.js';
-import { keysetRunPage } from './run-cursor.js';
+import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus, runRelationsOf, relationsOfInput, ownerColumnOf, ownerOfRecord, OWNER_RECORD_GLOB } from './journal.js';
+import { keysetRunPage, rangeOrder, type RunRelationRead } from './run-cursor.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, orgSpaceSql } from './organization.js';
 import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
@@ -20,11 +20,11 @@ import type {
   AdoptIntoOrgResult, ThreadRecord, MessageRecord, MessageAppend, Observation, RecallOptions, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord,
 } from './storage.js';
 // P2-migrate schema introspection/migration façade — see migrate.ts's header.
-import { tablesFromDDL } from './migrate.js';
+import { tablesFromDDL, indexesFromDDL } from './migrate.js';
 import type { SchemaCheckResult, SchemaMigrationResult, MissingColumn } from './migrate.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { ADOPT_INTO_ORG_NAMES } from './option-names.js';
-import { runUpgrade, threadRecordsStep, subjectIndexStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
+import { runUpgrade, threadRecordsStep, relationsStep, verifyRelationsStep, RELATIONS_PENDING_ADVICE, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
 import { UPGRADE_NAMES } from './option-names.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
@@ -357,6 +357,44 @@ export class SqliteStorage implements Storage {
     }
     this.db.exec(WORK_LOG_SEQ_INDEX);
     this.db.exec(WORK_LOG_NUMBER_TRIGGER);
+    // The relation columns (see RELATION_INDEXES): the same additive shape as the columns above, and
+    // the same no-backfill argument — NULL is "not placed yet", which every lookup reads and decides
+    // from the record, so a row written before them is found without them. The `relations` upgrade
+    // step places those rows, for speed only.
+    for (const [table, col] of RELATION_COLUMNS) {
+      if ((this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some((c) => c.name === col)) continue;
+      try {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} TEXT`);
+      } catch (e) {
+        if (!String((e as Error)?.message ?? e).includes('duplicate column')) throw e;
+      }
+    }
+    for (const sql of RELATION_INDEXES) this.db.exec(sql);
+    // The guards (OWNER_UNPLACE_TRIGGER, RUN_UNPLACE_TRIGGERS). Found missing on a file whose columns
+    // already hold placements — dropped by hand, or by a tool — the placements made while nothing
+    // guarded them may be wrong: RELATIONS_VERIFY_KEY marks them, no column is trusted until the
+    // `relations` step has placed every row again from its record.
+    // A guard is there when SQLite holds THIS version's text for it (it stores the statement without
+    // `IF NOT EXISTS`): a trigger of the same name with another body — an earlier release's, or one
+    // edited by hand — guards something else, and `CREATE TRIGGER IF NOT EXISTS` would keep it for good.
+    const stored = (name: string) => (this.db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?`).get(name) as { sql: string } | undefined)?.sql;
+    const current = GUARD_TRIGGERS.map(([name, sql]) => ({ name, sql, ok: stored(name) === sql.replace('CREATE TRIGGER IF NOT EXISTS ', 'CREATE TRIGGER ') }));
+    const guarded = current.every((g) => g.ok);
+    for (const g of current) {
+      if (g.ok) continue;
+      this.db.exec(`DROP TRIGGER IF EXISTS ${g.name}`);
+      this.db.exec(g.sql);
+    }
+    if (!guarded && this.db.prepare(`SELECT 1 AS x FROM gnl_runs WHERE resource_id IS NOT NULL UNION ALL SELECT 1 FROM gnl_run_journal WHERE owner IS NOT NULL LIMIT 1`).get()) {
+      this.db.prepare(`INSERT OR IGNORE INTO gnl_meta(k, v) VALUES (?, ?)`).run(RELATIONS_VERIFY_KEY, String(Date.now()));
+    }
+    // Rows the step can place — runs from before the columns, or placements to verify — make every
+    // lookup by person or thread read them all (see RELATIONS_PENDING_ADVICE): said once, at open, with
+    // the one command that ends it. A run with no `:input` stays unplaced for good (no record says whose
+    // it is), so it is not counted: no command would make the warning go away.
+    if (this.db.prepare(`SELECT 1 AS x FROM gnl_meta WHERE k = ? UNION ALL SELECT 1 FROM gnl_runs r JOIN gnl_run_journal j ON j.key = r.run_id || ':input' WHERE r.resource_id IS NULL LIMIT 1`).get(RELATIONS_VERIFY_KEY)) {
+      console.warn(RELATIONS_PENDING_ADVICE);
+    }
     // The seed used to be
     // check-then-INSERT (SELECT → INSERT if absent) — a TOCTOU: two simultaneous booters both saw no
     // row, both inserted, and the loser CRASHED ON BOOT with a UNIQUE constraint. `INSERT OR IGNORE`
@@ -526,6 +564,10 @@ export class SqliteStorage implements Storage {
       'ALTER TABLE gnl_work_log ADD COLUMN seq INTEGER NOT NULL DEFAULT 0',
       WORK_LOG_SEQ_INDEX,
       WORK_LOG_NUMBER_TRIGGER,
+      ...RELATION_COLUMNS.map(([t, c]) => `ALTER TABLE ${t} ADD COLUMN ${c} TEXT`),
+      ...RELATION_INDEXES,
+      OWNER_UNPLACE_TRIGGER,
+      ...RUN_UNPLACE_TRIGGERS,
     ];
   }
 
@@ -552,7 +594,12 @@ export class SqliteStorage implements Storage {
       for (const col of cols.keys()) if (!liveCols.has(col)) missingColumns.push({ table, column: col });
     }
     const unknownTables = [...liveTables].filter((t) => !expected.has(t));
-    return { ok: missingTables.length === 0 && missingColumns.length === 0, missingTables, missingColumns, unknownTables };
+    const liveIndexes = new Set((this.db.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all() as { name: string }[]).map((r) => r.name));
+    const missingIndexes = [...expectedIndexes().keys()].filter((n) => !liveIndexes.has(n));
+    return {
+      ok: missingTables.length === 0 && missingColumns.length === 0 && missingIndexes.length === 0,
+      missingTables, missingColumns, unknownTables, missingIndexes,
+    };
   }
 
   /**
@@ -564,7 +611,7 @@ export class SqliteStorage implements Storage {
    */
   /**
    * See `Storage.upgrade`. Steps: `schema` (the tables, columns and indexes this version expects —
-   * additive only), then `thread-records`.
+   * additive only), then `thread-records`, then `relations` (places older rows' person and thread).
    */
   async upgrade(opts?: UpgradeOptions): Promise<UpgradeReport> {
     refuseUnknownNames('SqliteStorage.upgrade', opts, UPGRADE_NAMES);
@@ -577,7 +624,8 @@ export class SqliteStorage implements Storage {
         run: async () => ({ statements: (await this.applySchemaGap()).statements }),
       },
       threadRecordsStep(this, ['schema']),
-      subjectIndexStep(this, ['schema']),
+      relationsStep(this.runs as SqliteRunJournal, ['schema']),
+      verifyRelationsStep(this.runs as SqliteRunJournal, ['schema']),
     ], opts);
   }
 
@@ -598,6 +646,12 @@ export class SqliteStorage implements Storage {
     for (const { table, column } of check.missingColumns) {
       const def = expected.get(table)?.get(column);
       if (def) statements.push(`ALTER TABLE ${table} ADD COLUMN ${def}`);
+    }
+    // After the columns they may need, and only those a missing table's CREATE did not already bring.
+    const all = expectedIndexes();
+    for (const name of check.missingIndexes ?? []) {
+      const ix = all.get(name);
+      if (ix && !statements.includes(ix.statement)) statements.push(ix.statement);
     }
     if (opts?.dryRun) return { statements, dryRun: true };
     for (const stmt of statements) {
@@ -625,13 +679,13 @@ const DDL = `
 CREATE TABLE IF NOT EXISTS gnl_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS gnl_run_journal (
   key TEXT PRIMARY KEY, run_id TEXT, kind TEXT, suspended INTEGER NOT NULL DEFAULT 0,
-  value TEXT NOT NULL, created_at INTEGER NOT NULL
+  value TEXT NOT NULL, created_at INTEGER NOT NULL, owner TEXT
 );
 CREATE INDEX IF NOT EXISTS gnl_run_journal_run ON gnl_run_journal (run_id, created_at);
 CREATE TABLE IF NOT EXISTS gnl_runs (
   run_id TEXT PRIMARY KEY, model_steps INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0,
   suspended INTEGER NOT NULL DEFAULT 0, suspended_count INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, running INTEGER NOT NULL DEFAULT 0, canceled INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, thread_id TEXT, resource_id TEXT
 );
 CREATE INDEX IF NOT EXISTS gnl_runs_created ON gnl_runs (created_at, run_id);
 CREATE INDEX IF NOT EXISTS gnl_runs_updated ON gnl_runs (updated_at);
@@ -657,6 +711,66 @@ CREATE TABLE IF NOT EXISTS gnl_work_seq (ns TEXT PRIMARY KEY, seq INTEGER NOT NU
 CREATE TABLE IF NOT EXISTS gnl_work_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS gnl_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER);
 `;
+/**
+ * A run's person and thread, and a thread owner record's person, as columns its own write fills
+ * (`runRelationsOf`, `ownerColumnOf` in journal.ts). NULL = not placed yet: a row written before these
+ * columns, or by an older process on the same file, whose INSERT knows nothing of them. Every lookup
+ * reads those rows too and decides them from the record — see `keysetRunPage` and `listOwnerRecords`.
+ * The columns are added by the ALTERs in the constructor; these indexes come after them, never in DDL:
+ * on an existing database DDL runs before the ALTER, and an index on a missing column fails the boot.
+ *  - `gnl_runs_resource` serves both reads of a person's runs: `resource_id = ?` (placed) and
+ *    `resource_id IS NULL` (not placed — the same range for a thread's lookup), each in creation order.
+ *  - `gnl_run_journal_owner` holds owner records only (partial, by key shape), placed and not: the one
+ *    index both halves of `listOwnerRecords` read. `GLOB`, not `LIKE`: Sqlite's LIKE ignores case.
+ */
+const RELATION_INDEXES = [
+  'CREATE INDEX IF NOT EXISTS gnl_runs_resource ON gnl_runs (resource_id, created_at, run_id)',
+  'CREATE INDEX IF NOT EXISTS gnl_runs_thread ON gnl_runs (thread_id, created_at, run_id)',
+  `CREATE INDEX IF NOT EXISTS gnl_run_journal_owner ON gnl_run_journal (owner, key) WHERE key GLOB '${OWNER_RECORD_GLOB}'`,
+];
+/** The columns RELATION_INDEXES need, added to a table an earlier version created. */
+const RELATION_COLUMNS: Array<[table: string, column: string]> = [['gnl_runs', 'thread_id'], ['gnl_runs', 'resource_id'], ['gnl_run_journal', 'owner']];
+/**
+ * An owner record REWRITTEN by a writer that leaves `owner` as it was — an older process, whose
+ * statement sets the value and knows nothing of the column — goes back to "not placed" (NULL), so
+ * every lookup reads it and decides from the record. Without it the column kept the previous person:
+ * the record now named carl, the column still said ayse, and carl's erasure left that thread behind.
+ * The same reason as WORK_LOG_NUMBER_TRIGGER: it lives in the database, so it holds for every writer.
+ * A rewrite by this version that keeps the same person lands unplaced too — still found, read from
+ * the record; the `relations` step places it again.
+ */
+const OWNER_UNPLACE_TRIGGER = `CREATE TRIGGER IF NOT EXISTS gnl_owner_unplace AFTER UPDATE OF value ON gnl_run_journal
+WHEN OLD.owner IS NOT NULL AND NEW.value IS NOT OLD.value AND NEW.owner IS OLD.owner
+BEGIN
+  UPDATE gnl_run_journal SET owner = NULL WHERE key = NEW.key;
+END`;
+/**
+ * The same guard for a run's `gnl_runs.resource_id`/`thread_id`: a run's `:input` INSERTED or with its
+ * value CHANGED leaves the run unplaced (NULL), read and decided from the record by every lookup, until
+ * the writer places it. This version places it in the same transaction, after the write (`placeRun`),
+ * so its own runs stay placed; an older process, a raw put of an unversioned record, or plain SQL does
+ * not, and its record — naming carl on thread t2 — is no longer listed and erased as ayse's on t1, which
+ * is what the column said before. `GLOB`, not `LIKE`: Sqlite's LIKE ignores case.
+ */
+const RUN_UNPLACE_TRIGGERS = [
+  `CREATE TRIGGER IF NOT EXISTS gnl_run_unplace_insert AFTER INSERT ON gnl_run_journal WHEN NEW.key GLOB '*:input'
+BEGIN
+  UPDATE gnl_runs SET resource_id = NULL, thread_id = NULL WHERE run_id = substr(NEW.key, 1, length(NEW.key) - 6) AND resource_id IS NOT NULL;
+END`,
+  `CREATE TRIGGER IF NOT EXISTS gnl_run_unplace_update AFTER UPDATE OF value ON gnl_run_journal
+WHEN NEW.key GLOB '*:input' AND NEW.value IS NOT OLD.value
+BEGIN
+  UPDATE gnl_runs SET resource_id = NULL, thread_id = NULL WHERE run_id = substr(NEW.key, 1, length(NEW.key) - 6) AND resource_id IS NOT NULL;
+END`,
+];
+/** Every guard by name, with the statement that creates it. */
+const GUARD_TRIGGERS: Array<[name: string, sql: string]> = [
+  ['gnl_owner_unplace', OWNER_UNPLACE_TRIGGER],
+  ['gnl_run_unplace_insert', RUN_UNPLACE_TRIGGERS[0]!],
+  ['gnl_run_unplace_update', RUN_UNPLACE_TRIGGERS[1]!],
+];
+/** `gnl_meta` key: placements to verify (see the constructor and the `relations` step). Postgres's twin of the same name. */
+const RELATIONS_VERIFY_KEY = 'relations_verify';
 /** `WorkStore.list`'s keyset, in its ORDER BY order (and `seq = 0` for the unnumbered). Created after the `seq` migration, not in DDL. */
 const WORK_LOG_SEQ_INDEX = 'CREATE INDEX IF NOT EXISTS gnl_work_log_seq ON gnl_work_log (ns, seq, ts, id)';
 /**
@@ -680,6 +794,14 @@ BEGIN
   UPDATE gnl_work_seq SET seq = seq + 1 WHERE ns = NEW.ns;
   UPDATE gnl_work_log SET seq = (SELECT seq FROM gnl_work_seq WHERE ns = NEW.ns) WHERE rowid = NEW.rowid;
 END`;
+
+/** `where` (empty, or ` WHERE …` from keysetRunPage) with one more condition. */
+const and = (where: string, cond: string): string => (where ? `${where} AND ${cond}` : ` WHERE ${cond}`);
+/** Rows the `relations` step reads and places per transaction. */
+const PLACE_PAGE = 1000;
+
+/** Every index this version creates, by name: the DDL's, the work log's and the relation columns'. */
+const expectedIndexes = () => indexesFromDDL([...DDL.split(';'), WORK_LOG_SEQ_INDEX, ...RELATION_INDEXES]);
 
 // ── RunJournal ──────────────────────────────────────────────────────────────────
 class SqliteRunJournal implements RunJournal {
@@ -731,10 +853,11 @@ class SqliteRunJournal implements RunJournal {
   private putCore(key: string, value: unknown): void {
     const p = parseJournalKey(key);
     const suspended = p?.kind === 'tool' && (value as ToolJournalRecord | undefined)?.status === 'suspended' ? 1 : 0;
+    // `owner` (ownerColumnOf): written with the record, in the same statement, every time the record is.
     const upsert = () => this.db.prepare(
-      `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at) VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value, suspended = excluded.suspended`,
-    ).run(key, p?.runId ?? null, p?.kind ?? null, suspended, serialize(value), Date.now());
+      `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at, owner) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, suspended = excluded.suspended, owner = excluded.owner`,
+    ).run(key, p?.runId ?? null, p?.kind ?? null, suspended, serialize(value), Date.now(), ownerColumnOf(key, value));
     if (!p) {
       // Not a replayable entry — so it gets NO run_id and NO kind in the journal table (readRun and
       // time-travel must not start seeing it). But if it belongs to a run, the run itself has to exist
@@ -746,6 +869,7 @@ class SqliteRunJournal implements RunJournal {
       this.withTx(() => {
         upsert();
         if (owner) this.touchRunDelta(owner, null, false, 0);
+        this.placeRun(key, value); // a run's `:input`: its person and thread, in this transaction
         // The outcome carries its OWN path rather than riding on run ownership: it is not a versioned
         // record, so runIdOfKey (which now demands that proof) does not claim it. The UPDATE only
         // touches a row that already exists, so it cannot invent a run. ALL THREE flags from ONE
@@ -782,9 +906,9 @@ class SqliteRunJournal implements RunJournal {
     const p = parseJournalKey(key);
     const suspended = p?.kind === 'tool' && (value as ToolJournalRecord | undefined)?.status === 'suspended' ? 1 : 0;
     const ins = () => this.db.prepare(
-      `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at) VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at, owner) VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(key) DO NOTHING`,
-    ).run(key, p?.runId ?? null, p?.kind ?? null, suspended, serialize(value), Date.now());
+    ).run(key, p?.runId ?? null, p?.kind ?? null, suspended, serialize(value), Date.now(), ownerColumnOf(key, value));
     if (!p) {
       const owner = runIdOfKey(key, value);
       const oc = outcomeStatusOf(key, value);
@@ -793,6 +917,7 @@ class SqliteRunJournal implements RunJournal {
         const info = ins();
         if (info.changes === 1) {
           if (owner) this.touchRunDelta(owner, null, false, 0);
+          this.placeRun(key, value); // only the winner places: a lost claim wrote nothing, columns included
           // The outcome's first write arrives through putIfAbsent (recordRunOutcome's monotonic
           // path); handling the flags only in put() left sqlite reading every failure as completed.
           if (oc !== null) {
@@ -821,20 +946,23 @@ class SqliteRunJournal implements RunJournal {
     const p = parseJournalKey(key);
     const suspended = p?.kind === 'tool' && (value as ToolJournalRecord | undefined)?.status === 'suspended' ? 1 : 0;
     const upd = () => this.db.prepare(
-      'UPDATE gnl_run_journal SET value = ?, suspended = ? WHERE key = ? AND value = ?',
-    ).run(serialize(value), suspended, key, serialize(expected));
+      'UPDATE gnl_run_journal SET value = ?, suspended = ?, owner = ? WHERE key = ? AND value = ?',
+    ).run(serialize(value), suspended, ownerColumnOf(key, value), key, serialize(expected));
     if (!p) {
       const oc = outcomeStatusOf(key, value);
-      if (oc === null) return Number(upd().changes ?? 0) === 1; // lock key (e.g. ':lock') → no derived index
+      const placed = runRelationsOf(key, value) !== undefined;
+      if (oc === null && !placed) return Number(upd().changes ?? 0) === 1; // lock key (e.g. ':lock') → no derived index
       // The monotonic outcome REPLACEMENT (running→terminal, or a later success clearing an earlier
-      // failure) arrives through putIfMatch — the flags must follow the record here too.
+      // failure) arrives through putIfMatch — the flags must follow the record here too. So must a
+      // run's person and thread, should its `:input` ever be replaced this way.
       return this.withTx(() => {
         const ok = Number(upd().changes ?? 0) === 1;
-        if (ok) {
+        if (ok && oc !== null) {
           const runId = key.slice(0, -':outcome'.length);
           this.touchRunDelta(runId, null, false, 0); // see putCore's twin
           this.db.prepare(`UPDATE gnl_runs SET failed = ?, running = ?, canceled = ? WHERE run_id = ?`).run(oc === 'failed' ? 1 : 0, oc === 'running' ? 1 : 0, oc === 'canceled' ? 1 : 0, runId);
         }
+        if (ok) this.placeRun(key, value);
         return ok;
       });
     }
@@ -887,6 +1015,117 @@ class SqliteRunJournal implements RunJournal {
     return { entries: Number(r.c), bytes: Number(r.b) };
   }
   /**
+   * A run's `:input` names who and where the run is (`runRelationsOf`): its `gnl_runs` row gets them,
+   * in the caller's transaction. Any other key: nothing. An upsert, so the row exists whichever write
+   * of the run came first (the write-ahead outcome may precede `:input`).
+   */
+  private placeRun(key: string, value: unknown): void {
+    const rel = runRelationsOf(key, value);
+    if (!rel) return;
+    const now = Date.now();
+    this.db.prepare(
+      `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at, resource_id, thread_id)
+       VALUES (?, 0, 0, 0, 0, ?, ?, ?, ?)
+       ON CONFLICT(run_id) DO UPDATE SET resource_id = excluded.resource_id, thread_id = excluded.thread_id`,
+    ).run(rel.runId, now, now, rel.resourceId, rel.threadId);
+  }
+
+  /**
+   * See `Journal.listOwnerRecords`. ONE statement over the owner-record index: the records placed under
+   * this person, and every record not placed yet (NULL), each decided from its value. One statement, so
+   * a record the `relations` step places while this reads is seen in exactly one of the two halves.
+   */
+  async listOwnerRecords(resourceId: string, opts?: { prefix?: string }): Promise<string[]> {
+    const rg = range('key', opts?.prefix ?? '');
+    const half = (cond: string) => `SELECT key, value FROM gnl_run_journal WHERE ${cond} AND key GLOB '${OWNER_RECORD_GLOB}' AND ${rg.where}`;
+    const rows = (this.verifying()
+      ? this.db.prepare(half('1 = 1')).all(...rg.params)    // placements to verify: every owner record, decided from itself
+      : this.db.prepare(`${half('owner = ?')} UNION ALL ${half('owner IS NULL')}`).all(resourceId, ...rg.params, ...rg.params)) as { key: string; value: string }[];
+    return rows.filter((r) => ownerOfRecord(deserialize(r.value)) === resourceId).map((r) => r.key);
+  }
+
+  /** See RelationPlacer and `verify-relations`. */
+  async requestRelationsVerify(): Promise<void> {
+    this.db.prepare(`INSERT OR IGNORE INTO gnl_meta(k, v) VALUES (?, ?)`).run(RELATIONS_VERIFY_KEY, String(Date.now()));
+  }
+
+  /** Whether the `relations` step has anything to place: a run whose `:input` is there, or an owner record that names someone or staff. */
+  async relationsPending(): Promise<boolean> {
+    // Placements to verify, or a run with an `:input` the step can place.
+    if (this.verifying()) return true;
+    if (this.db.prepare(`SELECT 1 AS x FROM gnl_runs r JOIN gnl_run_journal j ON j.key = r.run_id || ':input' WHERE r.resource_id IS NULL LIMIT 1`).get()) return true;
+    for (let after = '';;) {
+      const rows = this.unplacedOwners(after, PLACE_PAGE);
+      if (rows.some((r) => ownerColumnOf(r.key, deserialize(r.value)) !== null)) return true;
+      if (rows.length < PLACE_PAGE) return false;
+      after = rows[rows.length - 1]!.key;
+    }
+  }
+
+  /** Owner records not placed yet, after `after` in key order, one page. */
+  private unplacedOwners(after: string, limit: number): { key: string; value: string }[] {
+    return this.db.prepare(`SELECT key, value FROM gnl_run_journal WHERE owner IS NULL AND key GLOB '${OWNER_RECORD_GLOB}' AND key > ? ORDER BY key LIMIT ?`)
+      .all(after, limit) as { key: string; value: string }[];
+  }
+
+  /**
+   * The `relations` step: places the rows written before the columns, from their own records, a page at
+   * a time (bounded memory), each page in one transaction. Never needed for a correct answer — only for
+   * an indexed one. Each UPDATE holds only while the row is still unplaced AND its record is still the
+   * one read: an older process rewriting it in between leaves it unplaced, to be read from the record,
+   * rather than placed from a value it no longer holds. A run with no `:input` yet stays unplaced — an
+   * older process may be about to write it. A record that names nobody and is not staff's stays
+   * unplaced by design (`ownerColumnOf`).
+   * @internal — `storage.upgrade({ only: ['relations'] })` runs it.
+   */
+  async placeRelations(): Promise<{ runs: number; owners: number }> {
+    let runs = 0;
+    let owners = 0;
+    // Placements made while nothing guarded them (RELATIONS_VERIFY_KEY): cleared, and placed again below.
+    const verify = this.verifying();
+    if (verify) {
+      this.withTx(() => {
+        this.db.prepare(`UPDATE gnl_runs SET resource_id = NULL, thread_id = NULL WHERE resource_id IS NOT NULL`).run();
+        this.db.prepare(`UPDATE gnl_run_journal SET owner = NULL WHERE owner IS NOT NULL AND key GLOB '${OWNER_RECORD_GLOB}'`).run();
+      });
+    }
+    // Keyed on `(created_at, run_id)` like a run list — written out, as keysetRunPage writes a relation
+    // read's position, since this range sits under `resource_id IS NULL` on the same index.
+    for (let after = { at: Number.MIN_SAFE_INTEGER, runId: '' };;) {
+      const rows = this.db.prepare(
+        `SELECT r.run_id, r.created_at, j.key, j.value FROM gnl_runs r JOIN gnl_run_journal j ON j.key = r.run_id || ':input'
+         WHERE r.resource_id IS NULL AND r.created_at >= ?1 AND (r.created_at > ?1 OR r.run_id > ?2) ORDER BY r.created_at, r.run_id LIMIT ?3`,
+      ).all(after.at, after.runId, PLACE_PAGE) as { run_id: string; created_at: number; key: string; value: string }[];
+      this.withTx(() => {
+        for (const r of rows) {
+          const rel = relationsOfInput(deserialize(r.value));
+          runs += Number(this.db.prepare(
+            `UPDATE gnl_runs SET resource_id = ?, thread_id = ? WHERE run_id = ? AND resource_id IS NULL
+               AND EXISTS (SELECT 1 FROM gnl_run_journal WHERE key = ? AND value = ?)`,
+          ).run(rel.resourceId, rel.threadId, r.run_id, r.key, r.value).changes ?? 0);
+        }
+      });
+      if (rows.length < PLACE_PAGE) break;
+      const last = rows[rows.length - 1]!;
+      after = { at: last.created_at, runId: last.run_id };
+    }
+    for (let after = '';;) {
+      const rows = this.unplacedOwners(after, PLACE_PAGE);
+      this.withTx(() => {
+        for (const r of rows) {
+          const col = ownerColumnOf(r.key, deserialize(r.value));
+          if (col === null) continue;
+          owners += Number(this.db.prepare('UPDATE gnl_run_journal SET owner = ? WHERE key = ? AND owner IS NULL AND value = ?').run(col, r.key, r.value).changes ?? 0);
+        }
+      });
+      if (rows.length < PLACE_PAGE) break;
+      after = rows[rows.length - 1]!.key;
+    }
+    if (verify) this.db.prepare(`DELETE FROM gnl_meta WHERE k = ?`).run(RELATIONS_VERIFY_KEY);
+    return { runs, owners };
+  }
+
+  /**
    * H11b — O(1) INCREMENTAL gnl_runs update (hot path). The old recompute used to SUM ALL rows of
    * the run on every write → write cost grew with the run's length. Now: a fresh insert →
    * counter +1; an overwrite → counter unchanged; suspended is kept as a SIGNED sum of row transitions
@@ -908,6 +1147,11 @@ class SqliteRunJournal implements RunJournal {
          updated_at = ?`,
     ).run(runId, m, t, suspendedDelta > 0 ? 1 : 0, Math.max(0, suspendedDelta), now, now,
           m, t, suspendedDelta, suspendedDelta, now);
+  }
+
+  /** Placements to verify (RELATIONS_VERIFY_KEY): while set, no relation column is read. Asked per lookup — another process may clear it. */
+  private verifying(): boolean {
+    return !!this.db.prepare(`SELECT 1 AS x FROM gnl_meta WHERE k = ?`).get(RELATIONS_VERIFY_KEY);
   }
 
   /** Full recount — for rare paths (putIfMatch/repair); NOT USED on the hot path. */
@@ -1005,13 +1249,28 @@ class SqliteRunJournal implements RunJournal {
     };
     const atOf = (runId: string) =>
       (this.db.prepare('SELECT created_at FROM gnl_runs WHERE run_id = ?').get(runId) as { created_at: number } | undefined)?.created_at;
-    return keysetRunPage(q, statusCond, atOf, (where, params, dir, take, skip) => {
-      const rows = this.db.prepare(
-        `SELECT r.run_id, r.created_at, r.model_steps, r.tool_calls, r.suspended, r.failed, r.running, r.canceled,
-                (SELECT value FROM gnl_run_journal WHERE key = r.run_id || ':input') AS input_val
-         FROM gnl_runs r${where} ORDER BY r.created_at ${dir}, r.run_id ${dir} LIMIT ? OFFSET ?`,
-      ).all(...params, take, skip) as (RunRow & { created_at: number })[];
+    const cols = `r.run_id, r.created_at, r.model_steps, r.tool_calls, r.suspended, r.failed, r.running, r.canceled,
+                (SELECT value FROM gnl_run_journal WHERE key = r.run_id || ':input') AS input_val`;
+    return keysetRunPage(q, statusCond, atOf, (where, params, dir, take, skip, rel?: RunRelationRead) => {
+      const order = `ORDER BY r.created_at ${dir}, r.run_id ${dir}`;
+      const n = params.length;
+      // By a relation: the placed rows that match, and the rows not placed yet — both, always, each an
+      // index range in creation order (`gnl_runs_resource`), then cut together. See keysetRunPage.
+      const rows = (rel
+        ? this.db.prepare(
+          `SELECT ${cols} FROM gnl_runs r WHERE r.run_id IN (
+             SELECT run_id FROM (SELECT r.run_id FROM gnl_runs r${and(where, `r.${rel.column} = ?${n + 1}`)} ${rangeOrder(rel.column, dir)} LIMIT ?${n + 2})
+             UNION ALL
+             SELECT run_id FROM (SELECT r.run_id FROM gnl_runs r${and(where, 'r.resource_id IS NULL')} ${rangeOrder('resource_id', dir)} LIMIT ?${n + 2}))
+           ${order} LIMIT ?${n + 3} OFFSET ?${n + 4}`,
+        ).all(...params, rel.value, take + skip, take, skip)
+        : this.db.prepare(`SELECT ${cols} FROM gnl_runs r${where} ${order} LIMIT ? OFFSET ?`).all(...params, take, skip)) as (RunRow & { created_at: number })[];
       return rows.map((r) => ({ summary: toSummary(r), at: r.created_at }));
+    }, undefined, !this.verifying(), (prefix, from) => { // the columns, unless placements are waiting to be verified
+      const upper = prefixUpperBound(prefix);
+      return upper === undefined
+        ? { where: `r.run_id >= ?${from}`, params: [prefix] }
+        : { where: `r.run_id >= ?${from} AND r.run_id < ?${from + 1}`, params: [prefix, upper] };
     });
   }
 

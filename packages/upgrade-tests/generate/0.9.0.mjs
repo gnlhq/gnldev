@@ -5,7 +5,6 @@
 //   node generate/0.9.0.mjs                      # SQLite fixtures, 0.9.0 installed from npm into a temp dir
 //   GNL_090_ROOT=/path/to/0.9.0 node generate/0.9.0.mjs
 //   GNL_PG_URL=postgres://… GNL_PG_DUMP='docker exec -i pg pg_dump' node generate/0.9.0.mjs --backend postgres
-//   GNL_REDIS_URL=redis://… node generate/0.9.0.mjs --backend redis
 //
 // GNL_090_ROOT is either a checkout of the 0.9.0 tag, built (`<root>/packages/<name>/dist`), or a
 // directory where the published packages are installed (`<root>/node_modules/@gnldev/<name>/dist`).
@@ -298,7 +297,7 @@ async function writeSqlite(dir) {
   rmSync(work, { recursive: true, force: true });
 }
 
-// ── Postgres / Redis: the work store only (queue and events), where the stores differ ───────────────
+// ── Postgres: the work store only (queue and events), where the stores differ ───────────────────────
 /** `work`: as queue.db + events.db; `work-erased`: as queue-erased.db + events-erased.db (0.9.0 erased ayse). */
 const WORK_VARIANTS = [['work', false], ['work-erased', true]];
 async function workScenarios(s, eraseOn090) {
@@ -336,51 +335,13 @@ async function writePostgres(dir) {
   await admin.end();
 }
 
-async function writeRedis(dir) {
-  const url = process.env.GNL_REDIS_URL;
-  if (!url) throw new Error('--backend redis needs GNL_REDIS_URL');
-  const { default: Redis } = await import(pathToFileURL(join(root, 'node_modules', 'ioredis', 'built', 'index.js')).href).catch(() => import('ioredis'));
-  const prefix = 'gnlfx090:';
-  const client = new Redis(url);
-  for (const [name, eraseOn090] of WORK_VARIANTS) {
-    const old = await client.keys(`${prefix}*`);
-    if (old.length) await client.del(...old);
-    const s = new m.durable.RedisStorage({ client, keyPrefix: prefix });
-    await workScenarios(s, eraseOn090);
-    // Every key under the prefix, with its type and value, prefix stripped: loadable under any prefix.
-    const keys = (await client.keys(`${prefix}*`)).sort();
-    const out = [];
-    for (const key of keys) {
-      const type = await client.type(key);
-      const k = key.slice(prefix.length);
-      if (type === 'string') out.push({ k, type, v: await client.get(key) });
-      else if (type === 'hash') out.push({ k, type, v: Object.fromEntries(Object.entries(await client.hgetall(key)).sort(([a], [b]) => (a < b ? -1 : 1))) });
-      else if (type === 'zset') {
-        // Scores here are the SERVER's clock (Lua TIME), which the fixed clock cannot reach: kept as
-        // order only (T0 + rank), so the dump is stable and every member keeps its place.
-        const members = await client.zrange(key, 0, -1);
-        const v = members.map((member, rank) => [member, String(T0 + rank)]);
-        out.push({ k, type, v });
-      } else if (type === 'list') out.push({ k, type, v: await client.lrange(key, 0, -1) });
-      else if (type === 'set') out.push({ k, type, v: (await client.smembers(key)).sort() });
-      else throw new Error(`unexpected Redis type ${type} at ${key}`);
-      const ttl = await client.pttl(key);
-      if (ttl > 0) out.at(-1).ttl = true;
-    }
-    await client.del(...keys);
-    writeFileSync(join(dir, `redis-${name}.json`), `${JSON.stringify({ writtenBy: 'packages/upgrade-tests/generate/0.9.0.mjs --backend redis', keys: out }, null, 1)}\n`);
-  }
-  await client.quit();
-}
-
 // ── main ────────────────────────────────────────────────────────────────────────────────────────────
 const sha = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
 const target = check ? mkdtempSync(join(tmpdir(), 'gnl-090-check-')) : outDir;
 mkdirSync(target, { recursive: true });
 if (backend === 'sqlite') await writeSqlite(target);
 else if (backend === 'postgres') await writePostgres(target);
-else if (backend === 'redis') await writeRedis(target);
-else throw new Error(`unknown --backend ${backend} (sqlite | postgres | redis)`);
+else throw new Error(`unknown --backend ${backend} (sqlite | postgres)`);
 
 const notesFile = join(target, `notes-${backend}.json`);
 writeFileSync(notesFile, `${JSON.stringify({ writtenBy: 'packages/upgrade-tests/generate/0.9.0.mjs', clockStart: new Date(T0).toISOString(), notes }, null, 1)}\n`);

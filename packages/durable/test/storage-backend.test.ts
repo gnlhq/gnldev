@@ -2,10 +2,9 @@
 // → concrete proof of "portability" (every storage satisfies the same contract). + composite/capability verification.
 import { describe, it, expect } from 'vitest';
 import { newDb } from 'pg-mem';
-import { InMemoryStorage, composite, requireCapability, CapabilityError, RedisStorage, toJournal } from '../src/index.js';
+import { InMemoryStorage, composite, requireCapability, CapabilityError, toJournal } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { makeFakeRedis } from './fake-redis.js';
 import { memoryConformance } from './memory-conformance.js';
 import type { Storage, MessageRecord, ThreadRecord } from '../src/index.js';
 
@@ -22,8 +21,8 @@ const thread = (id: string, resourceId: string, updatedAt: number): ThreadRecord
 // docker integration).
 // The data-level invariant (value is preserved / marker written once) is still verified on every storage.
 // The memory/vectors skip decision is NOT a manual flag — it's derived from the storage's own capability
-// declaration (below, in the describe setup): for PARTIAL storages declaring 'none' (Redis: memory/vectors
-// ='none' → overridden via composite), that port's conformance tests are skipped.
+// declaration (below, in the describe setup): for a storage declaring 'none' for a port (or one whose
+// probe withdrew it, as PostgresStorage does on pg-mem), that port's conformance tests are skipped.
 // serialisesAppends=false: the storage cannot serialise two concurrent appends to one thread in this
 // test environment. pg-mem has no `pg_advisory_xact_lock`, so four callers all read the same free
 // position and collide. That collision is now a LOUD error rather than a silent drop, which is the
@@ -45,9 +44,6 @@ try {
 // Postgres: fresh db per test via pg-mem (in-memory real SQL).
 const pgmemPool = () => { const { Pool } = newDb().adapters.createPg(); return new Pool(); };
 storages.push(['PostgresStorage(pg-mem)', () => new PostgresStorage({ pool: pgmemPool() }), { exactCas: false, serialisesAppends: false, rowValues: false }]);
-// Redis: partial storage (runs/work/cache/meta='full/ttl'; memory/vectors='none'). Runs against a fake RedisLike;
-// those two ports are skipped in the conformance suite since they're overridden via composite (capability='none' → skip).
-storages.push(['RedisStorage(fake)', () => new RedisStorage({ client: makeFakeRedis() }), { exactCas: true, serialisesAppends: true }]);
 
 for (const [name, make, caps] of storages) {
   // The port-skip decision comes from the storage's OWN declaration: capability 'none' (or the port not
@@ -122,8 +118,8 @@ for (const [name, make, caps] of storages) {
       // WHOSE run it is, from the same invisible `:input` entry as threadId/agent — no column, no
       // migration, no second read. Every adapter must surface AND filter it, so this lives in the
       // conformance suite rather than in one adapter's own file: the in-memory and SQL paths derive it
-      // differently (SQL joins the `:input` row and filters in JS, Redis collects it during its single
-      // SCAN), and only a shared test proves they agree.
+      // differently (SQL joins the `:input` row, in-memory reads it point by point), and only a shared
+      // test proves they agree.
       const b = make();
       for (const [id, owner] of [['ra', 'u-a'], ['rb', 'u-b'], ['rc', 'u-a'], ['rd', 'u-a']] as const) {
         await b.runs.put(`${id}:input`, { prompt: 'hi', resourceId: owner });
@@ -350,7 +346,7 @@ for (const [name, make, caps] of storages) {
       expect(expected.suspended, 'and the canceled run must NOT have landed in the suspended bucket').toBe(1);
     });
 
-    // MemoryStore conformance is skipped for storages that don't provide the memory port (Redis).
+    // MemoryStore conformance is skipped for storages that don't provide the memory port.
     if (!skipMemory) {
       memoryConformance(make, caps);
     } // /memory capability

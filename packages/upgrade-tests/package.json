@@ -21,7 +21,6 @@
     "@gnldev/scheduler": "workspace:*",
     "@gnldev/workflow": "workspace:*",
     "ai": "^7.0.0",
-    "ioredis": "^5.4.0",
     "pg": "^8.0.0",
     "zod": "^3.25.0"
   }

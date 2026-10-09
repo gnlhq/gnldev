@@ -34,10 +34,10 @@
 // FIX: the state is now SPLIT into TWO SEPARATE keys:
 // `__gnl_limits_counters`: ONLY PURELY-ADDITIVE numeric fields (modelStepsSeen/totalTokens/costUsd/
 //     succeededToolCalls) — written ATOMICALLY via `journal.incrBy` (H8a, engine-internal atomic: SQL
-// UPSERT arithmetic/Redis HINCRBYFLOAT), read via `getCounters`. incrBy is COMMUTATIVE: no matter
+// UPSERT arithmetic), read via `getCounters`. incrBy is COMMUTATIVE: no matter
 // WHICH ORDER two concurrent deltas are applied in, both are summed WITHOUT LOSS — the "last writer
 //     wins" risk of a struct-put is STRUCTURALLY eliminated. On an adapter without incrBy (e.g. a custom
-// RedisLike client) it falls back to get→put (the SAME fallback pattern as budget.ts's `addUsage` —
+// journal) it falls back to get→put (the SAME fallback pattern as budget.ts's `addUsage` —
 // SINGLE-PROCESS safe, the old bound still applies under distributed contention, documented risk).
 // `__gnl_limits_state` (name preserved): ONLY the RESETTABLE/conditional "chain" fields
 //     (lastToolName/lastArgsHash/consecutiveRepeats/subRunIds) — these are NOT additive (RESET to
@@ -552,7 +552,7 @@ async function incrCounters(store: LimitsStore, runId: string, delta: Partial<Li
       await store.incrBy(countersKey(runId), clean);
       return;
     } catch {
-      // a custom client (e.g. a RedisLike without hincrbyfloat) → the legacy path
+      // a custom journal whose incrBy cannot do this → the legacy path
     }
   }
   if (typeof store.get !== 'function' || typeof store.put !== 'function') return;

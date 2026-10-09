@@ -6,14 +6,11 @@ import { InMemoryJournal, runKeys, USAGE_KEY, recordRunUsage, getOrgUsage, purge
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { runDurable } from '../src/run.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
-import { RedisStorage } from '../src/redis-storage.js';
-import { makeFakeRedis } from './fake-redis.js';
 
 describe('H8a — atomic counters (incrBy)', () => {
   it.each([
     ['InMemory', () => new InMemoryJournal() as any],
     ['Sqlite', () => new SqliteStorage(':memory:').runs as any],
-    ['Redis(fake)', () => new RedisStorage({ client: makeFakeRedis() }).runs as any],
   ])('%s: 50 concurrent increments → NO lost update (exact total)', async (_n, mk) => {
     const j = mk();
     await Promise.all(

@@ -7,8 +7,6 @@
 import { describe, it, expect, afterAll } from 'vitest';
 import pg from 'pg';
 import { InMemoryStorage, purgeRun, toJournal, withOrg } from '../src/index.js';
-import { makeFakeRedis } from './fake-redis.js';
-import { RedisStorage } from '../src/redis-storage.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import type { RunSummary } from '../src/journal.js';
@@ -26,7 +24,6 @@ afterAll(async () => {
 const stores: [string, () => Promise<any>][] = [
   ['InMemoryStorage', async () => new InMemoryStorage()],
   ['SqliteStorage', async () => new SqliteStorage()],
-  ['RedisStorage (fake)', async () => new RedisStorage({ client: makeFakeRedis(undefined, true) as never })],
   // No pg-mem: it cannot compare rows, and the keyset is a row comparison (run-cursor.ts). The real
   // Postgres below runs in the real-backend CI job (GNL_PG_URL).
   ...(PG_ADMIN ? [['PostgresStorage (real)', async () => {

@@ -18,8 +18,6 @@ import { newDb } from 'pg-mem';
 import { InMemoryStorage } from '../src/in-memory-storage.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { RedisStorage } from '../src/redis-storage.js';
-import { makeFakeRedis } from './fake-redis.js';
 import type { Storage } from '../src/storage.js';
 
 const pgmemPool = () => new (newDb().adapters.createPg().Pool)();
@@ -28,7 +26,6 @@ const ADAPTERS: Array<[string, () => Storage]> = [
   ['InMemoryStorage', () => new InMemoryStorage()],
   ['SqliteStorage', () => new SqliteStorage(':memory:')],
   ['PostgresStorage', () => new PostgresStorage({ pool: pgmemPool() } as never)],
-  ['RedisStorage', () => new RedisStorage({ client: makeFakeRedis(undefined, true) } as never)],
 ];
 
 /** A store with one ordinary row, and `__org__:acme` set to whatever the case under test needs. */

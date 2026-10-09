@@ -1,10 +1,9 @@
-// Upgrade from 0.9.0 on a real Postgres and a real Redis: the queue and events 0.9.0 left behind (the
-// same scenarios as queue.db / events.db, and as queue-erased.db / events-erased.db where 0.9.0 itself
-// erased a person), loaded from `postgres-work*.sql` / `redis-work*.json` into a fresh database or key
-// prefix and opened by the current stores. The work store is where the three
-// backends differ (Postgres adds `seq`, `ord` and `gnl_work_seq`; Redis numbers records itself).
+// Upgrade from 0.9.0 on a real Postgres: the queue and events 0.9.0 left behind (the same scenarios
+// as queue.db / events.db, and as queue-erased.db / events-erased.db where 0.9.0 itself erased a
+// person), loaded from `postgres-work*.sql` into a fresh database and opened by the current store. The
+// work store is where the backends differ (Postgres adds `seq`, `ord` and `gnl_work_seq`).
 //
-// Runs with GNL_INTEGRATION=1, against GNL_PG_URL and GNL_REDIS_URL — the variables, defaults and
+// Runs with GNL_INTEGRATION=1, against GNL_PG_URL — the variable, default and
 // servers the repository's other real-backend tests use (CI job `integration`,
 // scripts/check-real-backends.mjs). The Postgres URL must allow CREATE DATABASE.
 import { readFileSync } from 'node:fs';
@@ -13,7 +12,6 @@ import { createRequire } from 'node:module';
 import { afterEach, describe, expect, it } from 'vitest';
 import { eraseSubject } from '@gnldev/durable';
 import { PostgresStorage } from '@gnldev/durable/postgres';
-import { RedisStorage } from '@gnldev/durable/redis';
 import { createConsumer, eventEraser } from '@gnldev/events';
 import { createWorker, jobEraser } from '@gnldev/queue';
 import * as S from '../../generate/shapes.mjs';
@@ -27,7 +25,6 @@ async function schemaStep(s: { upgrade(o: { only: ['schema']; dryRun?: boolean }
 
 const RUN = process.env.GNL_INTEGRATION === '1';
 const PG_URL = process.env.GNL_PG_URL ?? 'postgres://postgres:gnl@localhost:55432/gnl';
-const REDIS_URL = process.env.GNL_REDIS_URL ?? 'redis://localhost:6380';
 const require = createRequire(import.meta.url);
 
 const pad = (n: number) => String(n).padStart(3, '0');
@@ -41,12 +38,12 @@ const pendingEvents = [
   ...Array.from({ length: E.carolPending }, (_, i) => `c${i}`),
 ].sort();
 
-type Store = PostgresStorage | RedisStorage;
+type Store = PostgresStorage;
 /** `work`: as left by 0.9.0; `work-erased`: 0.9.0 then erased ayse under its row-offset cursors. */
 type Variant = 'work' | 'work-erased';
 interface Loaded {
   storage: Store;
-  /** Every stored string holding `needle` (rows on Postgres, keys and values on Redis). */
+  /** Every stored string holding `needle`, as `table.column=value`. */
   containing(needle: string): Promise<string[]>;
   /** A second process on the same data. */
   reopen(): Promise<Store>;
@@ -99,64 +96,20 @@ async function loadPostgres(variant: Variant): Promise<Loaded> {
   return { storage, containing, reopen: open };
 }
 
-async function loadRedis(variant: Variant): Promise<Loaded> {
-  const Redis = require('ioredis');
-  const prefix = `gnlupg${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}:`;
-  const client = new Redis(REDIS_URL);
-  const dump = JSON.parse(readFileSync(join(FIXTURES_090, `redis-${variant}.json`), 'utf8')) as { keys: Array<{ k: string; type: string; v: any }> };
-  for (const { k, type, v } of dump.keys) {
-    const key = prefix + k;
-    if (type === 'string') await client.set(key, v);
-    else if (type === 'hash') await client.hset(key, v);
-    else if (type === 'zset') for (const [member, score] of v) await client.zadd(key, score, member);
-    else if (type === 'list') await client.rpush(key, ...v);
-    else if (type === 'set') await client.sadd(key, ...v);
-  }
-  const opened: Store[] = [];
-  const open = async () => {
-    const s = new RedisStorage({ connectionString: REDIS_URL, keyPrefix: prefix });
-    await s.init();
-    opened.push(s);
-    return s;
-  };
-  cleanups.push(async () => {
-    for (const s of opened) await s.close();
-    const keys = await client.keys(`${prefix}*`);
-    if (keys.length) await client.del(...keys);
-    await client.quit();
-  });
-  const storage = await open();
-  const containing = async (needle: string) => {
-    const out: string[] = [];
-    for (const key of await client.keys(`${prefix}*`)) {
-      const type = await client.type(key);
-      const v = type === 'string' ? await client.get(key) : type === 'zset' ? (await client.zrange(key, 0, -1)).join(' ') : type === 'hash' ? JSON.stringify(await client.hgetall(key)) : '';
-      if (key.includes(needle) || String(v).includes(needle)) out.push(key.slice(prefix.length));
-    }
-    return out;
-  };
-  return { storage, containing, reopen: open };
-}
-
 const worker = (storage: Store, ran: string[]) =>
   createWorker(storage, { plain: async (p: { n: string }) => { ran.push(p.n); } }, { maxAttempts: 2, heartbeat: false });
 const consumer = (storage: Store, seen: string[]) =>
   createConsumer(storage.work!, E.topic, async (p: { n: string }) => { seen.push(p.n); }, { name: E.consumer });
 
-describe.skipIf(!RUN).each([
-  ['Postgres', loadPostgres],
-  ['Redis', loadRedis],
-] as const)('upgrade from 0.9.0 — work store on a real %s', (name, loadAs) => {
+describe.skipIf(!RUN)('upgrade from 0.9.0 — work store on a real Postgres', () => {
+  const loadAs = loadPostgres;
   const load = () => loadAs('work');
-  if (name === 'Postgres') {
-    it('the current code migrates the 0.9.0 schema once, and a second open changes nothing', async () => {
-      const f = await load();
-      const pgStore = f.storage as PostgresStorage;
-      expect(await pgStore.checkSchema()).toMatchObject({ ok: true, missingTables: [], missingColumns: [] });
-      const again = (await f.reopen()) as PostgresStorage;
-      expect((await schemaStep(again)).statements).toEqual([]);
-    });
-  }
+  it('the current code migrates the 0.9.0 schema once, and a second open changes nothing', async () => {
+    const f = await load();
+    expect(await f.storage.checkSchema()).toMatchObject({ ok: true, missingTables: [], missingColumns: [] });
+    const again = await f.reopen();
+    expect((await schemaStep(again)).statements).toEqual([]);
+  });
 
   it('the first drain after the upgrade runs every job 0.9.0 left pending, once', async () => {
     const f = await load();

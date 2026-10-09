@@ -50,7 +50,7 @@ async function addUsage(journal: Partial<Journal>, delta: OrganizationUsage): Pr
       await journal.incrBy(USAGE_KEY, { runs: delta.runs, tokens: delta.tokens, costUsd: delta.costUsd });
       return;
     } catch {
-      // custom client (e.g. RedisLike without hincrbyfloat) → legacy path
+      // a custom journal whose incrBy cannot do this (no float arithmetic, a read-only view) → legacy path
     }
   }
   if (typeof journal.get !== 'function' || typeof journal.put !== 'function') return;

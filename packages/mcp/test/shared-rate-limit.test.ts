@@ -5,8 +5,8 @@
 // README says so, and that was the whole of it — an escape hatch nobody had used is a claim, not a way out.
 //
 // This is the way out, exercised: `rateLimit` also takes a FUNCTION, and @gnldev/durable's journal already
-// carries the primitive for a shared counter — `incrBy` is atomic on every real storage (Redis
-// HINCRBYFLOAT, Postgres/SQLite UPSERT arithmetic), which is why `budget.ts` uses it for the same kind of
+// carries the primitive for a shared counter — `incrBy` is atomic on every real storage
+// (Postgres/SQLite UPSERT arithmetic), which is why `budget.ts` uses it for the same kind of
 // bookkeeping. Nothing new is added to this package for it.
 //
 // Two servers share one journal below, which is the shape two processes have. What the test would look

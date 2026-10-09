@@ -8,24 +8,22 @@
 //     their pending jobs never ran and their events were never delivered (in-memory and SQLite);
 //   · `ts` is the PRODUCER's `Date.now()`. A producer 5s behind had its row sorted before the cursor on
 //     SQLite/Postgres/Redis, so it was never seen at all.
-// The same contract runs against every bundled adapter (and a live Postgres/Redis under GNL_INTEGRATION=1).
+// The same contract runs against every bundled adapter (and a live Postgres under GNL_INTEGRATION=1).
 import { describe, it, expect, vi, afterEach, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { newDb } from 'pg-mem';
-import { InMemoryStorage, RedisStorage } from '../src/index.js';
+import { InMemoryStorage } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { makeFakeRedis } from './fake-redis.js';
 import type { WorkStore, Storage } from '../src/index.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
 
 const RUN = process.env.GNL_INTEGRATION === '1';
 const PG_URL = process.env.GNL_PG_URL ?? 'postgres://postgres:gnl@localhost:55432/gnl';
-const REDIS_URL = process.env.GNL_REDIS_URL ?? 'redis://localhost:6380';
 const SEED = `wc${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
 afterEach(() => vi.restoreAllMocks());
@@ -35,7 +33,6 @@ const backends: Array<[string, Make]> = [
   ['in-memory', () => new InMemoryStorage()],
   ['sqlite', () => new SqliteStorage(':memory:')],
   ['postgres (pg-mem)', () => { const { Pool } = newDb().adapters.createPg(); return new PostgresStorage({ pool: new Pool() }); }],
-  ['redis (fake)', () => new RedisStorage({ client: makeFakeRedis() as never })],
 ];
 
 let ns = 0;
@@ -172,7 +169,6 @@ for (const [name, make] of backends) contract(name, make);
 
 describe.skipIf(!RUN)('WorkStore.list cursor — live backends', () => {
   const pools: PostgresStorage[] = [];
-  const redisClients: Array<{ quit(): Promise<unknown> }> = [];
   beforeAll(async () => {
     const probe = new PostgresStorage({ connectionString: PG_URL });
     for (let i = 0; ; i++) {
@@ -182,19 +178,11 @@ describe.skipIf(!RUN)('WorkStore.list cursor — live backends', () => {
   }, 30_000);
   afterAll(async () => {
     for (const p of pools) await p.close();
-    for (const c of redisClients) await c.quit();
   });
   const pg = () => { const s = new PostgresStorage({ connectionString: PG_URL }); pools.push(s); return s; };
-  const redis = async () => {
-    const { default: Redis } = await import('ioredis');
-    const client = new Redis(REDIS_URL, { maxRetriesPerRequest: 2 });
-    redisClients.push(client);
-    return new RedisStorage({ client: client as never, keyPrefix: `${SEED}:` });
-  };
   contract('postgres (live)', pg);
-  contract('redis (live)', redis);
 
-  for (const [name, make] of [['postgres (live)', pg], ['redis (live)', redis]] as const) {
+  for (const [name, make] of [['postgres (live)', pg]] as const) {
     it(`${name}: 8 concurrent producers on separate connections vs a reader persisting cursors — nothing is passed over`, async () => {
       const producers = await Promise.all(Array.from({ length: 4 }, () => make()));
       const reader = (await make()).work!;
@@ -309,7 +297,6 @@ describe('SIBLING — adoptIntoOrg moves a log into an organization that already
     ['in-memory', () => new InMemoryStorage()],
     ['sqlite', () => new SqliteStorage(':memory:')],
     ['postgres (pg-mem)', () => { const { Pool } = newDb().adapters.createPg(); return new PostgresStorage({ pool: new Pool() }); }],
-    ['redis (fake)', () => new RedisStorage({ client: makeFakeRedis() as never })],
   ];
   it.each(all)('%s: the moved records land after the organization\'s persisted cursor, and its own records survive', async (_name, make) => {
     const s = make();

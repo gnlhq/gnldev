@@ -12,7 +12,7 @@
 // schema parser (so "expected" can never drift from the DDL text the adapters actually execute), and the
 // duck-typed `runMigrationCheck` a CLI/CI script calls without caring which adapter it got.
 //
-// Scope (v1, deliberate): SQL adapters only. Redis/in-memory storage are schema-free by construction (no
+// Scope (v1, deliberate): SQL adapters only. In-memory storage is schema-free by construction (no
 // tables/columns to diff) — runMigrationCheck reports them as "not supported" rather than pretending to
 // check something that doesn't exist.
 //
@@ -43,6 +43,13 @@ export interface SchemaCheckResult {
   missingColumns: MissingColumn[];
   /** Tables present in the live DB (under the `gnl_` prefix) but not part of the expected schema — informational only, never acted on. */
   unknownTables?: string[];
+  /**
+   * Indexes this version creates (`CREATE INDEX IF NOT EXISTS` in its DDL) that the live database lacks.
+   * `CREATE TABLE IF NOT EXISTS` never touches an existing table, so an index added to an existing table
+   * reached new installs only — the `schema` step creates these too. Left out where the backend cannot
+   * list its indexes (pg-mem).
+   */
+  missingIndexes?: string[];
 }
 
 export interface SchemaMigrationResult {
@@ -65,7 +72,7 @@ export type MigrationCheckResult =
 /**
  * Duck-types the given storage for `checkSchema`/`exportSchema` — structural, so it works with
  * SqliteStorage, PostgresStorage, or any future adapter shaped the same way, with zero import coupling to
- * which concrete adapters exist. Storages without a schema (RedisStorage, InMemoryStorage) get an honest
+ * which concrete adapters exist. Storages without a schema (InMemoryStorage, a custom one) get an honest
  * "not supported" result instead of a crash. This is the entry point a CLI or CI script calls.
  * @internal — a storage adapter's conformance helper; its argument is the adapter.
  */
@@ -79,7 +86,7 @@ export async function runMigrationCheck(storage: {
     return {
       supported: false,
       storage: storageName,
-      reason: `storage '${storageName}' does not implement checkSchema()/exportSchema() — schema-free by construction (e.g. redis/in-memory) or an adapter that predates P2-migrate`,
+      reason: `storage '${storageName}' does not implement checkSchema()/exportSchema() — schema-free by construction (e.g. in-memory) or an adapter that predates P2-migrate`,
     };
   }
   const check = await storage.checkSchema();
@@ -109,6 +116,21 @@ export function tablesFromDDL(ddl: string | string[]): Map<string, Map<string, s
       cols.set(name, part);
     }
     out.set(table, cols);
+  }
+  return out;
+}
+
+/**
+ * Every `CREATE INDEX IF NOT EXISTS <name> ON <table>` in the adapters' own DDL text, by index name —
+ * the expected indexes `checkSchema` diffs against the live database, from the same text the adapter
+ * runs, so the list cannot drift from what a fresh install gets.
+ * @internal — the adapters' `checkSchema`.
+ */
+export function indexesFromDDL(statements: readonly string[]): Map<string, { table: string; statement: string }> {
+  const out = new Map<string, { table: string; statement: string }>();
+  for (const stmt of statements) {
+    const m = /^\s*CREATE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)\s+ON\s+(\w+)/i.exec(stmt);
+    if (m) out.set(m[1]!, { table: m[2]!, statement: stmt.trim() });
   }
   return out;
 }

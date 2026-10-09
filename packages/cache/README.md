@@ -33,7 +33,7 @@ const vec = await cache.getOrCompute({ text: 'hello' }, () => embed('hello'));
   throws `CapabilityError`. Best-effort covers a store that is *down*, not one that is *wrong*.
 - `cache.get(key)` · `cache.set(key, value, opts?)` · `cache.getOrCompute(key, compute, opts?)`
   — the trailing `opts` is `{ ttlMs? }`, honoured by stores whose capability is `'ttl'`
-  (SQLite/Postgres/Redis; `InMemory` is `'full'`).
+  (SQLite/Postgres; `InMemory` is `'full'`).
 - `cache.stats() → { hits, misses, hitRate, size }` — **in-process** counters, not persistent: they
   reset when the process does, and `size` is only the keys *this instance* has touched, because
   `CacheStore` offers no enumeration.

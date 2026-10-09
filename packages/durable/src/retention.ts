@@ -2,7 +2,7 @@
 // journal's append-only philosophy — only for legal deletion (PII purge) and retention sweeps.
 // Requires the `deletePrefix` port (InMemory/Sqlite/Postgres adapters provide it); otherwise
 // throws a clear error.
-import { runKeys, summarizeRun, nestedAgentRunId, runIdOfKey, executedHere } from './journal.js';
+import { runKeys, summarizeRun, nestedAgentRunId, runIdOfKey, executedHere, listRunsWhere } from './journal.js';
 import { identityOnlyInput } from './run.js';
 import { workKeyHash } from './hash.js';
 import { MEM_LEAVES, OM_LEAVES, memKey, readJournalLogDated, semanticLogKey, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX } from './memory.js';
@@ -25,7 +25,6 @@ import { orgPrefix, isOrganizationKey } from './organization.js';
 import type { PollLoop } from './polling.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { LOG_SWEEP_TARGET_NAMES, PURGE_RESOURCE_NAMES, PURGE_RUN_NAMES, RETENTION_SWEEPER_NAMES, SWEEP_LOG_NAMES, SWEEP_RUNS_NAMES, SWEEP_THREADS_NAMES } from './option-names.js';
-import { unindexSubject, subjectPrefix, runsOfSubject, subjectIndexComplete } from './subject-index.js';
 
 function requireDelete(journal: Journal): NonNullable<Journal['deletePrefix']> {
   if (typeof journal.deletePrefix !== 'function') {
@@ -284,12 +283,10 @@ export async function purgeRun(
   const del = requireDelete(journal);
   if (seen.has(runId)) return 0; // cycle/repeat safety
   seen.add(runId);
-  // BEFORE the delete: `<runId>:input` is one of the keys this function is about to remove, and it
-  // names the person whose index entry for this run goes with it (subject-index.ts).
-  const input = await journal.get<{ resourceId?: string; threadId?: string }>(runKeys.input(runId))
-    .catch(() => undefined);
-  await unindexSubject(journal, 'run', input?.resourceId, runId);
   if (opts.ownershipTrace) {
+    // BEFORE the delete: `<runId>:input` is one of the keys this function is about to remove.
+    const input = await journal.get<{ resourceId?: string; threadId?: string }>(runKeys.input(runId))
+      .catch(() => undefined);
     if (input?.resourceId && input.threadId) {
       await journal.put(ownershipTraceKey(input.resourceId, input.threadId), { at: Date.now() })
         .catch(() => {});  // best-effort: a trace that cannot be written must not block the sweep
@@ -511,42 +508,28 @@ export async function purgeResource(
   let total =
     (await purgePersonFamilies(journal, resourceId));
 
-  // The person's RUNS — enumerated by the same field the ownership gates read.
-  // Structural read: `listRunsPaged` lives on JournalReader, and a Journal usually IS one (the
-  // storage bridge delegates it straight through) — but a bare custom Journal may not be, and this
-  // must degrade to the three-prefix behaviour rather than throw on a deletion request.
-  const paged = (journal as unknown as {
-    listRunsPaged?: (q: { resourceId: string; limit: number; cursor?: string }) => Promise<{ items: Array<{ runId: string; threadId?: string }>; nextCursor?: string }>;
-  }).listRunsPaged;
   // Their own documents in the knowledge base (shared ones are nobody's to erase with one person).
   // Before the early return below, which a journal without paged listing takes.
   // Without `outsideOrganizations` this erasure is the id's in every partition: the grant says so, since
   // a root delete without a namespace is otherwise the root's alone (ADR-0001, `vectorDeletePlan`).
   if (opts.vectors) total += await opts.vectors.delete!({ owner: resourceId, ...(opts.outsideOrganizations ? { outsideOrganizations: true } : { [VECTOR_ALL_PARTITIONS]: true as const }) });
-  const indexed = await subjectIndexComplete(journal);
-  if (typeof paged !== 'function' && !indexed) return total;
+  // The person's RUNS — enumerated by the same field the ownership gates read: on Sqlite and Postgres
+  // the runs placed under them plus every run not placed yet, by index (`keysetRunPage`); elsewhere the
+  // listing's own filter. A bare custom Journal without a paged listing degrades to the three-prefix
+  // behaviour rather than throw on a deletion request — a missing capability is a known limit.
+  //
+  // A FAILING listing is not that, and is not swallowed. It used to be: a page that threw read as an
+  // empty page, so the erasure deleted none of the person's runs and returned a count, and the caller
+  // told the person their data was gone — the outcome the `listKeys` block below refuses in so many
+  // words. A throw is the only honest answer; the request is retried, not reported done.
+  const listed = await listRunsWhere(journal, { resourceId });
+  if (listed === undefined) return total;
   const threads = new Set<string>();
   const runIds: string[] = [];
-  // Once the scope's subject index is complete, the person's runs are listed from it, each checked
-  // against its `:input` (subject-index.ts); before, by walking every run.
-  if (indexed) {
-    for (const r of await runsOfSubject(journal, resourceId)) {
-      if (opts.outsideOrganizations && isOrganizationKey(r.runId)) continue;
-      if (r.threadId) threads.add(r.threadId);
-      runIds.push(r.runId);
-    }
-  } else {
-  let cursor: string | undefined;
-  do {
-    const page = await paged!.call(journal, { resourceId, limit: 200, ...(cursor ? { cursor } : {}) })
-      .catch(() => ({ items: [] as Array<{ runId: string; threadId?: string }>, nextCursor: undefined as string | undefined }));
-    for (const r of page.items) {
-      if (opts.outsideOrganizations && isOrganizationKey(r.runId)) continue;
-      if (r.threadId) threads.add(r.threadId);
-      runIds.push(r.runId);
-    }
-    cursor = page.nextCursor;
-  } while (cursor);
+  for (const r of listed) {
+    if (opts.outsideOrganizations && isOrganizationKey(r.runId)) continue;
+    if (r.threadId) threads.add(r.threadId);
+    runIds.push(r.runId);
   }
   // WHOSE THREADS. A run of this person's on a thread does not make the thread theirs: an older
   // release let a user attach a run to someone else's thread, and this function then deleted her
@@ -580,8 +563,6 @@ export async function purgeResource(
   for (const t of owned) total += await purgeThread(journal, t);
   // The trace names a person and must not outlive them. Last, so a failure above cannot strand it.
   total += await del(`${ownershipTraceKey(resourceId, '')}`);
-  // So does the person's index: every entry in it names them (subject-index.ts).
-  total += await del(subjectPrefix(resourceId));
   return total;
 }
 
@@ -652,11 +633,7 @@ export async function purgeThread(journal: Journal, threadId: string): Promise<n
     // SemanticMemory's log (@gnldev/rag) — the thread's messages, kept under their own prefix.
     + (await purgeThreadNamespace(journal, SEMANTIC_LOG_PREFIX, threadId, threadIdOfSemKey));
   // The owner record names a person, and with the thread gone it guards nothing.
-  const ownerRec = await journal.get<{ resourceId?: string }>(threadOwnerKey(threadId));
-  if (ownerRec !== undefined) {
-    await unindexSubject(journal, 'thread', ownerRec?.resourceId, threadId);
-    total += await del(threadOwnerKey(threadId));
-  }
+  if ((await journal.get(threadOwnerKey(threadId))) !== undefined) total += await del(threadOwnerKey(threadId));
   if ((await journal.get(threadSeenKey(threadId))) !== undefined) total += await del(threadSeenKey(threadId));
 
   // The ownership traces pointing HERE. Once this thread's state is gone they identify nothing —
@@ -703,7 +680,7 @@ export async function purgeThread(journal: Journal, threadId: string): Promise<n
  * (the studio org-delete route already does).
  *
  * NOT DELETED BY THIS FUNCTION, but no longer a gap: everything `@gnldev/queue` and `@gnldev/events`
- * write lives in the WorkStore (`gnl_work_log` / `gnl_work_kv`, `wl:` / `wk:` on redis), a different
+ * write lives in the WorkStore (`gnl_work_log` / `gnl_work_kv`), a different
  * port from the Journal this function sweeps. `purgeOrganizationWork(storage.work, orgId)` is the
  * matching surface — call BOTH, in either order, to erase an organization completely. They stay two
  * calls on purpose: a deployment can hold the two stores on different backends (that is what
@@ -737,7 +714,7 @@ export async function purgeOrganizationWork(workArg: WorkStore, orgId: string): 
   const prefix = orgPrefix(orgId); // refuses '' (which would sweep `org::`) and a ':'-bearing id
   if (typeof work.deletePrefix !== 'function') {
     throw new Error(
-      "@gnldev/durable: this WorkStore does not implement `deletePrefix`, so an organization's queue and event records cannot be erased through it (the first-party in-memory/sqlite/postgres/redis adapters all do). Sweep those tables directly, or the erasure is incomplete.",
+      "@gnldev/durable: this WorkStore does not implement `deletePrefix`, so an organization's queue and event records cannot be erased through it (the first-party in-memory/sqlite/postgres adapters all do). Sweep those tables directly, or the erasure is incomplete.",
     );
   }
   return work.deletePrefix(prefix);

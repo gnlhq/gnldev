@@ -68,6 +68,15 @@ export interface ListQuery {
   workKey?: string;
   /** Only runs no other run started (`RunSummary.parentRunId` absent). Same filter-before-slice contract. */
   topLevel?: boolean;
+  /** (RunJournal.listRuns only.) Runs on this thread (`RunSummary.threadId`). Same filter-before-slice contract. */
+  threadId?: string;
+  /**
+   * (RunJournal.listRuns only.) Runs whose id starts with this — an organization's view asks for its
+   * own `org:<id>:` runs this way. Sqlite and Postgres read it as a range of the run id's index, so a
+   * small slice of a large store is not found by reading the rest; any other journal filters it like
+   * the others. Same filter-before-slice contract.
+   */
+  runIdPrefix?: string;
   /**
    * (RunJournal.listRuns only.) `'desc'` lists newest first — what a run list on a screen shows.
    * Default `'asc'`, the order runs were created in. A cursor continues in the order it was handed
@@ -949,7 +958,7 @@ export interface LogPosition {
 const LOG_CURSOR = /^w1:(\d+):(-?\d+):([\s\S]*)$/;
 
 /**
- * How many unnumbered records one `WorkStore.list` numbers (SQL, Redis), at least. A backlog larger
+ * How many unnumbered records one `WorkStore.list` numbers (SQL), at least. A backlog larger
  * than this — the first read of a log written entirely by 0.9 — is numbered over successive reads,
  * oldest first; a record not numbered yet is not listed yet, and cannot be passed over for it.
  */
@@ -1018,15 +1027,13 @@ export interface WorkStore {
    *   · the producer's clock. Records used to be ordered by the writer's `Date.now()`, so a producer 5s
    *     behind wrote BEFORE the cursor and was never read.
    *   · the version of the process that wrote it. During a rolling deploy a 0.9 process keeps writing
-   *     with its own statement (SQL) or value format (Redis), which knows nothing of positions.
+   *     with its own statement, which knows nothing of positions.
    * Every bundled store orders by a store-assigned per-namespace sequence (`LogPosition`), which only
    * grows — deletions leave gaps, never reuse — and hands out the cursor as the last record's position.
    * WHERE a record gets its number differs by store, and the rule they share is that a number is
    * always above every number already handed out, so no writer, of any version, can put a record
    * behind a cursor:
    *   · in-memory: at append (one writer).
-   *   · Redis: at append, in the append script, which numbers after the namespace's counter. A 0.9
-   *     writer's bare record (no number) is numbered by the first `list` that sees it, in one script.
    *   · SQLite: at insert, by a trigger in the database (`gnl_work_log_number`), so a 0.9 process's
    *     INSERT on the same file is numbered too — inside its own write, under SQLite's single writer
    *     lock. A row the trigger never saw (written before it existed, or reset by `adoptIntoOrg`) is
@@ -1081,7 +1088,7 @@ export interface WorkStore {
    * job or event carries its owner in its id (`ownedName`), so this is how one person's jobs and
    * events are erased without the store knowing what a job is. The prefix is LITERAL (no wildcard
    * characters), and KV keys are not touched — only log records. Every bundled store implements it
-   * (in-memory, SQLite, Postgres, Redis); `eraseSubject` refuses a work store without it.
+   * (in-memory, SQLite, Postgres); `eraseSubject` refuses a work store without it.
    */
   deleteIdPrefix?(idPrefix: string): Promise<number>;
 }
@@ -1129,7 +1136,7 @@ export interface Storage {
   close?(): Promise<void>;
   /**
    * Brings data an earlier version wrote up to this one: the steps this store has (`schema`,
-   * `key-index`, `thread-records`, `subject-index` — see `UPGRADE_STEPS`), every pending one or those named in `only`.
+   * `thread-records`, `relations` — see `UPGRADE_STEPS`), every pending one or those named in `only`.
    * `dryRun` lists them and what each would do, writing nothing — what `gnl upgrade --list` prints.
    * Each step is idempotent; until one has run, the store answers correctly at the earlier version's
    * speed. A store with nothing to upgrade leaves it out.
@@ -1189,7 +1196,7 @@ export interface AdoptIntoOrgResult {
    *
    * ROWS, not logical keys, and the two differ by engine. SQLite and Postgres materialise a per-run
    * summary row (`gnl_runs`) alongside the journal entries, so they report one more than the
-   * key-value engines do for the same data — measured: 5 against in-memory and Redis's 4. Nothing is
+   * key-value engines do for the same data — measured: 5 against in-memory's 4. Nothing is
    * lost either way; a migration rehearsed on one engine simply reports a different figure than
    * production, and an operator counting with `listKeys` afterwards will find the key-value number.
    */
@@ -1244,7 +1251,7 @@ export function toJournal(source: RunJournal | Storage): Journal & JournalReader
     listRuns: async () => (await runs.listRuns({ limit: 1_000_000_000 })).items,
     // P0.3: RunJournal.listRuns is MANDATORY (unlike the optional methods forwarded in the loop below)
     // → this bridge is unconditional. Delegates straight through — every RunJournal (in-memory/sqlite/
-    // postgres/redis) already implements the filter+pagination contract itself (see each adapter's
+    // postgres) already implements the filter+pagination contract itself (see each adapter's
     // listRuns), so there's nothing extra to do here beyond exposing it under the paged capability name.
     listRunsPaged: (q) => runs.listRuns(q),
   };
@@ -1255,10 +1262,10 @@ export function toJournal(source: RunJournal | Storage): Journal & JournalReader
   // 501/fallback). Forward every existing optional method at runtime (leave it alone if absent — old behavior preserved).
   const anyJ = j as unknown as Record<string, unknown>;
   const anyRuns = runs as unknown as Record<string, unknown>;
-  // P1.6b: applyBatch/getMany/countRunsByStatus forwarded the SAME way — SqliteRunJournal/PgRunJournal/
-  // RedisRunJournal expose them as EXTRA (non-RunJournal-interface) methods; without this they'd be
+  // P1.6b: applyBatch/getMany/countRunsByStatus forwarded the SAME way — SqliteRunJournal/PgRunJournal
+  // expose them as EXTRA (non-RunJournal-interface) methods; without this they'd be
   // silently dropped here exactly like the other optional methods were before the bug fix above.
-  for (const m of ['deletePrefix', 'putIfMatch', 'now', 'incrBy', 'getCounters', 'listStaleRuns', 'readRunStats', 'applyBatch', 'getMany', 'countRunsByStatus']) {
+  for (const m of ['deletePrefix', 'putIfMatch', 'now', 'incrBy', 'getCounters', 'listStaleRuns', 'readRunStats', 'applyBatch', 'getMany', 'countRunsByStatus', 'listOwnerRecords']) {
     if (typeof anyRuns[m] === 'function') anyJ[m] = (...args: unknown[]) => (anyRuns[m] as (...a: unknown[]) => unknown).call(runs, ...args);
   }
   return j;
@@ -1360,7 +1367,7 @@ function storePortKey(store: StoreName): keyof Storage {
 export interface CompositeConfig {
   /** The main storage that provides every undefined port (runs + meta come from here). */
   default: Storage;
-  /** Route specific ports to another storage (e.g. cache: redis()). */
+  /** Route specific ports to another storage (e.g. cache: new InMemoryStorage()). */
   overrides?: Partial<Record<Exclude<StoreName, 'runs'>, Storage>>;
 }
 

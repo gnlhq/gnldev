@@ -87,8 +87,8 @@ import { PostgresStorage } from '@gnldev/durable/postgres';
 import { InMemoryStorage, toJournal, composite } from '@gnldev/durable';`,
     apis: [`SqliteStorage — node:sqlite-based dev/single-file storage`, `PostgresStorage — pg-based production storage (connectionString or pool)`, `InMemoryStorage — test storage without persistence`, `composite({ default, overrides }) — different backend per port`, `toJournal(storage.runs) — bridges RunJournal to Journal & JournalReader`],
     example: `const storage = composite({
-  default: new SqliteStorage('app.db'),
-  overrides: { cache: someRedisBackedStorage },
+  default: new PostgresStorage({ connectionString: process.env.DATABASE_URL }),
+  overrides: { memory: new SqliteStorage('memory.db') },
 });`,
   },
   {

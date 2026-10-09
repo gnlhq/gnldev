@@ -51,7 +51,7 @@ describe('gnl upgrade', () => {
 
   it('--only names a step this store does not have: refused, naming the ones it has', async () => {
     const { storage } = await oldStore();
-    await expect(run(['--only', 'key-index'], storage)).rejects.toThrow(/not a step of this store\. Its steps: thread-records/);
+    await expect(run(['--only', 'schema'], storage)).rejects.toThrow(/not a step of this store\. Its steps: thread-records/);
   });
 
   it('a store with no upgrade steps says so', async () => {

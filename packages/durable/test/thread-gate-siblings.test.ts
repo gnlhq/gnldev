@@ -2,36 +2,27 @@
 // the anonymous thread's `seen` marker — never from the store's other runs. These are the same eight
 // cases on every store: who may claim a new, an anonymous and an older thread, a race between users,
 // a journal with only the required methods, and the cost of a new thread (S7: 1000 unrelated runs,
-// fewer than 10 summaries and 20 calls; before, every run was read, 9.4 s at 4000 runs on Redis).
-import { describe, it, expect, afterAll } from 'vitest';
-import Redis from 'ioredis';
+// fewer than 10 summaries and 20 calls; before, every run was read: 70 s at 30 000 runs on Postgres).
+import { describe, it, expect } from 'vitest';
 import { newDb } from 'pg-mem';
 import * as D from '../src/index.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { makeFakeRedis } from './fake-redis.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { STAFF, UNKNOWN, user } from '../src/run-identity.js';
 
-const { InMemoryStorage, RedisStorage, toJournal, admitThreadRun } = D as any;
+const { InMemoryStorage, toJournal, admitThreadRun } = D as any;
 /** Each journal's storage, so a test upgrades the store the way a host does: `storage.upgrade()`. */
 const storageOf = new WeakMap<object, any>();
 const journalOf = (s: any) => { const j = toJournal(s.runs); storageOf.set(j, s); return j; };
-// Only the step this gate needs: the subject index has its own tests (erase-subject-index), and a second
+// Only the step this gate needs: the relation columns have their own tests (erase-relations), and a second
 // pass over 1000 runs on pg-mem ran past the timeout under a loaded full suite.
 const upgrade = async (j: any) => { const s = storageOf.get(j); await s.init?.(); await s.upgrade({ only: ['thread-records'] }); };
 
-// A real server when the real-backend job provides one (GNL_REDIS_URL); the fake always.
-const REDIS_URL = process.env.GNL_REDIS_URL;
-const clients: Redis[] = [];
-let seq = 0;
 const stores: [string, () => any][] = [
   ['memory', () => new InMemoryStorage()],
   ['sqlite', () => new SqliteStorage()],
   ['postgres (pg-mem)', () => new PostgresStorage({ pool: new (newDb().adapters.createPg().Pool)() })],
-  ['redis (fake)', () => new RedisStorage({ client: makeFakeRedis(undefined, true) as never })],
-  ...(REDIS_URL ? [['redis (real)', () => { const c = new Redis(REDIS_URL); clients.push(c); return new RedisStorage({ client: c as any, keyPrefix: `gate${process.pid}-${seq++}:` }); }] as [string, () => any]] : []),
 ];
-afterAll(async () => { for (const c of clients) await c.quit(); });
 
 const admit = (j: any, t: string, caller: any) => admitThreadRun(j, undefined, t, caller).then((o: any) => o, (e: Error) => `REFUSED:${e.name}`);
 

@@ -109,24 +109,6 @@ export class RetryLimitExceededError extends Error {
 }
 
 /**
- * After a successful claim
- * (putIfAbsent/putIfMatch genuinely wrote something new), fewer than the requested number of replicas
- * acknowledged the write within the timeout (native Redis `WAIT`). The claim itself already happened —
- * this only means the async-replication gap (the core-hardening review: a claim acked only by the primary
- * can be lost on the replica promoted during failover) could not be ruled out within the deadline.
- * Thrown only when `waitReplicas.onTimeout === 'throw'` (default is 'warn' — see redis-storage.ts).
- */
-export class ReplicationNotAcknowledgedError extends Error {
-  constructor(
-    message: string,
-    public readonly detail: { requested: number; acknowledged: number; timeoutMs: number },
-  ) {
-    super(message);
-    this.name = 'ReplicationNotAcknowledgedError';
-  }
-}
-
-/**
  * (Task 3 — suite-consistency guard, `assertSuiteConsistent`/`createGnl({ checkSuiteConsistency })`):
  * an INSTALLED sibling @gnldev/* package's version differs from @gnldev/durable's own — a project that
  * bypassed the package manager's caret range (--force/overrides/manual node_modules edits) ended up

@@ -13,7 +13,7 @@ import type { RunSummary, RunStatus } from './journal.js';
  *
  * - `runId` — the last run handed out. Every reader can place it.
  * - `at` — that run's `created_at`, when the source keeps one in the order (Sqlite, Postgres). A
- *   source that orders an array it built (InMemory, Redis) does not, and a database reader resolves
+ *   source that orders an array it built (InMemory) does not, and a database reader resolves
  *   a position without it from the run itself.
  * - `next` — the run the next page starts with, as the source saw it. An array source places the
  *   cursor by it when the run above is gone (purged while the page was on screen).
@@ -78,17 +78,36 @@ export interface RunFilter {
   resourceId?: string;
   workKey?: string;
   topLevel?: boolean;
+  threadId?: string;
+  runIdPrefix?: string;
 }
 
 export function matchesRunFilter(r: RunSummary, q: RunFilter | undefined): boolean {
   return (q?.status ? r.status === q.status : true) && (q?.agent ? r.agent === q.agent : true)
     && (q?.resourceId ? r.resourceId === q.resourceId : true)
+    && (q?.threadId ? r.threadId === q.threadId : true)
+    && (q?.runIdPrefix ? r.runId.startsWith(q.runIdPrefix) : true)
     && (q?.workKey ? r.workKey === q.workKey : true) && (q?.topLevel ? !r.parentRunId : true);
 }
 
 /**
- * One page of runs from an array already in ascending creation order — the shape InMemory, Redis
- * and a legacy array reader produce. Filters before it slices (the listRunsPaged contract), and
+ * The relation a listing can read from an index: who (`resource_id`) or where (`thread_id`). Handed
+ * to an adapter's `read` by `keysetRunPage` when the adapter keeps those columns.
+ */
+export type RunRelationRead = { column: 'resource_id' | 'thread_id'; value: string };
+
+/**
+ * The order of ONE relation range: its whole index `(<column>, created_at, run_id)`, leading column
+ * first, so the planner reads the range in order instead of sorting it. Postgres does not take
+ * `resource_id IS NULL` as fixing that column the way `= $1` does; without it in the ORDER BY the
+ * unplaced range was read whole and sorted for every page (see PostgresStorage.listRunsPaged).
+ */
+export const rangeOrder = (column: RunRelationRead['column'], dir: 'ASC' | 'DESC'): string =>
+  `ORDER BY r.${column} ${dir}, r.created_at ${dir}, r.run_id ${dir}`;
+
+/**
+ * One page of runs from an array already in ascending creation order — the shape InMemory and a legacy
+ * array reader produce. Filters before it slices (the listRunsPaged contract), and
  * places the cursor by its run: the position after `runId`, wherever that run now sits. When that
  * run is gone, the page starts at `next`; when both are gone, at `seen` — the best an array without
  * creation times can do.
@@ -131,21 +150,41 @@ export interface KeyedRun {
  * row. One run past the page is read to know whether there is a next page, so the last page carries
  * no cursor (the `Page` contract) rather than one that leads to an empty page.
  *
- * `read(where, params, dir, take, skip)` runs the adapter's SELECT; `ph(n)` writes its n-th bound
+ * `read(where, params, dir, take, skip, rel)` runs the adapter's SELECT; `ph(n)` writes its n-th bound
  * parameter (`?n` for Sqlite, `$n` for Postgres). `skip` is non-zero only for a cursor whose run is gone
  * and that carries no `created_at` — the one case a position must fall back to counting.
+ *
+ * RELATIONS. An adapter that keeps a run's person and thread in columns (`relations: true` — Sqlite and
+ * Postgres, `runRelationsOf`) is handed `rel` for a `resourceId` or `threadId` filter, and reads TWO
+ * ranges in one statement: the rows placed under that value, and every row not placed yet
+ * (`resource_id IS NULL`: written before the columns, or by an older process). Never only the first —
+ * an unplaced row is still a run, and the person's erasure or their own run list must see it. Each row
+ * is then decided by `matchesRunFilter` from its `:input`, exactly as without the columns: the column
+ * narrows what is read, the record decides what is listed.
  */
 export async function keysetRunPage(
   q: (RunFilter & { limit?: number; cursor?: string; order?: RunOrder }) | undefined,
   statusCond: string | undefined,
   atOf: (runId: string) => number | undefined | Promise<number | undefined>,
-  read: (where: string, params: unknown[], dir: 'ASC' | 'DESC', take: number, skip: number) => KeyedRun[] | Promise<KeyedRun[]>,
+  read: (where: string, params: unknown[], dir: 'ASC' | 'DESC', take: number, skip: number, rel?: RunRelationRead) => KeyedRun[] | Promise<KeyedRun[]>,
   ph: (n: number) => string = (n) => `?${n}`,
+  relations = false,
+  /**
+   * `q.runIdPrefix` as SQL over the run id's index — `run_id >= prefix AND run_id < upper`, numbered
+   * from `from` — built by the adapter, which knows its collation. Without it the prefix is a row
+   * filter like `agent`: exact, and paid for by reading the rest.
+   */
+  runIdRange?: (prefix: string, from: number) => { where: string; params: unknown[] },
 ): Promise<{ items: RunSummary[]; nextCursor?: string }> {
   const limit = q?.limit ?? 50;
   const desc = q?.order === 'desc';
   const pos = decodeRunCursor(q?.cursor);
-  const unindexed = !!(q?.agent || q?.resourceId || q?.workKey || q?.topLevel);
+  const unindexed = !!(q?.agent || q?.resourceId || q?.threadId || q?.workKey || q?.topLevel || (q?.runIdPrefix && !runIdRange));
+  // One column is read by index; with both filters given the other is decided per row, like any filter.
+  const rel: RunRelationRead | undefined = !relations ? undefined
+    : q?.resourceId ? { column: 'resource_id', value: q.resourceId }
+    : q?.threadId ? { column: 'thread_id', value: q.threadId }
+    : undefined;
   // `inclusive`: the position is placed BY the next run (its own run is gone), so that run is listed.
   let after: { at: number; runId: string; inclusive?: boolean } | undefined;
   let skip = 0;
@@ -169,10 +208,21 @@ export async function keysetRunPage(
       // depended on its statistics: 10 000 runs walked in 1.3 s before an ANALYZE, 0.15 s after; the
       // row form took 0.13 s either way (and 30 000 runs 0.43 s).
       const [cmp, cmpEq] = desc ? ['<', '<='] : ['>', '>='];
-      conds.push(`(r.created_at, r.run_id) ${after.inclusive ? cmpEq : cmp} (${ph(1)}, ${ph(2)})`);
+      // A RELATION read is different: its index leads with the relation's column —
+      // `(resource_id, created_at, run_id)` — so the position is a range on the SECOND column under an
+      // equality (or IS NULL) on the first, `created_at >= a` as the index bound and the run id as a
+      // filter on the rows of that one millisecond. Here the expanded form is the plain one, and the
+      // row form is refused by pg-mem outright against that index ("cannot cast type list to list").
+      if (rel) conds.push(`r.created_at ${cmpEq} ${ph(1)} AND (r.created_at ${cmp} ${ph(1)} OR r.run_id ${after.inclusive ? cmpEq : cmp} ${ph(2)})`);
+      else conds.push(`(r.created_at, r.run_id) ${after.inclusive ? cmpEq : cmp} (${ph(1)}, ${ph(2)})`);
       params.push(after.at, after.runId);
     }
-    const rows = await read(conds.length ? ` WHERE ${conds.join(' AND ')}` : '', params, desc ? 'DESC' : 'ASC', take, skipRows);
+    if (q?.runIdPrefix && runIdRange) {
+      const r = runIdRange(q.runIdPrefix, params.length + 1);
+      conds.push(r.where);
+      params.push(...r.params);
+    }
+    const rows = await read(conds.length ? ` WHERE ${conds.join(' AND ')}` : '', params, desc ? 'DESC' : 'ASC', take, skipRows, rel);
     skipRows = 0;
     for (const row of rows) {
       after = { at: row.at, runId: row.summary.runId };

@@ -103,13 +103,13 @@ jobs:
       fail-fast: false
       matrix:
         pg:
-          - label: 'Postgres en_US.utf8 + Redis'
+          - label: 'Postgres en_US.utf8'
             image: 'postgres:16'
             # The official Debian image already sets LANG=en_US.utf8; passed explicitly so an image
             # default change cannot silently move this leg to C and evaporate the coverage.
             initdb: '--locale=en_US.utf8 --encoding=UTF8'
             collation: 'en_US.utf8'
-          - label: 'Postgres C + Redis'
+          - label: 'Postgres C'
             image: 'postgres:15-alpine'
             initdb: '--locale=C'
             collation: 'C'
@@ -122,11 +122,6 @@ jobs:
         ports: ['5432:5432']
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
-      redis:
-        image: redis:7-alpine
-        ports: ['6379:6379']
-        options: >-
-          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
       # A second Postgres with the `vector` extension (docker-compose.yml's `pgvector`), for the stores
       # that need it. Without it and GNL_PGVECTOR_URL, the pgvector tests below skipped themselves on
       # every run and the job said nothing. Not collation-matrixed: the vector contract does no prefix
@@ -140,12 +135,11 @@ jobs:
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       GNL_INTEGRATION: '1'
-      # integration-real.test.ts reads GNL_PG_URL / GNL_REDIS_URL (audit finding: the old
-      # PG_URL/REDIS_PORT names never matched what the test expected -> instead of the job
-      # services it connected to the defaults 55432/6380 and failed with a retry-timeout).
+      # integration-real.test.ts reads GNL_PG_URL (audit finding: the old PG_URL name never
+      # matched what the test expected -> instead of the job service it connected to the
+      # default 55432 and failed with a retry-timeout).
       GNL_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
       GNL_PGVECTOR_URL: postgresql://postgres:postgres@localhost:5433/postgres
-      GNL_REDIS_URL: redis://localhost:6379
       # The leg asserts it really got the ordering it was assigned. Without this, POSTGRES_INITDB_ARGS
       # silently not taking effect would leave both legs byte-ordered and the job would report coverage
       # it does not have -- the same failure this matrix exists to fix.
@@ -192,7 +186,7 @@ jobs:
     name: upgrade from 0.9.0 (known failures, not yet gating)
     runs-on: ubuntu-latest
     # Opens databases 0.9.0 wrote (packages/upgrade-tests/fixtures/0.9.0) with this code: SQLite files,
-    # a Postgres dump and a Redis dump, plus a rolling deploy with the published 0.9.0 in a child process.
+    # a Postgres dump, plus a rolling deploy with the published 0.9.0 in a child process.
     # It holds known failures that the fixes after it turn green, so for now a red here does not make the
     # workflow red (and does not block the release, which `needs` every job of this file). Remove
     # `continue-on-error` once it is green: from then on it guards the upgrade like any other gate.
@@ -205,15 +199,9 @@ jobs:
         ports: ['5432:5432']
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
-      redis:
-        image: redis:7-alpine
-        ports: ['6379:6379']
-        options: >-
-          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       GNL_INTEGRATION: '1'
       GNL_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
-      GNL_REDIS_URL: redis://localhost:6379
     steps:
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v5

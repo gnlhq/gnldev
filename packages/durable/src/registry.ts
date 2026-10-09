@@ -522,10 +522,9 @@ export interface CreateGnlConfig {
    *   strictInput + actor binding on        (one runId = one request, one owner)
    *   conflictLedger on                     (every refusal leaves a PII-free trace)
    *   tombstonePolicy 'reject'              (a swept runId's late retry is refused, not re-run)
-   * JOURNAL GUIDANCE (documented, not enforced): prefer Postgres. If Redis is a hard requirement,
-   * configure `waitReplicas: { replicas: 1, timeoutMs: 1000, onTimeout: 'throw' }` — and know the
-   * honest bound: the throw fires AFTER the write, so an unacknowledged claim becomes VISIBLE, not
-   * undone; treat thrown claims as a reconciliation suspect list.
+   * JOURNAL GUIDANCE (documented, not enforced): prefer Postgres, and if it replicates, run it with
+   * `synchronous_commit = on` and a synchronous standby — a claim acknowledged only by a primary that
+   * then fails over can be lost, and with it the exactly-once promise.
    * SINGLE-HOME BOUND (the guarantee's edge, restated where the guarantee is SOLD — full statement
    * on the Journal interface JSDoc): every exactly-once promise here — locks, fingerprints,
    * ledger, tombstones, dedup windows — holds for any number of workers sharing ONE journal store.
@@ -901,14 +900,6 @@ export function createGnl(config: CreateGnlConfig) {
   const journal: Journal = config.storage ? config.storage.runs : config.journal!;
   if (!journal) throw new Error('createGnl: `storage` or `journal` is required');
   const memSource: Storage | Journal = config.storage ?? config.journal!;
-  // FAZ-4 journal guidance (best-effort detection, warn-only): the critical profile's claims should
-  // not ride async replication — see CreateGnlConfig.preset's JOURNAL GUIDANCE note.
-  if (config.preset === 'critical' && /redis/i.test(journal?.constructor?.name ?? '')) {
-    console.warn(
-      "@gnldev/durable: preset 'critical' is running on a Redis journal — prefer Postgres for the critical profile, " +
-      "or configure waitReplicas { replicas: 1, timeoutMs: 1000, onTimeout: 'throw' } and treat thrown claims as a reconciliation suspect list.",
-    );
-  }
   // A declaration nothing reads. `effectClass` is the tool's half of the policy matrix — it says what
   // a REPEAT of this tool costs — and the only thing that ever reads it is a profile
   // (`limits.sideEffectDuplicates.byClass`, which `preset` fills in; see policy-matrix.ts and
@@ -1854,7 +1845,7 @@ export function createGnl(config: CreateGnlConfig) {
       // A plain `get`, deliberately: @gnldev/workflow writes this marker with a plain `put` for
       // exactly this reason. Its retry COUNTER cannot be read here — on a backend with `incrBy` it
       // lives in a counter map rather than the field, so a naive read would return nothing on
-      // Postgres/Redis while looking correct in memory, and the reader that knows the difference is
+      // Sqlite/Postgres while looking correct in memory, and the reader that knows the difference is
       // in @gnldev/workflow, which this file must not import (see the structural-type note above).
       //
       // The `_` is that package's reserved-control-key prefix, and the brand is checked rather than

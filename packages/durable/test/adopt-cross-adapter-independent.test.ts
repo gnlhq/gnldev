@@ -1,7 +1,7 @@
 // The same migration, on all four adapters, judged by what an operator would see afterwards.
 //
-// `adoptIntoOrg` is implemented four times over four very different engines — a Map, SQLite, Postgres
-// and a Redis keyspace. Four implementations of one contract is four chances for one to disagree, and
+// `adoptIntoOrg` is implemented three times over three very different engines — a Map, SQLite and
+// Postgres. Three implementations of one contract is three chances for one to disagree, and
 // the disagreement that matters is not "the SQL differs" but "the keys afterwards differ". So the
 // property is stated once and run against every adapter: seed the same rows, adopt, compare the
 // resulting keyspace.
@@ -13,8 +13,6 @@ import { newDb } from 'pg-mem';
 import { InMemoryStorage } from '../src/in-memory-storage.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { RedisStorage } from '../src/redis-storage.js';
-import { makeFakeRedis } from './fake-redis.js';
 import type { Storage } from '../src/storage.js';
 
 const pgmemPool = () => new (newDb().adapters.createPg().Pool)();
@@ -24,7 +22,6 @@ const ADAPTERS: Array<[string, () => Storage]> = [
   ['InMemoryStorage', () => new InMemoryStorage()],
   ['SqliteStorage', () => new SqliteStorage(':memory:')],
   ['PostgresStorage', () => new PostgresStorage({ pool: pgmemPool() } as never)],
-  ['RedisStorage', () => new RedisStorage({ client: makeFakeRedis(undefined, true) } as never)],
 ];
 
 /** One row of each kind: ordinary, adoptable-reserved, platform, and already-scoped. */
@@ -65,8 +62,8 @@ describe('all four adapters agree on what adoption does', () => {
   /**
    * A SUPERSET property, not equality — comparing the reports directly was an invalid comparison and my
    * first version failed on it for the wrong reason. The engines hold DIFFERENT platform state:
-   * Postgres and Redis write a `schema_version` row at init and correctly report declining to move it,
-   * and Redis additionally reports `cache:`. In-memory has neither. So every adapter must report the
+   * Postgres writes a `schema_version` row at init and correctly reports declining to move it.
+   * In-memory has none. So every adapter must report the
    * platform families that were SEEDED, and may report more of its own.
    */
   it.each(ADAPTERS)('%s reports every seeded platform family it declined to move', async (_name, make) => {
@@ -115,8 +112,8 @@ describe('all four adapters agree on what adoption does', () => {
  * THE HONEST LIMITS, pinned rather than trusted.
  *
  * These are documented constraints, not defects — but a documented constraint that nothing asserts is
- * a constraint that quietly stops being true. Each of these would be silent if it regressed: a Redis
- * migration that starts rewriting `cache:` drops every TTL, and a Postgres migration that runs on a
+ * a constraint that quietly stops being true. Each of these would be silent if it regressed: a Postgres
+ * migration that runs on a
  * pool without `connect()` is a sequence of independent statements pretending to be a transaction.
  */
 describe('the limits the implementation documents', () => {
@@ -130,24 +127,7 @@ describe('the limits the implementation documents', () => {
       .rejects.toThrow(/connect\(\)/);
   }, 30_000);
 
-  it('Redis leaves cache entries alone, because rewriting them would drop their TTL', async () => {
-    const s = new RedisStorage({ client: makeFakeRedis(undefined, true) } as never);
-    await s.init?.();
-    await s.runs.put('r-1:model:0', { x: 1 });
-    await s.runs.put('__org__:acme', { id: 'acme' });   // adoption refuses an unregistered organization
-    await s.cache!.set('ck', { v: 1 }, { ttlMs: 60_000 });
-
-    const result = await s.adoptIntoOrg!('acme');
-
-    expect(result.moved.runs, 'the run did not move, so this says nothing about cache').toBeGreaterThan(0);
-    expect(result.moved.cache ?? 0,
-      'Redis adopted cache entries. Re-keying them means re-writing them, which resets the TTL — an '
-      + 'entry that was seconds from expiry becomes fresh, and the cache silently stops expiring.')
-      .toBe(0);
-    await s.close?.();
-  }, 30_000);
-
-  it('and says so in the result rather than reporting a silent zero', async () => {
+  it('a store says which ports it touched rather than reporting a silent zero', async () => {
     // A store with no cache at all must be ABSENT from `moved`, not present as 0 — the two mean
     // different things ("this engine has no cache" vs "it has one and nothing moved").
     const s = new InMemoryStorage();
@@ -161,10 +141,10 @@ describe('the limits the implementation documents', () => {
 /**
  * A CROSS-ADAPTER DIFFERENCE in the numbers, with a benign cause — recorded rather than asserted away.
  *
- * The visible outcome agrees on all four: the same keys end up under `org:acme:`. The reported COUNTS
+ * The visible outcome agrees on all three: the same keys end up under `org:acme:`. The reported COUNTS
  * do not. Measured on identical input, and with the already-scoped row removed so it is not the cause:
  *
- *   InMemoryStorage / RedisStorage   moved.runs = 4   alreadyScoped = 1
+ *   InMemoryStorage                  moved.runs = 4   alreadyScoped = 1
  *   SqliteStorage  / PostgresStorage moved.runs = 5   alreadyScoped = 2
  *
  * The SQL adapters keep a derived per-run summary row (`gnl_runs`) alongside the journal rows, and

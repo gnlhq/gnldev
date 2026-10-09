@@ -488,7 +488,7 @@ describe('GET /runs — what the coverage above misses', () => {
     const journal = new InMemoryJournal();
     await seedRuns(journal, 6);
     // Everything the push-down needs EXCEPT the count — which is the real discriminator, and exactly
-    // the shape Redis and every organization-scoped view present.
+    // the shape every organization-scoped view presents.
     const noCount = {
       listRuns: journal.listRuns.bind(journal),
       readRun: journal.readRun.bind(journal),

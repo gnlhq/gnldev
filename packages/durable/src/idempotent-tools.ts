@@ -137,8 +137,8 @@ export async function releaseFailedClaim(
     throw new Error(
       '@gnldev/durable: releaseFailedClaim needs a journal with putIfMatch — without a compare-and-set ' +
       'the release cannot tell a still-failed claim from one that succeeded a moment ago, and removing ' +
-      'the latter runs the side effect twice. (InMemoryJournal, SqliteStorage, PostgresStorage and ' +
-      'RedisStorage all have it.)',
+      'the latter runs the side effect twice. (InMemoryJournal, SqliteStorage and PostgresStorage all ' +
+      'have it.)',
     );
   }
   const hash = argsHash(opts.key ? opts.key(opts.toolName, opts.args) : opts.args);

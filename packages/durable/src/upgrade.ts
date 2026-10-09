@@ -1,8 +1,8 @@
 // One way to bring a store written by an earlier version up to this one: `storage.upgrade()`.
 //
 // Before this, each upgrade had its own name on its own adapter — `migrateSchema()` on Sqlite and
-// Postgres, `rebuildKeyIndex()` on Redis, `upgradeThreadRecords(journal)` everywhere — and the
-// developer had to know all three, and which applied. Now a store lists the steps it has, says which
+// Postgres, `upgradeThreadRecords(journal)` everywhere — and the developer had to know each, and
+// which applied. Now a store lists the steps it has, says which
 // are pending, and runs them — all of them, or the ones named in `only`.
 
 import type { Storage } from './storage.js';
@@ -11,12 +11,11 @@ import { toJournal, threadRecordOwner } from './storage.js';
 import { withOrg, withRootScope, ORG_RECORD_PRE } from './organization.js';
 import { withOrgStorage } from './org-storage.js';
 import { threadRecordsComplete, writeThreadRecords } from './thread-owner.js';
-import { subjectIndexComplete, writeSubjectIndex } from './subject-index.js';
 import type { Memory } from './memory.js';
 import type { MemoryStore } from './storage.js';
 
 /** Every upgrade step a first-party store can have, in the order `upgrade()` runs them. */
-export const UPGRADE_STEPS = ['schema', 'key-index', 'thread-records', 'subject-index'] as const;
+export const UPGRADE_STEPS = ['schema', 'thread-records', 'relations', 'verify-relations'] as const;
 export type UpgradeStepName = (typeof UPGRADE_STEPS)[number];
 
 export interface UpgradeOptions {
@@ -57,6 +56,11 @@ export interface UpgradeStep {
   /** Steps that must be done before this one can run. */
   requires?: readonly UpgradeStepName[];
   pending(): Promise<boolean>;
+  /**
+   * Never pending on its own: it runs only when named in `only`, and `upgrade()` with no `only` leaves
+   * it out. For a step an operator asks for after an event the store cannot see (`verify-relations`).
+   */
+  explicit?: true;
   /** What it would do, without writing — for `dryRun`. */
   plan?(): Promise<Record<string, unknown>>;
   run(): Promise<Record<string, unknown>>;
@@ -78,7 +82,7 @@ export async function runUpgrade(who: string, steps: readonly UpgradeStep[], opt
       );
     }
   }
-  const selected = new Set(opts.only ?? steps.map((s) => s.name));
+  const selected = new Set(opts.only ?? steps.filter((s) => !s.explicit).map((s) => s.name));
   const needed = new Set<UpgradeStepName>(selected);
   for (const s of [...steps].reverse()) if (needed.has(s.name)) for (const r of s.requires ?? []) if (has.has(r)) needed.add(r);
   // Asked in order. A step whose prerequisite is still pending is pending too, and is NOT asked: asking
@@ -87,8 +91,10 @@ export async function runUpgrade(who: string, steps: readonly UpgradeStep[], opt
   const pending = new Map<UpgradeStepName, boolean>();
   const blockedBy = (s: UpgradeStep) => (s.requires ?? []).filter((r) => pending.get(r) === true);
   for (const s of steps) {
+    // An explicit step not named has nothing to do: reported as not pending rather than as not asked.
+    if (s.explicit && !needed.has(s.name)) { pending.set(s.name, false); continue; }
     if (!needed.has(s.name)) continue;
-    pending.set(s.name, blockedBy(s).length > 0 ? true : await s.pending());
+    pending.set(s.name, s.explicit ? selected.has(s.name) : blockedBy(s).length > 0 ? true : await s.pending());
   }
   for (const s of steps) {
     if (!selected.has(s.name) || !pending.get(s.name)) continue;
@@ -112,7 +118,7 @@ export async function runUpgrade(who: string, steps: readonly UpgradeStep[], opt
         else if (s.plan) row.detail = await s.plan();
       } else {
         // Assumed pending behind its prerequisite: asked now that the prerequisite ran.
-        const still = waiting.length === 0 || (waiting.every((w) => ran.has(w)) && (await s.pending()));
+        const still = waiting.length === 0 || (waiting.every((w) => ran.has(w)) && (s.explicit || await s.pending()));
         if (still) { row.detail = await s.run(); row.ran = true; ran.add(s.name); } else row.pending = false;
       }
     }
@@ -177,34 +183,78 @@ export function threadRecordsStep(storage: Storage, requires?: readonly UpgradeS
 }
 
 /**
- * The `subject-index` step every store with runs has: indexes each person's runs and owned threads, in
- * the root scope and every registered organization, then marks each scope complete — from then on an
- * erasure lists one person's prefix instead of walking the store (subject-index.ts). Until a scope is
- * complete erasure keeps the walk, so it never waits for this step.
+ * What a store that keeps a run's person and thread in columns hands its `relations` step (Sqlite,
+ * Postgres): whether any row written before the columns can be placed now, and the pass that places them.
  * @internal
  */
-export function subjectIndexStep(storage: Storage, requires?: readonly UpgradeStepName[]): UpgradeStep {
-  const scopes = () => upgradeScopes(storage);
+export interface RelationPlacer {
+  relationsPending(): Promise<boolean>;
+  placeRelations(): Promise<{ runs: number; owners: number }>;
+  /** Marks every placement for verification (RELATIONS_VERIFY_KEY): no column is trusted until `placeRelations` has placed every row again. */
+  requestRelationsVerify(): Promise<void>;
+}
+
+/**
+ * What a Sqlite or Postgres process prints once at boot while runs written before the relation columns
+ * are still unplaced: every lookup by person or thread reads all of them, so those queries are slow
+ * until the `relations` step has run — the answers stay complete, only the speed waits. Measured, 1 000
+ * 000 unplaced runs on Postgres: erasing a person 31 s (5 s placed), a person's run list 30 s (1 ms).
+ * During a rolling deploy the older processes keep writing unplaced runs, so run the step once they
+ * are gone; a process that boots before then says this again.
+ */
+export const RELATIONS_PENDING_ADVICE =
+  '@gnldev/durable: this store has runs written before the person/thread columns (an older version), ' +
+  'not placed in them yet. Answers stay complete, but every lookup by person or thread reads all of ' +
+  'those runs until they are placed: erasing a person, a person\'s run list ("my runs"), deleting a ' +
+  "thread with its runs — slow queries (1 000 000 runs on Postgres: ~30 s instead of milliseconds). " +
+  "Place them once no older process writes here: `gnl upgrade --only relations` " +
+  "(or `await storage.upgrade({ only: ['relations'] })`).";
+
+/**
+ * The `relations` step of a store with relation columns: fills `gnl_runs.resource_id`/`thread_id` and
+ * `gnl_run_journal.owner` for the rows written before them (an earlier version, or a process of one
+ * still running), from their own records, one page at a time. For SPEED only: every lookup by person
+ * or thread already reads the rows not placed yet and decides them from the record, so an erasure or a
+ * run list is complete before this step, during it, and if it never runs. Rows go store-wide, every
+ * organization's with the root's: a column is a property of the row, not of a scope.
+ * @internal
+ */
+export function relationsStep(store: RelationPlacer, requires?: readonly UpgradeStepName[]): UpgradeStep {
   return {
-    name: 'subject-index',
-    description: "indexes each person's runs and threads, so erasing a person stops reading the whole store",
+    name: 'relations',
+    description: "places each older run's person and thread, and each older thread owner record, in their columns, so lookups by person or thread read an index",
     ...(requires ? { requires } : {}),
-    async pending() {
-      for (const s of await scopes()) if (!(await subjectIndexComplete(s.journal))) return true;
-      return false;
-    },
+    pending: () => store.relationsPending(),
     async plan() {
-      const left: string[] = [];
-      for (const s of await scopes()) if (!(await subjectIndexComplete(s.journal))) left.push(s.name);
-      return { scopes: left, reads: 'every run and every thread owner record of each scope once, a page at a time' };
+      return { reads: "every run with no person placed yet (with its `:input`) and every owner record with none, a page at a time" };
+    },
+    run: () => store.placeRelations(),
+  };
+}
+
+/**
+ * The `verify-relations` step: every placement cleared and placed again from its record. For after a
+ * write the triggers never saw — `pg_restore --disable-triggers`, a logical-replication apply worker
+ * (`session_replication_role = replica`), triggers disabled or dropped and re-created by hand between two
+ * boots. The store cannot tell such a write from any other afterwards, so it is never pending on its
+ * own: an operator names it (`gnl upgrade --only verify-relations`). Until it finishes no relation column
+ * is trusted, so answers stay exact while it runs; it takes as long as the `relations` step on a store
+ * whose rows were never placed (1 000 000 runs on Postgres: ~6 min).
+ * @internal
+ */
+export function verifyRelationsStep(store: RelationPlacer, requires?: readonly UpgradeStepName[]): UpgradeStep {
+  return {
+    name: 'verify-relations',
+    description: 'clears every person/thread placement and places it again from its record — after a restore or replication that bypassed the triggers',
+    explicit: true,
+    ...(requires ? { requires } : {}),
+    pending: async () => false,
+    async plan() {
+      return { reads: 'every run and owner record: clears their placements, then places each again from its record' };
     },
     async run() {
-      const done: Record<string, { runs: number; threads: number }> = {};
-      for (const s of await scopes()) {
-        if (await subjectIndexComplete(s.journal)) continue;
-        done[s.name] = await writeSubjectIndex(s.journal);
-      }
-      return { scopes: done };
+      await store.requestRelationsVerify();
+      return store.placeRelations();
     },
   };
 }

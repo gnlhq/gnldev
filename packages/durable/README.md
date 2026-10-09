@@ -524,10 +524,8 @@ What each protection answers, in one line each:
   client retry horizon. `sweepRuns({ suspendedTtlMs })` gives abandoned suspended runs an expiry so
   they stop accumulating forever.
 
-Journal guidance: prefer Postgres. On Redis, configure
-`waitReplicas: { replicas: 1, timeoutMs: 1000, onTimeout: 'throw' }` and know the honest bound — the
-throw fires AFTER the write, so an unacknowledged claim becomes visible, not undone; treat thrown
-claims as a reconciliation suspect list. And the single-home bound, restated where it matters: every
+Journal guidance: prefer Postgres, run with synchronous replication if it replicates (see Production
+deployment notes below). And the single-home bound, restated where it matters: every
 guarantee above spans any number of workers on ONE journal store; two regions with independent
 journals are two independent dedup windows — route a runId to its home journal. Scope stated
 honestly: the preset wraps `run()`/`stream()`; `runWorkflow()`/`runNetwork()` entry paths are not
@@ -917,7 +915,7 @@ export function readerFor(journal: Journal & JournalReader, memory: Memory, user
 
 The journal is append-only by design, and these are the deliberate exception: permanent deletion,
 for a legal erasure request or an age-based retention policy. They all need the `deletePrefix` port
-(the InMemory/SQLite/Postgres/Redis adapters provide it) and throw a clear error where it is absent —
+(the InMemory/SQLite/Postgres adapters provide it) and throw a clear error where it is absent —
 a deletion that silently did nothing would be the worst possible failure here.
 
 | Call | Deletes | Reach for it when |
@@ -939,6 +937,18 @@ out: the journal, the memory store (threads, messages, observations, working mem
 store and the work log. It refuses, before deleting anything, a store that cannot delete what it
 holds. What lives outside the storage comes in as `erasers`: the background packages' own records,
 or a store of yours.
+
+**How it finds what is theirs.** On Sqlite and Postgres a run's person and thread, and a thread owner
+record's person, are columns the store fills in the same write as the record, whoever writes it — so the
+erasure (and a person's run list, `listRunsPaged({ resourceId })`) reads an index, not the whole store.
+A row written before those columns, or by a process of an older version during a rolling deploy, has no
+value yet; it is read too and decided from the record, never skipped. `storage.upgrade({ only:
+['relations'] })` fills those rows for speed — nothing depends on it having run. Two database triggers
+keep the columns true when another writer rewrites a record; after a write that bypassed them (a
+`pg_restore --disable-triggers`, a logical-replication apply worker), run `storage.upgrade({ only:
+['verify-relations'] })` (`gnl upgrade --only verify-relations`) to place every row again from its
+record. InMemory decides from the records directly; a journal of your own without these lookups is asked
+for every run.
 
 ```ts
 import { InMemoryStorage, eraseSubject, toJournal } from '@gnldev/durable';
@@ -1064,13 +1074,6 @@ The exactly-once guarantee rests on one precondition: **storage never loses an a
 - **Postgres (recommended `runs` backend):** run it with `synchronous_commit = on` +
   `synchronous_standby_names` (quorum). Under **asynchronous replication**, a primary failover can lose
   acknowledged CAS writes → the same tool can run twice.
-- **Redis:** since replication is always asynchronous, it is NOT RECOMMENDED for `runs` (the replay
-  journal) in failover setups — use `composite()` to keep `runs` on Postgres and use Redis for
-  `work`/`cache` (this is also how the adapter's capability design is meant to be used).
-- **Redis, listing:** the store lists a prefix through its own index (one sorted set per key space), so
-  a run costs the same beside a million other keys. A store an earlier version wrote lists by SCAN —
-  which walks the whole database — until every process runs this version and you run
-  `storage.upgrade()` (or `gnl upgrade`) once.
 - **SQLite:** meant for a single node; WAL mode gives sufficient filesystem durability.
 - **Outbound side effects:** the strongest end-to-end defense is using a provider-side **idempotency
   key** on tool calls (see the pattern in `test/idempotency-key.test.ts`) — regardless of the storage

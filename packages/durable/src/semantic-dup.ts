@@ -485,7 +485,7 @@ async function scanCandidates(journal: Journal, plan: SemPlan, ttlMs?: number): 
     if (!rec || rec.v !== 1) continue;
     // The cross-tool AND cross-thread gates are DECISIONS, so they are enforced against the record's
     // own ADDRESS — a raw prefix cannot carry either, on any backend (measured identically on
-    // InMemory, SQLite, Postgres and Redis). `xthr:<threadId>:sem-<toolName>-<argsHash>` is built
+    // InMemory, SQLite and Postgres). `xthr:<threadId>:sem-<toolName>-<argsHash>` is built
     // from separators that both threadIds and tool names may themselves contain, so the single
     // prefix `xthr:a:sem-order-` matches BOTH tool 'order-cancel' in thread 'a' AND tool 'order' in
     // a thread literally named 'a:sem-order-x'. The first leak quotes another TOOL's work into the

@@ -103,25 +103,22 @@ export function executedHere(record: { mirrorOf?: string; ranBy?: { runId: strin
 
 /**
  * Every optional concurrency primitive
- * below, per first-party adapter, with its ATOMICITY MECHANISM. All four first-party adapters
+ * below, per first-party adapter, with its ATOMICITY MECHANISM. All three first-party adapters
  * implement all four primitives ENGINE-ATOMICALLY on their primary paths — the "single-process safe
  * fallback" bounds documented in limits.ts/budget.ts/claim() apply ONLY to custom third-party
  * journals that omit a primitive.
  *
- *   primitive     InMemory        SQLite (multi-process via WAL)     Postgres                        Redis (real ioredis)
- *   ─────────     ────────        ──────────────────────────────     ────────                        ────────────────────
- *   putIfAbsent   sync Map        INSERT ON CONFLICT DO NOTHING      INSERT ON CONFLICT DO NOTHING   SET NX
- *   putIfMatch    sync Map        UPDATE WHERE value=?               UPDATE WHERE value=$            Lua CAS (eval)†
- *   incrBy        sync Map        UPSERT arithmetic                  UPSERT arithmetic               HINCRBYFLOAT
- *   claim (M4)    putIfAbsent     putIfAbsent                        putIfAbsent                     putIfAbsent
- *
- *   † a custom Redis client WITHOUT `eval` degrades putIfMatch to best-effort compare-then-set
- *     (documented, the core-hardening review); real ioredis always takes the atomic Lua path.
+ *   primitive     InMemory        SQLite (multi-process via WAL)     Postgres
+ *   ─────────     ────────        ──────────────────────────────     ────────
+ *   putIfAbsent   sync Map        INSERT ON CONFLICT DO NOTHING      INSERT ON CONFLICT DO NOTHING
+ *   putIfMatch    sync Map        UPDATE WHERE value=?               UPDATE WHERE value=$
+ *   incrBy        sync Map        UPSERT arithmetic                  UPSERT arithmetic
+ *   claim (M4)    putIfAbsent     putIfAbsent                        putIfAbsent
  *
  * PROOF, not prose: cross-PROCESS races on SQLite run in EVERY CI (multi-process-race.test.ts — two
  * OS processes, file barrier: run-lock / tool-claim / putIfAbsent grid / putIfMatch takeover / incrBy
- * storm, all exact). The REAL Postgres/Redis twins live in integration-real.test.ts (two pools/two
- * clients, GNL_INTEGRATION=1). Multi-process COLD START is part of the proof too — two booters on the
+ * storm, all exact). The REAL Postgres twins live in integration-real.test.ts (two pools,
+ * GNL_INTEGRATION=1). Multi-process COLD START is part of the proof too — two booters on the
  * same fresh SQLite file must both survive (busy_timeout-first + OR IGNORE seeding, see sqlite-storage.ts).
  *
  * SCOPE (honest bound): these guarantees hold for ANY number of workers sharing ONE journal store.
@@ -143,6 +140,16 @@ export interface Journal {
    */
   listKeys?(prefix: string, opts?: { limit?: number }): Promise<string[]>;
   /**
+   * (optional) The keys of the thread OWNER RECORDS (`…thread:<id>:owner`, see `isOwnerRecordKey`) under
+   * `prefix` whose record names `resourceId` — what an erasure asks instead of opening every thread's
+   * record. Exact: a key is listed only when its record names this person, however the store finds it.
+   * A store that keeps the owner in a column (Sqlite, Postgres: `ownerColumnOf`) reads the rows placed
+   * under that person AND every row not placed yet (written before the column, or by an older process),
+   * deciding those from the record itself; it never skips one. A journal without this method is asked the
+   * old way: every owner record, read one by one.
+   */
+  listOwnerRecords?(resourceId: string, opts?: { prefix?: string }): Promise<string[]>;
+  /**
    * Retention/GDPR (optional): PERMANENTLY deletes ALL keys starting with a prefix, returns the
    * number deleted. The single exception to the journal's append-only philosophy — only for lawful
    * deletion (PII purge) and retention sweeps; never used in the normal flow.
@@ -160,13 +167,13 @@ export interface Journal {
   putIfMatch?(key: string, expected: unknown, value: unknown): Promise<boolean>;
   /**
    * H2 (optional): the storage's OWN clock (epoch ms) — makes lock TTL decisions independent of
-   * worker wall-clock skew (Postgres `now()`, Redis `TIME`).
+   * worker wall-clock skew (Postgres `now()`).
    * If undefined, Date.now is used (no difference on single-machine setups).
    */
   now?(): Promise<number>;
   /**
    * H8a (optional): field-based ATOMIC counter increment — `value = value + delta` inside the engine
-   * (SQL UPSERT arithmetic / Redis HINCRBYFLOAT). Kills two ailments of get→put at once: the
+   * (SQL UPSERT arithmetic). Kills two ailments of get→put at once: the
    * lost-update race (two workers read the same value and add, one gets overwritten) and the hot-row
    * read-modify-write cost. Negative delta = decrement. budget.ts uses this when supported.
    * Resolves to the new value of each field it was given — what this increment made it, so a caller can
@@ -178,7 +185,7 @@ export interface Journal {
   getCounters?(key: string): Promise<Record<string, number> | undefined>;
   /**
    * P1.6b (optional): ATOMIC batch — claim (putIfAbsent semantics) + counter increments + plain puts as
-   * ONE all-or-nothing unit (SQL transaction / Redis Lua). If `claim` is given and its key EXISTS, the
+   * ONE all-or-nothing unit (a SQL transaction). If `claim` is given and its key EXISTS, the
    * WHOLE batch is a no-op and `false` is returned; otherwise everything applies and `true` is returned.
    * Motivation (metrics.ts recordRunMetrics): with the sequential claim→incrBy path, a crash between the
    * two loses one run's counter contribution forever (documented undercount window). applyBatch closes
@@ -189,7 +196,7 @@ export interface Journal {
   applyBatch?(batch: JournalBatch): Promise<boolean>;
   /**
    * P1.6b (optional): batch point-read — values for `keys`, ORDER-PRESERVING, `undefined` for misses
-   * (SQL `WHERE key IN` / Redis MGET). Kills the N-roundtrip pattern of reading N keys in a loop
+   * (SQL `WHERE key IN`). Kills the N-roundtrip pattern of reading N keys in a loop
    * (studio's /metrics/runs fast-rows). Semantically identical to `Promise.all(keys.map(get))`.
    */
   getMany?<T = unknown>(keys: string[]): Promise<(T | undefined)[]>;
@@ -487,7 +494,7 @@ export async function frozenGet<T>(journal: Journal, key: string, compute: () =>
 /** Context of a durable run: journal, run, optional policy and approvals. */
 import type { RunIdentity } from './identity-types.js';
 import { refuseUnknownNames } from '@gnldev/options';
-import { LIST_KEYS_NAMES, LIST_STALE_RUNS_NAMES } from './option-names.js';
+import { LIST_KEYS_NAMES, LIST_OWNER_RECORDS_NAMES, LIST_STALE_RUNS_NAMES } from './option-names.js';
 export interface DurableCtx {
   /** The maxToolCalls seats this run's calls hold, by toolCallId (limits.ts takeToolSeat) — so the
    *  write that counts a call can give its seat back in the same step. @internal */
@@ -770,6 +777,10 @@ export interface JournalReader {
     workKey?: string;
     /** Only runs no other run started (`RunSummary.parentRunId` absent). Same filter-before-slice contract. */
     topLevel?: boolean;
+    /** WHICH THREAD — matches `RunSummary.threadId` exactly; same filter-before-slice contract as `resourceId`. */
+    threadId?: string;
+    /** Runs whose id starts with this (see `ListQuery.runIdPrefix`); same filter-before-slice contract. */
+    runIdPrefix?: string;
     /** `'desc'` lists newest first; default `'asc'`. See `ListQuery.order`. */
     order?: RunOrder;
   }): Promise<{ items: RunSummary[]; nextCursor?: string }>;
@@ -783,8 +794,35 @@ export type RunListQuery = {
   resourceId?: string;
   workKey?: string;
   topLevel?: boolean;
+  threadId?: string;
+  runIdPrefix?: string;
   order?: RunOrder;
 };
+
+/**
+ * Every run a journal lists for one filter (a person, a thread), walking `listRunsPaged` to its end —
+ * on Sqlite and Postgres an index read of the placed rows plus the unplaced ones, elsewhere the
+ * listing's own filter. `undefined` for a journal that cannot list runs by page. A failed page is
+ * THROWN, never read as "no more runs": the callers are an erasure and an ownership question, and an
+ * empty answer there is a person's data reported gone, or a thread reported new.
+ * @internal
+ */
+export async function listRunsWhere(journal: Journal, q: { resourceId?: string; threadId?: string }): Promise<RunSummary[] | undefined> {
+  const paged = (journal as Partial<JournalReader>).listRunsPaged;
+  if (typeof paged !== 'function') return undefined;
+  const out: RunSummary[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await paged.call(journal, { ...q, limit: 200, ...(cursor ? { cursor } : {}) });
+    // Kept only when the summary itself says so: a journal written to an older listing contract — one
+    // that knew no `threadId` filter, a third party's — answers with every run, and taken as given that
+    // made every run "on the thread" (the gate refused a stranger on a new thread; an erasure kept the
+    // person's own). The filter is a speed-up the journal may offer, not the rule.
+    out.push(...page.items.filter((r) => (q.resourceId === undefined || r.resourceId === q.resourceId) && (q.threadId === undefined || r.threadId === q.threadId)));
+    cursor = page.nextCursor;
+  } while (cursor);
+  return out;
+}
 
 /**
  * A journal's runs, a page at a time, through whichever listing it has — for a pass over every run that
@@ -959,6 +997,69 @@ export function runIdOfKey(key: string, value?: unknown): string | null {
   return asInput && isVersionedRecord(value) ? asInput[1]! : null;
 }
 
+/**
+ * WHO AND WHERE a run is, as its `:input` record says: the person (`''` when it names nobody) and the
+ * thread (`null` when it has none). The one derivation behind Sqlite's and Postgres's relation columns
+ * (`gnl_runs.resource_id`, `gnl_runs.thread_id`) — the same fields, read the same way, as the summary
+ * `listRuns` builds from that record (a truthy string), so a column can never place a run where the
+ * listing's own filter (`matchesRunFilter`) would not find it.
+ */
+export interface RunRelations { resourceId: string; threadId: string | null }
+export function relationsOfInput(input: unknown): RunRelations {
+  const v = (typeof input === 'object' && input !== null ? input : {}) as { resourceId?: unknown; threadId?: unknown };
+  return {
+    resourceId: typeof v.resourceId === 'string' ? v.resourceId : '',
+    threadId: typeof v.threadId === 'string' && v.threadId !== '' ? v.threadId : null,
+  };
+}
+
+/**
+ * The relation columns a WRITE places: only a run's own `:input` record (versioned, the same proof
+ * `runIdOfKey` asks for — the write that registers the run). `undefined` for every other write. An
+ * adapter calls it inside the transaction that writes the record, so the row and its columns land
+ * together, and the loser of a `putIfAbsent` places nothing.
+ */
+export function runRelationsOf(key: string, value: unknown): (RunRelations & { runId: string }) | undefined {
+  // The run `runIdOfKey` registers, and only when this key IS that run's `:input`: `r9:tool:call:input`
+  // is a tool record of r9, not the input of a run `r9:tool:call` (it once made Postgres list one).
+  const runId = runIdOfKey(key, value);
+  if (runId === null || key !== `${runId}:input`) return undefined;
+  return { runId, ...relationsOfInput(value) };
+}
+
+/**
+ * A thread OWNER RECORD's key — `thread:<id>:owner`, under any organization prefix. Written as the SQL
+ * patterns too (Postgres `LIKE`, Sqlite `GLOB`, which unlike Sqlite's `LIKE` keeps case), and the three
+ * say the same thing: the rows an adapter gives an owner column are exactly the rows its "not placed
+ * yet" read looks at.
+ */
+export const OWNER_RECORD_LIKE = '%thread:%:owner';
+export const OWNER_RECORD_GLOB = '*thread:*:owner';
+export const isOwnerRecordKey = (key: string): boolean => /thread:[\s\S]*:owner$/.test(key);
+
+/** The person an owner record names, or `undefined` for one that names nobody (staff, legacy, unknown). */
+export function ownerOfRecord(value: unknown): string | undefined {
+  const r = (typeof value === 'object' && value !== null ? value : {}) as { resourceId?: unknown };
+  return typeof r.resourceId === 'string' && r.resourceId !== '' ? r.resourceId : undefined;
+}
+
+/**
+ * The owner column a write gives a key (`gnl_run_journal.owner`):
+ *  - `null` for any key that is not an owner record;
+ *  - the person, for a record that names one;
+ *  - `''` for a record STAFF claimed — no one, and nothing but an operator moves it;
+ *  - `null` again for a record that names nobody and is not staff's (a legacy `{ at }`, an `unknown`
+ *    one): `threadOwnerOf` may still upgrade it to the person a memory names, so it is not placed —
+ *    every lookup reads it and decides from the record, as for a row written before the column.
+ * NULL is therefore always "decide from the record", never "nobody".
+ */
+export function ownerColumnOf(key: string, value: unknown): string | null {
+  if (!isOwnerRecordKey(key)) return null;
+  const owner = ownerOfRecord(value);
+  if (owner !== undefined) return owner;
+  return (value as { ownerKind?: unknown } | null | undefined)?.ownerKind === 'staff' ? '' : null;
+}
+
 /** Carries stampFormat's version marker → written by the journal itself, not by a caller's payload. */
 export function isVersionedRecord(value: unknown): boolean {
   return typeof value === 'object' && value !== null && '_v' in (value as Record<string, unknown>);
@@ -1078,7 +1179,7 @@ export class InMemoryJournal implements Journal, JournalReader {
 
   // P1.6b: atomic batch — no await between the claim check and the writes → structurally atomic in
   // single-threaded JS (the same argument as putIfAbsent/putIfMatch above). Mirrors the SQL-transaction/
-  // Redis-Lua semantics of the real adapters: claim exists → NOTHING is applied.
+  // semantics of the real adapters: claim exists → NOTHING is applied.
   async applyBatch(batch: JournalBatch): Promise<boolean> {
     if (batch.claim) {
       if (this.store.has(batch.claim.key)) return false;
@@ -1157,6 +1258,18 @@ export class InMemoryJournal implements Journal, JournalReader {
   // are included below wherever store keys are.
   keys(): string[] {
     return [...new Set([...this.store.keys(), ...this.counters.keys()])];
+  }
+
+  /**
+   * See `Journal.listOwnerRecords`. Decided from each record, in memory — there is no column to place and
+   * so no row that can be "not placed yet": the record is always at hand.
+   */
+  async listOwnerRecords(resourceId: string, opts?: { prefix?: string }): Promise<string[]> {
+    refuseUnknownNames('listOwnerRecords', opts, LIST_OWNER_RECORDS_NAMES);
+    const prefix = opts?.prefix ?? '';
+    const out: string[] = [];
+    for (const [k, v] of this.store) if (k.startsWith(prefix) && isOwnerRecordKey(k) && ownerOfRecord(v) === resourceId) out.push(k);
+    return out;
   }
 
   async listKeys(prefix: string, opts?: { limit?: number }): Promise<string[]> {

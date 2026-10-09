@@ -22,7 +22,7 @@ A caller-supplied id can put those words in a middle segment. A thread named `mo
 `org:tool:…`, which reads as a run called `org`. Purging that "run" by prefix would delete the whole
 `mem:` or `org:` keyspace — every thread, every organization, not one run.
 
-Measured on Postgres, Redis and SQLite: one such id, one purge, and two unrelated users' threads
+Measured on Postgres and SQLite: one such id, one purge, and two unrelated users' threads
 were gone.
 
 The answer is 409 rather than 404 deliberately. The row is there and you can see it listed;

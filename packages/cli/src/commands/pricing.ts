@@ -29,7 +29,7 @@ interface Doc { version: number; models: Record<string, Row>; replace?: boolean;
  * The document as stored, plus the RAW value it came back as.
  *
  * The raw value is the compare-and-set operand. Every adapter compares the SERIALISED form (sqlite
- * `value = ?`, postgres/redis serialize(expected), in-memory stableStringify), so a normalised copy —
+ * `value = ?`, postgres serialize(expected), in-memory stableStringify), so a normalised copy —
  * which is what the object below is, with its defaults filled in — never matches and the CAS always
  * loses. Learned the hard way in run-lock.ts; repeated here so it is not learned twice.
  */

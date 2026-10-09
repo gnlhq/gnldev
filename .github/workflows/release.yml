@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   # The SAME gates a push to main runs, by reference rather than by restatement — whatever ci.yml
-  # defines, including the real-backend matrix (Postgres in both collations + Redis). `publish` needs
+  # defines, including the real-backend matrix (Postgres in both collations). `publish` needs
   # this, so a red gate stops the release before npm.
   #
   # Deliberately not a list: enumerating the jobs here re-creates by hand the drift this job exists to

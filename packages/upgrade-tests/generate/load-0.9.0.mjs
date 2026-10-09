@@ -37,7 +37,7 @@ export function install090(dir) {
   const target = dir ? resolve(dir) : mkdtempSync(join(tmpdir(), 'gnl-090-'));
   mkdirSync(target, { recursive: true });
   writeFileSync(join(target, 'package.json'), JSON.stringify({ name: 'gnl-090-install', private: true, type: 'module' }));
-  const specs = [...PACKAGES_090.map((p) => `@gnldev/${p}@0.9.0`), 'ai@^7', 'zod@^3.25.76', 'pg@^8', 'ioredis@^5'];
+  const specs = [...PACKAGES_090.map((p) => `@gnldev/${p}@0.9.0`), 'ai@^7', 'zod@^3.25.76', 'pg@^8'];
   console.error(`installing ${specs.join(' ')} into ${target} …`);
   execSync(`npm install --no-audit --no-fund --loglevel=error ${specs.join(' ')}`, { cwd: target, stdio: 'inherit' });
   assert090(target);

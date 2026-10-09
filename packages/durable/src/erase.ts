@@ -30,12 +30,11 @@ import { orgVectorDelete, orgStorageScopeOf, withOrgStorage } from './org-storag
 import { toJournal, isStorage, workingMemoryScope, legacyWorkingMemoryScope, MEMORY_PARTITION } from './storage.js';
 import { memKey, MEM_LEAVES, OM_VECTOR_SOURCE, semanticLogKey } from './memory.js';
 import type { Memory } from './memory.js';
-import { runKeys } from './journal.js';
+import { runKeys, listRunsWhere } from './journal.js';
 import type { Journal } from './journal.js';
 import type { MemoryStore, Storage, WorkStore } from './storage.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { ERASE_SUBJECT_NAMES, RESERVED_ROOT_THREADS_NAMES, SUBJECT_RUNS_NAMES } from './option-names.js';
-import { runsOfSubject, subjectIndexComplete, indexedIds } from './subject-index.js';
 
 /** One package's share of a person's erasure (`jobEraser`, `triggerEraser`, `eventEraser`), or a store outside the storage. */
 export interface SubjectEraser {
@@ -279,10 +278,12 @@ export async function subjectRuns(storage: Storage, resourceId: string, opts: { 
   const journal = toJournal(storage.runs);
   const outside = opts.orgId === undefined;
   const runs = outside ? journal : withOrg(journal, opts.orgId!);
-  if (typeof (runs as unknown as { listRunsPaged?: unknown }).listRunsPaged !== 'function') throw new Error('@gnldev/durable: subjectRuns needs a journal that lists runs by owner (listRunsPaged)');
+  // By person: on Sqlite and Postgres the person's placed runs plus every run not placed yet, by index
+  // (`keysetRunPage`); elsewhere the listing's own filter over every run.
+  const mine = await listRunsWhere(runs, { resourceId });
+  if (mine === undefined) throw new Error('@gnldev/durable: subjectRuns needs a journal that lists runs by owner (listRunsPaged)');
   const out: SubjectRun[] = [];
-  // From the person's index once the scope's is complete, by walking every run before (subject-index.ts).
-  for (const r of await runsOfSubject(runs, resourceId)) {
+  for (const r of mine) {
     if (outside && isOrganizationKey(r.runId)) continue;
     const outcome = await runs.get<{ status?: unknown }>(runKeys.outcome(r.runId));
     const inFlight = outcome?.status === 'running' || (await hasRunningClaim(runs, r.runId));
@@ -356,11 +357,15 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
   const asker = stores[0] ? ownerAsker(stores[0].store) : undefined;
 
   // Threads first, while the owner records still exist: the ones this person owns, by the ONE question.
-  // From the person's index once the scope's is complete; before, every thread's owner record. Each is
-  // checked below with threadOwnerOf either way: the index names candidates, the record decides.
+  // A store that keeps the owner in a column lists this person's records (the placed ones and every one
+  // not placed yet, decided from the record — `listOwnerRecords`); any other is asked for every thread's
+  // record. Each is checked below with threadOwnerOf either way: the listing names candidates, the
+  // record decides.
   const ownedByRecord = new Set<string>();
-  if (await subjectIndexComplete(runs)) for (const t of await indexedIds(runs, 'thread', resourceId)) ownedByRecord.add(t);
-  else for (const k of (await runs.listKeys?.('thread:')) ?? []) if (k.endsWith(':owner')) ownedByRecord.add(k.slice('thread:'.length, -':owner'.length));
+  const ownerKeys = runs.listOwnerRecords
+    ? await runs.listOwnerRecords(resourceId, { prefix: 'thread:' })
+    : (await runs.listKeys?.('thread:')) ?? [];
+  for (const k of ownerKeys) if (k.startsWith('thread:') && k.endsWith(':owner')) ownedByRecord.add(k.slice('thread:'.length, -':owner'.length));
   // Outside organizations, a thread under an `org:` id is the root's to erase only when it is CERTAINLY
   // the root's (`reservedThreadVerdict`); an organization's goes with that organization's erasure, and
   // an undecided one is reported, not deleted. Asked before `threadOwnerOf`, which would backfill.

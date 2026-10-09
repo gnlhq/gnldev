@@ -174,7 +174,6 @@ graph TB
         A1["InMemory<br/>(test/geliştirme)"]
         A2["SQLite<br/>(tek makine,<br/>sıfır kurulum)"]
         A3["Postgres<br/>(çok sunuculu<br/>üretim)"]
-        A4["Redis<br/>(hızlı kuyruk/<br/>önbellek)"]
     end
     Storage --- Adaptörler
 ```
@@ -183,10 +182,11 @@ Her adaptör her limanı desteklemek ZORUNDA değil — **capability matrix** (y
 ne verebildiğini söyler ve `composite()` (birleştirici) ile limanlar farklı motorlara dağıtılır:
 
 ```ts
-// Örnek: koşu defteri Postgres'te (dayanıklılık), kuyruk+önbellek Redis'te (hız):
+// Örnek: her şey Postgres'te, thread belleği yerel bir SQLite dosyasında — pg_advisory_xact_lock'u
+// olmayan Postgres uyumlu bir sunucu için; orada Postgres bellek portunu kapatır (açılış uyarısına bakın):
 const storage = composite({
   default: new PostgresStorage({ connectionString: PG_URL }),
-  overrides: { work: redis, cache: redis }, // redis = new RedisStorage({...})
+  overrides: { memory: new SqliteStorage('memory.db') },
 });
 ```
 
@@ -195,10 +195,9 @@ const storage = composite({
 | InMemory | ✅ | ✅ | ✅ | ✅ | ✅ | Test, prototip. |
 | SQLite | ✅ | ✅ | ✅ (tarama) | ✅ | ✅ | Tek makine, sıfır kurulum (Node'a gömülü). |
 | Postgres | ✅ | ✅ | ✅ (tarama) | ✅ | ✅ | Çok sunuculu üretim. **Önerilen defter.** |
-| Redis | ✅* | ❌ | ❌ | ✅ | ✅ (gerçek TTL) | Kuyruk/önbellek hızlandırıcı. *Defter için failover'lı kurulumda önerilmez (aşağıda). |
 
 Hücreler adaptörlerin kendi `capabilities` matrisinin birebir aktarımı (`postgres-storage.ts`,
-`sqlite-storage.ts`, `redis-storage.ts`, `in-memory-storage.ts`).
+`sqlite-storage.ts`, `in-memory-storage.ts`).
 
 > **`scan` (tarama), pgvector değil.** SQLite *ve* Postgres adaptörlerinin `vectors` limanı
 > embedding'i TEXT kolonda tutar ve kosinüs benzerliğini **JavaScript'te, uygun tüm satırlar
@@ -308,9 +307,9 @@ karakter, o yüzden her parça birleştirilmeden önce yeniden yazılır: `:` �
 `refunds` konusundaki `billing:eu` adlı tüketici bu yüzden `evtack:refunds:billing%3Aeu:<id>`
 altında durur; `LIKE 'evtack:refunds:billing:eu:%'` hiçbir şey bulmaz. Aynı kaçışlama ⑧'deki defter
 ad alanına da uzanır: `orders:eu` konusu `gnl_work_log.ns = 'evt:orders%3Aeu'` olarak durur. Bu bir
-düzen kaygısı değil — `WorkStore.list(ns)` burada tam-değer eşleşmesidir, ama Redis adaptörü ad
-alanından bir anahtar türetiyor ve onu önek taramasıyla geri okuyordu; bu da bir konuya başka bir
-konunun olaylarını teslim ediyordu.
+düzen kaygısı değil — `WorkStore.list(ns)` burada tam-değer eşleşmesidir, ama ad alanından bir
+anahtar türetip onu önek taramasıyla geri okuyan bir depo (GNL'in kaldırılan Redis adaptörü böyleydi)
+bir konuya başka bir konunun olaylarını teslim eder.
 
 **⑩ `gnl_cache` — süreli önbellek.** `key, value, expires_at (son kullanma zamanı)`. Koşular
 ARASI tekrar kullanım için (örn. aynı metnin embedding'i iki koşuda → bir kez hesapla).
@@ -817,7 +816,7 @@ koşu.** Bu tercih birinci listeyi kazandırıyor, ikincisine mal oluyor.
 
 | Yetenek | Pratikte ne demek |
 |---|---|
-| **At-most-once yan etki** | Tamamlandığı kayda geçmiş bir araç çağrısı ikinci kez çalışmaz — CAS ile zorlanır, iki ayrı işletim sistemi süreciyle ve CI'da gerçek Postgres/Redis'e karşı doğrulanır |
+| **At-most-once yan etki** | Tamamlandığı kayda geçmiş bir araç çağrısı ikinci kez çalışmaz — CAS ile zorlanır, iki ayrı işletim sistemi süreciyle ve CI'da gerçek Postgres'e karşı doğrulanır |
 | **Deterministic replay** | Aynı koşu, modele tekrar gitmeden aynı sonuca kurulur — modelin cevabı journal'da, sadece durum değil |
 | **Time-travel + fork** | Geçmişteki herhangi bir adıma dönüp oradan dallanma, Studio'da görsel olarak |
 | **Model fallback kalıcı** | Gerçekte kazanan model journal'a yazılır; resume zarı yeniden atmaz, ona yapışır |
@@ -847,7 +846,7 @@ Evet; iddiaların çoğu **gerçek motorlarda canlı testlerle** kanıtlı — t
 `packages/durable/test/` altında:
 
 - **Çok-sunucu CAS yarışı:** iki ayrı Postgres bağlantı havuzu aynı anahtara aynı anda yazıyor →
-  her seferinde TAM BİR kazanan (20 tur + 10'lu fırtına). Redis'te aynı (SET NX).
+  her seferinde TAM BİR kazanan (20 tur + 10'lu fırtına).
 - **Canlı failover** (sunucu değişimi): birincil Postgres **SIGKILL ile öldürüldü**, yedek terfi
   ettirildi → 30/30 onaylı yazı korundu, at-most-once garantisi sürdü. (Ön koşul: **senkron replikasyon** —
   `synchronous_commit = on` ve senkron bir standby; asenkron kurulumda bu garanti YOKTUR. Koşulun
@@ -883,7 +882,7 @@ o kaydı okur, modele hiç gitmez.
 Mistral... `'sağlayıcı/model'` yazman yeterli; sağlayıcı paketleri ancak kullanılırsa yüklenir.
 
 **"En küçük başlangıç?"** `npm create gnl` → SQLite ile tek dosya kalıcılık, sunucu ve Studio
-dahil çalışan iskelet. Postgres/Redis üretime geçerken tek satır `storage` değişikliğidir.
+dahil çalışan iskelet. Postgres'e üretimde geçmek tek satır `storage` değişikliğidir.
 
 ---
 
@@ -1174,9 +1173,9 @@ Tek cümlelik özet: **resume = geçmişe sadakat (üretim güvenliği), replay/
 | LLM soyutlaması | **Vercel AI SDK** (`ai`) | En kritik bağımlılık: OpenAI/Anthropic/Google/Mistral'e TEK arayüz. `runDurable` aslında `generateText`'in dayanıklı sarmalayıcısıdır — sağlayıcı kilidi yok. |
 | Şema doğrulama | Zod | Araç girdi şemaları (LLM'in araca göndereceği parametrelerin biçim kontrolü). |
 | Web çatısı | **Hono** | Server/Studio/auth'un HTTP katmanı. Express yerine Hono: hem Node'da hem edge'de (Cloudflare Workers) aynen çalışır, çok küçüktür — "küçük edge bundle" iddiasının temeli. |
-| Depolama | SQLite / PostgreSQL / Redis | §5'teki adaptörler; hepsi OPSİYONEL bağımlılık (kullanmadığın sürücü yüklenmez — lazy import). |
+| Depolama | SQLite / PostgreSQL | §5'teki adaptörler; hepsi OPSİYONEL bağımlılık (kullanmadığın sürücü yüklenmez — lazy import). |
 | Serileştirme | superjson | Kayıt→metin çevirimi; düz JSON'dan farkı `Date` gibi tipleri kaybetmemesi. |
-| Test | Vitest + pg-mem + Docker | 548 dosyada 5.004 geçen test (14 Eyl 2026); pg-mem = bellek-içi sahte Postgres (hızlı); Docker compose'ları = GERÇEK PG/Redis entegrasyonu + canlı failover senaryosu. |
+| Test | Vitest + pg-mem + Docker | 548 dosyada 5.004 geçen test (14 Eyl 2026); pg-mem = bellek-içi sahte Postgres (hızlı); Docker compose'ları = GERÇEK PG entegrasyonu + canlı failover senaryosu. |
 | Paketleme | — | Gerekmiyor: `createRestApi()` web standardı bir fetch handler döndürüyor, her platform onu zaten kendi yöntemiyle paketliyor. |
 | Studio arayüzü | React + TanStack Query + Recharts | Panel ön yüzü: arayüz + veri çekme/önbellek + grafikler. |
 | Gözlemlenebilirlik | OTLP/HTTP (elle, ~8KB) | İzleri dış araçlara gönderme; koca OTel SDK yerine elle yazılmış çevirici (ince-kal felsefesi). Canlı mod ayrıca OTel SDK'sını opsiyonel kullanır. |

@@ -8,15 +8,10 @@
 // Measured on the first cut of the sequenced cursor (review panel, round 2): a 0.9 process keeps
 // running its own INSERT, which names no `seq`, so its rows took the column default 0 and sorted AHEAD
 // of every sequenced row — behind any cursor this version had saved, forever (SQLite and Postgres:
-// "pending 3" after a full drain). On Redis the new value format `<seq>|<record>` made a 0.9 reader's
-// `superjson.parse` throw a SyntaxError on every record this version wrote.
+// "pending 3" after a full drain).
 //
 // Each case below writes the way 0.9.0 wrote — its exact statement or its exact value format, from a
 // separate connection, as the old process does — and reads the way this version reads.
-//
-// On Redis the store already holds a 0.9 record when this version first touches it, as it does in a real
-// rolling deploy: that is what keeps this version listing by SCAN (IndexGate) until every process is
-// upgraded. A NEW store started with 0.9 processes writing beside this version is not supported there.
 import { describe, it, expect, afterAll } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -24,31 +19,25 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { newDb } from 'pg-mem';
 import superjson from 'superjson';
-import { RedisStorage } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { makeFakeRedis } from './fake-redis.js';
 import type { WorkStore } from '../src/index.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
 
 const RUN = process.env.GNL_INTEGRATION === '1';
 const PG_URL = process.env.GNL_PG_URL ?? 'postgres://postgres:gnl@localhost:55432/gnl';
-const REDIS_URL = process.env.GNL_REDIS_URL ?? 'redis://localhost:6380';
 const SEED = `rd${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
-/** 0.9.0's exact SQL, and its exact Redis value/key format. */
+/** 0.9.0's exact SQL. */
 const OLD_SQLITE_APPEND = 'INSERT INTO gnl_work_log (ns, id, payload, ts) VALUES (?, ?, ?, ?) ON CONFLICT(ns, id) DO NOTHING';
 const OLD_PG_APPEND = 'INSERT INTO gnl_work_log (ns, id, payload, ts) VALUES ($1,$2,$3,$4) ON CONFLICT (ns, id) DO NOTHING';
-const encNs = (ns: string) => ns.replace(/%/g, '%25').replace(/:/g, '%3A');
 
 interface Mixed {
   /** This version's store. */
   work: WorkStore;
   /** A 0.9 process appending to the same log. `ts` defaults to its own `Date.now()`. */
   oldAppend(ns: string, id: string, payload: unknown, ts?: number): Promise<void>;
-  /** A 0.9 process reading every record's raw value the way its `list` did (Redis only). */
-  oldParseAll?(ns: string): Promise<unknown[]>;
   close?(): Promise<void>;
 }
 
@@ -76,30 +65,6 @@ function pgMemMixed(): Mixed {
     async oldAppend(ns, id, payload, ts = Date.now()) {
       await s.init();
       await pool.query(OLD_PG_APPEND, [ns, id, superjson.stringify(payload), ts]);
-    },
-  };
-}
-
-async function redisMixed(client: any, prefix: string): Promise<Mixed> {
-  // What the 0.9 process wrote before this version started (see the header).
-  await client.set(`${prefix}wl:${encNs('rolling:before')}:seed`, superjson.stringify({ id: 'seed', payload: 0, ts: 0 }), 'NX');
-  const s = new RedisStorage({ client, keyPrefix: prefix });
-  return {
-    work: s.work!,
-    async oldAppend(ns, id, payload, ts = Date.now()) {
-      await client.set(`${prefix}wl:${encNs(ns)}:${id}`, superjson.stringify({ id, payload, ts }), 'NX');
-    },
-    async oldParseAll(ns) {
-      const keys: string[] = [];
-      let cursor: string | number = '0';
-      do {
-        const [next, found] = await client.scan(cursor, 'MATCH', `${prefix}wl:${encNs(ns)}:*`, 'COUNT', 1000);
-        keys.push(...found);
-        cursor = next;
-      } while (String(cursor) !== '0');
-      const out: unknown[] = [];
-      for (const k of keys) out.push(superjson.parse(String(await client.get(k)))); // 0.9: deserialize<LogRecord>(s)
-      return out;
     },
   };
 }
@@ -181,69 +146,11 @@ function contract(name: string, make: () => Promise<Mixed> | Mixed) {
 
 contract('sqlite (two connections to one file)', sqliteMixed);
 contract('postgres (pg-mem)', pgMemMixed);
-contract('redis (fake)', () => redisMixed(makeFakeRedis(), 'gnl:'));
-
-describe('rolling deploy — a 0.9 Redis reader parses what this version writes', () => {
-  it('fake: every value (appended, and after this version has read the log) is a record 0.9 can parse', async () => {
-    const m = await redisMixed(makeFakeRedis(), 'gnl:');
-    const ns = freshNs();
-    for (const id of range('new-', 5)) await m.work.append(ns, { v: 1 }, id);
-    const shape = (xs: unknown[]) => xs.map((x: any) => [x.id, x.payload?.v, typeof x.ts]).sort();
-    expect(shape(await m.oldParseAll!(ns))).toEqual(range('new-', 5).map((id) => [id, 1, 'number']));
-    await readFrom(m.work, ns, undefined);
-    expect(shape(await m.oldParseAll!(ns))).toEqual(range('new-', 5).map((id) => [id, 1, 'number']));
-  });
-});
-
-describe('rolling deploy — Redis: a record numbered while a reader\'s SCAN is running', () => {
-  // SCAN is not a snapshot: a key created during it may be missed while an older one is returned. Here
-  // a 0.9 producer with a slow clock writes y DURING reader R's scan, and a second reader numbers y
-  // BEFORE the x and z R's scan did return (y is older by its clock). Had R paged by the numbers it
-  // read, its full page would end at x and persist a cursor past y — which R never saw.
-  it('the reader does not page past a number it could have missed: y, x and z are all read', async () => {
-    const inner = makeFakeRedis();
-    let during: (() => Promise<void>) | undefined;
-    const client = new Proxy(inner, {
-      get(t, p) {
-        if (p === 'scan') {
-          return async (...a: Parameters<typeof t.scan>) => {
-            const r = await t.scan(...a);
-            const h = during;
-            during = undefined;
-            if (h) await h();
-            return r;
-          };
-        }
-        const v = (t as any)[p];
-        return typeof v === 'function' ? v.bind(t) : v;
-      },
-    });
-    const r = await redisMixed(client, 'gnl:');
-    const r2 = await redisMixed(client, 'gnl:');
-    const ns = freshNs();
-    for (const id of range('new-', 60)) await r.work.append(ns, { v: 1 }, id);
-    const first = await r.work.list(ns, { limit: 50 });
-    const c50 = first.nextCursor!;
-    const base = Date.now();
-    await r.oldAppend(ns, 'old-x', { v: 2 }, base + 3000);
-    await r.oldAppend(ns, 'old-z', { v: 2 }, base + 4000);
-    during = async () => {
-      await r.oldAppend(ns, 'old-y', { v: 2 }, base + 1000);
-      await r2.work.list(ns, { limit: 1 }); // numbers y, x, z in that order
-    };
-    const page = await r.work.list(ns, { cursor: c50, limit: 11 });
-    const rest = await readFrom(r.work, ns, page.nextCursor ?? c50);
-    const seen = new Set([...page.items.map((x) => x.id), ...rest.ids]);
-    expect(['old-y', 'old-x', 'old-z'].filter((id) => !seen.has(id))).toEqual([]);
-  });
-});
 
 describe.skipIf(!RUN)('rolling deploy — live backends', () => {
   const pools: Array<{ end(): Promise<void> }> = [];
-  const redisClients: Array<{ quit(): Promise<unknown> }> = [];
   afterAll(async () => {
     for (const p of pools) await p.end();
-    for (const c of redisClients) await c.quit();
   });
   const pgLive = async (): Promise<Mixed> => {
     const { Pool } = await import('pg');
@@ -257,21 +164,5 @@ describe.skipIf(!RUN)('rolling deploy — live backends', () => {
       async oldAppend(ns, id, payload, ts = Date.now()) { await theirs.query(OLD_PG_APPEND, [ns, id, superjson.stringify(payload), ts]); },
     };
   };
-  const redisLive = async (): Promise<Mixed> => {
-    const { default: Redis } = await import('ioredis');
-    const client = new Redis(REDIS_URL, { maxRetriesPerRequest: 2 });
-    redisClients.push(client);
-    return redisMixed(client, `${SEED}:`);
-  };
   contract('postgres (live)', pgLive);
-  contract('redis (live)', redisLive);
-
-  it('redis (live): a 0.9 reader parses every value this version wrote or renumbered', async () => {
-    const m = await redisLive();
-    const ns = freshNs();
-    for (const id of range('new-', 5)) await m.work.append(ns, { v: 1 }, id);
-    await readFrom(m.work, ns, undefined);
-    const parsed = await m.oldParseAll!(ns);
-    expect(parsed.map((x: any) => x.id).sort()).toEqual(range('new-', 5));
-  });
 });

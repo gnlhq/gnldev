@@ -61,10 +61,15 @@ describe('SqliteStorage schema tooling', () => {
     raw.exec('ALTER TABLE gnl_runs DROP COLUMN running');
     raw.exec('ALTER TABLE gnl_runs DROP COLUMN canceled');
     raw.exec('DROP TABLE gnl_counters');
+    // An index added to an EXISTING table — what `CREATE TABLE IF NOT EXISTS` can never bring, and the
+    // schema step used to have no way to add: the relation indexes.
+    raw.exec('DROP INDEX gnl_runs_resource');
+    raw.exec('DROP INDEX gnl_run_journal_owner');
 
     const before = await storage.checkSchema();
     expect(before.ok).toBe(false);
     expect(before.missingTables).toEqual(['gnl_counters']);
+    expect(before.missingIndexes!.sort()).toEqual(['gnl_run_journal_owner', 'gnl_runs_resource']);
     // Both added-later columns are reported. `failed` (the run-outcome flag) arrived the same way
     // suspended_count did, and the introspection picks it up from the DDL without being told.
     expect(before.missingColumns.map((c) => c.column).sort()).toEqual(['canceled', 'failed', 'running', 'suspended_count']);
@@ -88,6 +93,7 @@ describe('SqliteStorage schema tooling', () => {
     expect(after.ok).toBe(true);
     expect(after.missingTables).toEqual([]);
     expect(after.missingColumns).toEqual([]);
+    expect(after.missingIndexes).toEqual([]);
 
     // the storage actually WORKS after migration: a journal write/read + incrBy (gnl_counters, the
     // table that was entirely missing) both round-trip correctly.
@@ -141,7 +147,8 @@ describe('PostgresStorage schema tooling (pg-mem)', () => {
     expect(before.ok).toBe(false);
     // Both added-later columns are reported. `failed` (the run-outcome flag) arrived the same way
     // suspended_count did, and the introspection picks it up from the DDL without being told.
-    expect(before.missingColumns.map((c) => c.column).sort()).toEqual(['canceled', 'failed', 'running', 'suspended_count']);
+    // …and so are the relation columns (a run's person and thread), the same additive shape.
+    expect(before.missingColumns.map((c) => c.column).sort()).toEqual(['canceled', 'failed', 'resource_id', 'running', 'suspended_count', 'thread_id']);
     expect(before.missingColumns.every((c) => c.table === 'gnl_runs')).toBe(true);
     expect(before.missingTables.sort()).toEqual(
       ['gnl_counters', 'gnl_run_journal', 'gnl_threads', 'gnl_messages', 'gnl_working_memory', 'gnl_observations', 'gnl_message_batches', 'gnl_vectors', 'gnl_work_log', 'gnl_work_kv', 'gnl_work_seq', 'gnl_cache'].sort(),

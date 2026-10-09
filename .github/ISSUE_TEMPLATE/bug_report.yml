@@ -59,7 +59,6 @@ body:
         - InMemoryJournal
         - SqliteStorage
         - PostgresStorage
-        - Redis
         - Custom / other
     validations:
       required: true

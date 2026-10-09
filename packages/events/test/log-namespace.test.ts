@@ -2,11 +2,11 @@
 // deliberately left out.
 //
 // That exclusion was argued from the WorkStore PORT: `list(ns)` is defined as "the records appended
-// under exactly this ns", so a namespace needs no escaping — the store matches it whole. Three of the
-// four shipped adapters do exactly that (InMemory: a Map keyed by ns; SQLite/Postgres: `WHERE ns = ?`).
-// The fourth did not. RedisWorkStore stored a record at `<pfx>wl:<ns>:<id>` and read a namespace back
-// with `SCAN MATCH <pfx>wl:<ns>:*` — a PREFIX scan with `:` as an unescaped delimiter on BOTH sides of
-// the join. Measured on a real Redis 7 before the fix:
+// under exactly this ns", so a namespace needs no escaping — the store matches it whole. The
+// first-party stores do exactly that (InMemory: a Map keyed by ns; SQLite/Postgres: `WHERE ns = ?`).
+// GNL's own Redis adapter, since removed, did not: it stored a record at `<pfx>wl:<ns>:<id>` and read
+// a namespace back with `SCAN MATCH <pfx>wl:<ns>:*` — a PREFIX scan with `:` as an unescaped delimiter
+// on BOTH sides of the join. Measured on a real Redis 7 before the fix:
 //
 //   F1  'orders' consumer received: 2 ["global-order","EU-ONLY-ORDER"]   <- never subscribed to 'orders:eu'
 //   F2  emit returns: ["x","eu:x"]                                        <- both reported success
@@ -14,42 +14,26 @@
 //       KEYS: [... "wl:evt:inv:eu:x" ...]                                 <- ONE key for TWO events
 //
 // F2 is the worse half: `emit` returns an event id for a record that `SET NX` silently refused,
-// because a different topic's (ns, id) split hashed onto the same Redis key. No dead-letter row, no
-// log line — the exact class of loss the escaping round existed to remove.
+// because a different topic's (ns, id) split hashed onto the same key. No dead-letter row, no log
+// line — the exact class of loss the escaping round existed to remove.
 //
-// This file pins BOTH layers, because they fail independently:
-//   1. The ADAPTER (the load-bearing fix): RedisWorkStore now escapes `ns` when it derives a key, so
-//      the ns→key mapping is injective and `list` cannot see a neighbour's records.
-//   2. The PACKAGE (defence in depth): events escapes the topic into the namespace as well, so it
-//      does not depend on a property of the store that it cannot observe. WorkStore is a public port;
-//      the store that got this wrong for months was one of our own.
-//
-// …and it pins them in TWO SEPARATE describes, because going through `emit`/`createConsumer` cannot
-// reach the adapter's bug at all. MEASURED (mutation): with `encNs` reduced to `return ns`, every
-// test in the `describe.each` below stays GREEN on the Redis case — the package escape has already
-// turned the topic into `evt:orders%3Aeu` by the time the adapter sees it, so `SCAN MATCH
-// wl:evt:orders:*` no longer matches it. The end-to-end case therefore MASKS layer 1 rather than
-// covering it; the adapter is asserted directly, on plain namespaces, in the first describe.
-// (The `describe.each` Redis case is kept anyway: it is the only place the two layers run composed,
-// and it costs one fake-Redis instance. It is a composition smoke test, not the adapter's pin.)
+// WorkStore is a public port, and addressing a record by a concatenated key is an ordinary way to
+// implement it. So this package escapes the topic into the namespace itself, and does not depend on
+// a property of the store that it cannot observe. This file pins that, against a store that joins
+// ns and id the way that adapter did.
 import { describe, it, expect } from 'vitest';
 import type { WorkStore, ListQuery, Page, LogRecord } from '@gnldev/durable';
-import { RedisStorage } from '../../durable/src/redis-storage.js';
-import { makeFakeRedis } from '../../durable/test/fake-redis.js';
 import { emit, createConsumer } from '../src/index.js';
-
-/** The shipped Redis adapter over the SCAN/MATCH-faithful fake — the layout the bug lived in. */
-const redisWork = (): WorkStore => new RedisStorage({ client: makeFakeRedis(), keyPrefix: 'gnl:' }).work;
 
 /**
  * A WorkStore that derives its storage key by joining `ns` and `id` with `:` and answers `list` with
- * a prefix match — i.e. RedisWorkStore as it shipped, distilled to nine lines and with no Redis in it.
+ * a prefix match — the Redis adapter's layout, distilled to nine lines and with no Redis in it.
  *
  * It is here on purpose, and it is NOT a bug being pinned: it is the stand-in for any store that
  * addresses a record by a concatenated key (a Redis/Valkey/DynamoDB/S3-prefix implementation a user
  * writes against the public `WorkStore` port). The tests that use it assert a property of THIS
  * package — that events' own namespaces are self-disambiguating — which stays true no matter what
- * the adapter underneath does. Fixing the adapter alone would leave that property untested.
+ * the adapter underneath does.
  */
 function prefixJoinWork(): WorkStore {
   const log = new Map<string, LogRecord<any>>();
@@ -71,95 +55,8 @@ function prefixJoinWork(): WorkStore {
   };
 }
 
-// ── LAYER 1: the adapter, on its own ─────────────────────────────────────────────────────────────
-// No `emit`, no `createConsumer`, no `evt:` prefix — just `WorkStore.append`/`list` with plain
-// namespaces, which is the contract EVERY caller of the port gets (the queue's `qjob`, a durable
-// run's log, a user's own namespace), not only this package's. These assertions live in the events
-// package purely because the audit round that produced them may touch only this file and this is
-// where the fake Redis is already wired up; they belong to @gnldev/durable and the real-Redis half
-// of them is in durable/test/integration-real.test.ts, behind Docker. This describe is the copy
-// that runs in the DEFAULT suite.
-describe('@gnldev/durable — RedisWorkStore: the ns→key mapping is injective (no events involved)', () => {
-  const work = () => new RedisStorage({ client: makeFakeRedis(), keyPrefix: 'gnl:' }).work;
-
-  // READ direction. `list(ns)` is specified as a whole-value match; this adapter answers it with a
-  // `SCAN MATCH <pfx>wl:<ns>:*` prefix scan, so an unescaped `:` in the ns makes a parent namespace's
-  // scan pattern a prefix of its child's key space.
-  it('list(ns) does not return a neighbouring namespace\'s records', async () => {
-    const w = work();
-    await w.append('nspar', { tag: 'PARENT' }, 'p-1');
-    await w.append('nspar:child', { tag: 'CHILD' }, 'c-1');
-    expect((await w.list('nspar')).items.map((i) => i.id)).toEqual(['p-1']); // ['c-1','p-1'] = leak
-    expect((await w.list('nspar:child')).items.map((i) => i.id)).toEqual(['c-1']);
-  });
-
-  // WRITE direction, the silent-loss half: ('nsbnd:eu','x') and ('nsbnd','eu:x') are two different
-  // records that used to address ONE key. `append` is SET NX, so the second one was refused with no
-  // error while `append` still returned its id.
-  it('two records whose ns/id split differs are not collapsed onto one key', async () => {
-    const w = work();
-    const first = await w.append('nsbnd:eu', { tag: 'A-first' }, 'x');
-    const second = await w.append('nsbnd', { tag: 'B-PAID' }, 'eu:x');
-    expect([first, second]).toEqual(['x', 'eu:x']); // both reported success before the fix too
-    expect((await w.list('nsbnd:eu')).items.map((i) => (i.payload as any).tag)).toEqual(['A-first']);
-    expect((await w.list('nsbnd')).items.map((i) => (i.payload as any).tag)).toEqual(['B-PAID']);
-  });
-
-  // The `%` half of `encNs`, which nothing else pins: escaping ONLY `:` is not injective, because
-  // then the namespace literally named `a%3Ab` and the namespace `a:b` both map to `a%3Ab` and the
-  // leak comes straight back one level down. MEASURED: dropping the `%` replace from `encNs` leaves
-  // the whole durable+events suite green EXCEPT this test — one failure out of 1616 — and the audit
-  // that found the hole measured the Docker integration run green under the same mutation too.
-  it('a namespace containing the escape sequence itself stays a separate namespace', async () => {
-    const w = work();
-    await w.append('a%3Ab', { tag: 'LITERAL' }, 'r1');
-    await w.append('a:b', { tag: 'COLON' }, 'r2');
-    expect((await w.list('a%3Ab')).items.map((i) => (i.payload as any).tag)).toEqual(['LITERAL']);
-    expect((await w.list('a:b')).items.map((i) => (i.payload as any).tag)).toEqual(['COLON']);
-  });
-
-  // globEscape's job, at the SCAN site that already had it: a `*`/`?`/`[` inside the NAMESPACE must
-  // match itself, not widen the pattern. Distinct from encNs — `:` is not a glob metacharacter and a
-  // glob escape cannot fix a delimiter ambiguity, which is why both escapes exist. `encNs` leaves
-  // glob characters alone on purpose (it is not a general encoder), so this line is the only thing
-  // standing between a topic named `g*` and every namespace beginning with `g`.
-  it('a glob metacharacter in the namespace matches literally', async () => {
-    const w = work();
-    await w.append('g*', { tag: 'STAR' }, 'k1');
-    await w.append('ga', { tag: 'PLAIN' }, 'k2');
-    expect((await w.list('g*')).items.map((i) => (i.payload as any).tag)).toEqual(['STAR']);
-    expect((await w.list('ga')).items.map((i) => (i.payload as any).tag)).toEqual(['PLAIN']);
-  });
-
-  // …and the same for the caller's `keyPrefix`, which was going into nine of the ten SCAN patterns
-  // RAW. A metacharacter there makes the pattern match the keys of the store NEXT DOOR, so
-  // `listKeys`/`readRun`/`listRuns` return another store's data — and `listKeys` then slices its own
-  // (longer) prefix length off those keys and hands back corrupted key text.
-  //
-  // The originally measured prefix was `X[a]:` (a character class matching `Xa:`); `X*:` is used here
-  // because fake-redis.ts's `globToRegExp` implements `\`, `*` and `?` but NOT `[...]`, so a bracket
-  // would be matched literally by the fake and this test could not go red on it. `*` is the same bug
-  // through the same line. The bracket form is exercised against a real server in
-  // durable/test/integration-real.test.ts.
-  it('a glob metacharacter in keyPrefix does not read the neighbouring store', async () => {
-    const client = makeFakeRedis();
-    const meta = new RedisStorage({ client, keyPrefix: 'X*:' });
-    const neighbour = new RedisStorage({ client, keyPrefix: 'Xabc:' });
-    await neighbour.runs.put('nrun:model:0', { who: 'NEIGHBOUR' });
-    await meta.runs.put('brun:model:0', { who: 'MINE' });
-
-    // ['j:nrun:model:0', 'brun:model:0'] = the neighbour's key, sliced at MY prefix length.
-    expect(await meta.runs.listKeys!('')).toEqual(['brun:model:0']);
-    expect(await meta.runs.readRun('nrun')).toEqual([]); // the neighbour's run is not mine
-    expect((await meta.runs.listRuns()).items.map((r) => r.runId)).toEqual(['brun']);
-    // and the neighbour is unharmed in the other direction (its prefix has no metacharacter).
-    expect(await neighbour.runs.listKeys!('')).toEqual(['nrun:model:0']);
-  });
-});
-
-// ── LAYER 2: the package ─────────────────────────────────────────────────────────────────────────
+// ── The package ─────────────────────────────────────────────────────────────────────────
 const CASES: Array<[string, () => WorkStore]> = [
-  ['the shipped Redis adapter (SCAN/MATCH)', redisWork],
   ['a store that joins ns and id into one key', prefixJoinWork],
 ];
 

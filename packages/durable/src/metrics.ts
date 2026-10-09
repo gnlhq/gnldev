@@ -3,7 +3,7 @@
 // O(runs × entries) per page view, which collapses at a few thousand runs. This file adds INCREMENTAL
 // counters written ONCE at run completion, riding the EXISTING optional Journal primitives (incrBy/
 // getCounters/putIfAbsent/put/deletePrefix — see the parity matrix in journal.ts) so every first-party
-// backend (in-memory/sqlite/postgres/redis) gets it for free — NO new dependency, NO time-series DB.
+// backend (in-memory/sqlite/postgres) gets it for free — NO new dependency, NO time-series DB.
 // Same shape as budget.ts's `__usage__` counter (H8a) and its get→put/warn-once fallback story, just
 // bucketed per-day/per-agent instead of a single running total, plus a per-run "fast row" for the
 // runs table (avoids readRun+getRunCost for every already-finalized run).
@@ -16,7 +16,7 @@ import { METRICS_SUMMARY_NAMES } from './option-names.js';
 
 /**
  * P1.6b: money is accumulated as INTEGER micro-USD (`costUsdMicros = round(usd × 1e6)`) — float
- * counters (SQLite REAL / PG DOUBLE / Redis HINCRBYFLOAT) drift over millions of increments; integers
+ * counters (SQLite REAL / PG DOUBLE) drift over millions of increments; integers
  * don't. `readMetricsSummary` derives a `costUsd` float back out for consumers (and still folds in a
  * legacy `costUsd` float field if counters predate this switch, so no rebuild is forced).
  */
@@ -188,7 +188,7 @@ export interface MetricsRunRow {
  * CONTRACT: the journal (readRun/getRunCost) is always the source of truth; this is the derived aggregate.
  * P1.6b — TWO write paths, chosen by capability:
  * `applyBatch` (all first-party journals): claim marker + counter increments + fast-row land as ONE
- *    all-or-nothing unit (SQL transaction / Redis Lua / in-memory sync block) → NO loss window at all.
+ *    all-or-nothing unit (SQL transaction / in-memory sync block) → NO loss window at all.
  * Sequential fallback (third-party journals without applyBatch): claim FIRST (`putIfAbsent` CAS,
  *    exactly-once under concurrency), then incrBy. A crash between the two loses that ONE run's
  *    contribution (marker-first = UNDERCOUNTS, never overcounts — the safe direction; same accepted
@@ -428,9 +428,9 @@ export async function backfillMetrics(
  *
  * ADAPTER CONTRACT: `deletePrefix` wiping a counter written via `incrBy` requires the adapter to treat
  * counter keys as ordinary keys of the prefix space (the deletePrefix contract in journal.ts: ALL keys).
- * All four first-party adapters honor this — InMemoryJournal (fixed alongside this file; see the bugfix
- * note on its `keys`/`listKeys`/`deletePrefix`) and SQLite/Postgres/Redis (fixed in the same round:
- * their deletePrefix now also sweeps `gnl_counters` / the Redis `ctr:` sub-namespace — which was ALSO a
+ * All three first-party adapters honor this — InMemoryJournal (fixed alongside this file; see the bugfix
+ * note on its `keys`/`listKeys`/`deletePrefix`) and SQLite/Postgres (fixed in the same round: their
+ * deletePrefix now also sweeps `gnl_counters` — which was ALSO a
  * pre-existing GDPR-purge gap: org deletion used to leave `org:<id>:__usage__` counters behind). A
  * third-party Journal that stores counters outside its deletePrefix scan would break this contract —
  * verified by the storage conformance suite (test/storage-backend.test.ts).

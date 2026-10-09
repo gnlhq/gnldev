@@ -17,7 +17,6 @@ import {
   describeProtections, formatProtections, listLog, readIdemLedger, readMetricsSummary, withSubjectJournal, ProcessorRetry, createBatch,
   validateJudgeConfig,
 } from '../src/index.js';
-import { RedisStorage } from '../src/redis-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { toolCallingModel } from '../src/mock-model.js';
 import { createMockModel, toolCallResult, finalTextResult, countToolResults } from './mock.js';
@@ -121,7 +120,6 @@ describe('every other option bag the package reads', () => {
     ['listKeys', () => j().listKeys('p', { limt: 1 } as any), /listKeys: `limt` .* did you mean `limit`\?/],
     ['listStaleRuns', () => j().listStaleRuns(0, { includeSuspend: true } as any), /listStaleRuns: `includeSuspend`/],
     ['ProcessorRetry', () => new ProcessorRetry('f', 'p', { maxRetry: 1 } as any), /ProcessorRetry: `maxRetry` .* `maxRetries`/],
-    ['RedisStorage', () => new RedisStorage({ keyprefix: 'x' } as any), /RedisStorage: `keyprefix` .* `keyPrefix`/],
     ['PostgresStorage', () => new PostgresStorage({ connectionstring: 'x' } as any), /PostgresStorage: `connectionstring` .* `connectionString`/],
     ['toolCallingModel', () => toolCallingModel({ toolname: 'x' } as any), /toolCallingModel: `toolname` .* `toolName`/],
     ['runWorkflow', () => createGnl({ storage: s(), workflows: { w: {} as any } }).runWorkflow('w', {}, { runID: 'r' } as any), /runWorkflow\('w'\): `runID` .* `runId`/],

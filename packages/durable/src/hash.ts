@@ -84,7 +84,7 @@ function compareTokens(a: string, b: string): number {
  *
  * Returns `undefined` — not a string, despite the annotation — for values JSON cannot represent at
  * all (`undefined`, a function, a symbol). That predates this file's current shape and is relied on
- * by the `putIfMatch` comparisons in `journal.ts` / `redis-storage.ts` / `in-memory-storage.ts`, so
+ * by the `putIfMatch` comparisons in `journal.ts` / `in-memory-storage.ts`, so
  * the signature is left alone; `argsHash` handles the case explicitly instead.
  *
  * THROWS a `TypeError` for a circular value (see `circularReference`). It threw before too — as

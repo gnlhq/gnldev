@@ -9,16 +9,14 @@
 // fails this one.
 import { describe, it, expect } from 'vitest';
 import { newDb } from 'pg-mem';
-import { InMemoryStorage, RedisStorage, toJournal } from '../src/index.js';
+import { InMemoryStorage, toJournal } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { makeFakeRedis } from './fake-redis.js';
 import { purgeResource } from '../src/retention.js';
 
 const backends: [string, () => Promise<any>][] = [
   ['InMemoryStorage', async () => toJournal(new InMemoryStorage().runs)],
   ['PostgresStorage(pg-mem)', async () => { const { Pool } = newDb().adapters.createPg(); const s = new PostgresStorage({ pool: new Pool() }); await (s as any).init?.(); return toJournal(s.runs); }],
-  ['RedisStorage(fake)', async () => toJournal(new RedisStorage({ client: makeFakeRedis() }).runs)],
 ];
 try {
   const probe = new SqliteStorage();

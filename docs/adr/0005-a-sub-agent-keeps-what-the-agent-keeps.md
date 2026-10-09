@@ -2,6 +2,7 @@
 
 - **Status:** Accepted, 2026-10-05
 - **Builds on:** ADR-0002 (one owner per rule).
+- **Note:** the Redis store was removed later (CHANGELOG, Unreleased); its measurements here are history.
 
 ## Context
 

@@ -8,17 +8,15 @@
 // rows on Postgres is worse than no purge — the operator has a green run and a live record.
 import { describe, it, expect } from 'vitest';
 import { newDb } from 'pg-mem';
-import { InMemoryStorage, RedisStorage, purgeOrganization, purgeOrganizationWork, withOrgStorage, toJournal } from '../src/index.js';
+import { InMemoryStorage, purgeOrganization, purgeOrganizationWork, withOrgStorage, toJournal } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { makeFakeRedis } from './fake-redis.js';
 import type { Storage } from '../src/index.js';
 
 const backends: Array<[string, () => Promise<Storage> | Storage]> = [
   ['in-memory', () => new InMemoryStorage()],
   ['sqlite', () => new SqliteStorage(':memory:')],
   ['postgres', () => { const { Pool } = newDb().adapters.createPg(); return new PostgresStorage({ pool: new Pool() }); }],
-  ['redis', () => new RedisStorage({ client: makeFakeRedis() as never })],
 ];
 
 for (const [name, make] of backends) {

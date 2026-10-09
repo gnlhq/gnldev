@@ -62,7 +62,7 @@ export interface RunExperimentOptions {
 
 /**
  * Journal-based dataset/experiment manager. Requires a journal that supports `listKeys`
- * (the InMemory/SQLite/Postgres/Redis adapters provide it).
+ * (the InMemory/SQLite/Postgres adapters provide it).
  */
 export function createDatasetsManager(journal: Journal) {
   const requireListKeys = () => {

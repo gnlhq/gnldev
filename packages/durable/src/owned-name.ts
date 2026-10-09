@@ -29,12 +29,10 @@ export const isWellFormed = (s: string): boolean => s.search(LONE_SURROGATE) < 0
 
 // `%` first, so every `%` in the output is one this escape wrote. The output is well-formed UTF-16
 // and contains no `:` or `~`, which is what makes the `:`-separated layout below unambiguous.
-/** @internal — the owner-part escape, for a key that must hold an id with no `:` or `~` in it (subject-index.ts). */
-export const esc = (v: string) =>
+const esc = (v: string) =>
   v.replace(/%/g, '%25').replace(/:/g, '%3A').replace(/~/g, '%7E')
     .replace(LONE_SURROGATE, (s) => `%u${s.charCodeAt(0).toString(16).toUpperCase()}`);
-/** @internal — `esc` undone. */
-export const unesc = (v: string) =>
+const unesc = (v: string) =>
   v.replace(/%(25|3A|7E|u[0-9A-F]{4})/g, (_m, c: string) =>
     c === '25' ? '%' : c === '3A' ? ':' : c === '7E' ? '~' : String.fromCharCode(parseInt(c.slice(1), 16)));
 
