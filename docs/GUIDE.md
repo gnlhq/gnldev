@@ -782,7 +782,7 @@ buys the first list and costs the second.
 |---|---|
 | Voice (TTS/STT), Slack/WhatsApp channels | Out of scope. These are integration surface, not durability; adding them would widen the core without making a single run safer. |
 | No-code agent editor | Code-first by design. An agent's behaviour lives in reviewable, testable, version-controlled code — a visual editor moves it somewhere a diff cannot follow it. |
-| A large catalogue of storage adapters | Four, plus composite mixing. Each adapter has to prove at-most-once against a real engine, and that proof is expensive; a long list of adapters that were never raced under load would be a liability, not a feature. |
+| A large catalogue of storage adapters | Three (InMemory, Sqlite, Postgres), plus composite mixing. Each adapter has to prove at-most-once against a real engine, and that proof is expensive; a long list of adapters that were never raced under load would be a liability, not a feature. |
 | A large catalogue of built-in scorers | Sixteen — 8 LLM-judge, 4 model-free text, 3 rule-based, plus `embeddingSimilarity` — and the judge infrastructure to write your own. (Count them in `packages/evals/src/index.ts`: `scorers.ts` contributes 8, `text-scorers.ts` 4, `scorer.ts` 4. The trajectory scorers are a separate family on top.) |
 
 If your workload is "running twice is a disaster" — payments, finance, legal, healthcare, anything

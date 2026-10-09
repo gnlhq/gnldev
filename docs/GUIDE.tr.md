@@ -831,7 +831,7 @@ koşu.** Bu tercih birinci listeyi kazandırıyor, ikincisine mal oluyor.
 |---|---|
 | Ses (TTS/STT), Slack/WhatsApp kanalları | Kapsam dışı. Bunlar entegrasyon yüzeyi, dayanıklılık değil; eklemek çekirdeği genişletir ama tek bir koşuyu bile daha güvenli yapmaz. |
 | No-code ajan editörü | Tasarım gereği kod-öncelikli. Ajanın davranışı incelenebilir, test edilebilir, sürüm kontrollü kodda durur — görsel editör onu diff'in izleyemediği bir yere taşır. |
-| Geniş depolama adaptörü kataloğu | Dört tane, artı composite karışımı. Her adaptörün at-most-once garantisini gerçek bir motora karşı kanıtlaması gerekir ve bu kanıt pahalıdır; yük altında hiç yarıştırılmamış uzun bir adaptör listesi özellik değil, yükümlülüktür. |
+| Geniş depolama adaptörü kataloğu | Üç tane (InMemory, Sqlite, Postgres), artı composite karışımı. Her adaptörün at-most-once garantisini gerçek bir motora karşı kanıtlaması gerekir ve bu kanıt pahalıdır; yük altında hiç yarıştırılmamış uzun bir adaptör listesi özellik değil, yükümlülüktür. |
 | Geniş hazır scorer kataloğu | On altı tane — 8 LLM-hakem, 4 modelsiz metin, 3 kural-tabanlı, artı `embeddingSimilarity` — ve kendinizinkini yazabileceğiniz hakem altyapısı. (`packages/evals/src/index.ts`'te sayabilirsiniz: `scorers.ts` 8, `text-scorers.ts` 4, `scorer.ts` 4 katkı veriyor. Trajectory scorer'ları bunların üstünde ayrı bir aile.) |
 
 İş yükünüz "iki kez çalışırsa felaket" cinsindense — ödeme, finans, hukuk, sağlık, uzun-koşan ve
