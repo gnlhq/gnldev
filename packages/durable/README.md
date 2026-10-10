@@ -1108,14 +1108,16 @@ journalConformance('my journal', () => ({ journal: new InMemoryJournal() }), { d
   store that needs either flag cannot give the guarantee the flag skips.
 - **The scenarios:** the key-value contract (K1–K6: values, the racing claim, `putIfMatch`, literal
   prefixes, exact counters, `applyBatch`/`getMany`); runs (R1–R4: which records name a run, the
-  summary, the status after each write of a scripted history, paging and filters); relations (L1–L2:
+  summary, `readRun` in first-write order — not key or clock order, an older writer's rows too —, the status after each write of a scripted history, paging and filters); relations (L1–L2:
   a person's and a thread's runs, owner records, rows from older writers); and the dependents model
   (D1–D7: thread delete, organization isolation, refusal while a run is in flight, a delete killed at
   every step and then retried, run purge, erasure, cross-run claims that outlive a delete). Optional
   methods such as `putIfMatch`, `incrBy`, `applyBatch` and `listOwnerRecords` are checked when the
   journal has them.
 - **What a journal must have:** the `Journal` port with `putIfAbsent`, `listKeys` and `deletePrefix`, plus
-  `readRun` and `listRunsPaged` from `JournalReader`. A journal without a paged listing gives
+  `readRun` and `listRunsPaged` from `JournalReader`. `readRun` returns a run's records in the order
+  they were first written (an overwrite keeps its place) — a position the store keeps, not a clock. A
+  journal without a paged listing gives
   `purgeThread` and `purgeResource` no way to find the runs, so they would leave the runs and still
   report a count. A run is named by any one of its records: a `:model:` or `:tool:` entry
   (`parseJournalKey`), its stamped `:input` (`runIdOfKey`), or its outcome record (`outcomeStatusOf`).

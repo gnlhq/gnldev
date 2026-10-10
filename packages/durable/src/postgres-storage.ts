@@ -156,7 +156,7 @@ const RELATIONS_VERIFY_KEY = 'relations_verify';
 
 const DDL = [
   `CREATE TABLE IF NOT EXISTS gnl_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`,
-  `CREATE TABLE IF NOT EXISTS gnl_run_journal (key TEXT PRIMARY KEY, run_id TEXT, kind TEXT, suspended BOOLEAN NOT NULL DEFAULT false, value TEXT NOT NULL, created_at BIGINT NOT NULL, owner TEXT)`,
+  `CREATE TABLE IF NOT EXISTS gnl_run_journal (key TEXT PRIMARY KEY, run_id TEXT, kind TEXT, suspended BOOLEAN NOT NULL DEFAULT false, value TEXT NOT NULL, created_at BIGINT NOT NULL, owner TEXT, ord BIGINT NOT NULL DEFAULT 0)`,
   `CREATE INDEX IF NOT EXISTS gnl_run_journal_run ON gnl_run_journal (run_id, created_at)`,
   // A run's status is two inputs and their result, all three written by the adapter in the statement that
   // writes the run's counters (`writeRunRows`): `suspended_count` (its tool records waiting on a human),
@@ -199,6 +199,19 @@ const DDL = [
   `CREATE INDEX IF NOT EXISTS gnl_runs_resource ON gnl_runs (resource_id, created_at, run_id)`,
   `CREATE INDEX IF NOT EXISTS gnl_runs_thread ON gnl_runs (thread_id, created_at, run_id)`,
   `ALTER TABLE gnl_run_journal ADD COLUMN IF NOT EXISTS owner TEXT`,
+  // `ord`: the order a run's records were FIRST written in — what `readRun` returns them in
+  // (JournalReader's ordering contract). `created_at` cannot be that order: it is a millisecond from the
+  // WRITER's clock, so two records of one run written in the same millisecond tied and came back by key
+  // (`model:10` before `model:2`, every tool after every step: compensation unwound in the wrong order),
+  // and a worker whose clock is behind put a resumed run's later steps before its earlier ones
+  // (measured, H7). A column DEFAULT, not a value the write names, so an older process's INSERT gets one
+  // too; an overwrite (ON CONFLICT DO UPDATE, putIfMatch) never sets it, so a record keeps its place.
+  // Added at 0 and only then given the default — `ADD COLUMN … DEFAULT nextval` would rewrite the table
+  // and number the existing rows in physical order; at 0 they keep `(created_at, key)`, and every one of
+  // them was written before any numbered row. Same shape as `gnl_work_log.ord`.
+  `CREATE SEQUENCE IF NOT EXISTS gnl_run_journal_ord`,
+  `ALTER TABLE gnl_run_journal ADD COLUMN IF NOT EXISTS ord BIGINT NOT NULL DEFAULT 0`,
+  `ALTER TABLE gnl_run_journal ALTER COLUMN ord SET DEFAULT nextval('gnl_run_journal_ord')`,
   `CREATE INDEX IF NOT EXISTS gnl_run_journal_owner ON gnl_run_journal (owner, key) WHERE key LIKE '${OWNER_RECORD_LIKE}'`,
   `CREATE TABLE IF NOT EXISTS gnl_counters (key TEXT NOT NULL, field TEXT NOT NULL, value DOUBLE PRECISION NOT NULL, PRIMARY KEY (key, field))`,
   `CREATE INDEX IF NOT EXISTS gnl_runs_created ON gnl_runs (created_at, run_id)`,
@@ -1036,6 +1049,14 @@ export class PostgresStorage implements Storage {
     for (const { table, column } of check.missingColumns) {
       const def = expected.get(table)?.get(column);
       if (def) statements.push(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${def}`);
+      // A column numbered by a sequence (`gnl_run_journal.ord`, `gnl_work_log.ord`) is added at 0 and only
+      // then given its default — the DDL's own two statements, carried with it. Without them every INSERT
+      // until the first boot of this version, an older process's included, would write 0: "written
+      // before the column", which a numbered row of the same run then follows.
+      for (const stmt of DDL) {
+        const m = /^ALTER TABLE (\S+) ALTER COLUMN (\S+) SET DEFAULT nextval\('([^']+)'\)$/.exec(stmt);
+        if (m && m[1] === table && m[2] === column) statements.push(`CREATE SEQUENCE IF NOT EXISTS ${m[3]}`, stmt);
+      }
     }
     // An index an existing table lacks — after the columns it may need, and CONCURRENTLY, so building it
     // over a large table does not hold every writer off (a plain CREATE INDEX takes a lock that blocks
@@ -1605,10 +1626,10 @@ class PgRunJournal implements RunJournal {
     // Same upper bound as the SQLite approach: prefixUpperBound(prefix).
     const c = this.shape.collate;
     const rg = pgRange('key', c, prefix, 1);
-    // `key` tie-breaker, for the reason `readRun` below already states: Postgres does not guarantee
-    // order for equal ORDER BY keys, and entries written in the same millisecond (parallel tool
-    // calls) could otherwise come back in a different order on every read. `readRun` has carried
-    // this since Decision #4 and Sqlite sorts the same way — this one call was left behind, so two
+    // `key` tie-breaker: Postgres does not guarantee order for equal ORDER BY keys, and entries written
+    // in the same millisecond (parallel tool calls) could otherwise come back in a different order on
+    // every read. (Not write order — `readRun` gives that, by `ord`.) Sqlite sorts the same way; this
+    // call once sorted without the tie-breaker, so two
     // reads of the same prefix could disagree and a caller paging through them could see a key twice
     // or not at all.
     // A bounded probe asks "is anything here", not "in what order": no sort, the index stops early.
@@ -1635,9 +1656,10 @@ class PgRunJournal implements RunJournal {
     return r.rowCount ?? 0;
   }
   async readRun(runId: string): Promise<JournalEntry[]> {
-    // Decision #4: `key` tie-breaker — Postgres does NOT GUARANTEE order for equal ORDER BY keys; records
-    // written within the same ms (parallel tool-calls) could otherwise shuffle position between reads. Same semantics as SQLite.
-    const r = await this.q('SELECT key, kind, value, created_at FROM gnl_run_journal WHERE run_id = $1 ORDER BY created_at, key', [runId]);
+    // JournalReader's ordering contract: first-write order is `ord` (the DDL note on it). Rows written
+    // before the column hold 0 — all of them older than every numbered row — and keep the order they
+    // had, `(created_at, key)`.
+    const r = await this.q('SELECT key, kind, value, created_at FROM gnl_run_journal WHERE run_id = $1 ORDER BY ord, created_at, key', [runId]);
     return r.rows.map((x, seq) => ({ key: x.key, runId, kind: x.kind as JournalEntry['kind'], value: deserialize(x.value), seq, ts: Number(x.created_at) }));
   }
   /**

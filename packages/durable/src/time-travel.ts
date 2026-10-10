@@ -313,10 +313,15 @@ export async function forkRun(
   let copiedModel = 0;
   let copiedTool = 0;
   const toolCalls: { toolCallId: string; toolName: string; input: unknown }[] = [];
+  // What to copy, by source key — written below in the SOURCE's order, so the fork's readRun (first-
+  // write order, JournalReader) reads step, its tools, next step… as the source does. Written as they
+  // were found (every step, then every tool) the fork read back as all steps then all tools — its
+  // reconstructState, rollover and compensation order with it (H7).
+  const copies = new Map<string, () => Promise<void>>();
 
   for (const m of keep) {
     const n = m.key.slice(m.key.lastIndexOf(':model:') + ':model:'.length);
-    await journal.put(runKeys.model(dst, n), m.value);
+    copies.set(m.key, () => journal.put(runKeys.model(dst, n), m.value));
     copiedModel++;
     for (const p of ((m.value as any)?.content ?? []) as any[]) {
       if (p?.type === 'tool-call' && p.toolCallId) toolCalls.push({ toolCallId: p.toolCallId, toolName: p.toolName, input: p.input });
@@ -342,18 +347,20 @@ export async function forkRun(
         // pointed at it — otherwise the fork finds an empty window and runs the effect again.
         const mirrorOf = (e.value as { mirrorOf?: unknown } | undefined)?.mirrorOf;
         const forked = typeof mirrorOf === 'string' ? runKeys.toolRequestIn(mirrorOf, dst) : undefined;
-        if (forked) {
-          const authoritative = await journal.get(mirrorOf as string);
-          if (authoritative !== undefined) await journal.put(forked, authoritative);
-          await journal.put(dstKey, { ...(e.value as object), mirrorOf: forked });
-        } else {
-          await journal.put(dstKey, e.value);
-        }
+        copies.set(srcKey, forked
+          ? async () => {
+            const authoritative = await journal.get(mirrorOf as string);
+            if (authoritative !== undefined) await journal.put(forked, authoritative);
+            await journal.put(dstKey, { ...(e.value as object), mirrorOf: forked });
+          }
+          : () => journal.put(dstKey, e.value));
         copiedDstKeys.add(dstKey);
         copiedTool++;
       }
     }
   }
+
+  for (const e of entries) await copies.get(e.key)?.();
 
   const input = await journal.get(runKeys.input(srcRunId));
   if (input !== undefined) await journal.put(runKeys.input(dst), input);

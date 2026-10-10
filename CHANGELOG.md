@@ -127,6 +127,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A run's records were read back in the wrong order** — by a millisecond clock with the key as
+  tie-break, not in the order they were written. Measured on Sqlite and Postgres: records of one run
+  written in the same millisecond (a fast run on Sqlite did it with no clock mocked) came back by key —
+  `model:10` before `model:2`, every tool after every step — and a worker whose clock was behind put a
+  resumed run's later steps before its earlier ones. What read that order went wrong with it:
+  `compensateRun` undid a charge before the reservation and the notice made after it; `forkRun`
+  copied step 10 in place of step 2; `rolloverRun` carried the conversation as all assistant turns then
+  all tool results; Studio's step view and diff, `gnl run`/`gnl inspect` and the chat history showed it
+  that way and called settled tool calls pending; the a2a answer came from the wrong step. Sqlite and
+  Postgres now number each new journal row (`gnl_run_journal.ord`: a Postgres sequence default, a
+  Sqlite trigger with one counter for the file — both in the database, so an older process's writes
+  are numbered too) and `readRun` orders by it; an overwrite keeps its place. `forkRun` also copies in
+  the source's order (it wrote every step, then every tool). The in-memory journal already gave write
+  order. No upgrade step: the column is added on boot (or by `gnl upgrade --only schema`, with its
+  sequence default), and rows written before it read in the order they always did, ahead of every
+  later row — same-millisecond ties among them stay as ambiguous as they were. A custom journal's
+  `readRun` must return write order too: `@gnldev/durable/testing` R2 now asserts it (R2b: one
+  millisecond, a clock 5 s behind, an older writer).
+
 - **Two workers resuming the same run could run one tool call twice.** Measured with several
   processes driving the same runs (Sqlite and Postgres), in two places:
   - A worker that took over an approved question (or a crashed attempt) checked that it was free on one
@@ -140,6 +159,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     without the approval wrote it over a live claim, and a worker with the approval then ran the call
     while the first was still in its body. A decision now replaces only the record it was made on; if
     that record moved, the call answers from what is there now, or is busy.
+- **A repeat of a side effect whose process stopped mid-flight ran with no block and no question.**
+  The duplicate marker (`sideEffectDuplicates`) is claimed in flight before the body and finished after
+  the call's record; a process that died in between — in the body, or right after recording a success —
+  left it in flight, and once its claim TTL passed the next call with the same arguments took it over.
+  Measured under `'block'` and the default `'suspend'`: a charge that had succeeded ran a second time.
+  A stale in-flight marker is now taken over only by the call that left it (its crash ladder decides);
+  any other call is a duplicate of something that may have run — blocked or asked about. With a dedup
+  window (`ttlMs`), a stale marker ages out of it like a finished one.
+- **`recover()` answering "done" could overwrite a newer record.** The answer was recorded with a plain
+  write while the call held no claim. A second worker that judged the same crashed attempt and got its
+  slow "done" after the first worker had taken the call over replaced that worker's record — every
+  replay then returned the probe's output instead of the one the run got — or recorded a success over
+  its live claim. The answer is now written only over the attempt it was asked about; if that record
+  moved, the call answers from what is there now, or is busy.
+- **A gate could turn a call another worker was running into a question.** The gates before a call's
+  claim (a guard's `require-approval`, the duplicate and taint guards, the loop nudge) also ran on a
+  fresh `running` record, and wrote their decision over it: a worker resuming without the approval put
+  `suspended` over the live claim, and a worker carrying the approval took that question over and ran
+  the call while the first was still in its body (measured: 2 executions). A fresh `running` record is
+  now busy before any gate (`RunBusyError`); in `'args'` mode the call waits for its outcome.
+- **A side effect that timed out could run again on the next retry when `timeoutMs` ≥ 30 s.** The
+  claim of a timed-out attempt stays `running` so a retry waits for it, but it was dated from the
+  attempt's start and its TTL is `max(30 s, timeoutMs)`: it went stale at the timeout itself, the retry
+  took it for a crash, `recover()` said "not done" while the attempt was still in flight, and the effect
+  ran twice (measured with `timeoutMs: 31_000`). The claim is now renewed when the timeout fires.
+- **After `releaseFailedClaim`, a `confirm: true` tool ran without asking.** The `released` tombstone
+  read as a record, so the gates that answer only a first call (`confirm`, the semantic gate) were
+  skipped. It now reads as no record: the next call is a first call and meets every first-call gate.
 - **`adoptIntoOrg` moved different things on different stores** (the same world, measured on
   35b70348): on InMemory the adopted threads kept their old id inside the record, so the organization
   listed none of them and read none of their messages; on Sqlite a platform meta key

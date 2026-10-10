@@ -214,12 +214,9 @@ describe.skipIf(!RUN)('REAL Postgres — multi-pool CAS + run-lock + exactly-onc
 
   it('the readRun ordering contract + superjson type preservation on REAL PG', async () => {
     const runId = `${SEED}:order`;
-    // Decision #4: order by (created_at, key); writes landing in the same ms trigger the key tie-break
-    // and make the insertion-order assertion flake → separate the timestamps to test insertion order.
+    // First-write order (the store's `ord`), whatever the clock: the three writes may share a millisecond.
     await a.runs.put(`${runId}:model:0`, { step: 0, at: new Date(1700000000000) });
-    await sleep(5);
     await a.runs.put(`${runId}:tool:t1`, { status: 'succeeded' });
-    await sleep(5);
     await a.runs.put(`${runId}:model:1`, { step: 1 });
     const entries = await b.runs.readRun(runId); // read from the OTHER pool
     expect(entries.map((e) => e.key)).toEqual([`${runId}:model:0`, `${runId}:tool:t1`, `${runId}:model:1`]);

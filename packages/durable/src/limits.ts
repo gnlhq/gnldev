@@ -854,7 +854,7 @@ function applyToolOutcomeToChain(
 
 /**
  * A ONE-TIME full scan (called ONLY WHEN the chain key does NOT EXIST — first encounter/seeding an old
- * run). THANKS TO `reader.readRun`'s ordering contract (ASCENDING by write time) AND the strict
+ * run). THANKS TO `reader.readRun`'s ordering contract (first-write order) AND the strict
  * sequentiality of model steps, both the counter totals and the chain/fan-out candidates are
  * reconstructed correctly in a single FORWARD pass, in the CORRECT order (the order readRun returns =
  * the actual order of occurrence).

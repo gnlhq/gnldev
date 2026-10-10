@@ -648,7 +648,7 @@ export interface JournalEntry {
   runId: string;
   kind: JournalEntryKind;
   value: unknown; // model: doGenerate result · tool: ToolJournalRecord
-  seq: number; // order within the run
+  seq: number; // position in readRun's first-write order (0-based)
   ts?: number; // write time (created_at) — for OTEL trace timing (undefined if absent)
 }
 
@@ -729,9 +729,19 @@ export interface JournalReader {
    */
   listRuns(): Promise<RunSummary[]>;
   /**
-   * ORDERING CONTRACT (Decision #4): records are returned in ASCENDING write-time order; ties at the
-   * same timestamp are broken deterministically by `key`. limits.ts (loop counting) and
-   * regression.ts (diff) rely on this order — adapters must apply `ORDER BY created_at, key` (or an equivalent).
+   * ORDERING CONTRACT: records come back in the order they were FIRST written; an overwrite (a tool
+   * record going `running` → `succeeded`) keeps its place. A position the store assigns as it writes —
+   * not a clock: Sqlite and Postgres number each new row (`gnl_run_journal.ord`, from one counter or
+   * sequence for the store), the in-memory journal keeps insertion order. Read in this order:
+   * reconstructState (Studio's /state and /diff, the CLI, chat history), forkRun's prefix, rollover's
+   * carried conversation, compensation's reverse unwind, the loop chain limits.ts seeds, a2a's final
+   * answer. It used to be `ORDER BY created_at, key` with `created_at` in the writer's milliseconds, and
+   * that is not write order (H7, measured on Sqlite and Postgres): records written in one millisecond
+   * came back by key — `model:10` before `model:2`, every tool after every step, so compensation undid
+   * a charge before the reservation made after it — and a worker whose clock was behind put a resumed
+   * run's later steps first. Rows a store holds from before its position existed (position 0 on Sqlite
+   * and Postgres) come first, in the `(created_at, key)` order they always had: same-millisecond ties
+   * among them stay as ambiguous as they were. `seq` is the position in the returned array.
    */
   readRun(runId: string): Promise<JournalEntry[]>;
   /**

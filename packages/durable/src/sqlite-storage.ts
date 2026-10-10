@@ -344,6 +344,17 @@ export class SqliteStorage implements Storage {
       }
     }
     for (const sql of RELATION_INDEXES) this.db.exec(sql);
+    // `ord` (RUN_JOURNAL_ORD_TRIGGER): the same additive shape, and no backfill — 0 is "written before
+    // the column", every such row older than every numbered one, read in the `(created_at, key)` order
+    // it always had.
+    if (!(this.db.prepare(`PRAGMA table_info(gnl_run_journal)`).all() as { name: string }[]).some((c) => c.name === 'ord')) {
+      try {
+        this.db.exec(`ALTER TABLE gnl_run_journal ADD COLUMN ord INTEGER NOT NULL DEFAULT 0`);
+      } catch (e) {
+        if (!String((e as Error)?.message ?? e).includes('duplicate column')) throw e;
+      }
+    }
+    this.db.exec(RUN_JOURNAL_ORD_TRIGGER);
     if (!this.flagsPending) for (const sql of [OPEN_RUNS_INDEX, STATUS_RUNS_INDEX]) this.db.exec(sql); // on `status`: an older file has none until `run-status`
     // The guards (OWNER_UNPLACE_TRIGGER, RUN_UNPLACE_TRIGGERS). Found missing on a file whose columns
     // already hold placements — dropped by hand, or by a tool — the placements made while nothing
@@ -543,6 +554,8 @@ export class SqliteStorage implements Storage {
       'ALTER TABLE gnl_work_log ADD COLUMN seq INTEGER NOT NULL DEFAULT 0',
       WORK_LOG_SEQ_INDEX,
       WORK_LOG_NUMBER_TRIGGER,
+      'ALTER TABLE gnl_run_journal ADD COLUMN ord INTEGER NOT NULL DEFAULT 0',
+      RUN_JOURNAL_ORD_TRIGGER,
       ...RELATION_COLUMNS.map(([t, c]) => `ALTER TABLE ${t} ADD COLUMN ${c} TEXT`),
       ...RELATION_INDEXES,
       OPEN_RUNS_INDEX,
@@ -708,9 +721,10 @@ const DDL = `
 CREATE TABLE IF NOT EXISTS gnl_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS gnl_run_journal (
   key TEXT PRIMARY KEY, run_id TEXT, kind TEXT, suspended INTEGER NOT NULL DEFAULT 0,
-  value TEXT NOT NULL, created_at INTEGER NOT NULL, owner TEXT
+  value TEXT NOT NULL, created_at INTEGER NOT NULL, owner TEXT, ord INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS gnl_run_journal_run ON gnl_run_journal (run_id, created_at);
+CREATE TABLE IF NOT EXISTS gnl_run_journal_ord (k INTEGER PRIMARY KEY, n INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS gnl_runs (
   run_id TEXT PRIMARY KEY, model_steps INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0,
   suspended_count INTEGER NOT NULL DEFAULT 0, outcome TEXT, status TEXT NOT NULL,
@@ -851,6 +865,25 @@ BEGIN
   INSERT OR IGNORE INTO gnl_work_seq (ns, seq) VALUES (NEW.ns, 0);
   UPDATE gnl_work_seq SET seq = seq + 1 WHERE ns = NEW.ns;
   UPDATE gnl_work_log SET seq = (SELECT seq FROM gnl_work_seq WHERE ns = NEW.ns) WHERE rowid = NEW.rowid;
+END`;
+
+/**
+ * A run record's place in first-write order (`ord`) — what `readRun` returns a run in (JournalReader's
+ * ordering contract). `created_at` cannot be that order: it is a millisecond of the writer's clock, so
+ * records written in one millisecond tied and came back by key (`model:10` before `model:2`, every
+ * tool after every step: compensation unwound in the wrong order), and a worker whose clock is behind
+ * put a resumed run's later steps first (measured, H7). Numbered by the database, after the row is in,
+ * so every writer is numbered — an older process whose INSERT knows nothing of `ord` too; one counter
+ * for the store (`gnl_run_journal_ord`), the twin of Postgres's sequence. SQLite admits one writer at a
+ * time, so the numbers follow commit order. Insert only: an overwrite (ON CONFLICT DO UPDATE,
+ * putIfMatch) fires no INSERT trigger and keeps its place. Rows that belong to no run (`run_id` NULL)
+ * are never read in order and are left at 0. Created after the `ord` migration in the constructor.
+ */
+const RUN_JOURNAL_ORD_TRIGGER = `CREATE TRIGGER IF NOT EXISTS gnl_run_journal_ord AFTER INSERT ON gnl_run_journal WHEN NEW.ord = 0 AND NEW.run_id IS NOT NULL
+BEGIN
+  INSERT OR IGNORE INTO gnl_run_journal_ord (k, n) VALUES (1, 0);
+  UPDATE gnl_run_journal_ord SET n = n + 1 WHERE k = 1;
+  UPDATE gnl_run_journal SET ord = (SELECT n FROM gnl_run_journal_ord WHERE k = 1) WHERE rowid = NEW.rowid;
 END`;
 
 /** `where` (empty, or ` WHERE …` from keysetRunPage) with one more condition. */
@@ -1224,8 +1257,8 @@ class SqliteRunJournal implements RunJournal {
     if (opts?.limit !== undefined) {
       return (this.db.prepare(`SELECT key FROM gnl_run_journal WHERE ${rg.where} LIMIT ?`).all(...rg.params, opts.limit) as { key: string }[]).map((r) => r.key);
     }
-    // `key` tie-breaker — same reason `readRun` below carries one (Decision #4): entries written in
-    // the same millisecond have no defined order without it, so two reads of one prefix can disagree.
+    // `key` tie-breaker: entries written in the same millisecond have no defined order without it, so
+    // two reads of one prefix can disagree. (Not write order — `readRun` gives that, by `ord`.)
     // SQLite's plan is stabler than Postgres's in practice, which is exactly why this was easy to
     // leave out and hard to notice; the guarantee should not depend on which engine you happen to run.
     const rows = this.db.prepare(`SELECT key FROM gnl_run_journal WHERE ${rg.where} ORDER BY created_at, key`)
@@ -1250,10 +1283,11 @@ class SqliteRunJournal implements RunJournal {
     return Number(r.changes ?? 0);
   }
   async readRun(runId: string): Promise<JournalEntry[]> {
-    // Decision #4: `key` tie-breaker — the order of records written in the same ms is deterministic
-    // (limits.ts's loop counting + regression diff rely on the order; identical semantics to Postgres).
+    // JournalReader's ordering contract: first-write order is `ord` (RUN_JOURNAL_ORD_TRIGGER). Rows
+    // written before the column hold 0 — all of them older than every numbered row — and keep the order
+    // they had, `(created_at, key)`. Postgres reads the same.
     const rows = this.db.prepare(
-      'SELECT key, kind, value, created_at FROM gnl_run_journal WHERE run_id = ? ORDER BY created_at, key',
+      'SELECT key, kind, value, created_at FROM gnl_run_journal WHERE run_id = ? ORDER BY ord, created_at, key',
     ).all(runId) as { key: string; kind: string; value: string; created_at: number }[];
     return rows.map((r, seq) => ({ key: r.key, runId, kind: r.kind as JournalEntry['kind'], value: deserialize(r.value), seq, ts: r.created_at }));
   }

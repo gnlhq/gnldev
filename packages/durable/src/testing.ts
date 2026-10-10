@@ -236,20 +236,44 @@ export function journalConformance(
       const bare = all.find((r) => r.runId === 'bare')!;
       assert.deepEqual([bare.threadId, bare.agent, bare.resourceId, bare.workKey, bare.parentRunId], [undefined, undefined, undefined, undefined, undefined]);
       const entries = await reader.readRun('rs');
-      // Ordering (JournalReader.readRun): ascending first-write time. Writes in the same millisecond
-      // tie, and how a store breaks a tie is not asserted here (the SQL stores use the key), so only
-      // the time order is; a store that keeps no write times must give write order itself.
-      assert.deepEqual(entries.map((e) => e.key).sort(), ['rs:model:0', 'rs:model:1', 'rs:tool:t1'], 'one entry per key');
+      // Ordering (JournalReader.readRun): first-write order, an overwrite keeping its place — not a clock.
+      assert.deepEqual(entries.map((e) => e.key), ['rs:model:0', 'rs:tool:t1', 'rs:model:1'], 'first-write order, one entry per key');
       const entry = (k: string) => entries.find((e) => e.key === k)!;
-      if (entries.every((e) => e.ts !== undefined)) {
-        const ts = (k: string) => entry(k).ts!;
-        assert.ok(entries.every((e, i) => i === 0 || entries[i - 1]!.ts! <= e.ts!), 'ascending by first write');
-        assert.ok(ts('rs:model:0') <= ts('rs:tool:t1') && ts('rs:tool:t1') <= ts('rs:model:1'), 'an overwrite keeps its first-write time');
-      } else {
-        assert.deepEqual(entries.map((e) => e.key), ['rs:model:0', 'rs:tool:t1', 'rs:model:1'], 'write order');
-      }
+      assert.deepEqual(entries.map((e) => e.seq), [0, 1, 2], 'seq is the position');
       assert.deepEqual([entry('rs:model:0').kind, entry('rs:tool:t1').kind, entry('rs:model:1').kind], ['model', 'tool', 'model']);
       assert.deepEqual(entry('rs:tool:t1').value, { status: 'succeeded', output: 1 }, 'the entry holds the latest value');
+    });
+
+    scenario('R2b readRun is first-write order, not key order and not clock order — however fast the writes, whoever writes them', async ({ journal: j, older }) => {
+      const reader = requireReader(j);
+      // Twelve steps, each with a tool whose id sorts against the call order, all in ONE millisecond of
+      // this process's clock (`Date.now` held still): a store that orders by that clock with the key as
+      // tie-break reads model:10 before model:2 and every tool after every step (H7). Then the clock
+      // goes back 5 s — a second worker behind the first — and the run's next steps must still follow.
+      const expected: string[] = [];
+      const realNow = Date.now;
+      const at = realNow.call(Date);
+      try {
+        Date.now = () => at;
+        for (let i = 0; i < 12; i++) {
+          await j.put(`wo:model:${i}`, { step: i });
+          expected.push(`wo:model:${i}`);
+          const tool = `wo:tool:${String.fromCharCode(122 - i)}${i}`; // z0, y1, x2 … — descending
+          await j.put(tool, { status: 'running', startedAt: i });
+          expected.push(tool);
+        }
+        await j.put('wo:tool:z0', { status: 'succeeded', output: 0 }); // an overwrite keeps its place
+        Date.now = () => at - 5_000;
+        await j.put('wo:model:12', { step: 12 });
+        expected.push('wo:model:12');
+        // An older process writing the run's next step after this version's rows (a rolling deploy):
+        // its INSERT names no position, and it still lands after them.
+        await older('wo:model:13', { step: 13 });
+        expected.push('wo:model:13');
+      } finally {
+        Date.now = realNow;
+      }
+      assert.deepEqual((await reader.readRun('wo')).map((e) => e.key), expected);
     });
 
     scenario('R3 status: after every write of a scripted history, every run reads deriveRunStatus of its own records — listed, filtered, counted', async ({ journal: j }) => {

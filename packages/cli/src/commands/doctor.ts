@@ -65,8 +65,8 @@ export interface DoctorStamps {
  * `listRunsCore`.
  *
  * ASCENDING ORDER IS THE CONTRACT this leans on: `listRuns()` returns runs in append order and
- * `readRun()` returns entries in ascending write-time order (JournalReader's documented ordering,
- * which limits.ts and regression.ts already depend on). So the oldest run is the first element, and
+ * `readRun()` returns entries in first-write order (JournalReader's documented ordering) — which is
+ * not clock order, so the earliest time below is the minimum, not the first entry's. So the oldest run is the first element, and
  * the first run to carry an incident is the earliest one that has any.
  */
 export async function doctorStamps(journal: Durable.Journal & Durable.JournalReader, d: typeof Durable): Promise<DoctorStamps> {
