@@ -38,7 +38,7 @@ describe('upgrade from 0.9.0 — rag', () => {
   itMigrates('rag.db');
 
   it('every 0.9.0 record is still found by a query', async () => {
-    const f = openFixture('rag.db');
+    const f = await openFixture('rag.db');
     const all = rows(f.path);
     const hits = await f.storage.vectors.query(await S.fixtureEmbed('multi paragraph 0'), all.length);
     expect(hits.map((h) => h.id).sort()).toEqual(all.map((r) => r.id).sort());
@@ -46,7 +46,7 @@ describe('upgrade from 0.9.0 — rag', () => {
 
   describe.each(S.RAG_DOCS.map((d) => [d.id]))('re-ingesting %s after the upgrade', (doc) => {
     it('leaves exactly its new chunk, and every other document\'s records as they were', async () => {
-      const f = openFixture('rag.db');
+      const f = await openFixture('rag.db');
       const before = rows(f.path);
       const old = ownedOn090(before, doc);
       expect(old.length, `the fixture holds 0.9.0 records for ${doc}`).toBeGreaterThan(0);
@@ -61,7 +61,7 @@ describe('upgrade from 0.9.0 — rag', () => {
 
   describe.each(S.RAG_DOCS.map((d) => [d.id]))('deleteDocuments([%s]) after the upgrade', (doc) => {
     it('removes its 0.9.0 records and nothing else', async () => {
-      const f = openFixture('rag.db');
+      const f = await openFixture('rag.db');
       const before = rows(f.path);
       const old = ownedOn090(before, doc);
       await deleteDocuments(f.storage.vectors, [doc]);
@@ -70,20 +70,20 @@ describe('upgrade from 0.9.0 — rag', () => {
   });
 
   it('deleting every document leaves only the record that was never a document', async () => {
-    const f = openFixture('rag.db');
+    const f = await openFixture('rag.db');
     await deleteDocuments(f.storage.vectors, S.RAG_DOCS.map((d) => d.id));
     expectIds(rows(f.path).map((r) => r.id), S.RAG_RAW.map((d) => d.id));
   });
 
   it("deleteDocuments(['handbook']) does not delete the 0.9.0 record the user labelled source: 'handbook'", async () => {
-    const f = openFixture('rag.db');
+    const f = await openFixture('rag.db');
     const before = rows(f.path).length;
     expect(await deleteDocuments(f.storage.vectors, ['handbook'])).toBe(0);
     expect(rows(f.path)).toHaveLength(before);
   });
 
   it("re-ingesting a document keeps the user's own source label next to the trail", async () => {
-    const f = openFixture('rag.db');
+    const f = await openFixture('rag.db');
     const single = S.RAG_DOCS.find((d) => d.id === 'single')!;
     await ingestDocuments(f.storage.vectors, S.fixtureEmbed, [single]);
     const row = rows(f.path).find((r) => ungen(r.id) === 'single#0');

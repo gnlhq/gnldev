@@ -2,7 +2,8 @@
 // hosts (@gnldev/server) read them LIVE via checkBudget on the write path and return 402 on overrun → a
 // limit change does not require a deploy. Usage is computed post-hoc/exactly from journaled usage (cost.ts).
 import type { Journal, JournalReader, RunSummary } from './journal.js';
-import { claim, listRunsArray } from './journal.js';
+import { claim, listRunsArray, asReaderJournal } from './journal.js';
+import { OPEN_RUN_STATUSES } from './run-cursor.js';
 import { getRunCost, type RunCost } from './cost.js';
 import { effectivePricingTable, type ModelPricing } from './pricing.js';
 import { withOrg } from './organization.js';
@@ -153,6 +154,40 @@ async function listAllRuns(view: Pick<JournalReader, 'listRuns'>): Promise<RunLi
 }
 
 /**
+ * The strict total's two inputs WITHOUT listing every run: the runs that are not 'completed' (the only
+ * ones whose cost is not in the counter yet), and how many runs there are. `undefined` when the view
+ * cannot answer both that way — a journal without `listRunsPaged` or `countRuns` — and the caller lists
+ * every run as before.
+ *
+ * Why this is the same answer: the old loop skipped 'completed' runs and priced the rest in listing
+ * order; `listRunsPaged({ statuses })` hands out exactly the rest, in the same creation order (so the
+ * floating-point sums add in the same order), and `countRuns` counts the rows `listRuns` returns.
+ * `runs` stays a count, NOT `counter.runs + open runs`: the counter misses runs that completed without
+ * recording usage (a crash after the claim, an older process) and keeps runs that were purged since
+ * — measured on the 1M store: counter 6, runs 100 008 for acme. Each row is still checked here, so a
+ * journal that ignores the `statuses` filter stays exact, and only slower.
+ *
+ * 1M-run store, before: 17 s (acme) / 18 s (root), one unbounded listing reading every run and its
+ * `:input`, two parallel sequential scans and 3.7 GB of temp files. After: the open runs from the
+ * `gnl_runs_open` index plus one index COUNT.
+ */
+async function openRunsAndCount(source: Partial<JournalReader>): Promise<{ open: RunLike[]; total: number } | undefined> {
+  if (typeof source.countRuns !== 'function') return undefined;
+  // A store's own `runs` port pages through `listRuns(q)` and has no `listRunsPaged` by that name: the
+  // README hands it over as the journal, and `asReaderJournal` names it.
+  const view = asReaderJournal(source);
+  if (typeof view.listRunsPaged !== 'function') return undefined;
+  const open: RunLike[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await view.listRunsPaged({ statuses: OPEN_RUN_STATUSES, limit: 200, ...(cursor ? { cursor } : {}) });
+    for (const r of page.items) if (r.status !== 'completed') open.push(r);
+    cursor = page.nextCursor;
+  } while (cursor);
+  return { open, total: await view.countRuns!() };
+}
+
+/**
  * Total usage for an organization (or the orgless root scope).
  * 1.1: reads the incremental counter (`__usage__`) FIRST — if present, no FULL SCAN happens (O(1)).
  * The counter holds only the total of COMPLETED runs (`recordRunUsage` is only called when a run
@@ -206,7 +241,8 @@ export async function getOrgUsage(
       // The live cost of suspended runs is IGNORED this round (recordRunUsage adds it once finished).
       return { runs: counted.runs, tokens: counted.tokens, costUsd: counted.costUsd };
     }
-    const runs = await listAllRuns(view);
+    const read = await openRunsAndCount(view);
+    const runs = read ? read.open : await listAllRuns(view);
     let extraTokens = 0;
     let extraCostUsd = 0;
     for (const r of runs) {
@@ -215,7 +251,7 @@ export async function getOrgUsage(
       extraTokens += rc.totalTokens;
       extraCostUsd += rc.costUsd;
     }
-    return { runs: runs.length, tokens: counted.tokens + extraTokens, costUsd: counted.costUsd + extraCostUsd };
+    return { runs: read ? read.total : runs.length, tokens: counted.tokens + extraTokens, costUsd: counted.costUsd + extraCostUsd };
   }
 
   // No counter → full-scan fallback (old behavior, same result).

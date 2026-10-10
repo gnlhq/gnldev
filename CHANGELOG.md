@@ -12,20 +12,97 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 **A new thread no longer reads the store's other runs, and a run list resumes from its last run**
 (ADR-0006). Who may reach a thread is unchanged. When you upgrade from 0.10:
 
-- Once every process runs this version, run `gnl upgrade` (or `await storage.upgrade()`) once. It
-  lists its steps first — `gnl upgrade --list` — and runs every pending one, or only those you name
-  (`--only thread-records`). Until then everything works as in 0.10, at 0.10's speed.
+- **Stop every 0.10 process, run `gnl upgrade` (or `await storage.upgrade()`), then start this
+  version.** Not a rolling deploy: this version refuses a Sqlite or Postgres store until the upgrade's
+  `run-status` step has moved its run table off 0.10's status flags (see Breaking), and once it has, a
+  0.10 process can no longer write a run there. `gnl upgrade --list` lists the steps first; with no
+  flag it runs every pending one, or only those you name (`--only thread-records`). On 1 000 000 runs
+  the `run-status` step took 0.6 s on Postgres (2.2 s on Sqlite); the other steps only make
+  lookups faster (`relations`: ~5.5 min) and can run later — the store answers correctly before them.
 - A run list's `nextCursor` names a run, not a row number. Pass it back verbatim; a numeric cursor from
   0.10 is refused.
-- Postgres: this version adds three indexes (`gnl_runs_resource`, `gnl_runs_thread`,
-  `gnl_run_journal_owner`). Its processes build any that are missing when they boot, with a lock that
+- Postgres: this version adds five indexes (`gnl_runs_resource`, `gnl_runs_thread`,
+  `gnl_run_journal_owner`, `gnl_runs_open`, `gnl_runs_status`; the last two are built by the
+  `run-status` step). Its processes build any that are missing when they boot, with a lock that
   holds writers off for the length of the build. To build them without it, run
   `gnl upgrade --only schema` (or `storage.upgrade({ only: ['schema'] })`) before the new processes
-  start: the `schema` step builds a missing index `CONCURRENTLY`. Processes of 0.10 keep working beside it.
+  start: the `schema` step builds a missing index `CONCURRENTLY` (`gnl upgrade` runs it with the others).
 - Redis: this version has no Redis store. Move to Postgres (or Sqlite on one machine) — see Breaking.
+- **Deleting a thread now deletes its runs** (see Breaking). If anything of yours reads a thread's runs
+  after the thread is gone — an audit export, a bill — read it first. `sweepThreads` deletes through the
+  same plan, so an idle BasicMemory thread now leaves with its runs.
 
 ### Breaking
 
+- **Deleting a thread deletes its runs, and everything else the thread owns, in one call** — one model
+  of what a run, a thread, a person and an organization own (`model.ts` in `@gnldev/durable`), and one
+  executor that every deletion runs. `AgentMemory.deleteThread`, Studio's `DELETE /threads/:id`,
+  `purgeThread` and `sweepThreads` now take: every run whose `:input` names the thread (a sub-agent, a
+  fork and a rollover on it too) with their children, the thread's journal state (`mem:`, `om:` —
+  the observer's summaries — `sem:`, the `xthr:` idempotency window), the ownership traces naming it,
+  its observation vectors, the memory store's rows, and its owner record LAST, so a deletion killed
+  half-way leaves the thread gated and the next attempt finishes it. Why: "what goes with a thread"
+  was written in eight places and they had drifted. Measured on 35b70348, the same world on InMemory,
+  Sqlite, pg-mem and Postgres: `AgentMemory.deleteThread` (and Studio's route) took the 9 memory-store
+  rows and left the thread's 6 runs with their 46 journal keys (prompts, tool arguments, a pending
+  approval), its observer summaries, its idempotency window, its owner record and its observation
+  vector; `purgeThread` took the 7 journal records and left every message; only `eraseSubject` reached
+  both. New: `purgeThread(journal, threadId, { memory?, vectors?, allowInFlight? })` — given the memory
+  store and the vector store it deletes both halves (`AgentMemory.deleteThread` passes its own);
+  `Memory.deleteThread(threadId, opts?)`. A thread with a run still executing is REFUSED, nothing
+  deleted (`ThreadRunsInFlightError`, `runIds`; Studio answers 409 `thread_runs_in_flight` with
+  `runs`): its run would write its answer into the deleted thread, and a step whose claim was deleted
+  could run its effect twice. Cancel the run (`cancelAgentRun`) and delete again, or pass
+  `{ allowInFlight: true }` for a run whose worker is gone; a run waiting on an approval is not in flight
+  and goes with the thread. `sweepThreads` keeps such a thread for its next round (`keptInFlight`).
+  `eraseSubject` deletes each of the person's threads through the same plan (not refused for a run in
+  flight — see `subjectRuns`), and now also removes what this storage's journal holds of a thread whose
+  messages no reachable store held (its runs, state and owner record; the thread is still listed in
+  `unreachedThreads`): a retried erasure used to leave that owner record — naming the person — behind.
+  A move is not a delete: `migrateReservedRootThreads` empties the old id with `purgeThreadState`, which
+  leaves the runs. `observationalMemory.omVectors.store` needs a `delete` (every bundled store has one):
+  `AgentMemory.deleteThread` refuses a store without it rather than leave the thread's observations.
+  1 000 020-run Postgres (35b70348 → this, the same work on both sides: a thread with its 5 runs,
+  an erasure of ~500 runs, one run): statements 194 → 195, 21 112 → 19 598, 33 → 33; times within
+  this machine's noise (median of six rounds, both orders: 146 → 88 ms, 7.7 → 6.9 s, 14 → 11 ms).
+  Message writes are untouched (91/85 statements).
+
+- **A run's status is a column the store writes, not four flags** (Sqlite and Postgres). `gnl_runs`
+  loses `suspended`, `failed`, `running` and `canceled` and gains `outcome` (the run's `:outcome`
+  record: `running`, `failed` or `canceled`; NULL when it completed or recorded none — the two read
+  the same in every state) and `status` (`completed`, `suspended`, `failed`, `running`, `canceled`),
+  written with `suspended_count` in the one statement that writes the run's counters, from one rule
+  (`deriveRunStatus`'s precedence, kept as a table the SQL is generated from). Every listing, count and
+  status filter reads `status`, through two partial indexes `WHERE status <> 'completed'`:
+  `gnl_runs_open (created_at, run_id)` (every open run, in order — the usage total) and the new
+  `gnl_runs_status (status, created_at, run_id)` (one status — the approval inbox; on a store with 500 000
+  failed runs a page of suspended ones read 65 ms through the first, 1.5 ms through this). Why: the status was decoded from the flags on every read, in five hand-kept copies (two
+  SQL `CASE`s, two TypeScript decoders, a filter per status), each carrying the precedence; a row now
+  says its status, and the outcome is kept because the status alone cannot be (a run that failed, then
+  waited on an approval, must read `failed` again once it is resolved).
+  **Upgrade:** stop every 0.10 process → `gnl upgrade` → start this version. The new `run-status` step
+  (first of `UPGRADE_STEPS`) adds the two columns (`status` defaults to `completed` during the step, so
+  only the runs a flag marks are written), fills those a page at a time with no table lock, builds both
+  indexes `CONCURRENTLY`, and then, in one short transaction under an `ACCESS EXCLUSIVE` lock on
+  `gnl_runs`, rewrites any run whose flags changed after its page, drops the old index and the flags and
+  the default. Postgres, 1 000 000 runs: 0.6 s with 167 runs flagged (the lock held 6 ms; 99 ms on a store
+  0.10.0 wrote, which has no index on the flags, so the final check reads the table), 20 s with 500 167
+  flagged (the lock 216 ms; a first design that filled under the lock held it 16 s). Sqlite does it all
+  in one `BEGIN IMMEDIATE` transaction (2.2 s for 1 000 000 runs: `DROP COLUMN` rewrites the table;
+  readers in WAL mode are not held). Killed half-way, run it again: it
+  continues — the pages already filled stay filled, exactly as their flags say; a killed transaction
+  rolls back; a killed concurrent build leaves an INVALID index the next run drops and builds again.
+  Until it has run, this version refuses the store — every port, from the first call — with an error
+  naming `gnl upgrade`; `gnl doctor` lists the step and exits 1. After it, a 0.10 process's run writes
+  and run listings fail with the database's own error (`column "suspended" of relation "gnl_runs" does
+  not exist`; Sqlite `table gnl_runs has no column named suspended`) and write nothing; its boot puts
+  three of the flags back (empty), which makes this version refuse again until `gnl upgrade` drops
+  them, changing no status. Measured against stores written by 0.10.0 and by this release's earlier
+  code, on Sqlite and Postgres: every run's status, the approval inbox, `countRunsByStatus`, the status
+  listings and the strict and plain usage totals answer exactly as before. Code that read the flag
+  columns with SQL reads `status` instead. The `gnl upgrade` command no longer calls `storage.init()`
+  first (a pending store refuses to boot); each Postgres step that reads through the store boots it
+  itself.
 - **Redis is no longer a storage backend.** `@gnldev/durable/redis` and everything it exported are
   gone: `RedisStorage`, `RedisLike`, `RedisStorageOptions`, `ReplicationNotAcknowledgedError` (only
   Redis threw it), the `ioredis` peer dependency, and `ioredis` in `@gnldev/deploy`'s default
@@ -49,6 +126,77 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   back: pass `nextCursor` back, or use `order: 'desc'` for newest first.
 
 ### Fixed
+
+- **Two workers resuming the same run could run one tool call twice.** Measured with several
+  processes driving the same runs (Sqlite and Postgres), in two places:
+  - A worker that took over an approved question (or a crashed attempt) checked that it was free on one
+    read and took it over with the next — and when another worker had taken it over in between, the
+    compare-and-set matched *that* worker's fresh claim. Both ran the tool, side by side. A fresh claim
+    found there is now a live executor: the call is busy (`RunBusyError`), like a claim that lost.
+  - A call's decision — a guard's question, the duplicate guard, a confirm, a refusal, a nudge — was
+    written over whatever the record held by then. A worker that had read the call before another
+    worker ran it wrote `suspended` over the result (the duplicate guard took the call for a repeat of
+    itself: "already succeeded … (first: <this call>)"), and approving that question ran it again; one
+    without the approval wrote it over a live claim, and a worker with the approval then ran the call
+    while the first was still in its body. A decision now replaces only the record it was made on; if
+    that record moved, the call answers from what is there now, or is busy.
+- **`adoptIntoOrg` moved different things on different stores** (the same world, measured on
+  35b70348): on InMemory the adopted threads kept their old id inside the record, so the organization
+  listed none of them and read none of their messages; on Sqlite a platform meta key
+  (`__eeuser__:…`, the paid user store) moved into the organization; on Sqlite and Postgres every adopted
+  run's `readRun` came back empty (`gnl_run_journal.run_id` was not renamed — time travel, cost and a
+  purge's child discovery saw nothing), where InMemory answered in full; and the three reported three
+  different `skippedPlatformKeys`. The table list is now one, in `model.ts` (`SCOPE_TABLES`), with
+  `gnl_run_journal.run_id` and `gnl_threads.parent_thread_id`; InMemory renames the ids a record
+  carries; every store skips and reports platform keys by family.
+- **A run purge killed half-way and retried subtracted the run's usage twice.** The subtraction came
+  before the run's records, its `usage-counted` marker among them; it now comes after (what to subtract
+  is read first), so a retry finds no marker and subtracts nothing — at worst the counter keeps one
+  run's usage, an over-count. A run's own records also go last among its keys, so a retry still finds
+  it: before, a purge killed just after them left its `__metrics__run:`/`__metrics__done:` rows for good.
+- **Deleting thread `x` took the owner record of thread `x:owner:y`.** Thread ids may contain `:`, and
+  the owner record and the anonymous mark were deleted as key prefixes, so `thread:x:owner` took
+  `thread:x:owner:y:owner` and left that thread ungated — the next caller to name it became its owner,
+  history included. Both are deleted exactly now.
+
+- **Studio's approval inbox, the strict usage total and Studio's live updates no longer read every
+  run.** Measured on a 1 000 020-run Postgres store (167 suspended, acme 100 008 runs, organizations
+  present), before → after: `GET /approvals` 23.3 s / 20 335 statements → 75 ms / 335 (the 167
+  suspended runs only, through `listRunsPaged({ status: 'suspended' })`); `getOrgUsage` strict, the
+  write-path budget gate's default, acme 17.0 s → 10 ms and root 18.1 s → 72 ms (the open runs plus one
+  index `COUNT`; same `runs`/`tokens`/`costUsd`); `GET /events` 22.8 s per 2 s tick, database 73% busy
+  for one tab and 94% for three → ~1–3 ms per tick (0.07–0.17% busy, idle and at 20 writes/s, one or
+  three tabs). Writes are unchanged (new / existing thread 21.2 / 17.3 ms median after vs 22.2 / 18.2
+  before, same session). `runs` stays exact: the counter's run total plus the open runs is a different
+  number (the counter misses runs that completed without recording usage and keeps purged ones).
+- **A run's row is written once per journal write, and no longer locked for the whole write.**
+  Every write of a run updates its `gnl_runs` row (counters, status flags, person and thread,
+  `updated_at`). Postgres wrote that row 2–3 times per write — a lock-only update FIRST, held to the
+  commit, then the counters, then the `:input` placement or the outcome flags as statements of their
+  own; Sqlite twice for an `:input` or outcome. Now each write locks its own record (an existing key
+  `FOR UPDATE`, a new key by its `INSERT`) and writes its run's row once, last, in one upsert. Measured
+  on the 1 000 020-run Postgres store, one parent step fanning out to 200 sub-agents (5 model steps and
+  4 side-effect tool calls each), 5 runs each, alternated, before → after (median): `gnl_runs` row
+  writes 7 612 → 3 806 (per child 34 → 17, the parent's row 812 → 406), statements 41 668 → 37 862,
+  active backends waiting on a row lock 33% → 19%, wall 3.74 → 3.23 s, step latency p50/p95/p99
+  497/519/543 → 451/472/486 ms; 12 sub-agents: 434 → 387 ms wall, p95 68 → 58 ms. The rest of the step
+  time is statements and WAL, not the row: ~38 statements per sub-agent step, a quarter of them
+  `SELECT value FROM gnl_run_journal WHERE key = $1` reads. Single writes are not slower (new /
+  existing thread 25.5 / 19.6 ms median vs 25.7 / 22.4 before; 91 / 85 statements vs 96 / 90). The
+  counters, status, person and thread are unchanged for the same history (suspend, resume, fail, cancel,
+  fork, rollover, sub-agents — compared row for row with the previous code on Sqlite, pg-mem and real
+  Postgres), a claim is still won exactly once, and every write still moves `updated_at`, so the
+  change feed announces every step. `gnl_runs`' HOT-update ratio drops from ~38% to ~1%: the updates
+  that were HOT were the lock-only ones, now gone. `applyBatch` on Postgres derives a put's run row
+  the way `put` does (as Sqlite's already did): an outcome or `:input` record in a batch now sets its
+  run's status or person — no caller in GNL batches one.
+- `GET /events` under an organization (or at the root of a store that has one) now sends the
+  informative `{ runIds, at }` frame instead of the content-free `runs` frame. One difference from the
+  full diff it replaces: a run DELETED by another process is not announced (its row is gone); the
+  client drops it on its next list fetch. A change is announced late or twice, never lost, when its
+  commit lands within 3 s of its `updated_at` (a 5 s re-read window less one poll); a writer whose clock
+  trails Studio's by more, or a later commit, is the residual. A row stamped more than 5 s in the future
+  waits until Studio's clock reaches it.
 - **An organization's run list read the whole store.** `withOrg` found an organization's runs by
   walking every run page and keeping its own, so an organization with few runs on a large store paid
   for everyone else's — its first-contact thread probe and every unfiltered list: Sqlite, 200 000 root
@@ -124,6 +272,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`@gnldev/durable/testing`**: `journalConformance(name, make, { describe, it, timeout?, exactClaim?, pageWalk? })`
+  registers the journal conformance scenarios with any test runner. It covers the key-value contract,
+  the racing claim, which records name a run and its status, paging, a person's and a thread's runs
+  (including rows from older writers), owner records, and the dependents model's deletes (ADR-0007
+  decision 6). InMemory, Sqlite, Postgres (pg-mem, and a real server under `GNL_PG_URL`) and a
+  Map-based custom journal pass it. The RunJournal contract cases that lived in
+  `storage-backend.test.ts` moved into it. See the durable README, "Testing your own journal".
+- `outcomeStatusOf` is exported, and `JournalReader.listRuns` documents what names a run. A custom
+  journal that lists runs only by `parseJournalKey` and `runIdOfKey`, the only helpers exported
+  before, never lists a run whose only record is its outcome. One example is a run canceled before
+  it started. That run's status, its count and its retention were lost (measured: scenarios R1 and R3
+  fail on such a journal).
+- **`gnl_runs_open`** and **`gnl_runs_status`** (Sqlite and Postgres): partial indexes of the runs that
+  are not `completed` (`WHERE status <> 'completed'`) — in creation order, and by status — built by the
+  `run-status` step (Postgres: `CONCURRENTLY`).
+- `listRunsPaged({ statuses })` / `ListQuery.statuses`: any of several statuses; every status but
+  `completed` reads `gnl_runs_open`, one status `gnl_runs_status`.
+- `JournalReader.countRuns({ runIdPrefix })`: the run count from the engine. Bridged by `withOrg` (its
+  range) and `withRootScope` (every run less the organizations'); withheld by a person's view.
+- `JournalReader.listRunsChangedSince(cursor, { limit, since, runIdPrefix })` and the `RunChange` type:
+  runs ordered by when they last changed, over the existing `gnl_runs_updated` index. InMemory, Sqlite
+  and Postgres; bridged by `withOrg` and `withRootScope`; withheld by a person's view. A journal without
+  it keeps Studio's previous `/events` behaviour.
+
 - `storage.upgrade({ only?, dryRun? })` on every first-party store, and `gnl upgrade [--list] [--only …]`;
   `gnl doctor` lists pending steps. Steps: `schema` (Sqlite, Postgres — it now also adds an index an
   existing table lacks, which it could not before, and rebuilds one a failed concurrent build left
@@ -147,6 +319,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   old way. `SchemaCheckResult.missingIndexes`.
 
 ### Known limits
+- `adoptIntoOrg` moves the root work log's namespaces whole (every store alike). Owned jobs and events
+  live in the root log with their owner in the id (`~o~<org>:<user>:…`), so adopting into `acme2` also
+  moves `acme`'s owned records into `org:acme2:…`, and a root person's (`~o~:<user>:…`) stops matching
+  their erasure in `acme2` (which looks for `~o~acme2:<user>:`). Measured (C+ step C); not changed here
+  — adopting re-owns those records, which is the queue's format, not the model's.
 - What keeps the person/thread columns true is two triggers in the database. A write they do not see —
   a session with `session_replication_role = replica` (a logical-replication apply worker),
   `pg_restore --disable-triggers`, triggers disabled or dropped and re-created by hand between two
@@ -163,6 +340,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   or thread reads it, and decides it is nobody's. Answers are exact; with many such runs those lookups
   slow down (30 000 of them: a person's erasure ~1 s on Postgres). Runs started with `run()` are not
   affected.
+- A 0.10 process left running after the upgrade fails on every run write, but its other stores do not
+  touch `gnl_runs` (memory, work queue, cache, meta) and keep writing. Stop it: the upgrade is not a
+  rolling deploy. (The deadlock a 0.10 process and this version could meet writing the same run record
+  is gone with it: 0.10's run writes now fail on their first `gnl_runs` statement, holding no run row.)
 
 - A process of 0.10 writing after the upgrade (a rolling deploy) writes no `seen` marker: its anonymous
   thread reads as new. A named user's thread stays theirs; the first named user still claims an

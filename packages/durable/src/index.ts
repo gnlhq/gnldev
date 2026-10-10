@@ -1,7 +1,7 @@
 // @gnldev/durable — an exactly-once + deterministic-replay layer for Vercel AI SDK agents.
 // Drop-in: generateText -> runDurable. Composable: withDurableModel + durableTools.
 
-export { InMemoryJournal, parseJournalKey, assertThreadId, summarizeRun, claim, frozenGet, runKeys, deriveRunStatus, nestedAgentRunId, listRunsArray, asReaderJournal, runIdOfKey } from './journal.js';
+export { InMemoryJournal, parseJournalKey, assertThreadId, summarizeRun, claim, frozenGet, runKeys, deriveRunStatus, nestedAgentRunId, listRunsArray, asReaderJournal, runIdOfKey, outcomeStatusOf } from './journal.js';
 export { isRunCursor, pageRunsFromArray, type RunOrder } from './run-cursor.js';
 // H13 — journal format versioning: an API that keeps old records readable across SDK-major transitions.
 export { JOURNAL_FORMAT_VERSION, JournalFormatError, registerFormatUpgrade, stampFormat, upgradeFormat, isVersionedKey } from './format.js';
@@ -17,6 +17,7 @@ export type {
   JournalEntry,
   JournalEntryKind,
   RunSummary,
+  RunChange,
   DurableCtx,
   ToolJournalRecord,
   RunStatus,
@@ -38,7 +39,7 @@ export { usageAndCostFromModelValue, modelRecordFacts } from './cost.js';
 export type { ModelPricing, PricingDoc } from './pricing.js';
 export {
   DivergenceError, RunBusyError, SideEffectRetryBlockedError, RetryLimitExceededError,
-  SuiteVersionMismatchError, RunThreadMismatchError, RunTargetMismatchError,
+  SuiteVersionMismatchError, RunThreadMismatchError, RunTargetMismatchError, ThreadRunsInFlightError,
   RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, RunSweptError, BatchPlanMismatchError,
   CALLER_CONFLICT_CODES, callerConflictCode, callerConflictAnswer, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, FOREIGN_PARTY_DETAIL_FIELDS,
   BLOCKED_ERROR_CODES, blockedErrorCode, upstreamFailure, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES,
@@ -164,7 +165,7 @@ export { withSubjectJournal, withSubjectMemory, type SubjectViewOptions, type Su
 export { threadOwnerOf, admitThreadRun, threadOwnerKey, threadSeenKey, THREAD_RECORDS_KEY, copyThreadOwnership, assignThreadOwner, recordThreadCreated, type ThreadOwnership } from './thread-owner.js';
 export { ownedName, ownerOfName, assertSystemName, ownedPrefix, ownerIdProblem, assertOwnerId, OwnerIdError, RESERVED_OWNER_PREFIXES } from './owned-name.js';
 export { eraseSubject, subjectRuns, assertRootWorkForErasure, findReservedRootThreads, type ReservedRootThread, type EraseOptions, type EraseReport, type SubjectEraser, type SubjectRun } from './erase.js';
-export { orgPurgedKey, purgeRun, isRealRun, purgeThread, purgeResource, purgeBatch, purgeOrganization, purgeOrganizationWork, sweepRuns, sweepLog, sweepThreads, listOrphanThreadState, createRetentionSweeper } from './retention.js';
+export { orgPurgedKey, purgeRun, isRealRun, purgeThread, purgeThreadState, purgeResource, purgeBatch, purgeOrganization, purgeOrganizationWork, sweepRuns, sweepLog, sweepThreads, listOrphanThreadState, createRetentionSweeper } from './retention.js';
 export type { LogSweepTarget, RetentionSweeperOptions, RetentionSweepSummary, RetentionSweeper } from './retention.js';
 export { recordIdemConflict, readIdemLedger } from './idem-ledger.js';
 export { semKey, semTombKey, SEM_TEMPLATE_VERSION } from './semantic-dup.js';

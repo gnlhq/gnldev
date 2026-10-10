@@ -65,6 +65,13 @@ async function loadPostgres(variant: Variant): Promise<Loaded> {
   await loader.connect();
   await loader.query(readFileSync(join(FIXTURES_090, `postgres-${variant}.sql`), 'utf8'));
   await loader.end();
+  // The step this version refuses a 0.9.0 store without (its run status in four flag columns): what
+  // `gnl upgrade` runs first. Every other step is left to the tests, as before.
+  {
+    const first = new PostgresStorage({ connectionString: u.toString() });
+    await first.upgrade({ only: ['run-status'] });
+    await first.close();
+  }
   const opened: Store[] = [];
   const open = async () => {
     const s = new PostgresStorage({ connectionString: u.toString() });

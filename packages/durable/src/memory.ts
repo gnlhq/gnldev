@@ -151,8 +151,12 @@ export interface Memory {
    * interface and AgentMemory `implements` it, so the two cannot disagree without a compile error.
    */
   updateThread?(threadId: string, patch: { title?: string; metadata?: Record<string, unknown> }): Promise<unknown>;
-  /** Delete a thread with its messages, observations and thread-scoped working memory (optional). */
-  deleteThread?(threadId: string): Promise<void>;
+  /**
+   * Delete a thread WITH ITS RUNS (optional): its messages, observations, thread-scoped working memory,
+   * observation vectors, journal state and owner record, and every run on it (`purgeThread`, model.ts).
+   * Refuses while a run on the thread is in flight (`ThreadRunsInFlightError`) unless `allowInFlight`.
+   */
+  deleteThread?(threadId: string, opts?: { allowInFlight?: boolean }): Promise<void>;
   /**
    * Truncate a thread AFTER `afterIndex` (optional): the message AT `afterIndex` is kept, every message
    * after it is deleted. `afterIndex` indexes the array `getMessages(threadId)` (no `opts`) returns.

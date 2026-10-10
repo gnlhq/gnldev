@@ -37,7 +37,7 @@ import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { serialize } from '../src/serialize.js';
 import { RELATIONS_PENDING_ADVICE } from '../src/upgrade.js';
-import { runIdOfKey, parseJournalKey } from '../src/journal.js';
+import { OLD, oldSqlitePut, oldPgPut } from './older-writer.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
 const PG_URL = process.env.GNL_PG_URL;
@@ -67,20 +67,6 @@ interface Backend {
   sql?(text: string): Promise<{ rows: any[] }>;
 }
 
-/** The previous version's journal write, as SQL text with `?` or `$n` placeholders. */
-const OLD = {
-  sqliteJournal: `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at) VALUES (?, ?, ?, ?, ?, ?)
-                  ON CONFLICT(key) DO UPDATE SET value = excluded.value, suspended = excluded.suspended`,
-  sqliteRun: `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at)
-              VALUES (?, 0, 0, 0, 0, ?, ?) ON CONFLICT(run_id) DO UPDATE SET updated_at = excluded.updated_at`,
-  pgJournal: `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at) VALUES ($1,$2,$3,$4,$5,$6)
-              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, suspended = EXCLUDED.suspended`,
-  pgRun: `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at)
-          VALUES ($1,0,0,false,0,$2,$3) ON CONFLICT (run_id) DO UPDATE SET updated_at = EXCLUDED.updated_at`,
-};
-/** Which run a key registers, as the previous version decided it (the same rule as this one). */
-const oldRunOf = (key: string, value: unknown) => parseJournalKey(key)?.runId ?? runIdOfKey(key, value);
-
 function sqliteBackend(): Backend {
   const dir = mkdtempSync(join(tmpdir(), 'gnl-relations-'));
   const file = join(dir, 'shared.db');
@@ -92,13 +78,7 @@ function sqliteBackend(): Backend {
     storage,
     relations: true,
     file,
-    async oldPut(key, value) {
-      const p = parseJournalKey(key);
-      const now = Date.now();
-      old.prepare(OLD.sqliteJournal).run(key, p?.runId ?? null, p?.kind ?? null, 0, serialize(value), now);
-      const run = oldRunOf(key, value);
-      if (run) old.prepare(OLD.sqliteRun).run(run, now, now);
-    },
+    async oldPut(key, value) { oldSqlitePut(old, key, value); },
     async placedPerson(runId) {
       return (old.prepare('SELECT resource_id FROM gnl_runs WHERE run_id = ?').get(runId) as { resource_id: string | null } | undefined)?.resource_id;
     },
@@ -112,11 +92,7 @@ function pgBackend(storagePool: any, oldPool: any): Backend {
     relations: true,
     async oldPut(key, value) {
       await storage.init();
-      const p = parseJournalKey(key);
-      const now = Date.now();
-      await oldPool.query(OLD.pgJournal, [key, p?.runId ?? null, p?.kind ?? null, false, serialize(value), now]);
-      const run = oldRunOf(key, value);
-      if (run) await oldPool.query(OLD.pgRun, [run, now, now]);
+      await oldPgPut(oldPool, key, value);
     },
     async placedPerson(runId) {
       const r = await oldPool.query('SELECT resource_id FROM gnl_runs WHERE run_id = $1', [runId]);
@@ -692,7 +668,7 @@ if (PG_URL) {
         ['g2:input', 'g2', 'input', serialize(input({ resourceId: 'carl' })), now],
       );
       await bare.query(
-        `INSERT INTO ${b.schema}.gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at) VALUES ($1, 0, 0, false, 0, $2, $2)`,
+        `INSERT INTO ${b.schema}.gnl_runs (run_id, model_steps, tool_calls, suspended_count, status, created_at, updated_at) VALUES ($1, 0, 0, 0, 'completed', $2, $2)`,
         ['g2', now],
       );
       expect(await walk(b.storage, { resourceId: 'carl' })).toEqual(['g2']);

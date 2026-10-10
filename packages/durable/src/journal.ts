@@ -5,7 +5,7 @@ import type { Guard } from './guard.js';
 import type { RunLimits, ToolSeat } from './limits.js';
 import type { Processor } from './processor.js';
 import { stableStringify } from './hash.js';
-import { pageRunsFromArray, type RunOrder } from './run-cursor.js';
+import { pageRunsFromArray, decodeChangeCursor, encodeChangeCursor, type RunOrder } from './run-cursor.js';
 import { isVersionedKey, upgradeFormat } from './format.js';
 
 export type ToolJournalRecord = (
@@ -494,7 +494,7 @@ export async function frozenGet<T>(journal: Journal, key: string, compute: () =>
 /** Context of a durable run: journal, run, optional policy and approvals. */
 import type { RunIdentity } from './identity-types.js';
 import { refuseUnknownNames } from '@gnldev/options';
-import { LIST_KEYS_NAMES, LIST_OWNER_RECORDS_NAMES, LIST_STALE_RUNS_NAMES } from './option-names.js';
+import { LIST_KEYS_NAMES, LIST_OWNER_RECORDS_NAMES, LIST_STALE_RUNS_NAMES, COUNT_RUNS_NAMES, LIST_RUNS_CHANGED_NAMES } from './option-names.js';
 export interface DurableCtx {
   /** The maxToolCalls seats this run's calls hold, by toolCallId (limits.ts takeToolSeat) — so the
    *  write that counts a call can give its seat back in the same step. @internal */
@@ -712,8 +712,21 @@ export interface RunSummary {
   parentRunId?: string;
 }
 
+/** One run as a change feed hands it out: its summary and when it last changed (`gnl_runs.updated_at`). */
+export type RunChange = RunSummary & {
+  /** Epoch ms of the run's last write, as the WRITING process's clock read it. */
+  updatedAt: number;
+};
+
 /** Journal read surface (timeline / time-travel / studio). */
 export interface JournalReader {
+  /**
+   * Every run. A run is named by any ONE of its records: a `:model:`/`:tool:` entry (`parseJournalKey`),
+   * its stamped `:input` (`runIdOfKey`), or its outcome record (`outcomeStatusOf` not null) — the only
+   * record of a run canceled before it started, and the first one a run writes. A journal that lists
+   * runs by the first two alone never lists such a run: its status, its count and its retention go with
+   * it (`@gnldev/durable/testing` R1, R3). Status: `summarizeRun(runId, readRun(runId), outcomeRecord)`.
+   */
   listRuns(): Promise<RunSummary[]>;
   /**
    * ORDERING CONTRACT (Decision #4): records are returned in ASCENDING write-time order; ties at the
@@ -737,6 +750,35 @@ export interface JournalReader {
    * aggregate (e.g. a pure-KV backend) simply leave it undefined — callers fall back to listRuns.
    */
   countRunsByStatus?(): Promise<Record<string, number>>;
+  /**
+   * (optional) How many runs there are — the same rows `listRuns()` returns, counted by the engine
+   * (`SELECT COUNT(*)`), never listed. `runIdPrefix` counts only runs whose id starts with it — the
+   * range an organization's view passes down (`withOrg`), read from the run id's index.
+   *
+   * Exists for the usage total (`getOrgUsage`): its run count was `listRuns().length`, which on the
+   * 1M-run store the C+ audit measured read every run with their `:input` blobs — 17–18 s, 3.7 GB of
+   * temp files — to produce one number. Unlike `countRunsByStatus` it takes the prefix, so a scoped view
+   * CAN bridge it without leaking other organizations' counts; a journal written before it leaves it
+   * undefined and callers count by listing, as before.
+   */
+  countRuns?(q?: { runIdPrefix?: string }): Promise<number>;
+  /**
+   * (optional) THE CHANGE FEED: runs ordered by when they last changed — `(updated_at, run_id)`
+   * ascending — starting after `cursor`, or at `opts.since` (epoch ms, inclusive) when no cursor is given,
+   * or at the beginning. At most `opts.limit` (default 200) per call. `nextCursor` names the last run
+   * handed out (absent on an empty page); a page shorter than `limit` means the feed is caught up for
+   * now — more rows can arrive later, which is why the cursor is still handed back.
+   *
+   * Every write to a run moves its `updated_at` (each journal entry, a tool record changing status, the
+   * outcome), so a reader polling this sees step progress and status flips without reading every run.
+   * What it does NOT see: a run DELETED (its row is gone). And `updated_at` is the writer's clock, set
+   * inside a transaction that can commit after a reader has already passed that value — a consumer that
+   * must not miss a change re-reads a fixed window behind its position (see Studio's GET /events).
+   *
+   * `runIdPrefix` narrows to runs whose id starts with it (an organization's range); a journal that
+   * cannot filter by it may ignore it, and the scoped views check every row themselves.
+   */
+  listRunsChangedSince?(cursor?: string, opts?: { limit?: number; since?: number; runIdPrefix?: string }): Promise<{ items: RunChange[]; nextCursor?: string }>;
   /**
    * P0.3 a PAGINATED + FILTERED sibling of `listRuns()`
    * above. The array method stays exactly as-is (used EVERYWHERE — studio, budget.ts, toJournal's own
@@ -762,6 +804,12 @@ export interface JournalReader {
     limit?: number;
     cursor?: string;
     status?: RunStatus;
+    /**
+     * Any of these statuses. The set of every status but 'completed' is what the approval inbox and the
+     * usage total ask for, and Sqlite and Postgres answer it from the `gnl_runs_open` partial index —
+     * reading those runs only. Same filter-before-slice contract as `status`; with both, both apply.
+     */
+    statuses?: readonly RunStatus[];
     agent?: string;
     /** WHOSE runs — matches `RunSummary.resourceId`; same filter-before-slice contract as `agent`. */
     resourceId?: string;
@@ -790,6 +838,7 @@ export type RunListQuery = {
   limit?: number;
   cursor?: string;
   status?: RunStatus;
+  statuses?: readonly RunStatus[];
   agent?: string;
   resourceId?: string;
   workKey?: string;
@@ -1028,6 +1077,85 @@ export function runRelationsOf(key: string, value: unknown): (RunRelations & { r
 }
 
 /**
+ * What journal writes change on their runs' derived rows (`gnl_runs` in Sqlite and Postgres): the
+ * counters, the person and thread, the outcome and the status they decide — and, always, `updated_at`,
+ * which the change feed (`listRunsChangedSince`) reads, so every write announces its run.
+ */
+export interface RunRowChange {
+  /** Model records the writes INSERTED (an overwrite of an existing record adds none). */
+  models: number;
+  /** Tool records the writes inserted. */
+  tools: number;
+  /** Records that became suspended minus records that stopped being suspended. */
+  suspendedDelta: number;
+  /** The run's `:input` was written: its person and thread (`runRelationsOf`). */
+  relations?: RunRelations;
+  /** The run's outcome record was written: `gnl_runs.outcome` (`storedOutcomeOf`) and the status follow it. */
+  outcome?: 'running' | 'failed' | 'canceled' | 'completed';
+}
+
+/**
+ * The run-row changes of ONE transaction, merged per run, so an adapter writes each run's row ONCE
+ * per transaction (one upsert carrying counters, relations, outcome, status and `updated_at`).
+ *
+ * Why: a run's row is the one row every write of that run touches. Measured on Postgres (C+ step B,
+ * 200 sub-agents under one parent step): the row was written 2–3 times per journal write — a lock-only
+ * "no-op" update, the counter update, then the `:input` placement or the outcome flags as separate
+ * statements — 34 row versions per 5-step child and 4 per child on the PARENT's row, which every child's
+ * tool-call record touches. Every one of those is a new tuple and a lock on that row.
+ *
+ * `noteWrite` is the one derivation of which run(s) a write belongs to, shared by both SQL adapters
+ * and every write path (put, putIfAbsent, putIfMatch, applyBatch), so the paths cannot drift.
+ */
+export class RunRowChanges {
+  private readonly byRun = new Map<string, RunRowChange>();
+  /** Merge `c` into `runId`'s change; an empty `c` still marks the run (its `updated_at` advances). */
+  add(runId: string, c: Partial<RunRowChange> = {}): this {
+    const cur = this.byRun.get(runId) ?? { models: 0, tools: 0, suspendedDelta: 0 };
+    cur.models += c.models ?? 0;
+    cur.tools += c.tools ?? 0;
+    cur.suspendedDelta += c.suspendedDelta ?? 0;
+    if (c.relations) cur.relations = c.relations;
+    if (c.outcome) cur.outcome = c.outcome;
+    this.byRun.set(runId, cur);
+    return this;
+  }
+  /**
+   * One journal write that LANDED. `prev`: the row it replaced (`undefined` = a fresh insert), its
+   * `suspended`. A run-scoped record (`<run>:model:…`/`<run>:tool:…`) counts on its run; a run's
+   * `:input` registers the run and places it; a run's outcome record sets its outcome (the write-ahead
+   * outcome may be a brand-new run's first write — the upsert creates its row). Any other key: nothing.
+   */
+  noteWrite(key: string, value: unknown, prev: { suspended: boolean } | undefined): this {
+    const p = parseJournalKey(key);
+    if (p) {
+      const suspended = p.kind === 'tool' && (value as ToolJournalRecord | undefined)?.status === 'suspended';
+      const fresh = prev === undefined;
+      return this.add(p.runId, {
+        models: fresh && p.kind === 'model' ? 1 : 0,
+        tools: fresh && p.kind === 'tool' ? 1 : 0,
+        suspendedDelta: (suspended ? 1 : 0) - (prev?.suspended ? 1 : 0),
+      });
+    }
+    const owner = runIdOfKey(key, value);
+    if (owner) this.add(owner);
+    const rel = runRelationsOf(key, value);
+    if (rel) this.add(rel.runId, { relations: { resourceId: rel.resourceId, threadId: rel.threadId } });
+    const oc = outcomeStatusOf(key, value);
+    if (oc !== null) this.add(key.slice(0, -':outcome'.length), { outcome: oc });
+    return this;
+  }
+  get size(): number { return this.byRun.size; }
+  /**
+   * In run-id order: every writer takes run-row locks in this order, so two transactions that touch the
+   * same runs cannot each hold one the other waits for.
+   */
+  entries(): [string, RunRowChange][] {
+    return [...this.byRun.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  }
+}
+
+/**
  * A thread OWNER RECORD's key — `thread:<id>:owner`, under any organization prefix. Written as the SQL
  * patterns too (Postgres `LIKE`, Sqlite `GLOB`, which unlike Sqlite's `LIKE` keeps case), and the three
  * say the same thing: the rows an adapter gives an owner column are exactly the rows its "not placed
@@ -1066,25 +1194,73 @@ export function isVersionedRecord(value: unknown): boolean {
 }
 
 /**
- * The ONE status rule. Every adapter derives status from its own storage shape, and four separate
- * copies of `suspended ? 'suspended' : 'completed'` is exactly how a third value silently becomes a
- * second value in three of them.
+ * The ONE status rule, as data: the first entry that holds names the status, and a run none of them
+ * holds is 'completed'. `deriveRunStatus` reads it, and so does the SQL the Sqlite and Postgres adapters
+ * write into `gnl_runs.status` (`runStatusCaseSql`) — one table, not a TypeScript copy and two SQL
+ * copies, because four separate copies of `suspended ? 'suspended' : 'completed'` is exactly how a
+ * third value silently became a second value in three of them.
+ *
+ * Canceled outranks even 'suspended', which is the one precedence call here that is not obvious.
+ * 'suspended' is derived from tool records, and those outlive the cancel: a run canceled while it
+ * waited on a human still has its suspended tool record, so it would keep advertising an approval
+ * that can never be applied — runDurableGuarded (and resumeRun, which goes through it) calls
+ * assertNotCanceled and refuses, and cancel.ts states there is deliberately no uncancel. Every other
+ * status describes a run that could still move; a canceled one is terminally over.
+ *
+ * 'running' is the write-ahead half: a run that recorded a start and never recorded an end has NOT
+ * completed — saying 'completed' there was the lie the vocabulary used to force. A journal with NO
+ * outcome at all (written before outcomes existed) still reads 'completed', exactly as it always did.
+ * @internal — deriveRunStatus and the SQL adapters.
  */
+export const RUN_STATUS_PRECEDENCE: ReadonlyArray<{ status: Exclude<RunStatus, 'completed'>; when: 'outcome' | 'suspended' }> = [
+  { status: 'canceled', when: 'outcome' },
+  { status: 'suspended', when: 'suspended' },
+  { status: 'failed', when: 'outcome' },
+  { status: 'running', when: 'outcome' },
+];
+
 export function deriveRunStatus(suspended: boolean, outcome?: Pick<RunOutcomeRecord, 'status'> | null): RunStatus {
-  // Canceled outranks even 'suspended', which is the one precedence call here that is not obvious.
-  // 'suspended' is derived from tool records, and those outlive the cancel: a run canceled while it
-  // waited on a human still has its suspended tool record, so it would keep advertising an approval
-  // that can never be applied — runDurableGuarded (and resumeRun, which goes through it) calls
-  // assertNotCanceled and refuses, and cancel.ts states there is deliberately no uncancel. Every other
-  // status describes a run that could still move; a canceled one is terminally over.
-  if (outcome?.status === 'canceled') return 'canceled';
-  if (suspended) return 'suspended';
-  if (outcome?.status === 'failed') return 'failed';
-  // The write-ahead half: a run that recorded a start and never recorded an end has NOT completed —
-  // saying 'completed' here was the lie the vocabulary used to force. A journal with NO outcome at
-  // all (written before outcomes existed) still reads 'completed', exactly as it always did.
-  if (outcome?.status === 'running') return 'running';
+  for (const r of RUN_STATUS_PRECEDENCE) if (r.when === 'suspended' ? suspended : outcome?.status === r.status) return r.status;
   return 'completed';
+}
+
+/**
+ * What `gnl_runs.outcome` keeps of a run's `:outcome` record: the three outcomes the status rule reads
+ * ('running', 'failed', 'canceled'). A 'completed' record and no record at all are both NULL: they
+ * decide the status the same way in every state (`runStatusOf(n, 'completed')` would equal
+ * `runStatusOf(n, null)` for every n — run-status-columns.test.ts checks the rule), and the flags an
+ * earlier version kept could not tell them apart either, so a migrated row and a row written today mean
+ * the same thing by NULL.
+ * @internal — the SQL adapters.
+ */
+export type StoredOutcome = 'running' | 'failed' | 'canceled';
+/** @internal — see StoredOutcome. */
+export function storedOutcomeOf(status: RunOutcomeRecord['status'] | null | undefined): StoredOutcome | null {
+  return status === 'running' || status === 'failed' || status === 'canceled' ? status : null;
+}
+
+/**
+ * A run's status from the two things it depends on: how many of its tool records are suspended (a
+ * counter that goes up and down) and its recorded outcome. What the Sqlite and Postgres adapters store
+ * in `gnl_runs.status`, written with those two in the same statement. Both inputs are kept, not the
+ * status alone: a run that failed and then suspended reads 'suspended' — and once the approval is
+ * resolved it must read 'failed' again, which the status alone no longer says.
+ * @internal — the SQL adapters.
+ */
+export function runStatusOf(suspendedCount: number, outcome: StoredOutcome | null): RunStatus {
+  return deriveRunStatus(suspendedCount > 0, outcome ? { status: outcome } : null);
+}
+
+/**
+ * `runStatusOf` as a SQL expression, generated from RUN_STATUS_PRECEDENCE: `suspended` is a boolean SQL
+ * expression (`gnl_runs.suspended_count + ? > 0`), `outcome` one that yields the stored outcome or NULL.
+ * For the one write that cannot compute the status in TypeScript: an upsert whose counter is the row's
+ * own, known only to the database.
+ * @internal — the SQL adapters.
+ */
+export function runStatusCaseSql(suspended: string, outcome: string): string {
+  const arms = RUN_STATUS_PRECEDENCE.map((r) => `WHEN ${r.when === 'suspended' ? `(${suspended})` : `${outcome} = '${r.status}'`} THEN '${r.status}'`);
+  return `CASE ${arms.join(' ')} ELSE 'completed' END`;
 }
 
 /**
@@ -1130,11 +1306,17 @@ export class InMemoryJournal implements Journal, JournalReader {
       // leave an organization's usage totals stranded at the root while its runs moved.
       if (this.counters.has(k)) { this.counters.set(to, this.counters.get(k)!); this.counters.delete(k); }
       if (this.times.has(k)) { this.times.set(to, this.times.get(k)!); this.times.delete(k); }
+      if (this.mtimes.has(k)) { this.mtimes.set(to, this.mtimes.get(k)!); this.mtimes.delete(k); }
       n++;
     }
     return n;
   }
   private times = new Map<string, number>(); // key → first write time (OTEL timing)
+  /**
+   * key → LAST write time: the in-memory twin of `gnl_runs.updated_at`, which the SQL adapters move on
+   * every write to a run. A run's change time is its newest key's (`listRunsChangedSince`).
+   */
+  private mtimes = new Map<string, number>();
 
   async get<T = unknown>(key: string): Promise<T | undefined> {
     if (!this.store.has(key)) return undefined;
@@ -1143,6 +1325,7 @@ export class InMemoryJournal implements Journal, JournalReader {
 
   async put(key: string, value: unknown): Promise<void> {
     if (!this.times.has(key)) this.times.set(key, Date.now());
+    this.mtimes.set(key, Date.now());
     this.store.set(key, structuredClone(value));
   }
 
@@ -1150,6 +1333,7 @@ export class InMemoryJournal implements Journal, JournalReader {
   async putIfAbsent(key: string, value: unknown): Promise<boolean> {
     if (this.store.has(key)) return false;
     this.times.set(key, Date.now());
+    this.mtimes.set(key, Date.now());
     this.store.set(key, structuredClone(value));
     return true;
   }
@@ -1159,6 +1343,7 @@ export class InMemoryJournal implements Journal, JournalReader {
   async putIfMatch(key: string, expected: unknown, value: unknown): Promise<boolean> {
     if (!this.store.has(key)) return false;
     if (stableStringify(this.store.get(key)) !== stableStringify(expected)) return false;
+    this.mtimes.set(key, Date.now());
     this.store.set(key, structuredClone(value));
     return true;
   }
@@ -1184,6 +1369,7 @@ export class InMemoryJournal implements Journal, JournalReader {
     if (batch.claim) {
       if (this.store.has(batch.claim.key)) return false;
       this.times.set(batch.claim.key, Date.now());
+      this.mtimes.set(batch.claim.key, Date.now());
       this.store.set(batch.claim.key, structuredClone(batch.claim.value));
     }
     for (const { key, fields } of batch.incrs ?? []) {
@@ -1193,6 +1379,7 @@ export class InMemoryJournal implements Journal, JournalReader {
     }
     for (const { key, value } of batch.puts ?? []) {
       if (!this.times.has(key)) this.times.set(key, Date.now());
+      this.mtimes.set(key, Date.now());
       this.store.set(key, structuredClone(value));
     }
     return true;
@@ -1292,6 +1479,7 @@ export class InMemoryJournal implements Journal, JournalReader {
       if (k.startsWith(prefix)) {
         this.store.delete(k);
         this.times.delete(k);
+        this.mtimes.delete(k);
         deleted++;
       }
     }
@@ -1370,5 +1558,38 @@ export class InMemoryJournal implements Journal, JournalReader {
    */
   async listRunsPaged(q?: RunListQuery): Promise<{ items: RunSummary[]; nextCursor?: string }> {
     return pageRunsFromArray(await this.listRuns(), q);
+  }
+
+  /** See `JournalReader.countRuns` — the runs `listRuns()` derives, counted in memory. */
+  async countRuns(q?: { runIdPrefix?: string }): Promise<number> {
+    refuseUnknownNames('countRuns', q, COUNT_RUNS_NAMES);
+    const prefix = q?.runIdPrefix;
+    return (await this.listRuns()).filter((r) => prefix === undefined || r.runId.startsWith(prefix)).length;
+  }
+
+  /**
+   * See `JournalReader.listRunsChangedSince`. A run's change time is the newest last-write time of any
+   * key that belongs to it — the same keys `listRuns` attributes to it — so every write that moves
+   * `gnl_runs.updated_at` in the SQL adapters moves it here too.
+   */
+  async listRunsChangedSince(cursor?: string, opts?: { limit?: number; since?: number; runIdPrefix?: string }): Promise<{ items: RunChange[]; nextCursor?: string }> {
+    refuseUnknownNames('listRunsChangedSince', opts, LIST_RUNS_CHANGED_NAMES);
+    const pos = decodeChangeCursor(cursor);
+    const limit = opts?.limit ?? 200;
+    const at = new Map<string, number>();
+    for (const [key, value] of this.store) {
+      const p = parseJournalKey(key);
+      const runId = p ? p.runId : runIdOfKey(key, value) ?? (outcomeStatusOf(key, value) !== null ? key.slice(0, -':outcome'.length) : undefined);
+      if (!runId) continue;
+      at.set(runId, Math.max(at.get(runId) ?? 0, this.mtimes.get(key) ?? this.times.get(key) ?? 0));
+    }
+    const all = (await this.listRuns())
+      .filter((r) => opts?.runIdPrefix === undefined || r.runId.startsWith(opts.runIdPrefix))
+      .map((r) => ({ ...r, updatedAt: at.get(r.runId) ?? 0 }))
+      .filter((r) => (pos ? r.updatedAt > pos.at || (r.updatedAt === pos.at && r.runId > pos.runId) : opts?.since === undefined || r.updatedAt >= opts.since))
+      .sort((a, b) => a.updatedAt - b.updatedAt || (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0));
+    const items = all.slice(0, limit);
+    const last = items[items.length - 1];
+    return { items, ...(last ? { nextCursor: encodeChangeCursor({ at: last.updatedAt, runId: last.runId }) } : {}) };
   }
 }

@@ -6,8 +6,8 @@
 // PRESERVED in the organization view (the same Journal interface). A highly requested feature that has no
 // counterpart in most agent frameworks.
 import { listRunsArray } from './journal.js';
-import { decodeRunCursor, encodeRunCursor } from './run-cursor.js';
-import type { Journal, JournalBatch, JournalReader, JournalEntry, RunSummary } from './journal.js';
+import { decodeRunCursor, encodeRunCursor, encodeChangeCursor, type ChangePosition } from './run-cursor.js';
+import type { Journal, JournalBatch, JournalReader, JournalEntry, RunChange, RunSummary } from './journal.js';
 
 /** An organization-prefixed key. orgId must not contain ':' (it would break the key schema). */
 /**
@@ -311,6 +311,39 @@ async function walkRunPages(
   }
 }
 
+/**
+ * One page of `listRunsChangedSince` over a source that also holds rows the caller may not see — the
+ * change feed's `walkRunPages`. Walks the source's pages until `limit` rows are kept or the source is
+ * caught up (a short page), so "a page shorter than `limit` means caught up" stays true through the
+ * view. The cursor names the last SOURCE row read, kept or not: the next page resumes after it, and a
+ * window of other organizations' changes is never read twice. Honest cost: the rows the source hands
+ * over that are not the caller's — under `withOrg` none on Sqlite and Postgres (the run id range goes
+ * down), under `withRootScope` every organization's changes in the window, read and dropped.
+ */
+async function walkChangePages(
+  reader: Partial<JournalReader>,
+  journal: unknown,
+  cursor: string | undefined,
+  opts: Parameters<NonNullable<JournalReader['listRunsChangedSince']>>[1],
+  keep: (r: RunChange) => RunChange | undefined,
+): Promise<{ items: RunChange[]; nextCursor?: string }> {
+  const limit = opts?.limit ?? 200;
+  const items: RunChange[] = [];
+  let cur = cursor;
+  let last: ChangePosition | undefined;
+  for (;;) {
+    const page = await reader.listRunsChangedSince!.call(journal, cur, { ...opts, limit });
+    for (const r of page.items) {
+      last = { at: r.updatedAt, runId: r.runId };
+      const mine = keep(r);
+      if (mine) items.push(mine);
+      if (items.length >= limit) return { items, nextCursor: encodeChangeCursor(last) };
+    }
+    if (page.items.length < limit || !last) return { items, ...(last ? { nextCursor: encodeChangeCursor(last) } : {}) };
+    cur = encodeChangeCursor(last);
+  }
+}
+
 export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<JournalReader> {
   // An organization's view of the root scope's view is the organization's view of the root: the root
   // view hides `org:` keys, and every key this view reads is one.
@@ -444,6 +477,16 @@ export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<J
     // stays exact, and only walks.
     out.listRunsPaged = (q) => walkRunPages(reader, journal, { ...q, runIdPrefix: prefix + (q?.runIdPrefix ?? '') }, (r) => (r.runId.startsWith(prefix) ? { ...r, runId: r.runId.slice(prefix.length) } : undefined));
   }
+  // The count and the change feed take the organization's range the same way — the prefix goes down,
+  // so the store counts and reads only this organization's runs. Unlike `countRunsByStatus` (above),
+  // both take a prefix BY CONTRACT, which is what makes bridging them here safe.
+  if (typeof reader.countRuns === 'function') {
+    out.countRuns = (q) => reader.countRuns!.call(journal, { runIdPrefix: prefix + (q?.runIdPrefix ?? '') });
+  }
+  if (typeof reader.listRunsChangedSince === 'function') {
+    out.listRunsChangedSince = (cursor, opts) => walkChangePages(reader, journal, cursor, { ...opts, runIdPrefix: prefix + (opts?.runIdPrefix ?? '') },
+      (r) => (r.runId.startsWith(prefix) ? { ...r, runId: r.runId.slice(prefix.length) } : undefined));
+  }
   // H8c (run size statistics): runId is prefixed, the result (entries/bytes) is independent of the
   // organization — returned as-is. If not bridged, retention/budget's stats path would silently disappear in the org view.
   if (typeof reader.readRunStats === 'function') {
@@ -474,7 +517,7 @@ export function rootScopeParentOf(journal: unknown): Journal | undefined {
  * rule for runs; a door hands it out wherever it serves the root scope.
  *
  * READS ONLY. `get`, `getMany`, `getCounters`, `listKeys`, `listOwnerRecords`, `readRun`, `readRunStats`, `listRuns`,
- * `listRunsPaged` and `listStaleRuns` answer as if no `org:` key existed (`isOrganizationKey`);
+ * `listRunsPaged`, `listStaleRuns`, `countRuns` and `listRunsChangedSince` answer as if no `org:` key existed (`isOrganizationKey`);
  * `countRunsByStatus` answers only while no organization holds a row — it counts every organization's
  * runs and takes no filter — and otherwise resolves `undefined` (a caller falls back to `listRuns`, as
  * it does under `withOrg`). Writes pass through unchanged: a
@@ -517,6 +560,19 @@ export function withRootScope<J extends Partial<Journal> & Partial<JournalReader
       && ((q?: Parameters<NonNullable<JournalReader['listRunsPaged']>>[0]) => walkRunPages(j, journal, q, (r) => (hidden(r.runId) ? undefined : r))),
     listStaleRuns: j.listStaleRuns && (async (cutoffTs: number, o?: { includeSuspended?: boolean }) =>
       (await j.listStaleRuns!(cutoffTs, o)).filter((runId) => !hidden(runId))),
+    // The root's runs are every run less the organizations' range: two counts over the run id's index,
+    // never a listing. A prefix inside the organizations' space counts nothing; one the space starts
+    // with (`'o'`, `''`) holds all of it and subtracts it; any other prefix is disjoint from it.
+    countRuns: j.countRuns && (async (q?: { runIdPrefix?: string }) => {
+      const p = q?.runIdPrefix ?? '';
+      if (hidden(p)) return 0;
+      const all = await j.countRuns!.call(journal, q);
+      return ORG_KEY_PREFIX.startsWith(p) ? all - (await j.countRuns!.call(journal, { runIdPrefix: ORG_KEY_PREFIX })) : all;
+    }),
+    // Walked like `listRunsPaged`: every organization's changes in the window are read and dropped, so
+    // the cost follows how much the whole store is changing — a window of seconds, not its size.
+    listRunsChangedSince: j.listRunsChangedSince
+      && ((cursor?: string, o?: Parameters<NonNullable<JournalReader['listRunsChangedSince']>>[1]) => walkChangePages(j, journal, cursor, o, (r) => (hidden(r.runId) ? undefined : r))),
     // Counted by the store only while no organization holds a row: then the store's count IS the
     // root's. Once one does, `undefined` — the store's aggregate takes no filter — and a caller falls
     // back to `listRuns`, as under `withOrg`. One indexed probe, so a single-tenant deployment keeps

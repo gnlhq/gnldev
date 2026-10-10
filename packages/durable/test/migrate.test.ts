@@ -54,12 +54,9 @@ describe('SqliteStorage schema tooling', () => {
     // simulate drift AFTER construction (the constructor already fully migrated this instance —
     // see the file header for why the "old db" has to be crafted post-construction for sqlite).
     const raw = (storage as unknown as { db: any }).db;
+    // An older file has no open-runs index either.
+    raw.exec('DROP INDEX gnl_runs_open');
     raw.exec('ALTER TABLE gnl_runs DROP COLUMN suspended_count');
-    // `failed` (the run-outcome flag) was added the same way suspended_count was, so it belongs in the
-    // same drift scenario — dropping only one would leave the newer column's migration unproven.
-    raw.exec('ALTER TABLE gnl_runs DROP COLUMN failed');
-    raw.exec('ALTER TABLE gnl_runs DROP COLUMN running');
-    raw.exec('ALTER TABLE gnl_runs DROP COLUMN canceled');
     raw.exec('DROP TABLE gnl_counters');
     // An index added to an EXISTING table — what `CREATE TABLE IF NOT EXISTS` can never bring, and the
     // schema step used to have no way to add: the relation indexes.
@@ -69,10 +66,11 @@ describe('SqliteStorage schema tooling', () => {
     const before = await storage.checkSchema();
     expect(before.ok).toBe(false);
     expect(before.missingTables).toEqual(['gnl_counters']);
-    expect(before.missingIndexes!.sort()).toEqual(['gnl_run_journal_owner', 'gnl_runs_resource']);
-    // Both added-later columns are reported. `failed` (the run-outcome flag) arrived the same way
-    // suspended_count did, and the introspection picks it up from the DDL without being told.
-    expect(before.missingColumns.map((c) => c.column).sort()).toEqual(['canceled', 'failed', 'running', 'suspended_count']);
+    expect(before.missingIndexes!.sort()).toEqual(['gnl_run_journal_owner', 'gnl_runs_open', 'gnl_runs_resource']);
+    // The added-later column is reported, picked up from the DDL without being told. (The status flags
+    // that were added the same way are gone: `status`/`outcome` replace them through the `run-status`
+    // step, run-status-columns.test.ts, not through this additive one.)
+    expect(before.missingColumns.map((c) => c.column).sort()).toEqual(['suspended_count']);
     expect(before.missingColumns.every((c) => c.table === 'gnl_runs')).toBe(true);
 
     const dry = await schemaStep(storage, true);
@@ -102,7 +100,7 @@ describe('SqliteStorage schema tooling', () => {
     await storage.runs.incrBy('mig-run:usage', { tokens: 5 });
     expect(await storage.runs.getCounters('mig-run:usage')).toEqual({ tokens: 5 });
     // suspended_count-driven bookkeeping (the exact column that was missing) also works: a suspended
-    // tool record increments gnl_runs.suspended_count under the hood (touchRunDelta).
+    // tool record increments gnl_runs.suspended_count under the hood (writeRunRows).
     await storage.runs.put('mig-run:tool:c1', { status: 'suspended' });
     const page = await storage.runs.listRuns({ status: 'suspended' });
     expect(page.items.some((r) => r.runId === 'mig-run')).toBe(true);
@@ -136,19 +134,20 @@ describe('PostgresStorage schema tooling (pg-mem)', () => {
   it('out-of-band: checkSchema on a hand-built reduced schema reports the gap WITHOUT ever calling init() (ensureReady is never triggered)', async () => {
     const pool = pgmemPool();
     // hand-written REDUCED schema — no gnl_counters at all; gnl_runs without suspended_count. This is
-    // the "old db, never auto-inited" scenario the P2 out-of-band production pattern targets.
+    // the "old db, never auto-inited" scenario the P2 out-of-band production pattern targets. Its run
+    // table already has `status`/`outcome` (a store from before them is the `run-status` step's, see
+    // run-status-columns.test.ts), so what is missing is this additive step's to add.
     await pool.query(`CREATE TABLE IF NOT EXISTS gnl_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`);
     await pool.query(
-      `CREATE TABLE IF NOT EXISTS gnl_runs (run_id TEXT PRIMARY KEY, model_steps INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0, suspended BOOLEAN NOT NULL DEFAULT false, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)`,
+      `CREATE TABLE IF NOT EXISTS gnl_runs (run_id TEXT PRIMARY KEY, model_steps INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0, outcome TEXT, status TEXT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL)`,
     );
 
     const storage = new PostgresStorage({ pool }); // NOTE: .init() deliberately never called
     const before = await storage.checkSchema();
     expect(before.ok).toBe(false);
-    // Both added-later columns are reported. `failed` (the run-outcome flag) arrived the same way
-    // suspended_count did, and the introspection picks it up from the DDL without being told.
-    // …and so are the relation columns (a run's person and thread), the same additive shape.
-    expect(before.missingColumns.map((c) => c.column).sort()).toEqual(['canceled', 'failed', 'resource_id', 'running', 'suspended_count', 'thread_id']);
+    // The added-later columns are reported, picked up from the DDL without being told — the counter and
+    // the relation columns (a run's person and thread), the same additive shape.
+    expect(before.missingColumns.map((c) => c.column).sort()).toEqual(['resource_id', 'suspended_count', 'thread_id']);
     expect(before.missingColumns.every((c) => c.table === 'gnl_runs')).toBe(true);
     expect(before.missingTables.sort()).toEqual(
       ['gnl_counters', 'gnl_run_journal', 'gnl_threads', 'gnl_messages', 'gnl_working_memory', 'gnl_observations', 'gnl_message_batches', 'gnl_vectors', 'gnl_work_log', 'gnl_work_kv', 'gnl_work_seq', 'gnl_cache'].sort(),
@@ -158,9 +157,6 @@ describe('PostgresStorage schema tooling (pg-mem)', () => {
     expect(dry.ran).toBe(false);
     expect(dry.statements.some((s) => /CREATE TABLE IF NOT EXISTS gnl_counters/i.test(s))).toBe(true);
     expect(dry.statements.some((s) => /ALTER TABLE gnl_runs ADD COLUMN IF NOT EXISTS suspended_count/i.test(s))).toBe(true);
-    expect(dry.statements.some((s) => /ALTER TABLE gnl_runs ADD COLUMN IF NOT EXISTS failed/i.test(s))).toBe(true);
-    expect(dry.statements.some((s) => /ALTER TABLE gnl_runs ADD COLUMN IF NOT EXISTS running/i.test(s))).toBe(true);
-    expect(dry.statements.some((s) => /ALTER TABLE gnl_runs ADD COLUMN IF NOT EXISTS canceled/i.test(s))).toBe(true);
     const stillBefore = await storage.checkSchema();
     expect(stillBefore.ok).toBe(false); // dry-run applied nothing
 

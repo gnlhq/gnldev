@@ -5,7 +5,7 @@
 // loadContext runs BEFORE persistInput, so the whole context freezes into `:input` = replayable.
 import { cosineSimilarity } from 'ai';
 import { requireCapability, durableProcessorStep, workingMemoryScope, OM_LEAVES, OM_VECTOR_SOURCE, OBSERVATION_VECTOR_KEY, type OmLeaf } from '@gnldev/durable';
-import { threadOwnerOf, threadRecordOwner, toJournal, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, VECTOR_PARTITION, assertRootThreadId, assertRootOutsideOrganizations, type Memory } from '@gnldev/durable';
+import { threadOwnerOf, threadRecordOwner, toJournal, purgeThread, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, VECTOR_PARTITION, assertRootThreadId, assertRootOutsideOrganizations, type Memory } from '@gnldev/durable';
 import { PROVENANCE_RECENT_CAP, messagePreview } from '@gnldev/durable';
 import type { Storage, RunJournal, MemoryStore, MessageRecord, MessageAppend, ThreadRecord, RecallOptions, MemoryContextProvenance, RecalledMessageRef } from '@gnldev/durable';
 import { messageText, hasNorm, type Embed } from './keys.js';
@@ -13,7 +13,7 @@ import { deepMerge } from './deep-merge.js';
 import { createWorkingMemoryTool, renderWorkingMemorySystem, type WorkingMemoryConfig } from './working-memory.js';
 import { observe, reflect, approxTokens, resolveModel, type ObservationalMemoryConfig, type Observation, type OmRecallMatch } from './observational.js';
 import { refuseUnknownNames } from '@gnldev/options';
-import { MEMORY_CONFIG_NAMES, refuseMemoryBagNames, GET_MESSAGES_NAMES, LOAD_CONTEXT_NAMES, RECALL_OBSERVATIONS_NAMES, CREATE_THREAD_NAMES, UPDATE_THREAD_NAMES, CLONE_THREAD_NAMES } from './option-names.js';
+import { MEMORY_CONFIG_NAMES, refuseMemoryBagNames, GET_MESSAGES_NAMES, LOAD_CONTEXT_NAMES, RECALL_OBSERVATIONS_NAMES, CREATE_THREAD_NAMES, UPDATE_THREAD_NAMES, CLONE_THREAD_NAMES, DELETE_THREAD_NAMES } from './option-names.js';
 
 export type { ThreadRecord, RecallOptions };
 
@@ -892,9 +892,36 @@ export class AgentMemory implements Required<Memory> {
     await this.store.upsertThread(next);
     return next;
   }
-  async deleteThread(threadId: string): Promise<void> {
+  /**
+   * Delete a thread WITH ITS RUNS, and everything else it owns — `purgeThread` in @gnldev/durable, the
+   * one plan its model makes: the runs on the thread (their children, forks and rollovers on it too),
+   * its journal state (observer summaries, idempotency window), its observation vectors, this store's
+   * rows, and its owner record last. Until 0.11 it took this store's rows and nothing else: the runs —
+   * prompts, tool arguments, a pending approval — and the observer's summaries stayed (measured, C+
+   * step C). Refuses, deleting nothing, while a run on the thread is in flight (`ThreadRunsInFlightError`):
+   * cancel it, or pass `allowInFlight: true` for a run whose worker is gone.
+   */
+  async deleteThread(threadId: string, opts: { allowInFlight?: boolean } = {}): Promise<void> {
+    refuseUnknownNames('deleteThread', opts, DELETE_THREAD_NAMES);
     this.scoped(threadId);
-    await this.store.deleteThread(threadId);
+    const ov = this.om?.omVectors;
+    const ns = this.omVectorNs;
+    // Its observation vectors, in the namespace this memory wrote them under (an organization's view
+    // adds its own; a root store holding an organization's documents takes the namespace and its grant).
+    if (ov && typeof ov.store.delete !== 'function') {
+      throw new Error(
+        `@gnldev/memory: deleteThread('${threadId}') was not done: observationalMemory.omVectors.store cannot delete, so the thread's ` +
+          'observations — the model\'s summary of the conversation — would outlive it. Give the store a `delete` (every @gnldev/durable vector store has one).',
+      );
+    }
+    const vectors = ov
+      ? { delete: (where: Parameters<NonNullable<typeof ov.store.delete>>[0]) => ov.store.delete!({ ...where, ...(ns ? { namespace: ns, [VECTOR_PARTITION]: ns } : {}) }) }
+      : undefined;
+    await purgeThread(toJournal(this.runs), threadId, {
+      memory: this.store,
+      ...(vectors ? { vectors } : {}),
+      ...(opts.allowInFlight ? { allowInFlight: true } : {}),
+    });
   }
   /** COPY a thread (messages/WM/OM) into a new thread (common thread-clone semantics + ancestry). */
   async cloneThread(srcThreadId: string, opts: { newThreadId?: string; resourceId?: string } = {}): Promise<ThreadRecord> {

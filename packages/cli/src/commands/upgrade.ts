@@ -41,7 +41,8 @@ export const upgradeCommand: Command = {
     const onlyRaw = flag(ctx.argv, 'only');
     const only = onlyRaw ? onlyRaw.split(',').map((s) => s.trim()).filter(Boolean) : undefined;
     const dryRun = flagBool(ctx.argv, 'list') || flagBool(ctx.argv, 'dry-run');
-    await storage.init?.();
+    // No `storage.init()` first: init is a process's boot, and a store whose `run-status` step is pending
+    // refuses to boot — that refusal names this command. Every step reaches the store its own way.
     const report = await storage.upgrade({ ...(only ? { only: only as never } : {}), dryRun });
     for (const l of renderUpgrade(report)) console.log(l);
     if (dryRun && report.steps.some((s) => s.pending)) {

@@ -8,10 +8,10 @@ import { memoryPartitionOf, memoryPartitionSql, type MemoryPartitionOption } fro
 import { createRequire } from 'node:module';
 import { statSync, existsSync } from 'node:fs';
 import { cosineSimilarity } from 'ai';
-import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus, runRelationsOf, relationsOfInput, ownerColumnOf, ownerOfRecord, OWNER_RECORD_GLOB } from './journal.js';
-import { keysetRunPage, rangeOrder, type RunRelationRead } from './run-cursor.js';
+import { runIdOfKey, parseJournalKey, outcomeStatusOf, runRelationsOf, relationsOfInput, ownerColumnOf, ownerOfRecord, OWNER_RECORD_GLOB, RunRowChanges, runStatusOf, runStatusCaseSql, storedOutcomeOf } from './journal.js';
+import { keysetRunPage, rangeOrder, runStatusSql, openRunPredicate, decodeChangeCursor, encodeChangeCursor, type RunRelationRead } from './run-cursor.js';
 import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, orgSpaceSql } from './organization.js';
-import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
+import type { JournalBatch, JournalEntry, RunChange, RunStatus, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
 import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, VECTOR_DOCUMENT_KEY, vectorFilterDocument } from './storage.js';
 import type {
@@ -24,8 +24,9 @@ import { tablesFromDDL, indexesFromDDL } from './migrate.js';
 import type { SchemaCheckResult, SchemaMigrationResult, MissingColumn } from './migrate.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { ADOPT_INTO_ORG_NAMES } from './option-names.js';
-import { runUpgrade, threadRecordsStep, relationsStep, verifyRelationsStep, RELATIONS_PENDING_ADVICE, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
+import { runUpgrade, threadRecordsStep, relationsStep, verifyRelationsStep, runStatusStep, runStatusPending, RUN_STATUS_FLAGS, RUN_STATUS_PENDING_MESSAGE, RELATIONS_PENDING_ADVICE, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
 import { UPGRADE_NAMES } from './option-names.js';
+import { SCOPE_TABLES } from './model.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
 
@@ -149,6 +150,18 @@ class BusyRetryDatabase {
   private readonly statements = new Map<string, any>();
   private static readonly MAX_STATEMENTS = 256;
   constructor(readonly inner: any) {}
+  /**
+   * The stores' view of this database while the file's run table is in an earlier version's format
+   * (`run-status` pending): every statement asks `refuse` first, which throws until the step has run —
+   * in this process or another. The storage's own schema work (the constructor, `upgrade`) keeps the
+   * ungated connection.
+   */
+  gated(refuse: () => void): BusyRetryDatabase {
+    const view = Object.create(this) as BusyRetryDatabase;
+    view.exec = (sql) => { refuse(); return this.exec(sql); };
+    view.prepare = (sql) => { refuse(); return this.prepare(sql); };
+    return view;
+  }
   exec(sql: string): unknown {
     // Multi-statement `exec` is used ONLY for BEGIN/COMMIT/ROLLBACK, pragmas and the idempotent
     // `IF NOT EXISTS` DDL — all safe to re-run whole.
@@ -179,19 +192,9 @@ function pageOf<T>(rows: T[], start: number, limit: number, total: number): Page
 }
 /** A `gnl_runs` row as listRuns selects it (plus the joined `:input` blob). */
 type RunRow = {
-  run_id: string; model_steps: number; tool_calls: number;
-  suspended: number; failed: number; running: number; canceled: number;
+  run_id: string; model_steps: number; tool_calls: number; status: string;
   input_val: string | null;
 };
-/**
- * The materialized flags back into the ONE outcome shape `deriveRunStatus` reads. Written out once
- * rather than inline at each of the three call sites (listRuns' two queries and countRunsByStatus):
- * The flag→status mapping is precedence-bearing, and three hand-copied ternary chains is exactly how
- * one of them ends up ordering `failed` ahead of `canceled` while the other two do not.
- */
-function outcomeOfRow(r: { failed?: unknown; running?: unknown; canceled?: unknown }): { status: 'canceled' | 'failed' | 'running' } | null {
-  return r.canceled ? { status: 'canceled' } : r.failed ? { status: 'failed' } : r.running ? { status: 'running' } : null;
-}
 // P1.5 matchFilter is now shared (storage.ts) — see its JSDoc for the operator
 // subset ($eq/$ne/$gt/$gte/$lt/$lte/$in/$nin). Import above (was a local exact-equality-only copy).
 function normRange(r?: number | { before: number; after: number }) {
@@ -271,6 +274,11 @@ export class SqliteStorage implements Storage {
     } catch {
       // memory: / old sqlite: if pragmas are unsupported, continue with the default (same behavior, just slower)
     }
+    // An earlier version's run table (status flags) is not served: see RUN_STATUS_PENDING_MESSAGE. The
+    // file is still opened — the rest of its schema brought up to date — so `upgrade()` can move it; the
+    // stores answer every call with the message until the `run-status` step has run (here or in another
+    // process: asked again on each call while pending, from the file).
+    this.flagsPending = runStatusPending(this.runColumns());
     this.db.exec(DDL);
     // H11b migration: suspended_count column (for incremental touchRun). Add it if missing from the
     // old table + backfill existing rows with a ONE-TIME recount (init cost; O(1) afterward).
@@ -307,40 +315,6 @@ export class SqliteStorage implements Storage {
       this.db.exec(`UPDATE gnl_runs SET suspended_count = (
         SELECT COUNT(*) FROM gnl_run_journal j WHERE j.run_id = gnl_runs.run_id AND j.suspended = 1)`);
     }
-    // `failed` column: the same shape of migration as suspended_count above. MATERIALIZED at write
-    // time rather than derived at read time (there is no index on it — the status filter is an
-    // operator path), because filtering on the serialized outcome value would mean matching the
-    // word 'failed' inside error MESSAGES. Nothing to backfill — runs written before this have no
-    // outcome record at all, and 0 is exactly right for them (they read as before).
-    if (!cols.some((c) => c.name === 'failed')) {
-      try {
-        this.db.exec(`ALTER TABLE gnl_runs ADD COLUMN failed INTEGER NOT NULL DEFAULT 0`);
-      } catch (e) {
-        if (!String((e as Error)?.message ?? e).includes('duplicate column')) throw e;
-      }
-    }
-    // `running` (the write-ahead half of the outcome): same shape, same no-backfill argument — an
-    // outcome with status 'running' only exists from the write-ahead onward, so pre-existing rows
-    // have nothing to reconstruct it from and 0 reads as before.
-    if (!cols.some((c) => c.name === 'running')) {
-      try {
-        this.db.exec(`ALTER TABLE gnl_runs ADD COLUMN running INTEGER NOT NULL DEFAULT 0`);
-      } catch (e) {
-        if (!String((e as Error)?.message ?? e).includes('duplicate column')) throw e;
-      }
-    }
-    // `canceled`: same shape, same no-backfill argument again — a cancel recorded no outcome at all
-    // before this, so there is nothing in an older journal to reconstruct one from, and 0 reads as
-    // before. Three booleans for one status IS inelegant; they are only ever written together, from a
-    // single `outcomeStatusOf` value in a single statement (see putCore), so they cannot disagree —
-    // collapsing them into one materialized `outcome` TEXT column is a schema round of its own.
-    if (!cols.some((c) => c.name === 'canceled')) {
-      try {
-        this.db.exec(`ALTER TABLE gnl_runs ADD COLUMN canceled INTEGER NOT NULL DEFAULT 0`);
-      } catch (e) {
-        if (!String((e as Error)?.message ?? e).includes('duplicate column')) throw e;
-      }
-    }
     // `gnl_work_log.seq`: the store-assigned position `WorkStore.list` pages by (see the port). Same
     // additive shape as the columns above. No backfill: 0 means "not numbered yet", which is what a row
     // written before sequences is, and what a 0.9 process still running on this file keeps writing —
@@ -370,6 +344,7 @@ export class SqliteStorage implements Storage {
       }
     }
     for (const sql of RELATION_INDEXES) this.db.exec(sql);
+    if (!this.flagsPending) for (const sql of [OPEN_RUNS_INDEX, STATUS_RUNS_INDEX]) this.db.exec(sql); // on `status`: an older file has none until `run-status`
     // The guards (OWNER_UNPLACE_TRIGGER, RUN_UNPLACE_TRIGGERS). Found missing on a file whose columns
     // already hold placements — dropped by hand, or by a tool — the placements made while nothing
     // guarded them may be wrong: RELATIONS_VERIFY_KEY marks them, no column is trusted until the
@@ -401,7 +376,11 @@ export class SqliteStorage implements Storage {
     // is the engine-atomic form of the same intent (write only if absent; an existing version row —
     // whatever it says — is never overwritten, exactly as before).
     this.db.prepare(`INSERT OR IGNORE INTO gnl_meta(k,v) VALUES('schema_version', ?)`).run(SCHEMA_VERSION);
-    const db = this.db;
+    const db = !this.flagsPending ? this.db : this.db.gated(() => {
+      if (!this.flagsPending) return;
+      if (runStatusPending(this.runColumns())) throw new Error(RUN_STATUS_PENDING_MESSAGE);
+      this.flagsPending = false;
+    });
     this.runs = new SqliteRunJournal(db);
     this.memory = new SqliteMemoryStore(db);
     this.vectors = new SqliteVectorStore(db);
@@ -409,7 +388,15 @@ export class SqliteStorage implements Storage {
     this.cache = new SqliteCacheStore(db);
     this.meta = new SqliteMetaStore(db);
   }
-  async init() {/* schema was set up idempotently in the constructor */}
+  /** Whether this file's run table still has an earlier version's status flags (see the constructor). */
+  private flagsPending: boolean;
+  private runColumns(): Set<string> {
+    return new Set((this.db.prepare(`PRAGMA table_info(gnl_runs)`).all() as { name: string }[]).map((c) => c.name));
+  }
+  /** Schema set up idempotently in the constructor; refuses a file whose `run-status` step is pending, as every store does. */
+  async init() {
+    if (this.flagsPending && runStatusPending(this.runColumns())) throw new Error(RUN_STATUS_PENDING_MESSAGE);
+  }
   async close() {
     // Flush the WAL to the main file on close → no leftover side file buildup (H12).
     try { this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* :memory: etc. */ }
@@ -423,9 +410,10 @@ export class SqliteStorage implements Storage {
    * the hot path. (`full` is ignored on SQLite since VACUUM is already complete.) No-op on a `:memory:` DB.
    */
   /**
-   * See `Storage.adoptIntoOrg`. Every table that carries an organization-bearing column is listed here
-   * ONCE — a table added later and not added to this list is data an upgrade silently leaves behind,
-   * which is why the list sits next to the DDL rather than in a doc.
+   * See `Storage.adoptIntoOrg`. Every table that carries an organization-bearing column is listed ONCE,
+   * for both SQL stores, in model.ts (`SCOPE_TABLES`) — a table added later and not added there is data
+   * an upgrade silently leaves behind. Each adapter kept its own copy until C+ step C, and both had
+   * missed `gnl_run_journal.run_id`: every adopted run's `readRun` came back empty.
    *
    * `gnl_vectors` is the odd one: it is partitioned by a `namespace` COLUMN rather than by a key
    * prefix (the store ranks, so a prefix cannot be applied before it has already chosen its global
@@ -439,20 +427,6 @@ export class SqliteStorage implements Storage {
     await assertNoRunsInFlight(this.runs, opts?.allowInFlight);
     const ns = prefix.slice(0, -1);                // 'org:acme', what scopedVectors writes
     const dryRun = opts?.dryRun === true;
-    // [table, column, store-name-for-the-report]
-    const KEYED: Array<[string, string, string]> = [
-      ['gnl_run_journal', 'key', 'runs'],
-      ['gnl_runs', 'run_id', 'runs'],
-      ['gnl_counters', 'key', 'runs'],
-      ['gnl_threads', 'id', 'memory'],
-      ['gnl_messages', 'thread_id', 'memory'],
-      ['gnl_working_memory', 'scope_id', 'memory'],
-      ['gnl_observations', 'thread_id', 'memory'],
-      ['gnl_message_batches', 'thread_id', 'memory'],
-      ['gnl_work_log', 'ns', 'work'],
-      ['gnl_work_kv', 'key', 'work'],
-      ['gnl_cache', 'key', 'cache'],
-    ];
     const moved: Record<string, number> = {};
     const skipped = new Set<string>();
     let alreadyScoped = 0;
@@ -483,9 +457,10 @@ export class SqliteStorage implements Storage {
       }
       if (!dryRun) for (const k of resetPositions) this.db.prepare('DELETE FROM gnl_work_kv WHERE key = ?').run(k);
       const notCarried = new Set(resetPositions);
-      for (const [table, col, store] of KEYED) {
+      // The tables and columns are the model's (`SCOPE_TABLES`, model.ts) — one list for both SQL stores.
+      for (const [table, col, store, counted] of SCOPE_TABLES) {
         const scopedQ = inOrg(col);
-        alreadyScoped += this.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${scopedQ.cond}`).get(...scopedQ.params).c as number;
+        if (counted) alreadyScoped += this.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${scopedQ.cond}`).get(...scopedQ.params).c as number;
         // Row by row rather than one UPDATE, because which reserved keys are the PLATFORM's is a rule
         // in TypeScript (`isPlatformKey`), not something SQL can express — and a blanket UPDATE here
         // would move `__org__:acme` to `org:acme:__org__:acme` and stop every organization resolving.
@@ -495,7 +470,7 @@ export class SqliteStorage implements Storage {
         for (const { k } of rows) {
           if (isPlatformKey(k)) { skipped.add(k.split(':')[0]!); continue; }
           if (table === 'gnl_work_kv' && notCarried.has(k)) continue;
-          n += this.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${col} = ?`).get(k).c as number;
+          if (counted) n += this.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${col} = ?`).get(k).c as number;
           if (dryRun) continue;
           if (table === 'gnl_work_log') {
             // The moved records are APPENDED to the organization's log: they become unnumbered, and the
@@ -509,15 +484,22 @@ export class SqliteStorage implements Storage {
         }
         bump(store, n);
       }
-      // `gnl_meta` minus the engine's own rows — see ENGINE_META_KEYS for why moving `schema_version`
-      // would leave the deployment looking unversioned on its next boot.
-      const holes = ENGINE_META_KEYS.map(() => '?').join(',');
+      // `gnl_meta` minus the engine's own rows (see ENGINE_META_KEYS for why moving `schema_version`
+      // would leave the deployment looking unversioned on its next boot) and minus the platform's — the
+      // rule every other table here follows. One blanket UPDATE used to skip only the engine's rows:
+      // measured, it moved `__eeuser__:<id>` (the paid user store) into the organization, where Postgres
+      // and InMemory kept it at the root.
       const metaRoot = outOrg('k');
       const metaIn = inOrg('k');
-      const metaTodo = this.db.prepare(`SELECT COUNT(*) AS c FROM gnl_meta WHERE ${metaRoot.cond} AND k NOT IN (${holes})`).get(...metaRoot.params, ...ENGINE_META_KEYS).c as number;
       alreadyScoped += this.db.prepare(`SELECT COUNT(*) AS c FROM gnl_meta WHERE ${metaIn.cond}`).get(...metaIn.params).c as number;
-      if (!dryRun && metaTodo) this.db.prepare(`UPDATE gnl_meta SET k = ? || k WHERE ${metaRoot.cond} AND k NOT IN (${holes})`).run(prefix, ...metaRoot.params, ...ENGINE_META_KEYS);
-      bump('meta', metaTodo);
+      let metaN = 0;
+      for (const { k } of this.db.prepare(`SELECT k FROM gnl_meta WHERE ${metaRoot.cond}`).all(...metaRoot.params) as { k: string }[]) {
+        if (ENGINE_META_KEYS.includes(k)) continue;
+        if (isPlatformKey(k)) { skipped.add(k.split(':')[0]!); continue; }
+        metaN++;
+        if (!dryRun) this.db.prepare('UPDATE gnl_meta SET k = ? WHERE k = ?').run(prefix + k, k);
+      }
+      bump('meta', metaN);
 
       const vecs = this.db.prepare(`SELECT COUNT(*) AS c FROM gnl_vectors WHERE namespace IS NULL`).get().c as number;
       alreadyScoped += this.db.prepare(`SELECT COUNT(*) AS c FROM gnl_vectors WHERE namespace IS NOT NULL`).get().c as number;
@@ -558,14 +540,13 @@ export class SqliteStorage implements Storage {
     return [
       ...DDL.split(';').map((s) => s.trim()).filter(Boolean),
       'ALTER TABLE gnl_runs ADD COLUMN suspended_count INTEGER NOT NULL DEFAULT 0',
-      'ALTER TABLE gnl_runs ADD COLUMN failed INTEGER NOT NULL DEFAULT 0',
-      'ALTER TABLE gnl_runs ADD COLUMN running INTEGER NOT NULL DEFAULT 0',
-      'ALTER TABLE gnl_runs ADD COLUMN canceled INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE gnl_work_log ADD COLUMN seq INTEGER NOT NULL DEFAULT 0',
       WORK_LOG_SEQ_INDEX,
       WORK_LOG_NUMBER_TRIGGER,
       ...RELATION_COLUMNS.map(([t, c]) => `ALTER TABLE ${t} ADD COLUMN ${c} TEXT`),
       ...RELATION_INDEXES,
+      OPEN_RUNS_INDEX,
+      STATUS_RUNS_INDEX,
       OWNER_UNPLACE_TRIGGER,
       ...RUN_UNPLACE_TRIGGERS,
     ];
@@ -610,15 +591,18 @@ export class SqliteStorage implements Storage {
    * source of truth). `dryRun: true` returns the statements it WOULD run without touching the DB.
    */
   /**
-   * See `Storage.upgrade`. Steps: `schema` (the tables, columns and indexes this version expects —
-   * additive only), then `thread-records`, then `relations` (places older rows' person and thread).
+   * See `Storage.upgrade`. Steps: `run-status` (an earlier version's status flags into `status` and
+   * `outcome` — the one step that drops columns), `schema` (the tables, columns and indexes this version
+   * expects — additive only), then `thread-records`, then `relations` (places older rows' person and thread).
    */
   async upgrade(opts?: UpgradeOptions): Promise<UpgradeReport> {
     refuseUnknownNames('SqliteStorage.upgrade', opts, UPGRADE_NAMES);
     return runUpgrade('SqliteStorage', [
+      runStatusStep(this),
       {
         name: 'schema',
         description: 'adds the tables, columns and indexes this version expects (additive: never drops or renames)',
+        requires: ['run-status'],
         pending: async () => !(await this.checkSchema()).ok,
         plan: async () => ({ statements: (await this.applySchemaGap({ dryRun: true })).statements }),
         run: async () => ({ statements: (await this.applySchemaGap()).statements }),
@@ -627,6 +611,51 @@ export class SqliteStorage implements Storage {
       relationsStep(this.runs as SqliteRunJournal, ['schema']),
       verifyRelationsStep(this.runs as SqliteRunJournal, ['schema']),
     ], opts);
+  }
+
+  /** See RunStatusMigrator. */
+  async runStatusPending(): Promise<boolean> {
+    return runStatusPending(this.runColumns());
+  }
+
+  /** The statements `migrateRunStatus` runs on this file, in order (`gnl upgrade --list`). */
+  async runStatusPlan(): Promise<string[]> {
+    const cols = this.runColumns();
+    return runStatusPending(cols) ? ['BEGIN IMMEDIATE', ...sqliteRunStatusMigration(cols), 'COMMIT'] : [];
+  }
+
+  /**
+   * The `run-status` step on Sqlite: `gnl_runs`' four flags into `outcome` and `status`, the old index and
+   * the flags dropped, `gnl_runs_open` built on `status` — ONE transaction (BEGIN IMMEDIATE: the file's
+   * write lock, so no other process writes between the fill and the drop, and Sqlite's DDL is
+   * transactional). A kill leaves the file as it was; there is nothing to resume. Only the runs a flag
+   * marks are written: `status` is added with a DEFAULT of 'completed', which every other run already is.
+   * Sqlite keeps that default (it cannot add a NOT NULL column without one, nor drop a default without
+   * rebuilding the table); every write of this version names the status, so nothing reads it.
+   * `DROP COLUMN` (Sqlite 3.35+; node:sqlite ships 3.50) rewrites the table, once per flag: measured on
+   * 1 000 000 runs (167 flagged), 2.5 s for the whole transaction, the file's write lock held throughout.
+   * A process of an earlier version on the same file fails on its next write — "no such column" — once
+   * this commits.
+   */
+  async migrateRunStatus(): Promise<Record<string, unknown>> {
+    const t0 = Date.now();
+    let runs = 0;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const cols = this.runColumns(); // under the write lock: another process may have just done it
+      if (runStatusPending(cols)) {
+        for (const sql of sqliteRunStatusMigration(cols)) {
+          const r = this.db.prepare(sql).run() as { changes?: number | bigint };
+          if (sql.startsWith('UPDATE')) runs = Number(r.changes ?? 0);
+        }
+      }
+      this.db.exec('COMMIT');
+    } catch (e) {
+      try { this.db.exec('ROLLBACK'); } catch { /* the transaction is already gone */ }
+      throw e;
+    }
+    this.flagsPending = false;
+    return { runs, ms: Date.now() - t0 };
   }
 
   /** The `schema` step: applies exactly the gap checkSchema reports (see above). */
@@ -684,7 +713,7 @@ CREATE TABLE IF NOT EXISTS gnl_run_journal (
 CREATE INDEX IF NOT EXISTS gnl_run_journal_run ON gnl_run_journal (run_id, created_at);
 CREATE TABLE IF NOT EXISTS gnl_runs (
   run_id TEXT PRIMARY KEY, model_steps INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0,
-  suspended INTEGER NOT NULL DEFAULT 0, suspended_count INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, running INTEGER NOT NULL DEFAULT 0, canceled INTEGER NOT NULL DEFAULT 0,
+  suspended_count INTEGER NOT NULL DEFAULT 0, outcome TEXT, status TEXT NOT NULL,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, thread_id TEXT, resource_id TEXT
 );
 CREATE INDEX IF NOT EXISTS gnl_runs_created ON gnl_runs (created_at, run_id);
@@ -728,6 +757,35 @@ const RELATION_INDEXES = [
   'CREATE INDEX IF NOT EXISTS gnl_runs_thread ON gnl_runs (thread_id, created_at, run_id)',
   `CREATE INDEX IF NOT EXISTS gnl_run_journal_owner ON gnl_run_journal (owner, key) WHERE key GLOB '${OWNER_RECORD_GLOB}'`,
 ];
+/**
+ * The runs that are not 'completed', in creation order — Postgres's `gnl_runs_open` twin (see its note
+ * there). Not in DDL: a file of an earlier version has no `status` column until the `run-status` step
+ * adds it, and an index on a missing column fails the open. Sqlite takes a partial index when the
+ * query's WHERE carries the predicate's term as written; every status filter that admits no completed
+ * run does (`runStatusSql`).
+ */
+const OPEN_RUNS_INDEX = `CREATE INDEX IF NOT EXISTS gnl_runs_open ON gnl_runs (created_at, run_id) WHERE ${openRunPredicate()}`;
+/** One status's runs in creation order — Postgres's `gnl_runs_status` twin (see its note there for why there are two). */
+const STATUS_RUNS_INDEX = `CREATE INDEX IF NOT EXISTS gnl_runs_status ON gnl_runs (status, created_at, run_id) WHERE ${openRunPredicate()}`;
+/**
+ * The `run-status` step's statements for a file whose `gnl_runs` has these columns (a missing flag reads
+ * false, as it did there), in order, all inside one transaction. Postgres's twin: `runStatusMigration`.
+ */
+function sqliteRunStatusMigration(cols: ReadonlySet<string>): string[] {
+  const flags = RUN_STATUS_FLAGS.filter((f) => cols.has(f));
+  const on = (f: (typeof RUN_STATUS_FLAGS)[number]) => (flags.includes(f) ? `${f} = 1` : '0');
+  const outcome = `(CASE WHEN ${on('canceled')} THEN 'canceled' WHEN ${on('failed')} THEN 'failed' WHEN ${on('running')} THEN 'running' END)`;
+  return [
+    ...(cols.has('outcome') ? [] : ['ALTER TABLE gnl_runs ADD COLUMN outcome TEXT']),
+    ...(cols.has('status') ? [] : [`ALTER TABLE gnl_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'`]),
+    // 0.10's `gnl_runs_open` predicate, term for term, so the read of the runs to fill is that index.
+    `UPDATE gnl_runs SET outcome = ${outcome}, status = ${runStatusCaseSql(flags.includes('suspended') ? on('suspended') : 'suspended_count > 0', outcome)} WHERE ${flags.length ? (['canceled', 'suspended', 'failed', 'running'] as const).filter((f) => flags.includes(f)).map((f) => `${f} = 1`).join(' OR ') : '0'}`,
+    'DROP INDEX IF EXISTS gnl_runs_open',
+    ...flags.map((f) => `ALTER TABLE gnl_runs DROP COLUMN ${f}`),
+    OPEN_RUNS_INDEX,
+    STATUS_RUNS_INDEX,
+  ];
+}
 /** The columns RELATION_INDEXES need, added to a table an earlier version created. */
 const RELATION_COLUMNS: Array<[table: string, column: string]> = [['gnl_runs', 'thread_id'], ['gnl_runs', 'resource_id'], ['gnl_run_journal', 'owner']];
 /**
@@ -747,7 +805,7 @@ END`;
 /**
  * The same guard for a run's `gnl_runs.resource_id`/`thread_id`: a run's `:input` INSERTED or with its
  * value CHANGED leaves the run unplaced (NULL), read and decided from the record by every lookup, until
- * the writer places it. This version places it in the same transaction, after the write (`placeRun`),
+ * the writer places it. This version places it in the same transaction, after the write (`writeRunRows`),
  * so its own runs stay placed; an older process, a raw put of an unversioned record, or plain SQL does
  * not, and its record — naming carl on thread t2 — is no longer listed and erased as ayse's on t1, which
  * is what the column said before. `GLOB`, not `LIKE`: Sqlite's LIKE ignores case.
@@ -801,7 +859,20 @@ const and = (where: string, cond: string): string => (where ? `${where} AND ${co
 const PLACE_PAGE = 1000;
 
 /** Every index this version creates, by name: the DDL's, the work log's and the relation columns'. */
-const expectedIndexes = () => indexesFromDDL([...DDL.split(';'), WORK_LOG_SEQ_INDEX, ...RELATION_INDEXES]);
+const expectedIndexes = () => indexesFromDDL([...DDL.split(';'), WORK_LOG_SEQ_INDEX, ...RELATION_INDEXES, OPEN_RUNS_INDEX, STATUS_RUNS_INDEX]);
+
+/** A `gnl_runs` row (with its `:input` value as `input_val`) as the summary every listing hands out. */
+function sqliteRunSummary(r: RunRow): RunSummary {
+  const input = r.input_val ? deserialize<{ threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string }>(r.input_val) : undefined;
+  return {
+    runId: r.run_id, status: r.status as RunStatus, modelSteps: r.model_steps, toolCalls: r.tool_calls,
+    ...(input?.threadId ? { threadId: input.threadId } : {}),
+    ...(input?.agent ? { agent: input.agent } : {}),
+    ...(input?.resourceId ? { resourceId: input.resourceId } : {}),
+    ...(input?.workKey ? { workKey: input.workKey } : {}),
+    ...(input?.parentRunId ? { parentRunId: input.parentRunId } : {}),
+  };
+}
 
 // ── RunJournal ──────────────────────────────────────────────────────────────────
 class SqliteRunJournal implements RunJournal {
@@ -866,26 +937,13 @@ class SqliteRunJournal implements RunJournal {
       const owner = runIdOfKey(key, value);
       const oc = outcomeStatusOf(key, value);
       if (!owner && oc === null) { upsert(); return; } // genuinely run-less key (queues, events, cache)
+      // A run's `:input` registers and places the run; its outcome record sets the three flags (the
+      // write-ahead 'running' is a brand-new run's FIRST write, so the upsert creates the row — and an
+      // outcome is only ever written by the engine for a real run, so this cannot invent one). One
+      // upsert of the run's row for all of it (`RunRowChanges`).
       this.withTx(() => {
         upsert();
-        if (owner) this.touchRunDelta(owner, null, false, 0);
-        this.placeRun(key, value); // a run's `:input`: its person and thread, in this transaction
-        // The outcome carries its OWN path rather than riding on run ownership: it is not a versioned
-        // record, so runIdOfKey (which now demands that proof) does not claim it. The UPDATE only
-        // touches a row that already exists, so it cannot invent a run. ALL THREE flags from ONE
-        // status in ONE statement, so they can never disagree — and every transition clears its
-        // predecessors (running→canceled leaves running=0, which is what the five-way filter reads).
-        if (oc !== null) {
-          const runId = key.slice(0, -':outcome'.length);
-          // The write-ahead 'running' is the FIRST write of a brand-new run — before `:input`, before
-          // any entry — so the row may not exist yet, and an UPDATE against a missing row silently
-          // dropped the flag (measured: outcome said running, gnl_runs said 0 0 0 → 'completed', the
-          // exact lie this vocabulary removes). touchRunDelta's upsert creates the row with zero
-          // counts; an outcome is only ever written by the engine for a real run, so this does not
-          // reopen the invented-run hazard the non-owner branch guards against.
-          this.touchRunDelta(runId, null, false, 0);
-          this.db.prepare(`UPDATE gnl_runs SET failed = ?, running = ?, canceled = ? WHERE run_id = ?`).run(oc === 'failed' ? 1 : 0, oc === 'running' ? 1 : 0, oc === 'canceled' ? 1 : 0, runId);
-        }
+        this.writeRunRows(new RunRowChanges().noteWrite(key, value, undefined));
       });
       return;
     }
@@ -895,7 +953,7 @@ class SqliteRunJournal implements RunJournal {
       // run's length (measured: +8% at 3000 steps, linear). Now it's O(1).
       const prev = this.db.prepare(`SELECT suspended FROM gnl_run_journal WHERE key = ?`).get(key) as { suspended: number } | undefined;
       upsert();
-      this.touchRunDelta(p.runId, p.kind, prev === undefined, suspended - (prev?.suspended ?? 0));
+      this.writeRunRows(new RunRowChanges().noteWrite(key, value, prev && { suspended: !!prev.suspended }));
     });
   }
   async putIfAbsent(key: string, value: unknown): Promise<boolean> {
@@ -915,23 +973,15 @@ class SqliteRunJournal implements RunJournal {
       if (!owner && oc === null) return ins().changes === 1; // genuinely run-less key
       return this.withTx(() => {
         const info = ins();
-        if (info.changes === 1) {
-          if (owner) this.touchRunDelta(owner, null, false, 0);
-          this.placeRun(key, value); // only the winner places: a lost claim wrote nothing, columns included
-          // The outcome's first write arrives through putIfAbsent (recordRunOutcome's monotonic
-          // path); handling the flags only in put() left sqlite reading every failure as completed.
-          if (oc !== null) {
-            const runId = key.slice(0, -':outcome'.length);
-            this.touchRunDelta(runId, null, false, 0); // first write of a new run — see putCore's twin
-            this.db.prepare(`UPDATE gnl_runs SET failed = ?, running = ?, canceled = ? WHERE run_id = ?`).run(oc === 'failed' ? 1 : 0, oc === 'running' ? 1 : 0, oc === 'canceled' ? 1 : 0, runId);
-          }
-        }
+        // Only the winner writes the run's row: a lost claim wrote nothing, columns included. The
+        // outcome's first write arrives here (recordRunOutcome's monotonic path).
+        if (info.changes === 1) this.writeRunRows(new RunRowChanges().noteWrite(key, value, undefined));
         return info.changes === 1;
       });
     }
     return this.withTx(() => {
       const info = ins();
-      if (info.changes === 1) this.touchRunDelta(p.runId, p.kind, true, suspended); // fresh insert → O(1)
+      if (info.changes === 1) this.writeRunRows(new RunRowChanges().noteWrite(key, value, undefined)); // fresh insert → O(1)
       return info.changes === 1;
     });
   }
@@ -953,16 +1003,11 @@ class SqliteRunJournal implements RunJournal {
       const placed = runRelationsOf(key, value) !== undefined;
       if (oc === null && !placed) return Number(upd().changes ?? 0) === 1; // lock key (e.g. ':lock') → no derived index
       // The monotonic outcome REPLACEMENT (running→terminal, or a later success clearing an earlier
-      // failure) arrives through putIfMatch — the flags must follow the record here too. So must a
+      // failure) arrives through putIfMatch — the outcome and status must follow the record here too. So must a
       // run's person and thread, should its `:input` ever be replaced this way.
       return this.withTx(() => {
         const ok = Number(upd().changes ?? 0) === 1;
-        if (ok && oc !== null) {
-          const runId = key.slice(0, -':outcome'.length);
-          this.touchRunDelta(runId, null, false, 0); // see putCore's twin
-          this.db.prepare(`UPDATE gnl_runs SET failed = ?, running = ?, canceled = ? WHERE run_id = ?`).run(oc === 'failed' ? 1 : 0, oc === 'running' ? 1 : 0, oc === 'canceled' ? 1 : 0, runId);
-        }
-        if (ok) this.placeRun(key, value);
+        if (ok) this.writeRunRows(new RunRowChanges().noteWrite(key, value, undefined));
         return ok;
       });
     }
@@ -1003,7 +1048,7 @@ class SqliteRunJournal implements RunJournal {
   async listStaleRuns(cutoffTs: number, opts?: { includeSuspended?: boolean }): Promise<string[]> {
     const sql = opts?.includeSuspended
       ? 'SELECT run_id FROM gnl_runs WHERE updated_at < ?'
-      : 'SELECT run_id FROM gnl_runs WHERE updated_at < ? AND suspended = 0';
+      : 'SELECT run_id FROM gnl_runs WHERE updated_at < ? AND suspended_count <= 0'; // what 0.10's `suspended` flag was: count > 0
     return (this.db.prepare(sql).all(cutoffTs) as { run_id: string }[]).map((r) => r.run_id);
   }
 
@@ -1014,22 +1059,6 @@ class SqliteRunJournal implements RunJournal {
     ).get(runId) as { c: number; b: number };
     return { entries: Number(r.c), bytes: Number(r.b) };
   }
-  /**
-   * A run's `:input` names who and where the run is (`runRelationsOf`): its `gnl_runs` row gets them,
-   * in the caller's transaction. Any other key: nothing. An upsert, so the row exists whichever write
-   * of the run came first (the write-ahead outcome may precede `:input`).
-   */
-  private placeRun(key: string, value: unknown): void {
-    const rel = runRelationsOf(key, value);
-    if (!rel) return;
-    const now = Date.now();
-    this.db.prepare(
-      `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at, resource_id, thread_id)
-       VALUES (?, 0, 0, 0, 0, ?, ?, ?, ?)
-       ON CONFLICT(run_id) DO UPDATE SET resource_id = excluded.resource_id, thread_id = excluded.thread_id`,
-    ).run(rel.runId, now, now, rel.resourceId, rel.threadId);
-  }
-
   /**
    * See `Journal.listOwnerRecords`. ONE statement over the owner-record index: the records placed under
    * this person, and every record not placed yet (NULL), each decided from its value. One statement, so
@@ -1126,27 +1155,45 @@ class SqliteRunJournal implements RunJournal {
   }
 
   /**
-   * H11b — O(1) INCREMENTAL gnl_runs update (hot path). The old recompute used to SUM ALL rows of
-   * the run on every write → write cost grew with the run's length. Now: a fresh insert →
-   * counter +1; an overwrite → counter unchanged; suspended is kept as a SIGNED sum of row transitions
-   * (suspended_count) → it can correctly DECREASE on a suspended-to-succeeded transition (a boolean MAX
-   * couldn't do that). The `suspended` boolean is derived in the same expression (count+delta > 0).
+   * The runs' rows for one transaction's writes (`RunRowChanges`): ONE upsert per run, carrying the
+   * counters, the `:input`'s person and thread, the outcome, the status and `updated_at` (every write
+   * advances it — the change feed reads it). After the journal write, so the relation guard has already
+   * unplaced the run when this places it again. Before, a run's `:input` and its outcome record each
+   * wrote the row twice (the touch, then the placement or the flags) — see the Postgres twin.
+   *
+   * H11b — the counters are O(1) deltas, never a recount: a fresh insert → counter +1; an overwrite →
+   * unchanged; suspended is a SIGNED sum of row transitions (suspended_count), so it can DECREASE on a
+   * suspended-to-succeeded transition (a boolean MAX couldn't). The status follows in the same statement:
+   * a new row's from its values (`runStatusOf`), an existing row's in SQL from its counter after the
+   * delta and its outcome after this write (`runStatusCaseSql`). The old recompute SUMmed all rows of
+   * the run on every write → write cost grew with the run's length (+8% at 3000 steps, linear).
    */
-  private touchRunDelta(runId: string, kind: 'model' | 'tool' | null, isInsert: boolean, suspendedDelta: number): void {
-    const m = isInsert && kind === 'model' ? 1 : 0;
-    const t = isInsert && kind === 'tool' ? 1 : 0;
-    const now = Date.now();
-    this.db.prepare(
-      `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(run_id) DO UPDATE SET
-         model_steps = gnl_runs.model_steps + ?,
-         tool_calls = gnl_runs.tool_calls + ?,
-         suspended_count = gnl_runs.suspended_count + ?,
-         suspended = (gnl_runs.suspended_count + ?) > 0,
-         updated_at = ?`,
-    ).run(runId, m, t, suspendedDelta > 0 ? 1 : 0, Math.max(0, suspendedDelta), now, now,
-          m, t, suspendedDelta, suspendedDelta, now);
+  private writeRunRows(changes: RunRowChanges): void {
+    for (const [runId, c] of changes.entries()) {
+      const now = Date.now();
+      const outcome = storedOutcomeOf(c.outcome);
+      const row: [string, unknown][] = [['run_id', runId], ['model_steps', c.models], ['tool_calls', c.tools],
+        ['suspended_count', Math.max(0, c.suspendedDelta)], ['outcome', outcome], ['status', runStatusOf(Math.max(0, c.suspendedDelta), outcome)],
+        ['created_at', now], ['updated_at', now]];
+      const sets: string[] = [];
+      if (c.relations) {
+        row.push(['resource_id', c.relations.resourceId], ['thread_id', c.relations.threadId]);
+        sets.push('resource_id = excluded.resource_id', 'thread_id = excluded.thread_id');
+      }
+      // An outcome written in this transaction replaces the row's (every transition clears its
+      // predecessor, 'completed' included: NULL); otherwise the row keeps its own.
+      if (c.outcome) sets.push('outcome = excluded.outcome');
+      const n = row.length;
+      this.db.prepare(
+        `INSERT INTO gnl_runs (${row.map(([col]) => col).join(', ')}) VALUES (${row.map((_, i) => `?${i + 1}`).join(', ')})
+         ON CONFLICT(run_id) DO UPDATE SET
+           status = ${runStatusCaseSql(`gnl_runs.suspended_count + ?${n + 3} > 0`, c.outcome ? 'excluded.outcome' : 'gnl_runs.outcome')},
+           model_steps = gnl_runs.model_steps + ?${n + 1},
+           tool_calls = gnl_runs.tool_calls + ?${n + 2},
+           suspended_count = gnl_runs.suspended_count + ?${n + 3},
+           updated_at = ?${n + 4}${sets.map((x) => `, ${x}`).join('')}`,
+      ).run(...row.map(([, v]) => v), c.models, c.tools, c.suspendedDelta, now);
+    }
   }
 
   /** Placements to verify (RELATIONS_VERIFY_KEY): while set, no relation column is read. Asked per lookup — another process may clear it. */
@@ -1163,12 +1210,13 @@ class SqliteRunJournal implements RunJournal {
          SUM(suspended) AS s, MIN(created_at) AS c0
        FROM gnl_run_journal WHERE run_id = ?`,
     ).get(runId) as { m: number; t: number; s: number; c0: number };
+    // The counter is recounted; the outcome is the row's own (a new row has none), and the status follows both.
     this.db.prepare(
-      `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at)
+      `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended_count, status, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(run_id) DO UPDATE SET model_steps=excluded.model_steps, tool_calls=excluded.tool_calls,
-         suspended=excluded.suspended, suspended_count=excluded.suspended_count, updated_at=excluded.updated_at`,
-    ).run(runId, c.m ?? 0, c.t ?? 0, (c.s ?? 0) > 0 ? 1 : 0, c.s ?? 0, c.c0 ?? Date.now(), Date.now());
+         suspended_count=excluded.suspended_count, status=${runStatusCaseSql('excluded.suspended_count > 0', 'gnl_runs.outcome')}, updated_at=excluded.updated_at`,
+    ).run(runId, c.m ?? 0, c.t ?? 0, c.s ?? 0, runStatusOf(c.s ?? 0, null), c.c0 ?? Date.now(), Date.now());
   }
   async listKeys(prefix: string, opts?: { limit?: number }): Promise<string[]> {
     const rg = range('key', prefix);
@@ -1215,9 +1263,8 @@ class SqliteRunJournal implements RunJournal {
    * of the single SELECT. Ordering (LIMIT/OFFSET) is already applied on `gnl_runs` → the subquery
    * only runs for the rows on that page (the SQLite planner applies the subquery to the rows after LIMIT).
    *
-   * P0.3 filters: `status` is pushed down to SQL as a WHERE on the materialized
-   * `gnl_runs.suspended` column — same boolean `listRuns` already derives status FROM (`r.suspended ?
-   * 'suspended' : 'completed'`), so it cannot drift from the unfiltered read. `agent` has NO indexed
+   * P0.3 filters: `status` is pushed down to SQL as a WHERE on `gnl_runs.status` — the column every
+   * row's summary reads, so it cannot drift from the unfiltered read. `agent` has NO indexed
    * column of its own (it lives inside the superjson-serialized `:input` blob) — pushing it into SQL
    * would mean parsing that blob in a WHERE clause, which isn't sargable anyway. Honest cost: when
    * `agent` is given, this fetches every (status-filtered) run's summary WITHOUT LIMIT/OFFSET, decodes
@@ -1226,30 +1273,12 @@ class SqliteRunJournal implements RunJournal {
    * be the fix if this ever becomes a bottleneck at scale.
    */
   async listRuns(q?: ListQuery): Promise<Page<RunSummary>> {
-    // Five-way, still entirely in SQL and still on indexed columns — 'canceled' outranks 'suspended',
-    // which outranks the rest of the recorded outcome, matching deriveRunStatus exactly (see
-    // journal.ts), so a filtered page and an unfiltered scan can never disagree about the same run.
-    const statusCond =
-      q?.status === 'canceled' ? 'r.canceled = 1'
-      : q?.status === 'suspended' ? 'r.canceled = 0 AND r.suspended = 1'
-      : q?.status === 'failed' ? 'r.canceled = 0 AND r.suspended = 0 AND r.failed = 1'
-      : q?.status === 'running' ? 'r.canceled = 0 AND r.suspended = 0 AND r.failed = 0 AND r.running = 1'
-      : q?.status === 'completed' ? 'r.canceled = 0 AND r.suspended = 0 AND r.failed = 0 AND r.running = 0'
-      : undefined;
-    const toSummary = (r: RunRow): RunSummary => {
-      const input = r.input_val ? deserialize<{ threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string }>(r.input_val) : undefined;
-      return {
-        runId: r.run_id, status: deriveRunStatus(!!r.suspended, outcomeOfRow(r)), modelSteps: r.model_steps, toolCalls: r.tool_calls,
-        ...(input?.threadId ? { threadId: input.threadId } : {}),
-        ...(input?.agent ? { agent: input.agent } : {}),
-        ...(input?.resourceId ? { resourceId: input.resourceId } : {}),
-        ...(input?.workKey ? { workKey: input.workKey } : {}),
-        ...(input?.parentRunId ? { parentRunId: input.parentRunId } : {}),
-      };
-    };
+    // The column the summaries read, so a filtered page and an unfiltered scan can never disagree.
+    const statusCond = runStatusSql(q);
+    const toSummary = sqliteRunSummary;
     const atOf = (runId: string) =>
       (this.db.prepare('SELECT created_at FROM gnl_runs WHERE run_id = ?').get(runId) as { created_at: number } | undefined)?.created_at;
-    const cols = `r.run_id, r.created_at, r.model_steps, r.tool_calls, r.suspended, r.failed, r.running, r.canceled,
+    const cols = `r.run_id, r.created_at, r.model_steps, r.tool_calls, r.status,
                 (SELECT value FROM gnl_run_journal WHERE key = r.run_id || ':input') AS input_val`;
     return keysetRunPage(q, statusCond, atOf, (where, params, dir, take, skip, rel?: RunRelationRead) => {
       const order = `ORDER BY r.created_at ${dir}, r.run_id ${dir}`;
@@ -1280,7 +1309,7 @@ class SqliteRunJournal implements RunJournal {
    * reusing `withTx` directly because it needs to `await` the existing `put`/`putIfAbsent`/`incrBy`
    * calls in between — `withTx`'s `fn` is synchronous. Those calls detect the already-open transaction
    * (the SAME "within a transaction" reentrancy `withTx` already relies on) and skip their OWN
-   * BEGIN/COMMIT → ALL derived bookkeeping (gnl_runs `touchRunDelta` etc.) is reused as-is, no SQL
+   * BEGIN/COMMIT → ALL derived bookkeeping (gnl_runs `writeRunRows` etc.) is reused as-is, no SQL
    * duplicated. Claim-loses → `false`, with NOTHING else applied (checked FIRST, before any incr/put).
    */
   // P1.6b: ONE synchronous withTx block with ZERO awaits inside — critical, not stylistic. node:sqlite
@@ -1309,16 +1338,55 @@ class SqliteRunJournal implements RunJournal {
     return keys.map((k) => (byKey.has(k) ? deserialize<T>(byKey.get(k)!) : undefined));
   }
 
+  /** See `JournalReader.countRuns`: the same rows `listRuns` reads, counted; a prefix is a run id range. */
+  async countRuns(q?: { runIdPrefix?: string }): Promise<number> {
+    const upper = q?.runIdPrefix ? prefixUpperBound(q.runIdPrefix) : undefined;
+    const row = (q?.runIdPrefix
+      ? (upper === undefined
+        ? this.db.prepare('SELECT COUNT(*) AS n FROM gnl_runs WHERE run_id >= ?').get(q.runIdPrefix)
+        : this.db.prepare('SELECT COUNT(*) AS n FROM gnl_runs WHERE run_id >= ? AND run_id < ?').get(q.runIdPrefix, upper))
+      : this.db.prepare('SELECT COUNT(*) AS n FROM gnl_runs').get()) as { n: number } | undefined;
+    return Number(row?.n ?? 0);
+  }
+
   /**
-   * P1.6b: push-down status aggregate — a single `GROUP BY` over the same materialized `gnl_runs`
-   * columns, MUST MATCH listRuns' own status derivation (deriveRunStatus: canceled, then suspended,
-   * then failed, then running) — same columns, same order, so it cannot drift. `canceled` leads the
-   * CASE for the same reason it leads deriveRunStatus: a run canceled while suspended is over.
+   * See `JournalReader.listRunsChangedSince` and the Postgres twin: `(updated_at, run_id)` order over the
+   * existing `gnl_runs_updated (updated_at)` index, the position in the expanded form.
+   */
+  async listRunsChangedSince(cursor?: string, opts?: { limit?: number; since?: number; runIdPrefix?: string }): Promise<{ items: RunChange[]; nextCursor?: string }> {
+    const pos = decodeChangeCursor(cursor);
+    const limit = opts?.limit ?? 200;
+    const conds: string[] = [];
+    const params: unknown[] = [];
+    if (pos) {
+      conds.push('r.updated_at >= ?1 AND (r.updated_at > ?1 OR r.run_id > ?2)');
+      params.push(pos.at, pos.runId);
+    } else if (opts?.since !== undefined) {
+      conds.push('r.updated_at >= ?1');
+      params.push(opts.since);
+    }
+    if (opts?.runIdPrefix) {
+      const upper = prefixUpperBound(opts.runIdPrefix);
+      const n = params.length;
+      conds.push(upper === undefined ? `r.run_id >= ?${n + 1}` : `r.run_id >= ?${n + 1} AND r.run_id < ?${n + 2}`);
+      params.push(opts.runIdPrefix, ...(upper === undefined ? [] : [upper]));
+    }
+    const rows = this.db.prepare(
+      `SELECT r.run_id, r.created_at, r.updated_at, r.model_steps, r.tool_calls, r.status,
+              (SELECT value FROM gnl_run_journal WHERE key = r.run_id || ':input') AS input_val
+       FROM gnl_runs r${conds.length ? ` WHERE ${conds.join(' AND ')}` : ''} ORDER BY r.updated_at, r.run_id LIMIT ?${params.length + 1}`,
+    ).all(...params, limit) as (RunRow & { updated_at: number })[];
+    const items: RunChange[] = rows.map((r) => ({ ...sqliteRunSummary(r), updatedAt: Number(r.updated_at) }));
+    const last = items[items.length - 1];
+    return { items, ...(last ? { nextCursor: encodeChangeCursor({ at: last.updatedAt, runId: last.runId }) } : {}) };
+  }
+
+  /**
+   * P1.6b: push-down status aggregate — one `GROUP BY status` over the column every listing reads, so
+   * the counts and the listings cannot disagree about a run.
    */
   async countRunsByStatus(): Promise<Record<string, number>> {
-    const rows = this.db.prepare(
-      `SELECT CASE WHEN canceled THEN 'canceled' WHEN suspended THEN 'suspended' WHEN failed THEN 'failed' WHEN running THEN 'running' ELSE 'completed' END AS status, COUNT(*) AS n FROM gnl_runs GROUP BY status`,
-    ).all() as { status: string; n: number }[];
+    const rows = this.db.prepare(`SELECT status, COUNT(*) AS n FROM gnl_runs GROUP BY status`).all() as { status: string; n: number }[];
     const out: Record<string, number> = {};
     for (const r of rows) out[r.status] = Number(r.n);
     return out;

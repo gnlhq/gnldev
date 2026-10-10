@@ -7,7 +7,7 @@ import { sseResponse } from './sse.js';
 import { STUDIO_ERROR_CODES } from './error-codes.js';
 import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, requestRefusal, eraseSubject, subjectRuns, toJournal, decodeStepRecord, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
-import type { JournalReader, Journal, Memory, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser } from '@gnldev/durable';
+import type { JournalReader, Journal, Memory, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser, RunSummary, RunChange } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
 import { listTriggers } from '@gnldev/scheduler';
 import { mountSpa, notBuiltHtml } from './spa.js';
@@ -1303,6 +1303,11 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     ...(typeof (rawReader as any).listRunsPaged === 'function'
       ? { listRunsPaged: (q: any) => (scopedNow() as any).listRunsPaged(q) }
       : {}),
+    // The change feed GET /events reads. withOrg passes the organization's run id range down and
+    // withRootScope drops organizations' rows (organization.ts), so plain delegation is scoped.
+    ...(typeof (rawReader as any).listRunsChangedSince === 'function'
+      ? { listRunsChangedSince: (cursor: any, o: any) => (scopedNow() as any).listRunsChangedSince(cursor, o) }
+      : {}),
   } as JournalReader;
 
   /**
@@ -2284,9 +2289,28 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     return c.json({ totals, byTool, byOrigin, scan, judge, precision, byDeclaration: decls, recent: recent.slice(0, 50), scannedRuns: runs.length, totalRuns: allRuns.length });
   });
 
+  /**
+   * The suspended runs of the caller's scope, in creation order — what GET /approvals walks. Through
+   * `listRunsPaged({ status: 'suspended' })` where the reader has it: Sqlite and Postgres answer that
+   * from the `gnl_runs_status` partial index, so the inbox reads the suspended runs and not the store.
+   * 1M runs, 167 suspended: `listRuns()` read all 1 000 020 (20 001 pages, 23.3 s) to keep 167.
+   * Each row is still checked: a reader that ignores the filter stays exact, and only walks.
+   */
+  async function suspendedRuns(): Promise<RunSummary[]> {
+    if (typeof reader.listRunsPaged !== 'function') return (await reader.listRuns()).filter((r) => r.status === 'suspended');
+    const out: RunSummary[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await reader.listRunsPaged({ status: 'suspended', limit: 200, ...(cursor ? { cursor } : {}) });
+      for (const r of page.items) if (r.status === 'suspended') out.push(r);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return out;
+  }
+
   app.get('/approvals', async (c) => {
     if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
-    const runs = await reader.listRuns();
+    const runs = await suspendedRuns();
     const items: { runId: string; toolCallId: string; toolName: string; args?: unknown; reason?: string; suspendedAt?: number; owner?: string; ownerActor?: string; workKey?: string }[] = [];
     for (const r of runs) {
       if (r.status !== 'suspended') continue;
@@ -3192,6 +3216,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    * 1s pre-API-04 (~10x cut) while every change is still surfaced within a bounded delay.
    * Not part of the public API (StudioApiOptions) — overridable only via an internal, untyped option so
    * tests don't have to wait out the full 10s in real time.
+   * Only for a journal WITHOUT `listRunsChangedSince`: with it, GET /events reads the change feed and
+   * never scans the run list (see the feed loop there).
    */
   const FULL_SCAN_EVERY_TICKS: number = (opts as any).__fullScanEveryTicks ?? 5;
   /**
@@ -3225,6 +3251,40 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     }
     return JSON.stringify([counted, newest]);
   }
+  /**
+   * How far behind its position the change feed re-reads, every tick. `updated_at` is set by the
+   * WRITER, inside its transaction, from its own clock: a row can commit after this loop has already
+   * read past its value (a long transaction, a busy pool), and a writer's clock can trail another's.
+   * Re-reading this window and dropping what was already announced (by run and fingerprint) means such
+   * a change is announced late, or twice — never lost — when its commit lands within the window less
+   * one poll interval of its stamp (5 s − 2 s = 3 s: the next read may come a full interval later). The
+   * residual, named: a commit later than that, or a writer's clock behind this process's by more. On
+   * the 1M store a tick reads the rows changed in that window, not the store (one indexed query on
+   * `gnl_runs_updated`): ~1 ms idle, ~3 ms under 20 writes/s.
+   */
+  const CHANGE_WINDOW_MS = 5000;
+  /** Rows per change-feed page; a tick reads pages until one comes back short (caught up). */
+  const CHANGE_PAGE = 200;
+  /**
+   * Every run that changed in `[since, ceiling]` (epoch ms), through the scoped reader's change feed.
+   * The ceiling stops the walk at the first page that passes it: rows stamped further ahead — a writer
+   * whose clock runs ahead — are left for the tick at which this clock reaches them (delayed, not lost),
+   * so a tick reads the window and not every future-stamped row. Measured on the 1M copy as generated,
+   * where ~95 000 runs carry an `updated_at` up to 4.5 h ahead of the database clock: 160 000 rows,
+   * 803 pages, 2.5 s per tick without the ceiling.
+   */
+  async function readChangedRuns(since: number, ceiling: number): Promise<RunChange[]> {
+    const out: RunChange[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await reader.listRunsChangedSince!(cursor, { limit: CHANGE_PAGE, ...(cursor ? {} : { since }) });
+      for (const r of page.items) if (r.updatedAt <= ceiling) out.push(r);
+      const last = page.items[page.items.length - 1];
+      if (page.items.length < CHANGE_PAGE || !page.nextCursor || (last && last.updatedAt > ceiling)) return out;
+      cursor = page.nextCursor;
+    }
+  }
+
   app.get('/events', async (c) => {
     const ticket = c.req.query('ticket');
     let ticketOrg: string | undefined;
@@ -3248,6 +3308,48 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       let baselined = false;
       let legacyLast = ''; // fallback-path signature, used ONLY when countRunsByStatus is unavailable
       let tick = 0; // counts cheap-path ticks SINCE the baseline (for FULL_SCAN_EVERY_TICKS below)
+      if (typeof reader.listRunsChangedSince === 'function') {
+        // THE CHANGE FEED. No baseline of every run, no per-tick full listRuns() and so no
+        // FULL_SCAN_EVERY_TICKS: every write to a run moves its `updated_at` — a journal entry, a tool
+        // record's status, the outcome (the adapters' one run-row upsert per write, writeRunRows) — so a step added to
+        // ANY run, not just the newest, and every status flip arrive here as a changed row. 1M runs with
+        // organizations (where the cheap signal is unavailable and the old loop scanned every run every
+        // tick): 22.8 s per tick, the database 73% busy for one open tab and 94% for three.
+        // `seen` holds what was announced for the runs inside the window, so a re-read run is announced
+        // again only when its fingerprint moved. Its first read is the silent baseline, like the old
+        // loop's. Not seen here: a run DELETED (purge, retention) — its row is gone. The old full diff
+        // announced those; the client's next list fetch drops them.
+        // The window hangs off the newest `updated_at` seen — the writers' clock, so writers that all
+        // run a little behind this process are still read a full window back — but never off a time
+        // ahead of this process's own clock: one writer with a clock running ahead would otherwise
+        // drag the window past every other writer's changes. A row stamped up to one window ahead is
+        // read (and announced once, by fingerprint); one stamped further ahead waits for this clock
+        // (readChangedRuns' ceiling). Residual: see CHANGE_WINDOW_MS.
+        const connectedAt = Date.now();
+        let high: number | undefined;
+        const seen = new Map<string, { fp: string; at: number }>();
+        let first = true;
+        const base = (): number => Math.min(high ?? connectedAt, Date.now());
+        while (!stream.aborted) {
+          const since = base() - CHANGE_WINDOW_MS;
+          const changed: string[] = [];
+          for (const r of await readChangedRuns(since, Date.now() + CHANGE_WINDOW_MS)) {
+            const fp = `${r.status}|${r.modelSteps}|${r.toolCalls}`;
+            if (!first && seen.get(r.runId)?.fp !== fp) changed.push(r.runId);
+            seen.set(r.runId, { fp, at: r.updatedAt });
+            if (high === undefined || r.updatedAt > high) high = r.updatedAt;
+          }
+          first = false;
+          // Runs that fell out of the window are not read again until they change again — and a run
+          // that changes again is then announced, which is what it should be.
+          for (const [id, v] of seen) if (v.at < since) seen.delete(id);
+          if (changed.length > 0) {
+            await stream.writeSSE({ data: JSON.stringify({ runIds: changed, at: Date.now() }), event: 'change' });
+          }
+          await stream.sleep(EVENTS_POLL_MS);
+        }
+        return;
+      }
       while (!stream.aborted) {
         const sig = await readCheapEventsSignal();
         if (sig !== undefined) {
@@ -4173,10 +4275,16 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const resolvedMemory = memoryFor(c);
     if (!resolvedMemory?.deleteThread) return c.json({ error: 'deleteThread is not supported' }, 501);
     try {
+      // Takes the thread's runs with it (`AgentMemory.deleteThread` → `purgeThread`, @gnldev/durable's model).
       await resolvedMemory.deleteThread(decodeURIComponent(c.req.param('id')));
       await audit(c, 'thread.delete', decodeURIComponent(c.req.param('id')));
       return c.json({ ok: true });
     } catch (e) {
+      // A run on the thread is still writing: nothing was deleted. Matched by name, as every typed error
+      // here is (a host's memory may be built against another copy of @gnldev/durable).
+      if ((e as { name?: unknown })?.name === 'ThreadRunsInFlightError') {
+        return c.json({ error: String((e as Error).message), code: STUDIO_ERROR_CODES.threadRunsInFlight, runs: (e as { runIds?: unknown }).runIds }, 409);
+      }
       return reservedIdResponse(c, e) ?? c.json({ error: String((e as Error)?.message ?? e) }, 400);
     }
   });

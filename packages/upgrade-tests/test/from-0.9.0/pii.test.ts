@@ -27,7 +27,7 @@ describe('upgrade from 0.9.0 — PII tool results in the journal', () => {
   });
 
   it('the unfinished 0.9.0 run finishes after the upgrade without calling the tool again', async () => {
-    const { storage } = openFixture('pii.db');
+    const { storage } = await openFixture('pii.db');
     const executed: number[] = [];
     const r = await resume(toJournal(storage.runs), executed);
     expect(r.text).toBe('done');
@@ -35,13 +35,13 @@ describe('upgrade from 0.9.0 — PII tool results in the journal', () => {
   });
 
   it("erasing the run's owner leaves the email nowhere in the file", async () => {
-    const f = openFixture('pii.db');
+    const f = await openFixture('pii.db');
     await eraseSubject(f.storage, S.PII.resourceId);
     expect(rowsContaining(f.path, S.PII.email)).toEqual([]);
   });
 
   it('erasing after the run was finished on the current code leaves the email nowhere either', async () => {
-    const f = openFixture('pii.db');
+    const f = await openFixture('pii.db');
     await resume(toJournal(f.storage.runs), []);
     await eraseSubject(f.storage, S.PII.resourceId);
     expect(rowsContaining(f.path, S.PII.email)).toEqual([]);

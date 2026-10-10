@@ -50,8 +50,12 @@ ones), observational memory's journal records (the observer's memoized summaries
 Built over the same storage the engine runs on, nothing has to be listed. Built over ANOTHER storage
 (`memoryPreset(otherStorage)`), name it: `eraseSubject(storage, userId, { memory: otherStorage })` —
 otherwise that memory is not reached, and the report lists the person's threads in `unreachedThreads`.
-`deleteThread(id)` removes one thread from the memory store; its observational-memory records in the
-journal go with `purgeThread(journal, id)`.
+`deleteThread(id)` deletes one thread WITH ITS RUNS — every run on it (sub-agents, forks and rollovers
+on it too), its messages, working memory and observations, observational memory's journal records and
+vectors, its idempotency window and its owner record — in one call (`purgeThread` in `@gnldev/durable`,
+the plan its dependents model makes). It refuses, deleting nothing, while a run on the thread is still
+executing (`ThreadRunsInFlightError`): cancel the run, or pass `{ allowInFlight: true }` for one whose
+worker is gone. A run waiting on an approval is not in flight; it goes with the thread.
 
 Observation vectors (`observationalMemory.omVectors`) are written with the thread owner's `owner`
 label, through the same vector write rule every store runs, so erasing the person takes them. In an

@@ -16,7 +16,7 @@ describe('upgrade from 0.9.0 — evals', () => {
   });
 
   it("a 0.9.0 memo is computed again once, and the new score is replayed from then on", async () => {
-    const { storage } = openFixture('evals.db');
+    const { storage } = await openFixture('evals.db');
     const j = toJournal(storage.runs);
     const calls = { n: 0 };
     const scorers = () => [answerRelevancy({ model: S.textModel(S.EVAL.judgeText, calls) as any }), contains('France')];
@@ -30,7 +30,7 @@ describe('upgrade from 0.9.0 — evals', () => {
   });
 
   it('a restarted process replays the recomputed score too', async () => {
-    const f = openFixture('evals.db');
+    const f = await openFixture('evals.db');
     const calls = { n: 0 };
     const judge = () => [answerRelevancy({ model: S.textModel(S.EVAL.judgeText, calls) as any })];
     await scoreRun(toJournal(f.storage.runs), S.EVAL.runId, judge());

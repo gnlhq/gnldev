@@ -17,7 +17,7 @@ describe('upgrade from 0.9.0 — workflow', () => {
   });
 
   it('0.9.0 runs are listed and read as suspended, waiting where they stopped', async () => {
-    const { storage } = openFixture('workflow.db');
+    const { storage } = await openFixture('workflow.db');
     const j = toJournal(storage.runs);
     expect(await w.getWorkflowRunStatus(j, R.void)).toMatchObject({ status: 'suspended', waitId: 'approve' });
     expect(await w.getWorkflowRunStatus(j, R.nested)).toMatchObject({ status: 'suspended', waitId: 'ship' });
@@ -26,13 +26,13 @@ describe('upgrade from 0.9.0 — workflow', () => {
   });
 
   it('a 0.9.0 step record reads back unchanged through decodeStepRecord', async () => {
-    const { storage } = openFixture('workflow.db');
+    const { storage } = await openFixture('workflow.db');
     const j = toJournal(storage.runs);
     expect(decodeStepRecord(await j.get(`${R.nested}:wf:pay:check`))).toEqual({ amount: 20 });
   });
 
   it('resuming the 0.9.0 void-step run: the sideEffect void step does not run again; the plain one re-runs once (documented)', async () => {
-    const { storage } = openFixture('workflow.db');
+    const { storage } = await openFixture('workflow.db');
     const j = toJournal(storage.runs);
     const calls: string[] = [];
     const r = await S.voidWorkflow(w, calls).runResumable(1, { runId: R.void, journal: j }, { resume: { approve: 'yes' } });
@@ -43,7 +43,7 @@ describe('upgrade from 0.9.0 — workflow', () => {
   });
 
   it('after that resume, running the run again runs nothing', async () => {
-    const { storage } = openFixture('workflow.db');
+    const { storage } = await openFixture('workflow.db');
     const j = toJournal(storage.runs);
     await S.voidWorkflow(w, []).runResumable(1, { runId: R.void, journal: j }, { resume: { approve: 'yes' } });
     const calls: string[] = [];
@@ -53,7 +53,7 @@ describe('upgrade from 0.9.0 — workflow', () => {
   });
 
   it('resuming the 0.9.0 nested run runs only what comes after the wait', async () => {
-    const { storage } = openFixture('workflow.db');
+    const { storage } = await openFixture('workflow.db');
     const j = toJournal(storage.runs);
     const calls: string[] = [];
     const r = await S.nestedWorkflow(w, calls).runResumable(2, { runId: R.nested, journal: j }, { resume: { ship: 'today' } });
@@ -62,7 +62,7 @@ describe('upgrade from 0.9.0 — workflow', () => {
   });
 
   it('a 0.9.0 run resumed from a restarted process (a second open of the file) runs nothing twice', async () => {
-    const f = openFixture('workflow.db');
+    const f = await openFixture('workflow.db');
     const calls: string[] = [];
     await S.nestedWorkflow(w, calls).runResumable(2, { runId: R.nested, journal: toJournal(f.storage.runs) }, { resume: { ship: 'today' } });
     await S.nestedWorkflow(w, calls).runResumable(2, { runId: R.nested, journal: toJournal(f.reopen().runs) }, { resume: { ship: 'today' } });

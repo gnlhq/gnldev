@@ -159,9 +159,10 @@ describe.skipIf(!RUN)('REAL Postgres — multi-pool CAS + run-lock + exactly-onc
   it('T1: concurrent put(same NEW key) across two pools → the gnl_runs counter is exactly 1 (pg-mem CANNOT PROVE THIS)', async () => {
     // Under pg-mem this test showed the counter could reach 2 (verified experimentally: pg-mem does
     // NOT enforce real row-level locking/blocking between concurrent BEGIN'd clients — see
-    // multi-worker.test.ts §T1(e) HONESTY NOTE). On real PG, journal.put()'s lockRunRow row lock
-    // SERIALIZES the two pools: the second pool's "does prev exist" SELECT sees the first pool's
-    // commit → touchRunDelta is applied exactly once as +1.
+    // multi-worker.test.ts §T1(e) HONESTY NOTE). On real PG, journal.put() locks the JOURNAL row
+    // (`writeRecord`: SELECT … FOR UPDATE, or the INSERT itself for a new key) and SERIALIZES the two
+    // pools: the second one's INSERT waits for the first's commit, loses, and goes round to read the
+    // committed row as its prev → the counter is applied exactly once as +1.
     const runId = `${SEED}:t1race`;
     const key = `${runId}:tool:call-x`;
     await Promise.all([

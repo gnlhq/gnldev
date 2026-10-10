@@ -211,7 +211,21 @@ export const doctorCommand: Command = {
     });
 
     const journal = getJournal(config, d);
-    const stamps = await doctorStamps(journal, d);
+    let stamps: DoctorStamps;
+    try {
+      stamps = await doctorStamps(journal, d);
+    } catch (e) {
+      // A store in a format this version refuses (its `run-status` step pending: 0.10's status flags)
+      // answers no journal question until `gnl upgrade` has run. Said as what it is — the pending steps
+      // and the refusal — not as a crash halfway through the report. Any other failure is the report's.
+      const steps = typeof config.storage?.upgrade === 'function' ? (await config.storage.upgrade({ dryRun: true }).catch(() => undefined))?.steps ?? [] : [];
+      if (!steps.some((s) => s.name === 'run-status' && s.pending)) throw e;
+      console.log(bold('upgrade pending'));
+      for (const s of steps.filter((x) => x.pending)) console.log(`  ${s.name}  ${dim(`— ${s.description}`)}`);
+      console.log(dim(`  ${(e as Error).message}`));
+      process.exitCode = 1;
+      return;
+    }
 
     if (flagBool(ctx.argv, 'share')) {
       console.log(dim('  Copy the block below. It leaves this machine only if you paste it — nothing here sends anything.'));

@@ -11,8 +11,10 @@
  *    keyed in that package's own format, so the package that writes it erases it: `jobEraser`,
  *    `triggerEraser`, `eventEraser`, passed in as `erasers`. A copy of those formats in this file had
  *    already drifted (it knew the trigger families but not the fire locks, nor any job marker).
- * Runs, threads and documents are erased by `purgeResource`, whose thread question is `threadOwnerOf`
- * — the same one the gate and the listing ask.
+ * Her threads are deleted as every thread is — `purgeThread`, the one plan model.ts makes (its runs,
+ * its journal state, its vectors, the store's half, the owner record last) — and what else her id owns
+ * by `purgeResource`; whose a thread is, is `threadOwnerOf` — the same question the gate and the
+ * listing ask.
  *
  * IT TAKES THE STORAGE, NOT A LIST OF ITS STORES. It used to take `{ journal, work?, vectors?, memory? }`,
  * and a store left off the list was a store left untouched, with a report that read like success:
@@ -22,13 +24,14 @@
  * its own format, or a memory kept in some other database — comes in as an eraser.
  */
 import { purgeResource, purgeThread } from './retention.js';
+import { hasRunningClaim } from './model.js';
 import { threadRecordOwner, assertRootOutsideOrganizations } from './storage.js';
 import { ownedPrefix } from './owned-name.js';
 import { threadOwnerOf, threadOwnerKey } from './thread-owner.js';
 import { withOrg, isOrganizationKey, parseOrganizationKey, orgPrefix, ORG_KEY_PREFIX, ORG_RECORD_PRE } from './organization.js';
 import { orgVectorDelete, orgStorageScopeOf, withOrgStorage } from './org-storage.js';
 import { toJournal, isStorage, workingMemoryScope, legacyWorkingMemoryScope, MEMORY_PARTITION } from './storage.js';
-import { memKey, MEM_LEAVES, OM_VECTOR_SOURCE, semanticLogKey } from './memory.js';
+import { memKey, MEM_LEAVES, semanticLogKey } from './memory.js';
 import type { Memory } from './memory.js';
 import { runKeys, listRunsWhere } from './journal.js';
 import type { Journal } from './journal.js';
@@ -247,16 +250,6 @@ export interface SubjectRun {
   inFlight: boolean;
 }
 
-/** Is any model-step or tool claim of this run `running` at this moment? */
-async function hasRunningClaim(runs: Journal, runId: string): Promise<boolean> {
-  if (typeof runs.listKeys !== 'function') return false;
-  for (const k of await runs.listKeys(`${runId}:`)) {
-    if (!k.includes(':proc:') && !k.includes(':tool:')) continue;
-    const v = await runs.get<{ status?: unknown }>(k);
-    if (v && typeof v === 'object' && v.status === 'running') return true;
-  }
-  return false;
-}
 
 /**
  * A person's runs in a storage, and which of them may still write — what an erasure must wait for.
@@ -376,7 +369,7 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
     return v;
   };
   const reserved: ReservedRootThread[] = [];
-  const deleted: Array<{ thread: string; runs: Journal }> = [];
+  const deleted: Array<{ thread: string; store: MemoryStore; runs: Journal }> = [];
   const reached = new Set<string>();
   let workingMemory = 0;
   for (const { store, runs: memRuns } of stores) {
@@ -391,8 +384,7 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
       if ((await threadOwnerOf(runs, ownerAsker(store), t)).owner !== resourceId) continue;
       // Counted only when the store held it: a thread found by its owner record may live elsewhere.
       if (!(await holdsThread(store, t))) continue;
-      await store.deleteThread(t);
-      deleted.push({ thread: t, runs: memRuns });
+      deleted.push({ thread: t, store, runs: memRuns });
       reached.add(t);
     }
     for (const key of [workingMemoryScope.resource(resourceId), legacyWorkingMemoryScope.resource(resourceId)]) {
@@ -403,6 +395,7 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
   // or somewhere this erasure was not shown. Asked before `purgeResource` removes the owner records.
   const unreachedThreads: string[] = [];
   const journalKept: string[] = [];
+  const journalSide: string[] = [];
   for (const t of ownedByRecord) {
     if (reached.has(t)) continue;
     if (outside && isOrganizationKey(t)) {
@@ -419,31 +412,52 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
     // to be reached only through a run of this person, so a thread with none kept every message and
     // the report named nothing.
     if (await journalHoldsThread(runs, t)) journalKept.push(t);
-    else unreachedThreads.push(t);
+    else {
+      // Its messages are in no store this erasure reached — reported — but what of it lives in THIS
+      // journal is hers and goes (its runs, its state, its owner record): a thread whose memory-store
+      // half an earlier, killed attempt already deleted is exactly this, and without this its owner
+      // record, naming her, outlived every retry.
+      unreachedThreads.push(t);
+      journalSide.push(t);
+    }
   }
   // Threads 0.9 let the root create under an `org:` id: the certain ones were erased above; every other
   // one of the person's in that space is reported — undecided, so this erasure did not take it (if it is
   // an organization's, that organization's erasure, `{ orgId }`, does) — with the way through
   // (`findReservedRootThreads` / `migrateReservedRootThreads` with `threadIds`, then erase again).
   for (const t of reserved) if (!reached.has(t.id)) unreachedThreads.push(t.id);
-  let journalRows = await purgeResource(runs, resourceId, {
+  let journalRows = 0;
+  // Her threads, each deleted as a thread is (model.ts, `purgeThread`): its runs, its journal state, its
+  // observation vectors, the memory store's half, and its owner record LAST — so an erasure killed
+  // half-way leaves each thread still hers, found again by its record when the request is retried. In
+  // the `memory` storage's journal too, where that memory kept its observation records. Not refused for
+  // a run in flight: an erasure takes what is there (`subjectRuns` is the order that stops a turn first).
+  // Observation vectors go by thread: one indexed while the thread was anonymous has no owner label,
+  // and the owner delete below does not see it.
+  const threadVectors = vectors || homeVectors
+    ? {
+      delete: async (where: Parameters<NonNullable<NonNullable<Storage['vectors']>['delete']>>[0]) => {
+        let n = 0;
+        for (const v of [vectors, homeVectors && docs(homeVectors)]) if (v) n += await v.delete!({ ...where, ...(outside ? { outsideOrganizations: true } : {}) });
+        return n;
+      },
+    }
+    : undefined;
+  const inThread = { allowInFlight: true, ...(threadVectors ? { vectors: threadVectors } : {}) } as const;
+  for (const { thread, store, runs: memRuns } of deleted) {
+    if (memRuns !== runs) journalRows += await purgeThread(memRuns, thread, { allowInFlight: true });
+    journalRows += await purgeThread(runs, thread, { ...inThread, memory: store });
+  }
+  // A journal-kept thread (BasicMemory, SemanticMemory) is the journal alone.
+  for (const t of [...journalKept, ...journalSide]) journalRows += await purgeThread(runs, t, inThread);
+  // Then what is hers beside her threads: the families her id names, her documents, her runs on no
+  // thread of hers, the threads only a retention trace still names.
+  journalRows += await purgeResource(runs, resourceId, {
     ...(vectors ? { vectors } : {}),
     ...(asker ? { memory: asker } : {}),
     ...(outside ? { outsideOrganizations: true } : {}),
   });
   if (homeVectors) journalRows += await docs(homeVectors)!.delete!({ owner: resourceId, ...(outside ? { outsideOrganizations: true } : {}) });
-  // A memory-store thread's journal side (observational memory, dedup window, owner record) — reached
-  // here too, for a thread with no run left to lead `purgeResource` to it; and in the `memory`
-  // storage's journal, where that memory kept its observational-memory records.
-  for (const t of journalKept) journalRows += await purgeThread(runs, t);
-  for (const { thread, runs: memRuns } of deleted) {
-    journalRows += await purgeThread(runs, thread);
-    if (memRuns !== runs) journalRows += await purgeThread(memRuns, thread);
-    // …and its observational-memory vectors, by thread: one indexed while the thread was anonymous
-    // has no owner label, and the owner delete above does not see it.
-    const ofThread = { filter: { source: OM_VECTOR_SOURCE, threadId: thread }, ...(outside ? { outsideOrganizations: true } : {}) };
-    for (const v of [vectors, homeVectors && docs(homeVectors)]) if (v) journalRows += await v.delete!(ofThread);
-  }
   const owner = { resourceId, ...(opts.orgId !== undefined ? { orgId: opts.orgId } : {}) };
   const workRecords = work ? await work.deleteIdPrefix!(ownedPrefix(owner)) : 0;
   const byEraser: Record<string, number> = {};

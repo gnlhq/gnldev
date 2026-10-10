@@ -74,6 +74,8 @@ export function isRunCursor(cursor: string): boolean {
 /** The filters every run listing applies, in one place. */
 export interface RunFilter {
   status?: RunStatus;
+  /** Any of these statuses (`ListQuery.statuses`); with `status` too, a run must match both. */
+  statuses?: readonly RunStatus[];
   agent?: string;
   resourceId?: string;
   workKey?: string;
@@ -83,7 +85,8 @@ export interface RunFilter {
 }
 
 export function matchesRunFilter(r: RunSummary, q: RunFilter | undefined): boolean {
-  return (q?.status ? r.status === q.status : true) && (q?.agent ? r.agent === q.agent : true)
+  return (q?.status ? r.status === q.status : true) && (q?.statuses ? q.statuses.includes(r.status) : true)
+    && (q?.agent ? r.agent === q.agent : true)
     && (q?.resourceId ? r.resourceId === q.resourceId : true)
     && (q?.threadId ? r.threadId === q.threadId : true)
     && (q?.runIdPrefix ? r.runId.startsWith(q.runIdPrefix) : true)
@@ -195,6 +198,8 @@ export async function keysetRunPage(
     else if (nextAt !== undefined) after = { at: Number(nextAt), runId: pos.next!, inclusive: true };
     else skip = pos.seen;
   }
+  // Every status the filter admits is an open one: the read is served by a partial index (runStatusSql).
+  const openOnly = (q?.status !== undefined && q.status !== 'completed') || (q?.statuses !== undefined && !q.statuses.includes('completed'));
   const take = unindexed ? Math.max(limit + 1, 200) : limit + 1;
   let skipRows = unindexed ? 0 : skip;
   let skipMatches = unindexed ? skip : 0;
@@ -213,7 +218,11 @@ export async function keysetRunPage(
       // equality (or IS NULL) on the first, `created_at >= a` as the index bound and the run id as a
       // filter on the rows of that one millisecond. Here the expanded form is the plain one, and the
       // row form is refused by pg-mem outright against that index ("cannot cast type list to list").
-      if (rel) conds.push(`r.created_at ${cmpEq} ${ph(1)} AND (r.created_at ${cmp} ${ph(1)} OR r.run_id ${after.inclusive ? cmpEq : cmp} ${ph(2)})`);
+      // A read of open runs only (`openOnly`) is the same case: it reads the `gnl_runs_open` partial
+      // index, pg-mem refuses the row form against it the same way, and on Postgres the expanded form
+      // over that index is one bound either way — 1M runs, 167 open: 0.2–0.3 ms before and after an
+      // ANALYZE. A read that can include 'completed' runs keeps the row form on `gnl_runs_created`.
+      if (rel || openOnly) conds.push(`r.created_at ${cmpEq} ${ph(1)} AND (r.created_at ${cmp} ${ph(1)} OR r.run_id ${after.inclusive ? cmpEq : cmp} ${ph(2)})`);
       else conds.push(`(r.created_at, r.run_id) ${after.inclusive ? cmpEq : cmp} (${ph(1)}, ${ph(2)})`);
       params.push(after.at, after.runId);
     }
@@ -239,4 +248,74 @@ export async function keysetRunPage(
     items: items.map((r) => r.summary),
     ...(out.length > limit && last ? { nextCursor: encodeRunCursor({ runId: last.summary.runId, at: last.at, next: out[limit]!.summary.runId, seen: (pos?.seen ?? 0) + items.length }) } : {}),
   };
+}
+
+/**
+ * Every status a run can have that is not 'completed' — the runs a status read asks about in practice
+ * (the approval inbox, the live part of a usage total). Counted on the 1M-run store the C+ audit
+ * measured: 167 of 1 000 020. Kept in their own partial indexes on Sqlite and Postgres (`gnl_runs_open`
+ * in creation order, `gnl_runs_status` by status), so finding them reads those rows and not the other
+ * million.
+ */
+export const OPEN_RUN_STATUSES: readonly RunStatus[] = ['canceled', 'suspended', 'failed', 'running'];
+
+/**
+ * The partial indexes' predicate, word for word. A query reaches a partial index only when the planner
+ * can prove the query's WHERE implies it, and Sqlite proves it only from a term it finds in the WHERE
+ * as written — so every status filter below that admits no 'completed' run carries this exact term.
+ * @internal — the Sqlite and Postgres adapters' DDL and listings.
+ */
+export const openRunPredicate = (alias = ''): string => `${alias}status <> 'completed'`;
+
+/**
+ * A run status filter as SQL over `gnl_runs.status` — the status the adapter wrote with the run's
+ * counter and outcome (`runStatusOf`), so a filtered page and a full scan read the same column and
+ * cannot disagree about a run. A filter that admits no 'completed' run carries `openRunPredicate`, the
+ * term that lets both planners read the partial indexes: one status `gnl_runs_status`, the set of every
+ * open status `gnl_runs_open`. `undefined` for no filter.
+ * Statuses are written as literals: they are this union's own values, never a caller's string (an
+ * unknown one matches nothing).
+ * @internal — the Sqlite and Postgres adapters' `listRuns`.
+ */
+export function runStatusSql(q: { status?: RunStatus; statuses?: readonly RunStatus[] } | undefined): string | undefined {
+  const known = (s: RunStatus): boolean => s === 'completed' || OPEN_RUN_STATUSES.includes(s);
+  const set = (list: readonly RunStatus[]): string => {
+    const valid = [...new Set(list)].filter(known);
+    if (valid.length === 0) return `1 = 0`; // an empty set matches nothing, as `includes` says
+    const open = valid.every((s) => s !== 'completed') ? `${openRunPredicate('r.')} AND ` : '';
+    if (open && valid.length === OPEN_RUN_STATUSES.length) return openRunPredicate('r.');
+    return valid.length === 1 ? `${open}r.status = '${valid[0]}'` : `${open}r.status IN (${valid.map((s) => `'${s}'`).join(', ')})`;
+  };
+  const conds: string[] = [];
+  if (q?.status) conds.push(set([q.status]));
+  if (q?.statuses) conds.push(set(q.statuses));
+  return conds.length ? conds.join(' AND ') : undefined;
+}
+
+/** Where a change feed stopped: the last run it handed out, keyed on its `updated_at`. */
+export interface ChangePosition {
+  at: number;
+  runId: string;
+}
+
+// c1:<at>:<length of runId>:<runId> — same measured-not-delimited run id as RUN_CURSOR.
+const CHANGE_CURSOR = /^c1:(-?\d+):(\d+):([\s\S]*)$/;
+
+/** The opaque cursor of `JournalReader.listRunsChangedSince`. @internal — adapters and the scoped views. */
+export function encodeChangeCursor(p: ChangePosition): string {
+  return `c1:${p.at}:${p.runId.length}:${p.runId}`;
+}
+
+/**
+ * The position a change cursor names, or `undefined` for none. Anything else is refused, for the reason
+ * `decodeRunCursor` gives: a cursor answered as "from the start" would replay every run as changed.
+ * @internal — adapters and the scoped views.
+ */
+export function decodeChangeCursor(cursor: string | undefined): ChangePosition | undefined {
+  if (cursor === undefined || cursor === '') return undefined;
+  const m = CHANGE_CURSOR.exec(cursor);
+  if (!m || Number(m[2]) !== m[3]!.length) {
+    throw new TypeError(`@gnldev/durable: '${cursor}' is not a change-feed cursor — pass back a page's nextCursor verbatim, or omit it and give \`since\`.`);
+  }
+  return { at: Number(m[1]), runId: m[3]! };
 }

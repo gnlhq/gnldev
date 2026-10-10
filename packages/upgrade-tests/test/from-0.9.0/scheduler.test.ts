@@ -12,8 +12,8 @@ const spec = (id: string) => S.SCHEDULES.find((s) => s.id === id)!;
 /** Run ids 0.9.0 already fired: a fire after the upgrade must never reuse one (it would replay, not run). */
 const runIdsOn090 = new Set((notes090.scheduler.firedOn090 as string[]).map((f) => f.split('@')[1]));
 
-function setup() {
-  const f = openFixture('scheduler.db');
+async function setup() {
+  const f = await openFixture('scheduler.db');
   const j = toJournal(f.storage.runs);
   const fired: string[] = [];
   const runner = { runWorkflow: async (name: string, _in: unknown, o?: { runId?: string }) => { fired.push(`${name}@${o?.runId}`); return { runId: o?.runId ?? 'x' }; } };
@@ -37,7 +37,7 @@ describe('upgrade from 0.9.0 — scheduler', () => {
   });
 
   it('the first polls after the upgrade fire the valid trigger under new run ids, and nothing that cannot fire', async () => {
-    const { fired, poll } = setup();
+    const { fired, poll } = await setup();
     await quiet(async () => { await poll(T + 2600); await poll(T + 3700); });
     expect(fired.filter((f) => f.startsWith('w-ok@'))).toHaveLength(2);
     expect(fired.filter((f) => !f.startsWith('w-ok@'))).toEqual([]);
@@ -45,7 +45,7 @@ describe('upgrade from 0.9.0 — scheduler', () => {
   });
 
   it('a stored trigger that cannot fire is marked failed with the reason, naming the way through', async () => {
-    const { j, poll } = setup();
+    const { j, poll } = await setup();
     await quiet(() => poll(T + 2600));
     const t = new Map((await listTriggers(j)).map((x) => [x.id, x]));
     for (const id of ['zero', 'ma0']) {
@@ -56,7 +56,7 @@ describe('upgrade from 0.9.0 — scheduler', () => {
   });
 
   it('re-registering the 0.9.0 specs on boot: the valid one is a no-op, each spec that cannot fire is refused and writes nothing', async () => {
-    const { j } = setup();
+    const { j } = await setup();
     expect(await scheduleWorkflow(j, spec('ok'), T + 4000)).toBe('ok');
     for (const id of ['bad', 'zero', 'ma0', 'two']) {
       const before = await j.get(`sched:def:${id}`);
@@ -66,7 +66,7 @@ describe('upgrade from 0.9.0 — scheduler', () => {
   });
 
   it('a corrected spec replaces a stored one that cannot fire, and its fires never reuse a 0.9.0 run id', async () => {
-    const { j, fired, poll } = setup();
+    const { j, fired, poll } = await setup();
     await quiet(async () => {
       await scheduleWorkflow(j, { id: 'bad', cron: '0 3 * * *', name: 'w-bad' }, T + 4000);
       await scheduleWorkflow(j, { id: 'zero', every: 1000, name: 'w-zero' }, T + 4000);
@@ -79,7 +79,7 @@ describe('upgrade from 0.9.0 — scheduler', () => {
   });
 
   it("the 0.9.0 {at, every} trigger: `ifExists: 'replace'` applies one field, and its first fire does not reuse the run id 0.9.0 fired", async () => {
-    const { j, fired, poll } = setup();
+    const { j, fired, poll } = await setup();
     await quiet(async () => {
       await scheduleWorkflow(j, { id: 'two', every: 1000, name: 'w-two', ifExists: 'replace' }, T + 4000);
       await poll(T + 6000);
@@ -90,7 +90,7 @@ describe('upgrade from 0.9.0 — scheduler', () => {
   });
 
   it('the leap-day cron 0.9.0 refused in 2026: registered again, it fires on 2028-02-29 and not before, then 2032-02-29', async () => {
-    const { j, fired, poll } = setup();
+    const { j, fired, poll } = await setup();
     await quiet(async () => {
       await scheduleWorkflow(j, spec('leap'), T + 5);
       for (const at of [T + 10, Date.UTC(2027, 1, 28, 23, 59), Date.UTC(2028, 1, 28, 23, 59)]) await poll(at);

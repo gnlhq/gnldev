@@ -324,7 +324,7 @@ describe('§3.1(d) lock expiry / stale takeover', () => {
 });
 
 // ── (e) T1 audit fix — put() derived-index race: shared-backend proof ────────────────────
-// journal.put()'s triple of SELECT prev → UPSERT → touchRunDelta could, under autocommit, let TWO
+// journal.put()'s triple of SELECT prev → UPSERT → run-row delta could, under autocommit, let TWO
 // SEPARATE workers concurrently put() the SAME NEW key both see prev=none and DOUBLE-increment the
 // gnl_runs counter (even though the actual journal row stays SINGLE). BEGIN IMMEDIATE (SQLite) / row
 // locking + a single transaction (Postgres) close this window: the second worker's SELECT sees the
@@ -361,8 +361,8 @@ describe('§T1(e) double-put on the same NEW key — gnl_runs counter DOES NOT D
   it('Postgres (pg-mem) shared pool: concurrent put(same new model key) — HONESTY NOTE: pg-mem CANNOT PROVE THIS', async () => {
     // pg-mem NOTE (experimentally verified — see the tx() JSDoc in postgres-storage.ts): if two clients
     // BEGIN and write INSERT...ON CONFLICT DO UPDATE to the same row, pg-mem executes one IMMEDIATELY
-    // WITHOUT WAITING for the other's commit (no real row-level lock/blocking) → lockRunRow's serializing
-    // effect CANNOT BE OBSERVED in pg-mem; the counter here CAN GO UP TO 2 (not a code bug, a test-environment
+    // WITHOUT WAITING for the other's commit (no real row-level lock/blocking) → the journal-row lock's
+    // serializing effect (`writeRecord`) CANNOT BE OBSERVED in pg-mem; the counter here CAN GO UP TO 2 (not a code bug, a test-environment
     // fidelity limit). Proof of serialization on a real engine: the 'T1' test in integration-real.test.ts
     // (GNL_INTEGRATION=1, real PG). Here we only verify the invariant pg-mem CAN also provide: same key → a
     // single journal row.

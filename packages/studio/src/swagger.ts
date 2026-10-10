@@ -82,8 +82,9 @@ export function openapiSpec(apiBase = '') {
       '/users/{id}/revoke': P('post', "Revoke a user's token without deleting the user", idParam),
       '/auth/sse-ticket': P('post', 'Issue a single-use SSE ticket (60s TTL, for /events)'),
       // API-04: informative payload — event `change`, data `{"runIds":[...],"at":<epoch ms>}` naming
-      // the runs that changed (added/edited/removed) since the last event; a legacy plain `data:'runs'`
-      // is still sent when the journal has no cheap countRunsByStatus aggregate to diff against.
+      // the runs that changed since the last event (added/edited; removed too, except on a journal with
+      // the change feed, which cannot see a deleted row); a legacy plain `data:'runs'` is still sent
+      // when the journal has neither the feed nor a cheap countRunsByStatus aggregate to diff against.
       '/events': P('get', "SSE — event 'change', data {runIds,at} naming the runs that changed (legacy plain 'runs' payload as a fallback)", [q('ticket')]),
       '/policy': { ...P('get', 'Get the global tool policy'), ...P('put', "Update the global tool policy ({ rules, ifVersion? }); 409 version_conflict if ifVersion is stale", [], true) },
       '/chat': P('post', 'Live chat (admin)', [], true),
@@ -109,7 +110,7 @@ export function openapiSpec(apiBase = '') {
       '/workflows/{name}/def': P('get', 'Managed workflow definition', nameParam),
       '/workflows/{name}': { ...P('put', 'Update a managed workflow', nameParam, true), ...P('delete', 'Delete a managed workflow', nameParam) },
       '/threads': P('get', 'Memory thread list', [q('resourceId')]),
-      '/threads/{id}': { ...P('patch', 'Rename a thread', idParam, true), ...P('delete', 'Delete a thread', idParam) },
+      '/threads/{id}': { ...P('patch', 'Rename a thread', idParam, true), ...P('delete', 'Delete a thread with its runs', idParam) },
       '/threads/{id}/messages': {
         ...P('get', 'Thread messages', idParam),
         // afterIndex is INCLUSIVE (the message at afterIndex + every one after it is deleted); -1 = the whole thread.

@@ -241,7 +241,11 @@ sorguyla OKUNUR (bkz. §11.2). Atomiklik doğrudan SQL'dedir: `INSERT ... ON CON
 ("varsa ekleme" — iki sunucu aynı anahtarı yazarsa motor yalnız birine izin verir = CAS).
 
 **② `gnl_runs` — koşuların vitrini.** Kolonlar: `run_id, model_steps (kaç LLM adımı),
-tool_calls (kaç araç), suspended (askıda mı), created_at/updated_at`. *Neden var?* Studio'nun
+tool_calls (kaç araç), suspended_count (insan onayı bekleyen araç çağrısı sayısı), outcome (koşu
+tamamlanmadıysa nasıl bitti: running / failed / canceled), status (her liste, sayım ve filtrenin
+okuduğu durum — aynı yazımda önceki ikisinden türetilir), created_at/updated_at,
+resource_id/thread_id (kimin koşusu, hangi konuşmada)`. 0.10'a kadar durum dört bayrak kolonuydu;
+eski bir depoyu `gnl upgrade` taşır (`run-status` adımı). *Neden var?* Studio'nun
 "Koşular" listesi için: 10.000 koşuyu listelemek için milyonlarca defter satırını taramak yerine
 koşu başına 1 özet satır okunur. Her defter yazımında otomatik güncellenir (türetilmiş veridir —
 bozulsa bile defterden yeniden hesaplanabilir).
@@ -1070,8 +1074,8 @@ bozmadan verir — eski dönem, silinene KADAR tam kanıt olarak durur.
 | Koşuların toplamı | Koşu sayısıyla doğrusal | `sweepRuns` (cron'da) + `purgeRun` (GDPR) |
 | Kuyruk/olay kayıtları (`gnl_work_log`) | Olay başına 1 kayıt | **Framework'te hiçbir şey** — `WorkStore` arayüzünde silme operasyonu yok. Süpürge değil tavan: `emit(..., { maxDepth })`; satırları geri kazanmak elle `DELETE` (§5.3 ⑧) |
 | Journal durable-log namespace'leri (denetim defteri, …) | Ekleme başına 1 kayıt | `sweepLog(journal, ns, …)` |
-| Konuşma geçmişleri, journal BasicMemory (`mem:<threadId>:*`) | Mesajlar thread başına tek journal kaydının içinde birikir | `sweepThreads` + `purgeThread` |
-| Konuşma geçmişleri, `@gnldev/memory` (`gnl_threads`/`gnl_messages`) | Mesaj başına 1 satır | Bambaşka bir depo — `AgentMemory.deleteThread`; `sweepThreads` oraya ULAŞMAZ |
+| Konuşma geçmişleri, journal BasicMemory (`mem:<threadId>:*`) | Mesajlar thread başına tek journal kaydının içinde birikir | `sweepThreads` + `purgeThread` (thread run'larıyla gider; run'ı hâlâ çalışan thread bir sonraki tura kalır) |
+| Konuşma geçmişleri, `@gnldev/memory` (`gnl_threads`/`gnl_messages`) | Mesaj başına 1 satır | Bambaşka bir depo — `AgentMemory.deleteThread` (thread, run'larıyla); `sweepThreads` oraya ULAŞMAZ |
 | Resume okuma maliyeti | Koşu adımıyla doğrusal ama TEK sorguda | replay-cache (§11.2); sık-resume + dev koşuda → rollover |
 
 ---

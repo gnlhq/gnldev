@@ -92,8 +92,10 @@ describe('ONE start point: nothing outside it writes a run\'s owner record', () 
   // A new birth added with its own `put(<runId>:input)` would bypass the stamp, the ownerless marker
   // and the first-write-wins claim — the three things this decision is about. The two writers below
   // freeze CONTENT over a record that claimRunOwner already wrote (the frozen agent input; a fork's
-  // copy of its source's input), with the same owner fields.
-  const ALLOWED = new Set(['durable/src/run-identity.ts', 'durable/src/run.ts', 'durable/src/time-travel.ts']);
+  // copy of its source's input), with the same owner fields. `testing.ts` is no birth: the conformance
+  // scenarios write `:input` records as fixtures (as the engine, an older version and a foreign writer
+  // leave them) into a journal under test, and nothing in the engine imports it.
+  const ALLOWED = new Set(['durable/src/run-identity.ts', 'durable/src/run.ts', 'durable/src/time-travel.ts', 'durable/src/testing.ts']);
   const root = join(__dirname, '..', '..');
   const INPUT_KEY = /runKeys\.input\(|:input`/;
 

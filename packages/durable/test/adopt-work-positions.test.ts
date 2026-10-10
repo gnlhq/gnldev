@@ -68,7 +68,10 @@ describe.each(STORES)('adoptIntoOrg and read positions — %s', (_name, make) =>
     const pendRan = [...Array(10).keys()].filter((i) => ran.has(`pend${i}`) && !before.has(`pend${i}`));
     expect(pendRan).toHaveLength(10);
     expect(ran.size).toBe(130); // and nothing ran twice into a missing key either
-  });
+    // 130 jobs, each a run's journal writes: on pg-mem 5.3 s alone, and measured 26.1 s (19b94c3f) / 27.1 s
+    // (with the run-status columns, whose upsert carries a CASE) with the durable suite running in parallel
+    // — the default 30 s left no room once the whole repository ran beside it.
+  }, 60_000);
 
   it('SIBLING — a FIRST adoption after an erasure in the root: the renumbered pending jobs are not behind the carried cursor', async () => {
     const s = await make();

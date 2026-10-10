@@ -130,8 +130,11 @@ export function withSubjectJournal<J extends Journal & Partial<JournalReader>>(j
           return { ...page, items: page.items.filter(visible) };
         }
       : undefined,
-    // A count across every owner is exactly what this view withholds.
+    // A count across every owner is exactly what this view withholds — and so is a feed of every
+    // owner's changed runs.
     countRunsByStatus: undefined,
+    countRuns: undefined,
+    listRunsChangedSince: undefined,
   }) as J & SubjectViewBrand;
 }
 

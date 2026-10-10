@@ -7,7 +7,7 @@
  * thread deletion remove them either way — `legacyWorkingMemoryScope` in @gnldev/durable.)
  */
 import {
-  legacyWorkingMemoryScope, workingMemoryScope, findReservedRootThreads, isOrganizationKey, purgeThread, copyThreadOwnership,
+  legacyWorkingMemoryScope, workingMemoryScope, findReservedRootThreads, isOrganizationKey, purgeThreadState, copyThreadOwnership,
   toJournal, orgStorageScopeOf, type MemoryStore, type MessageAppend, type MessageRecord, type Storage,
 } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -159,7 +159,9 @@ export async function migrateReservedRootThreads(storage: Storage, opts: Migrate
     if (opts.dryRun) continue;
     await moveThread(store, t.id, to);
     await copyThreadOwnership(runs, t.id, to);
-    if (typeof runs.deletePrefix === 'function') await purgeThread(runs, t.id);
+    // The old id's state and records go; its runs stay, still naming the id they ran under — a move
+    // is not a delete (`purgeThread` would take them).
+    if (typeof runs.deletePrefix === 'function') await purgeThreadState(runs, t.id);
   }
   return report;
 }

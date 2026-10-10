@@ -245,7 +245,11 @@ NOTHING` ("insert if not exists" — if two servers write the same key, the engi
 one = CAS).
 
 **② `gnl_runs` — the run listing.** Columns: `run_id, model_steps (how many LLM steps),
-tool_calls (how many tools), suspended (is it pending), created_at/updated_at`. *Why does it
+tool_calls (how many tools), suspended_count (tool calls waiting for a human), outcome (how the run
+ended, when it did not complete: running / failed / canceled), status (what every listing, count and
+filter reads — derived from the two before it in the same write), created_at/updated_at,
+resource_id/thread_id (whose run, on which conversation)`. Up to 0.10 the status was four flag
+columns; `gnl upgrade` moves an older store over (its `run-status` step). *Why does it
 exist?* For Studio's "Runs" list: instead of scanning millions of journal rows to list 10,000
 runs, one summary row per run is read. Automatically updated on every journal write (it's derived
 data — even if it gets corrupted, it can be recomputed from the journal).
@@ -1032,8 +1036,8 @@ these three guarantees — the old period stands as full proof until it's actual
 | Total across runs | Linear with run count | `sweepRuns` (via cron) + `purgeRun` (GDPR) |
 | Queue/event records (`gnl_work_log`) | 1 record per event | **Nothing in the framework** — the `WorkStore` interface has no delete operation. A ceiling, not a broom: `emit(..., { maxDepth })`; reclaiming rows is a manual `DELETE` (§5.3 ⑧) |
 | Journal durable-log namespaces (audit log, …) | 1 record per append | `sweepLog(journal, ns, …)` |
-| Conversation histories, journal BasicMemory (`mem:<threadId>:*`) | Messages accumulate inside a single journal record per thread | `sweepThreads` + `purgeThread` |
-| Conversation histories, `@gnldev/memory` (`gnl_threads`/`gnl_messages`) | 1 row per message | A different store — `AgentMemory.deleteThread`; `sweepThreads` does NOT reach it |
+| Conversation histories, journal BasicMemory (`mem:<threadId>:*`) | Messages accumulate inside a single journal record per thread | `sweepThreads` + `purgeThread` (a thread goes with its runs; one with a run in flight is kept for the next round) |
+| Conversation histories, `@gnldev/memory` (`gnl_threads`/`gnl_messages`) | 1 row per message | A different store — `AgentMemory.deleteThread` (the thread with its runs); `sweepThreads` does NOT reach it |
 | Resume read cost | Linear with run steps, but in a SINGLE query | replay-cache (§11.2); frequent-resume + huge-run → rollover |
 
 ---

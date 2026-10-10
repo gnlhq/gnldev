@@ -2,12 +2,12 @@
 // journal's append-only philosophy — only for legal deletion (PII purge) and retention sweeps.
 // Requires the `deletePrefix` port (InMemory/Sqlite/Postgres adapters provide it); otherwise
 // throws a clear error.
-import { runKeys, summarizeRun, nestedAgentRunId, runIdOfKey, executedHere, listRunsWhere } from './journal.js';
+import { runKeys, summarizeRun, runIdOfKey, listRunsWhere } from './journal.js';
 import { identityOnlyInput } from './run.js';
 import { workKeyHash } from './hash.js';
-import { MEM_LEAVES, OM_LEAVES, memKey, readJournalLogDated, semanticLogKey, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX } from './memory.js';
+import { memKey, readJournalLogDated, semanticLogKey, SEMANTIC_LOG_PREFIX } from './memory.js';
 import type { Memory } from './memory.js';
-import { threadOwnerOf, threadOwnerKey, threadSeenKey } from './thread-owner.js';
+import { threadOwnerOf } from './thread-owner.js';
 import type { WorkScopeKind } from './hash.js';
 import type { Journal, JournalReader } from './journal.js';
 
@@ -15,23 +15,22 @@ import type { Journal, JournalReader } from './journal.js';
 type FrozenInputLike = { at?: number } & Record<string, unknown>;
 import type { WorkStore, VectorStore } from './storage.js';
 import { VECTOR_ALL_PARTITIONS, assertRootOutsideOrganizations, portOf } from './storage.js';
-import { getRunCost } from './cost.js';
-import { metricsRunKey, metricsDoneKey, metricsScoresDoneKey } from './metrics.js';
-import { USAGE_KEY, usageCountedKey } from './budget.js';
-import type { OrganizationUsage } from './budget.js';
 import type { LogItem } from './durable-log.js';
 import { createPollLoop } from './polling.js';
 import { orgPrefix, isOrganizationKey } from './organization.js';
 import type { PollLoop } from './polling.js';
 import { refuseUnknownNames } from '@gnldev/options';
-import { LOG_SWEEP_TARGET_NAMES, PURGE_RESOURCE_NAMES, PURGE_RUN_NAMES, RETENTION_SWEEPER_NAMES, SWEEP_LOG_NAMES, SWEEP_RUNS_NAMES, SWEEP_THREADS_NAMES } from './option-names.js';
+import { LOG_SWEEP_TARGET_NAMES, PURGE_RESOURCE_NAMES, PURGE_RUN_NAMES, PURGE_THREAD_NAMES, RETENTION_SWEEPER_NAMES, SWEEP_LOG_NAMES, SWEEP_RUNS_NAMES, SWEEP_THREADS_NAMES } from './option-names.js';
+// What a run, a thread and a person own, and the one executor that deletes by it (model.ts). The
+// journal primitives (exact and neighbour-safe deletes, the thread-key readers) live there with it.
+import {
+  requireDelete, deleteExactKey, escOwnerPart, ownershipTraceKey, planRun, planThread, executePlan, PERSON_FAMILIES,
+  MEM_PREFIX, XTHR_PREFIX, threadIdOfMemKey, threadIdOfXthrKey, threadIdOfSemKey,
+} from './model.js';
+import type { MemoryStore } from './storage.js';
+import { ThreadRunsInFlightError } from './errors.js';
+export { ownershipTraceKey };
 
-function requireDelete(journal: Journal): NonNullable<Journal['deletePrefix']> {
-  if (typeof journal.deletePrefix !== 'function') {
-    throw new Error("@gnldev/durable: journal must support 'deletePrefix' for purge (InMemory/Sqlite/Postgres provide it)");
-  }
-  return journal.deletePrefix.bind(journal);
-}
 
 function requireListKeys(journal: Journal): NonNullable<Journal['listKeys']> {
   if (typeof journal.listKeys !== 'function') {
@@ -40,156 +39,6 @@ function requireListKeys(journal: Journal): NonNullable<Journal['listKeys']> {
   return journal.listKeys.bind(journal);
 }
 
-/**
- * The workflow run-registry key, derived exactly the way @gnldev/workflow's `statusKey` WRITES it
- * (`wfrun:<runId>`). Mirrored rather than imported: this package stays structurally decoupled from
- * @gnldev/workflow (see registry.ts's WorkflowLike JSDoc), and the same mirroring already happens in
- * registry.ts's FLOW-08 comment and its tests. The record is deliberately NOT under `<runId>:` — a
- * top-level key so ONE prefix scan enumerates every workflow run — which is precisely why the
- * `${runId}:` deletes in purgeRun never reached it.
- */
-const workflowStatusKey = (runId: string) => `wfrun:${runId}`;
-
-/**
- * Deletes ONE key on a port that only offers PREFIX deletion. `wfrun:<runId>` ends where the runId
- * ends, so `deletePrefix('wfrun:r-1')` also takes `wfrun:r-10` — a DIFFERENT run's record, and that
- * boundary is the property purge.test.ts exists to protect. Extension neighbors are therefore read
- * back and rewritten around the delete. The rewrite is sound because the value is the one just read
- * and the record is an advisory mirror (@gnldev/workflow's `putStatus` is best-effort; the
- * WorkflowResult return value is the source of truth) — a status transition landing inside the window
- * loses one advisory update, which the run's next transition overwrites.
- *
- * Without listKeys the neighbors cannot be seen at all, so the delete is attempted only when the EXACT
- * record exists: a purge can then never turn a runId that owns no record into a prefix sweep of other
- * runs' records. The remaining case (the record exists AND a longer runId extends it on a journal with
- * no listKeys) is stated, not hidden — every adapter shipped here provides listKeys.
- */
-async function deleteExactKey(journal: Journal, key: string): Promise<number> {
-  const del = requireDelete(journal);
-  if ((await journal.get(key)) === undefined) return 0;
-  const lk = journal.listKeys;
-  if (typeof lk !== 'function') return del(key);
-  const neighbors: Array<[string, unknown]> = [];
-  for (const k of await lk.call(journal, key)) {
-    if (k === key) continue;
-    neighbors.push([k, await journal.get(k)]);
-  }
-  // CRASH WINDOW, stated: between this delete (which takes the neighbours too — delete is a prefix
-  // operation) and the re-puts below, a process death loses the neighbours' records with no trace.
-  // Accepted for now because the window is a handful of point-writes inside a rare, deliberate
-  // operation; closing it for real needs a `deleteExact` port on the adapters (backlog).
-  const deleted = await del(key);
-  for (const [k, value] of neighbors) {
-    if (value !== undefined) await journal.put(k, value);
-  }
-  return Math.max(0, deleted - neighbors.length);
-}
-
-/**
- * Deletes everything under `${runId}:` WITHOUT taking a run whose id extends this one.
- *
- * `${runId}:` looks like a safe prefix because it carries the separator — and against `r-1` vs `r-10`
- * it is (purge.test.ts pins that). The case it does not cover is the one where the neighbour's id
- * IS this id plus more: run `conv` and run `conv:msg1` are two ordinary runs, and every key of the
- * second lives under the prefix of the first. MEASURED on InMemoryJournal and SqliteStorage:
- * `purgeRun('conv')` removed `conv:msg1`'s model record, its tool record, its frozen input and its
- * frozen model choice. That pair is not contrived — @gnldev/chat-adapter DERIVES its per-turn runId as
- * `${conversationId}:${messageId}`, so any host that also runs something under the bare conversation
- * id has it.
- *
- * The fix uses the journal's own answer to "whose key is this": `runIdOfKey` (journal.ts), which is
- * already `_v`-corroborated and already the function the run index trusts. A key under our prefix
- * whose owner is a LONGER runId that starts with our prefix belongs to a neighbour; everything that
- * neighbour owns is then left alone wholesale, not just the three families runIdOfKey can name.
- *
- * TWO honest bounds, both deliberate:
- *  • Without `listKeys` there is nothing to filter on, so the single prefix delete stands — today's
- *    behaviour, stated rather than silently degraded. Every adapter shipped here provides listKeys.
- *  • With listKeys and NO neighbour found — the overwhelmingly common case — this is the old single
- *    `deletePrefix` call plus one key listing and a point-read per `:input` key (the only family
- *    whose owner needs the value; `:model:`/`:tool:` decide from the key text alone). The per-key
- *    delete path only runs when a neighbour actually exists; purge is a rare, deliberate operation
- *    (GDPR erasure / retention sweep), never a request path.
- */
-async function purgeOwnNamespace(journal: Journal & Partial<JournalReader>, runId: string): Promise<number> {
-  const del = requireDelete(journal);
-  const prefix = `${runId}:`;
-  const lk = journal.listKeys;
-  if (typeof lk !== 'function') return del(prefix);
-  const keys = await lk.call(journal, prefix);
-  const neighbours = new Set<string>();
-  for (const k of keys) {
-    // runIdOfKey reads the value only for `:input` keys — a point-read on every key here turned a
-    // nightly sweep over a large namespace into O(keys) round-trips for values it never looked at.
-    const owner = runIdOfKey(k, k.endsWith(':input') ? await journal.get(k) : undefined);
-    if (owner && owner !== runId && owner.startsWith(prefix)) neighbours.add(owner);
-  }
-  if (neighbours.size === 0) return del(prefix);
-  let total = 0;
-  for (const k of keys) {
-    let foreign = false;
-    for (const n of neighbours) if (k === n || k.startsWith(`${n}:`)) { foreign = true; break; }
-    if (foreign) continue;
-    // deleteExactKey rather than del(k): a key is a prefix too, and one of OUR keys can be a proper
-    // prefix of a neighbour's id (`conv:ms` against `conv:msg1`). The same boundary, one level down.
-    total += await deleteExactKey(journal, k);
-  }
-  return total;
-}
-
-/**
- * Does a DERIVED child runId actually have a trace? Keys first, because listKeys sees a workflow
- * child's `<runId>:wf:<step>` records and readRun cannot (they are not `:model:`/`:tool:` entries, so
- * parseJournalKey is blind to them by design). The run-registry record is the last probe: a workflow
- * whose steps all live behind a suspend, or one built with no steps at all, has written nothing else.
- */
-async function hasTrace(journal: Journal & Partial<JournalReader>, runId: string): Promise<boolean> {
-  const lk = journal.listKeys;
-  const rr = journal.readRun;
-  if (typeof lk === 'function') {
-    if ((await lk.call(journal, `${runId}:`)).length > 0) return true;
-  } else if (typeof rr === 'function' && (await rr.call(journal, runId)).length > 0) {
-    return true;
-  }
-  return (await journal.get(workflowStatusKey(runId))) !== undefined;
-}
-
-/**
- * 1.1: BEFORE the run is deleted, SUBTRACT any cost that may have been added to the counter (H4:
- * otherwise `__usage__` goes stale after purge — the deleted run's cost keeps being counted as a
- * ghost). Only subtracted if the `usage-counted` marker EXISTS (i.e. it was actually added to the
- * counter) — this avoids mistakenly pushing a never-counted run (e.g. still suspended) into the
- * negative. Best-effort: silently skipped if the journal read surface isn't supported (the purge
- * itself still runs).
- */
-async function uncountUsage(journal: Journal & Partial<JournalReader>, runId: string): Promise<void> {
-  if (typeof journal.get !== 'function' || typeof journal.put !== 'function' || typeof journal.readRun !== 'function') return;
-  const marker = usageCountedKey(runId);
-  if ((await journal.get(marker)) === undefined) return; // never counted → nothing to subtract
-  // H8a fix: usage can live in the legacy USAGE_KEY OR in atomic counters — the old guard, which
-  // only looked at legacy, silently skipped the subtraction in the counter-only case (caught by a test).
-  const current = await journal.get<OrganizationUsage>(USAGE_KEY);
-  const counters =
-    typeof (journal as Journal).getCounters === 'function'
-      ? await (journal as Journal).getCounters!(USAGE_KEY)
-      : undefined;
-  if (!current && !counters) return; // no counter at all → nothing to subtract
-  const cost = await getRunCost(journal as unknown as JournalReader, runId);
-  // H8a: if incrBy exists, subtract ATOMICALLY with a negative delta (reads are clamped to 0 on
-  // the readUsageCounter side); otherwise legacy get→put + clamp (single-process safe).
-  if (typeof (journal as Journal).incrBy === 'function') {
-    try {
-      await (journal as Journal).incrBy!(USAGE_KEY, { runs: -1, tokens: -cost.totalTokens, costUsd: -cost.costUsd });
-      return;
-    } catch { /* fall back to legacy */ }
-  }
-  if (!current) return; // no legacy record → no legacy subtraction either
-  await journal.put(USAGE_KEY, {
-    runs: Math.max(0, current.runs - 1),
-    tokens: Math.max(0, current.tokens - cost.totalTokens),
-    costUsd: Math.max(0, current.costUsd - cost.costUsd),
-  });
-}
 
 /**
  * Permanently delete ALL traces of a run: `<runId>:*` (model/tool/input/wf/proc/cfg/net) + memory
@@ -219,17 +68,6 @@ async function uncountUsage(journal: Journal & Partial<JournalReader>, runId: st
  * one without, the `${runId}:` prefix delete still takes it, which is the bound stated rather than
  * assumed away. Every adapter shipped here has listKeys.
  */
-/**
- * `resthr:<resourceId>:<threadId>` — who a thread belonged to, kept AFTER the run that said so.
- *
- * The resourceId part is ESCAPED (`%` and `:`), because both halves may contain ':' and the key has
- * to say where one ends. Unescaped, `resthr:bob:evil:th1` read as bob's trace of thread `evil:th1`,
- * and erasing `bob` deleted `bob:evil`'s trace. An id with neither character is written byte for byte
- * as before.
- */
-const escOwnerPart = (v: string) => v.replace(/%/g, '%25').replace(/:/g, '%3A');
-export const ownershipTraceKey = (resourceId: string, threadId: string): string =>
-  `resthr:${escOwnerPart(resourceId)}:${threadId}`;
 
 /**
  * Whether erasing `resourceId` should take `threadId` with it. Only their own threads: a run of theirs
@@ -280,88 +118,12 @@ export async function purgeRun(
   } = {},
 ): Promise<number> {
   refuseUnknownNames('purgeRun', opts, PURGE_RUN_NAMES);
-  const del = requireDelete(journal);
-  if (seen.has(runId)) return 0; // cycle/repeat safety
-  seen.add(runId);
-  if (opts.ownershipTrace) {
-    // BEFORE the delete: `<runId>:input` is one of the keys this function is about to remove.
-    const input = await journal.get<{ resourceId?: string; threadId?: string }>(runKeys.input(runId))
-      .catch(() => undefined);
-    if (input?.resourceId && input.threadId) {
-      await journal.put(ownershipTraceKey(input.resourceId, input.threadId), { at: Date.now() })
-        .catch(() => {});  // best-effort: a trace that cannot be written must not block the sweep
-    }
-  }
-  await uncountUsage(journal, runId); // BEFORE deletion (so getRunCost can still read it)
-  let total = 0;
-
-  // Child discovery BEFORE deletion (readRun/listKeys go empty once deleted).
-  const rr = journal.readRun;
-  const lk = journal.listKeys;
-  if (typeof rr === 'function') {
-    for (const e of await rr.call(journal, runId)) {
-      if (e.kind !== 'tool') continue;
-      // A request-window record this run EXECUTED (journal.ts ranBy) holds this run's output under the
-      // request's family: erasing the run erases it (measured: purging a sub-agent left its output, a
-      // person's data, behind). A record another run executed is that run's; cross-run and thread
-      // records are shared by design and have their own erasure (deletePrefix / purgeThread).
-      const v = e.value as { mirrorOf?: string; ranBy?: { runId: string; toolCallId: string } } | undefined;
-      if (executedHere(v, runId, e.key.slice(e.key.lastIndexOf(':tool:') + ':tool:'.length))) {
-        total += await deleteExactKey(journal, v!.mirrorOf!);
-      }
-      const tcid = e.key.slice(e.key.lastIndexOf(':tool:') + ':tool:'.length);
-      // Both KINDS of nested run (sub-agent and workflow-as-tool) in both SHAPES: the parent-scoped id
-      // they use now, and the bare legacy one still in journals written before it was scoped — a purge
-      // that misses any of them leaves orphaned PII.
-      for (const child of new Set([
-        nestedAgentRunId(runId, tcid),
-        `agent:${tcid}`,
-        nestedAgentRunId(runId, tcid, 'wf'),
-        `wf:${tcid}`,
-      ])) {
-        if (await hasTrace(journal, child)) total += await purgeRun(journal, child, seen);
-      }
-    }
-  }
-  if (typeof lk === 'function') {
-    const kids = new Set<string>();
-    for (const k of await lk.call(journal, `net:${runId}:`)) {
-      const restStr = k.slice(`net:${runId}:`.length);
-      const cut = restStr.indexOf(':');
-      if (cut > 0) kids.add(`net:${runId}:${restStr.slice(0, cut)}`);
-    }
-    for (const kid of kids) total += await purgeRun(journal, kid, seen);
-  }
-
-  total += await purgeOwnNamespace(journal, runId);
-  // The request's own window (`xreq:<runId>:args-…`), when this run started one: every record its tree
-  // deduped against. `args-` closes the prefix — run 'a' must not reach run 'a:b''s request.
-  total += await del(runKeys.toolRequestPrefix(runId));
-  // MEASURED, on both InMemoryJournal and SqliteStorage: `del('mem-appended:r-1')` also removed
-  // `mem-appended:r-10`. These two keys are the one family here that ends where the runId ends —
-  // every other delete in this function carries a trailing ':' and therefore cannot run past its own
-  // run. "Full key = its own prefix" was true and beside the point; a prefix that is a PROPER prefix
-  // of the neighbour's key is exactly the wfrun: boundary deleteExactKey was written for, and it was
-  // never applied to the two keys sitting right next to it.
-  total += await deleteExactKey(journal, runKeys.memAppended(runId));
-  total += await deleteExactKey(journal, runKeys.memUserAppended(runId)); // write-ahead marker — same lifecycle
-  total += await del(`net:${runId}:`); // blanket cascade for journals without listKeys (direct level)
-  total += await deleteExactKey(journal, workflowStatusKey(runId)); // top-level, so the prefixes above miss it
-  // The per-run metrics rows are top-level too, and their keys carry the runId — which for an owned
-  // job or trigger run is its owner's name (`job:~o~acme:ayse:…`). The aggregate counters stay.
-  for (const k of [metricsRunKey(runId), metricsDoneKey(runId), metricsScoresDoneKey(runId)]) total += await deleteExactKey(journal, k);
-  return total;
+  requireDelete(journal);
+  // The run and every run under it, children first (model.ts): the plan is read off the run's own
+  // records before anything goes, then executed in that order.
+  return executePlan({ journal }, await planRun(journal, runId, seen), opts.ownershipTrace ? { ownershipTrace: runId } : {});
 }
 
-/** Permanently delete a thread's BasicMemory trace (`mem:<threadId>:*`). Rich memory stores use their
- *  Own deletion API (AgentMemory.deleteThread) — this helper is for journal-based memory.
- *
- *  HERMES CAVEAT (honest-inventory line, denetçi K12): `sugg:`/`lesson:` records are NOT swept here —
- *  they are owned by the RESOURCE (user), not the thread. But a suggestion's evidence entries carry
- *  `threadId` (and `runId`) as provenance fields, and those entries survive both this sweep and
- *  purgeRun. A deployment erasing a person should purge their suggestion surface too:
- *  `deletePrefix('sugg:')` filtered by resourceId is not expressible — sweep
- *  `lesson:res:<resourceId>:` directly and delete their `sugg:` records via the suggestions API/list. */
 /**
  * KİŞİ-bazlı silme yüzeyi (GDPR/KVKK md.17): bir resource'un (kullanıcının) kalıcı kimlik ailelerini
  * süpürür — `xid:res:<rid>:` (kanallar-arası iş kimlikleri: düz-metin kimlik + tutar + ilk-koşum
@@ -401,9 +163,11 @@ export async function purgeBatch(journal: Journal, batchId: string): Promise<num
  */
 async function purgePersonFamilies(journal: Journal, resourceId: string): Promise<number> {
   const del = requireDelete(journal);
-  const xidPre = `xid:res:${resourceId}:`;
-  const lessonPre = `lesson:res:${resourceId}:`;
-  const statsPre = `suggstats:lesson:res:${resourceId}:`;
+  // The families are the model's (`PERSON_FAMILIES`, model.ts); what follows the id tells each one's own keys apart.
+  const [xidFamily, lessonFamily, statsFamily] = PERSON_FAMILIES;
+  const xidPre = `${xidFamily}${resourceId}:`;
+  const lessonPre = `${lessonFamily}${resourceId}:`;
+  const statsPre = `${statsFamily}${resourceId}:`;
   const lk = journal.listKeys;
   if (typeof lk !== 'function') return (await del(xidPre)) + (await del(lessonPre)) + (await del(statsPre));
   const own: string[] = [];
@@ -525,19 +289,18 @@ export async function purgeResource(
   const listed = await listRunsWhere(journal, { resourceId });
   if (listed === undefined) return total;
   const threads = new Set<string>();
-  const runIds: string[] = [];
+  const runs: Array<{ runId: string; threadId?: string }> = [];
   for (const r of listed) {
     if (opts.outsideOrganizations && isOrganizationKey(r.runId)) continue;
     if (r.threadId) threads.add(r.threadId);
-    runIds.push(r.runId);
+    runs.push(r);
   }
   // WHOSE THREADS. A run of this person's on a thread does not make the thread theirs: an older
   // release let a user attach a run to someone else's thread, and this function then deleted her
-  // messages with his account. Asked BEFORE the runs go, because a thread opened before owner records
-  // existed is still answered from its runs.
+  // messages with his account. Asked BEFORE anything goes, because a thread opened before owner
+  // records existed is still answered from its runs.
   const owned = new Set<string>();
   for (const t of threads) if (await threadIsTheirs(journal, t, resourceId, opts.memory)) owned.add(t);
-  for (const id of runIds) total += await purgeRun(journal, id);
   // THE THREADS WHOSE RUNS ARE ALREADY GONE. Everything above reaches a thread through a run, so a
   // retention sweep that ran first has already taken the only link — and the erasure request would
   // walk an empty list past `xthr:<threadId>:` records built from this person's own arguments.
@@ -559,112 +322,65 @@ export async function purgeResource(
       if (t && (await threadIsTheirs(journal, t, resourceId, opts.memory))) owned.add(t);
     }
   }
-  // Thread-scoped state of the threads that are theirs (memory, thread dedup window, semantic tombstones).
-  for (const t of owned) total += await purgeThread(journal, t);
+  // Their threads, each deleted as a thread is (model.ts): its runs — theirs, and any other run on it —
+  // its journal state, its owner record last. Not refused for a run in flight: an erasure takes what is
+  // there (see `subjectRuns` for the order that stops a turn writing after it).
+  for (const t of owned) total += await purgeThread(journal, t, { allowInFlight: true });
+  // Then their runs on no thread of theirs: on no thread at all, or on someone else's.
+  for (const r of runs) if (!(r.threadId && owned.has(r.threadId))) total += await purgeRun(journal, r.runId);
   // The trace names a person and must not outlive them. Last, so a failure above cannot strand it.
   total += await del(`${ownershipTraceKey(resourceId, '')}`);
   return total;
 }
 
+
 /**
- * Everything under `<prefix><threadId>:` that belongs to THIS thread — and nothing belonging to a
- * thread whose id merely EXTENDS it.
+ * Permanently delete a thread — WITH ITS RUNS (0.x, breaking) — and everything it owns
+ * (`THREAD_DEPENDENTS`, model.ts): every run whose `:input` names it (a sub-agent, a fork, a rollover
+ * on it included) with their children, its journal state (`mem:`, `xthr:`, `om:`, `sem:`), the
+ * ownership traces pointing at it, and — when they are handed in — its observation vectors and its
+ * memory-store half. The owner record goes last, so a deletion killed half-way leaves the thread gated.
  *
- * `mem:tenant:7:` is not a boundary. 'tenant:7' and 'tenant:7:chat' are two legitimate threads —
- * memory.ts keeps ':' legal on purpose and a test pins it — and every key of the second sits under
- * the prefix of the first. Measured before this existed: purging 'tenant:7' took all six keys, the
- * neighbour's three among them, and the report named only 'tenant:7'.
+ * The journal alone is the whole thread for a journal-kept memory (`BasicMemory`, `SemanticMemory`).
+ * A memory-store thread (`@gnldev/memory`'s `AgentMemory`) passes its store as `memory` — or calls
+ * `AgentMemory.deleteThread`, which does — so one call removes both halves. Before 0.11 this function
+ * took the journal half and nothing else, and `MemoryStore.deleteThread` the other half and nothing
+ * else; neither took the runs (raporlar/…/cplus-c/h5-before-analysis.txt).
  *
- * The same shape `purgeOwnNamespace` uses for runs, with the owner rule passed in, because the
- * recovery differs per namespace: a `mem:` key ends in a known LEAF, an `xthr:` key carries a known
- * FAMILY. Both are known-boundary matches rather than a split on ':' — the rule this file's own
- * `resthr:` block already states two blocks below, and the one the raw prefix delete above it
- * skipped.
+ * REFUSES, deleting nothing, while a run on the thread is in flight (`threadRunsInFlight`): pulling its
+ * records out from under it would let it write its answer into a deleted thread, and let a step whose
+ * claim was deleted run its effect again. Cancel it (`cancelAgentRun`) and delete, or pass
+ * `allowInFlight: true` for a run you know is abandoned (its worker died).
  *
- * TWO bounds, the same two purgeOwnNamespace states:
- *  • No `listKeys` → nothing to filter on, so the single prefix delete stands. Stated, not hidden.
- *  • No neighbour found (the overwhelmingly common case) → one `deletePrefix`, today's cost, plus
- *    one listing. The per-key path runs only when a descendant thread actually exists.
+ * Not swept here, by design: a person's `sugg:`/`lesson:` records (`eraseSubject` erases them), and
+ * cross-run claims (`xrun:`), which are shared by every run that dedups against them.
  */
-async function purgeThreadNamespace(
+export async function purgeThread(
   journal: Journal,
-  prefix: string,
   threadId: string,
-  ownerOf: (key: string) => string | undefined,
+  opts: {
+    /** The memory store that holds the thread's record, messages, working memory and observations. */
+    memory?: Pick<MemoryStore, 'deleteThread'>;
+    /** The vector store holding its observation vectors (deleted by `{ source, threadId }`; add your scope in a wrapper). */
+    vectors?: Pick<VectorStore, 'delete'>;
+    /** Delete even when a run on the thread is in flight — for a run you know is abandoned. */
+    allowInFlight?: boolean;
+  } = {},
 ): Promise<number> {
-  const del = requireDelete(journal);
-  const scope = `${prefix}${threadId}:`;
-  const lk = journal.listKeys;
-  if (typeof lk !== 'function') return del(scope);
-
-  const keys = await lk.call(journal, scope);
-  const mine: string[] = [];
-  let foreign = false;
-  for (const k of keys) {
-    const owner = ownerOf(k);
-    if (owner === threadId) { mine.push(k); continue; }
-    if (owner !== undefined) { foreign = true; continue; } // a descendant thread's key
-    // Owner unknown — a leaf or family this build cannot name. ONE remaining segment can only be
-    // our own unrecognised leaf (`mem:tenant:7:summary`); one that still contains ':' is
-    // indistinguishable from a descendant's key, and guessing there is how a live thread dies.
-    if (k.slice(scope.length).includes(':')) foreign = true; else mine.push(k);
-  }
-  if (!foreign) return del(scope);
-
-  let total = 0;
-  // deleteExactKey rather than del(k): a key is a prefix too — `mem:t:messages` is a proper prefix
-  // of `mem:t:messagesX:working`, which belongs to thread 't:messagesX'. The same boundary, one
-  // level down; purgeOwnNamespace makes the identical call for the identical reason.
-  for (const k of mine) total += await deleteExactKey(journal, k);
-  return total;
+  refuseUnknownNames('purgeThread', opts, PURGE_THREAD_NAMES);
+  requireDelete(journal);
+  const target = { journal, ...(opts.memory ? { memory: opts.memory } : {}), ...(opts.vectors ? { vectors: opts.vectors } : {}) };
+  return executePlan(target, await planThread(target, threadId, { ...(opts.allowInFlight ? { allowInFlight: true } : {}) }));
 }
 
-export async function purgeThread(journal: Journal, threadId: string): Promise<number> {
-  const del = requireDelete(journal);
-  // FAZ-3: the thread owns its dedup state too — `idempotencyWindow: 'thread'` records and
-  // thread-scoped duplicate markers both live under `xthr:<threadId>:` PRECISELY so this one sweep
-  // reclaims them with the thread (the cross-run family's immortal-key problem does not recur here).
-  // `om:` is observational memory's: its counters and its memoized observer output, which is the
-  // model's summary of what the person said. Measured before it was here: after an erasure the thread
-  // was gone and `om:<thread>:proc:observe:0` still held that summary.
-  let total = (await purgeThreadNamespace(journal, MEM_PREFIX, threadId, threadIdOfMemKey))
-    + (await purgeThreadNamespace(journal, XTHR_PREFIX, threadId, threadIdOfXthrKey))
-    + (await purgeThreadNamespace(journal, OM_PREFIX, threadId, threadIdOfOmKey))
-    // SemanticMemory's log (@gnldev/rag) — the thread's messages, kept under their own prefix.
-    + (await purgeThreadNamespace(journal, SEMANTIC_LOG_PREFIX, threadId, threadIdOfSemKey));
-  // The owner record names a person, and with the thread gone it guards nothing.
-  if ((await journal.get(threadOwnerKey(threadId))) !== undefined) total += await del(threadOwnerKey(threadId));
-  if ((await journal.get(threadSeenKey(threadId))) !== undefined) total += await del(threadSeenKey(threadId));
-
-  // The ownership traces pointing HERE. Once this thread's state is gone they identify nothing —
-  // and they are not inert: `resthr:<resourceId>:<threadId>` names a person, so a dead pointer is a
-  // personal-data record kept for no reason, which is the shape retention exists to remove.
-  //
-  // Measured before this existed: after `purgeThread('th-1')` the thread held zero keys and its
-  // trace was still there. `sweepThreads` deletes through this function, so that made every
-  // age-swept thread leave one behind, accumulating with nothing to clear them — `purgeResource`
-  // was the only reader and it only fires when a person actually asks.
-  //
-  // Parsed rather than matched by suffix: a threadId can contain ':' ('tenant:7:chat'), so
-  // `endsWith(':th-1')` would also hit `resthr:p:other:th-1`, whose thread is `other:th-1` — a
-  // DIFFERENT thread, and deleting its trace would quietly re-open the gap for that person. The
-  // resourceId ends at the first ':' (the same boundary `purgeResource`'s prefix already assumes)
-  // and everything after it is the threadId, colons and all.
-  const lk = journal.listKeys;
-  if (typeof lk === 'function') {
-    const pre = ownershipTraceKey('', '').slice(0, -1); // 'resthr:'
-    // Same reasoning as the erasure path above: this function is called BY it, so a swallowed error
-    // here would resurface there as the same silent half-deletion.
-    for (const key of await lk.call(journal, pre)) {
-      const rest = key.slice(pre.length);
-      const cut = rest.indexOf(':');
-      if (cut < 0 || rest.slice(cut + 1) !== threadId) continue;
-      // deleteExactKey, not del: a key is a prefix too, and `resthr:p:th-1` would take
-      // `resthr:p:th-10` with it — another person's thread, erased by a name collision.
-      total += await deleteExactKey(journal, key);
-    }
-  }
-  return total;
+/**
+ * A thread's journal state and records WITHOUT its runs — the half of a thread MOVE that empties the old
+ * id (`migrateReservedRootThreads`): the runs keep naming the id they were run under.
+ * @internal — @gnldev/memory's migration.
+ */
+export async function purgeThreadState(journal: Journal, threadId: string): Promise<number> {
+  requireDelete(journal);
+  return executePlan({ journal }, await planThread({ journal }, threadId, { runs: false }));
 }
 
 /**
@@ -1090,54 +806,14 @@ export interface ThreadSweepResult {
   orphanThreadState: string[];
   /** `xthr:` keys whose family this build does not know — see OrphanThreadState.unrecognisedKeys. */
   unrecognisedXthrKeys?: string[];
+  /**
+   * Threads old enough to go, kept because a run on them is still in flight (`purgeThread` takes a
+   * thread's runs and refuses to pull one out from under itself). The next round takes them once the
+   * run ends — or cancel it (`cancelAgentRun`) if its worker is gone.
+   */
+  keptInFlight?: string[];
 }
 
-// BasicMemory's known key suffixes (memory.ts schema): `mem:<threadId>:messages|:working`.
-// threadId itself may contain ':' → the extraction is done via known-suffix matching, NOT split.
-//
-// DERIVED, not retyped. A second copy of this list drifts silently in the direction that is hardest
-// to notice: an unlisted leaf makes its thread invisible to `threadIdsFromMemory`, and a thread that
-// is not known is reported ORPHANED even though its memory is sitting right beside its dedup state.
-const MEM_PREFIX = 'mem:';
-const MEM_SUFFIXES = MEM_LEAVES.map((leaf) => `:${leaf}`);
-
-// The `xthr:<threadId>:<family>-…` families, listed so a threadId can be recovered from a key the
-// same way MEM_SUFFIXES recovers one from `mem:` — by matching a KNOWN boundary rather than
-// splitting on ':', because a threadId may contain ':' itself (memory.ts says so explicitly).
-// Ordered longest-first so ':semtomb-' is never mistaken for ':sem-' + 'tomb-'.
-const XTHR_PREFIX = 'xthr:';
-const XTHR_FAMILIES = [':semjudge-', ':semtomb-', ':sem-', ':dup-', ':args-'] as const;
-
-// `om:<threadId>:<leaf>` and `om:<threadId>:proc:<step>`. The step names (`observe:0`, `vec:0:1`)
-// never contain ':proc:', so the LAST ':proc:' is the boundary, whatever the thread id holds.
-const OM_PREFIX = 'om:';
-const OM_SUFFIXES = OM_LEAVES.map((leaf) => `:${leaf}`);
-
-/** threadId out of SemanticMemory's `sem:<threadId>:log` (`semanticLogKey`). */
-function threadIdOfSemKey(key: string): string | undefined {
-  const rest = key.slice(SEMANTIC_LOG_PREFIX.length);
-  return rest.endsWith(SEMANTIC_LOG_SUFFIX) && rest.length > SEMANTIC_LOG_SUFFIX.length ? rest.slice(0, -SEMANTIC_LOG_SUFFIX.length) : undefined;
-}
-
-function threadIdOfOmKey(key: string): string | undefined {
-  const rest = key.slice(OM_PREFIX.length);
-  for (const suffix of OM_SUFFIXES) if (rest.endsWith(suffix) && rest.length > suffix.length) return rest.slice(0, -suffix.length);
-  const cut = rest.lastIndexOf(':proc:');
-  return cut > 0 ? rest.slice(0, cut) : undefined;
-}
-
-/** threadId out of `xthr:<threadId>:<family>-…`, or undefined when no known family boundary is found. */
-function threadIdOfXthrKey(key: string): string | undefined {
-  const rest = key.slice(XTHR_PREFIX.length);
-  // LAST boundary wins: a threadId that itself contains ':dup-…' keeps its own text, and the family
-  // written by this runtime is always the final segment.
-  let cut = -1;
-  for (const fam of XTHR_FAMILIES) {
-    const i = rest.lastIndexOf(fam);
-    if (i > cut) cut = i;
-  }
-  return cut > 0 ? rest.slice(0, cut) : undefined;
-}
 
 /** Reads a timestamp from a message. HONEST NOTE: BasicMemory doesn't timestamp messages itself
  *  (AI SDK's ModelMessage has no ts field) — only common fields added by the caller are recognized
@@ -1158,15 +834,6 @@ function readMessageTs(msg: any): number | undefined {
 
 /** Thread ids the memory port knows about, off `mem:` keys. Shared so the read-only orphan listing
  *  and the sweep cannot drift into two different answers to "which threads exist". */
-/** threadId out of `mem:<threadId>:<leaf>` — the known-LEAF counterpart of threadIdOfXthrKey, and
- *  the answer purgeThreadNamespace needs to tell its own keys from a descendant thread's. */
-function threadIdOfMemKey(key: string): string | undefined {
-  const rest = key.slice(MEM_PREFIX.length);
-  for (const suffix of MEM_SUFFIXES) {
-    if (rest.endsWith(suffix) && rest.length > suffix.length) return rest.slice(0, -suffix.length);
-  }
-  return undefined;
-}
 
 async function threadIdsFromMemory(
   list: NonNullable<Journal['listKeys']>,
@@ -1301,7 +968,15 @@ export async function sweepThreads(journal: Journal, opts: ThreadSweepOptions): 
     }
     const lastActivity = Math.max(...stamps);
     if (now - lastActivity > opts.olderThanMs) {
-      await purgeThread(journal, threadId);
+      // A thread delete takes its runs (model.ts), so a thread with a run still executing is kept for a
+      // later round rather than pulled out from under it — named, not silently skipped.
+      try {
+        await purgeThread(journal, threadId);
+      } catch (e) {
+        if (!(e instanceof ThreadRunsInFlightError)) throw e;
+        (result.keptInFlight ??= []).push(threadId);
+        continue;
+      }
       result.purged.push(threadId);
     }
   }

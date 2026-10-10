@@ -761,26 +761,16 @@ describe('the ownership control — acme must SEE what globex must not', () => {
   /**
    * THE LIVE STREAM, controlled by whose write it reacted to.
    *
-   * Both routes here answer the same content-free frame to everybody — measured, not assumed:
-   * `event: change / data: runs`, the pre-API-04 fallback payload. The INFORMATIVE frame that names
-   * `runIds` (server.ts:2472) is unreachable for these callers, and deliberately: it fires only when
-   * `readCheapEventsSignal` returns a signal, that needs `countRunsByStatus`, and `withOrg` does NOT
-   * bridge `countRunsByStatus` (durable/organization.ts:294) because the engine's push-down has no
-   * per-organization filter. Under an org scope the bridge resolves to `undefined` and the handler
-   * takes the legacy branch. So no comparison of bodies can separate the owner from a stranger.
+   * Under an organization the stream reads the CHANGE FEED (`listRunsChangedSince`, which `withOrg`
+   * bridges with the organization's run id range), so its frame is the informative one — `{ runIds }`
+   * naming the runs that changed, ids as the organization sees them. Before the feed, these callers got
+   * the content-free legacy `data: runs` frame (`withOrg` does not bridge `countRunsByStatus`, so the
+   * cheap signal was unavailable), and no comparison of bodies could separate owner from stranger.
    *
-   * The instrumentation route does not work either, and this is the measurement that says so: the
-   * stream's only read is `reader.listRuns()`, and `withOrg`'s `listRuns` bridge calls the underlying
-   * `listRuns()` with NO argument and filters the RESULT by prefix in memory
-   * (durable/organization.ts:320-327). Recording the keys the journal was asked for therefore yields
-   * `listRuns(null)` for acme and `listRuns(null)` for globex — byte-identical. There is nothing
-   * org-shaped to record.
-   *
-   * What IS observable is the stream's REACTION. The org filter is applied to the run list the poll
-   * loop diffs, so a frame is written when — and only when — the CALLER'S OWN organization changes.
-   * That is an effect, it is asymmetric, and both halves are asserted: a stranger's write must leave
-   * the stream silent, and the caller's own write must move it (or the silence is a dead stream rather
-   * than isolation).
+   * Observed here: the stream's REACTION and, now, its WORDS. A stranger's write must leave the stream
+   * silent; the caller's own write must move it (or the silence is a dead stream rather than
+   * isolation) and must name the caller's run and no one else's. The feed's first read is a silent
+   * baseline, as the informative path's always was.
    */
   describe('a live stream follows only its own organization', () => {
     /** `EVENTS_POLL_MS` in server.ts — one tick of the poll loop. */
@@ -828,9 +818,8 @@ describe('the ownership control — acme must SEE what globex must not', () => {
       expect(res.status, `${what} did not open a stream at all`).toBe(200);
       const w = watchSse(res);
       try {
-        await w.until(1, 4 * POLL_MS);
-        expect(w.frames.length, `${what} never emitted its baseline frame — nothing below can mean anything`)
-          .toBeGreaterThan(0);
+        // The baseline read is silent; give it a tick and a half to have happened.
+        await new Promise((r) => setTimeout(r, 1.5 * POLL_MS));
         const baseline = w.frames.length;
 
         // ACME changes. A globex-scoped stream is not entitled to know.
@@ -846,6 +835,9 @@ describe('the ownership control — acme must SEE what globex must not', () => {
         expect(w.frames.length,
           `${what} never told globex about globex's own change — the isolation above is a stalled stream`)
           .toBeGreaterThan(baseline);
+        const said = w.frames.slice(baseline).join('');
+        expect(said, `${what} did not name globex's run`).toContain('"r-globex-late"');
+        expect(said, `${what} named an acme run to globex`).not.toContain('acme');
       } finally {
         await w.close();
       }

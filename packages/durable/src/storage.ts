@@ -52,6 +52,11 @@ export interface ListQuery {
    * page and desyncs `nextCursor`.
    */
   status?: RunStatus;
+  /**
+   * (RunJournal.listRuns only.) Any of these statuses — see `JournalReader.listRunsPaged`. The set of
+   * every status but 'completed' reads the `gnl_runs_open` partial index on Sqlite and Postgres.
+   */
+  statuses?: readonly RunStatus[];
   agent?: string;
   /**
    * WHOSE runs to return — matches `RunSummary.resourceId` exactly (same `:input`-derived field the
@@ -391,8 +396,13 @@ export interface MemoryStore {
    */
   listThreads(q: { resourceId?: string } & ListQuery & MemoryPartitionOption): Promise<Page<ThreadRecord>>;
   /**
-   * The thread, its messages, observations, batch markers and its thread-scoped working memory
+   * THIS STORE'S HALF of a thread delete: the thread (kept as a tombstone with no title or metadata),
+   * its messages, observations, batch markers and its thread-scoped working memory
    * (`workingMemoryScope.thread(id)`, and the 0.6 key `legacyWorkingMemoryScope.thread(id)` when there is one).
+   *
+   * Not a thread delete by itself: the thread's runs, its journal state, its observation vectors and
+   * its owner record live elsewhere. `purgeThread(journal, id, { memory: store })` (model.ts's plan, or
+   * `AgentMemory.deleteThread`) deletes all of it and calls this as one of its steps.
    */
   deleteThread(id: string): Promise<void>;
 
@@ -1265,7 +1275,7 @@ export function toJournal(source: RunJournal | Storage): Journal & JournalReader
   // P1.6b: applyBatch/getMany/countRunsByStatus forwarded the SAME way — SqliteRunJournal/PgRunJournal
   // expose them as EXTRA (non-RunJournal-interface) methods; without this they'd be
   // silently dropped here exactly like the other optional methods were before the bug fix above.
-  for (const m of ['deletePrefix', 'putIfMatch', 'now', 'incrBy', 'getCounters', 'listStaleRuns', 'readRunStats', 'applyBatch', 'getMany', 'countRunsByStatus', 'listOwnerRecords']) {
+  for (const m of ['deletePrefix', 'putIfMatch', 'now', 'incrBy', 'getCounters', 'listStaleRuns', 'readRunStats', 'applyBatch', 'getMany', 'countRunsByStatus', 'listOwnerRecords', 'countRuns', 'listRunsChangedSince']) {
     if (typeof anyRuns[m] === 'function') anyJ[m] = (...args: unknown[]) => (anyRuns[m] as (...a: unknown[]) => unknown).call(runs, ...args);
   }
   return j;

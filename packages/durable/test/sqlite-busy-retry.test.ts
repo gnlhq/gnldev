@@ -103,7 +103,7 @@ describe('SQLITE_BUSY: bounded retry (transient absorbed, permanent still throws
   it('transient BUSY on a statement INSIDE the transaction → only that statement re-runs (no double-count)', async () => {
     await withDb(async (path) => {
       const s = new SqliteStorage(path);
-      // touchRunDelta's counter upsert is the SECOND statement of the transaction: the journal row is
+      // the run row's upsert (writeRunRows) is the SECOND statement of the transaction: the journal row is
       // already written when it fails. Retrying the statement alone must not re-apply the first write.
       const f = injectFault(s, { match: /INSERT INTO gnl_runs/, times: 3, make: busyError });
       await s.runs.put('busy-run2:tool:call-1', { status: 'succeeded', output: 1 });

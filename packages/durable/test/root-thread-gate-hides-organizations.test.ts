@@ -56,12 +56,15 @@ interface Backend {
 const OLD = {
   sqliteJournal: `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at) VALUES (?, ?, ?, ?, ?, ?)
                   ON CONFLICT(key) DO UPDATE SET value = excluded.value, suspended = excluded.suspended`,
-  sqliteRun: `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at)
-              VALUES (?, 0, 0, 0, 0, ?, ?) ON CONFLICT(run_id) DO UPDATE SET updated_at = excluded.updated_at`,
+  // The run's row in this version's status columns: since the `run-status` step a 0.10 process cannot
+  // write here at all (run-status-columns.test.ts); these rows stand for what it wrote before the upgrade
+  // and for any writer that knows nothing of the relation columns (a restore, plain SQL).
+  sqliteRun: `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended_count, status, created_at, updated_at)
+              VALUES (?, 0, 0, 0, 'completed', ?, ?) ON CONFLICT(run_id) DO UPDATE SET updated_at = excluded.updated_at`,
   pgJournal: `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at) VALUES ($1,$2,$3,$4,$5,$6)
               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, suspended = EXCLUDED.suspended`,
-  pgRun: `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at)
-          VALUES ($1,0,0,false,0,$2,$3) ON CONFLICT (run_id) DO UPDATE SET updated_at = EXCLUDED.updated_at`,
+  pgRun: `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended_count, status, created_at, updated_at)
+          VALUES ($1,0,0,0,'completed',$2,$3) ON CONFLICT (run_id) DO UPDATE SET updated_at = EXCLUDED.updated_at`,
 };
 const oldRunOf = (key: string, value: unknown) => parseJournalKey(key)?.runId ?? runIdOfKey(key, value);
 

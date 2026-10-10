@@ -46,6 +46,8 @@
     "@gnldev/durable": "workspace:*",
     "@gnldev/queue": "workspace:*",
     "ai": "^7.0.0",
+    "pg": "^8.0.0",
+    "pg-mem": "^3.0.14",
     "zod": "^3.25.0"
   },
   "author": "Karaca Y\u0131lmaz (https://gnl.dev)",

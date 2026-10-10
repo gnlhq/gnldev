@@ -922,7 +922,7 @@ a deletion that silently did nothing would be the worst possible failure here.
 |---|---|---|
 | `eraseSubject(storage, resourceId, { orgId?, erasers?, memory? })` | a PERSON, from every store the storage holds: runs, their own threads (not other people's they wrote into) with messages, observations and observational-memory records and vectors, their working memory (0.7 and 0.6 keys), cross-channel ids, lesson counters, documents, owned jobs and events — plus what the `erasers` reach, and a memory kept in another storage (`memory`) | an erasure request arrives |
 | `purgeRun(journal, runId)` | one run and its nested sub-agent/workflow children | a single run must go |
-| `purgeThread(journal, threadId)` | `mem:`, `om:` (observational memory's counters and memoized summaries) + the whole `xthr:` family (dedup window, semantic records, tombstones, judge verdicts) | a conversation's journal side must go |
+| `purgeThread(journal, threadId, { memory?, vectors?, allowInFlight? })` | a THREAD, with its runs: every run on it (and their sub-agents), `mem:`, `om:` (observational memory's counters and memoized summaries), `sem:`, the whole `xthr:` family (dedup window, semantic records, tombstones, judge verdicts), the ownership traces naming it and its owner record (last) — plus, given them, the memory store's half (`memory`) and its observation vectors (`vectors`). Refuses while a run on it is in flight (`ThreadRunsInFlightError`) | a conversation must go (`AgentMemory.deleteThread` calls it with its own store) |
 | `purgeResource(journal, resourceId, { vectors?, memory? })` | the JOURNAL's share of a person (and, given the vector store, their documents). It does not reach the memory store or the work log | building your own erasure; for a request, use `eraseSubject` |
 | `purgeBatch(journal, batchId)` | one batch's bookkeeping | a batch must be re-run from scratch |
 | `purgeOrganization(journal, orgId)` | everything under `org:<id>:` | a tenant leaves |
@@ -941,7 +941,7 @@ or a store of yours.
 **How it finds what is theirs.** On Sqlite and Postgres a run's person and thread, and a thread owner
 record's person, are columns the store fills in the same write as the record, whoever writes it — so the
 erasure (and a person's run list, `listRunsPaged({ resourceId })`) reads an index, not the whole store.
-A row written before those columns, or by a process of an older version during a rolling deploy, has no
+A row written before those columns (by an older version, before its store was upgraded) has no
 value yet; it is read too and decided from the record, never skipped. `storage.upgrade({ only:
 ['relations'] })` fills those rows for speed — nothing depends on it having run. Two database triggers
 keep the columns true when another writer rewrites a record; after a write that bypassed them (a
@@ -1078,6 +1078,52 @@ The exactly-once guarantee rests on one precondition: **storage never loses an a
 - **Outbound side effects:** the strongest end-to-end defense is using a provider-side **idempotency
   key** on tool calls (see the pattern in `test/idempotency-key.test.ts`) — regardless of the storage
   layer, the external system rejects the duplicate.
+
+## Testing your own journal (`@gnldev/durable/testing`)
+
+A journal is more than its method signatures. Exactly-once needs a `putIfAbsent` that lets one of many
+racing callers win. A purge needs a prefix that is literal text, not a SQL pattern. Erasure needs a
+person's runs found even when an older writer never placed them. A thread delete must take what the
+dependents model says the thread owns, and nothing else. `journalConformance` registers those
+scenarios with your test runner. InMemory, Sqlite and Postgres run them in this repository, and so
+does a Map-based journal written against the public exports (`test/journal-conformance.test.ts`).
+
+```ts
+import { describe, it } from 'vitest';
+import { InMemoryJournal } from '@gnldev/durable';
+import { journalConformance } from '@gnldev/durable/testing';
+
+// Your journal goes here; InMemoryJournal stands in for it.
+journalConformance('my journal', () => ({ journal: new InMemoryJournal() }), { describe, it });
+```
+
+- **`make`** returns a fresh, empty journal for each scenario: `{ journal, writeAsOlderVersion?, close? }`.
+  `writeAsOlderVersion(key, value)` writes a key the way an earlier version of your store wrote it
+  (for Sqlite and Postgres, without the relation columns). Every lookup must still find those rows.
+  `close` runs when the scenario ends, whether it passed or failed.
+- **Options:** `describe` and `it` come from your runner (vitest, jest, mocha or `node:test`).
+  Assertions use `node:assert`, so no test framework is a dependency of this package. `timeout` is
+  passed to `it`. `exactClaim: false` and `pageWalk: false` declare the two limits of the pg-mem test
+  double: it reports a lost `putIfAbsent` as won, and it cannot read a run list's second page. A real
+  store that needs either flag cannot give the guarantee the flag skips.
+- **The scenarios:** the key-value contract (K1–K6: values, the racing claim, `putIfMatch`, literal
+  prefixes, exact counters, `applyBatch`/`getMany`); runs (R1–R4: which records name a run, the
+  summary, the status after each write of a scripted history, paging and filters); relations (L1–L2:
+  a person's and a thread's runs, owner records, rows from older writers); and the dependents model
+  (D1–D7: thread delete, organization isolation, refusal while a run is in flight, a delete killed at
+  every step and then retried, run purge, erasure, cross-run claims that outlive a delete). Optional
+  methods such as `putIfMatch`, `incrBy`, `applyBatch` and `listOwnerRecords` are checked when the
+  journal has them.
+- **What a journal must have:** the `Journal` port with `putIfAbsent`, `listKeys` and `deletePrefix`, plus
+  `readRun` and `listRunsPaged` from `JournalReader`. A journal without a paged listing gives
+  `purgeThread` and `purgeResource` no way to find the runs, so they would leave the runs and still
+  report a count. A run is named by any one of its records: a `:model:` or `:tool:` entry
+  (`parseJournalKey`), its stamped `:input` (`runIdOfKey`), or its outcome record (`outcomeStatusOf`).
+  The outcome record can be the only one, as with a run canceled before it started. Its status is
+  `summarizeRun(runId, entries, outcomeRecord)`, and `pageRunsFromArray` pages the result.
+- **Not covered:** scenarios that need a memory store, a vector store or the agent engine. These stay in
+  the packages that own them: `AgentMemory` thread deletes, `eraseSubject` over a whole `Storage`,
+  and `adoptIntoOrg`.
 
 ## License
 

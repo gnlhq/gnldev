@@ -328,6 +328,29 @@ export class RunTargetMismatchError extends Error {
   }
 }
 
+/**
+ * A thread was asked to be deleted while a run on it is still writing — refused, nothing deleted.
+ *
+ * A thread delete takes the thread's runs (C+ step C). Pulling a run's records out from under it while
+ * it executes lets it write its answer into the deleted thread afterwards (the thread comes back, holding
+ * the tail of the conversation) and lets a step whose claim was deleted run its effect a second time.
+ * `runIds` names them: cancel each (`cancelAgentRun`) and delete again, or pass `allowInFlight: true`
+ * for runs you know are abandoned. A SUSPENDED run is not in flight — it goes with the thread.
+ */
+export class ThreadRunsInFlightError extends Error {
+  constructor(
+    public readonly threadId: string,
+    public readonly runIds: string[],
+  ) {
+    super(teachingError({
+      error: `thread '${threadId}' was not deleted: ${runIds.length} run(s) on it are still in flight (${runIds.slice(0, 3).join(', ')}${runIds.length > 3 ? ', …' : ''})`,
+      note: "deleting a thread takes its runs; a run still executing would write its answer into the deleted thread, and a step whose claim was deleted could run its effect again",
+      help: "cancel them (`cancelAgentRun(journal, runId)`) and delete again, or pass `{ allowInFlight: true }` if their workers are gone",
+    }));
+    this.name = 'ThreadRunsInFlightError';
+  }
+}
+
 const CALLER_CONFLICT_BY_NAME = {
   RunThreadMismatchError: 'run_thread_mismatch',
   RunTargetMismatchError: 'run_target_mismatch',

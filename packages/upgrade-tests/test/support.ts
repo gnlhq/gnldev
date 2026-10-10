@@ -35,8 +35,13 @@ export interface OpenedFixture {
   reopen(): SqliteStorage;
 }
 
-/** Copies `fixtures/0.9.0/<file>` to a temp dir and opens it with the current SqliteStorage. Closed after each test. */
-export function openFixture(file: string): OpenedFixture {
+/**
+ * Copies `fixtures/0.9.0/<file>` to a temp dir and opens it with the current SqliteStorage, after the one
+ * upgrade step this version refuses a 0.9.0 file without: `run-status` (0.9.0's status flags into the
+ * `status`/`outcome` columns — what `gnl upgrade` runs first; run-status.test.ts proves the refusal and
+ * the statuses it keeps). Every other step is left to the test, as before. Closed after each test.
+ */
+export async function openFixture(file: string): Promise<OpenedFixture> {
   const dir = mkdtempSync(join(tmpdir(), 'gnl-upgrade-'));
   const path = join(dir, file);
   copyFileSync(join(FIXTURES_090, file), path);
@@ -46,12 +51,22 @@ export function openFixture(file: string): OpenedFixture {
     all.push(s);
     return s;
   };
-  const storage = open();
   opened.push(async () => {
     for (const s of all) await s.close().catch(() => undefined);
     rmSync(dir, { recursive: true, force: true });
   });
+  await open().upgrade({ only: ['run-status'] });
+  const storage = open();
   return { path, storage, reopen: open };
+}
+
+/** Copies `fixtures/0.9.0/<file>` to a temp dir as 0.9.0 left it — no step run. Removed after each test. */
+export function copyFixture(file: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'gnl-upgrade-'));
+  const path = join(dir, file);
+  copyFileSync(join(FIXTURES_090, file), path);
+  opened.push(async () => { rmSync(dir, { recursive: true, force: true }); });
+  return path;
 }
 
 /** Every row, in every table of the file, with a text column containing `needle` — `table[first column]: column=value`. */
@@ -102,7 +117,7 @@ export function rawQuery<T = Record<string, unknown>>(path: string, sql: string,
  */
 export function itMigrates(file: string): void {
   it(`${file}: the current code migrates the 0.9.0 schema once, and a second open changes nothing`, async () => {
-    const f = openFixture(file);
+    const f = await openFixture(file);
     const check = await f.storage.checkSchema();
     expect(check, JSON.stringify(check)).toMatchObject({ ok: true, missingTables: [], missingColumns: [] });
     const first = schemaOf(f.path);

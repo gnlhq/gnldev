@@ -356,11 +356,11 @@ import { evalDataset } from '@gnldev/evals';`,
     slug: `gdpr-purge`,
     order: 18,
     title: `GDPR / PII deletion (purge)`,
-    oneLiner: `Permanently delete a run/thread's journal trace (purgeRun/purgeThread).`,
+    oneLiner: `Permanently delete a run, or a thread with its runs (purgeRun/purgeThread).`,
     tier: `core`,
     package: `@gnldev/durable`,
     install: `import { purgeRun, purgeThread } from '@gnldev/durable';`,
-    apis: [`purgeRun(journal, runId) — permanently deletes ALL trace of a run (the only exception to append-only)`, `purgeThread(journal, threadId) — deletes a thread's BasicMemory trace`, `sweepRuns — bulk purgeRun based on retention policy`],
+    apis: [`purgeRun(journal, runId) — permanently deletes ALL trace of a run (the only exception to append-only)`, `purgeThread(journal, threadId, { memory?, vectors?, allowInFlight? }) — deletes a thread WITH ITS RUNS (and, given them, its memory-store half and observation vectors); refuses while a run on it is in flight`, `sweepRuns — bulk purgeRun based on retention policy`],
     example: `const removed = await purgeRun(journal, 'run-123');
 // Removed: number of journal keys deleted
 

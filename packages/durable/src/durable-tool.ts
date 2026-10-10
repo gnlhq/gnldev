@@ -184,7 +184,11 @@ const dupDeclinedKey = (requestRunId: string, toolName: string, hash: string): s
   runKeys.proc(requestRunId, `dupdeclined-${toolName}-${hash}`);
 
 /** The answer a declined repeat gets, without asking again. */
-async function declinedRepeat(ctx: DurableCtx, key: string, toolCallId: string, toolName: string, hash: string): Promise<unknown | undefined> {
+async function declinedRepeat(
+  ctx: DurableCtx, key: string, toolCallId: string, toolName: string, hash: string,
+  /** Before the call holds its claim, the refusal is a decision and is written as one (`decide`). */
+  decide?: Decide,
+): Promise<unknown | undefined> {
   const declined = await ctx.journal.get<{ toolCallId?: string }>(dupDeclinedKey(requestOf(ctx.identity), toolName, hash));
   if (!declined) return undefined;
   const output = {
@@ -195,9 +199,16 @@ async function declinedRepeat(ctx: DurableCtx, key: string, toolCallId: string, 
     at: Date.now(), source: 'duplicate-guard', action: 'skip', toolName, toolCallId,
     message: output.reason, detail: { toolName, argsHash: hash, toolCallId, declinedAs: declined.toolCallId },
   });
+  if (decide) {
+    const moved = await decide({ status: 'denied', output });
+    return moved ? moved.answered : output;
+  }
   await writeToolTerminal(ctx, key, { status: 'denied', output }, toolCallId, toolName, hash);
   return output;
 }
+
+/** Writes a decision over the record it was made on; `{ answered }` when that record had moved. */
+type Decide = (record: ToolJournalRecord) => Promise<{ answered: unknown } | undefined>;
 
 const dupMarkerKey = (runId: string, toolName: string, hash: string): string =>
   // toolName VERBATIM in the key — same accepted practice as runKeys.toolByArgs/toolCrossRun (journal.ts).
@@ -387,7 +398,11 @@ async function writeToolTerminal(
   /** XID (kanallar-arası iş kimliği): SUCCESS'te first-wins yazılır — aynı choke-point gerekçesiyle
    *  (unutan yol kalmasın). Best-effort; işi asla etkilemez. */
   xidPlan?: XidPlan,
-): Promise<void> {
+  /** A DECISION made before this call holds a claim (a question, a refusal, a nudge) replaces only the
+   *  record it was made on: `expected` is that record's stored value, `undefined` for none. When the
+   *  record has moved since, nothing is written and this returns false — see `decide` in durableTool. */
+  over?: { expected: unknown },
+): Promise<boolean> {
   // Stamp the ORIGINAL toolCallId onto succeeded/denied records here —
   // the single choke point every fresh terminal write goes through — so reconstructState can match
   // pending tool-calls back to this record WITHOUT needing to re-derive the dedupe key (see
@@ -409,7 +424,11 @@ async function writeToolTerminal(
     named.status === 'succeeded' || named.status === 'denied' || named.status === 'reflected'
       ? { ...named, resolvedToolCallIds: [toolCallId] }
       : named;
-  await ctx.journal.put(key, stampFormat(stamped));
+  const value = stampFormat(stamped);
+  if (!over) await ctx.journal.put(key, value);
+  else if (!(over.expected === undefined
+    ? await claim(ctx.journal, key, value)
+    : ctx.journal.putIfMatch ? await ctx.journal.putIfMatch(key, over.expected, value) : (await ctx.journal.put(key, value), true))) return false;
   if (key === runKeys.toolCrossRun(toolName, hash)) await claimCrossRunOwner(ctx, toolName, hash);
   await mirrorUnderRun(ctx, key, stamped, toolCallId);
   if (dupKey && record.status === 'succeeded') {
@@ -459,6 +478,7 @@ async function writeToolTerminal(
       ctx.seats?.delete(toolCallId); // counted and given back in one step
     }
   }
+  return true;
 }
 
 /**
@@ -794,6 +814,29 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // this call is a first attempt and meets every gate a first attempt meets. Whose it is was
       // still checked above — the owner was written with the claim.
       if (isUnstartedRelease(record)) record = undefined;
+      // A DECISION — a question, a refusal, a nudge — is made on `record` as read here, before this call
+      // holds a claim, and is written only over that record (compare-and-set). Another worker resuming
+      // the same run can reach this call in between and run it to the end, or hold it 'running' in its
+      // body. A blind write put 'suspended' over its result — the duplicate guard then read the call's
+      // own marker and asked "already succeeded (first: <this call>), run it again?" — or over its live
+      // claim, where a worker carrying the approval took the question over and ran the call a second
+      // time while the first was still in its body (C+ E1, measured: 2 executions). When the record has
+      // moved, this call answers from what is there now, or is busy — like a claim that lost.
+      const decidedOn = record;
+      const decide: Decide = async (rec) => {
+        const raw = await ctx.journal.get<ToolJournalRecord>(key);
+        const cur = upgradeFormat(raw, key) as { status?: string; startedAt?: number; attempts?: number } | undefined;
+        const was = decidedOn as { status?: string; startedAt?: number; attempts?: number } | undefined;
+        const unchanged = was === undefined
+          ? raw === undefined || isUnstartedRelease(raw)
+          : cur !== undefined && cur.status === was.status && cur.startedAt === was.startedAt && cur.attempts === was.attempts;
+        if (unchanged && (await writeToolTerminal(ctx, key, rec, toolCallId, toolName, hash, undefined, undefined, undefined, { expected: raw }))) return undefined;
+        const now = upgradeFormat(await ctx.journal.get<ToolJournalRecord>(key), key);
+        if (now && (now.status === 'succeeded' || now.status === 'denied' || now.status === 'reflected' || now.status === 'suspended')) {
+          return { answered: await consumeExistingRecord(ctx, key, now, toolCallId) };
+        }
+        return { answered: blockedOrThrow(ctx, toolCallId, toolName, new RunBusyError(`'${toolName}' (${key}) is being executed by another executor`)) };
+      };
       if (record && (record.status === 'succeeded' || record.status === 'denied' || record.status === 'reflected')) {
         // M2 drift detector: if the argsHash of the succeeded record doesn't match the hash of the new
         // input the model produced on replay → non-determinism. Since the model middleware replays the
@@ -907,7 +950,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
               ? `A human REFUSED this call — it did NOT run. Do not retry it unless the user asks again. The question they answered was: "${susReason}"`
               : 'Approval denied.',
           };
-          await writeToolTerminal(ctx, key, { status: 'denied', output }, toolCallId, toolName, hash);
+          { const moved = await decide({ status: 'denied', output }); if (moved) return moved.answered; }
           if ((record.output as { __gnl_suspend?: { kind?: string } })?.__gnl_suspend?.kind === 'duplicate') {
             await claim(ctx.journal, dupDeclinedKey(requestOf(ctx.identity), toolName, hash), { at: Date.now(), toolCallId });
           }
@@ -989,7 +1032,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // recover/reclaim ladder below, which owns exactly that case.
         if (approved === false) {
           const output = { __denied: true, reason: 'Confirmation denied.' };
-          await writeToolTerminal(ctx, key, { status: 'denied', output }, toolCallId, toolName, hash);
+          { const moved = await decide({ status: 'denied', output }); if (moved) return moved.answered; }
           return output;
         }
         let reason =
@@ -1096,7 +1139,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           });
         }
         const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'confirm' } };
-        await writeToolTerminal(ctx, key, { status: 'suspended', output: sentinel }, toolCallId, toolName, hash);
+        { const moved = await decide({ status: 'suspended', output: sentinel }); if (moved) return moved.answered; }
         return sentinel;
       } else if (ctx.guard) {
         // 3) General policy: check at the gate before execute (gate the side effect).
@@ -1107,13 +1150,13 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         const decision = await ctx.guard({ toolName, args: input, toolCallId, runId: ctx.runId, tainted });
         if (decision.action === 'deny') {
           const output = { __denied: true, reason: decision.reason ?? 'Denied by policy.' };
-          await writeToolTerminal(ctx, key, { status: 'denied', output }, toolCallId, toolName, hash);
+          { const moved = await decide({ status: 'denied', output }); if (moved) return moved.answered; }
           return output; // the model sees this result and can correct itself
         }
         if (decision.action === 'require-approval') {
           if (approved === false) {
             const output = { __denied: true, reason: decision.reason ?? 'Approval denied.' };
-            await writeToolTerminal(ctx, key, { status: 'denied', output }, toolCallId, toolName, hash);
+            { const moved = await decide({ status: 'denied', output }); if (moved) return moved.answered; }
             return output;
           }
           if (approved !== true) {
@@ -1121,7 +1164,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
             const sentinel = {
               __gnl_suspend: { toolCallId, toolName, args: input, reason: decision.reason, kind: 'guard' },
             };
-            await writeToolTerminal(ctx, key, { status: 'suspended', output: sentinel }, toolCallId, toolName, hash);
+            { const moved = await decide({ status: 'suspended', output: sentinel }); if (moved) return moved.answered; }
             return sentinel;
           }
           // approved === true → run below
@@ -1252,11 +1295,11 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
             // işaretler ve bir sonraki meşru farklı işte hard-block eskalasyonu üretirdi (denetçi K12);
             // denied ise "politika bu çağrıyı reddetti (zaten yapılmış)" — replay'de aynı notice döner,
             // success yan-yazımları (dup marker/XID) tetiklenmez.
-            await writeToolTerminal(ctx, key, { status: 'denied', output }, toolCallId, toolName, hash);
+            { const moved = await decide({ status: 'denied', output }); if (moved) return moved.answered; }
             return output;
           }
           if (dupAction === 'suspend') {
-            const already = await declinedRepeat(ctx, key, toolCallId, toolName, hash);
+            const already = await declinedRepeat(ctx, key, toolCallId, toolName, hash, decide);
             if (already !== undefined) return already;
             // Standard __gnl_suspend shape → the duplicate lands in the SAME approvals flow as guard
             // suspensions (Studio Approvals, resumeRun approvals[toolCallId]) — a human decides the
@@ -1273,7 +1316,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
               at: Date.now(), source: 'duplicate-guard', action: 'suspend', toolName, toolCallId,
               message: reason, detail: { toolName, argsHash: hash, firstToolCallId: marker.firstToolCallId, toolCallId },
             });
-            await writeToolTerminal(ctx, key, { status: 'suspended', output: sentinel }, toolCallId, toolName, hash);
+            { const moved = await decide({ status: 'suspended', output: sentinel }); if (moved) return moved.answered; }
             return sentinel;
           }
           if (dupAction === 'reflect') {
@@ -1297,7 +1340,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
               at: Date.now(), source: 'duplicate-guard', action: 'reflect', toolName, toolCallId,
               message: output.warning, detail: output.detail,
             });
-            await writeToolTerminal(ctx, key, { status: 'reflected', output, argsHash: hash, toolName }, toolCallId, toolName, hash);
+            { const moved = await decide({ status: 'reflected', output, argsHash: hash, toolName }); if (moved) return moved.answered; }
             return output; // the model sees this result and can reconsider — the run does NOT stop
           }
           // 'warn' (default): the call EXECUTES as before — zero behavior change — but the incident is
@@ -1420,7 +1463,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
               ...(verdict.trace?.length ? { trace: verdict.trace } : {}),
             },
           });
-          await writeToolTerminal(ctx, key, { status: 'suspended', output: sentinel }, toolCallId, toolName, hash);
+          { const moved = await decide({ status: 'suspended', output: sentinel }); if (moved) return moved.answered; }
           return sentinel;
         }
 
@@ -1470,7 +1513,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
                 ...(gray.trace.length ? { trace: gray.trace } : {}),
               },
             });
-            await writeToolTerminal(ctx, key, { status: 'suspended', output: sentinel }, toolCallId, toolName, hash);
+            { const moved = await decide({ status: 'suspended', output: sentinel }); if (moved) return moved.answered; }
             return sentinel;
           }
           // 'different' | 'unsure' | skipped(budget|timeout|parse-fail|...) → today's behavior, and
@@ -1542,7 +1585,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
               undeclaredHint(tool, toolName);
             const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'taint' } };
             await recordIncident(ctx.journal, ctx.runId, { at: Date.now(), source: 'taint-guard', action: 'suspend', toolName, toolCallId, message: reason, detail: taintDetail });
-            await writeToolTerminal(ctx, key, { status: 'suspended', output: sentinel }, toolCallId, toolName, hash);
+            { const moved = await decide({ status: 'suspended', output: sentinel }); if (moved) return moved.answered; }
             return sentinel;
           }
           if (taintAction === 'reflect') {
@@ -1570,7 +1613,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
                 detail: taintDetail,
               };
               await recordIncident(ctx.journal, ctx.runId, { at: Date.now(), source: 'taint-guard', action: 'reflect', toolName, toolCallId, message: output.warning, detail: taintDetail });
-              await writeToolTerminal(ctx, key, { status: 'reflected', output, argsHash: hash, toolName }, toolCallId, toolName, hash);
+              { const moved = await decide({ status: 'reflected', output, argsHash: hash, toolName }); if (moved) return moved.answered; }
               return output;
             }
             await recordIncident(ctx.journal, ctx.runId, {
@@ -1633,7 +1676,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
               'If you repeat the identical call, the run will be stopped for safety. If you cannot proceed, stop and explain why instead.',
             detail: gate.detail,
           };
-          await writeToolTerminal(ctx, key, { status: 'reflected', output, argsHash: hash, toolName }, toolCallId, toolName, hash);
+          { const moved = await decide({ status: 'reflected', output, argsHash: hash, toolName }); if (moved) return moved.answered; }
           return output; // the model sees this result and can reconsider — the run does NOT stop
         }
         if (gate) {
@@ -1927,11 +1970,25 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // NOT re-run here: that is a residual window worth naming rather than hiding — at most ONE
         // extra attempt per round can slip past `maxRetries`, and closing it means re-ordering the
         // whole ladder around the re-read, which is a bigger change than the bug.
-        if (before && (before.status === 'failed' || before.status === 'running')) record = before;
         // The shared clock, not the local one: staleness is measured via journal.now() (see the claim
         // gate above), so a takeover stamped with a fast local clock would look instantly stale to
         // every other worker — the exact skew class the clock fix removed, re-entering here.
         const nowTakeover = ctx.journal.now ? await ctx.journal.now() : Date.now();
+        // A FRESH 'running' claim at the re-read is a live executor, whatever the ladder judged. Two
+        // workers resuming with the same approval both judged the 'suspended' record; the first took it
+        // over and entered the body, the second re-read the first one's claim — and, using it as the
+        // CAS operand, MATCHED it and ran the tool alongside (C+ E1, measured: 2 executions on an
+        // approved resume; the same for two workers that judged one stale claim). Never taken over: the
+        // call is busy, like a claim that lost ('args' mode polls it at the top of the loop).
+        if (before?.status === 'running' && nowTakeover - before.startedAt <= claimTtl) {
+          if (mode !== 'args') {
+            return blockedOrThrow(ctx, toolCallId, toolName,
+              new RunBusyError(`'${toolName}' (${key}) is being executed by another executor`));
+          }
+          record = before;
+          continue claimLoop;
+        }
+        if (before && (before.status === 'failed' || before.status === 'running')) record = before;
         // Carry the counter across the takeover. A blind `{status:'running', startedAt}` here was the
         // whole leak: the ladder read `record.attempts` on the NEXT round and found nothing, so every
         // crash-restart cycle started from zero. `before` (the fresh re-read), not `record` — a worker

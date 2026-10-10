@@ -111,7 +111,7 @@ describe('storage.upgrade() — a step is never run behind the caller\'s back', 
     expect(dry.steps.find((x) => x.name === 'schema')?.pending).toBe(true);
     await expect(s.upgrade({ only: ['thread-records'] })).rejects.toThrow(/'thread-records' needs 'schema' first.*only: \['schema', 'thread-records'\]/);
     const both = await s.upgrade({ only: ['schema', 'thread-records'] });
-    expect(both.steps.filter((x) => x.name !== 'relations' && x.name !== 'verify-relations').map((x) => [x.name, x.ran])).toEqual([['schema', true], ['thread-records', true]]);
+    expect(both.steps.filter((x) => x.name !== 'run-status' && x.name !== 'relations' && x.name !== 'verify-relations').map((x) => [x.name, x.ran])).toEqual([['schema', true], ['thread-records', true]]);
     expect(both.steps.find((x) => x.name === 'relations')?.ran).toBe(false); // not named, so not run
   });
 });

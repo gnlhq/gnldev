@@ -105,6 +105,12 @@ export interface OmVectorStore {
   query(embedding: number[], topK: number, opts?: { namespace?: string } & VectorPartitionOption): Promise<OmVectorMatch[]>;
   /** An organization's memory writes into a root store only when this is `true` — @gnldev/durable `VectorStore.rootOutsideOrganizations`. */
   readonly rootOutsideOrganizations?: boolean;
+  /**
+   * Deletes documents (@gnldev/durable `VectorStore.delete`). A thread delete removes the thread's
+   * observations through it (`{ filter: { source, threadId } }`) — they are the model's summary of what
+   * the person said — so `AgentMemory.deleteThread` refuses a store without it rather than leave them.
+   */
+  delete?(where: { filter?: Record<string, unknown>; namespace?: string } & VectorPartitionOption): Promise<number>;
 }
 
 /** Approximate token count (not a real tokenizer; the char/4 heuristic). */

@@ -97,7 +97,13 @@ describe('GET /events (API-04 informative diff)', () => {
       // StudioApiOptions) so this test doesn't have to wait out the real ~10s production default
       // (FULL_SCAN_EVERY_TICKS=5 at the 2s poll interval) — it shrinks the full-scan period to every
       // 2nd tick (~4s) instead.
-      const app = createStudioApi({ reader: journal, __fullScanEveryTicks: 2 } as any);
+      // The change feed (listRunsChangedSince) would see run-1 directly; this pins the path a journal
+      // WITHOUT the feed still takes — cheap signal plus the periodic full scan.
+      const noFeed = new Proxy(journal, {
+        get: (t, p) => (p === 'listRunsChangedSince' ? undefined : typeof (t as any)[p] === 'function' ? (t as any)[p].bind(t) : (t as any)[p]),
+        has: (t, p) => p !== 'listRunsChangedSince' && Reflect.has(t, p),
+      });
+      const app = createStudioApi({ reader: noFeed, __fullScanEveryTicks: 2 } as any);
 
       const res = await call(app, '/events');
       expect(res.status).toBe(200);

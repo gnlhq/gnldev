@@ -25,7 +25,7 @@ describe('upgrade from 0.9.0 — events', () => {
   });
 
   it('the first poll after the upgrade delivers exactly the events 0.9.0 had not, once', async () => {
-    const { storage } = openFixture('events.db');
+    const { storage } = await openFixture('events.db');
     const seen: string[] = [];
     const c = consumer(storage.work, seen);
     await c.poll();
@@ -34,7 +34,7 @@ describe('upgrade from 0.9.0 — events', () => {
   });
 
   it('a consumer restarted after that delivers nothing again', async () => {
-    const f = openFixture('events.db');
+    const f = await openFixture('events.db');
     await consumer(f.storage.work, []).poll();
     const again: string[] = [];
     await consumer(f.reopen().work, again).poll();
@@ -42,7 +42,7 @@ describe('upgrade from 0.9.0 — events', () => {
   });
 
   it('erasing a person right after the upgrade skips none of anybody else\'s events', async () => {
-    const { storage } = openFixture('events.db');
+    const { storage } = await openFixture('events.db');
     await eraseSubject(storage, 'ayse', { erasers: [eventEraser(storage.work)] });
     const seen: string[] = [];
     await consumer(storage.work, seen).poll();
@@ -50,13 +50,13 @@ describe('upgrade from 0.9.0 — events', () => {
   });
 
   it('the erasure leaves nothing of the erased person\'s 0.9.0 events behind', async () => {
-    const f = openFixture('events.db');
+    const f = await openFixture('events.db');
     await eraseSubject(f.storage, 'ayse', { erasers: [eventEraser(f.storage.work)] });
     expect(rowsContaining(f.path, '~o~:ayse:')).toEqual([]);
   });
 
   it('an event emitted after the upgrade is delivered once', async () => {
-    const { storage } = openFixture('events.db');
+    const { storage } = await openFixture('events.db');
     const seen: string[] = [];
     await emit(storage.work, E.topic, { n: 'new-1' }, { id: 'new-1' });
     await consumer(storage.work, seen).poll();
@@ -65,7 +65,7 @@ describe('upgrade from 0.9.0 — events', () => {
   });
 
   it('the 0.9.0 poison event stays quarantined until released, and is delivered once after retryDeadEvent', async () => {
-    const { storage } = openFixture('events.db');
+    const { storage } = await openFixture('events.db');
     expect((await listDeadEvents(storage.work, E.poisonTopic, E.poisonConsumer)).map((d) => d.id)).toEqual([E.poisonId]);
     const seen: string[] = [];
     const c2 = createConsumer(storage.work, E.poisonTopic, async (p: { n: string }) => { seen.push(p.n); }, { name: E.poisonConsumer, retryDelayMs: 0 });
@@ -87,7 +87,7 @@ describe('upgrade from 0.9.0 — a topic 0.9.0 itself erased a person from', () 
   });
 
   it('the first poll after the upgrade delivers every event that was undelivered when 0.9.0 erased, once', async () => {
-    const { storage } = openFixture('events-erased.db');
+    const { storage } = await openFixture('events-erased.db');
     const seen: string[] = [];
     await consumer(storage.work, seen).poll();
     await consumer(storage.work, seen).poll();

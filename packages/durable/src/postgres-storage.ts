@@ -7,9 +7,9 @@ import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from '
 import { memoryPartitionOf, memoryPartitionSql, type MemoryPartitionOption } from './storage.js';
 import { createRequire } from 'node:module';
 import { cosineSimilarity } from 'ai';
-import { runIdOfKey, parseJournalKey, outcomeStatusOf, deriveRunStatus, runRelationsOf, relationsOfInput, ownerColumnOf, ownerOfRecord, OWNER_RECORD_LIKE } from './journal.js';
-import { keysetRunPage, rangeOrder, type RunRelationRead } from './run-cursor.js';
-import type { JournalBatch, JournalEntry, RunSummary, ToolJournalRecord } from './journal.js';
+import { runIdOfKey, parseJournalKey, outcomeStatusOf, runRelationsOf, relationsOfInput, ownerColumnOf, ownerOfRecord, OWNER_RECORD_LIKE, RunRowChanges, runStatusOf, runStatusCaseSql, storedOutcomeOf } from './journal.js';
+import { keysetRunPage, rangeOrder, runStatusSql, openRunPredicate, decodeChangeCursor, encodeChangeCursor, type RunRelationRead } from './run-cursor.js';
+import type { JournalBatch, JournalEntry, RunChange, RunStatus, RunSummary, ToolJournalRecord } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
 import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, vectorDocumentOf, vectorFilterDocument } from './storage.js';
 import type { AdoptIntoOrgResult,
@@ -23,8 +23,9 @@ import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatform
 import type { SchemaCheckResult, SchemaMigrationResult, MissingColumn } from './migrate.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { POSTGRES_STORAGE_NAMES, ADOPT_INTO_ORG_NAMES, COMPACT_NAMES } from './option-names.js';
-import { runUpgrade, threadRecordsStep, relationsStep, verifyRelationsStep, RELATIONS_PENDING_ADVICE, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
+import { runUpgrade, threadRecordsStep, relationsStep, verifyRelationsStep, runStatusStep, runStatusPending, RUN_STATUS_FLAGS, RUN_STATUS_PENDING_MESSAGE, RELATIONS_PENDING_ADVICE, type UpgradeOptions, type UpgradeReport, type UpgradeStep } from './upgrade.js';
 import { UPGRADE_NAMES } from './option-names.js';
+import { SCOPE_TABLES } from './model.js';
 
 type QueryResult = { rows: any[]; rowCount?: number | null };
 type PoolClient = { query: (sql: string, params?: unknown[]) => Promise<QueryResult>; release?: (destroy?: boolean) => void };
@@ -60,15 +61,6 @@ function offset(q?: ListQuery) { return { start: q?.cursor ? Number(q.cursor) ||
 function pageOf<T>(rows: T[], start: number, limit: number, total: number): Page<T> {
   const next = start + limit;
   return { items: rows, nextCursor: next < total ? String(next) : undefined };
-}
-/**
- * The materialized `gnl_runs` flags back into the ONE outcome shape `deriveRunStatus` reads — the
- * twin of sqlite-storage.ts's helper, and written out for the same reason: the flag→status mapping is
- * precedence-bearing, and hand-copying the ternary chain into listRuns AND countRunsByStatus is
- * exactly how one of them ends up ordering `failed` ahead of `canceled` while the other does not.
- */
-function outcomeOfRow(r: { failed?: unknown; running?: unknown; canceled?: unknown }): { status: 'canceled' | 'failed' | 'running' } | null {
-  return r.canceled ? { status: 'canceled' } : r.failed ? { status: 'failed' } : r.running ? { status: 'running' } : null;
 }
 // P1.5 matchFilter is now shared (storage.ts) — see its JSDoc for the operator
 // subset ($eq/$ne/$gt/$gte/$lt/$lte/$in/$nin). Import above (was a local exact-equality-only copy).
@@ -126,7 +118,7 @@ const OWNER_UNPLACE = [
 /**
  * The same guard for a run's `gnl_runs.resource_id`/`thread_id`: a run's `:input` INSERTED or with its
  * value CHANGED leaves the run unplaced (NULL), read and decided from the record by every lookup, until
- * the writer places it. This version places it in the same transaction, after the write (`placeRun`),
+ * the writer places it. This version places it in the same transaction, after the write (`writeRunRows`),
  * so its own runs stay placed; an older process, a raw put of an unversioned record, or plain SQL does
  * not, and its record — naming carl on thread t2 — is no longer listed and erased as ayse's on t1, which
  * is what the column said before. Sqlite's twin: RUN_UNPLACE_TRIGGERS.
@@ -166,21 +158,29 @@ const DDL = [
   `CREATE TABLE IF NOT EXISTS gnl_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS gnl_run_journal (key TEXT PRIMARY KEY, run_id TEXT, kind TEXT, suspended BOOLEAN NOT NULL DEFAULT false, value TEXT NOT NULL, created_at BIGINT NOT NULL, owner TEXT)`,
   `CREATE INDEX IF NOT EXISTS gnl_run_journal_run ON gnl_run_journal (run_id, created_at)`,
-  `CREATE TABLE IF NOT EXISTS gnl_runs (run_id TEXT PRIMARY KEY, model_steps INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0, suspended BOOLEAN NOT NULL DEFAULT false, suspended_count INTEGER NOT NULL DEFAULT 0, failed BOOLEAN NOT NULL DEFAULT false, running BOOLEAN NOT NULL DEFAULT false, canceled BOOLEAN NOT NULL DEFAULT false, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, thread_id TEXT, resource_id TEXT)`,
+  // A run's status is two inputs and their result, all three written by the adapter in the statement that
+  // writes the run's counters (`writeRunRows`): `suspended_count` (its tool records waiting on a human),
+  // `outcome` (its `:outcome` record: 'running' | 'failed' | 'canceled', NULL for 'completed' or none —
+  // `storedOutcomeOf`) and `status`, `runStatusOf` of the two — what every listing, count and filter
+  // reads. Up to 0.10 the status was four boolean flags (`suspended`, `failed`, `running`, `canceled`)
+  // decoded on every read; the `run-status` upgrade step moves a store from those to these.
+  `CREATE TABLE IF NOT EXISTS gnl_runs (run_id TEXT PRIMARY KEY, model_steps INTEGER NOT NULL DEFAULT 0, tool_calls INTEGER NOT NULL DEFAULT 0, suspended_count INTEGER NOT NULL DEFAULT 0, outcome TEXT, status TEXT NOT NULL, created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, thread_id TEXT, resource_id TEXT)`,
   `CREATE INDEX IF NOT EXISTS gnl_runs_updated ON gnl_runs (updated_at)`,
   // H11b migration: add the column if missing in an old setup (backfill once at init, below).
   `ALTER TABLE gnl_runs ADD COLUMN IF NOT EXISTS suspended_count INTEGER NOT NULL DEFAULT 0`,
-  // `failed`: materialized at write time rather than derived at read time (no index — the status
-  // filter is an operator path, not a hot one), because filtering on the serialized outcome
-  // value would mean matching the word 'failed' inside error MESSAGES. Nothing to backfill — a run
-  // written before outcomes existed has none, and false reads exactly as it did before.
-  `ALTER TABLE gnl_runs ADD COLUMN IF NOT EXISTS failed BOOLEAN NOT NULL DEFAULT false`,
-  // `running` (the write-ahead half): same shape, same no-backfill argument as `failed` above.
-  `ALTER TABLE gnl_runs ADD COLUMN IF NOT EXISTS running BOOLEAN NOT NULL DEFAULT false`,
-  // `canceled` (the operator's ending): same again. Three booleans for one status IS inelegant; they
-  // are only ever written together, from a single `outcomeStatusOf` value in a single statement, so
-  // they cannot disagree — collapsing them into one materialized `outcome` column is its own round.
-  `ALTER TABLE gnl_runs ADD COLUMN IF NOT EXISTS canceled BOOLEAN NOT NULL DEFAULT false`,
+  // The runs that are not 'completed' — what the approval inbox and the usage total ask for — in two
+  // partial indexes: `gnl_runs_open` in creation order (every open run: the usage total) and
+  // `gnl_runs_status` by status, then creation order (one status: the approval inbox). 1M-run store, 167
+  // such runs: GET /approvals read all 1 000 020 runs (20 001 pages, 23.3 s) to find them before them.
+  // Every status filter that admits no completed run carries the predicate word for word
+  // (`runStatusSql`), which is how both planners prove a status read may use them. Small and cold: a run
+  // enters them while open and leaves when it completes, and a completed run's writes never touch them.
+  // Two, because the open runs are not one kind (C+ A2, index-choice, 1M store with 500 000 failed runs):
+  // through `(created_at, run_id)` alone a page of suspended runs read 65 ms (every failed run in
+  // between, filtered), through `(status, …)` 1.5 ms; through `(status, …)` alone a page of ALL open runs
+  // went to `gnl_runs_created` and filtered the completed ones — on a store with few open runs, every run.
+  `CREATE INDEX IF NOT EXISTS gnl_runs_open ON gnl_runs (created_at, run_id) WHERE ${openRunPredicate()}`,
+  `CREATE INDEX IF NOT EXISTS gnl_runs_status ON gnl_runs (status, created_at, run_id) WHERE ${openRunPredicate()}`,
   // RELATIONS: a run's person and thread (`runRelationsOf`), and a thread owner record's person
   // (`ownerColumnOf`), as columns the adapter fills in the transaction that writes the record. NULL =
   // not placed yet — a row written before these columns, or by an older process whose INSERT knows
@@ -518,6 +518,12 @@ export class PostgresStorage implements Storage {
         // lock costs it nothing. Failing here instead would trade a rare boot race for a certain one.
         const locked = await this._pool.query('SELECT pg_advisory_lock(47110001)').then(() => true, () => false);
         try {
+          // A run table in an earlier version's format (status flags) is refused before anything is
+          // created or read: this version neither reads nor writes the flags, so serving it would read
+          // a status nobody keeps. `gnl upgrade` (the `run-status` step) moves it; see RUN_STATUS_PENDING_MESSAGE.
+          // Thrown from here, the boot is not memoised: the next call asks again, so a process that
+          // started before the step ran elsewhere serves the store once it has.
+          if (runStatusPending(await this.runColumns())) throw new Error(RUN_STATUS_PENDING_MESSAGE);
           for (const sql of DDL) await this._pool.query(sql);
           // The relation columns are trusted only where OWNER_UNPLACE and RUN_UNPLACE guard them, ENABLED.
           // The functions are (re)defined on every boot — the current body, whatever an earlier boot left;
@@ -653,7 +659,7 @@ export class PostgresStorage implements Storage {
    * table + temporarily needs 2× disk → only during a maintenance window. Postgres doesn't expose file
    * size via the API → reclaimedBytes = -1 (unknown).
    */
-  /** See `Storage.adoptIntoOrg`. Same table list and the same platform-key rule as the SQLite adapter. */
+  /** See `Storage.adoptIntoOrg`. The table list is model.ts's `SCOPE_TABLES`, the platform-key rule `isPlatformKey` — both shared with the SQLite adapter. */
   async adoptIntoOrg(orgId: string, opts?: { dryRun?: boolean; allowUnregistered?: boolean; allowInFlight?: boolean }): Promise<AdoptIntoOrgResult> {
     refuseUnknownNames('adoptIntoOrg', opts, ADOPT_INTO_ORG_NAMES);
     const prefix = orgPrefix(orgId);
@@ -681,17 +687,6 @@ export class PostgresStorage implements Storage {
     try { await assertOrgRegistered(this.runs, orgId, opts?.allowUnregistered);
       await assertNoRunsInFlight(this.runs, opts?.allowInFlight); }
     catch (e) { client.release?.(); throw e; }
-    const KEYED: Array<[string, string, string]> = [
-      // Missed here, an adopted thread keeps its batch markers under the OLD id: a retry of an
-      // in-flight batch is then unmarked and applies twice, and the stale rows sit in the global
-      // partition forever. The file's own warning above says a table left off this list is data an
-      // upgrade silently leaves behind.
-      ['gnl_message_batches', 'thread_id', 'memory'],
-      ['gnl_run_journal', 'key', 'runs'], ['gnl_runs', 'run_id', 'runs'], ['gnl_counters', 'key', 'runs'],
-      ['gnl_threads', 'id', 'memory'], ['gnl_messages', 'thread_id', 'memory'],
-      ['gnl_working_memory', 'scope_id', 'memory'], ['gnl_observations', 'thread_id', 'memory'],
-      ['gnl_work_log', 'ns', 'work'], ['gnl_work_kv', 'key', 'work'], ['gnl_cache', 'key', 'cache'],
-    ];
     const moved: Record<string, number> = {};
     const skipped = new Set<string>();
     const resetPositions: string[] = [];
@@ -719,16 +714,17 @@ export class PostgresStorage implements Storage {
       }
       if (!dryRun) for (const k of resetPositions) await q('DELETE FROM gnl_work_kv WHERE key = $1', [k]);
       const notCarried = new Set(resetPositions);
-      for (const [table, col, store] of KEYED) {
+      // The tables and columns are the model's (`SCOPE_TABLES`, model.ts) — one list for both SQL stores.
+      for (const [table, col, store, counted] of SCOPE_TABLES) {
         const inQ = space(col);
-        alreadyScoped += Number((await q(`SELECT COUNT(*) AS c FROM ${table} WHERE ${inQ.cond}`, inQ.params)).rows[0].c);
+        if (counted) alreadyScoped += Number((await q(`SELECT COUNT(*) AS c FROM ${table} WHERE ${inQ.cond}`, inQ.params)).rows[0].c);
         const rootQ = space(col, true);
         const rows = (await q(`SELECT DISTINCT ${col} AS k FROM ${table} WHERE ${rootQ.cond}`, rootQ.params)).rows as { k: string }[];
         let n = 0;
         for (const { k } of rows) {
           if (isPlatformKey(k)) { skipped.add(k.split(':')[0]!); continue; }
           if (table === 'gnl_work_kv' && notCarried.has(k)) continue;
-          n += Number((await q(`SELECT COUNT(*) AS c FROM ${table} WHERE ${col} = $1`, [k])).rows[0].c);
+          if (counted) n += Number((await q(`SELECT COUNT(*) AS c FROM ${table} WHERE ${col} = $1`, [k])).rows[0].c);
           if (dryRun) continue;
           if (table === 'gnl_work_log') {
             // APPENDED to the organization's log: unnumbered, so the next `list` numbers them after
@@ -747,7 +743,10 @@ export class PostgresStorage implements Storage {
       alreadyScoped += Number((await q(`SELECT COUNT(*) AS c FROM gnl_meta WHERE ${metaIn.cond}`, metaIn.params)).rows[0].c);
       let metaN = 0;
       for (const { k } of metaRows) {
-        if (ENGINE_META_KEYS.includes(k) || isPlatformKey(k)) { skipped.add(k); continue; }
+        // Reported as the platform keys of every other table are, by family; the engine's own rows are
+        // not platform keys and are not reported (the three stores used to answer three different lists).
+        if (ENGINE_META_KEYS.includes(k)) continue;
+        if (isPlatformKey(k)) { skipped.add(k.split(':')[0]!); continue; }
         metaN++;
         if (!dryRun) await q(`UPDATE gnl_meta SET k = $1 WHERE k = $2`, [prefix + k, k]);
       }
@@ -857,23 +856,168 @@ export class PostgresStorage implements Storage {
    * first. `dryRun: true` returns the statements it WOULD run without touching the DB.
    */
   /**
-   * See `Storage.upgrade`. Steps: `schema` (the tables, columns and indexes this version expects —
-   * additive only), then `thread-records`, then `relations` (places older rows' person and thread).
+   * See `Storage.upgrade`. Steps: `run-status` (an earlier version's status flags into `status` and
+   * `outcome` — the one step that drops columns), `schema` (the tables, columns and indexes this version
+   * expects — additive only), then `thread-records`, then `relations` (places older rows' person and thread).
    */
   async upgrade(opts?: UpgradeOptions): Promise<UpgradeReport> {
     refuseUnknownNames('PostgresStorage.upgrade', opts, UPGRADE_NAMES);
     return runUpgrade('PostgresStorage', [
+      runStatusStep(this),
       {
         name: 'schema',
         description: 'adds the tables, columns and indexes this version expects (additive: never drops or renames)',
+        requires: ['run-status'],
         pending: async () => !(await this.checkSchema()).ok,
         plan: async () => ({ statements: (await this.applySchemaGap({ dryRun: true })).statements }),
         run: async () => ({ statements: (await this.applySchemaGap()).statements }),
       },
-      threadRecordsStep(this, ['schema']),
-      relationsStep(this.runs as PgRunJournal, ['schema']),
-      verifyRelationsStep(this.runs as PgRunJournal, ['schema']),
+      this.booted(threadRecordsStep(this, ['schema'])),
+      this.booted(relationsStep(this.runs as PgRunJournal, ['schema'])),
+      this.booted(verifyRelationsStep(this.runs as PgRunJournal, ['schema'])),
     ], opts);
+  }
+
+  /**
+   * A step that reads through the adapter, run on a booted one. Some of the adapter's SQL is shaped by
+   * what the boot settles — the collation its key ranges need (`COLLATE "C"` on a linguistic database),
+   * whether the relation guards hold — and a statement built before the boot is built without it: on an
+   * en_US.utf8 database the first `listKeys('__org__:')` of an unbooted instance matched nothing, so the
+   * `thread-records` step saw no organization and called every scope complete (measured on a store
+   * 19b94c3f wrote: acme's threads were marked only by a second `gnl upgrade`). Before this step existed
+   * the CLI booted the store first; a store whose `run-status` step is pending refuses to boot, so each
+   * step boots it once the steps before it have run.
+   */
+  private booted(step: UpgradeStep): UpgradeStep {
+    const plan = step.plan;
+    return {
+      ...step,
+      pending: async () => { await this.ensureReady(); return step.pending(); },
+      ...(plan ? { plan: async () => { await this.ensureReady(); return plan.call(step); } } : {}),
+      run: async () => { await this.ensureReady(); return step.run(); },
+    };
+  }
+
+  /** `gnl_runs`' columns as the catalog has them; empty when there is no such table yet. */
+  private async runColumns(on: { query: Pool['query'] } = this._pool): Promise<Set<string>> {
+    const r = await on.query(`SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'gnl_runs'`);
+    return new Set((r.rows as { column_name: string }[]).map((x) => x.column_name));
+  }
+
+  /** See RunStatusMigrator. Asks the catalog, never `ensureReady` (which refuses such a store). */
+  async runStatusPending(): Promise<boolean> {
+    return runStatusPending(await this.runColumns());
+  }
+
+  /** The statements `migrateRunStatus` runs on this store, in order (`gnl upgrade --list`). */
+  async runStatusPlan(): Promise<string[]> {
+    const cols = await this.runColumns();
+    if (!runStatusPending(cols)) return [];
+    const m = runStatusMigration(cols);
+    return [m.add, `${m.page} -- then, per page: ${m.fill('$1, …')}`, m.index, m.byStatus, 'ANALYZE gnl_runs', 'BEGIN', 'LOCK TABLE gnl_runs IN ACCESS EXCLUSIVE MODE', m.reconcile,
+      'DROP INDEX IF EXISTS gnl_runs_open', 'ALTER INDEX gnl_runs_open_status RENAME TO gnl_runs_open', m.drop, m.dropDefault, 'COMMIT'];
+  }
+
+  /**
+   * The `run-status` step: `gnl_runs`' four flags into `outcome` and `status`, then the flags dropped.
+   *
+   * 1. The two columns added — `status` with a DEFAULT of 'completed', which Postgres (11+) stores once
+   *    in the catalog rather than in every row: no table rewrite, a lock held for milliseconds. Every run
+   *    no flag marks is then already right.
+   * 2. The runs a flag marks filled, FILL_PAGE at a time in creation order, each page its own statement:
+   *    row locks only, no table lock, client memory bounded by a page. A page picks only rows still at
+   *    the default — a filled row never is (a flag always means a status other than 'completed') — so a
+   *    step killed here and run again continues where it stopped.
+   * 3. The two indexes on `status` built CONCURRENTLY (writers are not held off) — `gnl_runs_open` under a
+   *    temporary name, since the old one on the flags still has it — then ANALYZE, so the planner knows
+   *    the new column before the lock is taken.
+   * 4. One short transaction under an ACCESS EXCLUSIVE lock on `gnl_runs`: every row a flag marks or
+   *    whose status is not the default is compared with what its flags say, and the few that differ —
+   *    written by an earlier version's process after their page — are written again; then the old index
+   *    and the flags go, the new index takes the old name, and the default goes, so a write that names no
+   *    status fails instead of quietly reading 'completed'. A write of an earlier version either commits
+   *    before the lock (and is reconciled) or after it (and fails on the missing column). Killed, the
+   *    transaction rolls back and the step runs again from 2 (nothing left to fill) on.
+   * Measured on 1 000 000 runs (C+ A2): 167 flagged — 0.6 s, the lock held 6 ms (99 ms on a store 0.10.0
+   * wrote: no index on the flags, so the reconcile reads the table); 500 167 flagged — 20 s, nearly all
+   * of it the fill, the lock 216 ms. A first design that filled under the lock held it 16 s there.
+   */
+  async migrateRunStatus(): Promise<Record<string, unknown>> {
+    const ms: Record<string, number> = {};
+    const timed = async <T>(phase: string, f: () => Promise<T>): Promise<T> => {
+      const t0 = Date.now();
+      try { return await f(); } finally { ms[phase] = (ms[phase] ?? 0) + Date.now() - t0; }
+    };
+    if (!runStatusPending(await this.runColumns())) return { runs: 0, ms };
+    if (typeof this._pool.connect !== 'function') {
+      throw new Error('@gnldev/durable: the run-status step needs a pool that supports connect(), so its last part is one transaction. Pass a real `pg` Pool (or a connectionString).');
+    }
+    // A backend without some statement (pg-mem: LOCK TABLE, CREATE INDEX CONCURRENTLY, ALTER INDEX) answers
+    // with an error that carries no SQLSTATE; a real Postgres error always has one, and is never swallowed.
+    const unsupported = (e: unknown) => (e as { code?: string } | undefined)?.code === undefined;
+    await timed('addColumns', () => this._pool.query(runStatusMigration(new Set()).add));
+    const m = runStatusMigration(await this.runColumns());
+    let runs = 0;
+    let pages = 0;
+    await timed('fill', async () => {
+      let after: { at: unknown; runId: string } | undefined;
+      for (;;) {
+        const page = (await this._pool.query(m.page, after ? [after.at, after.runId] : [null, null])).rows as { run_id: string; created_at: unknown }[];
+        if (page.length === 0) break;
+        const r = await this._pool.query(m.fill(page.map((_, k) => `$${k + 1}`).join(', ')), page.map((x) => x.run_id));
+        runs += Number(r.rowCount ?? page.length);
+        pages++;
+        const last = page[page.length - 1]!;
+        after = { at: last.created_at, runId: last.run_id };
+        if (page.length < FILL_PAGE) break;
+      }
+    });
+    await timed('index', async () => {
+      const valid = await this.indexValidity().catch(() => undefined);
+      for (const [name, sql] of [['gnl_runs_open_status', m.index], ['gnl_runs_status', m.byStatus]] as const) {
+        if (valid?.get(name) === false) await this._pool.query(`DROP INDEX CONCURRENTLY IF EXISTS ${name}`);
+        await this._pool.query(sql).catch((e: unknown) => {
+          if (!unsupported(e)) throw e;
+          return this._pool.query(sql.replace(' CONCURRENTLY', ''));
+        });
+      }
+    });
+    // The planner's picture of the new column BEFORE the lock: without it the reconcile below read the
+    // whole table under the lock (1 000 000 runs: a sequential scan, 135 ms) instead of the two indexes
+    // (0.5 ms).
+    const analyzed = await timed('analyze', () => this._pool.query('ANALYZE gnl_runs').then(() => true, () => false));
+    const client = await this._pool.connect();
+    let reconciled = 0;
+    let destroy = false;
+    try {
+      await timed('lockedSwap', async () => {
+        await client.query('BEGIN');
+        try {
+          await client.query('LOCK TABLE gnl_runs IN ACCESS EXCLUSIVE MODE').catch((e: unknown) => { if (!unsupported(e)) throw e; });
+          // Asked again under the lock: another `gnl upgrade` may have finished while this one waited.
+          const cols = await this.runColumns(client);
+          if (RUN_STATUS_FLAGS.some((f) => cols.has(f))) {
+            const now = runStatusMigration(cols);
+            reconciled = Number((await client.query(now.reconcile)).rowCount ?? 0);
+            await client.query('DROP INDEX IF EXISTS gnl_runs_open');
+            await client.query('ALTER INDEX gnl_runs_open_status RENAME TO gnl_runs_open').catch(async (e: unknown) => {
+              if (!unsupported(e)) throw e;
+              await client.query('DROP INDEX IF EXISTS gnl_runs_open_status');
+              await client.query(now.index.replace(' CONCURRENTLY', '').replace('gnl_runs_open_status', 'gnl_runs_open'));
+            });
+            await client.query(now.drop);
+            await client.query(now.dropDefault);
+          }
+          await client.query('COMMIT');
+        } catch (e) {
+          await client.query('ROLLBACK').catch(() => { destroy = true; });
+          throw e;
+        }
+      });
+    } finally {
+      client.release?.(destroy);
+    }
+    return { runs, pages, reconciled, analyzed, ms };
   }
 
   /** The `schema` step: applies exactly the gap checkSchema reports (see above). */
@@ -916,6 +1060,48 @@ export class PostgresStorage implements Storage {
   }
 }
 
+/** Runs the `run-status` step fills per statement (Postgres). */
+const FILL_PAGE = 5000;
+
+/**
+ * The `run-status` step's statements for a `gnl_runs` with these columns (the flags it has: a store from
+ * before one of them existed lacks it, and a missing flag reads false, as it did there — except
+ * `suspended`, which every version had: without it the flags are ones an earlier version's boot put back
+ * on a migrated table, and the counter decides, as it does for this version).
+ */
+function runStatusMigration(cols: ReadonlySet<string>): {
+  add: string; page: string; fill: (ids: string) => string; index: string; byStatus: string; reconcile: string; drop: string; dropDefault: string;
+} {
+  const flags = RUN_STATUS_FLAGS.filter((f) => cols.has(f));
+  const on = (f: (typeof RUN_STATUS_FLAGS)[number]) => (flags.includes(f) ? `${f} = true` : 'false');
+  // The order 0.10 decoded the flags in (`outcomeOfRow`); they were written together from one outcome,
+  // so at most one is set and the order never decides anything on a row 0.10 wrote.
+  const outcome = `(CASE WHEN ${on('canceled')} THEN 'canceled' WHEN ${on('failed')} THEN 'failed' WHEN ${on('running')} THEN 'running' END)`;
+  const status = runStatusCaseSql(flags.includes('suspended') ? on('suspended') : 'suspended_count > 0', outcome);
+  // The runs a flag marks, in the order of 0.10's `gnl_runs_open` predicate, so the planner reads them from it.
+  const flagged = flags.length ? `(${(['canceled', 'suspended', 'failed', 'running'] as const).filter((f) => flags.includes(f)).map((f) => `${f} = true`).join(' OR ')})` : 'false';
+  const set = `outcome = ${outcome}, status = ${status}`;
+  return {
+    add: `ALTER TABLE gnl_runs ADD COLUMN IF NOT EXISTS outcome TEXT, ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'completed'`,
+    // Keyset by (created_at, run_id), expanded rather than a row comparison (pg-mem refuses those);
+    // `$1` NULL on the first page.
+    page: `SELECT run_id, created_at FROM gnl_runs WHERE ${flagged} AND status = 'completed'`
+      + ` AND ($1::bigint IS NULL OR created_at > $1::bigint OR (created_at = $1::bigint AND run_id > $2::text)) ORDER BY created_at, run_id LIMIT ${FILL_PAGE}`,
+    fill: (ids) => `UPDATE gnl_runs SET ${set} WHERE run_id IN (${ids})`,
+    index: `CREATE INDEX CONCURRENTLY IF NOT EXISTS gnl_runs_open_status ON gnl_runs (created_at, run_id) WHERE ${openRunPredicate()}`,
+    byStatus: `CREATE INDEX CONCURRENTLY IF NOT EXISTS gnl_runs_status ON gnl_runs (status, created_at, run_id) WHERE ${openRunPredicate()}`,
+    // A run a flag marks, or one already filled whose flags an earlier version's write has since cleared,
+    // that says something else than its flags. Without `suspended` the flags are an earlier version's
+    // boot put back after the step (empty, never written: its writes all name `suspended`) and the
+    // columns are the truth, so only a row such a flag marks is looked at — none.
+    // COALESCE rather than IS DISTINCT FROM: the same answer, and pg-mem parses it.
+    reconcile: `UPDATE gnl_runs SET ${set} WHERE ${flags.includes('suspended') ? `(${flagged} OR ${openRunPredicate()})` : flagged}`
+      + ` AND (status <> ${status} OR COALESCE(outcome, '') <> COALESCE(${outcome}, ''))`,
+    drop: `ALTER TABLE gnl_runs ${(flags.length ? flags : RUN_STATUS_FLAGS).map((f) => `DROP COLUMN IF EXISTS ${f}`).join(', ')}`,
+    dropDefault: `ALTER TABLE gnl_runs ALTER COLUMN status DROP DEFAULT`,
+  };
+}
+
 type Q = (sql: string, params?: unknown[]) => Promise<QueryResult>;
 /** `where` (empty, or ` WHERE …` from keysetRunPage) with one more condition. */
 const and = (where: string, cond: string): string => (where ? `${where} AND ${cond}` : ` WHERE ${cond}`);
@@ -942,6 +1128,14 @@ const PLACE_PAGE = 1000;
 /** Number of rows inserted: real pg rowCount (0 on a DO NOTHING conflict); pg-mem fallback is rows.length. */
 const inserted1 = (r: QueryResult) => (r.rowCount ?? r.rows.length) === 1;
 
+/** A journal record's row. `owner` (ownerColumnOf): written with the record, in the same statement, every time the record is. */
+const journalRow = (key: string, value: unknown, p: { runId: string; kind: string } | null, suspended: boolean): unknown[] =>
+  [key, p?.runId ?? null, p?.kind ?? null, !!suspended, serialize(value), Date.now(), ownerColumnOf(key, value)];
+const JOURNAL_UPSERT = `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at, owner) VALUES ($1,$2,$3,$4,$5,$6,$7)
+  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, suspended = EXCLUDED.suspended, owner = EXCLUDED.owner`;
+const JOURNAL_INSERT = `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at, owner) VALUES ($1,$2,$3,$4,$5,$6,$7)
+  ON CONFLICT (key) DO NOTHING RETURNING key`;
+
 /**
  * `atomic: true` marks a caller whose correctness DEPENDS on the transaction, so `tx` refuses instead
  * of quietly running the body unwrapped. Every journal write below is such a caller — their own
@@ -956,6 +1150,19 @@ const inserted1 = (r: QueryResult) => (r.rowCount ?? r.rows.length) === 1;
 type TxOptions = { atomic?: true; readCommitted?: true };
 type Tx = <T>(fn: (q: Q) => Promise<T>, opts?: TxOptions) => Promise<T>;
 
+/** A `gnl_runs` row (with its `:input` value as `input_val`) as the summary every listing hands out. */
+function pgRunSummary(x: any): RunSummary {
+  const input = x.input_val ? deserialize<{ threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string }>(x.input_val) : undefined;
+  return {
+    runId: x.run_id, status: x.status as RunStatus, modelSteps: Number(x.model_steps), toolCalls: Number(x.tool_calls),
+    ...(input?.threadId ? { threadId: input.threadId } : {}),
+    ...(input?.agent ? { agent: input.agent } : {}),
+    ...(input?.resourceId ? { resourceId: input.resourceId } : {}),
+    ...(input?.workKey ? { workKey: input.workKey } : {}),
+    ...(input?.parentRunId ? { parentRunId: input.parentRunId } : {}),
+  };
+}
+
 class PgRunJournal implements RunJournal {
   constructor(private q: Q, private tx: Tx, private shape: PrefixShape) {}
   async get<T = unknown>(key: string): Promise<T | undefined> {
@@ -965,86 +1172,37 @@ class PgRunJournal implements RunJournal {
   async put(key: string, value: unknown): Promise<void> {
     const p = parseJournalKey(key);
     const suspended = p?.kind === 'tool' && (value as ToolJournalRecord | undefined)?.status === 'suspended';
-    // `owner` (ownerColumnOf): written with the record, in the same statement, every time the record is.
-    const upsert = (q: Q) => q(
-      `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at, owner) VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, suspended = EXCLUDED.suspended, owner = EXCLUDED.owner`,
-      [key, p?.runId ?? null, p?.kind ?? null, !!suspended, serialize(value), Date.now(), ownerColumnOf(key, value)],
-    );
-    if (!p) {
-      // Not a replayable entry (no run_id / no kind in the journal table — readRun and time-travel must
-      // not start seeing it), but it may still BELONG to a run. Register the run itself, or one that died
-      // before its first model step never appears in listRuns and is never reached by sweepRuns — its
-      // persisted prompt then outlives every retention window.
-      const owner = runIdOfKey(key, value);
-      const oc = outcomeStatusOf(key, value);
-      if (!owner && oc === null) { await upsert(this.q); return; } // genuinely run-less key
-      await this.tx(async (q) => {
-        await upsert(q);
-        if (owner) await this.touchRunDelta(q, owner, null, false, 0);
-        await this.placeRun(q, key, value); // a run's `:input`: its person and thread, in this transaction
-        // Own path, not riding on run ownership (see the sqlite twin). The UPDATE only touches an
-        // existing row, so it cannot invent a run. ALL THREE flags from ONE status in ONE statement,
-        // so they can never disagree — and every transition clears its predecessors.
-        if (oc !== null) {
-          const runId = key.slice(0, -':outcome'.length);
-          // First write of a brand-new run may precede its row — see the sqlite twin's comment.
-          await this.touchRunDelta(q, runId, null, false, 0);
-          await q(`UPDATE gnl_runs SET failed = $1, running = $2, canceled = $3 WHERE run_id = $4`, [oc === 'failed', oc === 'running', oc === 'canceled', runId]);
-        }
-      }, { atomic: true });
+    if (!p && !runIdOfKey(key, value) && outcomeStatusOf(key, value) === null) {
+      await this.q(JOURNAL_UPSERT, journalRow(key, value, p, suspended)); // genuinely run-less key
       return;
     }
-    // T1 audit fix: SELECT prev → journal UPSERT → gnl_runs delta triple, all in ONE transaction.
-    // Under autocommit there were two hazards: (1) two workers on the same NEW key both see prev=none →
-    // the counter double-increments; (2) a crash between the suspended write and the gnl_runs update →
-    // stale suspended=false → retention could delete a suspended run. The transaction ALONE does NOT
-    // FIX (1) (under READ COMMITTED both txns still read prev=none from the old snapshot) → first
-    // lockRunRow: writers to the same run get SERIALIZED on the gnl_runs row lock, so the second txn's
-    // SELECT sees the committed prev. H11b's O(1) incremental update (touchRunDelta) is preserved as-is.
-    await this.tx(async (q) => {
-      await this.lockRunRow(q, p.runId);
-      const prev = (await q('SELECT suspended FROM gnl_run_journal WHERE key = $1', [key])).rows[0];
-      await upsert(q);
-      const delta = (suspended ? 1 : 0) - (prev?.suspended ? 1 : 0);
-      await this.touchRunDelta(q, p.runId, p.kind, prev === undefined, delta);
-    }, { atomic: true });
+    // T1 audit fix: prev → journal write → run row, all in ONE transaction. Under autocommit there were
+    // two hazards: (1) two workers on the same NEW key both see prev=none → the counter
+    // double-increments; (2) a crash between the suspended write and the gnl_runs update → stale
+    // suspended=false → retention could delete a suspended run. `writeRecord` closes (1) on the
+    // JOURNAL row: the second writer of a key waits for the first and reads what it committed.
+    // Not a replayable entry (`!p`: no run_id / no kind in the journal table — readRun and
+    // time-travel must not start seeing it) may still BELONG to a run: its `:input` registers and
+    // places the run, its outcome record sets its outcome and status (`RunRowChanges.noteWrite`).
+    await this.writeTx(async (q) => {
+      const prev = await this.writeRecord(q, key, value, p, suspended);
+      await this.writeRunRows(q, new RunRowChanges().noteWrite(key, value, prev));
+    });
   }
   async putIfAbsent(key: string, value: unknown): Promise<boolean> {
     const p = parseJournalKey(key);
     const suspended = p?.kind === 'tool' && (value as ToolJournalRecord | undefined)?.status === 'suspended';
-    const ins = (q: Q) => q(
-      `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at, owner) VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (key) DO NOTHING RETURNING key`,
-      [key, p?.runId ?? null, p?.kind ?? null, !!suspended, serialize(value), Date.now(), ownerColumnOf(key, value)],
-    );
-    if (!p) {
-      const owner = runIdOfKey(key, value);
-      const oc = outcomeStatusOf(key, value);
-      if (!owner && oc === null) return inserted1(await ins(this.q)); // genuinely run-less key
-      return await this.tx(async (q) => {
-        const ok = inserted1(await ins(q));
-        if (ok) {
-          if (owner) await this.touchRunDelta(q, owner, null, false, 0);
-          await this.placeRun(q, key, value); // only the winner places: a lost claim wrote nothing, columns included
-          // First outcome write arrives via putIfAbsent (monotonic recordRunOutcome) — see sqlite twin.
-          if (oc !== null) {
-            const runId = key.slice(0, -':outcome'.length);
-            await this.touchRunDelta(q, runId, null, false, 0); // see the sqlite twin
-            await q(`UPDATE gnl_runs SET failed = $1, running = $2, canceled = $3 WHERE run_id = $4`, [oc === 'failed', oc === 'running', oc === 'canceled', runId]);
-          }
-        }
-        return ok;
-      }, { atomic: true });
+    if (!p && !runIdOfKey(key, value) && outcomeStatusOf(key, value) === null) {
+      return inserted1(await this.q(JOURNAL_INSERT, journalRow(key, value, p, suspended))); // genuinely run-less key
     }
-    // T1: INSERT + touchRunDelta in a single transaction (closes the crash window). lockRunRow uses the
-    // SAME lock order as put() (gnl_runs first, then the journal row) → no deadlock possibility between put/putIfAbsent.
-    return this.tx(async (q) => {
-      await this.lockRunRow(q, p.runId);
-      const inserted = inserted1(await ins(q));
-      if (inserted) await this.touchRunDelta(q, p.runId, p.kind, true, suspended ? 1 : 0); // fresh insert → O(1)
+    // The INSERT is the claim and its own lock: a concurrent claim of the same key waits for this
+    // transaction and then finds the row (DO NOTHING). Only the winner touches the run's row — a lost
+    // claim writes nothing at all, run row and relation columns included.
+    return this.writeTx(async (q) => {
+      const inserted = inserted1(await q(JOURNAL_INSERT, journalRow(key, value, p, suspended)));
+      if (inserted) await this.writeRunRows(q, new RunRowChanges().noteWrite(key, value, undefined));
       return inserted;
-    }, { atomic: true });
+    });
   }
   /**
    * H1: atomic conditional replace (expired run-lock takeover, see journal.ts JSDoc).
@@ -1065,26 +1223,21 @@ class PgRunJournal implements RunJournal {
       const oc = outcomeStatusOf(key, value);
       const placed = runRelationsOf(key, value) !== undefined;
       if (oc === null && !placed) return Number((await upd(this.q)).rowCount ?? 0) === 1; // ':lock' etc. → no derived index
-      return await this.tx(async (q) => {
+      // The monotonic outcome REPLACEMENT (running→terminal) arrives here: the outcome follows the record,
+      // and so do a run's person and thread should its `:input` be replaced this way.
+      return await this.writeTx(async (q) => {
         const ok = Number((await upd(q)).rowCount ?? 0) === 1;
-        if (ok && oc !== null) {
-          const runId = key.slice(0, -':outcome'.length);
-          await this.touchRunDelta(q, runId, null, false, 0); // see the sqlite twin
-          await q(`UPDATE gnl_runs SET failed = $1, running = $2, canceled = $3 WHERE run_id = $4`, [oc === 'failed', oc === 'running', oc === 'canceled', runId]);
-        }
-        if (ok) await this.placeRun(q, key, value); // see the sqlite twin
+        if (ok) await this.writeRunRows(q, new RunRowChanges().noteWrite(key, value, undefined));
         return ok;
-      }, { atomic: true });
+      });
     }
-    // T1: UPDATE + recountRun in one transaction (closes the crash → stale gnl_runs window). There is NO
-    // lockRunRow here — so a failed match doesn't create a phantom row in gnl_runs (the lock order stays
-    // journal→runs; a theoretical deadlock with put requires the rare path × the same key, and PG detects
-    // it and aborts one → the caller sees an error, the takeover just doesn't happen that round = the safe side).
-    return this.tx(async (q) => {
+    // T1: UPDATE + recountRun in one transaction (closes the crash → stale gnl_runs window). The lock
+    // order is the journal row, then the run's row — the order every write path takes.
+    return this.writeTx(async (q) => {
       const ok = Number((await upd(q)).rowCount ?? 0) === 1;
       if (ok) await this.recountRun(q, p.runId); // rare path (takeover) → a full recount is safe and sufficient
       return ok;
-    }, { atomic: true });
+    });
   }
 
   /** H8a: in-engine atomic counter (UPSERT arithmetic) — lost-update is impossible, hot-row lock is short. */
@@ -1146,7 +1299,7 @@ class PgRunJournal implements RunJournal {
   async listStaleRuns(cutoffTs: number, opts?: { includeSuspended?: boolean }): Promise<string[]> {
     const sql = opts?.includeSuspended
       ? 'SELECT run_id FROM gnl_runs WHERE updated_at < $1'
-      : 'SELECT run_id FROM gnl_runs WHERE updated_at < $1 AND suspended = false';
+      : 'SELECT run_id FROM gnl_runs WHERE updated_at < $1 AND suspended_count <= 0'; // what 0.10's `suspended` flag was: count > 0
     const r = await this.q(sql, [cutoffTs]);
     return r.rows.map((row: any) => row.run_id);
   }
@@ -1165,35 +1318,102 @@ class PgRunJournal implements RunJournal {
     return Number(r.rows[0].ms);
   }
   /**
-   * T1: row lock that serializes concurrent writers to the same run — locks the gnl_runs row
-   * (creating it if missing) via ON CONFLICT DO UPDATE (even a no-op update takes a row lock);
-   * held until the end of the transaction. On rollback the created row is also undone → no phantom run remains.
+   * A journal write's transaction (`atomic`), run again when Postgres aborts it as a deadlock victim
+   * (40P01). The abort rolled ALL of it back — the record, a claim, the run's row — so running it again
+   * is the same write, and a claim that another writer won meanwhile is then simply lost.
+   *
+   * The one deadlock this version can meet is with an OLDER process (0.10 and before), which locks the
+   * run's row before the record's while this version locks the record's first (`writeRecord`): the two
+   * writing the SAME key at the same moment can each hold what the other waits for. Postgres breaks it
+   * after `deadlock_timeout` (1 s by default) by aborting one; this side retries, the older side
+   * surfaces the error as any failed write. Between two processes of this version the order is the same
+   * everywhere — journal rows, then run rows in run-id order — so they cannot deadlock on each other.
    */
-  private async lockRunRow(q: Q, runId: string): Promise<void> {
-    const now = Date.now();
-    await q(
-      `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at)
-       VALUES ($1,0,0,false,0,$2,$3)
-       ON CONFLICT (run_id) DO UPDATE SET updated_at = gnl_runs.updated_at`,
-      [runId, now, now],
-    );
+  private async writeTx<T>(fn: (q: Q) => Promise<T>): Promise<T> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.tx(fn, { atomic: true });
+      } catch (e) {
+        if ((e as { code?: string })?.code !== '40P01' || attempt >= 3) throw e;
+      }
+    }
   }
 
   /**
-   * A run's `:input` names who and where the run is (`runRelationsOf`): its `gnl_runs` row gets them,
-   * in the caller's transaction. Any other key: nothing. An upsert, so the row exists whichever write of
-   * the run came first. Same lock order as touchRunDelta (the journal row, then the run's row).
+   * Writes a record and returns the row it replaced (`undefined`: a fresh insert, or a record that is
+   * not run-scoped) — for a run-scoped record (`<run>:model:…`/`<run>:tool:…`), what its run's counters
+   * need, read under the JOURNAL row's lock.
+   *
+   * An existing key: `SELECT … FOR UPDATE` locks it (and, at READ COMMITTED, reads the latest committed
+   * version), then the upsert overwrites it. A new key: the INSERT is the lock — a concurrent writer of
+   * the same key waits for this transaction, finds the row (DO NOTHING) and goes round again, now seeing
+   * it. So two writers of one key are serialized on that key, and the counter counts it once (T1 (1)).
+   *
+   * This replaced a lock on the RUN's row (`lockRunRow`: an `ON CONFLICT DO UPDATE` no-op) taken before
+   * every write. That serialized every writer of a run — including every sub-agent's tool-call record
+   * on its PARENT's row — for the whole transaction, and wrote a dead tuple each time. Measured on the
+   * 1M-run Postgres, 200 sub-agents under one parent step: 45 of 119 sampled active backends waited on
+   * that row; with a 40-connection pool, 217 samples did. The run's row is now locked by its one upsert
+   * (`writeRunRows`), at the end of the transaction, for one statement and the COMMIT.
    */
-  private async placeRun(q: Q, key: string, value: unknown): Promise<void> {
-    const rel = runRelationsOf(key, value);
-    if (!rel) return;
-    const now = Date.now();
-    await q(
-      `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at, resource_id, thread_id)
-       VALUES ($1,0,0,false,0,$2,$2,$3,$4)
-       ON CONFLICT (run_id) DO UPDATE SET resource_id = EXCLUDED.resource_id, thread_id = EXCLUDED.thread_id`,
-      [rel.runId, now, rel.resourceId, rel.threadId],
-    );
+  private async writeRecord(q: Q, key: string, value: unknown, p: { runId: string; kind: string } | null, suspended: boolean): Promise<{ suspended: boolean } | undefined> {
+    if (!p) { await q(JOURNAL_UPSERT, journalRow(key, value, p, suspended)); return undefined; } // counts nothing: no prev needed
+    // Twice is the bound for a key that is not deleted in between: the second pass finds the row the
+    // first one's INSERT lost to. A third means the key was deleted and inserted again meanwhile.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const prev = (await q('SELECT suspended FROM gnl_run_journal WHERE key = $1 FOR UPDATE', [key])).rows[0] as { suspended: boolean } | undefined;
+      if (prev) { await q(JOURNAL_UPSERT, journalRow(key, value, p, suspended)); return { suspended: !!prev.suspended }; }
+      if (inserted1(await q(JOURNAL_INSERT, journalRow(key, value, p, suspended)))) return undefined;
+    }
+    throw new Error(`@gnldev/durable: journal key ${JSON.stringify(key)} was deleted and written again by other writers three times while this write waited; nothing was written — retry the write.`);
+  }
+
+  /**
+   * The runs' rows for one transaction's writes: ONE upsert per run (`RunRowChanges`, run-id order),
+   * carrying the counters (H11b: O(1) deltas, never a recount), the `:input`'s person and thread, the
+   * outcome, the status, and `updated_at` — which every write advances (the change feed reads it).
+   * An upsert, so the row exists whichever write of the run came first (the write-ahead outcome may
+   * precede `:input`). After the journal write, so the relation guard (RUN_UNPLACE) has already
+   * unplaced the run when this places it again.
+   *
+   * The status is written in this same statement from its two inputs: a new row's from the values it is
+   * inserted with (`runStatusOf`), an existing row's in SQL from its counter after the delta and its
+   * outcome after this write (`runStatusCaseSql` — the one place the rule is SQL, generated from the same
+   * precedence table), since only the database knows the row's counter.
+   */
+  private async writeRunRows(q: Q, changes: RunRowChanges): Promise<void> {
+    for (const [runId, c] of changes.entries()) {
+      const now = Date.now();
+      const outcome = storedOutcomeOf(c.outcome);
+      const row: [string, unknown][] = [['run_id', runId], ['model_steps', c.models], ['tool_calls', c.tools],
+        ['suspended_count', Math.max(0, c.suspendedDelta)], ['outcome', outcome], ['status', runStatusOf(Math.max(0, c.suspendedDelta), outcome)],
+        ['created_at', now], ['updated_at', now]];
+      const sets: string[] = [];
+      if (c.relations) {
+        row.push(['resource_id', c.relations.resourceId], ['thread_id', c.relations.threadId]);
+        sets.push('resource_id = EXCLUDED.resource_id', 'thread_id = EXCLUDED.thread_id');
+      }
+      // An outcome written in this transaction replaces the row's (every transition clears its
+      // predecessor, 'completed' included: NULL); otherwise the row keeps its own.
+      if (c.outcome) sets.push('outcome = EXCLUDED.outcome');
+      const vals = row.map(([, v]) => v);
+      const param = (v: unknown) => `$${vals.push(v)}`;
+      const delta = param(c.suspendedDelta);
+      // `status` first: Postgres reads every `gnl_runs.` in the SET as the row before the update, whatever
+      // the order; pg-mem reads each after the assignments before it (measured: a run with two approvals
+      // pending, one resolved, read 'completed' — the count already decremented when the status was
+      // computed). First, it is the row before the update on both.
+      await q(
+        `INSERT INTO gnl_runs (${row.map(([col]) => col).join(', ')}) VALUES (${row.map((_, i) => `$${i + 1}`).join(',')})
+         ON CONFLICT (run_id) DO UPDATE SET
+           status = ${runStatusCaseSql(`gnl_runs.suspended_count + ${delta} > 0`, c.outcome ? 'EXCLUDED.outcome' : 'gnl_runs.outcome')},
+           model_steps = gnl_runs.model_steps + ${param(c.models)},
+           tool_calls = gnl_runs.tool_calls + ${param(c.tools)},
+           suspended_count = gnl_runs.suspended_count + ${delta},
+           updated_at = ${param(now)}${sets.map((x) => `, ${x}`).join('')}`,
+        vals,
+      );
+    }
   }
 
   /**
@@ -1357,24 +1577,6 @@ class PgRunJournal implements RunJournal {
     return { runs, owners, analyzed };
   }
 
-  /** H11b — O(1) incremental gnl_runs update (hot path; details: sqlite-storage.ts's equivalent method). */
-  private async touchRunDelta(q: Q, runId: string, kind: 'model' | 'tool' | null, isInsert: boolean, suspendedDelta: number): Promise<void> {
-    const m = isInsert && kind === 'model' ? 1 : 0;
-    const t = isInsert && kind === 'tool' ? 1 : 0;
-    const now = Date.now();
-    await q(
-      `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (run_id) DO UPDATE SET
-         model_steps = gnl_runs.model_steps + $8,
-         tool_calls = gnl_runs.tool_calls + $9,
-         suspended_count = gnl_runs.suspended_count + $10,
-         suspended = (gnl_runs.suspended_count + $10) > 0,
-         updated_at = $11`,
-      [runId, m, t, suspendedDelta > 0, Math.max(0, suspendedDelta), now, now, m, t, suspendedDelta, now],
-    );
-  }
-
   /** Full recount — for rare paths (putIfMatch/repair). */
   private async recountRun(q: Q, runId: string): Promise<void> {
     const c = (await q(
@@ -1382,10 +1584,12 @@ class PgRunJournal implements RunJournal {
               SUM(CASE WHEN suspended THEN 1 ELSE 0 END) AS s, MIN(created_at) AS c0 FROM gnl_run_journal WHERE run_id = $1`,
       [runId],
     )).rows[0];
+    // The counter is recounted; the outcome is the row's own (a new row has none), and the status follows both.
     await q(
-      `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (run_id) DO UPDATE SET model_steps=EXCLUDED.model_steps, tool_calls=EXCLUDED.tool_calls, suspended=EXCLUDED.suspended, suspended_count=EXCLUDED.suspended_count, updated_at=EXCLUDED.updated_at`,
-      [runId, Number(c.m) || 0, Number(c.t) || 0, Number(c.s) > 0, Number(c.s) || 0, Number(c.c0) || Date.now(), Date.now()],
+      `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended_count, status, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (run_id) DO UPDATE SET status=${runStatusCaseSql('EXCLUDED.suspended_count > 0', 'gnl_runs.outcome')},
+         model_steps=EXCLUDED.model_steps, tool_calls=EXCLUDED.tool_calls, suspended_count=EXCLUDED.suspended_count, updated_at=EXCLUDED.updated_at`,
+      [runId, Number(c.m) || 0, Number(c.t) || 0, Number(c.s) || 0, runStatusOf(Number(c.s) || 0, null), Number(c.c0) || Date.now(), Date.now()],
     );
   }
   async listKeys(prefix: string, opts?: { limit?: number }): Promise<string[]> {
@@ -1444,39 +1648,21 @@ class PgRunJournal implements RunJournal {
    * faster) on real Postgres too, same behavior. `||` is the string concat operator in Postgres.
    *
    * P0.3 filters — same split as sqlite-storage.ts's listRuns: `status` pushes
-   * down to a WHERE on the indexed `gnl_runs.suspended` boolean (matches the SAME derivation used
-   * below, cannot drift); `agent` has no indexed column (it's inside the `:input` blob) — when given,
+   * down to a WHERE on `gnl_runs.status` (the same column every row's summary reads, so a filter cannot
+   * drift from it); `agent` has no indexed column (it's inside the `:input` blob) — when given,
    * this fetches every (status-filtered) row WITHOUT LIMIT/OFFSET, filters+paginates in JS (filter
    * BEFORE slicing). Honest scan cost, acceptable for an operator/debug filter — see the sqlite
    * comment for the full rationale.
    */
   async listRuns(q?: ListQuery): Promise<Page<RunSummary>> {
-    // Five-way, still on indexed columns, and in the SAME precedence deriveRunStatus applies
-    // (canceled beats suspended beats the rest of the recorded outcome) so a filtered page cannot
-    // disagree with a full scan.
-    const statusCond =
-      q?.status === 'canceled' ? 'r.canceled = true'
-      : q?.status === 'suspended' ? 'r.canceled = false AND r.suspended = true'
-      : q?.status === 'failed' ? 'r.canceled = false AND r.suspended = false AND r.failed = true'
-      : q?.status === 'running' ? 'r.canceled = false AND r.suspended = false AND r.failed = false AND r.running = true'
-      : q?.status === 'completed' ? 'r.canceled = false AND r.suspended = false AND r.failed = false AND r.running = false'
-      : undefined;
-    const toSummary = (x: any): RunSummary => {
-      const input = x.input_val ? deserialize<{ threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string }>(x.input_val) : undefined;
-      return {
-        runId: x.run_id, status: deriveRunStatus(!!x.suspended, outcomeOfRow(x)), modelSteps: Number(x.model_steps), toolCalls: Number(x.tool_calls),
-        ...(input?.threadId ? { threadId: input.threadId } : {}),
-        ...(input?.agent ? { agent: input.agent } : {}),
-        ...(input?.resourceId ? { resourceId: input.resourceId } : {}),
-        ...(input?.workKey ? { workKey: input.workKey } : {}),
-        ...(input?.parentRunId ? { parentRunId: input.parentRunId } : {}),
-      };
-    };
+    // The column the summaries read, so a filtered page cannot disagree with a full scan.
+    const statusCond = runStatusSql(q);
+    const toSummary = pgRunSummary;
     const atOf = async (runId: string) => {
       const r = await this.q('SELECT created_at FROM gnl_runs WHERE run_id = $1', [runId]);
       return r.rows[0] ? Number(r.rows[0].created_at) : undefined;
     };
-    const runCols = 'r.run_id, r.created_at, r.model_steps, r.tool_calls, r.suspended, r.failed, r.running, r.canceled';
+    const runCols = 'r.run_id, r.created_at, r.model_steps, r.tool_calls, r.status';
     const cols = `${runCols}, j.value AS input_val`;
     const trusted = await this.relationsTrusted();
     return keysetRunPage(q, statusCond, atOf, async (where, params, dir, take, skip, rel?: RunRelationRead) => {
@@ -1518,9 +1704,8 @@ class PgRunJournal implements RunJournal {
    * P1.6b: atomic batch — claim + counter increments + puts as ONE transaction (a single pinned client
    * via `tx`, same helper `put`/`putIfAbsent` use). `put`/`putIfAbsent` themselves can't be REUSED here
    * (each opens its OWN client via `tx()`, which would be a SEPARATE Postgres session — nesting them
-   * would silently defeat atomicity) — so the INSERT/UPSERT statements are mirrored inline (identical SQL
-   * to `put`'s `upsert`/`putIfAbsent`'s `ins`), while `touchRunDelta`/`lockRunRow` ARE reused as-is since
-   * they already take an explicit `q` and compose correctly with `tx`'s pinned client.
+   * would silently defeat atomicity) — so it runs the same statements (`JOURNAL_INSERT`, `writeRecord`,
+   * `writeRunRows`) on `tx`'s pinned client, and a put derives its run-row change exactly as `put` does.
    *
    * pg-mem NOTE (test-only limitation, see the file-header comment + `exactCas` in the conformance
    * matrix): pg-mem's `INSERT ... ON CONFLICT DO NOTHING RETURNING`/`rowCount` reports 1 even on a
@@ -1534,19 +1719,16 @@ class PgRunJournal implements RunJournal {
    * test double, not in the adapter.
    */
   async applyBatch(batch: JournalBatch): Promise<boolean> {
-    return this.tx(async (q) => {
+    return this.writeTx(async (q) => {
+      // Journal rows first, the runs' rows last — the lock order of every write path (`writeRecord`) —
+      // and each run's row once, however many of the batch's records belong to it.
+      const runs = new RunRowChanges();
       if (batch.claim) {
-        const p = parseJournalKey(batch.claim.key);
-        const suspended = p?.kind === 'tool' && (batch.claim.value as ToolJournalRecord | undefined)?.status === 'suspended';
-        if (p) await this.lockRunRow(q, p.runId);
-        const ins = await q(
-          `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at, owner) VALUES ($1,$2,$3,$4,$5,$6,$7)
-           ON CONFLICT (key) DO NOTHING RETURNING key`,
-          [batch.claim.key, p?.runId ?? null, p?.kind ?? null, !!suspended, serialize(batch.claim.value), Date.now(), ownerColumnOf(batch.claim.key, batch.claim.value)],
-        );
-        if (!inserted1(ins)) return false; // claim lost → the whole batch is a no-op (nothing else applied)
-        if (p) await this.touchRunDelta(q, p.runId, p.kind, true, suspended ? 1 : 0);
-        await this.placeRun(q, batch.claim.key, batch.claim.value);
+        const { key, value } = batch.claim;
+        const p = parseJournalKey(key);
+        const suspended = p?.kind === 'tool' && (value as ToolJournalRecord | undefined)?.status === 'suspended';
+        if (!inserted1(await q(JOURNAL_INSERT, journalRow(key, value, p, suspended)))) return false; // claim lost → the whole batch is a no-op (nothing else applied)
+        runs.noteWrite(key, value, undefined);
       }
       {
         const flat = flattenIncrs(batch.incrs ?? []);
@@ -1555,20 +1737,12 @@ class PgRunJournal implements RunJournal {
       for (const { key, value } of batch.puts ?? []) {
         const p = parseJournalKey(key);
         const suspended = p?.kind === 'tool' && (value as ToolJournalRecord | undefined)?.status === 'suspended';
-        const prev = p ? (await q('SELECT suspended FROM gnl_run_journal WHERE key = $1', [key])).rows[0] : undefined;
-        await q(
-          `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at, owner) VALUES ($1,$2,$3,$4,$5,$6,$7)
-           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, suspended = EXCLUDED.suspended, owner = EXCLUDED.owner`,
-          [key, p?.runId ?? null, p?.kind ?? null, !!suspended, serialize(value), Date.now(), ownerColumnOf(key, value)],
-        );
-        await this.placeRun(q, key, value);
-        if (p) {
-          const delta = (suspended ? 1 : 0) - (prev?.suspended ? 1 : 0);
-          await this.touchRunDelta(q, p.runId, p.kind, prev === undefined, delta);
-        }
+        const prev = await this.writeRecord(q, key, value, p, suspended);
+        runs.noteWrite(key, value, prev);
       }
+      await this.writeRunRows(q, runs);
       return true;
-    }, { atomic: true });
+    });
   }
 
   /** P1.6b: batch point-read — a single `WHERE key IN (...)` instead of N sequential `get` calls;
@@ -1585,21 +1759,60 @@ class PgRunJournal implements RunJournal {
   }
 
   /**
-   * P1.6b: push-down status aggregate — a single `GROUP BY` over the indexed `gnl_runs.suspended`
-   * column, MUST MATCH listRuns' own status derivation (deriveRunStatus: suspended, then failed) —
-   * same columns, same booleans, mapped to the status string in JS (not in SQL) so it cannot drift.
-   * Grouping by the RAW boolean columns (not a `CASE WHEN ... THEN 'suspended' ...` computed expression) —
-   * pg-mem's query planner mis-groups a `GROUP BY` on a CASE-derived alias (verified experimentally: rows
-   * for BOTH branches come back labeled with the wrong status); grouping by the underlying column is
-   * correct on both pg-mem and real Postgres.
+   * See `JournalReader.countRuns`. With a prefix, a range of the run id's "C"-collated index — the same
+   * range `listRuns({ runIdPrefix })` reads, so the count and the listing agree byte for byte.
+   */
+  async countRuns(q?: { runIdPrefix?: string }): Promise<number> {
+    const rg = q?.runIdPrefix ? pgRange('run_id', this.shape.collate, q.runIdPrefix, 1) : undefined;
+    const r = await this.q(`SELECT COUNT(*) AS n FROM gnl_runs${rg ? ` WHERE ${rg.where}` : ''}`, rg?.params ?? []);
+    return Number(r.rows[0]?.n ?? 0);
+  }
+
+  /**
+   * See `JournalReader.listRunsChangedSince`: `gnl_runs` in `(updated_at, run_id)` order from the
+   * position, over the existing `gnl_runs_updated (updated_at)` index — no new index, so no write pays
+   * for one (`updated_at` changes on every write, which is why a second index on it is not free). The
+   * position is the expanded form `updated_at >= a AND (updated_at > a OR run_id > b)`, not a row value:
+   * the index bound is the first half, the run id decides only the rows of that one millisecond, and
+   * pg-mem refuses row values. A reader polling from a recent `since` reads the rows changed since then
+   * and nothing else.
+   */
+  async listRunsChangedSince(cursor?: string, opts?: { limit?: number; since?: number; runIdPrefix?: string }): Promise<{ items: RunChange[]; nextCursor?: string }> {
+    const pos = decodeChangeCursor(cursor);
+    const limit = opts?.limit ?? 200;
+    const conds: string[] = [];
+    const params: unknown[] = [];
+    if (pos) {
+      conds.push(`r.updated_at >= $1 AND (r.updated_at > $1 OR r.run_id > $2)`);
+      params.push(pos.at, pos.runId);
+    } else if (opts?.since !== undefined) {
+      conds.push(`r.updated_at >= $1`);
+      params.push(opts.since);
+    }
+    if (opts?.runIdPrefix) {
+      const rg = pgRange('r.run_id', this.shape.collate, opts.runIdPrefix, params.length + 1);
+      conds.push(rg.where);
+      params.push(...rg.params);
+    }
+    const r = await this.q(
+      `SELECT r.run_id, r.created_at, r.updated_at, r.model_steps, r.tool_calls, r.status, j.value AS input_val
+       FROM gnl_runs r LEFT JOIN gnl_run_journal j ON j.key = r.run_id || ':input'${conds.length ? ` WHERE ${conds.join(' AND ')}` : ''}
+       ORDER BY r.updated_at, r.run_id LIMIT $${params.length + 1}`,
+      [...params, limit],
+    );
+    const items: RunChange[] = r.rows.map((x: any) => ({ ...pgRunSummary(x), updatedAt: Number(x.updated_at) }));
+    const last = items[items.length - 1];
+    return { items, ...(last ? { nextCursor: encodeChangeCursor({ at: last.updatedAt, runId: last.runId }) } : {}) };
+  }
+
+  /**
+   * P1.6b: push-down status aggregate — one `GROUP BY status` over the column every listing reads, so
+   * the counts and the listings cannot disagree about a run.
    */
   async countRunsByStatus(): Promise<Record<string, number>> {
-    const r = await this.q(`SELECT suspended, failed, running, canceled, COUNT(*) AS n FROM gnl_runs GROUP BY suspended, failed, running, canceled`);
+    const r = await this.q(`SELECT status, COUNT(*) AS n FROM gnl_runs GROUP BY status`);
     const out: Record<string, number> = {};
-    for (const row of r.rows) {
-      const status = deriveRunStatus(!!row.suspended, outcomeOfRow(row));
-      out[status] = (out[status] ?? 0) + Number(row.n);
-    }
+    for (const row of r.rows) out[row.status] = (out[row.status] ?? 0) + Number(row.n);
     return out;
   }
 }

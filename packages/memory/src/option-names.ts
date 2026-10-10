@@ -39,3 +39,4 @@ export const RECALL_OBSERVATIONS_NAMES = optionNames<NonNullable<Parameters<M['r
 export const CREATE_THREAD_NAMES = optionNames<NonNullable<Parameters<M['createThread']>[0]>>()(['id', 'resourceId', 'title', 'metadata']);
 export const UPDATE_THREAD_NAMES = optionNames<NonNullable<Parameters<M['updateThread']>[1]>>()(['title', 'metadata']);
 export const CLONE_THREAD_NAMES = optionNames<NonNullable<Parameters<M['cloneThread']>[1]>>()(['newThreadId', 'resourceId']);
+export const DELETE_THREAD_NAMES = optionNames<NonNullable<Parameters<M['deleteThread']>[1]>>()(['allowInFlight']);

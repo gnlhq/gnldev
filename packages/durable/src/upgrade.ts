@@ -15,7 +15,7 @@ import type { Memory } from './memory.js';
 import type { MemoryStore } from './storage.js';
 
 /** Every upgrade step a first-party store can have, in the order `upgrade()` runs them. */
-export const UPGRADE_STEPS = ['schema', 'thread-records', 'relations', 'verify-relations'] as const;
+export const UPGRADE_STEPS = ['run-status', 'schema', 'thread-records', 'relations', 'verify-relations'] as const;
 export type UpgradeStepName = (typeof UPGRADE_STEPS)[number];
 
 export interface UpgradeOptions {
@@ -89,12 +89,15 @@ export async function runUpgrade(who: string, steps: readonly UpgradeStep[], opt
   // can touch what the prerequisite would create (Postgres creates its tables on first use), which a
   // dry run must not do and which would leave the prerequisite nothing to report.
   const pending = new Map<UpgradeStepName, boolean>();
+  /** Taken as pending, unasked, because a prerequisite was: asked once that prerequisite is done. */
+  const assumed = new Set<UpgradeStepName>();
   const blockedBy = (s: UpgradeStep) => (s.requires ?? []).filter((r) => pending.get(r) === true);
   for (const s of steps) {
     // An explicit step not named has nothing to do: reported as not pending rather than as not asked.
     if (s.explicit && !needed.has(s.name)) { pending.set(s.name, false); continue; }
     if (!needed.has(s.name)) continue;
-    pending.set(s.name, s.explicit ? selected.has(s.name) : blockedBy(s).length > 0 ? true : await s.pending());
+    if (!s.explicit && blockedBy(s).length > 0) assumed.add(s.name);
+    pending.set(s.name, s.explicit ? selected.has(s.name) : assumed.has(s.name) ? true : await s.pending());
   }
   for (const s of steps) {
     if (!selected.has(s.name) || !pending.get(s.name)) continue;
@@ -117,9 +120,11 @@ export async function runUpgrade(who: string, steps: readonly UpgradeStep[], opt
         if (waiting.length) row.detail = { after: waiting };
         else if (s.plan) row.detail = await s.plan();
       } else {
-        // Assumed pending behind its prerequisite: asked now that the prerequisite ran.
-        const still = waiting.length === 0 || (waiting.every((w) => ran.has(w)) && (s.explicit || await s.pending()));
-        if (still) { row.detail = await s.run(); row.ran = true; ran.add(s.name); } else row.pending = false;
+        // Assumed pending behind its prerequisite: asked now that the prerequisite ran — or turned out to
+        // have nothing to do, which a chain of steps meets (`schema` behind `run-status`, `thread-records`
+        // behind `schema`): a step found done no longer holds back the ones after it.
+        const still = waiting.every((w) => ran.has(w)) && (s.explicit || !assumed.has(s.name) || await s.pending());
+        if (still) { row.detail = await s.run(); row.ran = true; ran.add(s.name); } else { row.pending = false; pending.set(s.name, false); }
       }
     }
     report.push(row);
@@ -256,5 +261,69 @@ export function verifyRelationsStep(store: RelationPlacer, requires?: readonly U
       await store.requestRelationsVerify();
       return store.placeRelations();
     },
+  };
+}
+
+/**
+ * The four status flags `gnl_runs` had up to 0.10 (and on the C+ step-B code): `suspended`, `failed`,
+ * `running`, `canceled`. Replaced by `status` and `outcome`, which this version's adapter writes in the
+ * same statement as the run's counter (`runStatusOf`) — see the `run-status` step.
+ * @internal — the Sqlite and Postgres adapters.
+ */
+export const RUN_STATUS_FLAGS = ['suspended', 'failed', 'running', 'canceled'] as const;
+
+/**
+ * Whether a `gnl_runs` with these columns still needs the `run-status` step: it has any of the flags,
+ * or lacks `status`/`outcome`. No table at all needs nothing: the schema creates it as this version's.
+ * @internal — the Sqlite and Postgres adapters.
+ */
+export function runStatusPending(columns: ReadonlySet<string>): boolean {
+  if (columns.size === 0) return false;
+  return RUN_STATUS_FLAGS.some((f) => columns.has(f)) || !columns.has('status') || !columns.has('outcome');
+}
+
+/**
+ * Why a store whose `run-status` step is pending refuses to run, and the one way through. Refused
+ * rather than migrated on open: the step drops the columns every process of the earlier version writes
+ * on each journal write, so it is the moment those processes must be gone — an open that migrated by
+ * itself would make the first new process that boots during a rolling deploy break every old one. And
+ * not served from the flags either: a version that reads the flags and writes `status` would read
+ * runs the old processes keep writing with a status column they never update.
+ */
+export const RUN_STATUS_PENDING_MESSAGE =
+  '@gnldev/durable: this store\'s run table (gnl_runs) is in the format of an earlier version (0.10 or before): ' +
+  'run status is kept in four flag columns this version no longer reads or writes. Nothing was read or written. ' +
+  'Stop every process of the earlier version, then run `gnl upgrade` (or `await storage.upgrade()`), then start this one. ' +
+  'Measured on 1 000 000 runs: 0.6 s on Postgres, 2.2 s on Sqlite.';
+
+/**
+ * What a store with a `gnl_runs` table hands its `run-status` step (Sqlite, Postgres): whether the flags
+ * are still there, what migrating them would run, and the migration itself.
+ * @internal
+ */
+export interface RunStatusMigrator {
+  runStatusPending(): Promise<boolean>;
+  runStatusPlan(): Promise<string[]>;
+  migrateRunStatus(): Promise<Record<string, unknown>>;
+}
+
+/**
+ * The `run-status` step (breaking, 0.11): fills `gnl_runs.status` and `gnl_runs.outcome` from the four
+ * flags an earlier version wrote, rebuilds the open-runs index on `status`, and drops the flags. Until it
+ * has run this version refuses the store (RUN_STATUS_PENDING_MESSAGE); once it has, a process of the
+ * earlier version fails on its first journal write with Postgres's or Sqlite's own "column does not
+ * exist" error — loudly, nothing written — instead of writing flags nobody reads. First of the steps:
+ * every other one reads runs through the adapter, which refuses the store until this has run.
+ * @internal
+ */
+export function runStatusStep(store: RunStatusMigrator): UpgradeStep {
+  return {
+    name: 'run-status',
+    description: "replaces gnl_runs' four status flags (0.10 and before) with the status and outcome columns this version writes — stop every older process first",
+    pending: () => store.runStatusPending(),
+    async plan() {
+      return { statements: await store.runStatusPlan() };
+    },
+    run: () => store.migrateRunStatus(),
   };
 }

@@ -38,6 +38,11 @@ export const STUDIO_ERROR_CODES = {
    * were cancelled and the user revoked; nothing was erased, so the report of a later delete is true.
    */
   userRunsInFlight: 'user_runs_in_flight',
+  /**
+   * 409 — `DELETE /threads/:id` found a run on the thread still writing. A thread delete takes its runs;
+   * nothing was deleted. Cancel the runs named in `runs`, then delete again.
+   */
+  threadRunsInFlight: 'thread_runs_in_flight',
 } as const;
 
 export type StudioErrorCode = (typeof STUDIO_ERROR_CODES)[keyof typeof STUDIO_ERROR_CODES];
@@ -55,4 +60,5 @@ export const STUDIO_ERROR_STATUS: Record<string, number> = {
   dead_scan_timeout: 504,
   run_not_a_run: 409,
   user_runs_in_flight: 409,
+  thread_runs_in_flight: 409,
 };

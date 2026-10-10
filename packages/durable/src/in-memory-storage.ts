@@ -83,6 +83,8 @@ class InMemoryRunJournal implements RunJournal {
   getCounters(k: string) { return this.journal.getCounters(k); }
   applyBatch(b: Parameters<InMemoryJournal['applyBatch']>[0]) { return this.journal.applyBatch(b); }
   countRunsByStatus() { return this.journal.countRunsByStatus(); }
+  countRuns(q?: { runIdPrefix?: string }) { return this.journal.countRuns(q); }
+  listRunsChangedSince(cursor?: string, opts?: { limit?: number; since?: number; runIdPrefix?: string }) { return this.journal.listRunsChangedSince(cursor, opts); }
   listStaleRuns(cutoffTs: number, opts?: { includeSuspended?: boolean }) { return this.journal.listStaleRuns(cutoffTs, opts); }
   readRunStats(runId: string) { return this.journal.readRunStats(runId); }
   deletePrefix(prefix: string) { return this.journal.deletePrefix(prefix); }
@@ -95,10 +97,23 @@ class InMemoryRunJournal implements RunJournal {
 
 // ── MemoryStore ───────────────────────────────────────────────────────────────
 class InMemoryMemoryStore implements MemoryStore {
-  /** @internal — see Storage.adoptIntoOrg. */
+  /**
+   * @internal — see Storage.adoptIntoOrg. The ids a record carries INSIDE it move with its key, as the
+   * SQL stores' columns do (`SCOPE_TABLES`, model.ts): a thread record's `id` and `parentThreadId`, a
+   * message's `threadId`. Renaming the map keys alone left `id: 't-a'` under `org:acme:t-a`, and the
+   * organization — which lists and reads by those ids — saw none of its adopted threads and none of
+   * their messages (measured, C+ step C; Sqlite and Postgres saw them all).
+   */
   _rekey(f: (k: string) => string | undefined): number {
-    return rekeyMap(this.threads, f) + rekeyMap(this.messages, f) + rekeyMap(this.wm, f) + rekeyMap(this.obs, f)
+    const moved = rekeyMap(this.threads, f) + rekeyMap(this.messages, f) + rekeyMap(this.wm, f) + rekeyMap(this.obs, f)
       + rekeyMap(this.batches, f);
+    for (const [k, t] of this.threads) {
+      if (t.id !== k) t.id = k;
+      const parent = t.parentThreadId === undefined ? undefined : f(t.parentThreadId);
+      if (parent !== undefined) t.parentThreadId = parent;
+    }
+    for (const [k, rows] of this.messages) for (const r of rows) if (r.threadId !== k) r.threadId = k;
+    return moved;
   }
 
   private threads = new Map<string, ThreadRecord>();
@@ -510,7 +525,9 @@ export class InMemoryStorage implements Storage {
     let alreadyScoped = 0;
     const rename = (k: string): string | undefined => {
       if (isOrganizationKey(k)) { alreadyScoped++; return undefined; }
-      if (isPlatformKey(k) || ENGINE_META_KEYS.includes(k)) { skipped.add(k.split(':')[0]!); return undefined; }
+      // The engine's own meta rows stay and are not platform keys, so not reported — as on Sqlite and Postgres.
+      if (ENGINE_META_KEYS.includes(k)) return undefined;
+      if (isPlatformKey(k)) { skipped.add(k.split(':')[0]!); return undefined; }
       return prefix + k;
     };
     // Counting pass: `rename` has the side effects, so a dry run must not mutate. Run it over the keys
