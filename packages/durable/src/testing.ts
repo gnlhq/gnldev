@@ -23,7 +23,8 @@ import assert from 'node:assert/strict';
 import type { Journal, JournalReader, RunSummary, RunStatus, RunListQuery } from './journal.js';
 import { claim, parseJournalKey, runIdOfKey, outcomeStatusOf, deriveRunStatus, isOwnerRecordKey, ownerOfRecord, nestedAgentRunId, runKeys } from './journal.js';
 import { stampFormat } from './format.js';
-import { withOrg, ORG_RECORD_PRE } from './organization.js';
+import { withOrg, ORG_RECORD_PRE, parseOrganizationKey, orgPrefix } from './organization.js';
+import { RUN_FENCE_PREFIX, runFenceKey } from './erasure-fence.js';
 import { threadOwnerKey, threadSeenKey } from './thread-owner.js';
 import { memKey, semanticLogKey } from './memory.js';
 import { metricsRunKey } from './metrics.js';
@@ -552,23 +553,54 @@ async function statusesFromRecords(j: ConformanceJournal): Promise<Record<string
 
 const dropZeros = (o: Record<string, number>) => Object.fromEntries(Object.entries(o).filter(([, n]) => n > 0));
 
-/** Every key and its value, as text. Counters are not keys `get` reads, so they are not in it. */
+/** What a run fence holds once its moment is set aside: `{ erased: true }` and a number, nothing of anyone (erasure-fence.ts). */
+const FENCE_SHAPE = '<run fence>';
+
+/**
+ * Every key and its value, as text. Counters are not keys `get` reads, so they are not in it. A run
+ * fence is shown by its shape: its `at` is the moment of the deletion, which a retry moves.
+ */
 async function snapshot(j: ConformanceJournal): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   for (const k of (await j.listKeys!('')).sort()) {
     const v = await j.get(k);
-    if (v !== undefined) out[k] = JSON.stringify(v);
+    if (v === undefined) continue;
+    const fence = isFence(k) && v !== null && typeof v === 'object' && Object.keys(v).sort().join() === 'at,erased'
+      && (v as { erased?: unknown }).erased === true && typeof (v as { at?: unknown }).at === 'number';
+    out[k] = fence ? FENCE_SHAPE : JSON.stringify(v);
   }
   return out;
 }
 
-/** Exactly `footprint` went; every other key is still there with the same value. */
+const isFence = (key: string): boolean => {
+  const own = parseOrganizationKey(key);
+  return (own ? own.rest : key).startsWith(RUN_FENCE_PREFIX);
+};
+
+/** The fence a deletion leaves for each run it took (erasure-fence.ts): one per `:input` in the footprint, in the run's own scope. */
+function fencesOf(footprint: Set<string>): string[] {
+  const out: string[] = [];
+  for (const k of footprint) {
+    if (!k.endsWith(':input')) continue;
+    const id = k.slice(0, -':input'.length);
+    const own = parseOrganizationKey(id);
+    out.push(own ? orgPrefix(own.orgId) + runFenceKey(own.rest) : runFenceKey(id));
+  }
+  return out;
+}
+
+/**
+ * Exactly `footprint` went; every other key is still there with the same value — and what the deletion
+ * added is the fence of each run it took, holding nothing but its shape.
+ */
 async function assertRemoved(j: ConformanceJournal, before: Record<string, string>, footprint: Set<string>, what: string): Promise<void> {
   const after = await snapshot(j);
   const removed = Object.keys(before).filter((k) => !(k in after)).sort();
   const added = Object.keys(after).filter((k) => !(k in before)).sort();
   const changed = Object.keys(after).filter((k) => k in before && after[k] !== before[k]).sort();
-  assert.deepEqual({ removed, added, changed }, { removed: [...footprint].filter((k) => k in before).sort(), added: [], changed: [] }, `${what}: exactly its footprint`);
+  const fences = fencesOf(footprint).filter((k) => !(k in before)).sort();
+  assert.deepEqual({ removed, added, changed }, { removed: [...footprint].filter((k) => k in before).sort(), added: fences, changed: [] }, `${what}: exactly its footprint`);
+  for (const k of added) assert.equal(after[k], FENCE_SHAPE, `${what}: ${k} holds a fence's shape and nothing else`);
   assert.ok(footprint.size > 0 && [...footprint].every((k) => k in before), `${what}: the world held its whole footprint`);
 }
 

@@ -127,6 +127,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A run deleted while its worker was still running came back — and ran its side effect again.**
+  The erasure order (`cancelAgentRun`, wait until `subjectRuns` lists nothing `inFlight`,
+  `eraseSubject`) could not see a worker that held no claim — one inside a call answered by a window
+  record — and the erasure took the run's cancel flag with everything else. Measured on InMemory,
+  Sqlite and Postgres: the canceled worker went on, made the same payment a second time (the window
+  record and the duplicate marker were gone too) and wrote the run back — model steps, outcome
+  `completed`, metrics, and the mirror holding the person's IBAN. `purgeThread` (so
+  `AgentMemory.deleteThread` and Studio's `DELETE /threads/:id`) and `purgeOrganization` pulled a run
+  out from under its worker the same way. Every deletion of a run now writes a fence before it deletes
+  anything — `__run_erased__:<sha256 of the run id>`, holding `{ erased, at }` and nothing of anyone —
+  and `purgeOrganization` writes its purge marker before its prefix delete. A worker reads it where it
+  reads its cancel flag (its entry, each fresh model step), before a side effect executes, before its
+  completion writes (the thread's messages, usage, metrics) and once more after its last write: it
+  stops with the new `RunErasedError` (`code: 'run_erased'`; not a run failure, nothing is recorded for
+  it), and deletes again whatever it wrote into its run in between. A deleted run id is refused like a
+  canceled one; `sweepRuns` removes fences older than its `olderThanMs` (reported as `fencesSwept`), and
+  retention's own deletions write none. Cost: one more point read per fresh model step (beside the
+  cancel flag's), per side-effect execution, and two per finished run.
+- **`subjectRuns` — and a thread deletion's in-flight check — did not see a tool call executing under an
+  idempotency window** (`idempotencyWindow: 'run' | 'thread' | 'cross-run'`; `'run'` is the default for
+  `idempotency: 'args'`): the call claims under the window's key, not under its run. Measured on all
+  three stores: a canceled run with the tool's body executing read `inFlight: false`, so the documented
+  order erased the person while the call ran and its record was written back afterwards. Such a call
+  now writes a pointer under its run before it claims (one write per call), and the claim it names is
+  read. Still not covered, stated: what a worker writes OUTSIDE its run — a thread-window record, a
+  turn's messages, a cross-run record, an aggregate counter — between its last read of the fence and the
+  deletion's write of it (one read and one write wide).
+
 - **A run's records were read back in the wrong order** — by a millisecond clock with the key as
   tie-break, not in the order they were written. Measured on Sqlite and Postgres: records of one run
   written in the same millisecond (a fast run on Sqlite did it with no clock mocked) came back by key —
@@ -184,6 +212,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   attempt's start and its TTL is `max(30 s, timeoutMs)`: it went stale at the timeout itself, the retry
   took it for a crash, `recover()` said "not done" while the attempt was still in flight, and the effect
   ran twice (measured with `timeoutMs: 31_000`). The claim is now renewed when the timeout fires.
+- **The same work from another channel ran again after a process died between a call's result and its
+  cross-channel id.** The cross-channel id (`semanticIdentity` + `resourceId`) was written after the
+  call's `succeeded` record, best-effort. Under the headless preset with a transactional tool, a death
+  between the two let the same payment from a second channel run (paid twice; without the death it is
+  refused), and resuming the first run did not write the id back. Where the id is a decision
+  (`sideEffectDuplicates` `'block'`, `'skip'`, `'reflect'`, `'suspend'`), it is now claimed in flight
+  before the effect, like the duplicate marker. Another channel that meets an in-flight id is blocked
+  or asked, because the work may have run. A stale in-flight id is taken over only by the call that
+  left it. Success completes the id and the replay of that call finishes it. A failure gives it back,
+  and a live attempt renews it with its claim. Erasure removes it like a completed one, and an attempt
+  that finishes after the erasure does not write it back. Under `'warn'`, `'off'` and the `args`
+  modes the id is still written after success, best-effort. `XidRecord` gains `inFlight` and `released`.
 - **After `releaseFailedClaim`, a `confirm: true` tool ran without asking.** The `released` tombstone
   read as a record, so the gates that answer only a first call (`confirm`, the semantic gate) were
   skipped. It now reads as no record: the next call is a first call and meets every first-call gate.

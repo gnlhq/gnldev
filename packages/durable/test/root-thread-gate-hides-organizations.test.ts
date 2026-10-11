@@ -220,7 +220,8 @@ for (const [name, make] of BACKENDS) {
       const orgBefore = (await allKeys(s)).filter((k) => k.startsWith('org:'));
       await eraseSubject(s, 'ayse');
       const left = await allKeys(s);
-      const leftAtRoot = left.filter((k) => !k.startsWith('org:') && k !== THREAD_RECORDS_KEY);
+      // The run's fence stays (erasure-fence.ts): a hash of its id, holding nothing of anyone.
+      const leftAtRoot = left.filter((k) => !k.startsWith('org:') && k !== THREAD_RECORDS_KEY && !k.startsWith('__run_erased__:'));
       expect(leftAtRoot).toEqual([]);
       // No record at the root for a thread the root never decided from acme's data.
       expect(await rootGet(s, threadOwnerKey('T'))).toBeUndefined();
@@ -238,7 +239,7 @@ for (const [name, make] of BACKENDS) {
       await b.oldPut(`org:acme:${memKey('T', 'messages')}`, [{ role: 'user', text: 'ACME BOB' }]);
       await eraseSubject(s, 'bob', { orgId: 'acme' });
       const left = await allKeys(s);
-      expect(left.filter((k) => k.startsWith('org:acme:') && !k.endsWith(THREAD_RECORDS_KEY))).toEqual([]);
+      expect(left.filter((k) => k.startsWith('org:acme:') && !k.endsWith(THREAD_RECORDS_KEY) && !k.startsWith('org:acme:__run_erased__:'))).toEqual([]);
       // …and the root's bob, somebody else, keeps everything.
       expect(left).toContain('r1:input');
       expect(left).toContain(memKey('T', 'messages'));

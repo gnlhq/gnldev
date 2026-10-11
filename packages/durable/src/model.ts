@@ -43,6 +43,8 @@ import { getRunCost } from './cost.js';
 import { metricsRunKey, metricsDoneKey, metricsScoresDoneKey } from './metrics.js';
 import { USAGE_KEY, usageCountedKey } from './budget.js';
 import type { OrganizationUsage } from './budget.js';
+import { fenceRun, runErasedSince } from './erasure-fence.js';
+import type { ErasureBaseline } from './erasure-fence.js';
 
 // ── How a thread id is read back out of a key ────────────────────────────────────────────────────
 // Thread ids may contain ':' (memory.ts keeps it legal on purpose), so a thread's keys are recognised
@@ -542,15 +544,42 @@ export async function threadRunsInFlight(journal: Journal & Partial<JournalReade
   return out;
 }
 
-/** Is any model-step or tool claim of this run `running` at this moment? */
+/** The run-scoped pointer to a tool claim held under a window (`xreq:`/`xthr:`/`xrun:`) — see `hasRunningClaim`. */
+export const windowClaimPointerKey = (runId: string, toolCallId: string): string => runKeys.proc(runId, `__gnl_window_claim:${toolCallId}`);
+
+/**
+ * Is any model-step or tool claim of this run `running` at this moment?
+ *
+ * A tool under an idempotency window claims under the WINDOW's key (`xreq:<request>:`,
+ * `xthr:<thread>:`, `xrun:`), not under the run — so a run executing one used to read as idle, and the
+ * erasure order deleted the person while the call ran (measured: `subjectRuns` said `inFlight: false`
+ * with the tool body executing). Such a call leaves a pointer under its run before it claims
+ * (`windowClaimPointerKey`); the claim it points to is read here, so the answer is the claim's own state.
+ */
 export async function hasRunningClaim(journal: Journal, runId: string): Promise<boolean> {
   if (typeof journal.listKeys !== 'function') return false;
   for (const k of await journal.listKeys(`${runId}:`)) {
     if (!k.includes(':proc:') && !k.includes(':tool:')) continue;
-    const v = await journal.get<{ status?: unknown }>(k);
+    const v = await journal.get<{ status?: unknown; claim?: unknown }>(k);
     if (v && typeof v === 'object' && v.status === 'running') return true;
+    if (k.includes(':proc:__gnl_window_claim:') && v && typeof v.claim === 'string') {
+      const claimed = await journal.get<{ status?: unknown }>(v.claim);
+      if (claimed && typeof claimed === 'object' && claimed.status === 'running') return true;
+    }
   }
   return false;
+}
+
+/**
+ * The last thing an attempt of a run does: when the run was deleted while the attempt ran (its fence,
+ * or its organization's purge since `baseline`), delete again what the attempt wrote into it — the same
+ * plan the deletion ran — and answer true. Read AFTER the attempt's last write: that order is what
+ * makes the fence close the run's own key space (erasure-fence.ts).
+ */
+export async function settleErasedRun(journal: Journal & Partial<JournalReader>, runId: string, baseline: ErasureBaseline | undefined): Promise<boolean> {
+  if (!(await runErasedSince(journal, runId, baseline))) return false;
+  if (typeof journal.deletePrefix === 'function') await executePlan({ journal }, await planRun(journal, runId));
+  return true;
 }
 
 /**
@@ -589,11 +618,13 @@ export async function planThread(target: ThreadTarget, threadId: string, opts: {
 /**
  * Runs a plan, in its order, and returns the rows it deleted (journal records and documents).
  * `ownershipTrace`: before the plan's FIRST run goes, record whose thread it was (`purgeRun`'s option).
+ * `fence: false`: write no fence for the runs (erasure-fence.ts) — retention's own sweeps, whose runs
+ * have been idle for longer than the horizon after which a fence is swept anyway.
  */
 export async function executePlan(
   target: ThreadTarget,
   steps: DeleteStep[],
-  opts: { ownershipTrace?: string } = {},
+  opts: { ownershipTrace?: string; fence?: boolean } = {},
 ): Promise<number> {
   const journal = target.journal;
   const del = requireDelete(journal);
@@ -601,6 +632,10 @@ export async function executePlan(
   for (const step of steps) {
     switch (step.kind) {
       case 'run': {
+        // FIRST, before anything of the run goes: a worker still running it reads this and stops, and
+        // deletes again what it wrote in between (erasure-fence.ts). Written last, a write of the worker
+        // that landed after the delete and before the fence would stay.
+        if (opts.fence !== false) await fenceRun(journal, step.runId);
         if (opts.ownershipTrace === step.runId) await writeOwnershipTrace(journal, step.runId);
         // What its usage was, read while its records are still there; subtracted once they are gone.
         const usage = await usageToSubtract(journal, step.runId);

@@ -16,6 +16,12 @@
 // GDPR: kişi-silme yüzeyi `purgeResource(journal, resourceId)` — bu aileyi (ve HERMES kişisel
 // derslerini) süpürür. purgeThread bu aileye DOKUNMAZ ve thread silinse bile XID işi hatırlar —
 // bilinçli: 'başka kanaldan yapılmıştı' hafızasının ömrü konuşmanın değil KİŞİNİN kaydıdır.
+//
+// WHEN IT IS WRITTEN depends on what the reader's cell does with it. Where it is a DECISION (a
+// duplicate policy that refuses or asks), it is claimed in flight before the effect and completed on
+// success (`claimXidInFlight` → `writeXid` with `held`): a process that dies after the effect still
+// leaves "may have run" behind. Where it is only a warning ('warn', 'off', the args modes), it is
+// written after success, best-effort — losing it loses one future warning.
 import { argsHash } from './hash.js';
 import { normalizeId, extractSemFields, type SemanticIdentity } from './semantic-dup.js';
 import type { Journal } from './journal.js';
@@ -30,7 +36,17 @@ export interface XidRecord {
   amounts: Record<string, number>;
   /** İLK tamamlanmış işin adresi (first-wins; soru/rapor hep ilkini gösterir). */
   first: { runId: string; toolCallId: string; at: number; channel?: string };
+  /**
+   * The work is RUNNING (or its process stopped mid-flight): claimed before the effect where the id is a
+   * decision (see `claimXidInFlight`). Read by another call as "may have run", never as nothing.
+   */
+  inFlight?: true;
+  /** An in-flight claim given back by a call that failed before its effect: stands for no record. */
+  released?: true;
 }
+
+/** The in-flight id one call holds: its key and the value it last wrote (every later write is a CAS over it). */
+export interface XidHeld { key: string; claimed: XidRecord }
 
 /** Kimlik değerleri ':' içerebilir; anahtar sınırını bozmasın diye hash'lenir — düz metin kayıtta durur. */
 export const xidKey = (resourceId: string, toolName: string, identity: Record<string, string>): string =>
@@ -54,8 +70,13 @@ export function xidPlanOf(id: SemanticIdentity, toolName: string, args: unknown,
 }
 
 /** Başarı choke-point'inden çağrılır — first-wins, best-effort (kayıp bir XID yalnız bir gelecek
- *  uyarısı kaybettirir; işin kendisine asla dokunmaz). */
-export async function writeXid(journal: Journal, plan: XidPlan, runId: string, toolCallId: string): Promise<void> {
+ *  uyarısı kaybettirir; işin kendisine asla dokunmaz).
+ *
+ *  `held`: the in-flight id this call claimed before its effect — completed by compare-and-set over it,
+ *  and ONLY over it. Gone means erased (or taken over past the window): an erased id is not written back.
+ *  Without `held` (the modes where the id is only a warning, or a call that ran without holding it): the
+ *  first-wins write as before, which also takes a released slot over. */
+export async function writeXid(journal: Journal, plan: XidPlan, runId: string, toolCallId: string, held?: XidHeld): Promise<void> {
   try {
     const rec: XidRecord = {
       v: 1,
@@ -64,7 +85,108 @@ export async function writeXid(journal: Journal, plan: XidPlan, runId: string, t
       amounts: plan.amounts,
       first: { runId, toolCallId, at: journal.now ? await journal.now() : Date.now(), ...(plan.channel ? { channel: plan.channel } : {}) },
     };
-    await claim(journal, xidKey(plan.resourceId, plan.toolName, plan.identity), rec);
+    const key = xidKey(plan.resourceId, plan.toolName, plan.identity);
+    if (held) { await casXid(journal, held.key, held.claimed, rec); return; }
+    if (await claim(journal, key, rec)) return;
+    const cur = await journal.get<XidRecord>(key);
+    // A released slot, or this call's own in-flight id (a recovered attempt that holds none) — completed.
+    const mine = cur?.inFlight === true && cur.first?.runId === runId && cur.first?.toolCallId === toolCallId;
+    if (cur && (cur.released === true || mine)) await casXid(journal, key, cur, rec);
+  } catch { /* best-effort */ }
+}
+
+/** Compare-and-set over `expected`; the single-process fallback compares the fields that identify a claim. */
+async function casXid(journal: Journal, key: string, expected: XidRecord, next: XidRecord): Promise<boolean> {
+  if (journal.putIfMatch) return journal.putIfMatch(key, expected, next);
+  // Single-process fallback — the same documented bound as claim().
+  const cur = await journal.get<XidRecord>(key);
+  if (!(cur && cur.inFlight === expected.inFlight && cur.released === expected.released &&
+    cur.first?.runId === expected.first.runId && cur.first?.toolCallId === expected.first.toolCallId && cur.first?.at === expected.first.at)) return false;
+  await journal.put(key, next);
+  return true;
+}
+
+/**
+ * Claims the cross-channel id IN FLIGHT, before the effect — where the id is a DECISION (a duplicate
+ * policy that refuses or asks). Written only after success, a process that died in the body or between
+ * the call's `succeeded` record and the id left nothing, and the same work from another channel ran
+ * again (measured: paid twice under the headless preset's 'block'). The same lifecycle as the duplicate
+ * marker (durable-tool.ts claimDupMarker):
+ *
+ *  - absent → first writer wins;
+ *  - released (a call that failed before its effect gave it back) → taken over by CAS;
+ *  - in flight and STALE by the shared clock → taken over only by the call that left it (same run, same
+ *    toolCallId). For any other call it is work that may have run, and may have SUCCEEDED;
+ *  - past the dedup window (`windowTtlMs`), completed or stale → no longer a duplicate of anything.
+ *
+ * Lost: `cur` is what stands there (live or stale in flight, or completed) — the caller decides.
+ */
+export async function claimXidInFlight(
+  journal: Journal, plan: XidPlan, runId: string, toolCallId: string, staleTtlMs: number, windowTtlMs?: number,
+): Promise<{ won: true; held: XidHeld } | { won: false; cur: XidRecord }> {
+  const key = xidKey(plan.resourceId, plan.toolName, plan.identity);
+  const now = journal.now ? await journal.now() : Date.now();
+  const claimed: XidRecord = {
+    v: 1, toolName: plan.toolName, identity: plan.identity, amounts: plan.amounts,
+    first: { runId, toolCallId, at: now, ...(plan.channel ? { channel: plan.channel } : {}) },
+    inFlight: true,
+  };
+  // A lost write is read again and judged again, never answered with "nothing there": two calls taking
+  // the same released slot over at once must not both come away free to run. Bounded: a row that reads
+  // as absent yet refuses an insert (a `put(key, undefined)` leftover) fails the call before its effect,
+  // loudly, rather than spinning or running unguarded.
+  for (let round = 0; round < 16; round++) {
+    const cur = await journal.get<XidRecord>(key);
+    if (cur === undefined) {
+      if (await claim(journal, key, claimed)) return { won: true, held: { key, claimed } };
+      continue;
+    }
+    const at = cur.first?.at ?? 0;
+    const stale = cur.inFlight === true && now - at > staleTtlMs;
+    const windowExpired = windowTtlMs !== undefined && cur.released !== true && (cur.inFlight !== true || stale) && now - at > windowTtlMs;
+    const own = cur.first?.runId === runId && cur.first?.toolCallId === toolCallId;
+    const takeable = cur.released === true || windowExpired || (stale && own);
+    if (!takeable) return { won: false, cur };
+    if (await casXid(journal, key, cur, claimed)) return { won: true, held: { key, claimed } };
+  }
+  throw new Error(`@gnldev/durable: the cross-channel id ${key} kept changing under this call and could not be claimed — the call did not run`);
+}
+
+/** Re-dates the in-flight id this call holds (CAS over the value it last wrote); false when it is no longer that value. */
+export async function renewXid(journal: Journal, held: XidHeld): Promise<boolean> {
+  const renewed: XidRecord = { ...held.claimed, first: { ...held.claimed.first, at: journal.now ? await journal.now() : Date.now() } };
+  if (!(await casXid(journal, held.key, held.claimed, renewed))) return false;
+  held.claimed = renewed;
+  return true;
+}
+
+/**
+ * Gives the in-flight id back — by CAS over the value this call wrote, so an id another call took over
+ * (or an erasure removed) is never touched. A slot, not a deletion: a row left behind by `put(undefined)`
+ * would make `putIfAbsent` lose forever (the duplicate marker's measured poison pill). The released value
+ * keeps only what erasure needs to recognise it as this person's (`toolName`), not the identity values.
+ */
+export async function releaseXid(journal: Journal, held: XidHeld): Promise<void> {
+  const at = journal.now ? await journal.now() : Date.now();
+  const released: XidRecord = {
+    v: 1, toolName: held.claimed.toolName, identity: {}, amounts: {},
+    first: { runId: held.claimed.first.runId, toolCallId: held.claimed.first.toolCallId, at }, released: true,
+  };
+  await casXid(journal, held.key, held.claimed, released);
+}
+
+/**
+ * A replayed call whose `succeeded` record stands, finishing the id its process left in flight (it died
+ * between the record and the id). Only an id still in flight AND this call's own is completed (CAS): an
+ * absent one is not created here — absent after a claim means erased, and a replay must not write a
+ * person's data back. Best-effort: an in-flight id left as it is still reads as "may have run".
+ */
+export async function completeOwnXid(journal: Journal, plan: XidPlan, runId: string, toolCallId: string): Promise<void> {
+  try {
+    const key = xidKey(plan.resourceId, plan.toolName, plan.identity);
+    const cur = await journal.get<XidRecord>(key);
+    if (!cur || cur.inFlight !== true || cur.first?.runId !== runId || cur.first?.toolCallId !== toolCallId) return;
+    await writeXid(journal, plan, runId, toolCallId, { key, claimed: cur });
   } catch { /* best-effort */ }
 }
 
@@ -72,7 +194,9 @@ export async function writeXid(journal: Journal, plan: XidPlan, runId: string, t
 export async function readXid(journal: Journal, plan: XidPlan): Promise<XidRecord | undefined> {
   try {
     const rec = await journal.get<XidRecord>(xidKey(plan.resourceId, plan.toolName, plan.identity));
-    return rec && rec.v === 1 ? rec : undefined;
+    // A released slot stands for no record. An in-flight one is returned with its flag: the reader says
+    // "started, may have run", never "completed".
+    return rec && rec.v === 1 && rec.released !== true ? rec : undefined;
   } catch {
     return undefined;
   }

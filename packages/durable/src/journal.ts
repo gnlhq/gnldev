@@ -43,7 +43,10 @@ export type ToolJournalRecord = (
   // argsHash/toolName are stamped like on 'succeeded' — seedFromHistory needs them to re-arm the chain's
   // `reflected` flag on the MATCHING chain after an internal-state loss (match-only, see limits.ts).
   | { status: 'reflected'; output: unknown; argsHash?: string; toolName?: string; resolvedToolCallIds?: string[] }
-  | { status: 'suspended'; output: unknown; toolName?: string }
+  // `attempts` — set when the question was asked over a 'failed' or stale 'running' attempt: the counter
+  // of that attempt, kept so the approved resume continues it (maxRetries) and meets the crash ladder
+  // (recover) instead of starting as a first call. Absent: the question came before the call ever ran.
+  | { status: 'suspended'; output: unknown; toolName?: string; attempts?: number }
   // Attempts — the number of FAILED attempts made so far for this key (to enforce the
   // retry limit). Optional: absent from old records → durable-tool.ts assumes 1.
   // `sideEffect` — whether this failed call was a SIDE-EFFECT tool (its execute was
@@ -57,7 +60,11 @@ export type ToolJournalRecord = (
   // is bounded by the same maxRetries ladder as 'failed'. Without it every takeover stamped a fresh
   // marker and the counter reset, so a wedged worker re-ran the tool once per restart, forever.
   // Optional: absent from old records → durable-tool.ts assumes 1, like 'failed'.
-  | { status: 'running'; startedAt: number; attempts?: number; toolName?: string }
+  // `claimTtlMs`: how long this claim stays live — the threshold its writer holds it by (the tool's
+  // own, from `claimTtlMs` / `timeoutMs`). Every other reader judges the claim by it, so a reader
+  // that does not know the tool (run.ts hasRunProbe) cannot call a live claim stale. Absent from old
+  // records → the reader's own threshold, as before.
+  | { status: 'running'; startedAt: number; attempts?: number; toolName?: string; claimTtlMs?: number }
 ) & {
   /**
    * Set on a delegation's success (`agent_<name>`, a network target): the call handed work to a child
@@ -493,6 +500,7 @@ export async function frozenGet<T>(journal: Journal, key: string, compute: () =>
 
 /** Context of a durable run: journal, run, optional policy and approvals. */
 import type { RunIdentity } from './identity-types.js';
+import type { ErasureBaseline } from './erasure-fence.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { LIST_KEYS_NAMES, LIST_OWNER_RECORDS_NAMES, LIST_STALE_RUNS_NAMES, COUNT_RUNS_NAMES, LIST_RUNS_CHANGED_NAMES } from './option-names.js';
 export interface DurableCtx {
@@ -568,6 +576,11 @@ export interface DurableCtx {
    * UNCHANGED for direct durableTool users (MCP server, manual wrapping): throw.
    */
   blockedAsSentinel?: boolean;
+  /**
+   * What this attempt read at its entry about its deletion (erasure-fence.ts): every later check of
+   * the attempt compares against it. Set by runDurable/streamDurable. @internal
+   */
+  erasure?: ErasureBaseline;
   /** Y1 (opt-in): default tool execute timeout (ms) — tool.timeoutMs overrides per tool. */
   toolTimeoutMs?: number;
   /** Y3 (opt-in): default 'running' claim staleness threshold (ms) — tool.claimTtlMs overrides per tool. */

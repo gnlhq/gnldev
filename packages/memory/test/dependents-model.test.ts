@@ -24,6 +24,7 @@
 //  P8 adoptIntoOrg moves the same things on every store;
 //  P9 for the same world, each path leaves the same store on InMemory, Sqlite, pg-mem and real Postgres.
 import { describe, it, expect, afterAll } from 'vitest';
+import { createHash } from 'node:crypto';
 import {
   eraseSubject, purgeThread, purgeRun, toJournal, withOrg, user, admitThreadRun, cancelAgentRun, ORG_RECORD_PRE, threadOwnerKey,
   ThreadRunsInFlightError,
@@ -59,6 +60,12 @@ const personFootprint = (p: string) => {
   const own = new RegExp(`^(j ${esc(p)}(lesson|xid):res:ayse:|wm ${esc(p)}resource:ayse$|row wm ${esc(p)}resource:ayse$|(vec|row vectors) ${esc(p)}doc-a |(work|row worklog) jobs ~o~${org}:ayse:)`);
   return (x: string) => runs(x) || own.test(x);
 };
+/**
+ * The fence a deletion leaves for each run it takes (durable's erasure-fence.ts): a hash of the run id
+ * under `__run_erased__:`, in the run's scope — so a worker still running it writes nothing back.
+ */
+const fenceOf = (runs: string[], p: string) => (x: string) =>
+  runs.some((r) => x === `j ${p}__run_erased__:${createHash('sha256').update(r).digest('hex')}`);
 /** The one row a thread delete adds: the record's tombstone (a soft delete that keeps no title). */
 const tombstone = (p: string) => (x: string) => new RegExp(`^row threads ${esc(p)}t-a .* deleted$`).test(x);
 
@@ -76,7 +83,7 @@ for (const kind of KINDS) {
       await bothWorlds(b.storage);
       const d = await after(b, () => scopeOf(b.storage).memory.deleteThread('t-a'));
       expect(d.removed.sort()).toEqual(d.before.filter(threadFootprint('')).sort());
-      expect(d.added.filter((x) => !tombstone('')(x))).toEqual([]);
+      expect(d.added.filter((x) => !tombstone('')(x) && !fenceOf(THREAD_RUNS, '')(x))).toEqual([]);
       // Nothing of t-a is readable any more, by run or by thread.
       const J = toJournal(b.storage.runs);
       for (const r of THREAD_RUNS) expect(await J.get(`${r}:input`), r).toBeUndefined();
@@ -106,7 +113,7 @@ for (const kind of KINDS) {
       const d = await after(b, () => eraseSubject(b.storage, 'ayse'));
       const mine = (x: string) => threadFootprint('')(x) || personFootprint('')(x);
       expect(d.removed.sort()).toEqual(d.before.filter(mine).sort());
-      expect(d.added.filter((x) => !tombstone('')(x))).toEqual([]);
+      expect(d.added.filter((x) => !tombstone('')(x) && !fenceOf([...THREAD_RUNS, ...PERSON_RUNS], '')(x))).toEqual([]);
     }, 120_000);
 
     it('P4: a root thread delete never touches an organization, and an organization\'s never the root', async () => {
@@ -114,7 +121,7 @@ for (const kind of KINDS) {
       await bothWorlds(b.storage);
       const org = await after(b, () => scopeOf(b.storage, 'acme').memory.deleteThread('t-a'));
       expect(org.removed.sort()).toEqual(org.before.filter(threadFootprint('org:acme:')).sort());
-      expect(org.added.filter((x) => !tombstone('org:acme:')(x))).toEqual([]);
+      expect(org.added.filter((x) => !tombstone('org:acme:')(x) && !fenceOf(THREAD_RUNS, 'org:acme:')(x))).toEqual([]);
       // The root's t-a, on a world where acme's t-a (the same id, and runs that name it) is still whole.
       const r = await makeBackend(kind);
       await bothWorlds(r.storage);

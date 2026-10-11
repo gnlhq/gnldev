@@ -6,6 +6,7 @@ import { claim, ctxGet, runKeys } from './journal.js';
 import { stampFormat } from './format.js';
 import { enforceStepLimits } from './limits.js';
 import { assertNotCanceled } from './cancel.js';
+import { assertNotErased } from './erasure-fence.js';
 import { RunBusyError } from './errors.js';
 import { withTimeout } from './timeout.js';
 import type { DurableCtx } from './journal.js';
@@ -321,7 +322,9 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       // above returns untouched: replay reconstructs work that already happened, cancel stops NEW
       // spend). A run canceled from anywhere (server ?durable=true, cancelAgentRun) stops here at its
       // next model-step boundary regardless of which worker is executing it.
-      await assertNotCanceled(ctx.journal, ctx.runId);
+      // …and the run was not DELETED since this attempt started (erasure-fence.ts): same boundary, one read
+      // beside the flag's — the deletion took the flag with everything else.
+      await Promise.all([assertNotCanceled(ctx.journal, ctx.runId), assertNotErased(ctx.journal, ctx.runId, ctx.erasure)]);
       // A new step spends budget: none left (the request's — a sibling may have used it), no step.
       if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId, 'before');
       await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
@@ -374,7 +377,9 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       // above returns untouched: replay reconstructs work that already happened, cancel stops NEW
       // spend). A run canceled from anywhere (server ?durable=true, cancelAgentRun) stops here at its
       // next model-step boundary regardless of which worker is executing it.
-      await assertNotCanceled(ctx.journal, ctx.runId);
+      // …and the run was not DELETED since this attempt started (erasure-fence.ts): same boundary, one read
+      // beside the flag's — the deletion took the flag with everything else.
+      await Promise.all([assertNotCanceled(ctx.journal, ctx.runId), assertNotErased(ctx.journal, ctx.runId, ctx.erasure)]);
       // A new step spends budget: none left (the request's — a sibling may have used it), no step.
       if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId, 'before');
       await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);

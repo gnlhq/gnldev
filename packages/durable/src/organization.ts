@@ -55,6 +55,9 @@ export const ADOPTABLE_RESERVED_PREFIXES: readonly string[] = [
   // list has: it leaves data behind. That is the trade it is chosen for — a missing DENY entry moves
   // platform state into one organization and breaks authentication.
   '__studio_wf__', '__studio_agent__',
+  // The fences of runs deleted in the root (erasure-fence.ts): adopted with the runs' scope, so a
+  // deleted run id stays refused where its work now runs.
+  '__run_erased__:',
 ];
 
 /**

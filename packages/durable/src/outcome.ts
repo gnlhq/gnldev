@@ -29,6 +29,8 @@ import { RunBusyError, CALLER_CONFLICT_CODES } from './errors.js';
  *   {status:'canceled'}. Writing again from the throw site would be a second machine for one fact —
  *   Racing the first, on a path (the mid-flight model-step gate) that fires once per worker that
  *   Notices. One writer, at the choke point that knows the ORIGINAL decision's timestamp.
+ * RunErasedError: the run was DELETED while this worker ran it (erasure-fence.ts). Recording anything
+ *   for it would write the run back — the exact thing the fence exists to stop.
  * RunThreadMismatchError: the caller's own mistake (a runId re-used for a different thread), asserted
  *   Before the attempt does anything — never a verdict on how the run itself went. Critically, this
  *   RunId may already carry a 'completed' outcome from a PRIOR, correctly-scoped attempt; classifying
@@ -70,7 +72,7 @@ import { RunBusyError, CALLER_CONFLICT_CODES } from './errors.js';
  * The two that are NOT caller conflicts stay written out: a compensation and a cancel are deliberate
  * lifecycle ends, not somebody being refused.
  */
-const NOT_A_RUN_FAILURE = new Set([...Object.keys(CALLER_CONFLICT_CODES), 'CompensatedRunError', 'RunCanceledError']);
+const NOT_A_RUN_FAILURE = new Set([...Object.keys(CALLER_CONFLICT_CODES), 'CompensatedRunError', 'RunCanceledError', 'RunErasedError']);
 
 /**
  * How a run's error relates to its outcome record. RunBusyError alone cannot answer this — it is

@@ -245,7 +245,10 @@ export interface SubjectRun {
   /**
    * The run may still write: its outcome is the write-ahead `running` (a run's own LAST write turns it
    * terminal), or a model step or tool call of it is claimed `running` right now (the step a canceled
-   * run is still inside). A run whose worker died stays `running` until someone purges or cancels it.
+   * run is still inside) — under the run, or under an idempotency window it points at. A run whose
+   * worker died stays `running` until someone purges or cancels it. A canceled worker that holds no
+   * claim (inside a call answered by a record) is not listed; it meets the fence the erasure leaves and
+   * writes nothing more (erasure-fence.ts).
    */
   inFlight: boolean;
 }
@@ -311,8 +314,11 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
         'so this view cannot reach them. Pass the root storage and name the organization with `{ orgId }`.',
     );
   }
-  // NOT A SNAPSHOT: a run of this person in flight while this runs writes after it returns. See
-  // `subjectRuns` for the order that closes that (revoke, wait or cancel, erase, check again).
+  // NOT A SNAPSHOT: a run of this person in flight while this runs may write after it returns — what it
+  // writes into its own run it deletes again on meeting the fence each run deletion leaves
+  // (erasure-fence.ts); what it writes outside its run, in the moment between its last read of the fence
+  // and the fence's write, it does not. See `subjectRuns` for the order that closes that (revoke, wait or
+  // cancel, erase, check again).
   const home = memoryHome(storage, opts.memory);
   const journal = toJournal(storage.runs);
   if (typeof journal.deletePrefix !== 'function') throw new Error('@gnldev/durable: eraseSubject needs a journal that can deletePrefix');

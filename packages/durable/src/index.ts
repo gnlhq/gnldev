@@ -230,6 +230,7 @@ export { compensateRun, assertNotCompensated, runCompensated, CompensatedRunErro
 export type { CompensationEntry, CompensationReport } from './compensation.js';
 // P2-cancel durable cross-worker agent-run cancel — see cancel.ts.
 export { cancelAgentRun, agentRunCanceled, assertNotCanceled, RunCanceledError } from './cancel.js';
+export { RunErasedError } from './erasure-fence.js';
 // Agent approval registry — governance gate for code-defined agents (opt-in via server requireAgentApproval).
 export {
   fingerprintAgent, recordAgent, approveAgent, blockAgent, agentApprovalStatus, isAgentServable,

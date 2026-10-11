@@ -22,11 +22,25 @@ import type { DurableCtx, ToolJournalRecord } from '../src/journal.js';
 
 const KEY = 'call-1';
 
-/** Bir tur: aracı çağır, execute'un ortasında çalıştırıcıyı terk et (çöküş). */
+/**
+ * One round: call the tool and kill its process in the middle of execute (a crash). A dead process
+ * never writes to the journal again — nor renews its claim (holdClaim). A hanging execute alone is not
+ * a death: in a live process it keeps its claim, and modelled that way the "crash" rounds raced a live
+ * attempt.
+ */
 function crashOnce(journal: any, runId: string, tool: any, ctx?: Partial<DurableCtx>) {
-  const c = { journal, runId, claimTtlMs: 1, ...ctx } as DurableCtx;
+  let dead = false;
+  const deadAfterBody = new Proxy(journal, {
+    get(t, p) {
+      const v = t[p];
+      if (typeof v !== 'function') return v;
+      return (...args: unknown[]) => (dead ? new Promise(() => {}) : v.apply(t, args));
+    },
+  });
+  const dies = { ...tool, execute: (...a: unknown[]) => { dead = true; return tool.execute(...a); } };
+  const c = { journal: deadAfterBody, runId, claimTtlMs: 1, ...ctx } as DurableCtx;
   // Bilerek await EDİLMİYOR: çağrı askıda kalır, kayıt 'running' olarak journal'da durur.
-  void durableTool(tool, c, 'senkronEt').execute!({ n: 1 }, { toolCallId: KEY }).catch(() => {});
+  void durableTool(dies, c, 'senkronEt').execute!({ n: 1 }, { toolCallId: KEY }).catch(() => {});
   return new Promise((r) => setTimeout(r, 12)); // claim yazımı insin + ttl(1ms) geçsin
 }
 

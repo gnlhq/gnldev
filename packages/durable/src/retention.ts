@@ -29,7 +29,9 @@ import {
 } from './model.js';
 import type { MemoryStore } from './storage.js';
 import { ThreadRunsInFlightError } from './errors.js';
-export { ownershipTraceKey };
+import { orgPurgedKey, sweepRunFences } from './erasure-fence.js';
+import { randomUUID } from 'node:crypto';
+export { ownershipTraceKey, orgPurgedKey };
 
 
 function requireListKeys(journal: Journal): NonNullable<Journal['listKeys']> {
@@ -119,9 +121,16 @@ export async function purgeRun(
 ): Promise<number> {
   refuseUnknownNames('purgeRun', opts, PURGE_RUN_NAMES);
   requireDelete(journal);
-  // The run and every run under it, children first (model.ts): the plan is read off the run's own
-  // records before anything goes, then executed in that order.
-  return executePlan({ journal }, await planRun(journal, runId, seen), opts.ownershipTrace ? { ownershipTrace: runId } : {});
+  return purgeRunPlan(journal, runId, seen, opts.ownershipTrace === true, true);
+}
+
+/**
+ * The run and every run under it, children first (model.ts): the plan is read off the run's own
+ * records before anything goes, then executed in that order. `fence: false` is retention's own sweep —
+ * see `executePlan`.
+ */
+async function purgeRunPlan(journal: Journal & Partial<JournalReader>, runId: string, seen: Set<string>, ownershipTrace: boolean, fence: boolean): Promise<number> {
+  return executePlan({ journal }, await planRun(journal, runId, seen), { ...(ownershipTrace ? { ownershipTrace: runId } : {}), ...(fence ? {} : { fence: false }) });
 }
 
 /**
@@ -368,9 +377,19 @@ export async function purgeThread(
   } = {},
 ): Promise<number> {
   refuseUnknownNames('purgeThread', opts, PURGE_THREAD_NAMES);
+  return purgeThreadPlan(journal, threadId, opts, true);
+}
+
+/** `purgeThread`, with `fence: false` for retention's own sweep — see `executePlan`. */
+async function purgeThreadPlan(
+  journal: Journal,
+  threadId: string,
+  opts: { memory?: Pick<MemoryStore, 'deleteThread'>; vectors?: Pick<VectorStore, 'delete'>; allowInFlight?: boolean },
+  fence: boolean,
+): Promise<number> {
   requireDelete(journal);
   const target = { journal, ...(opts.memory ? { memory: opts.memory } : {}), ...(opts.vectors ? { vectors: opts.vectors } : {}) };
-  return executePlan(target, await planThread(target, threadId, { ...(opts.allowInFlight ? { allowInFlight: true } : {}) }));
+  return executePlan(target, await planThread(target, threadId, { ...(opts.allowInFlight ? { allowInFlight: true } : {}) }), fence ? {} : { fence: false });
 }
 
 /**
@@ -439,6 +458,12 @@ export async function purgeOrganizationWork(workArg: WorkStore, orgId: string): 
 export async function purgeOrganization(journal: Journal, orgId: string, now = Date.now()): Promise<number> {
   const prefix = orgPrefix(orgId); // refuses '' (which would sweep `org::`) and a ':'-bearing id
   const del = requireDelete(journal);
+  // FIRST, outside the prefix it deletes: a worker of this organization still running reads the marker
+  // change, stops, and deletes again what it wrote in between (erasure-fence.ts). The organization's
+  // own run fences go with its partition below, so this is the only thing such a worker can read. A
+  // fresh value each purge (`n`): a worker compares it with the one it started under.
+  const mark = randomUUID();
+  await journal.put(orgPurgedKey(orgId), { at: now, n: mark });
   const n = await del(prefix);
   // A boundary marker, because the audit log is NOT org-prefixed and therefore survives this.
   //
@@ -450,13 +475,8 @@ export async function purgeOrganization(journal: Journal, orgId: string, now = D
   // The records are not deleted. An audit log that can be erased by the operation it is meant to
   // record is not an audit log, and the operator's own view still needs the whole history — including
   // the purge. What changes is the org-SCOPED view: it starts at the org's current tenancy.
-  await journal.put(orgPurgedKey(orgId), { at: now });
+  await journal.put(orgPurgedKey(orgId), { at: now, n: mark });
   return n;
-}
-
-/** Marks when an org id was last purged; an org-scoped audit view starts after this. */
-export function orgPurgedKey(orgId: string): string {
-  return `__org_purged__:${orgId}`;
 }
 
 export interface SweepOptions {
@@ -548,6 +568,11 @@ export interface SweepResult {
    * a field that is always present reads as a normal part of the report, and this one is not normal.
    */
   skippedGhosts?: string[];
+  /**
+   * Fences of deleted runs (erasure-fence.ts) older than `olderThanMs`, removed by this sweep: past the
+   * horizon after which a run counts as abandoned, its worker is presumed gone. Absent when none.
+   */
+  fencesSwept?: number;
 }
 
 /**
@@ -616,10 +641,12 @@ export async function sweepRuns(journal: Journal & Partial<JournalReader>, opts:
       if (!(await isRealRun(journal, runId))) { (fast.skippedGhosts ??= []).push(runId); continue; }
       // BEFORE the purge — `tombstoneFor` reads the run's own `:input`, which the next line deletes.
       const tomb = opts.tombstones ? await tombstoneFor(journal, runId, now) : undefined;
-      fast.deletedEntries += await purgeRun(journal, runId, new Set(), { ownershipTrace: true });
+      fast.deletedEntries += await purgeRunPlan(journal, runId, new Set(), true, false);
       if (tomb) await journal.put(`${runId}:swept`, tomb);
       fast.purged.push(runId);
     }
+    const fencesSwept = await sweepRunFences(journal, now - opts.olderThanMs);
+    if (fencesSwept > 0) fast.fencesSwept = fencesSwept;
     return fast;
   }
 
@@ -682,11 +709,13 @@ export async function sweepRuns(journal: Journal & Partial<JournalReader>, opts:
     if (now - lastActivity > opts.olderThanMs || (summary.status === 'suspended' && opts.suspendedTtlMs !== undefined && now - lastActivity > opts.suspendedTtlMs)) {
       if (!(await isRealRun(journal, r.runId))) { (result.skippedGhosts ??= []).push(r.runId); continue; }
       const tomb = opts.tombstones ? await tombstoneFor(journal, r.runId, now) : undefined; // BEFORE the purge
-      result.deletedEntries += await purgeRun(journal, r.runId, new Set(), { ownershipTrace: true });
+      result.deletedEntries += await purgeRunPlan(journal, r.runId, new Set(), true, false);
       if (tomb) await journal.put(`${r.runId}:swept`, tomb);
       result.purged.push(r.runId);
     }
   }
+  const fencesSwept = await sweepRunFences(journal, now - opts.olderThanMs);
+  if (fencesSwept > 0) result.fencesSwept = fencesSwept;
   return result;
 }
 
@@ -971,7 +1000,7 @@ export async function sweepThreads(journal: Journal, opts: ThreadSweepOptions): 
       // A thread delete takes its runs (model.ts), so a thread with a run still executing is kept for a
       // later round rather than pulled out from under it — named, not silently skipped.
       try {
-        await purgeThread(journal, threadId);
+        await purgeThreadPlan(journal, threadId, {}, false);
       } catch (e) {
         if (!(e instanceof ThreadRunsInFlightError)) throw e;
         (result.keptInFlight ??= []).push(threadId);

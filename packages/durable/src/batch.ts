@@ -208,7 +208,9 @@ export function createBatch(journal: Journal, cfg: BatchConfig) {
         if (x && !x.first.runId.startsWith(`batch:${batchId}:`)) {
           let now = Date.now(); try { if (journal.now) now = await journal.now(); } catch { /* görüntü saati — fail-open */ }
           const diff = amountsDifferOf(x, item);
-          if (diff.length) plan.amountMismatches.push({ itemKey: key, detail: `same identity completed ${xidWhen(x, now)}, but ${diff.join(', ')} differ` });
+          // Started and not finished (claimed in flight before its effect): it may have run — a hit, said as such.
+          if (x.inFlight) plan.xidHits.push({ itemKey: key, detail: `same identity started ${xidWhen(x, now)} and not finished — it may have run (first: ${x.first.toolCallId})` });
+          else if (diff.length) plan.amountMismatches.push({ itemKey: key, detail: `same identity completed ${xidWhen(x, now)}, but ${diff.join(', ')} differ` });
           else plan.xidHits.push({ itemKey: key, detail: `same identity completed ${xidWhen(x, now)} (first: ${x.first.toolCallId})` });
           continue;
         }

@@ -27,6 +27,9 @@ import type { ModelInput, ToolSet } from './types.js';
 import { DuplicateSideEffectError, RunLimitExceededError, TaintedSideEffectError, ToolLoopDetectedError } from './limits.js';
 import { assertNotCompensated, CompensatedRunError } from './compensation.js';
 import { assertNotCanceled } from './cancel.js';
+import { assertNotErased, erasureBaseline, runErasedSince, RunErasedError } from './erasure-fence.js';
+import type { ErasureBaseline } from './erasure-fence.js';
+import { settleErasedRun } from './model.js';
 import { markRunTainted, readThreadTaint, readDirectRunTaint, recordTaintProvenance, isThreadTaintExpired } from './taint.js';
 import type { RunLimits } from './limits.js';
 
@@ -746,14 +749,18 @@ export async function resolveApprovals(
  */
 export function hasRunProbe(journal: Journal, runId: string, claimTtlMs?: number): (toolCallId: string) => Promise<boolean> {
   return async (toolCallId) => {
-    const rec = await journal.get<{ status?: string; startedAt?: number }>(runKeys.tool(runId, toolCallId));
+    const rec = await journal.get<{ status?: string; startedAt?: number; claimTtlMs?: number }>(runKeys.tool(runId, toolCallId));
     if (rec?.status === 'succeeded' || rec?.status === 'denied' || rec?.status === 'reflected') return true;
     if (rec?.status !== 'running') return false;
     const nowTs = journal.now ? await journal.now() : Date.now();
     // A 'running' with no `startedAt` cannot be dated, so it reads as stale — the SAME verdict
     // durable-tool's reclaim ladder gives it. The two must agree: a record the ladder will take over
     // and re-run is a record a human may still re-answer.
-    return typeof rec.startedAt === 'number' && nowTs - rec.startedAt <= (claimTtlMs ?? CLAIM_TTL_MS);
+    // The claim's OWN threshold first: the tool's (`timeoutMs`-derived) claimTtl, stamped by the worker
+    // holding it. The run-wide one judged a 2-minute tool's live claim stale at 30 s, and a late "deny"
+    // replaced the approval its call was running on (a-a-long-call-keeps-the-answer-it-runs-on.test.ts).
+    const ttl = typeof rec.claimTtlMs === 'number' ? rec.claimTtlMs : (claimTtlMs ?? CLAIM_TTL_MS);
+    return typeof rec.startedAt === 'number' && nowTs - rec.startedAt <= ttl;
   };
 }
 
@@ -2929,8 +2936,12 @@ export async function runDurable(args: RunDurableArgs): Promise<DurableResult> {
   // the conformance registry: with the owner record unreadable, another user's call rejected with
   // EIO and still stamped the owner's run `failed`. An unreadable owner is not written through.
   const admission = { admitted: false };
+  // What this attempt knows of its run's deletion when it starts (erasure-fence.ts) — compared at every
+  // later check, and once more after the attempt's last write (below).
+  const erasure = await erasureBaseline(args.journal);
+  let out: DurableResult;
   try {
-    return await runDurableGuarded(await normalizeEntryArgs(args), admission);
+    out = await runDurableGuarded(await normalizeEntryArgs(args), admission, erasure);
   } catch (err) {
     if (!admission.admitted) throw err;
     const kind = classifyRunError(err);
@@ -2939,17 +2950,23 @@ export async function runDurable(args: RunDurableArgs): Promise<DurableResult> {
     // survivor's verdict — earlier or later — always stands; recording nothing left the run reading
     // 'completed' while it was neither.
     else if (kind === 'contended') await runFailedIfUnrecorded(args.journal, args.runId, err, Date.now());
+    if (await settleErasedRun(args.journal, args.runId, erasure)) throw err instanceof RunErasedError ? err : new RunErasedError(args.runId);
     throw err;
   }
+  // AFTER the attempt's last write: a run deleted while it ran is deleted again, and its answer —
+  // a deleted person's — is not handed on (erasure-fence.ts).
+  if (await settleErasedRun(args.journal, args.runId, erasure)) throw new RunErasedError(args.runId);
+  return out;
 }
 
-async function runDurableGuarded(args: RunDurableArgs, admission: { admitted: boolean }): Promise<DurableResult> {
+async function runDurableGuarded(args: RunDurableArgs, admission: { admitted: boolean }, erasure: ErasureBaseline): Promise<DurableResult> {
   // A COMPENSATED (unwound) run refuses to run/resume — replaying memoized successes
   // on top of an already-reverted world would silently "complete" a transaction that was undone.
   await assertNotCompensated(args.journal, args.runId);
   // P2-cancel: same terminal-refusal contract as compensation — a durably-canceled run never
-  // (re)starts or resumes (the per-step mid-flight gate lives in durable-model.ts).
-  await assertNotCanceled(args.journal, args.runId);
+  // (re)starts or resumes (the per-step mid-flight gate lives in durable-model.ts). Nor does a run
+  // that was deleted under a live worker (erasure-fence.ts).
+  await Promise.all([assertNotCanceled(args.journal, args.runId), assertNotErased(args.journal, args.runId, erasure)]);
   const lock = (args as any).lock;
   if (lock) {
     const handle = await acquireRunLock(args.journal, args.runId, lock.owner, lock.ttlMs);
@@ -2968,14 +2985,14 @@ async function runDurableGuarded(args: RunDurableArgs, admission: { admitted: bo
     const heartbeat = setInterval(() => { inflight = handle.renew(lock.ttlMs).catch(() => false); }, beat);
     (heartbeat as any).unref?.();
     try {
-      return await runDurableInner(args, admission);
+      return await runDurableInner(args, admission, erasure);
     } finally {
       clearInterval(heartbeat);
       await inflight;
       await handle.release();
     }
   }
-  return runDurableInner(args, admission);
+  return runDurableInner(args, admission, erasure);
 }
 
 
@@ -3064,7 +3081,7 @@ async function bornAs(journal: Journal, runId: string, owner: RunOwner, caller: 
   }
 }
 
-async function runDurableInner(args: RunDurableArgs, admission: { admitted: boolean }): Promise<DurableResult> {
+async function runDurableInner(args: RunDurableArgs, admission: { admitted: boolean }, erasure: ErasureBaseline): Promise<DurableResult> {
   // `workKey`/`workScope` are pulled OUT of `rest` deliberately: `rest` is both the frozen input and
   // the option bag handed to `generateText`, so a declared name left in it would travel to the
   // provider as an unknown request field and land in `:input` twice under two different meanings.
@@ -3149,7 +3166,7 @@ async function runDurableInner(args: RunDurableArgs, admission: { admitted: bool
   });
   // C2: on resume, fetch model/tool entries in a single query → hot replay reads take 1 round-trip instead of N.
   // On the first run there are no entries → undefined (no cache). Consume-once: see ctxGet.
-  const ctx: DurableCtx = { journal, runId, threadId, identity, channel, guard, approvals: resolvedApprovals, replay, limits, toolPolicy, blockedAsSentinel: true, toolTimeoutMs: timeouts?.toolMs, claimTtlMs: timeouts?.claimTtlMs, toolResultProcessors: processors, replayCache: await loadReplayCache(journal, runId, { maxBytes: replayCacheMaxBytes }), replayLog: [] };
+  const ctx: DurableCtx = { journal, runId, threadId, identity, channel, guard, approvals: resolvedApprovals, replay, limits, toolPolicy, blockedAsSentinel: true, toolTimeoutMs: timeouts?.toolMs, claimTtlMs: timeouts?.claimTtlMs, toolResultProcessors: processors, replayCache: await loadReplayCache(journal, runId, { maxBytes: replayCacheMaxBytes }), replayLog: [], erasure };
   const procCtx = processors?.length ? createProcessorCtx(journal, runId) : undefined;
 
   // Memory: load thread history (prepend to messages) + inject working memory into the system prompt.
@@ -3259,6 +3276,11 @@ async function runDurableInner(args: RunDurableArgs, admission: { admitted: bool
   // byte unchanged for a run with no ProcessorRetry-throwing processor).
   const { result: ladderResult, interrupts, produced: processedProduced, rawText } = await runGenerateWithRetryLadder(options, processors, procCtx, journal, runId, stepHookFailure);
   let result = ladderResult;
+
+  // A run DELETED while its last step ran writes none of what follows (erasure-fence.ts): its turn's
+  // messages land in the thread, outside the run, and its usage and metrics in the shared counters —
+  // places the run's own clean-up (runDurable's settle) does not reach.
+  if (interrupts.length === 0) await assertNotErased(journal, runId, erasure);
 
   // Memory: idempotent append on completion (not suspended) — resume/retry does NOT double-write.
   // TWO-PHASE MARKER (review finding A — see claimMemoryAppend/markMemoryAppendDone): if the pending
@@ -3536,8 +3558,10 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
   // Same refusal as runDurable — a compensated run never streams either.
   await assertNotCompensated(args.journal, args.runId);
   // P2-cancel: same terminal-refusal contract as compensation — a durably-canceled run never
-  // (re)starts or resumes (the per-step mid-flight gate lives in durable-model.ts).
-  await assertNotCanceled(args.journal, args.runId);
+  // (re)starts or resumes (the per-step mid-flight gate lives in durable-model.ts). Nor does a deleted
+  // one (erasure-fence.ts); `erasure` is what this attempt compares against until its last write.
+  const erasure = await erasureBaseline(args.journal);
+  await Promise.all([assertNotCanceled(args.journal, args.runId), assertNotErased(args.journal, args.runId, erasure)]);
   // Same reason as runDurableInner: the declared name leaves `rest` before `rest` becomes both the
   // frozen input and the `streamText` option bag.
   const { journal, runId, guard, approvals, memory, threadId, resourceId: _declaredResourceId, caller: _declaredCaller, channel, agentName, workKey, workScope, replay, lock, processors, schemaCompat, limits, exclusiveModelStep, replayCacheMaxBytes, toolPolicy, timeouts, strictInput, conflictLedger, tombstonePolicy, actor, auditOnReject, replayDisclosure, model, tools, stopWhen, onBlocked, origin, trustRecordedInput, ...rest } =
@@ -3662,7 +3686,7 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
     hasRun: hasRunProbe(journal, runId, timeouts?.claimTtlMs),
   });
   // C2: on resume, load the replay snapshot (same as runDurableInner).
-  const ctx: DurableCtx = { journal, runId, threadId, identity, channel, guard, approvals: resolvedApprovals, replay, limits, toolPolicy, blockedAsSentinel: true, toolTimeoutMs: timeouts?.toolMs, claimTtlMs: timeouts?.claimTtlMs, toolResultProcessors: processors, replayCache: await loadReplayCache(journal, runId, { maxBytes: replayCacheMaxBytes }), replayLog: [] };
+  const ctx: DurableCtx = { journal, runId, threadId, identity, channel, guard, approvals: resolvedApprovals, replay, limits, toolPolicy, blockedAsSentinel: true, toolTimeoutMs: timeouts?.toolMs, claimTtlMs: timeouts?.claimTtlMs, toolResultProcessors: processors, replayCache: await loadReplayCache(journal, runId, { maxBytes: replayCacheMaxBytes }), replayLog: [], erasure };
   const procCtx = processors?.length ? createProcessorCtx(journal, runId) : undefined;
 
   // Memory: load thread history + inject into system (BEFORE persistInput → replayable).
@@ -3810,7 +3834,11 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
       }
       const pending = stepsArr.some((s: any) =>
         Array.isArray(s?.content) && s.content.some((p: any) => hasSuspend(p) || hasLimitExceeded(p) || hasBlocked(p)));
-      if (!pending) {
+      // Parity with runDurableInner: a run DELETED while its last step streamed writes none of its
+      // completion — not its messages into the thread, not its usage or metrics (erasure-fence.ts). A
+      // read that fails is not a deletion; the settle below reads again after the last write.
+      const erased = !pending && (await runErasedSince(journal, runId, erasure).catch(() => false));
+      if (!pending && !erased) {
         try {
           let produced: any[] = producedMessages(ev);
           if (procCtx) {
@@ -3863,6 +3891,11 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
       // (a): the stream has finished (completed OR suspended) → release the run-lock so a resume
       // can proceed. Token-fenced + idempotent: a no-op if the lock was already taken over/released.
       await releaseStreamLock();
+      // After the attempt's last write (erasure-fence.ts) — parity with runDurable. The stream has
+      // already been delivered; what it wrote into a run deleted meanwhile is deleted again.
+      try { await settleErasedRun(journal, runId, erasure); } catch (err) {
+        console.warn(`@gnldev/durable: '${runId}' was deleted while it streamed, and what it wrote since could not be deleted again:`, err);
+      }
       if (prevOnFinish) await prevOnFinish(ev);
     };
     // (a): also release on a stream error (onFinish may not fire on the error path). release()
@@ -3875,6 +3908,9 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
       streamFailed = true; // onFinish still fires after an error — it must not record a success over this
       if (isRunFailure(err)) await runFailed(journal, runId, err, Date.now());
       await releaseStreamLock();
+      try { await settleErasedRun(journal, runId, erasure); } catch (e) {
+        console.warn(`@gnldev/durable: '${runId}' was deleted while it streamed, and what it wrote since could not be deleted again:`, e);
+      }
       if (prevOnError) await prevOnError(ev);
     };
     // (a): release on ABORT too — AI SDK 7 fires `onAbort` (NOT onFinish/onError) when the caller's
@@ -3885,6 +3921,7 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
     const prevOnAbort = (options as any).onAbort;
     (options as any).onAbort = async (ev: any) => {
       await releaseStreamLock();
+      try { await settleErasedRun(journal, runId, erasure); } catch { /* the stream was aborted; the deletion's own fence still stops a resume */ }
       if (prevOnAbort) await prevOnAbort(ev);
     };
   }
