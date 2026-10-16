@@ -44,6 +44,9 @@ function diesAt(journal: Journal, dies: (key: string, value: unknown) => boolean
   let dead = false;
   return new Proxy(journal as any, {
     get(t, p) {
+      // Another process, with no liveness on the store (as one cut off from it is judged, its session gone):
+      // its claims are judged by their age (process-liveness.ts bindOwnLiveness, liveness.ts stampIsLive).
+      if (p === 'processLiveness') return undefined;
       const v = t[p];
       if (typeof v !== 'function') return v;
       return async (...args: unknown[]) => {
@@ -63,6 +66,9 @@ function diesAt(journal: Journal, dies: (key: string, value: unknown) => boolean
 function later(journal: Journal, ms: number): Journal {
   return new Proxy(journal as any, {
     get(t, p) {
+      // Another process, with no liveness on the store (as one cut off from it is judged, its session gone):
+      // its claims are judged by their age (process-liveness.ts bindOwnLiveness, liveness.ts stampIsLive).
+      if (p === 'processLiveness') return undefined;
       if (p === 'now') return async () => (t.now ? await t.now() : Date.now()) + ms;
       const v = t[p];
       return typeof v === 'function' ? v.bind(t) : v;

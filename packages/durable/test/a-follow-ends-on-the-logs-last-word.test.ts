@@ -67,8 +67,8 @@ describe.each(STORES)('a follow ends on the log\'s last word — %s', (_name, ma
     const runId = `r-end-${unique()}`;
     const { a, b } = pair(journal, slowFirstRead(journal, async () => (await journal.get(execKey(undefined, runId))) === undefined));
     await a.start({ runId, launch: (s) => streamDurable({ journal, runId, model: streamingModel({ words: Array.from({ length: 20 }, (_, i) => `w${i} `), gapMs: 10 }), prompt: 'p', resourceId: 'u', abortSignal: s } as any) });
-    await sleep(60);
-    const from = (await lastRunEvent(journal, runId))!.seq;
+    // The log's first event, waited for: a fixed 60 ms was too short on a loaded runner (CI, Postgres C).
+    const from = (await vi.waitFor(async () => { const e = await lastRunEvent(journal, runId); expect(e).toBeDefined(); return e!; }, { timeout: 5_000 })).seq;
     const got: any[] = [];
     for await (const ev of b.follow({ runId, after: from })) got.push(ev);
     expect(statesOf(got)).toContain('completed');

@@ -4,7 +4,7 @@ import type { StreamTextResult } from 'ai';
 import { withDurableModel } from './durable-model.js';
 import { durableTools } from './durable-tool.js';
 import { CLAIM_TTL_MS, claimIsLive, journalNow } from './liveness.js';
-import { RunDrainedError, holdWhile } from './process-liveness.js';
+import { RunDrainedError, holdWhile, bindOwnLiveness } from './process-liveness.js';
 import { acquireRunLock } from './run-lock.js';
 import { RunBusyError, runBusyMessage, SideEffectRetryBlockedError, RetryLimitExceededError, OutcomeUnknownError, RunThreadMismatchError, RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunSweptError, ThreadOwnerMismatchError } from './errors.js';
 import { admitThreadRun } from './thread-owner.js';
@@ -2790,6 +2790,8 @@ async function normalizeEntryArgs<T extends { model?: unknown }>(args: T): Promi
 
 export async function runDurable(args: RunDurableArgs): Promise<DurableResult> {
   refuseDurableArgNames('runDurable', args);
+  // Its claims and its hand name this process, called directly too (process-liveness.ts bindOwnLiveness).
+  await bindOwnLiveness(args.journal);
   // Held by the process until it settles: a drain waits for it, and `pendingWork` lists it — from this
   // process, or from the store's shadow in any other (process-liveness.ts `holdWhile`).
   return holdWhile(() => runDurableHeld(args), typeof args.runId === 'string' ? { journal: args.journal, name: args.runId, what: 'the run is executing' } : undefined);

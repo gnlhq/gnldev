@@ -6,7 +6,8 @@ import { claim, ctxGet, runKeys } from './journal.js';
 import { stampFormat } from './format.js';
 import { enforceStepLimits } from './limits.js';
 import { assertNotCanceled } from './cancel.js';
-import { isDraining, RunDrainedError } from './process-liveness.js';
+import { isDraining, RunDrainedError, procStampFor, bindOwnLiveness } from './process-liveness.js';
+import { claimIsLive, newHoldId, holdHere, releaseHold } from './liveness.js';
 import { assertNotErased } from './erasure-fence.js';
 import { settleModelContent } from './time-travel.js';
 import { RunBusyError } from './errors.js';
@@ -63,7 +64,8 @@ async function journalNow(ctx: DurableCtx): Promise<number> {
  *
  * exclusive OFF (default): existing behavior EXACTLY — unconditional `put` (overwrites), never throws.
  * exclusive ON: tries an atomic `claim` (putIfAbsent); if lost, checks the existing record:
- * 'running' + FRESH (now - startedAt < ttlMs) → `RunBusyError` (another worker is processing that step).
+ * 'running' + LIVE (`claimIsLive`: held by an attempt in this process, or by a live process, else younger than
+ *     ttlMs) → `RunBusyError` (another worker is processing that step).
  * 'running' + STALE / 'failed' / other → existing behavior: overwrite, continue (the double-call
  *     risk is deliberately accepted — the FAST resume after a real crash happens in this window).
  * NOTE: RunBusyError is thrown WITHOUT touching the claim (the record belongs to the other worker) and
@@ -74,23 +76,30 @@ async function acquireModelClaim(
   claimKey: string,
   reqHash: string | undefined,
   exclusive: ExclusiveStepOptions | undefined,
-): Promise<void> {
+): Promise<string | undefined> {
   if (!exclusive) {
     await ctx.journal.put(claimKey, { status: 'running', startedAt: Date.now(), reqHash });
-    return;
+    return undefined;
   }
+  // The claim names this process and this call (liveness.ts): a holder that stalls past the step TTL keeps
+  // it — judged by the one rule every claim is judged by, not by its age alone.
+  await bindOwnLiveness(ctx.journal);
   const now = await journalNow(ctx);
-  const record: ModelClaimRecord = { status: 'running', startedAt: now, reqHash };
-  if (await claim(ctx.journal, claimKey, record)) return; // fresh key: won atomically
-  const existing = await ctx.journal.get<ModelClaimRecord>(claimKey);
+  const hold = newHoldId();
+  const record = { status: 'running' as const, startedAt: now, reqHash, ...procStampFor(ctx.journal), hold };
   const ttlMs = exclusive.ttlMs ?? DEFAULT_EXCLUSIVE_TTL_MS;
-  if (existing?.status === 'running' && now - existing.startedAt < ttlMs) {
-    throw new RunBusyError(
-      `model step '${claimKey}' is being processed by another worker (claim ${now - existing.startedAt}ms old, ttl ${ttlMs}ms)`,
-    );
+  if (!(await claim(ctx.journal, claimKey, record))) {
+    const existing = await ctx.journal.get<ModelClaimRecord & { proc?: string; hold?: string }>(claimKey);
+    if (await claimIsLive(existing, now, ttlMs, ctx.journal)) {
+      throw new RunBusyError(
+        `model step '${claimKey}' is being processed by another worker (claim ${now - (existing?.startedAt ?? now)}ms old, ttl ${ttlMs}ms)`,
+      );
+    }
+    // STALE running (crash) / failed (retry) / leftover succeeded → existing behavior: overwrite, continue.
+    await ctx.journal.put(claimKey, record);
   }
-  // STALE running (crash) / failed (retry) / leftover succeeded → existing behavior: overwrite, continue.
-  await ctx.journal.put(claimKey, record);
+  holdHere(hold, ctx.journal);
+  return hold;
 }
 
 // DETERMINISTIC components of the model request: messages/tool schema/sampling parameters.
@@ -344,7 +353,7 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       if (isDraining()) throw new RunDrainedError(ctx.runId);
       // A new step spends budget: none left (the request's — a sibling may have used it), no step.
       if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId, 'before');
-      await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
+      const hold = await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
       let result: Awaited<ReturnType<typeof doGenerate>>;
       try {
         // Y1: opt-in step timeout — a timeout falls into the catch, claim becomes 'failed' (retry key does not shift).
@@ -358,6 +367,8 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
         // immediately — the existing "retry does not shift the replay key" behavior is PRESERVED (step did not advance).
         await ctx.journal.put(claimKey, { status: 'failed', startedAt: Date.now(), reqHash });
         throw error;
+      } finally {
+        releaseHold(hold, ctx.journal);
       }
       step++;
       // Checked AFTER the step is SUCCESSFULLY journaled (journal is already consistent) —
@@ -400,7 +411,7 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       if (isDraining()) throw new RunDrainedError(ctx.runId);
       // A new step spends budget: none left (the request's — a sibling may have used it), no step.
       if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId, 'before');
-      await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
+      const hold = await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
       let result: Awaited<ReturnType<typeof doStream>>;
       try {
         // Y1: in stream, the timeout is applied to the doStream call (up to the first byte) — see DurableModelOptions.
@@ -410,6 +421,10 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       } catch (error) {
         await ctx.journal.put(claimKey, { status: 'failed', startedAt: Date.now(), reqHash });
         throw error;
+      } finally {
+        // Held while the provider is asked (the call a twin would repeat), not while the caller reads the
+        // stream: a stream nobody finishes reading would otherwise hold the step in this process forever.
+        releaseHold(hold, ctx.journal);
       }
       const { stream, ...rest } = result;
       const myStep = step;

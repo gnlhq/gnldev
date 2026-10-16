@@ -418,6 +418,8 @@ export async function claimRunOwner(journal: RawJournal, runId: string, caller: 
  */
 const bornCtx = new WeakSet<object>();
 const BIRTH_ON_WRITE = Symbol('gnl.birthOnWrite');
+/** storage.ts JOURNAL_SOURCE (not imported: storage.ts imports this module). */
+const JOURNAL_SOURCE = Symbol.for('@gnldev/durable.journalSource');
 /** Marks a ctx the engine built for a run it has just admitted (and so born). @internal */
 export function engineBorn<T extends object>(ctx: T): T {
   bornCtx.add(ctx);
@@ -435,6 +437,10 @@ export function bornOnFirstWrite(ctx: { journal: Journal; runId: string; identit
   ctx.journal = new Proxy(journal, {
     get(target, prop) {
       if (prop === BIRTH_ON_WRITE) return runId;
+      // The view is the same store: a claim written through it names this process (the store's liveness
+      // is looked up by the store, process-liveness.ts), or a holder that stalls past its TTL is judged by
+      // its age and run beside (a-primitive-keeps-its-stores-liveness.test.ts).
+      if (prop === JOURNAL_SOURCE) return Reflect.get(target, prop, target) ?? target;
       const v = Reflect.get(target, prop, target);
       if (typeof v !== 'function') return v;
       if (prop === 'put' || prop === 'putIfAbsent' || prop === 'putIfMatch' || prop === 'incrBy') {

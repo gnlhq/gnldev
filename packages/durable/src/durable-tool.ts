@@ -20,8 +20,8 @@ import { SEM_RULESET_VERSION } from './semantic-rules.js';
 import { judgeGrayPair } from './semantic-judge.js';
 import { xidPlanOf, readXid, xidWhen, amountsDifferOf, completeOwnXid, writeXid, type XidPlan, type XidHeld } from './xid.js';
 import { Attempt, AttemptLost, compareAndSet, isUnstartedRelease, type DupMarker, type TerminalWriter } from './attempt.js';
-import { claimTtlFor, claimTimeLeft, claimIsLive, journalNow } from './liveness.js';
-import { procStampFor, isDraining, RunDrainedError } from './process-liveness.js';
+import { claimTtlFor, claimTimeLeft, claimIsLive, journalNow, newHoldId } from './liveness.js';
+import { procStampFor, bindOwnLiveness, isDraining, RunDrainedError } from './process-liveness.js';
 import type { SemPlan } from './semantic-dup.js';
 import type { RunLimits, ToolSeat } from './limits.js';
 import { createProcessorCtx } from './processor.js';
@@ -89,9 +89,13 @@ const isAnswer = (r: ToolJournalRecord | undefined): r is AnswerRecord =>
 const isDone = (r: ToolJournalRecord | undefined): r is Extract<AnswerRecord, { status: 'succeeded' | 'denied' | 'reflected' }> =>
   r?.status === 'succeeded' || r?.status === 'denied' || r?.status === 'reflected';
 
-/** The 'running' stamp a claim writes into `journal`: dated by the shared clock, counted, carrying its own TTL. */
+/**
+ * The 'running' stamp a claim writes into `journal`: dated by the shared clock, counted, carrying its own
+ * TTL, the process that holds it and the attempt that will (`hold`: live in this process while the
+ * attempt is held — liveness.ts).
+ */
 const runningStamp = (journal: Journal, startedAt: number, attempts: number, claimTtlMs: number, idempotencyKey: string) =>
-  stampFormat({ status: 'running' as const, startedAt, attempts, claimTtlMs, idempotencyKey, ...procStampFor(journal) });
+  stampFormat({ status: 'running' as const, startedAt, attempts, claimTtlMs, idempotencyKey, ...procStampFor(journal), hold: newHoldId() });
 
 /**
  * THE CALL'S IDEMPOTENCY KEY, as its record holds it. Decided once — by the first record written for the
@@ -677,6 +681,8 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
     // timed-out attempt is still running (it settles later, and counts then).
     const seat: Seat = { held: undefined, late: false, slot: undefined, attempt: undefined };
     try {
+      // Its claims name this process before any is written or judged (process-liveness.ts bindOwnLiveness).
+      await bindOwnLiveness(ctx.journal);
       return await executeOnce(input, options, seat, emit);
     } catch (error) {
       // Failed between its claim and its body: nothing ran, so the claim is given back (a no-op once the
@@ -685,8 +691,8 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       await seat.attempt?.giveBack();
       throw error;
     } finally {
-      // Every way out but a timed-out body still running ends the attempt here (that one stops its own).
-      if (!seat.attempt?.outlived) seat.attempt?.stop();
+      // Every way out but a timed-out body still running ends the attempt here (that one ends its own).
+      if (!seat.attempt?.outlived) seat.attempt?.end();
       if (!seat.late) await releaseSeat(seat);
     }
   };
@@ -2541,7 +2547,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
             (late) => settleSuccess(late).then(() => undefined),
             (lateErr) => settleFailure(lateErr).then(() => undefined),
           ).finally(async () => {
-            attempt.stop();
+            attempt.end();
             if (seat.late) await releaseSeat(seat);
           }).catch((e) => console.warn(`@gnldev/durable: '${toolName}' finished after its timeout and its outcome could not be journaled:`, e));
           throw error;

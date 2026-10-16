@@ -132,10 +132,14 @@ const again = await gnl.follow(s.runId, { after: at }); // continues right after
   (`RunCanceledError` for its callers). A second call for a run in flight follows the same execution.
 - **A dead process's runs are taken over; a live one's never are.** Each store has a process liveness
   — a Postgres session advisory lock, a Sqlite file lock (`SqliteStorage` and `PostgresStorage` bring
-  their own). A frozen process keeps its runs; a dead one releases them at once. A store other
-  processes reach with no liveness is refused (`LivenessRequiredError`): pass
-  `createGnl({ liveness: await postgresLiveness({ connectionString }) })`, or `inMemoryLiveness()` for
-  a store only this process reaches.
+  their own; the executor, the queue worker, and `durableTool` / `durableModel` / `runDurable` called
+  directly bind it on their first call — on Postgres one connection per store per process). A frozen
+  process keeps its runs and its calls; a dead one releases them at once. In the process that holds it,
+  a call's claim is held while its attempt is, whatever its age, on every store. Only a claim on a store
+  other processes share that brings no liveness, with none installed, is judged by its age
+  (`claimTtlMs`) — a holder frozen past it there is taken over. The executor refuses such a store
+  (`LivenessRequiredError`): pass `createGnl({ liveness: await postgresLiveness({ connectionString }) })`,
+  or `inMemoryLiveness()` for a store only this process reaches.
 - **Tuning the executor** (`createGnl({ detached: { … } })`, or `new DetachedRuns({ … })` used
   directly): `sweepMs` — how often it looks for runs whose process is gone (default 1 s; `0` runs no
   sweeper in this process); `pollMs` — how often a reader on another process reads the store (200 ms);

@@ -47,6 +47,8 @@ export interface XidRecord {
   ttlMs?: number;
   /** The process holding an in-flight id (process-liveness.ts): judged by that process before the TTL. */
   proc?: string;
+  /** The attempt holding an in-flight id (liveness.ts): live in the process that holds it. */
+  hold?: string;
   /** An in-flight claim given back by a call that failed before its effect: stands for no record. */
   released?: true;
 }
@@ -128,14 +130,14 @@ async function casXid(journal: Journal, key: string, expected: XidRecord, next: 
  * Lost: `cur` is what stands there (live or stale in flight, or completed) — the caller decides.
  */
 export async function claimXidInFlight(
-  journal: Journal, plan: XidPlan, runId: string, toolCallId: string, staleTtlMs: number, windowTtlMs?: number,
+  journal: Journal, plan: XidPlan, runId: string, toolCallId: string, staleTtlMs: number, windowTtlMs?: number, hold?: string,
 ): Promise<{ won: true; held: XidHeld } | { won: false; cur: XidRecord }> {
   const key = xidKey(plan.resourceId, plan.toolName, plan.identity);
   const now = journal.now ? await journal.now() : Date.now();
   const claimed: XidRecord = {
     v: 1, toolName: plan.toolName, identity: plan.identity, amounts: plan.amounts,
     first: { runId, toolCallId, at: now, ...(plan.channel ? { channel: plan.channel } : {}) },
-    inFlight: true, ttlMs: staleTtlMs, ...procStampFor(journal),
+    inFlight: true, ttlMs: staleTtlMs, ...procStampFor(journal), ...(hold ? { hold } : {}),
   };
   // A lost write is read again and judged again, never answered with "nothing there": two calls taking
   // the same released slot over at once must not both come away free to run. Bounded: a row that reads
@@ -148,7 +150,7 @@ export async function claimXidInFlight(
       continue;
     }
     const at = cur.first?.at ?? 0;
-    const stale = cur.inFlight === true && !(await stampIsLive(at, cur.ttlMs ?? staleTtlMs, now, cur.proc, journal));
+    const stale = cur.inFlight === true && !(await stampIsLive(at, cur.ttlMs ?? staleTtlMs, now, cur, journal));
     const windowExpired = windowTtlMs !== undefined && cur.released !== true && (cur.inFlight !== true || stale) && now - at > windowTtlMs;
     const own = cur.first?.runId === runId && cur.first?.toolCallId === toolCallId;
     const takeable = cur.released === true || windowExpired || (stale && own);

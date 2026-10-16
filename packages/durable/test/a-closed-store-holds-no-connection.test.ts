@@ -6,7 +6,7 @@
 // closed on keeps a connection from this process — measured: `DROP DATABASE` without FORCE refuses
 // ("is being accessed by other users"), which is how a-seat-under-load and worker-runs-once fail on a
 // real server. Postgres runs when GNL_PG_URL is set.
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import pg from 'pg';
 import { createGnl, STAFF } from '../src/index.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
@@ -41,7 +41,9 @@ describe.skipIf(!PG_URL)('a closed Postgres store holds no connection to its dat
       const model = createMockModel(async () => finalTextResult('ok'));
       await createGnl({ storage, agents: { a: { model } } } as any).run('a', { runId: 'closed-1', prompt: 'go', caller: STAFF } as any);
       await storage.close();
-      expect(await connections(), 'connections left on the closed store\'s database').toEqual([]);
+      // Waited for: the server ends a backend after the client has closed it, so pg_stat_activity may list it
+      // for a moment after close() returns (CI, Postgres en_US.utf8). A held connection never leaves.
+      await vi.waitFor(async () => expect(await connections(), 'connections left on the closed store\'s database').toEqual([]), { timeout: 2_000 });
     });
   });
 });

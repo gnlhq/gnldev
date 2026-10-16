@@ -526,7 +526,7 @@ export class PostgresStorage implements Storage {
     };
     this.runs = new PgRunJournal(q, tx, this.prefixShape);
     // The run journal answers for its store's liveness too (see SqliteStorage).
-    Object.defineProperty(this.runs, 'processLiveness', { value: () => this.processLiveness(), enumerable: false });
+    Object.defineProperty(this.runs, 'processLiveness', { value: () => this.processLiveness(), enumerable: false, configurable: true });
     // A1 — DOWNGRADE THE PORT, do not throw. `connect` is a synchronous check, so there is no reason
     // to defer it to the first query; and killing the whole Storage would take the runs journal, work
     // queue and cache down with it, for a deployment that may never touch memory at all. Declaring

@@ -65,6 +65,9 @@ function partitioned(journal: Journal) {
   let after: ((m: string, a: unknown[]) => boolean) | undefined;
   const j = new Proxy(journal as any, {
     get(t, p) {
+      // Another process, with no liveness on the store (as one cut off from it is judged, its session gone):
+      // its claims are judged by their age (process-liveness.ts bindOwnLiveness, liveness.ts stampIsLive).
+      if (p === 'processLiveness') return undefined;
       const v = t[p];
       if (typeof v !== 'function') return v;
       return async (...a: unknown[]) => {

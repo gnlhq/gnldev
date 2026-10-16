@@ -94,8 +94,8 @@ export function processLiveness(): ProcessLiveness | undefined {
 
 const bound = new WeakMap<object, ProcessLiveness>();
 
-/** The store a journal belongs to: the root under an organization's view, the source under a wrapper. */
-function storeOf(journal: unknown): object | undefined {
+/** The store a journal belongs to: the root under an organization's view, the source under a wrapper. @internal */
+export function storeOf(journal: unknown): object | undefined {
   let cur = journal as Record<symbol, unknown> | null | undefined;
   for (let i = 0; i < 8 && cur; i++) {
     const parent = cur[Symbol.for('@gnldev/durable.orgParent')] as Record<symbol, unknown> | undefined;
@@ -135,6 +135,37 @@ export async function storeLiveness(
   if (l) bindLiveness(journal, l);
   return l;
 }
+
+/**
+ * A PRIMITIVE CALLED DIRECTLY names its process too. `durableTool`, `durableModel` and `runDurable` take a
+ * journal, not an executor: before, only `createGnl`'s executor and `createWorker` bound the store's
+ * liveness, so a direct call (a host's own loop, a tool in a workflow step, a script) wrote claims that
+ * named no process, and another process judged them by their age — past the TTL, a frozen holder's
+ * effect was run beside it (audit 2026-10-16, a-frozen-process-keeps-its-direct-claim.test.ts). So the
+ * primitive settles the store's liveness on its first call, by the same rule as the executor
+ * (`storeLiveness`): one already bound, else the store's own (a Sqlite file lock; a Postgres session — one
+ * connection per store per process, the same one an executor or worker on that store would open, closed
+ * with the store), else the installed one. A store only this process can reach needs none.
+ */
+export async function bindOwnLiveness(journal: unknown): Promise<void> {
+  if (isProcessLocal(journal)) return;
+  const store = storeOf(journal);
+  if (!store || bound.has(store) || unbindable.has(store)) return;
+  const own = (store as { processLiveness?: () => ProcessLiveness | Promise<ProcessLiveness> }).processLiveness;
+  if (typeof own !== 'function' && !installed) return;
+  try {
+    await storeLiveness(journal, typeof own === 'function' ? { own: () => own.call(store) } : {});
+  } catch (err) {
+    // A store that cannot make its liveness (a pool that does not say where it connects, a session that
+    // could not be opened) keeps its claims judged by their age, as before — said once, not failed: the
+    // call itself does not need it, and an executor or worker given a liveness binds one later.
+    unbindable.add(store);
+    console.warn('@gnldev/durable: no process liveness could be made for this store, so a claim another process holds on it is judged by its age (claimTtlMs) — pass `liveness` to createGnl or createWorker:', err instanceof Error ? err.message : err);
+  }
+}
+
+/** Stores whose own liveness could not be made, asked once (see `bindOwnLiveness`). */
+const unbindable = new WeakSet<object>();
 
 /** The liveness that answers for `journal`'s store in this process: its own, else the installed one. */
 export function livenessFor(journal: unknown): ProcessLiveness | undefined {

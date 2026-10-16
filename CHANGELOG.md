@@ -394,6 +394,22 @@ whose call may still report is never declared failed before it has (`waiting-out
 
 ### Fixed
 
+- **A side effect ran twice when the process holding its claim stalled past the claim's TTL, wherever
+  no process liveness answered for the store.** A claim was judged by its age unless it named a process
+  that a liveness could ask about, and only `createGnl`'s executor and `createWorker` bound one. A
+  holder whose event loop stalled past `claimTtlMs` (a GC pause, a synchronous burst; 30 s by default)
+  could not renew its claim, and a twin of the call ran the effect beside it: in the same process on
+  every store (in-memory, Sqlite, Postgres), and from another process when the call was made directly
+  (`durableTool`, `durableModel` with `exclusiveStep`, a tool in a queue handler or a workflow step).
+  Measured: 13 of 13 scenarios ran the effect twice; now once. Now:
+  - a claim names the attempt that holds it, and the process that holds the attempt reads it live,
+    whatever its age, until the attempt ends (liveness.ts `stampIsLive`, the one rule every claim,
+    duplicate marker and cross-channel id is judged by);
+  - `durableTool`, `durableModel` and `runDurable` called directly bind the store's own liveness on their
+    first call, as the executor does, so another process asks the holder's process and not the clock.
+    On Postgres that is one session connection per store per process — the one an executor or worker on
+    the store opens — closed by `storage.close()`;
+  - `durableModel`'s `exclusiveStep` judges a step's claim by the same rule instead of its own age check.
 - **A job or trigger under a run id an erasure deleted was accepted, then failed on every attempt with
   a false reason.** After `eraseSubject`, `enqueue(…, { id: 'weekly:w42', caller: user('ayse') })`
   returned ok; the job's run `job:<id>` was fenced, so each attempt was refused at its birth and the job
@@ -994,6 +1010,10 @@ whose call may still report is never declared failed before it has (`waiting-out
   does not saw 2 on a single partition, and at most the retry ceiling on partitions in a row (a tool's
   `maxRetries`, 3; a queue job's `maxAttempts`, 5). A process that is only frozen, its session alive,
   is never taken over (Postgres and Sqlite, 140 trials).
+- A claim is judged by its age (`claimTtlMs`) in one case only: on a store other processes share that
+  brings no liveness of its own (`processLiveness()`), with none installed or passed. A holder frozen
+  past the TTL there is taken over and its effect can run twice. `SqliteStorage` (a file) and
+  `PostgresStorage` bring one; a custom store shared between processes should pass `liveness`.
 - Background tools: a caller who can guess a parent's run id and tool call id can start a run under a derived id first (as with
   `agent:<runId>:<toolCallId>` today): the parent's owner then gets no continuation (no data reaches
   the caller). A user turn that starts while a continuation runs follows the concurrent-turn rule (send

@@ -59,7 +59,10 @@ describe.each(kinds)('S4 on %s', (kind) => {
     expect(effectCount(s)).toBe(1);
   });
 
-  it(`S4b-baseline ${kind}: today's claim-by-age, same freeze → the effect runs twice (E6 reproduced)`, { timeout: 60_000 }, async () => {
+  // Was the baseline of the age model: with no liveness given, a direct call's claim was judged by its age and
+  // the same freeze ran the effect twice (E6). A direct call now binds the store's own liveness on its first
+  // call (process-liveness.ts bindOwnLiveness), so with none given by the host the frozen holder keeps it.
+  it(`S4b-no-host-liveness ${kind}: no liveness given by the host, same freeze → the store's own answers, the effect runs once`, { timeout: 60_000 }, async () => {
     const s = store(kind);
     const env = { DN_TOOL_MS: '1500', DN_CLAIM_TTL: '1000', DN_RECOVER: '1', DN_BASELINE: '1' };
     const a = await node(s, env);
@@ -73,8 +76,8 @@ describe.each(kinds)('S4 on %s', (kind) => {
     await first;
     await sleep(500);
     dump('S4b0', s, []);
-    console.log(`[S4b-baseline ${kind}] retry=${JSON.stringify(retry).slice(0, 300)} effects=${effectCount(s)}`);
-    expect(effectCount(s)).toBe(2);
+    console.log(`[S4b-no-host-liveness ${kind}] retry=${JSON.stringify(retry).slice(0, 300)} effects=${effectCount(s)}`);
+    expect(effectCount(s)).toBe(1);
   });
 
   it(`S4c ${kind}: SIGKILL after the effect, before its record; recover() answers → another process continues, one execution`, { timeout: 60_000 }, async () => {
@@ -104,7 +107,13 @@ describe.each(kinds)('S4 on %s', (kind) => {
     a.kill('SIGKILL');
     await a.exited;
     const evs = await readEvents(await fetch(b.url('/events?runId=r-4cu')), (e) => e.kind === 'status' && e.data.state === 'waiting-approval');
-    const pending = await (await fetch(b.url('/pending?quiet=600000'))).json();
+    // Polled: the waiting-approval event is appended just before the record is written 'parked' (detached.ts),
+    // so for a moment the list still says running (CI, Postgres C).
+    let pending: any[] = [];
+    for (let i = 0; i < 100 && !pending.some((p: any) => p.runId === 'r-4cu' && p.status === 'parked'); i++) {
+      pending = await (await fetch(b.url('/pending?quiet=600000'))).json();
+      if (!pending.some((p: any) => p.runId === 'r-4cu' && p.status === 'parked')) await sleep(50);
+    }
     dump('S4cu', s, evs);
     console.log(`[S4c-undecidable ${kind}] last=${finalState(evs)} pending=${JSON.stringify(pending)} effects=${effectCount(s)}`);
     expect(finalState(evs)).toBe('waiting-approval');

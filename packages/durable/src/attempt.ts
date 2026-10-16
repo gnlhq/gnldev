@@ -33,7 +33,7 @@ import { claim } from './journal.js';
 import type { Journal, ToolJournalRecord } from './journal.js';
 import { stableStringify } from './hash.js';
 import { stampFormat, upgradeFormat } from './format.js';
-import { journalNow, stampIsLive, claimIsLive } from './liveness.js';
+import { journalNow, stampIsLive, claimIsLive, holdHere, releaseHold } from './liveness.js';
 import { procStampFor, livenessFor } from './process-liveness.js';
 import { claimXidInFlight, renewXid, releaseXid, type XidHeld, type XidPlan, type XidRecord } from './xid.js';
 import { keepLateReport, type LateWriter } from './call-outcome.js';
@@ -77,6 +77,8 @@ export interface DupMarker {
   ttlMs?: number;
   /** The process holding an in-flight marker (process-liveness.ts): judged by that process before the TTL. */
   proc?: string;
+  /** The attempt holding an in-flight marker (liveness.ts): live in the process that holds it. */
+  hold?: string;
   /**
    * The attempt that held this marker FAILED and gave the slot back. This is a real field rather
    * than a deletion because `put(key, undefined)` does not delete a row: `get` reads it as absent,
@@ -99,7 +101,7 @@ async function claimDupMarker(journal: Journal, dupKey: string, next: DupMarker,
   if (raw === undefined) return (await claim(journal, dupKey, next)) ? { won: true } : { won: false, cur: await journal.get<DupMarker>(dupKey) };
   const cur = raw as DupMarker;
   const now = await journalNow(journal);
-  const stale = cur.inFlight === true && !(await stampIsLive(cur.at, cur.ttlMs ?? staleTtlMs, now, cur.proc, journal));
+  const stale = cur.inFlight === true && !(await stampIsLive(cur.at, cur.ttlMs ?? staleTtlMs, now, cur, journal));
   // FAZ-3 windowTtlMs: a COMPLETED marker older than the configured dedup window is not a duplicate
   // of anything anymore — takeable like a released one. A LIVE in-flight marker is never
   // window-expired (a live executor is arbitrated by its TTL alone); a stale one ages out like a
@@ -126,7 +128,7 @@ export class AttemptLost extends Error {
   constructor(key: string) { super(`@gnldev/durable: the claim on ${key} is no longer this attempt's`); this.name = 'AttemptLost'; }
 }
 
-type RunningStamp = { status: 'running'; startedAt: number; attempts: number; claimTtlMs: number; idempotencyKey: string };
+type RunningStamp = { status: 'running'; startedAt: number; attempts: number; claimTtlMs: number; idempotencyKey: string; hold?: string };
 
 export class Attempt {
   /** The tool's own execute has been called: from here on its effect may have happened. */
@@ -157,6 +159,8 @@ export class Attempt {
     private readonly writer?: LateWriter,
   ) {
     this.datedAt = datedAt;
+    // From here until `end()` this process holds the claim: its stamp reads live here at any age (liveness.ts).
+    holdHere(stamp.hold, journal);
   }
 
   /** The attempt counter its stamp carries. */
@@ -192,6 +196,17 @@ export class Attempt {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+  }
+
+  /**
+   * The attempt is over — its outcome written, or nothing more to write. From here its stamp, and the
+   * marker and id it held, are judged as anyone's (liveness.ts): by the process, then the age. Called once
+   * the call's last write is done, never before it: a stamp released while its success was still being
+   * written read as a crashed attempt's to a twin in this process.
+   */
+  end(): void {
+    this.stop();
+    releaseHold(this.stamp.hold, this.journal);
   }
 
   /**
@@ -339,7 +354,7 @@ export class Attempt {
   async claimDup(dupKey: string, toolCallId: string, windowTtlMs: number | undefined): Promise<{ won: boolean; cur?: DupMarker }> {
     return this.serial(async () => {
       if (this.state !== 'held') throw new AttemptLost(this.key);
-      const claimed: DupMarker = { firstToolCallId: toolCallId, at: await journalNow(this.journal), inFlight: true, ttlMs: this.stamp.claimTtlMs, ...procStampFor(this.journal) };
+      const claimed: DupMarker = { firstToolCallId: toolCallId, at: await journalNow(this.journal), inFlight: true, ttlMs: this.stamp.claimTtlMs, ...procStampFor(this.journal), ...(this.stamp.hold ? { hold: this.stamp.hold } : {}) };
       const got = await claimDupMarker(this.journal, dupKey, claimed, this.stamp.claimTtlMs, windowTtlMs);
       if (got.won) this.dup = { key: dupKey, toolCallId, claimed, gone: false };
       return got;
@@ -350,7 +365,7 @@ export class Attempt {
   async claimXid(plan: XidPlan, runId: string, toolCallId: string, windowTtlMs: number | undefined): Promise<{ won: boolean; cur?: XidRecord }> {
     return this.serial(async () => {
       if (this.state !== 'held') throw new AttemptLost(this.key);
-      const got = await claimXidInFlight(this.journal, plan, runId, toolCallId, this.stamp.claimTtlMs, windowTtlMs);
+      const got = await claimXidInFlight(this.journal, plan, runId, toolCallId, this.stamp.claimTtlMs, windowTtlMs, this.stamp.hold);
       if (got.won) { this.xid = got.held; return { won: true }; }
       return { won: false, cur: got.cur };
     });

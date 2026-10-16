@@ -303,7 +303,7 @@ export class SqliteStorage implements Storage {
     this.runs = new SqliteRunJournal(db);
     // The run journal answers for its store's liveness too: a registry handed only `journal: storage.runs`
     // (no storage) still finds the process lock of the database it writes to.
-    Object.defineProperty(this.runs, 'processLiveness', { value: () => this.processLiveness(), enumerable: false });
+    Object.defineProperty(this.runs, 'processLiveness', { value: () => this.processLiveness(), enumerable: false, configurable: true });
     this.memory = new SqliteMemoryStore(db);
     this.vectors = new SqliteVectorStore(db);
     this.work = new SqliteWorkStore(db);
