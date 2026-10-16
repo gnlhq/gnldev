@@ -63,6 +63,19 @@ describe.each(engines)('memory partition edges (%s)', (_n, make) => {
     }
   });
 
+  it('deleting a non-ASCII organization\'s memory partition leaves none of its rows, and no other organization\'s', async () => {
+    const s = await make();
+    if (!s.memory?.deletePartition) return;
+    const org = `café-del-${RUN}`;
+    const other = `cafe-del-${RUN}`;
+    await seed(withOrgStorage(s, org).memory!, 't', `u-${RUN}`, `OWN-${org}`);
+    await seed(withOrgStorage(s, other).memory!, 't', `u-${RUN}`, `OWN-${other}`);
+    const removed = await s.memory.deletePartition(`org:${org}:`);
+    const left = (await withOrgStorage(s, org).memory!.listThreads({ resourceId: `u-${RUN}` })).items.map((t) => t.id);
+    const kept = (await withOrgStorage(s, other).memory!.listThreads({ resourceId: `u-${RUN}` })).items.map((t) => t.id);
+    expect({ removedSome: removed > 0, left, kept }).toEqual({ removedSome: true, left: [], kept: ['t'] });
+  });
+
   it('a pass-through wrapper that drops MEMORY_PARTITION is reported once, naming the fix', async () => {
     const s = await make();
     await seed(withOrgStorage(s, `wrap-${RUN}`).memory!, 't-a', `u-${RUN}`, 'ACME-OWN');

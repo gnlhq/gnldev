@@ -2,13 +2,14 @@
 // queryable telemetry. Mirrors the /processors contract: listKeys-less journal → empty list.
 import { describe, it, expect } from 'vitest';
 import { InMemoryJournal } from '@gnldev/durable';
-import { recordIncident } from '@gnldev/durable';
+import { recordIncident, claimRunOwner, STAFF } from '@gnldev/durable';
 import { createStudioApi } from '../src/server.js';
 import { call } from './call.js';
 
 describe('GET /runs/:id/incidents', () => {
   it('returns the run-scoped incidents oldest-first (and ONLY that run’s)', async () => {
     const journal = new InMemoryJournal();
+    for (const id of ['r1', 'r2']) await claimRunOwner(journal, id, STAFF); // incidents are the runs' records: the runs exist
     await recordIncident(journal, 'r1', {
       at: 2, source: 'loop-detection', action: 'block', toolName: 'charge', toolCallId: 'c-2',
       message: 'loop detected', detail: { repeats: 3 },

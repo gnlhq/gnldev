@@ -2,7 +2,7 @@
 // Keeps triggers in the journal (definition immutable, state mutable). The poll loop (now=Date.now())
 // fires due triggers exactly-once (acquireRunLock + per-fireCount runId). The workflow run carries its
 // own durable guarantee. Time = DATA (nextRunAt in the journal) → resolve-then-freeze, replay-safe.
-import { acquireRunLock, argsHash, createPollLoop, orgPrefix, ownedName, ownedPrefix, ownerOfName, stableStringify, user, staff, UNKNOWN } from '@gnldev/durable';
+import { acquireRunLock, argsHash, attemptEndOf, createPollLoop, holdWhile, isDraining, orgPrefix, ownedName, ownedPrefix, ownerOfName, stableStringify, user, staff, UNKNOWN } from '@gnldev/durable';
 import type { Journal, Caller } from '@gnldev/durable';
 import { canonicalTimeZone, cronNeverFires, nextCronTime } from './cron.js';
 import { rootJournal } from './root-journal.js';
@@ -245,31 +245,6 @@ const BUSY_SKIP = (id: string) => `sched:busy-skip:${id}`;
  * side-effecting tool once — drain the pollers over an upgrade if that matters to the workflow.
  */
 const FIRE_LOCK = (runId: string) => `${runId}:fire`;
-
-/**
- * "Somebody else is already running this exact run" — the durable engine's refusal AT LOCK
- * ACQUISITION, before the run did anything (`registry.ts` for the critical workflow path,
- * `run.ts` for the agent paths; both stamp `atLockAcquisition`).
- *
- * This is NOT a failed attempt. Nothing was tried and nothing went wrong: the work is in flight
- * somewhere else, and the only sane response is to come back later. Counting it against
- * `maxAttempts` is how a busy minute becomes a permanently dead trigger — which is exactly what the
- * live finding was, five deferrals spent as five failures.
- *
- * Deliberately narrower than durable's own `classifyRunError`: that helper also calls a compensated
- * or cancelled run "not a failure", and it is right to, but those are TERMINAL — deferring them
- * would retry them forever. A MID-FLIGHT `RunBusyError` (no `atLockAcquisition`: this poller got in,
- * ran, and was fenced out by a concurrent executor) is left as an ordinary failure for the same
- * reason: something did happen, and it is worth a retry budget.
- *
- * Matched by NAME, not `instanceof`: `@gnldev/durable` is a peer dependency here, and a host with
- * two resolved copies of it would silently fail every `instanceof` check — a lock refusal is not
- * where a version skew should get to change the behaviour.
- */
-function isRunBusyAtAcquisition(e: unknown): boolean {
-  return (e as { name?: string } | null)?.name === 'RunBusyError'
-    && (e as { atLockAcquisition?: boolean }).atLockAcquisition === true;
-}
 
 /**
  * 1.4: optional budget/quota hook — called BEFORE the trigger starts (before runner.runWorkflow is
@@ -684,6 +659,9 @@ export async function pollScheduler(
       continue;
     }
     if (!isDue(state, now)) continue;
+    // GRACEFUL DRAIN (@gnldev/durable drainProcess): a process shutting down fires nothing new. The
+    // trigger stays due; a process that is not leaving fires it.
+    if (isDraining()) break;
 
     const runId = `sched:${id}:${state.fireCount}`;
     // The fire lock, on its OWN key — see FIRE_LOCK. `runId` below is the RUN's name and is passed to
@@ -751,100 +729,120 @@ export async function pollScheduler(
       return false;
     };
 
-    try {
-      // 1.4: optional budget/quota hook — checked before runner.runWorkflow is CALLED.
-      if (opts.budgetGuard) {
-        try {
-          await opts.budgetGuard({
-            triggerId: id, workflowName: def.name, input: def.input, now,
-            ...(def.orgId !== undefined ? { orgId: def.orgId } : {}),
-            ...(def.resourceId !== undefined ? { resourceId: def.resourceId } : {}),
-          });
-        } catch (e) {
-          // attempts DOES NOT increase; the diagnostic record is only written if the CAS was won (a
-          // stale poller must not leave a budget-skip note on someone else's fire either).
-          if (await commit({ ...state, nextRunAt: now + retryMs }, 'budget-skip')) {
-            await journal.put(BUDGET_SKIP(id), { error: String((e as any)?.message ?? e), at: now });
-            out.skipped++;
-          }
-          continue;
-        }
-      }
-      let result: { suspended?: boolean; output?: unknown };
+    // THE FIRE IN HAND, from here to its lock's release (@gnldev/durable `holdWhile`): a drain waits for it,
+    // and `gnl pending` lists it — from this process, or from its shadow in another. The unit IS this block:
+    // it ends when the block does, on every way out (each `return` below goes on to the next trigger), and
+    // the workflow runs as part of it — a drain from inside the fire does not wait for itself (R2-7).
+    await holdWhile(async (): Promise<void> => {
       try {
-        // Inside this try on purpose: a trigger whose organization cannot be reached fails like any other
-        // fire — counted, retried, and written to `sched:fail:` — instead of running where it does not belong.
-        const target = def.orgId === undefined ? runner : opts.runnerForOrg?.(def.orgId);
-        if (!target) {
-          throw new Error(
-            `@gnldev/scheduler: trigger '${id}' belongs to organization '${def.orgId}', and this scheduler has no runnerForOrg — ` +
-            `it was NOT run on the organization-less runner, where that organization could not see it. Pass runnerForOrg to createScheduler/pollScheduler.`,
-          );
-        }
-        // The fire runs AS the trigger's recorded owner (ADR-0002): the caller is decided here, once,
-        // from the definition — the runner does not get to pick it, and forgetting it cannot happen.
-        result = await target.runWorkflow(def.name, def.input, { runId, caller: callerOfTrigger(def) });
-      } catch (e) {
-        // DEFERRAL, not attempt: the run is already in flight elsewhere (see isRunBusyAtAcquisition).
-        // `attempts` is untouched, `status` stays 'pending', and — this is the half that cost the live
-        // investigation its diagnosis — NOTHING is written to `sched:fail:`. That record is where an
-        // operator reads WHY a trigger died, and a run-busy message answers a question nobody asked
-        // while burying the answer to the one they did (the live record said "already running"; the
-        // real reason the workflow could not run was never written down anywhere).
-        //
-        // Not silent, though: a deferral that repeats forever is a trigger that never fires, so the
-        // record carries a RUNNING TOTAL (never reset — a lifetime count is the number an operator can
-        // compare against `fireCount`). There is no cap on purpose: "wait for the other holder" has no
-        // honest deadline, and the other side is already bounded by its own lock TTL.
-        if (isRunBusyAtAcquisition(e)) {
-          if (await commit({ ...state, nextRunAt: now + retryMs }, 'run-busy-skip')) {
-            const prev = await journal.get<{ deferrals?: number }>(BUSY_SKIP(id));
-            await journal.put(BUSY_SKIP(id), {
-              error: String((e as any)?.message ?? e),
-              at: now,
-              runId,
-              deferrals: (prev?.deferrals ?? 0) + 1,
+        // 1.4: optional budget/quota hook — checked before runner.runWorkflow is CALLED.
+        if (opts.budgetGuard) {
+          try {
+            await opts.budgetGuard({
+              triggerId: id, workflowName: def.name, input: def.input, now,
+              ...(def.orgId !== undefined ? { orgId: def.orgId } : {}),
+              ...(def.resourceId !== undefined ? { resourceId: def.resourceId } : {}),
             });
+          } catch (e) {
+            // attempts DOES NOT increase; the diagnostic record is only written if the CAS was won (a
+            // stale poller must not leave a budget-skip note on someone else's fire either).
+            if (await commit({ ...state, nextRunAt: now + retryMs }, 'budget-skip')) {
+              await journal.put(BUDGET_SKIP(id), { error: String((e as any)?.message ?? e), at: now });
+              out.skipped++;
+            }
+            return;
+          }
+        }
+        let result: { suspended?: boolean; output?: unknown };
+        try {
+          // Inside this try on purpose: a trigger whose organization cannot be reached fails like any other
+          // fire — counted, retried, and written to `sched:fail:` — instead of running where it does not belong.
+          const target = def.orgId === undefined ? runner : opts.runnerForOrg?.(def.orgId);
+          if (!target) {
+            throw new Error(
+              `@gnldev/scheduler: trigger '${id}' belongs to organization '${def.orgId}', and this scheduler has no runnerForOrg — ` +
+              `it was NOT run on the organization-less runner, where that organization could not see it. Pass runnerForOrg to createScheduler/pollScheduler.`,
+            );
+          }
+          // The fire runs AS the trigger's recorded owner (ADR-0002): the caller is decided here, once,
+          // from the definition — the runner does not get to pick it, and forgetting it cannot happen.
+          result = await target.runWorkflow(def.name, def.input, { runId, caller: callerOfTrigger(def) });
+        } catch (e) {
+          // DEFERRAL, not attempt: the run is already in flight elsewhere — the engine refused this poller AT
+          // LOCK ACQUISITION, before the run did anything. Nothing was tried and nothing went wrong; counting it
+          // against `maxAttempts` is how a busy minute became a permanently dead trigger (the live finding:
+          // five deferrals spent as five failures). A MID-FLIGHT RunBusyError (this poller got in, ran, and was
+          // fenced out) is an ordinary failure: something did happen, and it is worth a retry budget.
+          // `attempts` is untouched, `status` stays 'pending', and — this is the half that cost the live
+          // investigation its diagnosis — NOTHING is written to `sched:fail:`. That record is where an
+          // operator reads WHY a trigger died, and a run-busy message answers a question nobody asked
+          // while burying the answer to the one they did (the live record said "already running"; the
+          // real reason the workflow could not run was never written down anywhere).
+          //
+          // Not silent, though: a deferral that repeats forever is a trigger that never fires, so the
+          // record carries a RUNNING TOTAL (never reset — a lifetime count is the number an operator can
+          // compare against `fireCount`). There is no cap on purpose: "wait for the other holder" has no
+          // honest deadline, and the other side is already bounded by its own lock TTL.
+          // WHETHER IT COUNTS (@gnldev/durable `attemptEndOf` — the one answer the queue gives too).
+          const end = attemptEndOf(e, runId);
+          // RELEASED, not failed: this process drains ("another process continues it") or cannot judge other
+          // processes right now. Nothing is written — the trigger stays due, its attempts as they were — and a
+          // process that is not leaving fires it (the same run id: it continues from its journal). Counted, a
+          // drain failed the trigger for good on its last attempt (audit C5).
+          if (end === 'released') {
             out.skipped++;
+            return;
           }
-          continue;
-        }
-        const attempts = state.attempts + 1;
-        if (attempts >= def.maxAttempts) {
-          if (await commit({ ...state, attempts, status: 'failed' }, 'failed')) {
-            await journal.put(FAIL(id), { error: String((e as any)?.message ?? e), at: now });
-            out.failed++;
+          if (end === 'deferred') {
+            if (await commit({ ...state, nextRunAt: now + retryMs }, 'run-busy-skip')) {
+              const prev = await journal.get<{ deferrals?: number }>(BUSY_SKIP(id));
+              await journal.put(BUSY_SKIP(id), {
+                error: String((e as any)?.message ?? e),
+                at: now,
+                runId,
+                deferrals: (prev?.deferrals ?? 0) + 1,
+              });
+              out.skipped++;
+            }
+            return;
           }
-        } else if (await commit({ ...state, attempts, nextRunAt: now + backoff(attempts) }, 'retry')) {
-          out.rescheduled++;
+          const attempts = state.attempts + 1;
+          if (attempts >= def.maxAttempts) {
+            if (await commit({ ...state, attempts, status: 'failed' }, 'failed')) {
+              await journal.put(FAIL(id), { error: String((e as any)?.message ?? e), at: now });
+              out.failed++;
+            }
+          } else if (await commit({ ...state, attempts, nextRunAt: now + backoff(attempts) }, 'retry')) {
+            out.rescheduled++;
+          }
+          return;
         }
-        continue;
-      }
 
-      if (result.suspended) {
-        // workflow suspended → the same runId should be resumed later (fireCount unchanged).
-        if (await commit({ ...state, nextRunAt: now + retryMs }, 'suspended')) out.rescheduled++;
-      } else if (def.kind === 'at') {
-        if (await commit({ ...state, status: 'done' }, 'done')) out.fired++;
-      } else {
-        const next: TriggerState = {
-          nextRunAt: computeNext(def, state.nextRunAt, now),
-          attempts: 0,
-          fireCount: state.fireCount + 1,
-          status: 'pending',
-        };
-        if (await commit(next, 'reschedule')) out.fired++;
+        if (result.suspended) {
+          // workflow suspended → the same runId should be resumed later (fireCount unchanged).
+          if (await commit({ ...state, nextRunAt: now + retryMs }, 'suspended')) out.rescheduled++;
+        } else if (def.kind === 'at') {
+          if (await commit({ ...state, status: 'done' }, 'done')) out.fired++;
+        } else {
+          const next: TriggerState = {
+            nextRunAt: computeNext(def, state.nextRunAt, now),
+            attempts: 0,
+            fireCount: state.fireCount + 1,
+            status: 'pending',
+          };
+          if (await commit(next, 'reschedule')) out.fired++;
+        }
+      } finally {
+        // MUST run BEFORE release(): release() keeps the SAME fencing token (it only pushes `expires`
+        // into the past), so a heartbeat tick that survives this fire would find its own token still in
+        // the record and RESURRECT the lock it just released (expires: 0 → now+ttl) — blocking every
+        // later poll of the same runId (a suspended trigger's resume, most visibly). Pinned by test.
+        clearInterval(heartbeat);
+        // If the lock was genuinely taken over, release() is a no-op anyway (the fencing token no
+        // longer matches — run-lock.ts mkLock.release), so we never free somebody else's lock.
+        await lock.release();
       }
-    } finally {
-      // MUST run BEFORE release(): release() keeps the SAME fencing token (it only pushes `expires`
-      // into the past), so a heartbeat tick that survives this fire would find its own token still in
-      // the record and RESURRECT the lock it just released (expires: 0 → now+ttl) — blocking every
-      // later poll of the same runId (a suspended trigger's resume, most visibly). Pinned by test.
-      clearInterval(heartbeat);
-      // If the lock was genuinely taken over, release() is a no-op anyway (the fencing token no
-      // longer matches — run-lock.ts mkLock.release), so we never free somebody else's lock.
-      await lock.release();
-    }
+    }, { journal, name: runId, what: `trigger '${id}' is firing`, ...(def.orgId !== undefined ? { scope: def.orgId } : {}) });
   }
   return out;
 }
@@ -1203,10 +1201,11 @@ export async function moveTrigger(
   return toId;
 }
 
-/** What `eraseSubject` (in `@gnldev/durable`) calls to erase one person's share of a package. */
+/** What `eraseSubject` and `purgeOrganization` (in `@gnldev/durable`) call to erase a person's, or a whole organization's, share of a package. */
 export interface SubjectEraser {
   name: string;
   erase(owner: { resourceId: string; orgId?: string }): Promise<number>;
+  eraseOrganization?(orgId: string): Promise<number>;
 }
 
 /**
@@ -1215,23 +1214,27 @@ export interface SubjectEraser {
  * Found by the id prefix the engine wrote (`ownedPrefix`), never by payload. The fires' runs in an
  * organization's journal carry the owner record, so `purgeResource` (called by `eraseSubject`) takes them.
  *
- * Refuses a journal that cannot `deletePrefix` rather than report a partial erasure as done.
+ * Refuses a journal that cannot `deletePrefix` rather than report a partial erasure as done. Handed an
+ * organization (`{ orgId }`, by `purgeOrganization`), it erases every trigger owned under it, its members' too.
  */
 export function triggerEraser(journal: Journal): SubjectEraser {
   journal = rootJournal(journal, 'triggerEraser');
+  // One body for a person and an organization: what differs is the owner's prefix (`ownedPrefix`).
+  const eraseOwned = async (owner: { resourceId?: string; orgId?: string }): Promise<number> => {
+    const del = journal.deletePrefix;
+    if (typeof del !== 'function') {
+      throw new Error("@gnldev/scheduler: the journal cannot deletePrefix, so this person's triggers cannot be erased");
+    }
+    const prefix = ownedPrefix(owner);
+    let n = 0;
+    for (const fam of ['sched:def:', 'sched:state:', 'sched:fail:', 'sched:budget-skip:', 'sched:busy-skip:', 'sched:']) {
+      n += await del.call(journal, `${fam}${prefix}`);
+    }
+    return n;
+  };
   return {
     name: 'triggers',
-    async erase(owner) {
-      const del = journal.deletePrefix;
-      if (typeof del !== 'function') {
-        throw new Error("@gnldev/scheduler: the journal cannot deletePrefix, so this person's triggers cannot be erased");
-      }
-      const prefix = ownedPrefix(owner);
-      let n = 0;
-      for (const fam of ['sched:def:', 'sched:state:', 'sched:fail:', 'sched:budget-skip:', 'sched:busy-skip:', 'sched:']) {
-        n += await del.call(journal, `${fam}${prefix}`);
-      }
-      return n;
-    },
+    erase: (owner) => eraseOwned(owner),
+    eraseOrganization: (orgId) => eraseOwned({ orgId }),
   };
 }

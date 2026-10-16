@@ -23,7 +23,8 @@
 //  P7 exactly-once: a cross-run claim a deleted run made still answers every run that remains;
 //  P8 adoptIntoOrg moves the same things on every store;
 //  P9 for the same world, each path leaves the same store on InMemory, Sqlite, pg-mem and real Postgres.
-import { describe, it, expect, afterAll } from 'vitest';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { describe, it, expect, afterEach } from 'vitest';
 import { createHash } from 'node:crypto';
 import {
   eraseSubject, purgeThread, purgeRun, toJournal, withOrg, user, admitThreadRun, cancelAgentRun, ORG_RECORD_PRE, threadOwnerKey,
@@ -31,7 +32,9 @@ import {
 } from '@gnldev/durable';
 import { KINDS, makeBackend, closeBackends, bothWorlds, world, dump, portable, scopeOf, effects, type Backend } from './dependents-world.js';
 
-afterAll(closeBackends);
+// Each test's stores are closed when it ends: a Postgres store holds a pool and its own liveness session
+// (one per database), and a file of 27 open databases measured 98 of the server's 100 connections.
+afterEach(closeBackends);
 
 /** The runs that live on thread t-a in the world: four turns, the fork, the rollover, and r-a1's sub-agent. */
 const THREAD_RUNS = ['r-a1', 'r-a1f', 'r-a1n', 'r-a2', 'r-a4', 'agent:r-a1:c-agent_w'];
@@ -43,7 +46,9 @@ const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const ofRuns = (runs: string[], p: string) => (x: string) => runs.some((r) => {
   const id = esc(`${p}${r}`);
   return new RegExp(`^j ${id}:`).test(x) || new RegExp(`^j ${esc(p)}__metrics__(run|done):${esc(r)}$`).test(x)
-    || new RegExp(`^(run|row runs) ${id} `).test(x);
+    || new RegExp(`^(run|row runs) ${id} `).test(x)
+    // Its execution record, in the platform journal under its scope (a run that waits on a human keeps one).
+    || x === `j __exec__:${encodeURIComponent(p ? p.slice(4, -1) : '')}/${encodeURIComponent(r)}#`;
 });
 /** Everything thread t-a owns in scope `p`: its runs, its journal state, its owner record, its memory-store rows, its observation vector. */
 const threadFootprint = (p: string) => {
@@ -66,8 +71,6 @@ const personFootprint = (p: string) => {
  */
 const fenceOf = (runs: string[], p: string) => (x: string) =>
   runs.some((r) => x === `j ${p}__run_erased__:${createHash('sha256').update(r).digest('hex')}`);
-/** The one row a thread delete adds: the record's tombstone (a soft delete that keeps no title). */
-const tombstone = (p: string) => (x: string) => new RegExp(`^row threads ${esc(p)}t-a .* deleted$`).test(x);
 
 async function after(b: Backend, f: () => Promise<unknown>): Promise<{ before: string[]; after: string[]; removed: string[]; added: string[] }> {
   const before = await dump(b);
@@ -83,7 +86,7 @@ for (const kind of KINDS) {
       await bothWorlds(b.storage);
       const d = await after(b, () => scopeOf(b.storage).memory.deleteThread('t-a'));
       expect(d.removed.sort()).toEqual(d.before.filter(threadFootprint('')).sort());
-      expect(d.added.filter((x) => !tombstone('')(x) && !fenceOf(THREAD_RUNS, '')(x))).toEqual([]);
+      expect(d.added.filter((x) => !fenceOf(THREAD_RUNS, '')(x))).toEqual([]);
       // Nothing of t-a is readable any more, by run or by thread.
       const J = toJournal(b.storage.runs);
       for (const r of THREAD_RUNS) expect(await J.get(`${r}:input`), r).toBeUndefined();
@@ -113,7 +116,7 @@ for (const kind of KINDS) {
       const d = await after(b, () => eraseSubject(b.storage, 'ayse'));
       const mine = (x: string) => threadFootprint('')(x) || personFootprint('')(x);
       expect(d.removed.sort()).toEqual(d.before.filter(mine).sort());
-      expect(d.added.filter((x) => !tombstone('')(x) && !fenceOf([...THREAD_RUNS, ...PERSON_RUNS], '')(x))).toEqual([]);
+      expect(d.added.filter((x) => !fenceOf([...THREAD_RUNS, ...PERSON_RUNS], '')(x))).toEqual([]);
     }, 120_000);
 
     it('P4: a root thread delete never touches an organization, and an organization\'s never the root', async () => {
@@ -121,7 +124,7 @@ for (const kind of KINDS) {
       await bothWorlds(b.storage);
       const org = await after(b, () => scopeOf(b.storage, 'acme').memory.deleteThread('t-a'));
       expect(org.removed.sort()).toEqual(org.before.filter(threadFootprint('org:acme:')).sort());
-      expect(org.added.filter((x) => !tombstone('org:acme:')(x) && !fenceOf(THREAD_RUNS, 'org:acme:')(x))).toEqual([]);
+      expect(org.added.filter((x) => !fenceOf(THREAD_RUNS, 'org:acme:')(x))).toEqual([]);
       // The root's t-a, on a world where acme's t-a (the same id, and runs that name it) is still whole.
       const r = await makeBackend(kind);
       await bothWorlds(r.storage);
@@ -183,7 +186,7 @@ for (const kind of KINDS) {
         const b = await makeBackend(kind);
         await world(b.storage);
         const undo = killAt(b, k);
-        await expect(scopeOf(b.storage).memory.deleteThread('t-a'), `crash point ${k}`).rejects.toThrow(/killed/);
+        await expect(asEraser(() => scopeOf(b.storage).memory.deleteThread('t-a')), `crash point ${k}`).rejects.toThrow(/killed/);
         undo();
         const J = toJournal(b.storage.runs);
         const left = (await dump(b)).filter(threadFootprint(''));
@@ -211,7 +214,7 @@ for (const kind of KINDS) {
         const b = await makeBackend(kind);
         await world(b.storage);
         const undo = killAt(b, k);
-        await expect(purgeRun(toJournal(b.storage.runs) as any, 'r-a1'), `crash point ${k}`).rejects.toThrow(/killed/);
+        await expect(asEraser(() => purgeRun(toJournal(b.storage.runs) as any, 'r-a1')), `crash point ${k}`).rejects.toThrow(/killed/);
         undo();
         await purgeRun(toJournal(b.storage.runs) as any, 'r-a1');
         expect(await usage(b), `crash point ${k}`).toBe(expected);
@@ -229,7 +232,7 @@ for (const kind of KINDS) {
         const b = await makeBackend(kind);
         await world(b.storage);
         const undo = killAt(b, k);
-        await expect(eraseSubject(b.storage, 'ayse'), `crash point ${k}`).rejects.toThrow(/killed/);
+        await expect(asEraser(() => eraseSubject(b.storage, 'ayse')), `crash point ${k}`).rejects.toThrow(/killed/);
         undo();
         await eraseSubject(b.storage, 'ayse');
         expect(portable(await dump(b)), `crash point ${k}`).toEqual(done);
@@ -263,7 +266,8 @@ for (const kind of KINDS) {
         'row meta __eeuser__:u1', 'row meta org:acme2:app-setting',
       ]));
       expect(d.filter((x) => x.startsWith('row meta '))).toEqual(['row meta __eeuser__:u1', 'row meta org:acme2:app-setting']);
-      expect(report.skippedPlatformKeys).toEqual(['__eeuser__', '__org__']);
+      // `__exec__`: the organizations' execution records stay in the platform journal (the root's go with its runs).
+      expect(report.skippedPlatformKeys).toEqual(['__eeuser__', '__exec__', '__org__']);
     }, 120_000);
   });
 }
@@ -301,13 +305,18 @@ describe('P9: for the same world, each path leaves the same store on every store
  * Kills the k-th store call a thread deletion makes (journal deletes and memory-store deletes, in the
  * order they happen) by throwing, as a process dying there would leave it. Returns the undo.
  */
+// The calls counted and killed are the ERASURE's own: an executor of the same store may delete an erased
+// run's execution record at the same moment (its sweep), and counting that call moved every crash point
+// under load — the last one was then never reached and the erasure finished (seen in CI, not locally).
+const eraser = new AsyncLocalStorage<true>();
+const asEraser = <T>(f: () => Promise<T>): Promise<T> => eraser.run(true, f);
 function killAt(b: Backend, k: number): () => void {
   let n = 0;
   const targets: Array<[any, string]> = [[b.storage.runs, 'deletePrefix'], [b.storage.memory, 'deleteThread'], [b.storage.vectors, 'delete']];
   const saved = targets.map(([o, m]) => [o, m, o[m]] as const);
   for (const [o, m, f] of saved) {
     o[m] = async (...a: unknown[]) => {
-      if (n++ === k) throw new Error(`killed at store call ${k} (${m})`);
+      if (eraser.getStore() && n++ === k) throw new Error(`killed at store call ${k} (${m})`);
       return f.apply(o, a);
     };
   }
@@ -319,8 +328,8 @@ async function countCalls(kind: string, f: (b: Backend) => Promise<unknown>): Pr
   await world(b.storage);
   let n = 0;
   const targets: Array<[any, string]> = [[b.storage.runs, 'deletePrefix'], [b.storage.memory, 'deleteThread'], [b.storage.vectors, 'delete']];
-  for (const [o, m] of targets) { const g = o[m]; o[m] = async (...a: unknown[]) => { n++; return g.apply(o, a); }; }
-  await f(b);
+  for (const [o, m] of targets) { const g = o[m]; o[m] = async (...a: unknown[]) => { if (eraser.getStore()) n++; return g.apply(o, a); }; }
+  await asEraser(() => f(b));
   return n;
 }
 /** How many store calls one thread deletion makes in the world. */

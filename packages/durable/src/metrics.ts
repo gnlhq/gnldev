@@ -7,6 +7,7 @@
 // Same shape as budget.ts's `__usage__` counter (H8a) and its get→put/warn-once fallback story, just
 // bucketed per-day/per-agent instead of a single running total, plus a per-run "fast row" for the
 // runs table (avoids readRun+getRunCost for every already-finalized run).
+import { runRecordPrefix } from './run-id-grammar.js';
 import type { Journal, JournalBatch, JournalReader } from './journal.js';
 import { summarizeRun, runKeys, listRunsArray } from './journal.js';
 import { getRunCost } from './cost.js';
@@ -405,12 +406,13 @@ export async function backfillMetrics(
     // Attempted independently of `ok`: the scores claim is SEPARATE (metricsScoresDoneKey), so a run
     // whose base metrics were already recorded but whose score counters were wiped still restores.
     if (typeof journal.listKeys === 'function') {
-      const evalKeys = await journal.listKeys(`${r.runId}:proc:eval:`);
+      const evalPrefix = `${runRecordPrefix(r.runId, 'proc')}eval:`;
+      const evalKeys = await journal.listKeys(evalPrefix);
       if (evalKeys.length) {
         const scores: Record<string, number | { score: number }> = {};
         for (const k of evalKeys) {
           const rec = await journal.get<{ v: { score?: number } }>(k);
-          const name = k.slice(`${r.runId}:proc:eval:`.length);
+          const name = k.slice(evalPrefix.length);
           if (rec?.v !== undefined && name) scores[name] = rec.v as { score: number };
         }
         if (Object.keys(scores).length && (await recordRunScores(journal, r.runId, r.agent, scores))) scoresRestored++;

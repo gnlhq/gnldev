@@ -22,7 +22,8 @@ import { createRequire } from 'node:module';
 import { RECIPES, FEATURE_IDS, E2E_FEATURE, recipeContents, defaultVariants, configWiring, type Recipe } from './recipes.js';
 import { DEFAULT_ANSWERS, type InitAnswers } from './init-answers.js';
 import { IDENTITY_FILE } from './identity-file.js';
-import { hostById, APP_FILE, hostReadme, type HostMode } from './hosts.js';
+import { hostById, APP_FILE, hostReadme, pm2Config, type HostMode } from './hosts.js';
+import { DRAIN_DEADLINE_MS } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
 import { SCAFFOLD_OPTS_NAMES } from './option-names.js';
 
@@ -125,7 +126,11 @@ export function addHost(dir: string, hostId: string, mode: HostMode = 'own'): vo
   // reader's, and writing one next to theirs is the fork the iron rule forbids. The lines they need
   // are printed and appended to the README instead.
   writeFileSync(join(dir, 'src', 'app.ts'), APP_FILE);
-  if (mode === 'own') writeFileSync(join(dir, 'src', 'server.ts'), host.server);
+  if (mode === 'own') {
+    writeFileSync(join(dir, 'src', 'server.ts'), host.server);
+    // How the server is run comes with it: a process manager that kills before the drain ends undoes it.
+    writeFileSync(join(dir, 'ecosystem.config.cjs'), pm2Config(DRAIN_DEADLINE_MS));
+  }
   patchPkg(dir, (pkg) => {
     // The framework dependency belongs to whoever owns the server. Mounting into an existing app
     // means that app already declares it — and re-declaring it here is how two versions of Express
@@ -331,6 +336,24 @@ const BASE_IMPORTS: readonly string[] = [
   "import { chargeOrder } from './src/tools/charge-order.js';",
 ];
 
+/** The wirings `generateConfig` writes for these recipes: blank ones and the ones the base already wires left out. */
+function recipeWirings(recipes: Recipe[]) {
+  return recipes.flatMap((r) => {
+    const w = configWiring(r);
+    return w && !BASE_IMPORTS.includes(w.import.trim()) ? [w] : [];
+  });
+}
+
+/**
+ * The top-level config fields `generateConfig` writes for these recipes, as written (`memoryFactory`,
+ * `workflows: { checkout }`). One answer for the config and for what `gnl init` reports about it: the
+ * summary used to describe a config built from the answers alone, and said "no memory" for a project
+ * whose config it had just given `memoryFactory`.
+ */
+export function writtenConfigFields(recipes: Recipe[]): string[] {
+  return [...new Set(recipeWirings(recipes).filter((w) => w.place === 'configField').map((w) => w.code.trim()))];
+}
+
 /**
  * Builds a decoupled gnl.config.ts from a set of code recipes (imports only from the project runtime),
  * shaped by whatever `gnl init` was told.
@@ -353,14 +376,11 @@ export function generateConfig(recipes: Recipe[], answers: InitAnswers = DEFAULT
   // (`gnl init` in an existing project) wrote `import { chargeOrder }` twice: TS2300, and a config
   // `node` could not even parse. A recipe listed twice is wired once, for the same reason.
   const unique = <T,>(xs: T[]): T[] => [...new Set(xs)];
-  const ownWirings = recipes.flatMap((r) => {
-    const w = configWiring(r);
-    return w && !BASE_IMPORTS.includes(w.import.trim()) ? [w] : [];
-  });
+  const ownWirings = recipeWirings(recipes);
   const imports = unique(recipes.map((r) => r.wiring?.import.trim() ?? ''))
     .filter((i) => i !== '' && !BASE_IMPORTS.includes(i));
   const agentTools = unique(ownWirings.filter((w) => w.place === 'agentTool').map((w) => w.code.trim()));
-  const configFields = unique(ownWirings.filter((w) => w.place === 'configField').map((w) => w.code.trim()));
+  const configFields = writtenConfigFields(recipes);
   // EVERY recipe's type extension, not just the picked ones — the config is written once and edited
   // for years. `satisfies` is an upper bound over OPTIONAL fields, so naming one the config does not
   // use costs nothing; leaving it out cost something measurable: `gnl add auth` prints an `auth,`

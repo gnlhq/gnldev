@@ -23,10 +23,10 @@ import pg from 'pg';
 import { z } from 'zod';
 import {
   InMemoryStorage, createGnl, user, withOrgStorage, toJournal, forkRun, rolloverRun, gnlTool, ownedPrefix, semanticLogKey, memKey,
-  workingMemoryScope, VECTOR_ALL_PARTITIONS, ORG_RECORD_PRE, type Storage,
+  workingMemoryScope, VECTOR_ALL_PARTITIONS, ORG_RECORD_PRE, type Storage, inMemoryLiveness,
 } from '@gnldev/durable';
-import { SqliteStorage } from '../../durable/src/sqlite-storage.js';
-import { PostgresStorage } from '../../durable/src/postgres-storage.js';
+import { SqliteStorage } from '@gnldev/durable/sqlite';
+import { PostgresStorage } from '@gnldev/durable/postgres';
 import { memoryPreset } from '../src/index.js';
 
 (globalThis as { AI_SDK_LOG_WARNINGS?: boolean }).AI_SDK_LOG_WARNINGS = false;
@@ -217,7 +217,7 @@ export async function makeBackend(kind: string): Promise<Backend> {
   if (kind === 'Sqlite') {
     const dir = mkdtempSync(join(tmpdir(), 'gnl-dependents-'));
     const s = new SqliteStorage(join(dir, 'w.db'));
-    ends.push(() => { s.close?.(); rmSync(dir, { recursive: true, force: true }); });
+    ends.push(async () => { await s.close?.(); rmSync(dir, { recursive: true, force: true }); });
     const db = (s as any).db;
     return { name: kind, storage: s as unknown as Storage, raw: sqlRaw(async (q) => db.prepare(q).all()) };
   }
@@ -230,6 +230,9 @@ export async function makeBackend(kind: string): Promise<Backend> {
     const pool = new Pool();
     const s = new PostgresStorage({ pool } as never);
     await s.init();
+    // pg-mem is a database only this process reaches, and its pool does not say where it connects: its
+    // liveness is this process's (in-memory), as a store with none of its own would be told to take.
+    (s as any).processLiveness = async () => inMemoryLiveness();
     (s as any).advisoryLocks = true;
     (s as any).capabilities.memory = 'full';
     return { name: kind, storage: s as unknown as Storage, raw: sqlRaw(async (q) => (await pool.query(q)).rows) };

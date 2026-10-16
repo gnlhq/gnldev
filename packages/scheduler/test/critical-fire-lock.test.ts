@@ -167,7 +167,7 @@ describe('critical preset × scheduler fire lock', () => {
     const runner: WorkflowRunner = {
       async runWorkflow() {
         if (mode === 'busy') {
-          throw Object.assign(new RunBusyError("workflow run 'sched:t:0' is already running — it is locked by another process"), { atLockAcquisition: true });
+          throw new RunBusyError("workflow run 'sched:t:0' is already running — it is locked by another process", { runId: 'sched:t:0', atLockAcquisition: true });
         }
         throw new Error('NIM 404: model retired');
       },

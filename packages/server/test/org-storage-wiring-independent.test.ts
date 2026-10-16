@@ -17,7 +17,6 @@ const usage = { inputTokens: { total: 1, text: 1 }, outputTokens: { total: 1, te
 const model: any = {
   specificationVersion: 'v2', provider: 'mock', modelId: 'm', supportedUrls: {},
   doGenerate: async () => ({ content: [{ type: 'text', text: 'ok' }], finishReason: { unified: 'stop', raw: 'stop' }, usage, warnings: [] }),
-  doStream: async () => { throw new Error('no stream'); },
 };
 
 const authProvider = {

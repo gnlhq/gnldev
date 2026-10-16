@@ -9,6 +9,7 @@
 // the subject of the audit can delete is not one). Purge explicitly via
 // `journal.deletePrefix('idem:conflict:')` (org deployments: withOrg prefixes these keys like every
 // other, so an org purge sweeps them exactly).
+import { RUN_KEYED_FAMILIES, ownKeysOf } from './run-id-grammar.js';
 import { randomUUID } from 'node:crypto';
 import type { Journal } from './journal.js';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -41,7 +42,7 @@ export async function recordIdemConflict(journal: Journal, rec: Omit<IdemConflic
   // non-repudiation ledger); the uuid slice makes the key process-unique.
   const append = async () => {
     const at = journal.now ? await journal.now() : Date.now();
-    await journal.put(`idem:conflict:${rec.runId}:${at}-${seq++}-${randomUUID().slice(0, 8)}`, { ...rec, at });
+    await journal.put(`${RUN_KEYED_FAMILIES['idem-conflict'].prefix(rec.runId)}${at}-${seq++}-${randomUUID().slice(0, 8)}`, { ...rec, at });
   };
   if (mode === 'require') {
     await append();
@@ -72,8 +73,10 @@ export async function readIdemLedger(
       "@gnldev/durable: readIdemLedger requires the journal to implement `listKeys` — without it the ledger cannot be enumerated (an empty answer would misread as 'no conflicts').",
     );
   }
-  const prefix = opts.runId ? `idem:conflict:${opts.runId}:` : 'idem:conflict:';
-  const keys = await journal.listKeys(prefix);
+  // One run's: its keys by owner (run-id-grammar.ts) — the prefix alone also lists a run whose id extends it.
+  const keys = opts.runId !== undefined
+    ? (await ownKeysOf(journal as { listKeys(p: string): Promise<string[]> }, 'idem-conflict', opts.runId)).own
+    : await journal.listKeys('idem:conflict:');
   const out: IdemConflictRecord[] = [];
   for (const k of keys) {
     const rec = await journal.get<IdemConflictRecord>(k);

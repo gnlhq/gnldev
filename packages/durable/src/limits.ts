@@ -88,6 +88,7 @@
 //    returns normally (BEFORE memory/recordRunUsage). Because nothing was written to the journal, a
 //    blocked call is re-evaluated FROM SCRATCH on the NEXT attempt once the limit is RAISED (replay
 //    regenerates the same toolCallId) — no approval is REQUIRED (DIFFERENT from guard's require-approval).
+import { runRecordPrefix, composeRunId } from './run-id-grammar.js';
 import { claim, runKeys, nestedAgentRunId, executedHere } from './journal.js';
 import { usageAndCostFromModelValue, type RunCostOptions } from './cost.js';
 import { effectivePricingTable } from './pricing.js';
@@ -868,7 +869,7 @@ async function seedFromHistory(
   const entries = await reader.readRun(runId);
   const counters = emptyCounters();
   let chain = emptyChain();
-  const prefix = `${runId}:tool:`;
+  const prefix = runRecordPrefix(runId, 'tool');
   for (const e of entries) {
     if (e.kind === 'model') {
       applyModelStepDelta(counters, e.value, opts, unpriced);
@@ -1067,7 +1068,7 @@ async function sumSubRuns(
   // every sub-agent from the budget for good (measured: four sub-agents spent 120 tokens, the request
   // counted 0 of them).
   const groups: { ids: string[]; live: boolean }[] = [
-    ...subRunIds.map((toolCallId) => ({ ids: [nestedAgentRunId(parentRunId, toolCallId), `agent:${toolCallId}`], live: false })),
+    ...subRunIds.map((toolCallId) => ({ ids: [nestedAgentRunId(parentRunId, toolCallId), composeRunId('agent', undefined, toolCallId)], live: false })),
     ...childRunIds.map((id) => ({ ids: [id], live: true })),
   ];
   for (const { ids: candidates, live } of groups) {

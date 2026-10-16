@@ -166,7 +166,6 @@ function mockModel() {
     specificationVersion: 'v2', provider: 'mock', modelId: 'mock-model', supportedUrls: {},
     doGenerate: async () => ({ content: [{ type: 'text', text: 'replayed' }], finishReason: 'stop' as const,
       usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 }, warnings: [] as unknown[] }),
-    doStream: async () => { throw new Error('mock: doStream is not supported'); },
   };
 }
 
@@ -544,6 +543,9 @@ async function drive(api: (r: Request) => Promise<Response>, route: { method: st
       // `POST /dead-events/release` addresses a record by the TRIPLE (topic, consumer, id) — `id`
       // alone is already above, and without the other two the route 400s before reaching the host.
       topic: 'orders.created', consumer: 'acme-consumer',
+      // Running a managed workflow BEGINS a run: `r-acme` is an agent run of acme's, and a workflow may
+      // not write under another target's id (refused at its birth — the target rule). Its own id.
+      ...(/^\/workflows\/:name\/run(-stream)?$/.test(route.path) ? { runId: 'wf-run-acme' } : {}),
     });
   }
   const res = await Promise.race([

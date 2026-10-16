@@ -60,7 +60,8 @@ describe.each(journals)('void step on the real journal — %s', (_n, mk) => {
     const wf = workflow<number>()
       .then(step('sendEmail', async () => { sends++; }, { sideEffect: true, recover: async () => ({ done: false }) }))
       .then(step('after', async () => 'ok'));
-    expect(await wf.run(1, { runId: 'old', journal })).toBe('ok');
+    // A run written before owners were recorded is staff's (runOwnerOf): the operator resumes it as staff.
+    expect(await wf.run(1, { runId: 'old', journal, identity: { kind: 'staff', runId: 'old' } })).toBe('ok');
     expect(sends).toBe(0);
   });
 });

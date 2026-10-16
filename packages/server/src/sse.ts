@@ -76,11 +76,15 @@ export function pipeAgentStream(c: Context, runId: string, result: any, opts?: P
   refuseUnknownNames('pipeAgentStream', opts, PIPE_STREAM_NAMES);
   const lastEventId = opts?.lastEventId;
   return sseResponse(c, async (stream) => {
-    let nextId = 0; // deterministic: the same runId replays the same events, so the same ids
+    // A followed run (@gnldev/durable) says where its reader is: the id is the event's place in the
+    // run's log, which a reconnect hands back to read on from it. Anything else is numbered from 0
+    // (deterministic: the same runId replays the same events, so the same ids).
+    const cursor = typeof result?.cursor === 'function' ? () => String(result.cursor()) : undefined;
+    let nextId = 0;
     for await (const { event, data } of agentStreamEvents(result, runId, LIMIT_ERROR_CODES)) {
       if (stream.aborted) break;
-      const id = nextId++;
-      if (lastEventId != null && id <= lastEventId) continue; // the client already saw it
+      const id = cursor ? cursor() : nextId++;
+      if (!cursor && lastEventId != null && (id as number) <= lastEventId) continue; // the client already saw it
       await stream.writeSSE({ event, data: JSON.stringify(data), id: String(id) });
     }
   });

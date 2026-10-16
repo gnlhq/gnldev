@@ -41,7 +41,6 @@ function mkModel(text: string): any {
       usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
       warnings: [],
     }),
-    doStream: async () => { throw new Error('no stream'); },
   };
 }
 
@@ -83,13 +82,14 @@ async function seeded() {
 // Refusals below are 404: to a caller who is not staff, someone else's run answers as one that does
 // not exist (see foreign-write-is-missing.test.ts).
 describe('POST /agents/:name/resume — damga eşitliği (/run neyi reddediyorsa o da reddeder)', () => {
-  it('ANCHOR: the same caller on /run is refused at the edge (403) and learns no owner', async () => {
+  it('ANCHOR: the same caller on /run is refused at the edge (404, as an absent run) and learns no owner', async () => {
     const { api } = await seeded();
     const res = await post(api, '/agents/a/run', MALLORY, { runId: 'raw-ayse', prompt: 'zzz' });
     // An end user is bound to itself by default now, so `ownershipDenied` answers before the engine's
     // actor lock can. That lock's 409 said "run 'raw-ayse' belongs to actor 'u-ayse'" — the sentence
     // `FOREIGN_PARTY_DETAIL_FIELDS` could not redact. An end user no longer reaches it on this path.
-    expect(res.status).toBe(403);
+    // 404 `run_not_found`, the answer `/resume` gives: someone else's run reads as one that is not there.
+    expect(res.status).toBe(404);
     expect(await res.text(), 'the refusal named the owner').not.toContain('u-ayse');
   });
 
@@ -152,7 +152,7 @@ describe('POST /agents/:name/resume — damga eşitliği (/run neyi reddediyorsa
     const input = await journal.get<Record<string, unknown>>('raw-ayse:input');
     const { actor: _drop, ...withoutActor } = input as { actor?: string };
     await journal.put('raw-ayse:input', withoutActor);
-    expect((await post(api, '/agents/a/run', MALLORY, { runId: 'raw-ayse', prompt: 'hi' })).status).toBe(403);
+    expect((await post(api, '/agents/a/run', MALLORY, { runId: 'raw-ayse', prompt: 'hi' })).status).toBe(404);
     expect((await post(api, '/agents/a/resume', MALLORY, { runId: 'raw-ayse' })).status).toBe(404);
   });
 });

@@ -9,6 +9,7 @@
 import { describe, it, expect } from 'vitest';
 import { runDurable, InMemoryStorage, runKeys, purgeRun, RunLimitExceededError } from '../src/index.js';
 import { claimRunOwner, UNKNOWN as NOBODY } from '../src/run-identity.js';
+import { streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 5, outputTokens: 5, totalTokens: 10 };
 
@@ -16,7 +17,7 @@ function plainModel() {
   return {
     specificationVersion: 'v2', provider: 'scripted', modelId: 'plain', supportedUrls: {},
     doGenerate: async () => ({ content: [{ type: 'text', text: 'ok' }], finishReason: 'stop', usage, warnings: [] }),
-    doStream: async () => { throw new Error('generate-only'); },
+    doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
   } as any;
 }
 

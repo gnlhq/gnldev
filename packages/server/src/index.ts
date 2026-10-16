@@ -1,9 +1,10 @@
 // @gnldev/server — serves the createGnl registry over HTTP (auto-REST + OpenAPI). Every endpoint
 // descends into runDurable → exactly-once/durability inherited for free. (The durable counterpart of the common auto-REST pattern.)
+import { runRecordKey, runRecordPrefix } from '@gnldev/durable';
 import { Hono, type Context } from 'hono';
 import { toFetchHandler, type FetchHandler } from './handler.js';
 import { verifyA2ARequest } from '@gnldev/a2a';
-import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, cancelAgentRun, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, callerConflictAnswer, upstreamFailure, requestRefusal, assertRootThreadId, orgPrefix, withRootScope, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
+import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, callerConflictAnswer, upstreamFailure, requestRefusal, assertRootThreadId, orgPrefix, withRootScope, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, decideDoorRunAccess, runNotFound, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
 import type { CreateGnlConfig, Journal, JournalReader, BudgetLimit, UsageCostCache, RunLimits, ResolvedWorkIdentity, WorkScopeKind, StreamSurface as DurableStreamSurface, StreamSurfaceInput } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, callerKind, subjectIdProblem, actorIdOf, engineCallerOf, markRefusal, settleDecision, decisionNotRecorded, type AuthProvider, type ReadWriteAuth, type Principal, type PrincipalKind, type RefusalReason, refuseMisplacedOptions, doorOptionKeys, printProtections } from '@gnldev/auth';
 // P0.4 @gnldev/workflow is zero-dependency (see its package.json) — depending on it
@@ -16,7 +17,8 @@ import { buildOpenApi } from './openapi.js';
 import { EDGE_ERROR_CODES } from './edge-errors.js';
 import { LIMIT_ERROR_CODES, refuseRunLimitNames, refuseBudgetLimitNames } from '@gnldev/durable';
 import { refuseUnknownNames, optionNames } from '@gnldev/options';
-import { pipeAgentStream } from './sse.js';
+import { pipeAgentStream, sseResponse } from './sse.js';
+import { drainProcess, type DrainOptions } from '@gnldev/durable';
 
 /**
  * The request body as a JSON object (@gnldev/durable `readJsonObject`), or the 400 that says it is not
@@ -135,8 +137,8 @@ async function priorWork(journal: RawJournal, runId: string, known?: RunOwner): 
   if (o.kind !== 'workflow') return false;
   try {
     if ((await journal.get(`wfrun:${runId}`)) !== undefined) return true;
-    if (typeof journal.listKeys === 'function') return (await journal.listKeys(`${runId}:wf:`, { limit: 1 })).length > 0;
-    return (await journal.get(`${runId}:wf:_suspend`)) !== undefined;
+    if (typeof journal.listKeys === 'function') return (await journal.listKeys(runRecordPrefix(runId, 'wf'), { limit: 1 })).length > 0;
+    return (await journal.get(runRecordKey(runId, 'wf', '_suspend'))) !== undefined;
   } catch {
     return false; // a reader that cannot answer is not evidence of prior work: the gate stays on
   }
@@ -218,9 +220,9 @@ export interface OrgOptions {
    * that could have made it otherwise were measured rather than assumed: an instance is a CACHE over
    * the org-scoped journal (memory comes from `memoryFactory(scoped)`, the frozen model spec lives in
    * the journal), `createGnl` opens no connections and starts no timers, the rebuild re-derives
-   * `withOrg(base, id)` without double-scoping the key prefix, and cancellation is unaffected because
-   * `inflight` hangs off the API closure keyed `org:<id>:<runId>` — not off the instance — so the key
-   * survives a rebuild.
+   * `withOrg(base, id)` without double-scoping the key prefix, and cancellation is unaffected: an agent
+   * run's cancel is a record in the journal, and a workflow's `inflight` controllers hang off the API
+   * closure keyed `org:<id>:<runId>` — not off the instance — so the key survives a rebuild.
    *
    * The one exception is a `memoryFactory` that IGNORES its argument and returns a process-local store.
    * That is a split rather than a loss: an in-flight run holds the evicted instance by reference, so
@@ -656,11 +658,13 @@ function callerConflictResponse(c: Context, e: unknown, workKey?: string): Respo
   // (server, chat-adapter, agui); a literal copy per consumer is exactly the drift that left one
   // route unmapped. threadMismatchResponse still answers first in every chain, so its entry here is
   // unreachable duplication, kept for consumers that skip the dedicated renderer.
-  const a = callerConflictAnswer(e);
+  // The status and body are durable's: a "not your run" refusal is answered exactly as an absent run
+  // (`runNotFound`), every other member as its 409 with the caller's own name for the work put back.
+  const a = callerConflictAnswer(e, workKey);
   if (!a) return undefined;
   // The engine's ownership refusal is a refusal, whatever status carries it (see onDecision).
   if (a.ownership) markRefusal(c.req.raw, 'ownership', { detail: a.code });
-  return c.json({ error: a.error, code: a.code, detail: withWorkKey(a.detail, workKey) }, 409);
+  return c.json(a.body, a.status as 409);
 }
 
 function blockedErrorResponse(c: Context, e: unknown): Response | undefined {
@@ -687,7 +691,7 @@ function blockedErrorResponse(c: Context, e: unknown): Response | undefined {
 /** A reserved-id refusal (`ReservedThreadIdError`), as every door answers it — see @gnldev/durable#requestRefusal. */
 function reservedIdResponse(c: Context, e: unknown): Response | undefined {
   const f = requestRefusal(e);
-  return f ? c.json(f.body, f.status) : undefined;
+  return f ? c.json(f.body, f.status, f.headers) : undefined;
 }
 
 function upstreamErrorResponse(c: Context, e: unknown): Response | undefined {
@@ -917,6 +921,18 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     }
     return inst;
   }
+  // One per server: runs started here execute here; runs whose process is gone are continued here.
+  const instanceFor = (scopeId: string | undefined): Instance => (scopeId === undefined ? defaultInstance : orgInstance(scopeId));
+  /** The reader's cursor a request carries: `Last-Event-ID` (what EventSource resends), or `?after=` / body `lastEventId`. */
+  // Handed on as it came: the engine reads it (`readCursor`) and refuses one that is not a cursor
+  // (`invalid_cursor`, 400) — a cursor the door could not read used to become no cursor, and the reader
+  // was sent the whole run again.
+  function cursorOf(c: Context, body?: { lastEventId?: unknown }): string | number | undefined {
+    const raw = c.req.header('Last-Event-ID') ?? c.req.query('after') ?? body?.lastEventId;
+    if (raw === undefined || raw === null) return undefined;
+    return typeof raw === 'number' ? raw : typeof raw === 'string' ? raw.trim() : String(raw);
+  }
+
   /**
    * Resolve the request scope. An organization bound to identity (Principal.orgId, verified during
    * allow()) OVERRIDES the header and enforces isolation even if the org option is NOT SET UP (the
@@ -1094,9 +1110,11 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
    */
   async function runAccess(c: Context, s: Instance, runId: string, named?: unknown): Promise<{ decision: RunDecision; owner: RunOwner }> {
     const owner = await runOwnerOf(rawOf(s).journal as RawJournal, runId);
-    const decision = decideRunAccess(owner, callerOf(c, named ?? namedOnRead(c)));
+    // The DOOR's reading: an engine-begun id nobody has made is `deny`, as a foreign run is — no door
+    // may begin one, so "absent" is not the caller's to start (decideDoorRunAccess).
+    const decision = decideDoorRunAccess(owner, callerOf(c, named ?? namedOnRead(c)), runId);
     if (decision === 'deny' && kindOf(c) === 'operator' && owner.state === 'owned' && owner.owner.kind !== 'user') return { decision: 'allow', owner };
-    // Every route answers a `deny` as a refusal — a 403, or the 404 that hides a foreign run.
+    // Every route answers a `deny` as a refusal — `runRefused` below.
     if (decision === 'deny') markRefusal(c.req.raw, 'ownership', { detail: 'run belongs to another caller' });
     return { decision, owner };
   }
@@ -1117,6 +1135,20 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     return id === undefined ? {} : { resourceId: id };
   };
   const foreignRun = (c: Context) => refused(c, 'ownership', c.json({ error: 'access denied: this run belongs to a different resourceId' }, 403));
+  /** A run this caller may not reach, answered as durable's one answer (`runNotFound`): absent and foreign alike. */
+  const runNotFoundResponse = (c: Context): Response => {
+    const a = runNotFound();
+    return c.json(a.body, a.status);
+  };
+  /**
+   * THE answer to a `deny` on every run route. Anyone but staff gets `runNotFoundResponse` — the bytes an
+   * absent run gets, so a refusal cannot say "this one exists" (it used to: 403 here, 404 or 409 there).
+   * Staff naming a user keep the 403 for a run that EXISTS: staff list every run of their organization,
+   * so there is nothing for this answer to hide from them, and the 403 tells them the user they named is
+   * the wrong one. An absent engine-begun id is not a run, so staff get the 404 for it too.
+   */
+  const runRefused = (c: Context, runId: string, owner: RunOwner): Response =>
+    kindOf(c) === 'operator' && owner.state === 'owned' ? foreignRun(c) : runNotFoundResponse(c);
 
   /**
    * The question the ENGINE would have asked, asked here because on `/resume` the engine cannot.
@@ -1160,7 +1192,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     try {
       // The raw instance, as `ownershipDenied` reads it: the caller's view hides a stranger's input,
       // and a gate that saw "no stamp" there would wave the stranger's run through.
-      stamped = (await rawOf(s).journal.get<{ actor?: string }>(`${runId}:input`))?.actor;
+      stamped = (await rawOf(s).journal.get<{ actor?: string }>(runRecordKey(runId, 'input')))?.actor;
     } catch {
       return undefined; // a reader that cannot serve the entry is not evidence of a mismatch
     }
@@ -1388,13 +1420,13 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
   const isResumeIntent = (s: Instance, runId: string): Promise<boolean> => priorWork(rawOf(s).journal as RawJournal, runId);
 
   /**
-   * P0.3 in-process registry of the AbortControllers backing CURRENTLY IN-FLIGHT
-   * `/run` and `/stream` generations, keyed by an ORG-SCOPED key (NOT the raw runId — two different
+   * P0.4 in-process registry of the AbortControllers backing CURRENTLY IN-FLIGHT workflow runs
+   * (`POST /workflows/:name/run`), keyed by an ORG-SCOPED key (NOT the raw runId — two different
    * organizations may legitimately use the SAME client-supplied runId for unrelated work; a flat
-   * `runId → controllers` map would let org A's cancel abort org B's generation, a cross-organization
-   * correctness/security bug). `POST /runs/:id/cancel` below aborts every controller registered under
-   * an id. Deliberately per-INSTANCE (a plain Map, not journal-backed) — see the cancel handler's JSDoc
-   * for the honest multi-worker limitation.
+   * `runId → controllers` map would let org A's cancel abort org B's run, a cross-organization
+   * correctness/security bug). `POST /workflows/runs/:id/cancel` aborts every controller registered
+   * under an id. An AGENT run is not here: it executes on the process's executor, and its cancel
+   * reaches it wherever it executes (`gnl.cancel`).
    */
   const inflight = new Map<string, Set<AbortController>>();
   const inflightKey = (s: Instance, runId: string): string => (s.orgId ? `${orgPrefix(s.orgId)}${runId}` : runId);
@@ -1530,7 +1562,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     // ama iki düzeltme birbirinin yerine geçmez: biri sahipsizliği azaltır, bu onu SORAR.
     // Türetilmiş id'de kapı yine sorar: `'org'` kapsamında iki özne TEK digest paylaşır, yani
     // sahipliği hash'in kendisi garanti etmez.
-    if ((await runDecision(c, s, runId, subject.resourceId)) === 'deny') return foreignRun(c);
+    { const a = await runAccess(c, s, runId, subject.resourceId); if (a.decision === 'deny') return runRefused(c, runId, a.owner); }
     // CONSISTENT with 1.3: continuing a suspended run from this endpoint with the SAME runId + approvals
     // (like stream does) is also resume intent → if there's a trace in the journal the budget gate is
     // skipped; new runIds are still ENFORCED (no regression).
@@ -1540,12 +1572,6 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     }
     // §8's replay signal, read BEFORE the run — see priorWork.
     const prior = await priorWork(rawOf(s).journal as RawJournal, runId);
-    // P0.3: register an org-scoped AbortController so POST /runs/:id/cancel can stop THIS generation.
-    // Composed with the client's own disconnect signal (P0.2) via AbortSignal.any — whichever fires
-    // first wins; either way the journal keeps whatever prefix already completed (resumable, same as P0.2).
-    const ctrl = new AbortController();
-    const key = inflightKey(s, runId);
-    registerInflight(key, ctrl);
     try {
       // P1.7 seal the AUTHENTICATED identity into context — a body-supplied
       // `context.__gnl_orgId`/`__gnl_resourceId`/`__gnl_threadId` (spoof attempt) is stripped and
@@ -1570,11 +1596,10 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
           s.orgId ?? principal?.orgId,
         ),
         limits: limits.value,
-        // P0.2 a client disconnect stops generation instead of billing tokens to
-        // completion — an abort mid-run does NOT break resumable behavior, the journal keeps whatever
-        // prefix already completed and a later call with the SAME runId resumes/replays as before.
-        // P0.3: OR an explicit cancel via POST /runs/:id/cancel (ctrl.signal) — same non-destructive semantics.
-        abortSignal: AbortSignal.any([c.req.raw.signal, ctrl.signal]),
+        // The run executes apart from this request (@gnldev/durable, design decision D2): a client that
+        // disconnects leaves it running, and its answer is there when it comes back. The request's own
+        // signal is therefore NOT wired here — an abort would be a cancellation. Only an explicit cancel
+        // (POST /runs/:id/cancel) stops the run, in whichever process executes it.
       });
       // `finishReason` is here because without it an empty answer is unreadable. A run whose model
       // returned nothing answers 200 with `text: ""` — identical, on the wire, to a model that
@@ -1592,13 +1617,10 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       );
     } catch (e: any) {
       // The correlation handle rides on refusals too: a caller who named work and got a 409 has no
-      // other way to learn which run it collided with.
-      return stampRunHeaders(
-        limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400),
-        runId,
-      );
-    } finally {
-      unregisterInflight(key, ctrl);
+      // other way to learn which run it collided with. Not on `run_not_found`: there is no run to
+      // correlate, and the gate's answer for the same case carries none.
+      const res = limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400);
+      return callerConflictAnswer(e)?.hidden ? res : stampRunHeaders(res, runId);
     }
   });
 
@@ -1631,10 +1653,10 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     { const denied = clientSubjectDenied(c, body.resourceId); if (denied) return denied; }
     // A resume needs a run. One that does not exist is a 404 — and so, for a caller who is not staff, is
     // one that is someone else's (`asMissing`), so the two cannot be told apart.
-    const missingRun = () => c.json({ error: `run '${String(body.runId)}' not found` }, 404);
+    const missingRun = () => runNotFoundResponse(c);
     const access = await runAccess(c, s, String(body.runId), body.resourceId);
     if (access.decision === 'missing') return missingRun();
-    if (access.decision === 'deny') return kindOf(c) === 'operator' ? foreignRun(c) : missingRun();
+    if (access.decision === 'deny') return runRefused(c, String(body.runId), access.owner);
     const owner = access.owner;
     if (owner.state !== 'owned') return missingRun(); // `allow` is only ever given for a run that exists
     // …and the half of the same rule that no declaration can satisfy. The gate above asks about the
@@ -1839,12 +1861,33 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     const parsed = await readSignedBody(c); // F1: A2A signature enforced here too
     if ('denied' in parsed) return parsed.denied;
     return streamDoor(c, name, parsed.body as any, ({ result, runId }) => {
-      // Disconnect-recovery — if there's a Last-Event-ID header (sent automatically by
-      // EventSource) or body.lastEventId, events the client has already seen are not rewritten (see the note in sse.ts).
-      const lastEventIdRaw = c.req.header('Last-Event-ID') ?? (parsed.body as any)?.lastEventId;
-      const lastEventId = lastEventIdRaw != null && lastEventIdRaw !== '' ? Number(lastEventIdRaw) : undefined;
-      return pipeAgentStream(c, runId, result, Number.isFinite(lastEventId as number) ? { lastEventId } : undefined);
+      // Disconnect-recovery: the stream was asked for from the client's cursor (`Last-Event-ID`, sent
+      // automatically by EventSource, or body.lastEventId) — it carries only what the client has not seen,
+      // and every event's `id` is its place in the run's log (sse.ts).
+      return pipeAgentStream(c, runId, result);
     });
+  });
+
+  // A RUN'S EVENTS — a run executes apart from the request that started it; any process serves its events
+  // from the reader's cursor (`Last-Event-ID`), live until it ends or waits on a human.
+  app.get('/runs/:id/events', async (c) => {
+    if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
+    const s = await scope(c);
+    if ('error' in s) return c.json({ error: s.error }, s.status);
+    const runId = decodeURIComponent(c.req.param('id'));
+    { const d = clientSubjectDenied(c); if (d) return d; }
+    // The same rule as GET /runs/:id: not yours and not there answer the same 404.
+    if ((await runDecision(c, s, runId)) !== 'allow') return runNotFoundResponse(c);
+    const after = cursorOf(c);
+    let followed;
+    try {
+      followed = await s.gnl.follow(runId, after !== undefined ? { after } : {});
+    } catch (e) {
+      const r = reservedIdResponse(c, e);
+      if (r) return r;
+      throw e;
+    }
+    return pipeAgentStream(c, runId, followed);
   });
 
   // THE OTHER WIRE FORMATS, on the same door. Registered here, after `/stream`, so a surface cannot
@@ -1930,7 +1973,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     // threadId gönderilmeyen bir istekte tek kapı da sessiz kalıyordu. Sömürü, sahipsiz doğan
     // koşumlara dayanıyordu — bu turda o üretim de kapandı (persistInput benimsenen sahibi yazıyor),
     // ama iki düzeltme birbirinin yerine geçmez: biri sahipsizliği azaltır, bu onu SORAR.
-    if ((await runDecision(c, s, runId, subject.resourceId)) === 'deny') return foreignRun(c);
+    { const a = await runAccess(c, s, runId, subject.resourceId); if (a.decision === 'deny') return runRefused(c, runId, a.owner); }
     // 1.3: resume intent via approvals+runId (a pending tool approval) → the budget gate is skipped
     // CONSISTENTLY with /agents/:name/resume (otherwise a pending interrupt in an over-budget
     // organization would never finish).
@@ -1938,10 +1981,6 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       const over = await budgetGate(c, s);
       if (over) return over;
     }
-    // P0.3: same registry as /agents/:name/run — composed with the client's disconnect signal (P0.2).
-    const ctrl = new AbortController();
-    const key = inflightKey(s, runId);
-    registerInflight(key, ctrl);
     let result: any;
     try {
       // P1.7: same identity-sealing as /agents/:name/run above — see sealRequestContext.
@@ -1964,32 +2003,15 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
           s.orgId ?? principal?.orgId,
         ),
         limits: limits.value,
-        // P0.2 same as /agents/:name/run above — stop generation (and its token
-        // billing) on client disconnect. Deliberately compatible with W3 resumable SSE just below: an
-        // abort only stops THIS response's fullStream early: the journal still has whatever prefix
-        // completed before the abort, so a resumed/replayed call with the SAME runId (with or without
-        // Last-Event-ID) sees the same journal state it would have without the abort.
-        // P0.3: OR an explicit cancel via POST /runs/:id/cancel (ctrl.signal) — same non-destructive semantics.
-        abortSignal: AbortSignal.any([c.req.raw.signal, ctrl.signal]),
+        // Same as /agents/:name/run: a disconnect ends this response's reading, not the run; only an
+        // explicit cancel stops it. A reconnecting client sends its cursor and reads on from it.
+        ...(cursorOf(c, body) !== undefined ? { after: cursorOf(c, body) } : {}),
       });
     } catch (e: any) {
-      unregisterInflight(key, ctrl);
-      return stampRunHeaders(
-        limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400),
-        runId,
-      );
+      // As on `/run`: `run_not_found` names no run, so it carries no correlation header.
+      const res = limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400);
+      return callerConflictAnswer(e)?.hidden ? res : stampRunHeaders(res, runId);
     }
-    // P0.3 cleanup: `s.gnl.stream(...)` above only resolves the STREAM RESULT object — the actual
-    // fullStream consumption (and hence "this generation is done") happens INSIDE pipeAgentStream's
-    // streamSSE callback below, which Hono drives independently of this handler's return (it doesn't
-    // block on the SSE body finishing). Reaching INTO the streaming path to unregister exactly when the
-    // response body closes would mean contorting sse.ts's generic event loop for one caller's
-    // bookkeeping — not worth it. Instead: `result.finishReason` (a Vercel AI SDK StreamTextResult
-    // promise — see sse.ts's own `await Promise.resolve(result.finishReason)`) settles exactly when
-    // fullStream is fully drained (success OR error), which is a genuinely reachable, non-contorting
-    // completion hook — use it. Swallowed on rejection (a stream error already produces its own `error`
-    // SSE event in pipeAgentStream); this is ONLY registry bookkeeping.
-    void Promise.resolve(result.finishReason).catch(() => {}).finally(() => unregisterInflight(key, ctrl));
     // `__gnlPriorRun` is streamDurable's own answer to the replay question (run.ts), so the streamed
     // path uses it rather than the pre-read: same question, asked by the code that already knows.
     return stampRunHeaders(
@@ -2060,12 +2082,12 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       // run owned by the caller left in the listing. A missing run is a 404 and nothing is written; for
       // a caller who is not staff a foreign run is the same 404 (ADR-0001), as on `/agents/:name/resume`.
       if (!runId) return c.json({ error: 'resume needs the runId (or workKey) of the run to resume' }, 400);
-      const missingWf = () => c.json({ error: `workflow run '${runId}' not found` }, 404);
-      const d = await runDecision(c, s, runId, subject);
-      if (d === 'missing') return missingWf();
-      if (d === 'deny') return kindOf(c) === 'operator' ? foreignRun(c) : missingWf();
+      const a = await runAccess(c, s, runId, subject);
+      if (a.decision === 'missing') return runNotFoundResponse(c);
+      if (a.decision === 'deny') return runRefused(c, runId, a.owner);
     } else if (runId) {
-      if ((await runDecision(c, s, runId, subject)) === 'deny') return foreignRun(c);
+      const a = await runAccess(c, s, runId, subject);
+      if (a.decision === 'deny') return runRefused(c, runId, a.owner);
     }
     // The thread, as on the agent doors. This route took the body's `threadId` as given, so an end user
     // attached a workflow run to another user's thread — locking her out of it, and (the run being
@@ -2123,7 +2145,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       return effective ? stampRunHeaders(res, effective) : res;
     } catch (e: any) {
       const res = limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400);
-      return runId ? stampRunHeaders(res, runId) : res;
+      return runId && !callerConflictAnswer(e)?.hidden ? stampRunHeaders(res, runId) : res;
     } finally {
       if (wfKey) unregisterInflight(wfKey, ctrl);
     }
@@ -2207,14 +2229,13 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     // below, like every write — the view would turn it into a 404.
     const raw = rawOf(s).journal;
     const status = await getWorkflowRunStatus(raw, runId);
-    const visible = status !== undefined || (await raw.get(`${runId}:wf:_suspend`)) !== undefined;
-    const missingWf = () => c.json({ error: `workflow run '${runId}' not found` }, 404);
-    if (!visible) return missingWf();
+    const visible = status !== undefined || (await raw.get(runRecordKey(runId, 'wf', '_suspend'))) !== undefined;
+    if (!visible) return runNotFoundResponse(c);
     // Same expectation-check as the agent-run cancel next door — a workflow run carries an owner for
     // the same reason and stopping one is the same act.
     {
-      const d = await runDecision(c, s, runId);
-      if (d === 'deny') return kindOf(c) === 'operator' ? foreignRun(c) : missingWf();
+      const a = await runAccess(c, s, runId);
+      if (a.decision === 'deny') return runRefused(c, runId, a.owner);
     }
     // D4-FGA: runs AFTER the coarse allow(c,'write') gate above.
     const resourceDenied = await resourceGate(c, principalOf(c.req.raw), { type: 'workflow', id: runId }, 'cancel');
@@ -2317,15 +2338,12 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
   });
 
   /**
-   * P0.3 cancel in-flight generation for a run on THIS server instance.
-   * HONESTY (multi-worker): `inflight` is a plain in-process Map — this endpoint can only abort
-   * controllers registered on the SAME process that received THIS request. Behind a load balancer with
-   * multiple workers, a run's `/stream` may be in-flight on a DIFFERENT worker than the one that
-   * receives the cancel → `cancelled: 0` even though the run is genuinely still running elsewhere.
-   * Closing that gap needs a journal-level cancel FLAG that every worker polls during generation
-   * (deliberately deferred — see P0.4/P2). The run itself is UNAFFECTED by this
-   * limitation: it stays resumable either way (the journal prefix is intact — cancel never deletes
-   * anything, it only stops NEW tokens/tool-calls from being produced on this instance).
+   * Cancels a run, in whichever process executes it (@gnldev/durable `gnl.cancel`): the durable cancel
+   * record — which every executor obeys, and which refuses every later resume — and the holder told to
+   * read it now. The answer says which of the two happened: `cancel: 'delivered'` (it executed in THIS
+   * process and was stopped now) or `cancel: 'recorded'` (it executes in another process, which stops it at
+   * its next event — at once when the processes share a signal — or nowhere). The `?durable=` switch is
+   * gone: an in-process-only cancel stopped nothing a load balancer had sent elsewhere, and said `ok`.
    */
   app.post('/runs/:id/cancel', async (c) => {
     if (!(await allowP(c.req.raw, 'run:cancel'))) return deny(c.req.raw, 'write');
@@ -2343,31 +2361,21 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     { const denied = clientSubjectDenied(c); if (denied) return denied; }
     // Existence is asked of the raw instance: the caller's view hides a stranger's run, and this route
     // answers a stranger's run with the ownership 403 below, like every write, not with a 404.
-    const missingRun = () => c.json({ error: `run '${runId}' not found` }, 404);
     // Stopping someone else's work is a write, and an application credential serves many end users
     // under one token — so the SAME `?resourceId=` expectation the read path honours is honoured here.
     {
-      const d = await runDecision(c, s, runId);
-      if (d === 'missing') return missingRun();
-      if (d === 'deny') return kindOf(c) === 'operator' ? foreignRun(c) : missingRun();
+      const a = await runAccess(c, s, runId);
+      if (a.decision === 'missing') return runNotFoundResponse(c);
+      if (a.decision === 'deny') return runRefused(c, runId, a.owner);
     }
     // D4-FGA: runs AFTER the coarse allow(c,'write') gate above.
     const resourceDenied = await resourceGate(c, principalOf(c.req.raw), { type: 'run', id: runId }, 'cancel');
     if (resourceDenied) return resourceDenied;
-    const key = inflightKey(s, runId);
-    const set = inflight.get(key);
-    const cancelled = set ? set.size : 0;
-    if (set) for (const ctrl of set) ctrl.abort();
-    // P2-cancel (wave 2, opt-in `?durable=true`): ALSO write the journal cancel flag — reaches runs
-    // in-flight on OTHER workers (they stop at their next fresh model step) and makes the run refuse
-    // every future resume (terminal, like a compensated run; recovery = forkRun). WITHOUT the flag the
-    // default behavior is byte-identical to P0.3: in-process abort only, run stays resumable.
-    const durable = c.req.query('durable') === 'true';
-    if (durable) await cancelAgentRun(s.journal, runId, { reason: 'api-cancel' });
-    await audit(c, s.orgId, 'run.cancel', runId, { cancelled, durable });
-    return c.json(cancelled > 0
-      ? { ok: true, cancelled, durable }
-      : { ok: true, cancelled: 0, durable, note: durable ? 'no in-flight generation on this instance — durable flag written, other workers stop at their next step' : 'no in-flight generation on this instance' });
+    const cancel = await s.gnl.cancel(runId, { reason: 'api-cancel' });
+    await audit(c, s.orgId, 'run.cancel', runId, { cancel });
+    return c.json(cancel === 'delivered'
+      ? { ok: true, cancel }
+      : { ok: true, cancel, note: 'not executing in this process: the cancel is recorded, and the process executing the run (if any) stops it at its next event' });
   });
   // Token-based usage report: total usage of the request scope (organization/shared) + effective limit.
   app.get('/usage', async (c) => {
@@ -2497,7 +2505,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     { const d = clientSubjectDenied(c); if (d) return d; }
     // A run this caller may not read and a run that does not exist answer the SAME 404: a refusal
     // that differs from "not found" tells an id-guesser which ids are real.
-    const notFound = () => c.json({ error: 'run not found' }, 404);
+    const notFound = () => runNotFoundResponse(c);
     // A caller who speaks for a user holds the subject view (see `scope`): its reader returns nothing
     // for a run that is not that user's, so the view alone decides. The gate stays for staff who
     // state an expectation (`?resourceId=`), which no view expresses.
@@ -2604,9 +2612,13 @@ export function createRestApi(
   refuseMisplacedOptions('createRestApi', config, opts, REST_API_OPTION_KEYS, SHARED_WITH_DEV_CONFIG);
   refuseRestOptionNames(opts);
   const provider = normalizeAuth(opts.auth);
-  const routed = toFetchHandler(restApiApp(engineConfigOf(config), opts));
+  const app = restApiApp(engineConfigOf(config), opts);
+  const routed = toFetchHandler(app);
   const handler = provider?.onDecision ? withDecisions(routed, provider) : routed;
-  return opts.cors ? withCors(handler, opts.cors) : handler;
+  const out = opts.cors ? withCors(handler, opts.cors) : handler;
+  // Graceful drain (SIGTERM): the PROCESS's (@gnldev/durable drainProcess) — no new run (503), the
+  // running tool finishes, no new step, runs released; the queue and the scheduler take nothing new.
+  return Object.assign(out, { drain: (o?: DrainOptions) => drainProcess(o) });
 }
 
 /**

@@ -16,6 +16,7 @@ import { createRequire } from 'node:module';
 import { spawnFixtureEnv } from './fixtures/watchdog.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { runDurable, listRunsArray, readRunOutcome } from '../src/index.js';
+import { streamFromGenerate } from './mock.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
@@ -26,7 +27,7 @@ const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const good = {
   specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {},
   doGenerate: async () => ({ content: [{ type: 'text', text: 'recovered' }], finishReason: 'stop', usage, warnings: [] }),
-  doStream: async () => { throw new Error('gen-only'); },
+  doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
 } as any;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

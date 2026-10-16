@@ -4,7 +4,7 @@ import { describe, it, expect } from 'vitest';
 import { InMemoryJournal } from '../src/journal.js';
 import { BasicMemory } from '../src/memory.js';
 import { runDurable } from '../src/run.js';
-import { createMockModel } from './mock.js';
+import { createMockModel, streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 
@@ -63,7 +63,7 @@ describe('memory (8.1)', () => {
     let seenSystem = '';
     const model: any = {
       specificationVersion: 'v2', provider: 'mock', modelId: 'm', supportedUrls: {},
-      doStream: async () => { throw new Error('no'); },
+      doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
       doGenerate: async ({ prompt }: any) => {
         seenSystem = (prompt ?? []).filter((m: any) => m.role === 'system').map((m: any) => m.content).join('\n');
         return { content: [{ type: 'text', text: 'ok' }], finishReason: 'stop', usage, warnings: [] };

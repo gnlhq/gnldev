@@ -141,9 +141,13 @@ async function settle(journal: Journal, threadId: string, v: { derived?: string;
   return { exists: true, ...(now?.resourceId ? { owner: now.resourceId } : { staffClaimed: now?.ownerKind !== 'unknown' }) };
 }
 
-/** Whether a scope's every thread has its record or mark (`THREAD_RECORDS_KEY`), so its gate never reads runs. */
+/**
+ * Whether a scope's every thread has its record or mark (`THREAD_RECORDS_KEY`), so its gate never reads
+ * runs. A scope that holds no run has no older thread to give one: the gate marks it on first contact.
+ */
 export async function threadRecordsComplete(journal: Journal): Promise<boolean> {
-  return (await journal.get(THREAD_RECORDS_KEY)) !== undefined;
+  if ((await journal.get(THREAD_RECORDS_KEY)) !== undefined) return true;
+  return typeof (journal as Partial<JournalReader>).listRunsPaged === 'function' && scopeHoldsNoRun(journal);
 }
 
 /** Runs read per page by `writeThreadRecords`. */

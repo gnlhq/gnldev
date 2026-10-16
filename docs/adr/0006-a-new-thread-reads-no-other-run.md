@@ -52,6 +52,9 @@ Chosen: the marker. The owner record keeps its meaning and is only ever written 
 (`putIfAbsent`), as before; nothing new is asked of a custom journal. A store is marked complete
 (`thread:records:v1`) when it has no runs at first contact, or by the `thread-records` step of `storage.upgrade()`;
 until then the gate keeps the walk, so correctness never depends on running the upgrade.
+The mark is a fact about ONE scope's data (amended 11 Oct 2026): `adoptIntoOrg` never moves it, and the
+organization keeps its own mark only when the root held one too (`scopeFactsDroppedByAdoption`). Carried
+as data, the root's mark made an organization's older thread read as new.
 
 ### D2 — how a run list resumes
 

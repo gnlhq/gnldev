@@ -12,8 +12,10 @@ export function toolCall(toolName: string, toolCallId: string, args: unknown) {
   return { content: [{ type: 'tool-call', toolCallId, toolName, input: JSON.stringify(args) }], finishReason: 'tool-calls' as const, usage, warnings: [] as any[] };
 }
 
+// Generate-only: the registry streams such a model from its generate answer (its runs execute on the stream
+// path); a doStream that throws would be called and fail the run.
 export function mkModel(doGenerate: (o: any) => Promise<any>): any {
-  return { specificationVersion: 'v2', provider: 'mock', modelId: 'mock', supportedUrls: {}, doGenerate, doStream: async () => { throw new Error('no stream'); } };
+  return { specificationVersion: 'v2', provider: 'mock', modelId: 'mock', supportedUrls: {}, doGenerate };
 }
 
 /** Based on conversation state: 0 tool results → call the tool; otherwise final. */

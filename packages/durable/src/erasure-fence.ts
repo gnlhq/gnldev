@@ -15,12 +15,16 @@
  *  - where it already reads its cancel flag — at its entry and before every fresh model step — and
  *    before a side effect executes: it stops there (`RunErasedError`), and writes nothing more;
  *  - before the writes that land outside its own run (its turn's messages in the thread's memory);
- *  - and once more after its LAST write (`settleErasedRun`): fenced, it deletes its own footprint
- *    again, exactly as the deletion did.
- * The fence is written first and read last, so a write of the worker's into its own run either
- * precedes the deletion (and goes with it) or is followed by a read that sees the fence (and is
- * deleted by the worker itself). That holds on every store where a read sees every write that
- * completed before it — all three shipped here.
+ *    a read that FAILS there is not "not deleted": the completion is not written (run.ts);
+ *  - and once more after its LAST write (`settleErasedRun`): fenced, it takes back the turn it
+ *    appended to its thread (`Memory.retract`, by the run's own batch markers) and deletes its own
+ *    footprint again, exactly as the deletion did.
+ * The fence is written first and read last, so a write of the worker's either precedes the deletion
+ * (and goes with it) or is followed by a read that sees the fence (and is taken back by the worker
+ * itself). That holds on every store where a read sees every write that completed before it — all
+ * three shipped here — and for every write the worker can name: its own run's keys, the turn it
+ * appended (named by `mem-appended:<runId>` / `mem-user-appended:<runId>`), the window records it
+ * executed (named by its tool records, `executedHere`), its usage (its counted marker).
  *
  * WHAT IT HOLDS. Nothing of anyone: `{ erased: true, at }`, under a HASH of the run id — a run id can
  * name its owner (an owned job's is `job:~o~<org>:<user>:…`), and this record outlives the person.
@@ -33,13 +37,21 @@
  * the rest of its partition. Retention's own deletions write no fence: they delete runs idle for
  * longer than that horizon.
  *
- * NOT COVERED, stated: what a worker writes OUTSIDE its run between its last read of the fence and the
- * deletion's write of it — a thread-window record, a turn's messages, a cross-run record. That window
- * is one read and one write wide at each of those points (it is no longer the length of a model call).
+ * Before this the turn's messages were the exception: written in the moment between the worker's last
+ * read of the fence and the deletion, they stayed in the deleted thread for good — the worker settled
+ * its run away, so `subjectRuns` answered `[]` and a second erasure deleted nothing (c-erasure CE-2).
+ *
+ * NOT COVERED, stated: a `Memory` without `retract` (a custom one) keeps such a turn; a journal log that
+ * the retraction empties stays as an empty log under the thread's key (no message in it — deleting the
+ * key could not be compared, and an append landing meanwhile would go with it); the shared counters a
+ * worker incremented before its settle (usage is subtracted again; the metrics aggregates — counts, no
+ * content — are not, as for any deleted run; after an organization's purge they are that organization's
+ * counter rows again); and a worker that dies between its write and its settle leaves that write, as it
+ * leaves any write it never got to settle.
  */
 import { createHash } from 'node:crypto';
 import type { Journal } from './journal.js';
-import { orgParentOf, orgScopeOf } from './organization.js';
+import { orgParentOf, orgScopeOf, orgPrefix, ORG_RECORD_PRE } from './organization.js';
 
 /** The family every run fence lives under. */
 export const RUN_FENCE_PREFIX = '__run_erased__:';
@@ -71,32 +83,49 @@ export async function fenceRun(journal: Journal, runId: string): Promise<void> {
  * What a worker remembers at its entry: the purge marker of its organization as it was then. A purge
  * while it runs changes it; an organization purged BEFORE the run started is a new tenancy, and its
  * runs are not stopped by the old purge. `undefined` outside organizations.
+ *
+ * `lineage`: the run that made this one (its recorded `parentRunId` — a sub-agent's delegating run, a
+ * background task's or continuation's turn). A run made by a deleted run is deleted with it: its
+ * parent's fence fences it too. Without it a child born after the deletion planned its parent's
+ * children (the plan reads the parent's tool records first, then fences) had no fence of its own and
+ * ran — its effect for a person who is gone, its answer into their deleted thread.
  */
-export interface ErasureBaseline { orgMark?: string }
+export interface ErasureBaseline { orgMark?: string; lineage?: string[] }
 
 function orgMarkOf(value: unknown): string {
   const v = value as { at?: unknown; n?: unknown } | undefined;
   return v === undefined ? '' : `${String(v.at)}:${String(v.n ?? '')}`;
 }
 
-/** Read once at a run's entry; carried to every later check of the same attempt. */
-export async function erasureBaseline(journal: Journal): Promise<ErasureBaseline> {
+/** Read once at a run's entry; carried to every later check of the same attempt. `parentRunId`: see `lineage`. */
+export async function erasureBaseline(journal: Journal, parentRunId?: string): Promise<ErasureBaseline> {
   const org = orgScopeOf(journal);
   const root = orgParentOf(journal);
-  if (org === undefined || !root?.get) return {};
-  return { orgMark: orgMarkOf(await root.get(orgPurgedKey(org))) };
+  const lineage = parentRunId !== undefined ? { lineage: [parentRunId] } : {};
+  if (org === undefined || !root?.get) return lineage;
+  return { orgMark: orgMarkOf(await root.get(orgPurgedKey(org))), ...lineage };
 }
 
-/** Whether this run was deleted since the attempt started: its own fence, or its organization's purge. */
+/** Whether this run was deleted since the attempt started: its own fence, its parent's, or its organization's purge. */
 export async function runErasedSince(journal: Journal, runId: string, baseline: ErasureBaseline | undefined): Promise<boolean> {
   const org = orgScopeOf(journal);
   const root = orgParentOf(journal);
-  const [fence, mark] = await Promise.all([
-    journal.get(runFenceKey(runId)),
+  const [fences, mark] = await Promise.all([
+    Promise.all([runId, ...(baseline?.lineage ?? [])].map((id) => journal.get(runFenceKey(id)))),
     baseline?.orgMark !== undefined && org !== undefined && root?.get ? root.get(orgPurgedKey(org)) : Promise.resolve(undefined),
   ]);
-  if (fence !== undefined) return true;
+  if (fences.some((f) => f !== undefined)) return true;
   return baseline?.orgMark !== undefined && org !== undefined && orgMarkOf(mark) !== baseline.orgMark;
+}
+
+/**
+ * A run deleted THROUGH its parent has no fence of its own: its settle writes one, so every other reader
+ * of the run — its executor, a follower, a later admission, a sweep — refuses it by its own id.
+ */
+export async function fenceThroughLineage(journal: Journal, runId: string, baseline: ErasureBaseline | undefined): Promise<void> {
+  if (!baseline?.lineage?.length || (await journal.get(runFenceKey(runId))) !== undefined) return;
+  const parents = await Promise.all(baseline.lineage.map((id) => journal.get(runFenceKey(id))));
+  if (parents.some((f) => f !== undefined)) await fenceRun(journal, runId);
 }
 
 /** Throws `RunErasedError` when the run was deleted since the attempt started. */
@@ -104,14 +133,30 @@ export async function assertNotErased(journal: Journal, runId: string, baseline:
   if (await runErasedSince(journal, runId, baseline)) throw new RunErasedError(runId);
 }
 
-/** Retention for fences: those written before `cutoff` (epoch ms) go. Returns how many. */
+/**
+ * Retention for fences: those written before `cutoff` (epoch ms) go. Returns how many.
+ *
+ * In the scope `sweepRuns` sweeps: an organization's view, its own; the ROOT, its own and every
+ * registered organization's (`__org__:<id>`) — the root sweep already takes those organizations' runs
+ * (a root journal lists them), and their fences outlived them (measured, c-erasure CE-5). An
+ * organization that was never registered keeps its fences until a sweep through its own view.
+ */
 export async function sweepRunFences(journal: Journal, cutoff: number): Promise<number> {
   if (typeof journal.listKeys !== 'function' || typeof journal.deletePrefix !== 'function') return 0;
+  const scopes = [''];
+  if (orgScopeOf(journal) === undefined) {
+    for (const rec of await journal.listKeys(ORG_RECORD_PRE)) {
+      const orgId = rec.slice(ORG_RECORD_PRE.length);
+      if (orgId && !orgId.includes(':')) scopes.push(orgPrefix(orgId));
+    }
+  }
   let n = 0;
-  for (const key of await journal.listKeys(RUN_FENCE_PREFIX)) {
-    const v = await journal.get<{ at?: unknown }>(key);
-    // A fence key is a fixed-length hash: no other fence extends it, so the prefix delete is exact.
-    if (v !== undefined && typeof v.at === 'number' && v.at < cutoff) n += await journal.deletePrefix(key);
+  for (const scope of scopes) {
+    for (const key of await journal.listKeys(`${scope}${RUN_FENCE_PREFIX}`)) {
+      const v = await journal.get<{ at?: unknown }>(key);
+      // A fence key is a fixed-length hash: no other fence extends it, so the prefix delete is exact.
+      if (v !== undefined && typeof v.at === 'number' && v.at < cutoff) n += await journal.deletePrefix(key);
+    }
   }
   return n;
 }

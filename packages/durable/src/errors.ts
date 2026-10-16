@@ -19,9 +19,17 @@ export class DivergenceError extends Error {
  * execute in-flight). Thrown by opt-in concurrency control.
  */
 export class RunBusyError extends Error {
-  constructor(message: string) {
+  /**
+   * The run that was busy, and whether this caller was refused AT LOCK ACQUISITION (it never got in).
+   * Set by the lock sites — the one place that knows both. A unit that counts attempts (a job, a fire)
+   * reads them together (`attemptEndOf`): only its OWN run refused at its lock is a deferral.
+   */
+  readonly runId?: string;
+  readonly atLockAcquisition?: boolean;
+  constructor(message: string, refusal?: { runId: string; atLockAcquisition: true }) {
     super(message);
     this.name = 'RunBusyError';
+    if (refusal) { this.runId = refusal.runId; this.atLockAcquisition = true; }
   }
 }
 
@@ -105,6 +113,21 @@ export class RetryLimitExceededError extends Error {
   ) {
     super(message);
     this.name = 'RetryLimitExceededError';
+  }
+}
+
+/**
+ * A call reached its retry ceiling while its outcome is UNKNOWN: its last attempts started their body
+ * and never reported, and the tool can still report what happened (a `recover()` hook, or `idempotent:
+ * true` — the key it carried, so a late attempt's result stands). Not a failure: an attempt cut off from
+ * the store can still be in its body and land the effect after this. The run waits (`waiting-outcome`)
+ * and continues from the call's recorded result when one arrives — a late attempt's, a later recover()'s,
+ * or an operator's (`gnl pending`). A `RetryLimitExceededError` too: no attempt is started again.
+ */
+export class OutcomeUnknownError extends RetryLimitExceededError {
+  constructor(message: string, detail: { key: string; attempts: number; maxRetries: number }) {
+    super(message, detail);
+    this.name = 'OutcomeUnknownError';
   }
 }
 
@@ -204,6 +227,22 @@ export class VectorOwnerConflictError extends Error {
 }
 
 /**
+ * `adoptIntoOrg` would have put a root entry on an id the organization already holds — a thread's owner
+ * record, a run, a thread, a working memory, a meta or work-store key. Adoption never replaces what the
+ * organization holds (an owner record least of all), so it refuses BEFORE anything moves, the same on
+ * every store. `keys` names the organization ids that collide (at most `ADOPTION_CONFLICT_LIST`, in
+ * order), `count` how many there are. Counters are summed and content-addressed cache entries are kept,
+ * never reported here (adoption.ts).
+ */
+export class AdoptionConflictError extends Error {
+  readonly code = 'adoption_conflict';
+  constructor(message: string, public readonly detail: { orgId: string; keys: string[]; count: number }) {
+    super(message);
+    this.name = 'AdoptionConflictError';
+  }
+}
+
+/**
  * A `cross-run` dedup record — keyed by a business key such as an order id — was reached by a user it
  * does not belong to. It is refused: neither the recorded output (it is someone else's result) nor a
  * second execution (the key promises one). The detail names the tool, never the owner.
@@ -254,6 +293,19 @@ export class RunActorMismatchError extends Error {
  * count as the victim's run failing (`outcome.ts`'s `NOT_A_RUN_FAILURE`): a refused stranger may not
  * rewrite a finished run's history to 'failed'.
  */
+/**
+ * An operation that needs an existing run — a cancel, an unwind, a score — named one that does not exist
+ * (run-identity.ts `existingRun`). Nothing was written. A door answers it as `runNotFound`, like a run
+ * that is someone else's.
+ */
+export class RunNotFoundError extends Error {
+  readonly code = VISIBILITY_ERROR_CODES.runNotFound;
+  constructor(readonly runId: string) {
+    super(`@gnldev/durable: run '${runId.slice(0, 80)}' does not exist — this operation continues a run and does not begin one.`);
+    this.name = 'RunNotFoundError';
+  }
+}
+
 export class RunOwnerMismatchError extends Error {
   constructor(
     message: string,
@@ -406,15 +458,73 @@ export function publicConflictDetail(detail: unknown): unknown {
 }
 
 /**
- * A caller-conflict error as every door answers it: its code, its sentence, its detail with every
- * foreign party removed, and whether it is an OWNERSHIP refusal (which a door records as a refusal).
- * One reading, so a door cannot answer the family and forget the refusal, or the reverse.
+ * THE answer for a run this caller may not reach: one that does not exist, or one that is someone
+ * else's. ONE answer for both, because two answers are an existence oracle — measured on the REST door
+ * before this existed: a stranger naming another user's run got 403 "belongs to a different
+ * resourceId", and naming an engine-begun id nobody had made got 409 `run_owner_mismatch` "there is no
+ * such run for this caller", so the 403 said "this one exists". The read routes already answered both
+ * with a 404 (the client library says so: "a 404 means no such run, or not yours"); this is that 404,
+ * spelled once for every door — a door's own gate (`decideDoorRunAccess` says `deny`) and the engine's
+ * refusals (`callerConflictAnswer` below) both render it.
+ *
+ * It names nothing — not the owner, not whether there is one, not even the id: the same bytes for every
+ * id, so a body compared across two ids (one real, one invented) cannot differ either.
  */
-export function callerConflictAnswer(err: unknown): { code: CallerConflictCode; error: string; detail: unknown; ownership: boolean } | undefined {
+export const VISIBILITY_ERROR_CODES = {
+  runNotFound: 'run_not_found',
+} as const;
+
+/** The wire answer for a run this caller may not reach — see `VISIBILITY_ERROR_CODES`. */
+export function runNotFound(): { status: 404; body: { error: string; code: 'run_not_found' } } {
+  return { status: 404, body: { error: 'run not found', code: VISIBILITY_ERROR_CODES.runNotFound } };
+}
+
+/**
+ * The caller-conflict codes that mean "this RUN is not yours": answered as `runNotFound`, never as
+ * themselves. `run_owner_mismatch` covers both an existing run of another subject (`admitRun`, the
+ * derived-owner check) and an engine-begun id nobody has made (`admitRunId`, at the birth); `run_actor_mismatch` is
+ * an existing run another actor began. `thread_owner_mismatch` is about a conversation, not a run, and
+ * keeps its own answer.
+ */
+const NOT_YOUR_RUN_CODES: readonly CallerConflictCode[] = ['run_owner_mismatch', 'run_actor_mismatch'];
+
+/** `detail`, with the caller's own name for the work put back (it sent it; see @gnldev/server `withWorkKey`). */
+function withDeclaredWorkKey(detail: unknown, workKey: string | undefined): unknown {
+  if (workKey === undefined) return detail;
+  return detail && typeof detail === 'object' ? { ...(detail as Record<string, unknown>), workKey } : { workKey };
+}
+
+/**
+ * A caller-conflict error as every door answers it — THE one mapping from the engine's refusal to a
+ * door's response. `status` and `body` are what goes on the wire; `code`, `error` and `detail` are the
+ * engine's own reading (for a door that speaks another protocol, and for the refusal record);
+ * `ownership` says the door records it as an ownership refusal.
+ *
+ * `hidden`: a refusal that says "this run is not yours" is answered exactly as a run that is not there
+ * (`runNotFound`) — status, code, sentence, no `detail` — so a door that renders `body` cannot tell a
+ * stranger which of the two it was. Every other member keeps its 409 and its detail (with every foreign
+ * party removed), because there the caller is mistaken about its OWN work and needs to know how.
+ */
+export function callerConflictAnswer(err: unknown, workKey?: string): {
+  code: CallerConflictCode;
+  error: string;
+  detail: unknown;
+  ownership: boolean;
+  hidden: boolean;
+  status: number;
+  body: { error: string; code: string; detail?: unknown };
+} | undefined {
   const code = callerConflictCode(err);
   if (!code) return undefined;
   const e = err as { message?: unknown; detail?: unknown };
-  return { code, error: typeof e.message === 'string' ? e.message : String(err), detail: publicConflictDetail(e.detail), ownership: OWNERSHIP_CONFLICT_CODES.includes(code) };
+  const error = typeof e.message === 'string' ? e.message : String(err);
+  const detail = publicConflictDetail(e.detail);
+  const ownership = OWNERSHIP_CONFLICT_CODES.includes(code);
+  if (NOT_YOUR_RUN_CODES.includes(code)) {
+    const nf = runNotFound();
+    return { code, error, detail, ownership, hidden: true, status: nf.status, body: nf.body };
+  }
+  return { code, error, detail, ownership, hidden: false, status: WIRE_ERROR_STATUS[code] ?? 409, body: { error, code, detail: withDeclaredWorkKey(detail, workKey) } };
 }
 
 /** Name-matched like blockedErrorCode below (dist/src class-identity resilience). */
@@ -434,6 +544,7 @@ export const OWNERSHIP_CONFLICT_CODES: readonly CallerConflictCode[] = ['run_own
 const BLOCKED_BY_NAME = {
   SideEffectRetryBlockedError: 'side_effect_retry_blocked',
   RetryLimitExceededError: 'retry_limit_exceeded',
+  OutcomeUnknownError: 'outcome_unknown',
   RunBusyError: 'run_busy',
   // FAZ-1: @gnldev/workflow's side-effect claim refusal (StepRetryBlockedError, workflow.ts). Matched
   // by NAME here (blockedErrorCode works via err.name) — workflow stays zero-dependency, and a blocked
@@ -521,21 +632,60 @@ export const RESERVED_ID_ERROR_CODES = {
   ReservedThreadIdError: 'thread_id_reserved',
 } as const;
 
+/**
+ * An operator's `adoptIntoOrg` (`gnl adopt-org`) refused because the organization already holds ids the
+ * root would move onto (`AdoptionConflictError`). 409 when a door ever carries it: the data needs a
+ * decision; no retry clears it.
+ */
+export const ADOPTION_ERROR_CODES = {
+  AdoptionConflictError: 'adoption_conflict',
+} as const;
+
 /** A request whose shape is wrong before anything reads its fields (request-body.ts readJsonObject). */
 export const REQUEST_ERROR_CODES = {
   invalidJson: 'invalid_json',
   callerSystemMessage: 'caller_system_message',
+  /** A reader's cursor (`Last-Event-ID`, `?after=`, `after`) that is not one a run's stream gave (`InvalidCursorError`, run-events.ts). */
+  invalidCursor: 'invalid_cursor',
 } as const;
 
 /**
- * The 400 every door gives a request the ENGINE refused for what it carried, before any work: a reserved
- * thread id (`ReservedThreadIdError`), or a system message the caller sent (`CallerSystemMessageError`,
- * thrown by `run()`/`stream()` for a call that came through a door — request-body.ts). Name-matched like
- * `blockedErrorCode`, so it reads an error from any copy of the package.
+ * A process shutting down refused a new run (`DrainingError`, detached.ts): 503 with `Retry-After`.
+ * The request is correct and this process is leaving — the load balancer's cue to send it elsewhere.
  */
-export function requestRefusal(err: unknown): { status: 400; body: { error: string; code: 'thread_id_reserved' | 'caller_system_message'; detail?: { threadId: string } } } | undefined {
+export const DRAIN_ERROR_CODES = {
+  DrainingError: 'draining',
+  /**
+   * This process lost its liveness session and holds no new one yet (`LivenessUnavailableError`,
+   * process-liveness.ts): it cannot tell a live holder from a dead one, so it refuses rather than guess.
+   * 503 with `Retry-After`, for the same reason as `draining`: the request is correct, ask again.
+   */
+  LivenessUnavailableError: 'liveness_unavailable',
+} as const;
+
+/** Seconds a refused caller is told to wait before it asks again (another process answers by then). */
+const DRAINING_RETRY_AFTER_S = 1;
+
+/**
+ * The answer every door gives a request the ENGINE refused before any work: a reserved thread id
+ * (`ReservedThreadIdError`) or a system message the caller sent (`CallerSystemMessageError`, thrown by
+ * `run()`/`stream()` for a call that came through a door — request-body.ts) or a reader's cursor that is
+ * not one (`InvalidCursorError`) — 400, for what it
+ * carried; or a process that is shutting down (`DrainingError`) or has lost its liveness session
+ * (`LivenessUnavailableError`) — 503 and `Retry-After`, for where it arrived. Name-matched like `blockedErrorCode`, so it reads an error from any copy of the package.
+ * A door renders `body` with `status` and sets `headers`.
+ */
+export function requestRefusal(err: unknown):
+  | { status: 400; body: { error: string; code: 'thread_id_reserved' | 'caller_system_message' | 'invalid_cursor'; detail?: { threadId: string } }; headers?: undefined }
+  | { status: 503; body: { error: string; code: (typeof DRAIN_ERROR_CODES)[keyof typeof DRAIN_ERROR_CODES] }; headers: { 'Retry-After': string } }
+  | undefined {
   const e = err as { name?: unknown; message?: unknown; threadId?: unknown } | null | undefined;
+  if (e?.name === 'DrainingError' || e?.name === 'LivenessUnavailableError') {
+    const code = DRAIN_ERROR_CODES[e.name as keyof typeof DRAIN_ERROR_CODES];
+    return { status: 503, body: { error: String(e.message), code }, headers: { 'Retry-After': String(DRAINING_RETRY_AFTER_S) } };
+  }
   if (e?.name === 'CallerSystemMessageError') return { status: 400, body: { error: String(e.message), code: REQUEST_ERROR_CODES.callerSystemMessage } };
+  if (e?.name === 'InvalidCursorError') return { status: 400, body: { error: String(e.message), code: REQUEST_ERROR_CODES.invalidCursor } };
   if (e?.name !== 'ReservedThreadIdError') return undefined;
   return {
     status: 400,
@@ -617,7 +767,10 @@ export function upstreamFailure(err: unknown): UpstreamFailure | undefined {
  * fails the checker, which is the moment its author still knows the status.
  */
 const WIRE_STATUS_BY_CODE = {
-  // caller-conflict — all 409: something about the request needs fixing; no retry clears it
+  // visibility — a run this caller may not reach, absent or someone else's: one answer (runNotFound)
+  run_not_found: 404,
+  // caller-conflict — all 409: something about the request needs fixing; no retry clears it.
+  // run_owner_mismatch / run_actor_mismatch are the engine's codes; a door answers them as run_not_found.
   run_thread_mismatch: 409,
   run_target_mismatch: 409,
   run_input_mismatch: 409,
@@ -629,6 +782,8 @@ const WIRE_STATUS_BY_CODE = {
   // blocked — the run is waiting on a decision; the same id succeeds once it clears
   side_effect_retry_blocked: 409,
   retry_limit_exceeded: 422,
+  // a call's outcome is unknown at its ceiling: the run waits and continues on its own (detached.ts)
+  outcome_unknown: 409,
   run_busy: 409,
   step_retry_blocked: 409,
   // limit — resumable: raise the ceiling (or fix the loop) and re-drive the same runId
@@ -644,6 +799,12 @@ const WIRE_STATUS_BY_CODE = {
   // request shape — the body is not a JSON object (readJsonObject); fix the request
   invalid_json: 400,
   caller_system_message: 400,
+  invalid_cursor: 400,
+  // adoption — the organization already holds what the root would move onto; decide, then adopt again
+  adoption_conflict: 409,
+  // drain — this process is shutting down; the same request succeeds on another one (Retry-After)
+  draining: 503,
+  liveness_unavailable: 503,
 } as const;
 /** A code with a pinned HTTP status. */
 export type WireErrorCode = keyof typeof WIRE_STATUS_BY_CODE;

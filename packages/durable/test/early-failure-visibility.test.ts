@@ -18,12 +18,13 @@ import { newDb } from 'pg-mem';
 import { runDurable, sweepRuns, InMemoryStorage, InMemoryJournal, runIdOfKey, listRunsArray } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
+import { streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {} };
-const good = { ...base, doGenerate: async () => ({ content: [{ type: 'text', text: 'ok' }], finishReason: 'stop', usage, warnings: [] }), doStream: async () => { throw new Error('gen-only'); } } as any;
+const good = { ...base, doGenerate: async () => ({ content: [{ type: 'text', text: 'ok' }], finishReason: 'stop', usage, warnings: [] }), doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); } } as any;
 /** The provider rejects the very first call — nothing is ever journaled as an entry. */
-const dead = { ...base, doGenerate: async () => { throw new Error('401 invalid api key'); }, doStream: async () => { throw new Error('gen-only'); } } as any;
+const dead = { ...base, doGenerate: async () => { throw new Error('401 invalid api key'); }, doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); } } as any;
 
 async function seed(journal: any) {
   await runDurable({ runId: 'lived', journal, model: good, prompt: 'hello' } as any);

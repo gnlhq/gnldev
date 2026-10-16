@@ -108,8 +108,16 @@ export function ownedName(name: string, owner: Owner): string {
   return `${ownerPart(owner)}${name}`;
 }
 
-/** The id prefix every name this owner owns starts with (erasure finds them by it). Same checks as `ownedName`. */
+/**
+ * The id prefix every name this owner owns starts with (erasure finds them by it). Same checks as `ownedName`.
+ *
+ * An ORGANIZATION (`{ orgId }`, no `resourceId`) owns its own names (`~o~acme::nightly`) and every
+ * member's (`~o~acme:ayse:…`): its prefix is `~o~acme:`, which is what an organization's deletion hands
+ * the background packages' erasers (`purgeOrganization`). A person's prefix is unchanged, and still never
+ * reaches the organization's own names.
+ */
 export function ownedPrefix(owner: Owner): string {
+  if (owner.resourceId === undefined && owner.orgId !== undefined) return ownerPart(owner).slice(0, -1);
   return ownerPart(owner);
 }
 

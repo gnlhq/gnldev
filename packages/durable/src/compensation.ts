@@ -22,13 +22,24 @@
 //    space (xrun:*) and are NOT unwound here — a shared-window action belongs to no single run, and
 //    reverting it while unwinding ONE run could invalidate OTHER runs that legitimately deduped onto
 //    it. Sub-agent (agent:*) nested runs are also not recursed in v1 (documented; v1.1).
+// WHAT HAPPENED is read by the one reader of a call's records (call-outcome.ts): the record AND the late
+//    reports kept beside it — a call whose effect a late report proves is undone with the reported
+//    result, also beside a person's 'denied' (the answer stays; the effect happened anyway).
+// A BACKGROUND CALL is its task's call. The parent's record is the launcher's answer ({ status:
+//    'started', taskId }), not the effect: unwinding the parent unwinds the TASK's call — condemning the
+//    task first, then under the task's keys (its comp record, its idempotency key) — so unwinding the
+//    parent, the task, or both is ONE compensation, exactly once, with one key. The continuation that
+//    answered the agent is a turn of its own, not recursed (as sub-agents).
+import { runRecordKey, runRecordPrefix } from './run-id-grammar.js';
 import { claim, parseJournalKey, runKeys, executedHere } from './journal.js';
+import { readCallOutcome, callRecordKey, type CallEffect } from './call-outcome.js';
 import { orgScopeOf, orgPrefix } from './organization.js';
 import { upgradeFormat } from './format.js';
 import type { Journal, JournalReader, ToolJournalRecord } from './journal.js';
 import type { AnyTool } from './types.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { COMPENSATE_RUN_NAMES } from './option-names.js';
+import { existingRun } from './run-identity.js';
 
 /** The run was unwound (compensateRun condemned it) — it can never be resumed, forked, or allowed to
  *  execute further side effects (see assertNotCompensated call sites + the durable-tool mid-flight gate). */
@@ -72,7 +83,7 @@ export interface CompensationReport {
 }
 
 const tombstoneKey = (runId: string): string => runKeys.proc(runId, '__gnl_compensated');
-const compKey = (runId: string, suffix: string): string => `${runId}:comp:${suffix}`;
+const compKey = (runId: string, suffix: string): string => runRecordKey(runId, 'comp', suffix);
 
 /**
  * The `org:<id>:` part of a provider-facing key, or '' when nothing is scoped.
@@ -105,7 +116,7 @@ export async function assertNotCompensated(journal: Journal, runId: string): Pro
  *  parts (both generate `content` and stream `parts` shapes). Succeeded records of compensate-bearing
  *  tools carry `input` themselves; UNCERTAIN records ('running'/'failed') carry NEITHER input NOR
  *  toolName — this map is the only way to know which tool an uncertain call even belongs to. */
-function callsFromModelSteps(entries: { kind: string; value: unknown }[]): Map<string, { input: unknown; toolName?: string }> {
+export function callsFromModelSteps(entries: { kind: string; value: unknown }[]): Map<string, { input: unknown; toolName?: string }> {
   const map = new Map<string, { input: unknown; toolName?: string }>();
   for (const e of entries) {
     if (e.kind !== 'model') continue;
@@ -122,8 +133,9 @@ function callsFromModelSteps(entries: { kind: string; value: unknown }[]): Map<s
   return map;
 }
 
-/** The ORIGINAL execution's downstream idempotencyKey (mirrors durable-tool.ts) — recover must probe
- *  the provider with the SAME key the execution carried. */
+/** For a record written before records carried their key (`ToolJournalRecord.idempotencyKey`): the
+ *  key as the call-mode or run-scoped args-mode execution derived it. A record that carries its key is
+ *  asked about that key — recover must probe the provider with the SAME key the execution carried. */
 function originalIdempotencyKey(journal: Journal, runId: string, suffix: string): string {
   const m = suffix.match(/^args-(.+)-([0-9a-f]{16})$/);
   return `${orgPart(journal)}${m ? `${runId}:${m[1]}:${m[2]}` : `${runId}:${suffix}`}`;
@@ -152,16 +164,20 @@ export async function compensateRun(
   if (typeof journal.readRun !== 'function') {
     throw new Error('@gnldev/durable compensateRun: the journal does not support readRun — cannot enumerate the run');
   }
+  // An unwind continues a run; it does not begin one. Absent, nothing is written (run-identity.ts).
+  await existingRun(journal, runId);
   const entries = await journal.readRun(runId);
   const callsMap = callsFromModelSteps(entries);
 
-  // Worklist: EXECUTED-or-uncertain tool records, in REVERSE journal (≈ execution) order.
-  const prefix = `${runId}:tool:`;
-  const work: { suffix: string; record: ToolJournalRecord }[] = [];
+  // Worklist: EXECUTED-or-uncertain calls, in REVERSE journal (≈ execution) order. `owner`: the run
+  // whose keys the call's unwind lives under — this run's, or a background call's task's.
+  const prefix = runRecordPrefix(runId, 'tool');
+  const work: { suffix: string; owner: string; record: ToolJournalRecord | undefined; effect: Exclude<CallEffect, { state: 'none' }> }[] = [];
   for (const e of entries) {
     if (e.kind !== 'tool' || !e.key.startsWith(prefix)) continue;
     const record = upgradeFormat(e.value as any, e.key) as ToolJournalRecord | undefined;
     if (!record) continue;
+    const suffix = e.key.slice(prefix.length);
     // A SHADOW of a record whose authoritative key is not run-scoped (the `cross-run` window). The
     // action is SHARED — other runs may depend on it — so it is deliberately outside a single run's
     // unwind, which is why its real record lives outside the run's key space at all. The shadow only
@@ -170,11 +186,16 @@ export async function compensateRun(
     // A request-window record is the exception (journal.ts ranBy): the request's runs dedup against it,
     // but the action belongs to the run that executed it, and that run's unwind is its unwind — the
     // sub-agent that booked is the one whose rollback cancels. Every other run's mirror stays skipped.
-    if (record.mirrorOf !== undefined && !executedHere(record, runId, e.key.slice(prefix.length))) continue;
-    // denied/reflected/suspended never EXECUTED anything → nothing to unwind, not even reported.
-    if (record.status === 'succeeded' || record.status === 'failed' || record.status === 'running') {
-      work.push({ suffix: e.key.slice(prefix.length), record });
-    }
+    if (record.mirrorOf !== undefined && !executedHere(record, runId, suffix)) continue;
+    // A background call: its task's call (the head of this file), read only once the task is condemned
+    // — a task that had not reached its call yet never will, so "no record" stays true.
+    const call = await callRecordKey(journal, runId, suffix);
+    if (call.taskRunId !== undefined && !dryRun) await claim(journal, tombstoneKey(call.taskRunId), { at: Date.now() });
+    const outcome = await readCallOutcome(journal, call.key, call.taskRunId === undefined ? { value: e.value } : undefined);
+    // Nothing EXECUTED (an answer with no late report, a question, a task that never ran its call) →
+    // nothing to unwind, not even reported.
+    if (outcome.effect.state === 'none') continue;
+    work.push({ suffix, owner: call.runId, record: outcome.record, effect: outcome.effect });
   }
   work.reverse();
 
@@ -184,11 +205,11 @@ export async function compensateRun(
 
   const report: CompensationReport = { runId, dryRun, condemned: !dryRun, entries: [] };
   let stopped = false;
-  for (const { suffix, record } of work) {
+  for (const { suffix, owner, record, effect } of work) {
     const toolCallId =
-      record.status === 'succeeded' && record.resolvedToolCallIds?.length ? record.resolvedToolCallIds[0]
+      record?.status === 'succeeded' && record.resolvedToolCallIds?.length ? record.resolvedToolCallIds[0]
       : parseJournalKey(`${prefix}${suffix}`) ? suffix : suffix;
-    const toolName = (record as { toolName?: string }).toolName
+    const toolName = (record as { toolName?: string } | undefined)?.toolName
       ?? callsMap.get(toolCallId)?.toolName // uncertain records store no toolName — the model step knows
       ?? (suffix.match(/^args-(.+)-[0-9a-f]{16}$/)?.[1]);
     const base: Omit<CompensationEntry, 'status'> = { suffix, toolCallId, toolName };
@@ -200,16 +221,16 @@ export async function compensateRun(
 
     // 1) Resolve what actually HAPPENED for uncertain records — against the provider, never a guess.
     let output: unknown;
-    if (record.status === 'succeeded') {
-      output = record.output;
+    if (effect.state === 'happened') {
+      output = effect.output;
     } else {
       if (typeof tool?.recover !== 'function') {
         report.entries.push({ ...base, status: 'uncertain' });
         continue;
       }
       try {
-        const args = (record as any).input ?? callsMap.get(toolCallId)?.input;
-        const probe = await tool.recover(args, { idempotencyKey: originalIdempotencyKey(journal, runId, suffix), toolCallId });
+        const args = (record as any)?.input ?? callsMap.get(toolCallId)?.input;
+        const probe = await tool.recover(args, { idempotencyKey: record?.idempotencyKey ?? originalIdempotencyKey(journal, owner, suffix), toolCallId });
         if (!probe.done) {
           report.entries.push({ ...base, status: 'skipped-not-executed' });
           continue;
@@ -230,7 +251,7 @@ export async function compensateRun(
     // The terminal check comes BEFORE the dryRun branch on purpose (honesty fix): a dryRun on a
     // PARTIALLY-unwound run must report the already-done entries as 'already-compensated', not
     // pretend it 'would-compensate' work that has already happened.
-    const ck = compKey(runId, suffix);
+    const ck = compKey(owner, suffix);
     const existing = await journal.get<CompRecord>(ck);
     if (existing?.status === 'compensated') {
       report.entries.push({ ...base, status: 'already-compensated' });
@@ -261,14 +282,14 @@ export async function compensateRun(
       await journal.put(ck, { status: 'running', startedAt: Date.now() } satisfies CompRecord);
     }
     try {
-      const args = (record as any).input ?? callsMap.get(toolCallId)?.input;
+      const args = (record as any)?.input ?? callsMap.get(toolCallId)?.input;
       const result = await tool.compensate(args, output, {
         // Stable downstream key — the refund is exactly-once at the provider too, PER ORGANIZATION.
         // Without the org part, two organizations unwinding the same runId hand the provider one key
         // and the second refund is deduped against the first: org B's customer is never refunded,
         // while both journals record a completed compensation. See orgPart above.
-        idempotencyKey: `${orgPart(journal)}${compKey(runId, suffix)}`,
-        toolCallId, runId,
+        idempotencyKey: `${orgPart(journal)}${ck}`,
+        toolCallId, runId: owner,
       });
       await journal.put(ck, { status: 'compensated', output: result, at: Date.now() } satisfies CompRecord);
       report.entries.push({ ...base, status: 'compensated' });

@@ -102,8 +102,8 @@ describe('paket #4 — rollover hands the period over on the execution axis', ()
     expect(r2.newRunId).toBe(`${DERIVED}#3`);
 
     const jr = new InMemoryJournal();
-    await tinyRun(jr, 'agent');
-    expect((await rolloverRun(jr, 'agent')).newRunId).toBe('agent@2');
+    await tinyRun(jr, 'assistant');
+    expect((await rolloverRun(jr, 'assistant')).newRunId).toBe('assistant@2');
   });
 
   it('the handover carries workKey + workScope into the new period\'s seed', async () => {

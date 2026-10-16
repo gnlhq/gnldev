@@ -16,6 +16,7 @@ import { pricingCommand } from './pricing.js';
 import { rmCommand } from './rm.js';
 import { adoptOrgCommand } from './adopt-org.js';
 import { upgradeCommand } from './upgrade.js';
+import { pendingCommand } from './pending.js';
 
 export type { Command, CommandCtx, CommandGroup } from './types.js';
 
@@ -34,6 +35,7 @@ export const commandList: Command[] = [
   pricingCommand,
   rmCommand,
   adoptOrgCommand,
+  pendingCommand,
   upgradeCommand,
 ];
 

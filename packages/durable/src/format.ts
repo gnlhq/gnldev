@@ -1,3 +1,4 @@
+import { isVersionedRecordKey } from './run-id-grammar.js';
 // H13 — JOURNAL FORMAT VERSIONING: the insurance policy for the "weeks-long running" promise.
 //
 // PROBLEM: the SHAPE of input/model/tool records in the journal is tied to AI SDK v5's output
@@ -116,7 +117,7 @@ export function stampFormat<T extends object>(value: T): T {
 /** Is this key of a versioned kind? (input / model:N / tool:callId — runIds may contain ':',
  *  so it's checked with a SUFFIX pattern.) Lock/proc/counter keys are deliberately EXCLUDED. */
 export function isVersionedKey(key: string): boolean {
-  return key.endsWith(':input') || /:model:\d+$/.test(key) || /:tool:[^:]*$/.test(key);
+  return isVersionedRecordKey(key);
 }
 
 /**

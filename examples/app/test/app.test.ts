@@ -20,7 +20,8 @@ describe('the support desk', () => {
     const { state, post } = await desk();
     const { ticketId } = await post('/api/tickets', { customerId: 'cust-1', subject: 'refund' });
     const asked = await post(`/api/tickets/${ticketId}/messages`, { text: 'I want a refund for ORD-1042' });
-    expect(asked.pending, 'the refund did not wait for a human').not.toBeNull();
+    // Truthy, not merely non-null: an error answer has no `pending` at all, and passed `not.toBeNull()`.
+    expect(asked.pending, 'the refund did not wait for a human').toBeTruthy();
     expect(state.refunds.count).toBe(0);
 
     await post(`/api/tickets/${ticketId}/approve`, { approve: true });

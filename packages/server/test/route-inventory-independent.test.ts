@@ -24,7 +24,6 @@ const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const model: any = {
   specificationVersion: 'v2', provider: 'mock', modelId: 'm', supportedUrls: {},
   doGenerate: async () => ({ content: [{ type: 'text', text: 'ok' }], finishReason: 'stop', usage, warnings: [] }),
-  doStream: async () => { throw new Error('no stream'); },
 };
 const wf = { build: () => [{ id: 's1' }], run: async () => ({ ok: true }) };
 
@@ -116,10 +115,10 @@ describe('the inventory does not depend on configuration', () => {
     expect(sig(mk(cfg, opts)), 'the route set changed with configuration').toEqual(sig(mk()));
   });
 
-  it('is 18 routes for this package, and says so in one place', () => {
+  it('is 21 routes for this package, and says so in one place', () => {
     // A count, deliberately: it is what makes "a route was added" visible in review. If it changes,
     // read the diff above it — the set is asserted, this is the tripwire.
-    expect(mk().routeTable).toHaveLength(20);
+    expect(mk().routeTable).toHaveLength(21);
   });
 });
 
@@ -149,8 +148,9 @@ describe('what a conformance suite must know before using it', () => {
   it('exposes method and path and nothing else — no handler, no closure', () => {
     const api = mk();
     for (const r of api.routeTable) expect(Object.keys(r).sort()).toEqual(['method', 'path']);
+    // `drain`: the process's graceful shutdown (SIGTERM) — no new run, the running ones released.
     expect(Object.keys(api).sort(), 'the handler grew a property that is not part of its contract')
-      .toEqual(['fetch', 'routeTable']);
+      .toEqual(['drain', 'fetch', 'routeTable']);
     // The Hono instance itself must not be reachable from the handler.
     expect(JSON.stringify(api.routeTable), 'a handler reference is serialised into the inventory').not.toMatch(/function|=>/);
   });

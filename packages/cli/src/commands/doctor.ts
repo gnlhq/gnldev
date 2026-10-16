@@ -22,6 +22,7 @@
 // the SHAPE: which protections are on, which are off, and the two timestamps. That is what a person
 // asking for help needs to paste, and it is deliberately the whole of what this command knows how to
 // produce. There is no telemetry here to opt out of, because there is none to opt into.
+import { runRecordKey } from '@gnldev/durable';
 import type { Command } from './types.js';
 import type * as Durable from '@gnldev/durable';
 import { flag, flagBool } from '../args.js';
@@ -140,7 +141,7 @@ export async function doctorGhostRuns(
     // A failed read is not an absent key. Treating "I could not look" as "it is not there" is how a
     // detector reports a healthy run as a ghost, so an unreadable input is left alone.
     let input: unknown;
-    try { input = await journal.get(`${summary.runId}:input`); } catch { continue; }
+    try { input = await journal.get(runRecordKey(summary.runId, 'input')); } catch { continue; }
     if (input !== undefined) continue;
 
     const CAP = 5;
@@ -249,7 +250,15 @@ export const doctorCommand: Command = {
     // run. Asked as a dry run: doctor never writes.
     const store = config.storage;
     if (typeof store?.upgrade === 'function') {
-      const pending = (await store.upgrade({ dryRun: true }).catch(() => undefined))?.steps.filter((s) => s.pending) ?? [];
+      // A dry run that fails has not said "nothing pending": it is said as what it is, and doctor fails.
+      const asked = await store.upgrade({ dryRun: true }).then((r) => ({ r }), (e: unknown) => ({ e }));
+      if ('e' in asked) {
+        console.log(bold('upgrade status unknown'));
+        console.log(dim(`  \`gnl upgrade --list\` failed: ${(asked.e as Error)?.message ?? String(asked.e)}`));
+        console.log('');
+        process.exitCode = 1;
+      }
+      const pending = 'r' in asked ? asked.r.steps.filter((s) => s.pending) : [];
       if (pending.length) {
         console.log(bold('upgrade pending'));
         for (const s of pending) console.log(`  ${s.name}  ${dim(`— ${s.description}`)}`);

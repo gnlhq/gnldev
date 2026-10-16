@@ -155,7 +155,9 @@ Critical details:
 | `<runId>:proc:<name>` | The frozen result of non-deterministic intermediate decisions (LLM-based moderation, scoring...). |
 | `<runId>:wf:<stepId>` | Workflow step outputs. |
 | `<runId>:net:route:<i>` / `net:step:<i>` | In a dynamic agent network (below), router decisions + step results. |
-| `<runId>:lock` | The run lock (prevents two servers from processing the same run at once). |
+| `<runId>:ev:<seq>` | The run's event log (what a reader follows: text, tool calls, results, its ending), written about once a second while the run streams. |
+| `__exec__:<scope>/<runId>#` | The run's execution record: which live process executes it now. Another process takes the run over only when that process is gone. Deleted with the run. |
+| `<runId>:lock` | The run lock of the raw engine (`runDurable` / `streamDurable` with `lock`). A registry run (`gnl.run`, `gnl.stream`, every door) writes none: its execution record is what keeps it to one execution. |
 | `agent:<callId>` / `net:<runId>:<i>` | Sub-agents' OWN journals (each sub-agent is a full-fledged run). |
 
 ### 5.2 Storage architecture: 6 "ports," 4 adapters

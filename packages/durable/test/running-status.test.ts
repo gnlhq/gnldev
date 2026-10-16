@@ -7,13 +7,14 @@
 //
 // The fix is a write-ahead: every attempt records {status:'running'} at entry, and the terminal
 // verdict overwrites it. A run that never said it ended can no longer claim it did.
+import { streamFromGenerate } from './mock.js';
 import { describe, it, expect } from 'vitest';
 import {
   runDurable, InMemoryStorage, listRunsArray, readRunOutcome, deriveRunStatus, runStarted,
 } from '../src/index.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
-const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {}, doStream: async () => { throw new Error('gen-only'); } };
+const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {}, doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); } };
 const good = { ...base, doGenerate: async () => ({ content: [{ type: 'text', text: 'ok' }], finishReason: 'stop', usage, warnings: [] }) } as any;
 const dead = { ...base, doGenerate: async () => { throw new Error('401 invalid api key'); } } as any;
 

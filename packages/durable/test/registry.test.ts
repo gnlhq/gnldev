@@ -35,45 +35,32 @@ describe('createGnl + model router (8.6)', () => {
   // forwarded to runDurable through gnl.run. If it isn't, two concurrent runs of the same runId emit
   // DIFFERENT toolCallIds (this test mimics that: call-A vs call-B) → the toolCallId-keyed claim lets
   // both through → DOUBLE side-effect. The lock serializes the run: only one runs, the other gets RunBusyError.
-  it('opts.lock is forwarded: concurrent same runId → one RunBusyError, side-effect EXACTLY 1 (with distinct toolCallIds)', async () => {
+  it('concurrent calls for the same runId execute it ONCE: the second attaches (no lock option — design decision D2)', async () => {
+    // The run lock is gone from the registry: one execution per run is what the executor's record gives
+    // (detached.ts). Two registries over one store, distinct toolCallIds per model, no lock, a 'warn'
+    // duplicate ladder (so the ladder cannot be what saves it): still one charge, and both calls answered.
     const journal = new InMemoryJournal();
     let charges = 0;
     const charge = tool({
       description: 'charge', inputSchema: z.object({}),
       execute: async () => { charges++; await new Promise((r) => setTimeout(r, 60)); return { ok: true }; },
     });
-    // Each worker's model emits a DISTINCT toolCallId → without the lock, the tool-claim lets both through.
     const model = (id: string) => createMockModel(async ({ prompt }: any) =>
       countToolResults(prompt) === 0 ? toolCallResult('charge', `call-${id}`, {}) : finalTextResult('done'));
     const gnl = createGnl({ journal, agents: { pay: { model: model('A'), tools: { charge }, maxSteps: 4 } } });
-    // Two concurrent gnl.run, SAME runId, locked.
-    const opts = (owner: string) => ({ runId: 'race-1', prompt: 'x', lock: { owner, ttlMs: 5000 } });
     const gnlB = createGnl({ journal, agents: { pay: { model: model('B'), tools: { charge }, maxSteps: 4 } } });
-    const settled = await Promise.allSettled([gnl.run('pay', opts('A') as any), gnlB.run('pay', opts('B') as any)]);
-    const busy = settled.filter((s) => s.status === 'rejected' && (s as PromiseRejectedResult).reason instanceof RunBusyError);
-    expect(busy.length).toBe(1); // the lock eliminated exactly one
-    expect(charges).toBe(1); // side-effect exactly-once (would be 2 if the lock weren't forwarded)
+    const limits = { sideEffectDuplicates: 'warn' };
+    const settled = await Promise.allSettled([
+      gnl.run('pay', { runId: 'race-1', prompt: 'x', limits } as any),
+      gnlB.run('pay', { runId: 'race-1', prompt: 'x', limits } as any),
+    ]);
+    expect(settled.map((s) => s.status)).toEqual(['fulfilled', 'fulfilled']);
+    expect(settled.map((s) => (s as PromiseFulfilledResult<any>).value.text)).toEqual(['done', 'done']);
+    expect(charges).toBe(1);
   });
 
-  it('without a lock, distinct toolCallIds on the same runId → the tool-claim is not enough (negative proof for why the lock is required)', async () => {
-    const journal = new InMemoryJournal();
-    let charges = 0;
-    const charge = tool({
-      description: 'charge', inputSchema: z.object({}),
-      execute: async () => { charges++; await new Promise((r) => setTimeout(r, 60)); return { ok: true }; },
-    });
-    const model = (id: string) => createMockModel(async ({ prompt }: any) =>
-      countToolResults(prompt) === 0 ? toolCallResult('charge', `call-${id}`, {}) : finalTextResult('done'));
-    const gnl = createGnl({ journal, agents: { pay: { model: model('A'), tools: { charge }, maxSteps: 4 } } });
-    const gnlB = createGnl({ journal, agents: { pay: { model: model('B'), tools: { charge }, maxSteps: 4 } } });
-    // No lock → distinct toolCallIds (call-A/call-B) are separate journal keys → both execute.
-    // The default duplicate ladder is now 'suspend', which would stop the twin on its own; this negative
-    // proof isolates the tool-claim, so the ladder stays at 'warn'.
-    const limits = { sideEffectDuplicates: 'warn' };
-    await Promise.allSettled([
-      gnl.run('pay', { runId: 'race-2', prompt: 'x', limits } as any),
-      gnlB.run('pay', { runId: 'race-2', prompt: 'x', limits } as any),
-    ]);
-    expect(charges).toBe(2); // DOCUMENTED BOUND: without a lock, distinct toolCallIds are not deduped → the lock is REQUIRED
+  it('a registry refuses the removed lock option by name', () => {
+    const gnl = createGnl({ journal: new InMemoryJournal(), agents: { pay: { model: createMockModel(async () => finalTextResult('x')) } } });
+    return expect(gnl.run('pay', { runId: 'r', prompt: 'x', lock: { owner: 'a', ttlMs: 1 } } as any)).rejects.toThrow(/lock/);
   });
 });

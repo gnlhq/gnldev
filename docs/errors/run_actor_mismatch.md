@@ -2,6 +2,11 @@
 
 **HTTP 409 · no `resumable`**
 
+> **At a door you will not see this code.** The REST, chat, AG-UI and A2A doors answer it exactly as a
+> run that does not exist: 404 [`run_not_found`](./run_not_found.md). Two different answers for "not
+> yours" and "not there" would tell a stranger which runs exist. This page is the engine's code, as an
+> embedded caller (`runDurable`, `gnl.run`, …) catches it.
+
 ## What happened
 
 This `runId` was started by one actor and re-used by another. The first actor is bound into the run's

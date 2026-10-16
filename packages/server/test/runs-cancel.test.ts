@@ -18,7 +18,6 @@ function mkModel(text: string): any {
     modelId: 'm',
     supportedUrls: {},
     doGenerate: async () => ({ content: [{ type: 'text', text }], finishReason: 'stop', usage, warnings: [] }),
-    doStream: async () => { throw new Error('no stream'); },
   };
 }
 
@@ -36,7 +35,6 @@ function mkSuspendModel(): any {
       usage,
       warnings: [],
     }),
-    doStream: async () => { throw new Error('no stream'); },
   };
 }
 
@@ -142,7 +140,8 @@ describe('@gnldev/server POST /runs/:id/cancel (P0.3)', () => {
     expect(cancelRes.status).toBe(200);
     const body = await cancelRes.json();
     expect(body.ok).toBe(true);
-    expect(body.cancelled).toBe(1);
+    // (fix/m1) The answer says delivered vs recorded: the run executed in this process and was stopped now.
+    expect(body.cancel).toBe('delivered');
     expect(captured.signal!.aborted).toBe(true); // the SAME signal doStream received is now aborted
 
     // idempotent: cancelling an already-cancelled/unregistered run never errors (200, cancelled may be 0).
@@ -164,11 +163,11 @@ describe('@gnldev/server POST /runs/:id/cancel (P0.3)', () => {
     const crossOrg = await call(api, '/runs/r-acme/cancel', { method: 'POST', headers: { 'x-gnl-org': 'globex' } });
     expect(crossOrg.status).toBe(404);
 
-    // acme itself CAN target its own (already-completed, no in-flight controller) run — 200, cancelled:0.
+    // acme itself CAN target its own (already-completed, executing nowhere) run — 200, recorded, not delivered.
     const ownScope = await call(api, '/runs/r-acme/cancel', { method: 'POST', headers: { 'x-gnl-org': 'acme' } });
     expect(ownScope.status).toBe(200);
     const body = await ownScope.json();
-    expect(body).toMatchObject({ ok: true, cancelled: 0 });
+    expect(body).toMatchObject({ ok: true, cancel: 'recorded' });
   });
 
   it('a read-only identity is denied (write-permission gate)', async () => {

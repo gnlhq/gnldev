@@ -2,12 +2,15 @@ import { generateText, streamText, stepCountIs } from 'ai';
 import type { ToolSchemaRuleLike } from './types.js';
 import type { StreamTextResult } from 'ai';
 import { withDurableModel } from './durable-model.js';
-import { durableTools, CLAIM_TTL_MS } from './durable-tool.js';
+import { durableTools } from './durable-tool.js';
+import { CLAIM_TTL_MS, claimIsLive, journalNow } from './liveness.js';
+import { RunDrainedError, holdWhile } from './process-liveness.js';
 import { acquireRunLock } from './run-lock.js';
-import { RunBusyError, runBusyMessage, SideEffectRetryBlockedError, RetryLimitExceededError, RunThreadMismatchError, RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunSweptError, ThreadOwnerMismatchError } from './errors.js';
+import { RunBusyError, runBusyMessage, SideEffectRetryBlockedError, RetryLimitExceededError, OutcomeUnknownError, RunThreadMismatchError, RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunSweptError, ThreadOwnerMismatchError } from './errors.js';
 import { admitThreadRun } from './thread-owner.js';
-import { UNKNOWN, ownerFields, callerFromResourceId, callerOf, userIdOf, user, runIdentity, runOwnerOf, requestOf, actingCaller, assertRunTarget, runOwnerRefusal, claimRunOwner, ownerLabel, type Caller, type RunIdentity, type RunOwner } from './run-identity.js';
-import { argsHash, rawInputFingerprint, isDerivedRunId, DERIVED_RUN_ID_PREFIX, type WorkScope, type WorkScopeKind } from './hash.js';
+import { UNKNOWN, ownerFields, callerFromResourceId, callerOf, userIdOf, user, runIdentity, runOwnerOf, requestOf, actingCaller, assertRunTarget, runOwnerRefusal, claimRunOwner, ownerLabel, type Caller, type RunIdentity, type RunOwner, engineBorn } from './run-identity.js';
+import { withMintOf, assertRunIdSafe, runRecordPrefix, runRecordKey, isDerivedRunId } from './run-id-grammar.js';
+import { argsHash, rawInputFingerprint, type WorkScope, type WorkScopeKind } from './hash.js';
 import { recordIdemConflict } from './idem-ledger.js';
 import { createProcessorCtx, composePrepareStep, composeOnStepFinish, durableProcessorStep, ProcessorRetry, RetryExhaustedByProcessorError, type StepHookFailure } from './processor.js';
 import { loadReplayCache, runKeys, claim } from './journal.js';
@@ -29,7 +32,7 @@ import { assertNotCompensated, CompensatedRunError } from './compensation.js';
 import { assertNotCanceled } from './cancel.js';
 import { assertNotErased, erasureBaseline, runErasedSince, RunErasedError } from './erasure-fence.js';
 import type { ErasureBaseline } from './erasure-fence.js';
-import { settleErasedRun } from './model.js';
+import { settleErasedRun, windowClaimPointerKey, type RunAppends } from './model.js';
 import { markRunTainted, readThreadTaint, readDirectRunTaint, recordTaintProvenance, isThreadTaintExpired } from './taint.js';
 import type { RunLimits } from './limits.js';
 
@@ -435,6 +438,7 @@ export function blockedFromSteps(steps: any[]): { toolCallId: string; toolName: 
 function errorFromBlocked(b: { code: string; message: string; detail?: any }): Error {
   if (b.code === 'SideEffectRetryBlockedError') return new SideEffectRetryBlockedError(b.message, b.detail);
   if (b.code === 'RetryLimitExceededError') return new RetryLimitExceededError(b.message, b.detail);
+  if (b.code === 'OutcomeUnknownError') return new OutcomeUnknownError(b.message, b.detail);
   // A worker already inside the loop when the operator
   // condemned the run — durable-tool refuses the NEW side effect via this sentinel (see the gate there).
   if (b.code === 'CompensatedRunError') return new CompensatedRunError(b.detail?.runId ?? 'unknown');
@@ -694,7 +698,7 @@ export async function resolveApprovals(
   if (!journal.listKeys) return approvals;
 
   // (b) read all approval records in the journal + merge with the parameter (the journal's FIRST decision wins).
-  const prefix = runKeys.approval(runId, '');
+  const prefix = runRecordPrefix(runId, 'approval');
   const keys = await journal.listKeys(prefix);
   if (keys.length === 0) return approvals;
 
@@ -748,19 +752,25 @@ export async function resolveApprovals(
  * olabilir ve bayatlığı yerel saatle ölçmek onu saat kaymasının fonksiyonu yapardı.
  */
 export function hasRunProbe(journal: Journal, runId: string, claimTtlMs?: number): (toolCallId: string) => Promise<boolean> {
+  const decided = (rec: { status?: string } | undefined) => rec?.status === 'succeeded' || rec?.status === 'denied' || rec?.status === 'reflected';
   return async (toolCallId) => {
     const rec = await journal.get<{ status?: string; startedAt?: number; claimTtlMs?: number }>(runKeys.tool(runId, toolCallId));
-    if (rec?.status === 'succeeded' || rec?.status === 'denied' || rec?.status === 'reflected') return true;
-    if (rec?.status !== 'running') return false;
-    const nowTs = journal.now ? await journal.now() : Date.now();
+    if (decided(rec)) return true;
     // A 'running' with no `startedAt` cannot be dated, so it reads as stale — the SAME verdict
-    // durable-tool's reclaim ladder gives it. The two must agree: a record the ladder will take over
-    // and re-run is a record a human may still re-answer.
-    // The claim's OWN threshold first: the tool's (`timeoutMs`-derived) claimTtl, stamped by the worker
-    // holding it. The run-wide one judged a 2-minute tool's live claim stale at 30 s, and a late "deny"
-    // replaced the approval its call was running on (a-a-long-call-keeps-the-answer-it-runs-on.test.ts).
-    const ttl = typeof rec.claimTtlMs === 'number' ? rec.claimTtlMs : (claimTtlMs ?? CLAIM_TTL_MS);
-    return typeof rec.startedAt === 'number' && nowTs - rec.startedAt <= ttl;
+    // durable-tool's reclaim ladder gives it, through the same rule (liveness.ts): the claim's OWN
+    // threshold first, stamped by the worker holding it. The run-wide one judged a 2-minute tool's live
+    // claim stale at 30 s, and a late "deny" replaced the approval its call was running on
+    // (a-a-long-call-keeps-the-answer-it-runs-on.test.ts).
+    if (rec?.status === 'running') return claimIsLive(rec, await journalNow(journal), claimTtlMs ?? CLAIM_TTL_MS, journal);
+    // A call under an idempotency window claims under the WINDOW's key, not the run's: the run's own key
+    // holds only a mirror of the last terminal write (a 'suspended' question while the approved call
+    // runs). The run points at that claim (durable-tool pointAtWindowClaim) — read it there. Reading the
+    // run key alone, a late "deny" replaced the approval of an 'args' call already in its body
+    // (release audit E7).
+    const pointer = await journal.get<{ claim?: unknown }>(windowClaimPointerKey(runId, toolCallId));
+    if (typeof pointer?.claim !== 'string') return false;
+    const claimed = await journal.get<{ status?: string; startedAt?: number; claimTtlMs?: number }>(pointer.claim);
+    return decided(claimed) || claimIsLive(claimed, await journalNow(journal), claimTtlMs ?? CLAIM_TTL_MS, journal);
   };
 }
 
@@ -936,7 +946,7 @@ async function assertRunAdmissible(
   // different one, so a swept-and-silently-rerun outcome would be invisible to them. Same reasoning
   // as the workflow gate (assertWorkflowAdmissible), where the check is unconditional too.
   if (opts.tombstonePolicy === 'reject' || derived) {
-    const tomb = await journal.get<{ at?: number; workKeyHash?: string; workScope?: WorkScopeKind }>(`${runId}:swept`);
+    const tomb = await journal.get<{ at?: number; workKeyHash?: string; workScope?: WorkScopeKind }>(runRecordKey(runId, 'swept'));
     if (tomb !== undefined) {
       // What the marker knows about the dead run travels with the refusal (see RunSweptError.detail
       // and retention.ts's `tombstoneFor`): a hash and a scope kind, never a workKey. The ledger gets
@@ -2533,7 +2543,8 @@ async function appendCompletion(
   // safe-side skip; that sub-TTL window is the documented residual of this path.
   const userPending = needIncoming ? await claimMemoryAppend(journal, runKeys.memUserAppended(runId)) : undefined;
   const appended = userPending ? [...incoming, ...produced] : produced;
-  await memory.append(threadId, appended);
+  // Named by the marker, so a run deleted meanwhile can take it back (`Memory.retract`, `settleErasedRun`).
+  await memory.append(threadId, appended, marker);
   await recordAppendedTaintProvenance(journal, runId, threadId, limits, appended);
   if (userPending) await markMemoryAppendDone(journal, runKeys.memUserAppended(runId), userPending);
   await markMemoryAppendDone(journal, marker, pending);
@@ -2555,7 +2566,7 @@ async function appendBatchOnce(
   }
   const pending = await claimMemoryAppend(journal, marker);
   if (!pending) return false;
-  await memory.append(threadId, messages);
+  await memory.append(threadId, messages, marker);
   await markMemoryAppendDone(journal, marker, pending);
   return true;
 }
@@ -2752,161 +2763,11 @@ async function runGenerateWithRetryLadder(
  * `resume` = call again with the same `runId` + `journal` (+ `approvals`) → replay from the journal.
  */
 /**
- * Key families the journal OWNS. A runId is not just an identifier — it is a key PREFIX
- * (`<runId>:model:0`, `<runId>:tool:<id>`, `<runId>:input`), and `purgeRun` deletes by that prefix
- * (`retention.ts`, `del(`${runId}:`)`). So a caller who chooses `runId: 'mem'` is not naming a run;
- * they are naming the memory keyspace, and the next retention sweep deletes it. MEASURED: a run
- * created with that id, then swept, removed a victim thread's messages.
- *
- * runId was the ONLY unvalidated identifier on the write path — `resourceId`, `batchId`, `itemKey`
- * and `orgId` all have checks. This closes it in the ENGINE rather than at each HTTP surface,
- * because the surfaces are exactly what keeps being forgotten: chat-adapter, agui, batch, the CLI
- * and every host route reach `runDurable` directly.
- *
- * NOT a charset whitelist. Existing deployments run UUIDs, `chat-<ms>-<n>`, `sim-...` and hand-made
- * ids; a strict pattern would refuse work that is already journalled. The rule is narrower and aimed
- * at the actual damage: a runId may not CLAIM a family the journal already owns. The engine's own
- * composite ids (`batch:`, `sched:`, `net:`, `agent:`, `wfrun:`) are deliberately absent from this
- * list — they are constructed by the engine and their prefixes really are theirs.
+ * The run-id gate lives in run-id-grammar.ts — the one table of what a run id may be and what is written
+ * under one (record families, engine-composed id families). `assertRunIdSafe` is its spelling half,
+ * `admitRunId` the whole gate, asked at the run's birth (`claimRunOwner`), not by the entry points below.
  */
-const RESERVED_KEY_ROOTS = ['mem', 'xthr', 'xid', 'xrun', 'xreq', 'om', 'thread', 'lesson', 'sugg', 'suggstats', 'org', 'res'];
-
-/**
- * Every `#` in this id sits inside a VALID embedded derived id — i.e. the engine put it there.
- *
- * THE BUG THIS EXISTS FOR, measured end to end before the line was written. A run that has been
- * rolled over, forked or replayed is called `run1_<digest>#2` (`#fork-1`, `#replay-0`). When such a
- * run delegates, the ENGINE builds the child's id: `nestedAgentRunId` returns
- * `agent:run1_<digest>#2:<toolCallId>`, and `net:`/`wf:` produce the same shape. That string does not
- * START with `run1_`, so it fell past the first branch and landed on the blanket `#` refusal below —
- * the engine refusing an id the engine had just minted. Not an edge: a long-lived agent's FIRST
- * delegation after a period handoff died there, permanently, with no id the caller could choose
- * instead.
- *
- * THE FIX IS ON THE FILTER SIDE, deliberately. `nestedAgentRunId` stays a pure function of
- * (parentRunId, toolCallId) — limits.ts (`sumSubRuns`) and retention.ts (the purge cascade) never
- * observe a child being created, they RE-DERIVE its id from the parent's tool entries, so any
- * escaping or rewriting there would make a purge miss a sub-agent's output.
- *
- * THE RULE IS THE SHAPE, NOT A PREFIX WHITELIST. Split on ':' — the separator the engine composes
- * with — and require every segment that contains a '#' to be a whole derived id (`isDerivedRunId`,
- * anchored). So `agent:run1_<32hex>#2:tc` passes and `benim#işim`, `order-1#2`,
- * `agent:run1_zzz#2:tc`, `agent:run1_<hex>#2x:tc` and `agent:run1_<hex>#2#3:tc` all still throw.
- * Listing `agent`/`wf`/`net` instead would bless the prefix rather than the spelling, and the next
- * composite prefix would arrive with the same bug.
- *
- * The bare `run1_<digest>#2` never reaches here — it is judged by the first branch, unchanged.
- */
-function onlyEmbeddedDerivedHashes(runId: string): boolean {
-  for (const segment of runId.split(':')) {
-    if (segment.includes('#') && !isDerivedRunId(segment)) return false;
-  }
-  return true;
-}
-
-/** Throws when a runId would claim (or corrupt) a key family that is not its own. */
-export function assertRunIdSafe(runId: unknown): asserts runId is string {
-  if (typeof runId !== 'string' || runId.length === 0) {
-    throw new Error("@gnldev/durable: runId must be a non-empty string — it becomes the prefix of this run's journal keys.");
-  }
-  if (runId.length > 512) {
-    throw new Error(`@gnldev/durable: runId is too long (${runId.length} > 512).`);
-  }
-  // Control characters and whitespace do not survive key round-trips intact across the four adapters
-  // (and make a key impossible to read in a log or a purge confirmation).
-  if (/[\u0000-\u001f\u007f\s]/.test(runId)) {
-    throw new Error("@gnldev/durable: runId must not contain whitespace or control characters — it becomes a journal key.");
-  }
-  // The engine's OWN namespace, and the one family on this list that the caller is allowed to spell
-  // — as long as they spell it exactly.
-  //
-  // `runDurable`/`resumeRun`/`forkRun` take a RAW runId and always will: a hash cannot be reversed,
-  // so a caller resuming derived work has nothing to hand back except the derived id itself (§7).
-  // That makes "refuse everything starting with run1_" the wrong rule; the rule is "refuse everything
-  // that WEARS the namespace without being minted by it". `run1_<32 lowercase hex>` with at most one
-  // execution suffix passes; `run1_deadbeef`, uppercase hex, and `run1_<hex>:child` do not.
-  //
-  // Why this is a reservation at all: inside run1_ the digest IS the ownership statement (§5 makes
-  // strictInput unconditional there, with no opt-out). An id that is shaped like a derived id but was
-  // typed by hand carries no such statement, and every gate downstream would read it as if it did.
-  //
-  // '#' is refused everywhere else because the execution axis is the engine's alphabet, not the
-  // caller's (§4). `run1_<hex>#2` means "the second deliberate execution of this exact work"; if
-  // `order-1#2` were also legal the character would mean one thing in one namespace and nothing in
-  // another, and the mapping back from id to workKey — which spans the suffix — would stop being a
-  // function. MEASURED before writing this: no code path in the repo mints a runId containing '#'.
-  //
-  // PACKAGE #4 CLOSED THE OTHER HALF, and the measurement is worth keeping: the three rerun paths
-  // used to paste text onto a runId (`time-travel.ts` `${src}:fork:${Date.now()}`, `rollover.ts`
-  // `${base}@${n}`, `regression.ts` `:replay:${Date.now()}:${seq}`). Given a DERIVED source, the first
-  // and the third produced strings that wear this prefix without the shape — i.e. they threw right
-  // here, from inside the engine, on a call the user made correctly. All three now branch on
-  // `parseDerivedRunId`: a derived source gets `#fork-<n>` / `#<n>` / `#replay-<seq>`, a raw source
-  // keeps its old spelling byte for byte. Two regimes on purpose — `#` stays unspellable outside
-  // `run1_`, and no journal written before today has to move.
-  if (runId.startsWith(DERIVED_RUN_ID_PREFIX)) {
-    if (!isDerivedRunId(runId)) {
-      throw new Error(
-        `@gnldev/durable: runId '${runId.slice(0, 60)}' uses '${DERIVED_RUN_ID_PREFIX}', which is reserved for ` +
-          'engine-derived ids — the engine mints them from a workKey as ' +
-          `'${DERIVED_RUN_ID_PREFIX}<32 lowercase hex>' with an optional '#<n≥2>', '#replay-<seq>' or ` +
-          "'#fork-<n>' suffix, and an id that only looks derived would be trusted like one. " +
-          'Choose an id outside this prefix.',
-      );
-    }
-  } else if (runId.includes('#') && !onlyEmbeddedDerivedHashes(runId)) {
-    throw new Error(
-      `@gnldev/durable: runId '${runId.slice(0, 60)}' contains '#', which the engine reserves for its ` +
-        "execution axis ('<derived id>#2' is the second deliberate run of the same work). Pick another separator.",
-    );
-  }
-  const root = runId.split(':', 1)[0]!;
-  if (RESERVED_KEY_ROOTS.includes(root) || root.startsWith('__')) {
-    throw new Error(
-      `@gnldev/durable: runId '${runId.slice(0, 60)}' starts with the reserved key family '${root}:' — ` +
-      "runIds are journal key PREFIXES, and a retention sweep of this run would delete that family. Choose another id.",
-    );
-  }
-  // The other half of the same rule, and the one the family list cannot express: the two RECORD
-  // separators. `parseJournalKey` reads a key with `^(.*):(model|tool):.+$` — GREEDY, so the split
-  // lands at the LAST occurrence. A run called `pipeline:tool:x` writes `pipeline:tool:x:model:0`,
-  // which parses back as run `pipeline:tool:x` (fine) — but it also writes `pipeline:tool:x:input`,
-  // and every key it owns sits inside the namespace `parseJournalKey` reads as run `pipeline`,
-  // kind `tool`. Two runs then answer for one set of records: `readRun('pipeline')` returns this
-  // run's entries as if they were its own tool records, and `reconstructState` replays them.
-  //
-  // Reachable from OUTSIDE, which is why it is refused here rather than documented. @gnldev/chat-adapter
-  // derives its runId as `${body.id}:${lastMessage.id}` from a client-supplied conversation id, so a
-  // caller who names a conversation `x:tool` picks the separator itself. The rule stays as narrow as
-  // the damage: a bare colon is still legal (that derivation depends on it) — only the two segments
-  // the journal reads as "a record of this kind starts here" are refused.
-  //
-  // The TRAILING form belongs to the same rule and was missing. A run called `pipeline:model` writes
-  // `pipeline:model:input`, which `parseJournalKey` reads as run `pipeline`, kind `model` — so the
-  // run index grows a row named `pipeline` that no run ever wrote. Measured: the sweep and the
-  // operator surfaces refuse to delete it (isRealRun holds, `gnl doctor` names it), so nothing is
-  // lost — but `listRuns` reports a run that does not exist, and the cheapest place to stop that is
-  // where the id is accepted.
-  //
-  // The run gate stays NARROWER than `assertThreadId`, on purpose, and the difference is not an
-  // oversight to be tidied away later. `assertThreadId` is `/(^|:)(model|tool)(:|$)/` — anchored at
-  // the start too, because a threadId lands in the MIDDLE of a key (`mem:<id>:…`), so a leading
-  // segment of it can start somebody else's record. A runId is always a key PREFIX, so only its
-  // TAIL can. Measured: `model:pipeline:input` parses to null and `model:pipeline:model:0` parses
-  // back to `model:pipeline` — itself, correctly. Refusing the leading form here would reject ids
-  // that work, for a harm that does not exist on this side.
-  if (/:(?:model|tool)(?::|$)/.test(runId)) {
-    const which = /:model(?::|$)/.test(runId) ? ':model' : ':tool';
-    throw new Error(
-      `@gnldev/durable: runId '${runId.slice(0, 60)}' contains the journal's record separator '${which}' — ` +
-      'that is how a key says "a model/tool record starts here", so this run\'s keys would be read back ' +
-      'as records of a DIFFERENT run. Colons are fine; these two segments are not. ' +
-      'If a run with this id is ALREADY in your journal (it was accepted before this version), it can ' +
-      'no longer be resumed or re-run, but `purgeRun(journal, id)` still deletes it — that call is not ' +
-      'gated by this check. Give the work a new id.',
-    );
-  }
-}
+export { assertRunIdSafe };
 
 /**
  * What every agent entry point does to its arguments before the run starts. One function, so a rule
@@ -2918,18 +2779,28 @@ export function assertRunIdSafe(runId: unknown): asserts runId is string {
  * function"; 1562c8c6 resolved the string in runDurableInner only, so streamDurable kept dying
  * ("Cannot create proxy with a non-object as target") on the same published type.
  */
+/** Where a run appends its turn — what its settle takes back from when the run was deleted under it. */
+function appendsOf(args: { memory?: Memory | false; threadId?: string }): RunAppends | undefined {
+  return args.memory && args.threadId ? { memory: args.memory, threadId: args.threadId } : undefined;
+}
+
 async function normalizeEntryArgs<T extends { model?: unknown }>(args: T): Promise<T> {
   return typeof args.model === 'string' ? { ...args, model: await resolveModel(args.model) } : args;
 }
 
 export async function runDurable(args: RunDurableArgs): Promise<DurableResult> {
   refuseDurableArgNames('runDurable', args);
+  // Held by the process until it settles: a drain waits for it, and `pendingWork` lists it — from this
+  // process, or from the store's shadow in any other (process-liveness.ts `holdWhile`).
+  return holdWhile(() => runDurableHeld(args), typeof args.runId === 'string' ? { journal: args.journal, name: args.runId, what: 'the run is executing' } : undefined);
+}
+
+async function runDurableHeld(args: RunDurableArgs): Promise<DurableResult> {
   // The failure half of the run's outcome record. The success half is written at the completion choke
   // point inside runDurableInner, where "did it actually finish" is already established (a suspended
   // run returns normally with interrupts and must NOT be recorded as completed).
   // BEFORE the try: a bad runId must reject the CALL, not be recorded as this run's failure —
   // `runFailed(journal, args.runId, ...)` would itself write under the very prefix being refused.
-  assertRunIdSafe(args.runId);
   // The outcome record is the ADMITTED run's. An error thrown before admission — an owner record the
   // store could not read, a thread whose owner it could not read, a refusal — is the caller's, not
   // the run's: recording it wrote `failed` under a run the caller had no right to touch. Measured by
@@ -2938,7 +2809,7 @@ export async function runDurable(args: RunDurableArgs): Promise<DurableResult> {
   const admission = { admitted: false };
   // What this attempt knows of its run's deletion when it starts (erasure-fence.ts) — compared at every
   // later check, and once more after the attempt's last write (below).
-  const erasure = await erasureBaseline(args.journal);
+  const erasure = await erasureBaseline(args.journal, parentOf(args));
   let out: DurableResult;
   try {
     out = await runDurableGuarded(await normalizeEntryArgs(args), admission, erasure);
@@ -2950,12 +2821,12 @@ export async function runDurable(args: RunDurableArgs): Promise<DurableResult> {
     // survivor's verdict — earlier or later — always stands; recording nothing left the run reading
     // 'completed' while it was neither.
     else if (kind === 'contended') await runFailedIfUnrecorded(args.journal, args.runId, err, Date.now());
-    if (await settleErasedRun(args.journal, args.runId, erasure)) throw err instanceof RunErasedError ? err : new RunErasedError(args.runId);
+    if (await settleErasedRun(args.journal, args.runId, erasure, appendsOf(args))) throw err instanceof RunErasedError ? err : new RunErasedError(args.runId);
     throw err;
   }
-  // AFTER the attempt's last write: a run deleted while it ran is deleted again, and its answer —
-  // a deleted person's — is not handed on (erasure-fence.ts).
-  if (await settleErasedRun(args.journal, args.runId, erasure)) throw new RunErasedError(args.runId);
+  // AFTER the attempt's last write: a run deleted while it ran is deleted again — the turn it appended to
+  // its thread too — and its answer, a deleted person's, is not handed on (erasure-fence.ts).
+  if (await settleErasedRun(args.journal, args.runId, erasure, appendsOf(args))) throw new RunErasedError(args.runId);
   return out;
 }
 
@@ -2972,7 +2843,7 @@ async function runDurableGuarded(args: RunDurableArgs, admission: { admitted: bo
     const handle = await acquireRunLock(args.journal, args.runId, lock.owner, lock.ttlMs);
     if (!handle) {
       if ((args as any).conflictLedger) await recordIdemConflict(args.journal, { runId: args.runId, code: 'run_busy', ...((args as any).actor ? { actor: (args as any).actor } : {}) }, (args as any).auditOnReject ?? 'best-effort');
-      throw Object.assign(new RunBusyError(runBusyMessage(`run '${args.runId}' is already running — it is locked by another process`)), { atLockAcquisition: true });
+      throw new RunBusyError(runBusyMessage(`run '${args.runId}' is already running — it is locked by another process`), { runId: args.runId, atLockAcquisition: true });
     }
     // B4 (heartbeat): the lock was acquired ONCE and never renewed — a run that legitimately outlives
     // `ttlMs` let a second worker take over mid-run (two live runs of the same runId). Renew on a beat
@@ -3081,16 +2952,16 @@ async function bornAs(journal: Journal, runId: string, owner: RunOwner, caller: 
   }
 }
 
-async function runDurableInner(args: RunDurableArgs, admission: { admitted: boolean }, erasure: ErasureBaseline): Promise<DurableResult> {
-  // `workKey`/`workScope` are pulled OUT of `rest` deliberately: `rest` is both the frozen input and
-  // the option bag handed to `generateText`, so a declared name left in it would travel to the
-  // provider as an unknown request field and land in `:input` twice under two different meanings.
-  const { journal, runId, guard, approvals, memory, threadId, resourceId: _declaredResourceId, caller: _declaredCaller, channel, agentName, workKey, workScope, replay, lock: _lock, processors, schemaCompat, limits, exclusiveModelStep, replayCacheMaxBytes, toolPolicy, timeouts, strictInput, conflictLedger, tombstonePolicy, actor, auditOnReject, replayDisclosure, model, tools, stopWhen, origin, trustRecordedInput, ...rest } =
-    args as RunDurableArgs & Record<string, any>;
-  // `model` is already a model object here — string ids are resolved in normalizeEntryArgs.
-  // ONE read of `:input`, shared by the ownership check, the adoption and persistInput below (see
-  // applyInputProcessors). Read + asserted BEFORE runStarted/resolveApprovals — see
-  // assertThreadOwnership's own doc for why the order matters (K2/K3 hardening).
+/**
+ * THE ADMISSION of an agent run — every gate between "a caller names this run" and "the run is this
+ * caller's to act in", in the order that keeps a refusal from writing anything (each gate's reason is
+ * at its line). One function, so runDurable, streamDurable and the detached executor's attach
+ * (`admitAgentRun`) ask the SAME question and get the same answer — the executor never keeps a rule
+ * of its own. Writes only the owner of a NEW run (`bornAs`, first writer wins), and on a refusal at
+ * most a PII-free conflict-ledger line.
+ */
+async function admitAgentEntry(journal: Journal, runId: string, args: RunDurableArgs | StreamDurableArgs, rest: Record<string, any>) {
+  const { memory, threadId, agentName, workKey, workScope, strictInput, conflictLedger, tombstonePolicy, actor, auditOnReject, approvals, origin, trustRecordedInput } = args as RunDurableArgs & Record<string, any>;
   const entry = await enterAgentRun(journal, runId, args);
   const frozenInput = entry.frozenInput;
   // WHOSE runId IS THIS (run-identity.ts assertRunTarget), on the SAME read and before anything is
@@ -3142,7 +3013,39 @@ async function runDurableInner(args: RunDurableArgs, admission: { admitted: bool
   await assertRunAdmissible(journal, runId, frozenInput, rawInputHash, { strictInput, conflictLedger, auditOnReject, tombstonePolicy, actor, resourceId, approvals });
   if (entry.refusal) throw entry.refusal;
   await assertRecordedInputUsable(journal, runId, frozenInput, origin, trustRecordedInput);
-  await bornAs(journal, runId, entry.owner, caller, { ...(agentName ? { agent: agentName } : {}), ...(threadId ? { threadId } : {}), ...(actor ? { actor } : {}), ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}) });
+  // The parent is recorded with the owner, at the birth: a run continued elsewhere before its input was
+  // written (a takeover) still knows the run that made it — its erasure is this one's (erasure-fence.ts).
+  await bornAs(journal, runId, entry.owner, caller, withMintOf({ ...(agentName ? { agent: agentName } : {}), ...(threadId ? { threadId } : {}), ...(actor ? { actor } : {}), ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}), ...(parentOf(args) ? { parentRunId: parentOf(args) } : {}) }, args));
+  return { entry, frozenInput, caller, resourceId, identity, rawInputHash };
+}
+
+/**
+ * Asks the run's admission for a caller WITHOUT running anything: what the detached executor
+ * (detached.ts) calls before it executes a run or attaches a caller to one. Throws the engine's own
+ * refusal (`RunOwnerMismatchError`, `RunActorMismatchError`, `RunThreadMismatchError`, `RunErasedError`,
+ * …); a new run is born to this caller (its owner record, first writer wins).
+ *
+ * @internal — the executor's and the registry's admission; it takes the engine's own run arguments, already checked by the call that built them.
+ */
+export async function admitAgentRun(args: StreamDurableArgs): Promise<void> {
+  await assertNotCompensated(args.journal, args.runId);
+  await Promise.all([assertNotCanceled(args.journal, args.runId), assertNotErased(args.journal, args.runId, await erasureBaseline(args.journal, parentOf(args)))]);
+  const { journal, runId, guard: _g, approvals: _a, memory: _m, threadId: _t, resourceId: _r, caller: _c, channel: _ch, agentName: _an, workKey: _wk, workScope: _ws, replay: _rp, lock: _l, processors: _p, schemaCompat: _sc, limits: _li, exclusiveModelStep: _e, replayCacheMaxBytes: _rc, toolPolicy: _tp, timeouts: _to, strictInput: _si, conflictLedger: _cl, tombstonePolicy: _tb, actor: _ac, auditOnReject: _ar, replayDisclosure: _rd, model: _mo, tools: _tl, stopWhen: _sw, onBlocked: _ob, origin: _or, trustRecordedInput: _tr, ...rest } =
+    args as StreamDurableArgs & Record<string, any>;
+  await admitAgentEntry(journal, runId, args, rest);
+}
+
+async function runDurableInner(args: RunDurableArgs, admission: { admitted: boolean }, erasure: ErasureBaseline): Promise<DurableResult> {
+  // `workKey`/`workScope` are pulled OUT of `rest` deliberately: `rest` is both the frozen input and
+  // the option bag handed to `generateText`, so a declared name left in it would travel to the
+  // provider as an unknown request field and land in `:input` twice under two different meanings.
+  const { journal, runId, guard, approvals, memory, threadId, resourceId: _declaredResourceId, caller: _declaredCaller, channel, agentName, workKey, workScope, replay, lock: _lock, processors, schemaCompat, limits, exclusiveModelStep, replayCacheMaxBytes, toolPolicy, timeouts, strictInput, conflictLedger, tombstonePolicy, actor, auditOnReject, replayDisclosure, model, tools, stopWhen, origin, trustRecordedInput, ...rest } =
+    args as RunDurableArgs & Record<string, any>;
+  // `model` is already a model object here — string ids are resolved in normalizeEntryArgs.
+  // ONE read of `:input`, shared by the ownership check, the adoption and persistInput below (see
+  // applyInputProcessors). Read + asserted BEFORE runStarted/resolveApprovals — see
+  // assertThreadOwnership's own doc for why the order matters (K2/K3 hardening).
+  const { entry, frozenInput, caller, resourceId, identity, rawInputHash } = await admitAgentEntry(journal, runId, args, rest);
   // ADMITTED: the run is this caller's to act in. From here on a failure is the run's own (runDurable).
   admission.admitted = true;
   // RESUME-GATE probe, BEFORE runStarted buries the verdict under 'running': a re-entry of a run
@@ -3166,7 +3069,8 @@ async function runDurableInner(args: RunDurableArgs, admission: { admitted: bool
   });
   // C2: on resume, fetch model/tool entries in a single query → hot replay reads take 1 round-trip instead of N.
   // On the first run there are no entries → undefined (no cache). Consume-once: see ctxGet.
-  const ctx: DurableCtx = { journal, runId, threadId, identity, channel, guard, approvals: resolvedApprovals, replay, limits, toolPolicy, blockedAsSentinel: true, toolTimeoutMs: timeouts?.toolMs, claimTtlMs: timeouts?.claimTtlMs, toolResultProcessors: processors, replayCache: await loadReplayCache(journal, runId, { maxBytes: replayCacheMaxBytes }), replayLog: [], erasure };
+  // Admitted (and so born) above: the primitives do not ask again (run-identity.ts `engineBorn`).
+  const ctx: DurableCtx = engineBorn({ journal, runId, threadId, identity, channel, guard, approvals: resolvedApprovals, replay, limits, toolPolicy, blockedAsSentinel: true, toolTimeoutMs: timeouts?.toolMs, claimTtlMs: timeouts?.claimTtlMs, toolResultProcessors: processors, replayCache: await loadReplayCache(journal, runId, { maxBytes: replayCacheMaxBytes }), replayLog: [], erasure });
   const procCtx = processors?.length ? createProcessorCtx(journal, runId) : undefined;
 
   // Memory: load thread history (prepend to messages) + inject working memory into the system prompt.
@@ -3438,7 +3342,6 @@ export async function resumeRun(
 ): Promise<DurableResult> {
   refuseUnknownNames('resumeRun', opts, RESUME_NAMES);
   refuseRunLimitNames('resumeRun: limits', opts.limits);
-  assertRunIdSafe(runId); // journal I/O'dan ÖNCE: rezerve bir aile adıyla okuma bile yapılmasın
   const input = upgradeFormat(
     await opts.journal.get<{ prompt?: unknown; messages?: unknown; system?: unknown; threadId?: string; resourceId?: string; agent?: string }>(runKeys.input(runId)),
     runKeys.input(runId),
@@ -3553,14 +3456,48 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
   // chat-adapter ve agui `gnl.stream` üzerinden buraya iniyor, runId doğrudan istemciden geliyor.
   // Doğrulamayı yalnız runDurable/resumeRun'a koymak, yorumun kendi vaadini ("unutulan hep
   // yüzeyler") tam da unutulan yüzeyde tutmamak demekti.
-  assertRunIdSafe(args.runId);
+  // Held by the process for the RUN's life — runDurable's rule (process-liveness.ts `holdWhile`): a drain
+  // waits for it and `pendingWork` lists it. The call returns at once with the stream; the unit ends when
+  // the run's own stream has ended (`run.ended`: read to its end by the engine, whoever reads the caller's
+  // copy), or with a refusal before it began. It used to end on the reader's callbacks (onFinish, onError,
+  // onAbort): a reader that cancelled or never read fired none, and the run stayed "executing" for the
+  // life of the process — a drain never finished and `gnl pending` listed a run nothing executed (R2-4).
+  const run: StreamRun = {};
+  let handOut!: (r: Promise<StreamTextResult<any, any, any>>) => void;
+  const handed = new Promise<StreamTextResult<any, any, any>>((r) => (handOut = r));
+  void holdWhile(async () => {
+    const started = streamDurableHeld(args, run);
+    handOut(started);
+    await started;
+    await run.ended;
+  }, { journal: args.journal, name: args.runId, what: 'the run is executing' }).catch(() => undefined);
+  return handed;
+}
+
+/** What streamDurable holds until: the run's own stream, read to its end by the engine (`driveRun`). */
+interface StreamRun { ended?: Promise<void> }
+
+/**
+ * Reads the run's own copy of its stream to the end, so the run goes on to its end whatever its reader
+ * does — reads it, cancels it, or never reads it (the reader gets a copy: the result tees its stream for
+ * every reader, `fullStream`/`textStream`). Every callback of the run (onFinish, onError, onAbort) is
+ * awaited inside the stream before it closes, so the end of this read is the end of the run's completion
+ * too. Its failure is the run's, already recorded by onError: this read only marks the end.
+ */
+async function driveRun(stream: AsyncIterable<unknown>): Promise<void> {
+  try {
+    for await (const _ of stream) { /* the run's progress, not its reader's */ }
+  } catch { /* the run's failure: recorded by its onError, rejected to its reader; here only its end */ }
+}
+
+async function streamDurableHeld(args: StreamDurableArgs, run: StreamRun): Promise<StreamTextResult<any, any, any>> {
   args = await normalizeEntryArgs(args);
   // Same refusal as runDurable — a compensated run never streams either.
   await assertNotCompensated(args.journal, args.runId);
   // P2-cancel: same terminal-refusal contract as compensation — a durably-canceled run never
   // (re)starts or resumes (the per-step mid-flight gate lives in durable-model.ts). Nor does a deleted
   // one (erasure-fence.ts); `erasure` is what this attempt compares against until its last write.
-  const erasure = await erasureBaseline(args.journal);
+  const erasure = await erasureBaseline(args.journal, parentOf(args));
   await Promise.all([assertNotCanceled(args.journal, args.runId), assertNotErased(args.journal, args.runId, erasure)]);
   // Same reason as runDurableInner: the declared name leaves `rest` before `rest` becomes both the
   // frozen input and the `streamText` option bag.
@@ -3605,7 +3542,7 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
   };
   if (lock && !lockHandle) {
     if (conflictLedger) await recordIdemConflict(journal, { runId, code: 'run_busy', ...(actor ? { actor } : {}) }, auditOnReject ?? 'best-effort');
-    throw Object.assign(new RunBusyError(runBusyMessage(`run '${runId}' is already streaming — it is locked by another process`)), { atLockAcquisition: true });
+    throw new RunBusyError(runBusyMessage(`run '${runId}' is already streaming — it is locked by another process`), { runId, atLockAcquisition: true });
   }
   // (a): EVERYTHING after a successful acquire runs under a release-on-throw guard. The setup awaits
   // below (thread-ownership assert, runStarted, approvals, memory prep, persistInput...) can all
@@ -3622,54 +3559,7 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
   async function afterAcquire(): Promise<StreamTextResult<any, any, any>> {
   // ONE read of `:input`, shared with persistInput below — parity with runDurableInner. Read + asserted
   // BEFORE runStarted/resolveApprovals — see assertThreadOwnership's own doc (K2/K3 hardening).
-  const entry = await enterAgentRun(journal, runId, args);
-  const frozenInput = entry.frozenInput;
-  // Parity with runDurableInner — "unutulan hep yüzeyler": chat-adapter and agui reach the engine
-  // through THIS function, so a client-supplied workflow/batch runId arrives here first.
-  assertRunTarget(entry.recorded, { kind: 'agent', ...(agentName ? { name: agentName } : {}) }, runId, entry.refusal);
-  // A run this caller may not act on is refused as THAT before the thread gates below: they name the
-  // thread the run was started for, which is the owner's. Answered first, they told a stranger who sent
-  // another user's runId which conversation it belongs to — with a thread of their own (the mismatch
-  // names the run's) or re-entering the run's own (`resumeRun`; the thread gate names it). Measured on
-  // the standalone chat and AG-UI doors, 0.7.0 release panel D-4. Without a thread no gate describes
-  // the run, and the refusal keeps its place after the actor/tombstone gates.
-  if (entry.refusal && threadId !== undefined) throw entry.refusal;
-  try {
-    assertThreadOwnership(frozenInput, runId, threadId);
-  } catch (e) {
-    // FAZ-4 ledger: the flagship conflict leaves a trace too (best-effort, PII-free).
-    if (conflictLedger && e instanceof RunThreadMismatchError) await recordIdemConflict(journal, { runId, code: 'run_thread_mismatch', ...(actor ? { actor } : {}) }, auditOnReject ?? 'best-effort');
-    throw e;
-  }
-  // ÖZNE↔THREAD, HİÇBİR ŞEY YAZILMADAN ÖNCE. İlk yazışta bu kontrol prepareMemoryContext'in
-  // içindeydi — yani `runStarted` ve `resolveApprovals`'tan SONRA. Sonucu ölçüldü: reddedilen
-  // çağıran, kurbanın TAMAMLANMIŞ koşumunun outcome'unu 'failed'a çeviriyor ve journal'a kalıcı bir
-  // onay kararı bırakıyordu. Bir yetki reddi, reddettiği kişinin geçmişine yazamaz.
-  // Kardeş hata (RunThreadMismatchError) için aynı gerekçe outcome.ts:33-38'de kelimesi kelimesine
-  // yazılı ve çözümü iki yarımlı: erken fırlat (burası) + outcome'da "koşum başarısızlığı sayma"
-  // listesine gir (NOT_A_RUN_FAILURE).
-  //
-  // OKUNAMAYAN sahip DÜŞÜRÜR — runDurableInner'daki kardeş kapının aynısı, aynı gerekçeyle. Bu
-  // yüzeyde daha da önemli: chat/agui motora BURADAN giriyor, yani yutulan bir okuma hatasının
-  // bedeli en çok kullanılan yolda ödeniyordu.
-  // One gate for every memory, asked of the thread's owner RECORD (thread-owner.ts). It used to fire
-  // only for a memory that could name an owner, so with BasicMemory it never fired at all.
-  // WHO THIS RUN ACTS FOR — decided once, here, from the record and the caller (run-identity.ts).
-  let caller = entry.caller;
-  if (threadId) {
-    const th = await admitThreadRun(journal, memory || undefined, threadId, caller);
-    // Staff starting a NEW run on a user's thread acts for that user (the thread RECORD's owner).
-    if (caller.kind === 'staff' && th.owner && entry.owner.state === 'missing') caller = user(th.owner);
-  }
-  const resourceId = userIdOf(caller);
-  const identity = runIdentity(caller, runId, { ...(threadId ? { threadId } : {}), ...(parentOf(args) ? { parentRunId: parentOf(args) } : {}), ...(requestOfArgs(args) ? { requestRunId: requestOfArgs(args) } : {}) });
-  // FAZ-4: fingerprint the RAW caller input BEFORE memory prep mutates rest.messages (post-prep
-  // content grows with the thread — hashing it would 409 every legitimate resume).
-  const rawInputHash = rawInputFingerprint(rest);
-  await assertRunAdmissible(journal, runId, frozenInput, rawInputHash, { strictInput, conflictLedger, auditOnReject, tombstonePolicy, actor, resourceId, approvals });
-  if (entry.refusal) throw entry.refusal;
-  await assertRecordedInputUsable(journal, runId, frozenInput, origin, trustRecordedInput);
-  await bornAs(journal, runId, entry.owner, caller, { ...(agentName ? { agent: agentName } : {}), ...(threadId ? { threadId } : {}), ...(actor ? { actor } : {}), ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}) });
+  const { entry, frozenInput, caller, resourceId, identity, rawInputHash } = await admitAgentEntry(journal, runId, args, rest);
   // RESUME-GATE probe — the stream twin of runDurableInner's, and it matters MORE here: this is the
   // path chat/agui use, so an at-least-once redelivery of a finished turn arrives on this line.
   // Read BEFORE runStarted buries the verdict (see runResumeGates' "NOT on a run that already ENDED").
@@ -3686,7 +3576,8 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
     hasRun: hasRunProbe(journal, runId, timeouts?.claimTtlMs),
   });
   // C2: on resume, load the replay snapshot (same as runDurableInner).
-  const ctx: DurableCtx = { journal, runId, threadId, identity, channel, guard, approvals: resolvedApprovals, replay, limits, toolPolicy, blockedAsSentinel: true, toolTimeoutMs: timeouts?.toolMs, claimTtlMs: timeouts?.claimTtlMs, toolResultProcessors: processors, replayCache: await loadReplayCache(journal, runId, { maxBytes: replayCacheMaxBytes }), replayLog: [], erasure };
+  // Admitted (and so born) above: the primitives do not ask again (run-identity.ts `engineBorn`).
+  const ctx: DurableCtx = engineBorn({ journal, runId, threadId, identity, channel, guard, approvals: resolvedApprovals, replay, limits, toolPolicy, blockedAsSentinel: true, toolTimeoutMs: timeouts?.toolMs, claimTtlMs: timeouts?.claimTtlMs, toolResultProcessors: processors, replayCache: await loadReplayCache(journal, runId, { maxBytes: replayCacheMaxBytes }), replayLog: [], erasure });
   const procCtx = processors?.length ? createProcessorCtx(journal, runId) : undefined;
 
   // Memory: load thread history + inject into system (BEFORE persistInput → replayable).
@@ -3817,8 +3708,12 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
     // Set by the onError wrapper below; also derived from the finish event itself, because some
     // providers surface a mid-stream failure only as finishReason:'error' without an error part.
     let streamFailed = false;
+    // Released by a draining process (process-liveness.ts): the run is neither finished nor failed —
+    // another process continues it, so nothing of its completion is written here.
+    let drained = false;
     const prevOnFinish = options.onFinish;
     options.onFinish = async (ev: any) => {
+      if (drained) { await releaseStreamLock(); if (prevOnFinish) await prevOnFinish(ev); return; }
       const stepsArr: any[] = ev?.steps ?? [];
       // (b): visibility callback — a block/limit sentinel at stream finish → hand the caller
       // the RAW structured breach. Advisory: a throw is swallowed with a console.warn (same policy as
@@ -3836,9 +3731,18 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
         Array.isArray(s?.content) && s.content.some((p: any) => hasSuspend(p) || hasLimitExceeded(p) || hasBlocked(p)));
       // Parity with runDurableInner: a run DELETED while its last step streamed writes none of its
       // completion — not its messages into the thread, not its usage or metrics (erasure-fence.ts). A
-      // read that fails is not a deletion; the settle below reads again after the last write.
-      const erased = !pending && (await runErasedSince(journal, runId, erasure).catch(() => false));
-      if (!pending && !erased) {
+      // read that FAILS is not "not deleted" either: as runDurableInner's throw does, it writes none of
+      // the completion and records the run failed (it was read as "not deleted", and the turn's messages
+      // went into a thread the deletion may just have taken). The settle below reads again.
+      let erased = false;
+      let fenceUnread: unknown;
+      if (!pending) {
+        try { erased = await runErasedSince(journal, runId, erasure); } catch (err) { fenceUnread = err ?? new Error('fence read failed'); }
+      }
+      if (fenceUnread !== undefined) {
+        console.warn(`@gnldev/durable: '${runId}' could not read whether it was deleted while it streamed, so its completion was not written (no messages, usage or metrics) and it is recorded failed:`, fenceUnread);
+        try { await runFailed(journal, runId, fenceUnread, Date.now()); } catch { /* the settle below still runs */ }
+      } else if (!pending && !erased) {
         try {
           let produced: any[] = producedMessages(ev);
           if (procCtx) {
@@ -3893,22 +3797,24 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
       await releaseStreamLock();
       // After the attempt's last write (erasure-fence.ts) — parity with runDurable. The stream has
       // already been delivered; what it wrote into a run deleted meanwhile is deleted again.
-      try { await settleErasedRun(journal, runId, erasure); } catch (err) {
+      try { await settleErasedRun(journal, runId, erasure, appendsOf({ memory, threadId })); } catch (err) {
         console.warn(`@gnldev/durable: '${runId}' was deleted while it streamed, and what it wrote since could not be deleted again:`, err);
       }
       if (prevOnFinish) await prevOnFinish(ev);
     };
     // (a): also release on a stream error (onFinish may not fire on the error path). release()
-    // is idempotent, so a later onFinish release is harmless. On abandonment (neither fires), TTL reclaims.
+    // is idempotent, so a later onFinish release is harmless. A reader that goes away is no abandonment of
+    // the run: the engine reads the run's stream to its end (`driveRun`), so one of these fires.
     // Previously wrapped ONLY when a lock existed, so an unlocked stream that failed recorded nothing
     // and read back as 'completed'. Now always wrapped; the release stays conditional.
     const prevOnError = options.onError;
     options.onError = async (ev: any) => {
       const err = (ev as { error?: unknown })?.error ?? ev;
       streamFailed = true; // onFinish still fires after an error — it must not record a success over this
+      if (err instanceof RunDrainedError) drained = true;
       if (isRunFailure(err)) await runFailed(journal, runId, err, Date.now());
       await releaseStreamLock();
-      try { await settleErasedRun(journal, runId, erasure); } catch (e) {
+      try { await settleErasedRun(journal, runId, erasure, appendsOf({ memory, threadId })); } catch (e) {
         console.warn(`@gnldev/durable: '${runId}' was deleted while it streamed, and what it wrote since could not be deleted again:`, e);
       }
       if (prevOnError) await prevOnError(ev);
@@ -3921,7 +3827,7 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
     const prevOnAbort = (options as any).onAbort;
     (options as any).onAbort = async (ev: any) => {
       await releaseStreamLock();
-      try { await settleErasedRun(journal, runId, erasure); } catch { /* the stream was aborted; the deletion's own fence still stops a resume */ }
+      try { await settleErasedRun(journal, runId, erasure, appendsOf({ memory, threadId })); } catch { /* the stream was aborted; the deletion's own fence still stops a resume */ }
       if (prevOnAbort) await prevOnAbort(ev);
     };
   }
@@ -3969,6 +3875,9 @@ export async function streamDurable(args: StreamDurableArgs): Promise<StreamText
   // typed streamFinishError when a block/limit sentinel fired — see guardStreamTerminalPromises.
   // A synchronous streamText throw is released by afterAcquire's caller-side catch above.
   rawStream = streamText(options);
+  // The run's own reader, taken before the caller gets its copy: the run reaches its end — and its
+  // callbacks fire — whether the caller reads, cancels, or never reads (streamDurable holds until then).
+  run.ended = driveRun(rawStream.fullStream);
   const guarded = guardStreamTerminalPromises(rawStream, procCtx ? maskTerminal : undefined);
   // FAZ-7: the replay signal HTTP layers asked for (X-Gnl-Idempotency-Status) — true when this runId
   // had frozen input before this call (a resume/replay), false on a fresh run. A plain property on

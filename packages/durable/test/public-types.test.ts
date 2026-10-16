@@ -390,7 +390,7 @@ const conflict: CallerConflictCode | undefined = callerConflictCode(new Error('x
 const blocked: BlockedErrorCode | undefined = blockedErrorCode(new Error('x'));
 const ownership: readonly CallerConflictCode[] = OWNERSHIP_CONFLICT_CODES;
 const conflictSet: Same<CallerConflictCode, 'run_thread_mismatch' | 'run_target_mismatch' | 'run_input_mismatch' | 'run_actor_mismatch' | 'run_owner_mismatch' | 'thread_owner_mismatch' | 'run_swept' | 'batch_plan_mismatch'> = true;
-const blockedSet: Same<BlockedErrorCode, 'side_effect_retry_blocked' | 'retry_limit_exceeded' | 'run_busy' | 'step_retry_blocked'> = true;
+const blockedSet: Same<BlockedErrorCode, 'side_effect_retry_blocked' | 'retry_limit_exceeded' | 'outcome_unknown' | 'run_busy' | 'step_retry_blocked'> = true;
 const wire: WireErrorCode = 'run_limit_exceeded';
 const conflictNotAny: IsAny<CallerConflictCode> = false;
 export { owner, busy, status, dynamicCode, dynamicStatus, conflict, blocked, ownership, conflictSet, blockedSet, wire, conflictNotAny };

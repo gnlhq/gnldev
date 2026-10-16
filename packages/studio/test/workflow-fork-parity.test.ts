@@ -46,6 +46,8 @@ describe('the pinned copy answers what @gnldev/workflow answers', () => {
   }
 });
 
+// The runs here are staff's (born `STAFF`, forks inherit it): they are run as staff — a call that names
+// nobody may not act on a staff run (run-identity.ts `decideRunAccess`), for a workflow as for an agent.
 describe('Studio fork door = forkWorkflowRun on real workflows', () => {
   it("'a' then 'a:x': a fork keeping 'a' runs 'a:x' again (the engine's answer)", async () => {
     const journal = new InMemoryJournal();
@@ -55,12 +57,12 @@ describe('Studio fork door = forkWorkflowRun on real workflows', () => {
       .then(step('a:x', async (n: number) => { runs.ax++; return n * 10; }))
       .then(step('tail', async (n: number) => n));
     await claimRunOwner(journal, 'src', STAFF, { workflow: 'w' });
-    await wf.run(1, { journal, runId: 'src' } as never);
+    await wf.run(1, { journal, runId: 'src', identity: { kind: 'staff', runId: 'src' } } as never);
     const { studio, engine } = await forkBoth(journal, wf, 'src', 1);
     expect(studio).toEqual(['a']);
     expect(studio).toEqual(engine);
     const before = runs.ax;
-    await wf.run(1, { journal, runId: 'src-studio' } as never);
+    await wf.run(1, { journal, runId: 'src-studio', identity: { kind: 'staff', runId: 'src-studio' } } as never);
     expect(runs.ax - before).toBe(1);
   });
 
@@ -72,7 +74,7 @@ describe('Studio fork door = forkWorkflowRun on real workflows', () => {
       .then(step('charge', async (n: number) => n, { sideEffect: true }))
       .then(step('after', async (n: number) => n));
     await claimRunOwner(journal, 'src2', STAFF, { workflow: 'w' });
-    for (let i = 0; i < 4; i++) { try { await wf.run(1, { journal, runId: 'src2' } as never); break; } catch { /* retry */ } }
+    for (let i = 0; i < 4; i++) { try { await wf.run(1, { journal, runId: 'src2', identity: { kind: 'staff', runId: 'src2' } } as never); break; } catch { /* retry */ } }
     const { studio, engine } = await forkBoth(journal, wf, 'src2', 2);
     expect(studio).toEqual(['charge', 'pay']);
     expect(studio).toEqual(engine);
@@ -90,12 +92,12 @@ describe('Studio fork door = forkWorkflowRun on real workflows', () => {
       .loop(async (n: unknown, iter: number) => { rounds++; if (iter === 2 && crash) { crash = false; throw new Error('crash'); } return iter as never; }, (_o, iter) => iter < 3, { id: 'loop' })
       .then(step('tail', async (n: number) => n));
     await claimRunOwner(journal, 'src3', STAFF, { workflow: 'w' });
-    await wf.run(1, { journal, runId: 'src3' } as never).catch(() => undefined);
+    await wf.run(1, { journal, runId: 'src3', identity: { kind: 'staff', runId: 'src3' } } as never).catch(() => undefined);
     const { studio, engine } = await forkBoth(journal, wf as never, 'src3', 3);
     expect(studio).toEqual(['a', 'f', 'f[0]', 'f[1]', 'loop#0', 'loop#1']);
     expect(studio).toEqual(engine);
     const before = rounds;
-    await wf.run(1, { journal, runId: 'src3-studio' } as never);
+    await wf.run(1, { journal, runId: 'src3-studio', identity: { kind: 'staff', runId: 'src3-studio' } } as never);
     expect(rounds - before).toBe(2); // rounds 2 and 3, not 0..3
   });
 
@@ -112,7 +114,7 @@ describe('Studio fork door = forkWorkflowRun on real workflows', () => {
       .then(step('n/b', async (n: number) => n + 1))
       .then(step('tail', async (n: number) => n));
     await claimRunOwner(journal, 'src4', STAFF, { workflow: 'w' });
-    await wf.run(1, { journal, runId: 'src4' } as never);
+    await wf.run(1, { journal, runId: 'src4', identity: { kind: 'staff', runId: 'src4' } } as never);
     const all = (await journal.listKeys('src4:wf:')).map((k) => k.slice('src4:wf:'.length));
     expect(all).toContain('pay:c:_fallback');
     expect(all).toContain('pay:v:_claim');
@@ -137,7 +139,7 @@ describe('Studio fork door = forkWorkflowRun on real workflows', () => {
       .then(retry(step('charge', async () => { throw new Error('down'); }), { attempts: 2, fallback: step('viaB', async () => 2) }))
       .then(step('ship', async (n: number) => n));
     await claimRunOwner(journal, 'src5', STAFF, { workflow: 'w' });
-    await wf.run(1, { journal, runId: 'src5' } as never);
+    await wf.run(1, { journal, runId: 'src5', identity: { kind: 'staff', runId: 'src5' } } as never);
     await journal.put('src5:wf:charge', undefined as never);
     expect(await journal.get('src5:wf:charge:_fallback')).toBeTruthy();
     const { studio, engine } = await forkBoth(journal, wf as never, 'src5', 1);

@@ -21,11 +21,12 @@
 import { describe, it, expect } from 'vitest';
 import { runDurable, InMemoryJournal, listRunsArray, CALLER_CONFLICT_CODES } from '../src/index.js';
 import { classifyRunError } from '../src/outcome.js';
+import { streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const model = {
   specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {},
-  doStream: async () => { throw new Error('gen-only'); },
+  doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
   doGenerate: async () => ({ content: [{ type: 'text', text: 'ok' }], finishReason: 'stop', usage, warnings: [] }),
 } as any;
 

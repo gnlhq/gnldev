@@ -8,7 +8,7 @@
 import type { Storage } from './storage.js';
 import type { Journal } from './journal.js';
 import { toJournal, threadRecordOwner } from './storage.js';
-import { withOrg, withRootScope, ORG_RECORD_PRE } from './organization.js';
+import { withOrg, withRootScope, registeredOrganizations } from './organization.js';
 import { withOrgStorage } from './org-storage.js';
 import { threadRecordsComplete, writeThreadRecords } from './thread-owner.js';
 import type { Memory } from './memory.js';
@@ -70,10 +70,20 @@ export interface UpgradeStep {
  * Runs a store's steps: every pending one, or those in `only`, in the store's order (the adapter's
  * `upgrade` has already refused a misspelled option). Refuses before
  * running anything when `only` names a step this store does not have, or leaves out a step another
- * needs that is still pending — a step is never run behind the caller's back.
+ * needs that is still pending — a step is never run behind the caller's back. The refusal names every
+ * such step, the prerequisites of prerequisites too, so the command it suggests is one that runs.
+ *
+ * `exists` (an adapter with tables): whether the store has been created at all. One that has not has
+ * nothing to upgrade — its first boot creates it as this version's — so every step reads not pending
+ * and none is asked: asking would create it (Postgres creates its tables on first use).
  * @internal — what each adapter's `upgrade()` calls.
  */
-export async function runUpgrade(who: string, steps: readonly UpgradeStep[], opts: UpgradeOptions = {}): Promise<UpgradeReport> {
+export async function runUpgrade(
+  who: string,
+  steps: readonly UpgradeStep[],
+  opts: UpgradeOptions = {},
+  exists?: () => Promise<boolean>,
+): Promise<UpgradeReport> {
   const has = new Set(steps.map((s) => s.name));
   for (const name of opts.only ?? []) {
     if (!has.has(name)) {
@@ -81,6 +91,9 @@ export async function runUpgrade(who: string, steps: readonly UpgradeStep[], opt
         `${who}.upgrade: '${name}' is not a step of this store. Its steps: ${steps.map((s) => s.name).join(', ') || '(none)'}.`,
       );
     }
+  }
+  if (exists && !(await exists())) {
+    return { dryRun: !!opts.dryRun, steps: steps.map((s) => ({ name: s.name, description: s.description, pending: false, ran: false })) };
   }
   const selected = new Set(opts.only ?? steps.filter((s) => !s.explicit).map((s) => s.name));
   const needed = new Set<UpgradeStepName>(selected);
@@ -99,13 +112,23 @@ export async function runUpgrade(who: string, steps: readonly UpgradeStep[], opt
     if (!s.explicit && blockedBy(s).length > 0) assumed.add(s.name);
     pending.set(s.name, s.explicit ? selected.has(s.name) : assumed.has(s.name) ? true : await s.pending());
   }
+  // Every pending step a step waits on, through the prerequisites of its prerequisites: `thread-records`
+  // waits on `schema`, which waits on `run-status`. Naming only the direct one suggested a command that was
+  // refused in turn. Not run on the caller's behalf: `run-status` is the moment every process of the
+  // earlier version must be gone, and an operator who asked for `schema` has not chosen that moment.
+  const waitsOn = (s: UpgradeStep, out = new Set<UpgradeStepName>()): Set<UpgradeStepName> => {
+    for (const r of blockedBy(s)) if (!out.has(r)) { out.add(r); waitsOn(steps.find((x) => x.name === r)!, out); }
+    return out;
+  };
   for (const s of steps) {
     if (!selected.has(s.name) || !pending.get(s.name)) continue;
-    const missing = blockedBy(s).filter((r) => !selected.has(r));
+    const all = waitsOn(s);
+    const missing = steps.map((x) => x.name).filter((n) => all.has(n) && !selected.has(n));
     if (missing.length) {
+      const together = steps.map((x) => x.name).filter((n) => missing.includes(n) || selected.has(n));
       throw new Error(
-        `${who}.upgrade: '${s.name}' needs ${missing.map((m) => `'${m}'`).join(' and ')} first, which is still pending. ` +
-          `Run them together — upgrade({ only: [${[...missing, s.name].map((m) => `'${m}'`).join(', ')}] }) — or run upgrade() for every pending step.`,
+        `${who}.upgrade: '${s.name}' needs ${missing.map((m) => `'${m}'`).join(' and ')} first, which ${missing.length > 1 ? 'are' : 'is'} still pending. ` +
+          `Run them together — upgrade({ only: [${together.map((m) => `'${m}'`).join(', ')}] }), \`gnl upgrade --only ${together.join(',')}\` — or run upgrade() for every pending step.`,
       );
     }
   }
@@ -140,12 +163,7 @@ const ownerAsker = (store: MemoryStore): Memory =>
 async function upgradeScopes(storage: Storage): Promise<Array<{ name: string; journal: Journal; memory?: Memory }>> {
   const j = toJournal(storage.runs);
   const out: Array<{ name: string; journal: Journal; memory?: Memory }> = [];
-  const orgs: string[] = [];
-  if (typeof j.listKeys === 'function') {
-    for (const key of await j.listKeys(ORG_RECORD_PRE)) {
-      if ((await j.get(key)) != null) orgs.push(key.slice(ORG_RECORD_PRE.length));
-    }
-  }
+  const orgs = await registeredOrganizations(j);
   out.push({ name: '(root)', journal: orgs.length ? withRootScope(j) : j, ...(storage.memory ? { memory: ownerAsker(storage.memory) } : {}) });
   for (const org of orgs) {
     const view = withOrgStorage(storage, org);
@@ -293,8 +311,11 @@ export function runStatusPending(columns: ReadonlySet<string>): boolean {
 export const RUN_STATUS_PENDING_MESSAGE =
   '@gnldev/durable: this store\'s run table (gnl_runs) is in the format of an earlier version (0.10 or before): ' +
   'run status is kept in four flag columns this version no longer reads or writes. Nothing was read or written. ' +
-  'Stop every process of the earlier version, then run `gnl upgrade` (or `await storage.upgrade()`), then start this one. ' +
-  'Measured on 1 000 000 runs: 0.6 s on Postgres, 2.2 s on Sqlite.';
+  'Stop every process of the earlier version, run `gnl upgrade --only run-status,schema` ' +
+  "(or `await storage.upgrade({ only: ['run-status', 'schema'] })`), start this version, then run `gnl upgrade` " +
+  'for the remaining steps while it serves. The stop lasts as long as `run-status`, which grows with the runs ' +
+  'a flag marks (suspended, failed, running or canceled) — on Postgres, 1 000 000 runs: 0.6 s with 167 of them ' +
+  'flagged, 20 s with 500 167. `gnl upgrade --list` shows what each step will do.';
 
 /**
  * What a store with a `gnl_runs` table hands its `run-status` step (Sqlite, Postgres): whether the flags

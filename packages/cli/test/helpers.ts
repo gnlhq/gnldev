@@ -22,10 +22,9 @@ export function mkModel(doGenerate: (opts: any) => Promise<any>): any {
     provider: 'mock',
     modelId: 'mock-model',
     supportedUrls: {},
+    // No doStream: a registry run streams, and @gnldev/durable streams a generate-only model from its
+    // generate answer (generate-as-stream.ts) — as it does for any hand-written model.
     doGenerate,
-    doStream: async () => {
-      throw new Error('mock: doStream not supported');
-    },
   };
 }
 

@@ -27,7 +27,7 @@ const countTools = (prompt: any[]) => (prompt ?? []).filter((m: any) => m?.role 
 function mockModel(doGenerate: (o: any) => Promise<any>): any {
   return {
     specificationVersion: 'v2', provider: 'mock', modelId: 'm', supportedUrls: {},
-    doGenerate, doStream: async () => { throw new Error('no stream'); },
+    doGenerate,
   };
 }
 const toolCall = (toolName: string, toolCallId: string, args: unknown) => ({

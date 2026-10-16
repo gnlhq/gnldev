@@ -9,7 +9,7 @@
 // on resource id alone; see `recallPartition` in @gnldev/durable.
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, type Storage } from '@gnldev/durable';
-import { SqliteStorage } from '../../durable/src/sqlite-storage.js';
+import { SqliteStorage } from '@gnldev/durable/sqlite';
 import { echoModel } from '@gnldev/durable/mock';
 import { memoryPreset } from '../../memory/src/index.js';
 import { createChatRoute } from '../../chat-adapter/src/index.js';

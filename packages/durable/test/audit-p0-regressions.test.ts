@@ -5,12 +5,14 @@ import { describe, it, expect } from 'vitest';
 import { runDurable, streamDurable, InMemoryStorage, listRunsArray, readRunOutcome, runKeys, BasicMemory, RunBusyError, sweepRuns, appendLog } from '../src/index.js';
 import { durableTool } from '../src/durable-tool.js';
 import { stampFormat } from '../src/format.js';
+import { claimRunOwner, STAFF } from '../src/run-identity.js';
 import type { DurableCtx } from '../src/journal.js';
 import { tool } from 'ai';
 import { z } from 'zod';
+import { streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
-const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {}, doStream: async () => { throw new Error('gen-only'); } };
+const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {}, doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); } };
 const good = { ...base, doGenerate: async () => ({ content: [{ type: 'text', text: 'ok' }], finishReason: 'stop', usage, warnings: [] }) } as any;
 
 function sideEffectTool(extra: Record<string, unknown> = {}) {
@@ -210,6 +212,8 @@ describe('AUDIT-6 (adjacent): a mid-flight fence fills the outcome without buryi
   it('a fenced-out attempt records failed only while no verdict exists', async () => {
     const journal = new InMemoryStorage().runs;
     const { runFailedIfUnrecorded, runSucceeded } = await import('../src/outcome.js');
+    // The outcome is a run's record: the runs exist (born) before their attempts write it.
+    for (const id of ['fence-1', 'fence-2']) await claimRunOwner(journal as any, id, STAFF);
 
     // Case 1: no verdict yet → the fence-abort fills it (a run that aborted no longer reads completed).
     await runFailedIfUnrecorded(journal, 'fence-1', new RunBusyError('fenced mid-flight'), Date.now());

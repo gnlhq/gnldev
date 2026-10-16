@@ -8,11 +8,12 @@
 
 import type { Journal, JournalEntry, RunSummary, JournalReader, RunStatus } from './journal.js';
 import type { RunOrder } from './run-cursor.js';
-import { VectorOwnerConflictError } from './errors.js';
+import { VectorOwnerConflictError, AdoptionConflictError } from './errors.js';
 import { assertOwnerId, isWellFormed, OwnerIdError } from './owned-name.js';
 import { ORG_KEY_PREFIX, isOrganizationKey, parseOrganizationKey, orgSpaceSql, prefixSql } from './organization.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { COMPOSITE_NAMES } from './option-names.js';
+import { withBirth } from './run-identity.js';
 
 // ── Common ──────────────────────────────────────────────────────────────────
 
@@ -263,6 +264,19 @@ export function partitionReadCount(prefix: string): number {
   return partitionSeen.get(prefix) ?? 0;
 }
 
+/**
+ * The one check `MemoryStore.deletePartition` makes before it deletes: `partition` is an organization's
+ * prefix exactly as `orgPrefix` builds it (`org:<id>:`). Anything else — the root (`''`), the whole
+ * reserved space (`org:`), a key inside a partition — is refused, never widened or narrowed.
+ */
+export function assertOrganizationPartition(partition: string): string {
+  const parsed = parseOrganizationKey(partition);
+  if (parsed === undefined || parsed.rest !== '') {
+    throw new Error(`@gnldev/durable: '${partition}' is not an organization's partition (\`orgPrefix(orgId)\`, 'org:<id>:') — nothing was deleted`);
+  }
+  return partition;
+}
+
 /** Whether thread `id` is inside `partition` — the in-process twin of the SQL adapters' condition. */
 export function inMemoryPartition(partition: MemoryPartition, id: string): boolean {
   return partition.kind === 'root' ? !isOrganizationKey(id) : id.startsWith(partition.prefix);
@@ -396,9 +410,17 @@ export interface MemoryStore {
    */
   listThreads(q: { resourceId?: string } & ListQuery & MemoryPartitionOption): Promise<Page<ThreadRecord>>;
   /**
-   * THIS STORE'S HALF of a thread delete: the thread (kept as a tombstone with no title or metadata),
-   * its messages, observations, batch markers and its thread-scoped working memory
-   * (`workingMemoryScope.thread(id)`, and the 0.6 key `legacyWorkingMemoryScope.thread(id)` when there is one).
+   * THIS STORE'S HALF of a thread delete: the thread record, its messages, observations, batch markers
+   * and its thread-scoped working memory (`workingMemoryScope.thread(id)`, and the 0.6 key
+   * `legacyWorkingMemoryScope.thread(id)` when there is one). The record goes with the rest, not as a
+   * tombstone: one kept its owner's id and the thread's id after an erasure, and nothing read it — every
+   * reader already skipped it — so it served no purpose but to name the person.
+   *
+   * ATOMIC AGAINST AN APPEND: a batch's rows and its marker go together or stay together — an append
+   * lands wholly before the delete or wholly after it. A run deleted while it runs takes back what it
+   * appended after the deletion by its marker (`retractBatch`); rows whose marker went without them
+   * stay in the deleted thread for good. The shipped stores hold the thread's append lock across one
+   * transaction (Postgres) or delete in one transaction (Sqlite).
    *
    * Not a thread delete by itself: the thread's runs, its journal state, its observation vectors and
    * its owner record live elsewhere. `purgeThread(journal, id, { memory: store })` (model.ts's plan, or
@@ -493,6 +515,29 @@ export interface MemoryStore {
    * unconditionally.
    */
   deleteMessagesAfter?(threadId: string, afterSeq: number): Promise<number>;
+
+  /**
+   * (optional) Takes back what `appendMessagesOnce` wrote under `batchKey` on this thread: those rows
+   * and the batch's own record. Returns how many messages went; an unknown batch is 0.
+   *
+   * Called by a worker whose run was deleted while it ran (erasure-fence.ts): the turn it appended after
+   * the deletion is the deleted run's, and only the worker knows which batch it was. Without it a turn
+   * written in that moment stayed in the thread for good — nothing named it any more, so no later
+   * erasure could find it (measured, c-erasure CE-2). Every bundled store implements it.
+   */
+  retractBatch?(threadId: string, batchKey: string): Promise<number>;
+
+  /**
+   * (optional) Deletes EVERY row of one partition — `org:<id>:` — in every table this store keeps: the
+   * threads, their messages, observations and batch markers, and every working-memory record (a
+   * thread's and a person's alike). The memory-store half of an organization's deletion
+   * (`purgeOrganization`, model.ts `ORGANIZATION_DEPENDENTS`); the rows go outright, with no tombstone,
+   * so an organization registered again under the id starts empty. Returns how many rows went.
+   *
+   * Refuses (throws) anything but an organization's prefix (`orgPrefix`): the root has no partition this
+   * method may name. Not offered through an organization's view: an organization does not delete itself.
+   */
+  deletePartition?(partition: string): Promise<number>;
 }
 
 // ── 3) VectorStore = RAG corpus (structurally compatible with the rag package) ─
@@ -1010,10 +1055,11 @@ export function workKeyAdoption(rootValue: unknown, orgHasKey: boolean): 'move' 
 }
 
 /** The refusal for a work-store key both the root and the organization hold — see `workKeyAdoption`. */
-export function workKeyAdoptCollision(orgKey: string): Error {
-  return new Error(
+export function workKeyAdoptCollision(orgKey: string): AdoptionConflictError {
+  return new AdoptionConflictError(
     `@gnldev/durable: adoptIntoOrg would move a work-store key onto '${orgKey}', which the organization already holds. `
       + 'Delete one of the two (they are not a read position, so neither can be dropped for you), then adopt again. Nothing was moved.',
+    { orgId: parseOrganizationKey(orgKey)?.orgId ?? '', keys: [orgKey], count: 1 },
   );
 }
 
@@ -1089,8 +1135,8 @@ export interface WorkStore {
    * keeps it.
    *
    * Returns the number of records removed (log records + KV entries). Optional like the rest of this
-   * port's extensions: a custom WorkStore without it makes `purgeOrganizationWork` throw a clear
-   * error rather than report a silent success.
+   * port's extensions: a custom WorkStore without it makes `purgeOrganization` refuse, deleting nothing,
+   * rather than report a silent success.
    */
   deletePrefix?(prefix: string): Promise<number>;
   /**
@@ -1109,6 +1155,13 @@ export interface CacheStore {
   get<T = unknown>(key: string): Promise<T | undefined>;
   set(key: string, value: unknown, opts?: { ttlMs?: number }): Promise<void>;
   delete(key: string): Promise<void>;
+  /**
+   * (optional) Every entry whose key starts with `prefix` — the cache half of an organization's deletion
+   * (`purgeOrganization`): an organization's view keys its entries `org:<id>:…`, and a cached answer is
+   * the organization's data like any other. Literal, not a pattern. Returns how many went. Every bundled
+   * store implements it; `purgeOrganization` refuses a cache without it rather than leave entries behind.
+   */
+  deletePrefix?(prefix: string): Promise<number>;
 }
 
 // ── 6) MetaStore = schema_version / capability persistence ────────────────────
@@ -1116,6 +1169,8 @@ export interface CacheStore {
 export interface MetaStore {
   get(key: string): Promise<string | undefined>;
   set(key: string, value: string): Promise<void>;
+  /** (optional) Every key starting with `prefix`, as `CacheStore.deletePrefix` — an organization's view keys its own `org:<id>:…`. */
+  deletePrefix?(prefix: string): Promise<number>;
 }
 
 // ── Storage (composite) + Capability ───────────────────────────────────────
@@ -1143,6 +1198,13 @@ export interface Storage {
   readonly meta: MetaStore;
   /** Schema/table setup (idempotent). Called automatically once the storage is handed to the registry. */
   init?(): Promise<void>;
+  /**
+   * This process's liveness on this store (process-liveness.ts): what a detached run's executor holds
+   * while it lives, and what another process asks before taking its runs over. Optional: a store that
+   * only one process can reach needs none (the in-memory store), and one that others can reach and
+   * cannot answer leaves the registry asking for one explicitly.
+   */
+  processLiveness?(): import('./process-liveness.js').ProcessLiveness | Promise<import('./process-liveness.js').ProcessLiveness>;
   close?(): Promise<void>;
   /**
    * Brings data an earlier version wrote up to this one: the steps this store has (`schema`,
@@ -1192,7 +1254,13 @@ export interface Storage {
    * migration from failing halfway; it does not stop anything else writing meanwhile.
    * `allowInFlight: true` opts out for runs known to be abandoned.
    *
-   * `dryRun` reports the same counts without writing.
+   * NEVER OVERWRITES what the organization holds (adoption.ts `onAdoptionCollision`): a root record whose
+   * organization twin exists — a thread's owner record, a run, a memory thread, a meta or work key —
+   * refuses the whole adoption before anything moves (`AdoptionConflictError`, every id named); a counter
+   * is summed into the organization's; a cache entry (content-addressed) stays the organization's. A
+   * scope's facts (`thread:records:v1`) never move.
+   *
+   * `dryRun` reports the same counts without writing, and refuses the same conflicts.
    */
   adoptIntoOrg?(orgId: string, opts?: { dryRun?: boolean; allowUnregistered?: boolean; allowInFlight?: boolean }): Promise<AdoptIntoOrgResult>;
 }
@@ -1250,6 +1318,9 @@ export function isStorage(x: unknown): x is Storage {
  * The journal view every reader takes (Studio's `reader`, `exportRun`, `sweepRuns`, …), from a
  * `Storage` or from its `runs` port; anything else is refused naming what it is.
  */
+/** The store behind a `toJournal` bridge (not enumerable: it is the bridge's identity, never copied onto a wrapper). */
+export const JOURNAL_SOURCE = Symbol.for('@gnldev/durable.journalSource');
+
 export function toJournal(source: RunJournal | Storage): Journal & JournalReader {
   const runs: RunJournal = portOf(source, 'runs', 'toJournal');
   const j: Journal & JournalReader = {
@@ -1275,10 +1346,20 @@ export function toJournal(source: RunJournal | Storage): Journal & JournalReader
   // P1.6b: applyBatch/getMany/countRunsByStatus forwarded the SAME way — SqliteRunJournal/PgRunJournal
   // expose them as EXTRA (non-RunJournal-interface) methods; without this they'd be
   // silently dropped here exactly like the other optional methods were before the bug fix above.
-  for (const m of ['deletePrefix', 'putIfMatch', 'now', 'incrBy', 'getCounters', 'listStaleRuns', 'readRunStats', 'applyBatch', 'getMany', 'countRunsByStatus', 'listOwnerRecords', 'countRuns', 'listRunsChangedSince']) {
+  for (const m of ['deletePrefix', 'putIfMatch', 'now', 'incrBy', 'getCounters', 'listStaleRuns', 'readRunStats', 'applyBatch', 'getMany', 'countRunsByStatus', 'listOwnerRecords', 'countRuns', 'listRunsChangedSince', 'processLiveness', 'readRange']) {
     if (typeof anyRuns[m] === 'function') anyJ[m] = (...args: unknown[]) => (anyRuns[m] as (...a: unknown[]) => unknown).call(runs, ...args);
   }
-  return j;
+  // The port's markers (an organization view's `ORG_SCOPE` and `ORG_PARENT`) go along too. This bridge
+  // built a fresh object and dropped them, so a door's `{ storage }` org view read as the root: the
+  // provider-facing idempotency key lost its `org:<id>:` part (two organizations charging one order id
+  // handed the provider the same key) and an organization purge's fence was never consulted.
+  for (const s of Object.getOwnPropertySymbols(runs)) {
+    const d = Object.getOwnPropertyDescriptor(runs, s);
+    if (d?.enumerable) Object.defineProperty(j, s, d);
+  }
+  // Which store this journal is: a bridge is made per call, so its identity says nothing (executors.ts).
+  Object.defineProperty(j, JOURNAL_SOURCE, { value: (runs as unknown as Record<symbol, unknown>)[JOURNAL_SOURCE] ?? runs, enumerable: false });
+  return withBirth(j);
 }
 
 /** Missing/insufficient capability → a clear error at wiring time (never a silent `[]`/throw mix-up). */

@@ -431,40 +431,10 @@ export function workKeyHash(workKey: string): string {
 /** A `workKey` is a business name, not a payload; past this length it is neither. */
 const MAX_WORK_KEY_LENGTH = 2048;
 
-/** The engine's namespace on the raw runId surface. Generation 1 of the formula above. */
-export const DERIVED_RUN_ID_PREFIX = 'run1_';
-
-/**
- * The complete spelling of an engine-derived id: the prefix, 32 lowercase hex, and — optionally —
- * ONE execution-axis suffix.
- *
- * `#<n>` starts at 2 and carries no leading zero (`[2-9]\d*` covers 2..9 and anything opening with
- * 2-9; `[1-9]\d+` covers 10..19 and the rest), because execution #1 IS the bare id — a `#1` spelling
- * would be a second name for a run that already has one, and two names for one journal prefix is the
- * bug class this whole file exists to close. `#replay-<seq>` is the regression path's counter, a
- * DETERMINISTIC integer rather than the wall clock the old `:replay:${Date.now()}` buried in an id
- * (§4) — timestamps in an identity kill replay, and replay is what durability means here.
- * `#fork-<n>` is the third and last suffix: `forkRun`'s "re-run from here" copy, counted from 1
- * because — unlike an execution number — a fork is never the base run, so there is no fork #0 to
- * clash with the bare id.
- *
- * NO LEADING ZEROS anywhere, and that applies to `replay-` too (`0|[1-9]\d*`, not `\d+`). A suffix
- * is read back with `Number()`, so `#replay-01` and `#replay-1` would be two spellings of one
- * identity — the same "two names for one journal prefix" hazard as `#1`, arriving through a
- * different door. The engine never mints a padded number; refusing the padded spelling is what keeps
- * that a property instead of a habit.
- *
- * Note this is a full-string match: `run1_<32hex>#2#3` and `run1_<32hex>:child` do not pass. Inside
- * this namespace the engine owns the shape completely, so anything it did not mint is refused rather
- * than tolerated.
- */
-const DERIVED_RUN_ID_RE =
-  /^run1_([0-9a-f]{32})(?:#(?:([2-9]\d*|[1-9]\d+)|replay-(0|[1-9]\d*)|fork-([1-9]\d*)))?$/;
-
-/** True for an id the engine could have minted — prefix, digest and at most one axis suffix. */
-export function isDerivedRunId(runId: string): boolean {
-  return DERIVED_RUN_ID_RE.test(runId);
-}
+// The derived-id family's spelling (`run1_<32 hex>` + one axis suffix) is declared with every other run-id
+// family in run-id-grammar.ts; minted here, recognized there.
+export { DERIVED_RUN_ID_PREFIX, isDerivedRunId, parseDerivedRunId, derivedRunIdBase, type DerivedRunIdParts } from './run-id-grammar.js';
+import { DERIVED_RUN_ID_PREFIX, isDerivedRunId, parseDerivedRunId } from './run-id-grammar.js';
 
 function rejectEmpty(field: string, value: unknown, why: string): asserts value is string {
   if (typeof value !== 'string' || value.length === 0) {
@@ -617,48 +587,3 @@ export function forkRunId(base: string, n: number): string {
   return `${base}#fork-${n}`;
 }
 
-/** What an engine-derived id says about itself, once it is read back apart. */
-export interface DerivedRunIdParts {
-  /** The 32 hex characters of `workDigest`. Not reversible to the workKey — that mapping is stored. */
-  digest: string;
-  /** Present from the second deliberate execution onwards; absent means execution #1. */
-  execution?: number;
-  /** Present on a regression replay: the deterministic counter behind `#replay-<seq>`. */
-  replaySeq?: number;
-  /** Present on a `forkRun` copy: the deterministic counter behind `#fork-<n>`, from 1. */
-  fork?: number;
-}
-
-/**
- * The id WITHOUT its execution-axis suffix — `run1_<digest>` for every spelling in the namespace.
- *
- * The three minting sites (fork, rollover, replay) all need the same first move: given an id that may
- * already carry a suffix, find the base the suffix counts against. Doing it by hand is doing
- * `slice(0, indexOf('#'))` in three files, and the fourth site is where it gets done wrong.
- *
- * Returns `undefined` for anything outside the namespace — a raw runId has no base because it has no
- * axis, and the callers branch on exactly that.
- */
-export function derivedRunIdBase(runId: string): string | undefined {
-  const parts = parseDerivedRunId(runId);
-  return parts ? DERIVED_RUN_ID_PREFIX + parts.digest : undefined;
-}
-
-/**
- * Reads an id the engine minted; returns `undefined` for everything else — including ids that merely
- * look derived (`run1_deadbeef`) and the spellings the axis forbids (`#1`, `#0`, `#x`).
- *
- * `undefined` rather than a throw because every caller of this is asking a QUESTION ("is this one of
- * ours?") about an id that legitimately might not be. The refusal of a lookalike belongs on the write
- * path, and lives there: `assertRunIdSafe`.
- */
-export function parseDerivedRunId(runId: string): DerivedRunIdParts | undefined {
-  if (typeof runId !== 'string') return undefined;
-  const m = DERIVED_RUN_ID_RE.exec(runId);
-  if (!m) return undefined;
-  const parts: DerivedRunIdParts = { digest: m[1]! };
-  if (m[2] !== undefined) parts.execution = Number(m[2]);
-  if (m[3] !== undefined) parts.replaySeq = Number(m[3]);
-  if (m[4] !== undefined) parts.fork = Number(m[4]);
-  return parts;
-}

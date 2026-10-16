@@ -24,7 +24,7 @@
  * its own format, or a memory kept in some other database — comes in as an eraser.
  */
 import { purgeResource, purgeThread } from './retention.js';
-import { hasRunningClaim } from './model.js';
+import { runsInFlight } from './model.js';
 import { threadRecordOwner, assertRootOutsideOrganizations } from './storage.js';
 import { ownedPrefix } from './owned-name.js';
 import { threadOwnerOf, threadOwnerKey } from './thread-owner.js';
@@ -39,10 +39,21 @@ import type { MemoryStore, Storage, WorkStore } from './storage.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { ERASE_SUBJECT_NAMES, RESERVED_ROOT_THREADS_NAMES, SUBJECT_RUNS_NAMES } from './option-names.js';
 
-/** One package's share of a person's erasure (`jobEraser`, `triggerEraser`, `eventEraser`), or a store outside the storage. */
+/**
+ * One package's share of an erasure (`jobEraser`, `triggerEraser`, `eventEraser`), or a store outside the
+ * storage: a PERSON's (`erase`, from `eraseSubject`), and an ORGANIZATION's (`eraseOrganization`, from
+ * `purgeOrganization`) — the organization's own records and every member's, all under
+ * `ownedPrefix({ orgId })`.
+ */
 export interface SubjectEraser {
   name: string;
   erase(owner: { resourceId: string; orgId?: string }): Promise<number>;
+  /**
+   * Everything this eraser holds of an organization and its members. Optional, and `purgeOrganization`
+   * refuses, deleting nothing, an eraser without it: what it keeps of the organization would stay. One
+   * that keeps nothing per organization says so with `eraseOrganization: async () => 0`.
+   */
+  eraseOrganization?(orgId: string): Promise<number>;
 }
 
 export interface EraseOptions {
@@ -243,9 +254,11 @@ export interface SubjectRun {
   runId: string;
   threadId?: string;
   /**
-   * The run may still write: its outcome is the write-ahead `running` (a run's own LAST write turns it
-   * terminal), or a model step or tool call of it is claimed `running` right now (the step a canceled
-   * run is still inside) — under the run, or under an idempotency window it points at. A run whose
+   * The run may still write (model.ts `runsInFlight`): its outcome is the write-ahead `running` with no
+   * question open (a run's own LAST write turns it terminal), or a model step or tool call of it is
+   * claimed `running` right now (the step a canceled run is still inside) — under the run, or under an
+   * idempotency window it points at. A run parked on a person is not: it writes nothing until answered,
+   * and that answer meets the erasure's fence. A run whose
    * worker died stays `running` until someone purges or cancels it. A canceled worker that holds no
    * claim (inside a call answered by a record) is not listed; it meets the fence the erasure leaves and
    * writes nothing more (erasure-fence.ts).
@@ -278,14 +291,10 @@ export async function subjectRuns(storage: Storage, resourceId: string, opts: { 
   // (`keysetRunPage`); elsewhere the listing's own filter over every run.
   const mine = await listRunsWhere(runs, { resourceId });
   if (mine === undefined) throw new Error('@gnldev/durable: subjectRuns needs a journal that lists runs by owner (listRunsPaged)');
-  const out: SubjectRun[] = [];
-  for (const r of mine) {
-    if (outside && isOrganizationKey(r.runId)) continue;
-    const outcome = await runs.get<{ status?: unknown }>(runKeys.outcome(r.runId));
-    const inFlight = outcome?.status === 'running' || (await hasRunningClaim(runs, r.runId));
-    out.push({ runId: r.runId, ...(r.threadId ? { threadId: r.threadId } : {}), inFlight });
-  }
-  return out;
+  const theirs = mine.filter((r) => !(outside && isOrganizationKey(r.runId)));
+  // The engine's one rule for "may still write" (model.ts `runsInFlight`): a run parked on a person is not.
+  const inFlight = new Set(await runsInFlight(runs, theirs));
+  return theirs.map((r) => ({ runId: r.runId, ...(r.threadId ? { threadId: r.threadId } : {}), inFlight: inFlight.has(r.runId) }));
 }
 
 /**
@@ -315,10 +324,9 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
     );
   }
   // NOT A SNAPSHOT: a run of this person in flight while this runs may write after it returns — what it
-  // writes into its own run it deletes again on meeting the fence each run deletion leaves
-  // (erasure-fence.ts); what it writes outside its run, in the moment between its last read of the fence
-  // and the fence's write, it does not. See `subjectRuns` for the order that closes that (revoke, wait or
-  // cancel, erase, check again).
+  // writes it takes back on meeting the fence each run deletion leaves (its own run, the turn it
+  // appended to its thread — erasure-fence.ts). See `subjectRuns` for the order that keeps a turn from
+  // starting at all (revoke, wait or cancel, erase, check again).
   const home = memoryHome(storage, opts.memory);
   const journal = toJournal(storage.runs);
   if (typeof journal.deletePrefix !== 'function') throw new Error('@gnldev/durable: eraseSubject needs a journal that can deletePrefix');

@@ -144,6 +144,7 @@ yourApp.mount('/gnl', gnlApi);
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { app as api, studio } from './app.js';
+import { drainOnSignal } from '@gnldev/durable';
 
 const server = new Hono();
 server.mount('/studio', studio);
@@ -153,6 +154,11 @@ server.mount('/', api);
 // binds every interface, which for a Studio without auth is an admin surface offered to the network.
 serve({ fetch: server.fetch, port: Number(process.env.PORT ?? 3000), hostname: process.env.HOST ?? '127.0.0.1' });
 console.log('→ http://localhost:' + (process.env.PORT ?? 3000) + '/studio');
+
+// SIGTERM (pm2, Kubernetes, systemd): finish the work in hand — the running tool, the queue job —
+// take none, then exit. New requests get 503 meanwhile. ecosystem.config.cjs waits longer than the
+// drain before it kills; give any other process manager the same margin.
+drainOnSignal();
 `,
   },
   {
@@ -180,6 +186,7 @@ if (req.url?.startsWith('/gnl')) {
 import { createServer } from 'node:http';
 import { toNodeHandler } from '@gnldev/server/node';
 import { app as api, studio } from './app.js';
+import { drainOnSignal } from '@gnldev/durable';
 
 const studioNode = toNodeHandler(studio as never);
 const apiNode = toNodeHandler(api);
@@ -193,6 +200,11 @@ createServer((req, res) => {
   return apiNode(req, res);
 }).listen(port, process.env.HOST ?? '127.0.0.1'); // loopback by default — HOST=0.0.0.0 for containers
 console.log('→ http://localhost:' + port + '/studio');
+
+// SIGTERM (pm2, Kubernetes, systemd): finish the work in hand — the running tool, the queue job —
+// take none, then exit. New requests get 503 meanwhile. ecosystem.config.cjs waits longer than the
+// drain before it kills; give any other process manager the same margin.
+drainOnSignal();
 `,
   },
   {
@@ -216,6 +228,7 @@ yourApp.use('/gnl', toNodeHandler(gnlApi));
 import express from 'express';
 import { toNodeHandler } from '@gnldev/server/node';
 import { app as api, studio } from './app.js';
+import { drainOnSignal } from '@gnldev/durable';
 
 const server = express();
 
@@ -229,6 +242,11 @@ server.use('/', toNodeHandler(api));
 const port = Number(process.env.PORT ?? 3000);
 server.listen(port, process.env.HOST ?? '127.0.0.1'); // loopback by default — HOST=0.0.0.0 for containers
 console.log('→ http://localhost:' + port + '/studio');
+
+// SIGTERM (pm2, Kubernetes, systemd): finish the work in hand — the running tool, the queue job —
+// take none, then exit. New requests get 503 meanwhile. ecosystem.config.cjs waits longer than the
+// drain before it kills; give any other process manager the same margin.
+drainOnSignal();
 `,
   },
   {
@@ -255,6 +273,7 @@ import Fastify from 'fastify';
 import middie from '@fastify/middie';
 import { toNodeHandler } from '@gnldev/server/node';
 import { app as api, studio } from './app.js';
+import { drainOnSignal } from '@gnldev/durable';
 
 const server = Fastify();
 await server.register(middie);
@@ -271,6 +290,11 @@ server.use((req: { url?: string }, res: unknown, next: () => void) =>
 const port = Number(process.env.PORT ?? 3000);
 await server.listen({ port, host: process.env.HOST ?? '127.0.0.1' }); // loopback by default — HOST=0.0.0.0 for containers
 console.log('→ http://localhost:' + port + '/studio');
+
+// SIGTERM (pm2, Kubernetes, systemd): finish the work in hand — the running tool, the queue job —
+// take none, then exit. New requests get 503 meanwhile. ecosystem.config.cjs waits longer than the
+// drain before it kills; give any other process manager the same margin.
+drainOnSignal();
 `,
   },
   {
@@ -315,6 +339,7 @@ import Koa from 'koa';
 import c2k from 'koa-connect';
 import { toNodeHandler } from '@gnldev/server/node';
 import { app as api, studio } from './app.js';
+import { drainOnSignal } from '@gnldev/durable';
 
 const studioNode = toNodeHandler(studio as never);
 const apiNode = toNodeHandler(api);
@@ -336,6 +361,11 @@ server.use(c2k((req: { url?: string }, res: unknown, _next: () => void) => {
 const port = Number(process.env.PORT ?? 3000);
 server.listen(port, process.env.HOST ?? '127.0.0.1'); // loopback by default — HOST=0.0.0.0 for containers
 console.log('→ http://localhost:' + port + '/studio');
+
+// SIGTERM (pm2, Kubernetes, systemd): finish the work in hand — the running tool, the queue job —
+// take none, then exit. New requests get 503 meanwhile. ecosystem.config.cjs waits longer than the
+// drain before it kills; give any other process manager the same margin.
+drainOnSignal();
 `,
   },
   {
@@ -360,6 +390,7 @@ import { NestFactory } from '@nestjs/core';
 import { Module } from '@nestjs/common';
 import { toNodeHandler } from '@gnldev/server/node';
 import { app as api, studio } from './app.js';
+import { drainOnSignal } from '@gnldev/durable';
 
 @Module({ controllers: [], providers: [] })
 class AppModule {}
@@ -374,11 +405,39 @@ server.use((req: { url?: string }, res: unknown, next: () => void) =>
 const port = Number(process.env.PORT ?? 3000);
 await server.listen(port, process.env.HOST ?? '127.0.0.1'); // loopback by default — HOST=0.0.0.0 for containers
 console.log('→ http://localhost:' + port + '/studio');
+
+// SIGTERM (pm2, Kubernetes, systemd): finish the work in hand — the running tool, the queue job —
+// take none, then exit. New requests get 503 meanwhile. ecosystem.config.cjs waits longer than the
+// drain before it kills; give any other process manager the same margin.
+drainOnSignal();
 `,
   },
 ];
 
 export const HOST_IDS: readonly string[] = HOSTS.map((h) => h.id);
+
+/**
+ * The pm2 config written next to `src/server.ts` (own mode). `kill_timeout` is what matters: pm2 waits
+ * that long after SIGTERM before it kills, and its default (1.6 s) cuts the drain off — the tool or
+ * job in hand dies mid-way and runs again elsewhere. It waits longer than the drain's deadline.
+ */
+export function pm2Config(drainDeadlineMs: number): string {
+  return `// pm2 start ecosystem.config.cjs — written by \`gnl init\`.
+//
+// kill_timeout: how long pm2 waits after SIGTERM before it kills. src/server.ts drains on SIGTERM
+// (drainOnSignal): the work in hand finishes, none is taken, then the process exits — up to
+// ${drainDeadlineMs / 1000} s. pm2's own default is 1.6 s, which kills it mid-drain. Keep this above the drain.
+module.exports = {
+  apps: [{
+    name: 'gnl-app',
+    script: 'src/server.ts',
+    interpreter: 'node',
+    interpreter_args: '--import tsx',
+    kill_timeout: ${drainDeadlineMs + 5_000},
+  }],
+};
+`;
+}
 
 /**
  * The server-neutral half — written whenever a host is chosen.

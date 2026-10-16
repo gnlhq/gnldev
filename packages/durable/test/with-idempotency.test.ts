@@ -137,12 +137,13 @@ describe('the remedy named when a failed side effect is refused', () => {
   });
 
   it('still offers approvals to a run that HAS them, even when its runId looks like a key prefix', async () => {
-    // `xrun` is a legal runId. Keyed off the window rather than the key text, this is an ordinary
-    // run-scoped claim and approvals are exactly the right answer.
+    // `xrun-1` is a legal runId whose keys start like the cross-run family's (`xrun` itself is a
+    // reserved key root, refused at the run's birth). Keyed off the window rather than the key text,
+    // this is an ordinary run-scoped claim and approvals are exactly the right answer.
     const { durableTool } = await import('../src/durable-tool.js');
     const journal = new InMemoryJournal();
     const make = (fail: boolean) => ({
-      charge: durableTool(failing(fail) as never, { journal, runId: 'xrun' } as never, 'charge'),
+      charge: durableTool(failing(fail) as never, { journal, runId: 'xrun-1' } as never, 'charge'),
     });
     const msg = await refusalFrom(make as never);
 

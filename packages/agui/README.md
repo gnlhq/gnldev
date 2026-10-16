@@ -257,7 +257,7 @@ All eight are `CALLER_CONFLICT_CODES` in `@gnldev/durable`, and this route retur
 
 | Code | Status | `resumable` | Means |
 | --- | --- | --- | --- |
-| `run_busy` | 409 | yes | The same run is executing right now. The **only** code that also sends `Retry-After: 5`. |
+| `run_busy` | 409 | yes | A tool call (or a workflow run) is being executed by another executor right now — a second call for an agent run follows it instead. The **only** code that also sends `Retry-After: 5`. |
 | `side_effect_retry_blocked` | 409 | yes | A side effect's outcome is unknown; the engine refuses to guess. |
 | `step_retry_blocked` | 409 | yes | A workflow step's side-effect claim was refused for the same reason. |
 | `retry_limit_exceeded` | 422 | **no** | Retries are spent. 422 and no flag, because waiting is exactly what will not help. |

@@ -7,6 +7,7 @@
 // way the README describes, which is a thing no test in this suite had been doing.
 import { describe, it, expect } from 'vitest';
 import { runDurable, registerModelProvider, InMemoryStorage } from '../src/index.js';
+import { streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 
@@ -17,9 +18,7 @@ function scriptedModel(text: string) {
     modelId: 'scripted',
     supportedUrls: {},
     doGenerate: async () => ({ content: [{ type: 'text', text }], finishReason: 'stop', usage, warnings: [] }),
-    doStream: async () => {
-      throw new Error('generate-only');
-    },
+    doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
   } as any;
 }
 

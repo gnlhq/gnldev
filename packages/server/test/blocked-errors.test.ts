@@ -22,9 +22,6 @@ function stubbornModel(): any {
       usage,
       warnings: [],
     }),
-    doStream: async () => {
-      throw new Error('no stream');
-    },
   };
 }
 

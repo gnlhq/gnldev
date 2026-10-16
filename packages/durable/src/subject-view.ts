@@ -25,6 +25,8 @@
  *
  * Staff never get this view: operators work across their scope by design.
  */
+import { leafSuffix } from './run-id-grammar.js';
+import { runRecordKey } from './run-id-grammar.js';
 import type { Journal, JournalReader, RunSummary } from './journal.js';
 import type { Memory } from './memory.js';
 import { recordOwner, userIdOf, type SubjectViewBrand } from './run-identity.js';
@@ -32,6 +34,7 @@ import { threadOwnerOf } from './thread-owner.js';
 import { isOrganizationKey } from './organization.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { SUBJECT_JOURNAL_NAMES, SUBJECT_MEMORY_NAMES } from './option-names.js';
+import { hidingView, type Listed } from './journal-view.js';
 
 /** @gnldev/workflow's run registry: one `wfrun:<runId>` row per workflow run. */
 const WF_REGISTRY = 'wfrun:';
@@ -51,7 +54,7 @@ export interface SubjectMemoryOptions extends SubjectViewOptions {
   journal: Journal;
 }
 
-/** A forwarding view: overrides win, everything else is the target's own, bound to the target. */
+/** A forwarding view (the memory's): overrides win, everything else is the target's own, bound to the target. */
 function view<T extends object>(target: T, overrides: Record<PropertyKey, unknown>): T {
   return new Proxy(target, {
     get(t, prop) {
@@ -75,7 +78,7 @@ export function withSubjectJournal<J extends Journal & Partial<JournalReader>>(j
   const inputOf = (runId: string) => {
     let p = owners.get(runId);
     if (!p) {
-      p = journal.get(`${runId}:input`).then((v) => (v === undefined ? undefined : { owner: userIdOf(recordOwner(v)) }), () => 'error' as const);
+      p = journal.get(runRecordKey(runId, 'input')).then((v) => (v === undefined ? undefined : { owner: userIdOf(recordOwner(v)) }), () => 'error' as const);
       owners.set(runId, p);
     }
     return p;
@@ -87,16 +90,22 @@ export function withSubjectJournal<J extends Journal & Partial<JournalReader>>(j
   const mine = async (runId: string) => !foreignKey(runId) && (await ownerOf(runId)) === subject;
   // Every run `key` could belong to: each ':'-bounded prefix that has a frozen input. A registry row
   // (`wfrun:<runId>`) is its run's, so it is read as if it were `<runId>:`.
-  // `listed`: a listing already in hand. A candidate run whose `:input` key falls inside the listed
+  // `listed`: a whole listing already in hand. A candidate run whose `:input` key falls inside the listed
   // range EXISTS only if the listing holds that key — answered without a read, so a 400-key listing of
   // one run costs one owner read, not one per key per ':'.
-  const keyIsMine = async (key: string, listed?: { prefix: string; inputs: Set<string> }): Promise<boolean> => {
+  const inputsOf = new WeakMap<Listed, Set<string>>();
+  const listedInputs = (listed: Listed) => {
+    let set = inputsOf.get(listed);
+    if (!set) inputsOf.set(listed, (set = new Set(listed.keys.filter((k) => k.endsWith(leafSuffix('input'))).map((k) => k.slice(0, -leafSuffix('input').length)))));
+    return set;
+  };
+  const keyIsMine = async (key: string, listed?: Listed): Promise<boolean> => {
     if (foreignKey(key)) return false;
     const base = key.startsWith(WF_REGISTRY) ? `${key.slice(WF_REGISTRY.length)}:` : key;
     let claimed = false;
     for (let i = base.indexOf(':'); i > 0; i = base.indexOf(':', i + 1)) {
       const runId = base.slice(0, i);
-      if (listed && `${runId}:input`.startsWith(listed.prefix) && !listed.inputs.has(runId)) continue;
+      if (listed && runRecordKey(runId, 'input').startsWith(listed.prefix) && !listedInputs(listed).has(runId)) continue;
       const input = await inputOf(runId);
       if (input === 'error') return false;
       if (input === undefined) continue;
@@ -106,35 +115,31 @@ export function withSubjectJournal<J extends Journal & Partial<JournalReader>>(j
     return claimed;
   };
   const visible = (r: RunSummary) => r.resourceId === subject && !foreignKey(r.runId);
-  return view(journal, {
+  // Every read by key follows `keyIsMine` (journal-view.ts); the reads by run are answered here.
+  return hidingView(journal, {
+    hides: async (key, listed) => !(await keyIsMine(key, listed)),
+    hidesPrefix: foreignKey,
     // The brand: decisions (run-identity.ts, cancelWorkflowRun) refuse a view at runtime too.
-    __gnlSubjectView: true,
-    get: async (key: string) => ((await keyIsMine(key)) ? journal.get(key) : undefined),
-    listKeys: journal.listKeys
-      ? async (prefix: string) => {
-          const out: string[] = [];
-          const keys = await journal.listKeys!(prefix);
-          const listed = { prefix, inputs: new Set(keys.filter((k) => k.endsWith(':input')).map((k) => k.slice(0, -':input'.length))) };
-          for (const k of keys) if (await keyIsMine(k, listed)) out.push(k);
-          return out;
-        }
-      : undefined,
-    readRun: journal.readRun ? async (runId: string) => ((await mine(runId)) ? journal.readRun!(runId) : []) : undefined,
-    readRunStats: journal.readRunStats
-      ? async (runId: string) => ((await mine(runId)) ? journal.readRunStats!(runId) : { entries: 0, bytes: 0 })
-      : undefined,
-    listRuns: journal.listRuns ? async () => (await journal.listRuns!()).filter(visible) : undefined,
-    listRunsPaged: journal.listRunsPaged
-      ? async (q?: Parameters<NonNullable<JournalReader['listRunsPaged']>>[0]) => {
-          const page = await journal.listRunsPaged!({ ...q, resourceId: subject });
-          return { ...page, items: page.items.filter(visible) };
-        }
-      : undefined,
-    // A count across every owner is exactly what this view withholds — and so is a feed of every
-    // owner's changed runs.
-    countRunsByStatus: undefined,
-    countRuns: undefined,
-    listRunsChangedSince: undefined,
+    marks: { __gnlSubjectView: true },
+    runs: {
+      readRun: journal.readRun ? async (runId: string) => ((await mine(runId)) ? journal.readRun!(runId) : []) : undefined,
+      readRunStats: journal.readRunStats
+        ? async (runId: string) => ((await mine(runId)) ? journal.readRunStats!(runId) : { entries: 0, bytes: 0 })
+        : undefined,
+      listRuns: journal.listRuns ? async () => (await journal.listRuns!()).filter(visible) : undefined,
+      listRunsPaged: journal.listRunsPaged
+        ? async (q?: Parameters<NonNullable<JournalReader['listRunsPaged']>>[0]) => {
+            const page = await journal.listRunsPaged!({ ...q, resourceId: subject });
+            return { ...page, items: page.items.filter(visible) };
+          }
+        : undefined,
+      // A count across every owner is exactly what this view withholds — and so is a feed of every
+      // owner's changed runs, or every owner's quiet runs.
+      countRunsByStatus: undefined,
+      countRuns: undefined,
+      listRunsChangedSince: undefined,
+      listStaleRuns: undefined,
+    },
   }) as J & SubjectViewBrand;
 }
 

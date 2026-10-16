@@ -16,6 +16,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { runDurable, InMemoryStorage } from '../src/index.js';
 import { tool } from 'ai';
 import { z } from 'zod';
+import { streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 
@@ -39,7 +40,7 @@ function twoIdenticalCallsInOneStep() {
       }
       return { content: [{ type: 'text', text: 'done' }], finishReason: 'stop', usage, warnings: [] };
     },
-    doStream: async () => { throw new Error('generate-only'); },
+    doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
   } as any;
 }
 

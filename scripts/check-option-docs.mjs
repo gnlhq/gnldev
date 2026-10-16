@@ -22,7 +22,7 @@ const BASELINE = new Set([
   'deploy/NodeAdapterOptions.onListen', 'deploy/BundleOptions.esTarget',
   'deploy/TargetOptions.exportName', 'durable/ToolCallingModelOptions.doneText',
   'durable/RunNetworkOptions.routerModel',
-  'durable/RunOptions.topP', 'durable/RunOptions.abortSignal', 'durable/LogSweepOptions.markerFor',
+  'durable/RunOptions.topP', 'durable/LogSweepOptions.markerFor',
   'durable/AssertSuiteConsistentOptions.onMismatch', 'durable/AssertSuiteConsistentOptions.fromDir',
   'evals/EvalDatasetOptions.itemTimeoutMs', 'evals/LlmJudgeOptions.sampleFields',
   'evals/TrajectoryScorerOptions.expectedTools', 'evals/TrajectoryScorerOptions.requiredTools',

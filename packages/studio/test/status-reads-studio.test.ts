@@ -16,7 +16,7 @@ const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const POLL_MS = 2000; // EVENTS_POLL_MS in server.ts
 
 function mockModel(doGenerate: (o: any) => Promise<any>): any {
-  return { specificationVersion: 'v2', provider: 'mock', modelId: 'm', supportedUrls: {}, doGenerate, doStream: async () => { throw new Error('no stream'); } };
+  return { specificationVersion: 'v2', provider: 'mock', modelId: 'm', supportedUrls: {}, doGenerate };
 }
 const toolCall = (toolName: string, toolCallId: string, args: unknown) => ({ content: [{ type: 'tool-call', toolCallId, toolName, input: JSON.stringify(args) }], finishReason: 'tool-calls', usage, warnings: [] });
 const finalText = (text: string) => ({ content: [{ type: 'text', text }], finishReason: 'stop', usage, warnings: [] });

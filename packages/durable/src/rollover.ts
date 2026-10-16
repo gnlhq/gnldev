@@ -8,7 +8,7 @@
 // (purge/sweep is a separate decision, see retention.ts).
 //
 // PATTERN (long-lived agent):
-//   1. Period N runs:              await runDurable({ runId: 'agent', journal, model, tools, ... })
+//   1. Period N runs:              await runDurable({ runId: 'assistant', journal, model, tools, ... })
 //   2. Period close:               const r = await rolloverRun(journal, 'agent')          // → 'agent@2'
 //   3. Period N+1 continuation (plain): await resumeRun(r.newRunId, { journal, model, tools }) // from :input seed
 // or explicitly:            await runDurable({ runId: r.newRunId, journal, model, tools, messages: r.messages })
@@ -29,7 +29,8 @@
 // (filling in toolName, typing `output` as `{type:'json'|'text', value}`, parsing the tool-call
 // `input` JSON string into an object). "Carried over exactly" is at the content level, not the byte level.
 import { runKeys, claim } from './journal.js';
-import { derivedRunIdBase, executionRunId, parseDerivedRunId, rawInputFingerprint } from './hash.js';
+import { executionRunId, rawInputFingerprint } from './hash.js';
+import { derivedRunIdBase, parseDerivedRunId, runRecordKey, minted, withMintOf } from './run-id-grammar.js';
 import type { WorkScope } from './hash.js';
 import { upgradeFormat } from './format.js';
 import { runOwnerOf, claimRunOwner, UNKNOWN } from './run-identity.js';
@@ -59,7 +60,7 @@ export interface RolloverResult {
 }
 
 /** Handoff marker on the old run: `${runId}:rollover` → `{ to, at }` (invisible to parseJournalKey). */
-export const rolloverKey = (runId: string) => `${runId}:rollover`;
+export const rolloverKey = (runId: string) => runRecordKey(runId, 'rollover');
 
 /**
  * The next period's id — TWO REGIMES, deliberately (§4, condition 5).
@@ -191,21 +192,18 @@ export async function rolloverRun(journal: Journal, runId: string, opts?: Rollov
     );
   }
 
-  // 1) Determine the target deterministically: the marker claim's winner writes the target; the loser reads the EXISTING target.
+  // 1) The target. A handoff already decided (the marker under the source) is reported as it is — the
+  // idempotent second call. Otherwise this call's candidate is BORN first and the marker decides after:
+  // the next period's first write is its birth (claimRunOwner, which holds the run-id gate), so a
+  // refused id leaves nothing behind — not even a marker pointing at it.
   const candidate = opts?.newRunId ?? (await pickNextRunId(journal, runId));
-  let newRunId = candidate;
-  if (!(await claim(journal, rolloverKey(runId), { to: candidate, at: Date.now() }))) {
-    const existing = await journal.get<{ to: string }>(rolloverKey(runId));
-    if (!existing?.to) throw new Error(`@gnldev/durable: the '${rolloverKey(runId)}' marker could not be read (corrupt record?).`);
-    newRunId = existing.to;
-  }
-
-  // 2) If the seed already exists → no-op: report the existing seed exactly WITHOUT OVERWRITING it (idempotent second call).
-  const inputKey = runKeys.input(newRunId);
-  const already = await journal.get<{ messages?: unknown[] }>(inputKey);
-  if (already !== undefined) {
-    const msgs = Array.isArray(already.messages) ? already.messages : [];
-    return { newRunId, seededMessages: msgs.length, messages: msgs };
+  const decided = await journal.get<{ to?: string }>(rolloverKey(runId));
+  if (decided?.to) {
+    const already = await journal.get<{ messages?: unknown[] }>(runKeys.input(decided.to));
+    if (already !== undefined) {
+      const msgs = Array.isArray(already.messages) ? already.messages : [];
+      return { newRunId: decided.to, seededMessages: msgs.length, messages: msgs };
+    }
   }
 
   // 3) Materialize the old run's final state (input + all model/tool steps).
@@ -276,9 +274,21 @@ export async function rolloverRun(journal: Journal, runId: string, opts?: Rollov
     ...(oldInput?.origin !== undefined ? { origin: oldInput.origin } : {}),
   };
   // Born through the one start point (claimRunOwner): the owner is the SOURCE's, ownerless included.
-  // First write wins; the loser of a race reports the winner's seed.
-  await claimRunOwner(journal, newRunId, src.state === 'owned' ? src.owner : UNKNOWN, seed);
-  const winner = await journal.get<{ messages?: unknown[] }>(inputKey);
+  // First write wins; the loser of a race reports the winner's seed. An id this function picked itself
+  // (`<runId>@<n>`, `run1_…#<n>`) is the engine's and carries its mark; an explicit `newRunId` is a
+  // caller's spelling and is judged like any other.
+  const owner = src.state === 'owned' ? src.owner : UNKNOWN;
+  const born = decided?.to ?? candidate;
+  await claimRunOwner(journal, born, owner, withMintOf({ ...seed }, decided?.to !== undefined || opts?.newRunId === undefined ? minted({ runId: born }) : {}));
+  // 5) The handoff: the marker's winner names the next period. A racer that lost (two explicit ids at
+  // once) reports the winner's; the id it birthed holds a seed nothing points to.
+  let newRunId = born;
+  if (decided?.to === undefined && !(await claim(journal, rolloverKey(runId), { to: born, at: Date.now() }))) {
+    const existing = await journal.get<{ to: string }>(rolloverKey(runId));
+    if (!existing?.to) throw new Error(`@gnldev/durable: the '${rolloverKey(runId)}' marker could not be read (corrupt record?).`);
+    newRunId = existing.to;
+  }
+  const winner = await journal.get<{ messages?: unknown[] }>(runKeys.input(newRunId));
   const msgs = Array.isArray(winner?.messages) ? winner!.messages! : [];
   return { newRunId, seededMessages: msgs.length, messages: msgs };
 }

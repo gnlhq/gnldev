@@ -2,9 +2,9 @@
 // step N from journal entries. forkRun: copy a prefix to a new runId → continue LIVE from step N
 // (snapshot-based durability layers cannot do this structurally with an opaque snapshot).
 import { runKeys } from './journal.js';
-import { argsHash, derivedRunIdBase, forkRunId } from './hash.js';
+import { argsHash, forkRunId } from './hash.js';
 import { assertNotCompensated } from './compensation.js';
-import { assertRunIdSafe } from './run.js';
+import { derivedRunIdBase, rerunRunId, minted, withMintOf } from './run-id-grammar.js';
 import { inheritRunOwner } from './run-identity.js';
 import type { Journal, JournalReader, JournalEntry } from './journal.js';
 
@@ -263,12 +263,28 @@ async function namespaceTaken(journal: Journal, runId: string): Promise<boolean>
  */
 async function pickForkRunId(journal: Journal, srcRunId: string): Promise<string> {
   const base = derivedRunIdBase(srcRunId);
-  if (base === undefined) return `${srcRunId}:fork:${Date.now()}`;
+  if (base === undefined) return rerunRunId(srcRunId, 'fork', Date.now());
   for (let n = 1; n < 10_000; n++) {
     const cand = forkRunId(base, n);
     if (!(await namespaceTaken(journal, cand))) return cand;
   }
   throw new Error(`@gnldev/durable: forkRun could not find a free fork number (all '${base}#fork-<n>' are taken).`);
+}
+
+/**
+ * A fork's birth — the one every fork path takes (`forkRun`, Studio's workflow fork): its owner record,
+ * the source's, written through the one birth (`claimRunOwner`, which holds the run-id gate) before a
+ * single row is copied. A crash after it leaves a fork that belongs to the source's owner however far the copy got.
+ *
+ * `newRunId` given → the caller's id, admitted as any caller's (a family only the engine begins —
+ * `agent:`, `task:`… — is refused: pick another id). Omitted → `pickForkRunId` builds it, and the
+ * engine begins it: a fork of a sub-agent's run (`agent:<p>:<c>:fork:<ts>`) keeps its source's family.
+ * Returns the fork's id.
+ */
+export async function beginFork(journal: Journal, srcRunId: string, newRunId?: string, fields: Record<string, unknown> = {}): Promise<string> {
+  const dst = newRunId !== undefined ? { runId: newRunId } : minted({ runId: await pickForkRunId(journal, srcRunId) });
+  await inheritRunOwner(journal, srcRunId, dst.runId, withMintOf({ ...fields }, dst));
+  return dst.runId;
 }
 
 /**
@@ -298,14 +314,12 @@ export async function forkRun(
   // A fork of a COMPENSATED run is the same hazard class as resuming it — the copy
   // would replay memoized successes of side effects that were UNWOUND (the tombstone is a proc key,
   // invisible to readRun, so the copy itself would silently drop it) → refuse at the source.
-  if (newRunId !== undefined) assertRunIdSafe(newRunId);
   await assertNotCompensated(journal, srcRunId);
-  const dst = newRunId ?? (await pickForkRunId(journal, srcRunId));
-  // THE OWNER FIRST. The rows below are copied one by one and the source's input last; a crash in
-  // between used to leave a fork with the source's rows and no owner record — i.e. an ownerless run
-  // that the next end user to name it took over (measured: another user read the source's secret).
-  // Written before the first row, the fork belongs to the source's owner however far the copy got.
-  await inheritRunOwner(journal, srcRunId, dst);
+  // THE OWNER FIRST (beginFork, which also admits the fork's id). The rows below are copied one by one
+  // and the source's input last; a crash in between used to leave a fork with the source's rows and no
+  // owner record — i.e. an ownerless run that the next end user to name it took over (measured: another
+  // user read the source's secret).
+  const dst = await beginFork(journal, srcRunId, newRunId);
   const entries = await journal.readRun(srcRunId);
   const models = entries.filter((e) => e.kind === 'model');
   const keep = models.slice(0, Math.max(0, step)); // first `step` model steps

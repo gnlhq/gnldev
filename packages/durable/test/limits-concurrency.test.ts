@@ -12,11 +12,13 @@
 import { describe, it, expect } from 'vitest';
 import { InMemoryJournal } from '../src/journal.js';
 import { checkToolGate, recordToolOutcome } from '../src/limits.js';
+import { claimRunOwner, STAFF } from '../src/run-identity.js';
 
 describe('AUDIT Finding A — recordToolOutcome does NOT lose updates under concurrency', () => {
   it('10 parallel recordToolOutcome (succeeded) → succeededToolCalls EXACTLY 10 (no lost update)', async () => {
     const journal = new InMemoryJournal();
     const runId = 'concurrent-run';
+    await claimRunOwner(journal, runId, STAFF); // the limits state is the run's record: the run exists
 
     // Seed: create the state FIRST with a SEPARATE (NOT succeeded) call — so that all 10 parallel
     // calls below fall into the "state already exists" (steady-state) path; this is the ACTUAL
@@ -46,6 +48,7 @@ describe('AUDIT Finding A — recordToolOutcome does NOT lose updates under conc
   it('20 concurrent calls mixing succeeded + failed → only succeeded ones are counted, none is lost', async () => {
     const journal = new InMemoryJournal();
     const runId = 'concurrent-run-2';
+    await claimRunOwner(journal, runId, STAFF); // the limits state is the run's record: the run exists
     await recordToolOutcome(journal, runId, 'seed', 'noop', 'h-seed', 'denied');
 
     const calls = Array.from({ length: 20 }, (_, i) =>

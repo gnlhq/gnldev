@@ -19,7 +19,6 @@ function mkModel(tokens = 10): any {
       usage: { inputTokens: tokens / 2, outputTokens: tokens / 2, totalTokens: tokens },
       warnings: [],
     }),
-    doStream: async () => { throw new Error('no stream'); },
   };
 }
 
@@ -287,7 +286,6 @@ describe('@gnldev/server budget enforcement', () => {
           }
           return { content: [{ type: 'text', text: 'Done.' }], finishReason: 'stop', usage, warnings: [] };
         },
-        doStream: async () => { throw new Error('no stream'); },
       };
     }
 

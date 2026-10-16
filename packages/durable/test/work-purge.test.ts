@@ -8,7 +8,7 @@
 // rows on Postgres is worse than no purge — the operator has a green run and a live record.
 import { describe, it, expect } from 'vitest';
 import { newDb } from 'pg-mem';
-import { InMemoryStorage, purgeOrganization, purgeOrganizationWork, withOrgStorage, toJournal } from '../src/index.js';
+import { InMemoryStorage, purgeOrganization, withOrgStorage, toJournal } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import type { Storage } from '../src/index.js';
@@ -64,7 +64,7 @@ for (const [name, make] of backends) {
   });
 }
 
-describe('purgeOrganizationWork — the runbook half', () => {
+describe('purgeOrganization — the work store half of an organization', () => {
   it('erases an org through the SCOPED storage the deployment actually writes through', async () => {
     const root = new InMemoryStorage();
     // withOrgStorage is how a deployment addresses one tenant; the purge is expressed on the ROOT
@@ -75,24 +75,28 @@ describe('purgeOrganizationWork — the runbook half', () => {
     await acme.work.put('qdone:j1', true);
     await other.work.append('events:order', { id: 2 }, 'e2');
 
-    const n = await purgeOrganizationWork(root.work, 'acme');
-    expect(n).toBeGreaterThan(0);
+    const { deleted } = await purgeOrganization(root, 'acme');
+    expect(deleted).toBeGreaterThan(0);
     expect((await acme.work.list('events:order')).items).toHaveLength(0);
     expect(await acme.work.get('qdone:j1')).toBeUndefined();
     expect((await other.work.list('events:order')).items).toHaveLength(1);
   });
 
-  it('THROWS on a WorkStore without deletePrefix — an erasure may not report a silent success', async () => {
-    const bare = { append: async () => 'x', list: async () => ({ items: [] }), get: async () => undefined, put: async () => {}, ackOnce: async () => true };
-    await expect(purgeOrganizationWork(bare as never, 'acme')).rejects.toThrow(/deletePrefix/);
-  });
-
-  it("rejects an org id containing ':' — the same boundary rule as the journal half", async () => {
+  it('REFUSES, deleting nothing, a storage whose WorkStore cannot deletePrefix — an erasure may not report a silent success', async () => {
     const root = new InMemoryStorage();
-    await expect(purgeOrganizationWork(root.work, 'a:b')).rejects.toThrow(/must not contain/);
+    await withOrgStorage(root, 'acme').runs.put('r1:model:0', { v: 1 });
+    const bare = { append: async () => 'x', list: async () => ({ items: [] }), get: async () => undefined, put: async () => {}, ackOnce: async () => true };
+    (root as { work: unknown }).work = bare;
+    await expect(purgeOrganization(root, 'acme')).rejects.toThrow(/deleted nothing: its work store cannot `deletePrefix`/);
+    expect(await root.runs.get('org:acme:r1:model:0')).toEqual({ v: 1 });
   });
 
-  it('journal half + work half together leave nothing of the organization', async () => {
+  it("rejects an org id containing ':' — the same boundary rule for every store", async () => {
+    const root = new InMemoryStorage();
+    await expect(purgeOrganization(root, 'a:b')).rejects.toThrow(/must not contain/);
+  });
+
+  it('one call leaves nothing of the organization in the journal or the work store', async () => {
     const root = new InMemoryStorage();
     const acme = withOrgStorage(root, 'acme');
     const journal = toJournal(acme.runs);
@@ -100,8 +104,7 @@ describe('purgeOrganizationWork — the runbook half', () => {
     await acme.work.append('jobs:mail', { to: 'a@b' }, 'j1');
     await acme.work.put('qdone:j1', true);
 
-    await purgeOrganization(toJournal(root.runs), 'acme');
-    await purgeOrganizationWork(root.work, 'acme');
+    await purgeOrganization(root, 'acme');
 
     expect(await journal.get('r1:model:0')).toBeUndefined();
     expect((await acme.work.list('jobs:mail')).items).toHaveLength(0);

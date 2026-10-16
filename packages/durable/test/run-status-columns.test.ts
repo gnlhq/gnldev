@@ -42,11 +42,13 @@ import { newDb } from 'pg-mem';
 import pg from 'pg';
 import { tool } from 'ai';
 import { z } from 'zod';
-import { runDurable, cancelAgentRun, forkRun, rolloverRun, createGnl, gnlTool, STAFF, stampFormat, type Storage } from '../src/index.js';
+import { runDurable, cancelAgentRun, forkRun, rolloverRun, createGnl, gnlTool, STAFF, stampFormat, inMemoryLiveness, type Storage } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
+import { claimRunOwner } from '../src/run-identity.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import * as J from '../src/journal.js';
 import type { RunStatus } from '../src/journal.js';
+import { streamFromGenerate } from './mock.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
 const PG_URL = process.env.GNL_PG_URL;
@@ -93,11 +95,15 @@ function sqliteBackend(): Backend {
   };
 }
 
+// pg-mem is a database only this process reaches, and its pool does not say where it connects: its
+// liveness is this process's (in-memory), as a store with none of its own would be told to take.
+const processLocal = (s: PostgresStorage) => Object.assign(s, { processLiveness: async () => inMemoryLiveness() });
+
 function pgMemBackend(): Backend {
   const { Pool } = newDb().adapters.createPg();
   const pool = new Pool();
   return {
-    storage: new PostgresStorage({ pool }), dialect: 'pg', real: false, page: 1000,
+    storage: processLocal(new PostgresStorage({ pool })), dialect: 'pg', real: false, page: 1000,
     async sql(text, params = []) { return (await pool.query(text, params)).rows; },
     reopen() {
       // pg-mem refuses some `CREATE … IF NOT EXISTS` for an object that exists (a table, a sequence —
@@ -107,7 +113,7 @@ function pgMemBackend(): Backend {
         if (e?.code === undefined && /^CREATE (TABLE|SEQUENCE) IF NOT EXISTS /.test(sql)) return { rows: [], rowCount: 0 };
         throw e;
       });
-      return new PostgresStorage({ pool: { query, connect: () => pool.connect(), end: async () => {} } as never });
+      return processLocal(new PostgresStorage({ pool: { query, connect: () => pool.connect(), end: async () => {} } as never }));
     },
   };
 }
@@ -138,7 +144,7 @@ if (PG_URL) BACKENDS.push(['Postgres (real)', realPgBackend]);
 
 // ── the scripted history ───────────────────────────────────────────────────────────────────────────
 const usage2 = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
-const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {}, doStream: async () => { throw new Error('gen-only'); } };
+const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {}, doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); } };
 const toolMsgs = (prompt: any) => (prompt ?? []).filter((m: any) => m?.role === 'tool').length;
 const payModel = (n: number) => ({
   ...base,
@@ -156,11 +162,13 @@ const suspendedRec = { status: 'suspended', output: { __gnl_suspend: { toolCallI
 async function fanOut(storage: Storage, runId: string, n: number): Promise<void> {
   const usage = { inputTokens: { total: 10, noCache: 10 }, outputTokens: { total: 5, text: 5 } };
   const fin = (r: string) => ({ unified: r, raw: r });
-  const mock = (f: (o: any) => Promise<any>) => ({ specificationVersion: 'v4', provider: 'mock', modelId: 'm', supportedUrls: {}, doGenerate: f, doStream: async () => { throw new Error('x'); } }) as any;
+  const mock = (f: (o: any) => Promise<any>) => ({ specificationVersion: 'v4', provider: 'mock', modelId: 'm', supportedUrls: {}, doGenerate: f, doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); } }) as any;
   const t = gnlTool({ description: 't', inputSchema: z.object({}).passthrough(), execute: async () => ({ ok: true }) }, { sideEffect: true });
-  const parent = mock(async ({ prompt }) => (toolMsgs(prompt) > 0
+  // One sub-agent per step: two called in one step run side by side, and which is born first — the
+  // listing's order (created_at, run_id) — is then up to the scheduler (seen under the real-PG gate's load).
+  const parent = mock(async ({ prompt }) => (toolMsgs(prompt) >= n
     ? { content: [{ type: 'text', text: 'ok' }], finishReason: fin('stop'), usage, warnings: [] }
-    : { content: Array.from({ length: n }, (_, i) => ({ type: 'tool-call', toolCallId: `p${i}`, toolName: 'agent_w', input: JSON.stringify({ task: `w${i}` }) })), finishReason: fin('tool-calls'), usage, warnings: [] }));
+    : { content: [{ type: 'tool-call', toolCallId: `p${toolMsgs(prompt)}`, toolName: 'agent_w', input: JSON.stringify({ task: `w${toolMsgs(prompt)}` }) }], finishReason: fin('tool-calls'), usage, warnings: [] }));
   const w = mock(async ({ prompt }) => (toolMsgs(prompt) >= 2
     ? { content: [{ type: 'text', text: 'done' }], finishReason: fin('stop'), usage, warnings: [] }
     : { content: [{ type: 'tool-call', toolCallId: `c${toolMsgs(prompt)}`, toolName: 't', input: JSON.stringify({ k: toolMsgs(prompt), w: JSON.stringify(prompt).match(/w\d+/)![0] }) }], finishReason: fin('tool-calls'), usage, warnings: [] }));
@@ -182,7 +190,8 @@ const STEPS: Array<[string, (s: Storage) => Promise<unknown>]> = [
   ['suspended, to be canceled', (s) => runDurable({ runId: 'cs', journal: s.runs as any, model: payModel(1), tools, prompt: 'x', ...needsApproval } as any)],
   ['canceled while suspended', (s) => cancelAgentRun(s.runs as any, 'cs', { reason: 'operator' })],
   ['canceled after failed', (s) => cancelAgentRun(s.runs as any, 'fail', { reason: 'operator' })],
-  ['canceled before it started', (s) => cancelAgentRun(s.runs as any, 'never', { reason: 'operator' })],
+  // A cancel continues a run: the run is born (owner recorded), never run, then canceled.
+  ['canceled before it started', async (s) => { await claimRunOwner(s.runs as any, 'never', STAFF); await cancelAgentRun(s.runs as any, 'never', { reason: 'operator' }); }],
   ['failed (recorded)', (s) => s.runs.put('fsr:outcome', { status: 'failed', at: 1, error: 'boom' })],
   ['failed, then suspended', (s) => s.runs.put('fsr:tool:c1', suspendedRec)],
   ['failed, suspended, then resolved', (s) => s.runs.put('fsr:tool:c1', { status: 'succeeded', output: { ok: true } })],
@@ -195,12 +204,12 @@ const STEPS: Array<[string, (s: Storage) => Promise<unknown>]> = [
   }],
   ['a batch: claim suspended + failed outcome', (s) => s.runs.applyBatch!({ claim: { key: 'bat:tool:c1', value: suspendedRec }, puts: [{ key: 'bat:outcome', value: { status: 'failed', at: 1 } }] })],
   ['a batch resolves it', (s) => s.runs.applyBatch!({ puts: [{ key: 'bat:tool:c1', value: { status: 'succeeded', output: 1 } }] })],
-  ['takeover suspends a failed run (putIfMatch → recount)', async (s) => {
+  ['takeover suspends a failed run (putIfMatch)', async (s) => {
     await s.runs.put('tko:outcome', { status: 'failed', at: 1 });
     await s.runs.put('tko:tool:c1', { status: 'running', startedAt: 1 });
     await s.runs.putIfMatch!('tko:tool:c1', { status: 'running', startedAt: 1 }, suspendedRec);
   }],
-  ['takeover resolves it (putIfMatch → recount)', (s) => s.runs.putIfMatch!('tko:tool:c1', suspendedRec, { status: 'succeeded', output: 1 })],
+  ['takeover resolves it (putIfMatch)', (s) => s.runs.putIfMatch!('tko:tool:c1', suspendedRec, { status: 'succeeded', output: 1 })],
   ['fork', (s) => forkRun(s.runs as any, 'done', 1, 'done-fork')],
   ['rollover', async (s) => { await rolloverRun(s.runs as any, 'done', { newRunId: 'done-next' } as any); await runDurable({ runId: 'done-next', journal: s.runs as any, model: payModel(0), prompt: 'x', resourceId: 'ayse' } as any); }],
   ['sub-agents', (s) => fanOut(s, 'fan', 2)],
@@ -288,8 +297,8 @@ const BEFORE: Snapshot[] = [
   {step:'running replaced by completed (putIfMatch)',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed'},counts:{canceled:2,completed:4,failed:2,running:1},byStatus:{completed:['done','wait','two','pim'],suspended:[],failed:['fail','fsr'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr']},
   {step:'a batch: claim suspended + failed outcome',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'suspended'},counts:{canceled:2,completed:4,failed:2,running:1,suspended:1},byStatus:{completed:['done','wait','two','pim'],suspended:['bat'],failed:['fail','fsr'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat']},
   {step:'a batch resolves it',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed'},counts:{canceled:2,completed:4,failed:3,running:1},byStatus:{completed:['done','wait','two','pim'],suspended:[],failed:['fail','fsr','bat'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat']},
-  {step:'takeover suspends a failed run (putIfMatch → recount)',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed',tko:'suspended'},counts:{canceled:2,completed:4,failed:3,running:1,suspended:1},byStatus:{completed:['done','wait','two','pim'],suspended:['tko'],failed:['fail','fsr','bat'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat','tko']},
-  {step:'takeover resolves it (putIfMatch → recount)',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed',tko:'failed'},counts:{canceled:2,completed:4,failed:4,running:1},byStatus:{completed:['done','wait','two','pim'],suspended:[],failed:['fail','fsr','bat','tko'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat','tko']},
+  {step:'takeover suspends a failed run (putIfMatch)',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed',tko:'suspended'},counts:{canceled:2,completed:4,failed:3,running:1,suspended:1},byStatus:{completed:['done','wait','two','pim'],suspended:['tko'],failed:['fail','fsr','bat'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat','tko']},
+  {step:'takeover resolves it (putIfMatch)',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed',tko:'failed'},counts:{canceled:2,completed:4,failed:4,running:1},byStatus:{completed:['done','wait','two','pim'],suspended:[],failed:['fail','fsr','bat','tko'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat','tko']},
   {step:'fork',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed',tko:'failed','done-fork':'completed'},counts:{canceled:2,completed:5,failed:4,running:1},byStatus:{completed:['done','wait','two','pim','done-fork'],suspended:[],failed:['fail','fsr','bat','tko'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat','tko']},
   {step:'rollover',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed',tko:'failed','done-fork':'completed','done-next':'completed'},counts:{canceled:2,completed:6,failed:4,running:1},byStatus:{completed:['done','wait','two','pim','done-fork','done-next'],suspended:[],failed:['fail','fsr','bat','tko'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat','tko']},
   {step:'sub-agents',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed',tko:'failed','done-fork':'completed','done-next':'completed',fan:'completed','agent:fan:p0':'completed','agent:fan:p1':'completed'},counts:{canceled:2,completed:9,failed:4,running:1},byStatus:{completed:['done','wait','two','pim','done-fork','done-next','fan','agent:fan:p0','agent:fan:p1'],suspended:[],failed:['fail','fsr','bat','tko'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat','tko']},
@@ -452,7 +461,8 @@ for (const [name, make] of BACKENDS) {
       expect(step.pending).toBe(true);
       const plan = (step.detail as { statements: string[] }).statements.join('\n');
       expect(plan).toMatch(/gnl_runs_open/);
-      expect(plan).toMatch(/DROP COLUMN/);
+      // Postgres drops the flags; Sqlite rebuilds the table without them (its default on `status` goes too).
+      expect(plan).toMatch(b0(name) === 'pg' ? /DROP COLUMN/ : /DROP TABLE gnl_runs\b/);
       // Nothing else runs ahead of it: the schema step names it.
       await expect(s.upgrade!({ only: ['schema'] })).rejects.toThrow(/'schema' needs 'run-status' first/);
     });
@@ -499,7 +509,7 @@ for (const [name, make] of BACKENDS) {
       // The step fails on its drop of the flags — after the fill, inside its transaction — as a backend
       // killed there would (57P01). Only for this one call: the next one is the plain migration.
       const kill = (sql: unknown) => {
-        if (/^ALTER TABLE gnl_runs DROP COLUMN/.test(String(sql))) throw Object.assign(new Error('killed mid-step'), { code: '57P01' });
+        if (/^ALTER TABLE gnl_runs DROP COLUMN|^ALTER TABLE gnl_runs_rebuilt RENAME/.test(String(sql))) throw Object.assign(new Error('killed mid-step'), { code: '57P01' });
       };
       let restore: () => void;
       if (b.dialect === 'sqlite') {
@@ -563,13 +573,18 @@ for (const [name, make] of BACKENDS) {
       const b = await make();
       await oldStore(b);
       const { serialize } = await import('../src/serialize.js');
-      // An organization the earlier version registered, and a root scope it had already marked complete —
-      // so only the organization's scope is left, and only a step that sees the organization finds it.
-      for (const key of ['__org__:acme', 'thread:records:v1']) {
+      // An organization the earlier version registered, with a run on a thread, and a root scope it had
+      // already marked complete — so only the organization's scope is left, and only a step that sees the
+      // organization finds it. (A scope with no run has no older thread: it is complete as it is.)
+      for (const [key, runId, value] of [['__org__:acme', null, { at: 1 }], ['thread:records:v1', null, { at: 1 }],
+        ['org:acme:o1:input', 'org:acme:o1', { _v: 1, threadId: 't-acme', resourceId: 'dave' }]] as const) {
         await b.sql(b.dialect === 'pg'
-          ? `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at) VALUES ($1, NULL, NULL, false, $2, 1)`
-          : `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at) VALUES (?, NULL, NULL, 0, ?, 1)`, [key, serialize({ at: 1 })]);
+          ? `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at) VALUES ($1, $2, NULL, false, $3, 1)`
+          : `INSERT INTO gnl_run_journal (key, run_id, kind, suspended, value, created_at) VALUES (?, ?, NULL, 0, ?, 1)`, [key, runId, serialize(value)]);
       }
+      await b.sql(b.dialect === 'pg'
+        ? `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, failed, running, canceled, created_at, updated_at) VALUES ('org:acme:o1',0,0,false,0,true,false,false,2,2)`
+        : `INSERT INTO gnl_runs (run_id, model_steps, tool_calls, suspended, suspended_count, failed, running, canceled, created_at, updated_at) VALUES ('org:acme:o1',0,0,0,0,1,0,0,2,2)`); // failed: pg-mem fills no default into existing rows
       const s = b.reopen();
       const first = await s.upgrade!();
       expect(first.steps.find((x) => x.name === 'thread-records')!.detail).toMatchObject({ scopes: { acme: expect.anything() } });

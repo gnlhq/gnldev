@@ -17,7 +17,7 @@ import { newDb } from 'pg-mem';
 import pg from 'pg';
 import {
   InMemoryStorage, BasicMemory, composite, createGnl, scopeConfigToOrg, eraseSubject, toJournal, withOrgStorage, workingMemoryScope,
-  type Storage, type Journal,
+  type Storage, type Journal, inMemoryLiveness,
 } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
@@ -105,6 +105,9 @@ async function world(b: Backend, people: Person[]) {
   const wf = workflow<{ who: string }>().then(step('s', async (i) => ({ text: `WF|${i.who}|` })));
   const config = {
     storage,
+    // One process reaches these stores (pg-mem is in this process; the others are reached by this test
+    // alone): this process's in-memory identity is the truth, and a pg-mem pool cannot make a session.
+    liveness: inMemoryLiveness(),
     workflows: { weekly: wf },
     agents: { a: { model: model() } },
     memoryFactory: (s: Storage | Journal) => new BasicMemory(('runs' in s ? toJournal(s.runs) : s) as Journal),
@@ -126,7 +129,7 @@ async function world(b: Backend, people: Person[]) {
   // Each job runs as its owner (a job run) and fails once with an error naming them (a `qfail`).
   await createWorker(storage, {
     weekly: async (p, ctx) => { const n = (p as { note: string }).note; await ctx.run({ model: model(), prompt: `JOBRUN|${n}` }); throw new Error(`FAIL|${n}`); },
-  }, { maxAttempts: 1 }).drain();
+  }, { maxAttempts: 1, liveness: inMemoryLiveness() }).drain(); // every store here lives in this process (pg-mem included)
   // One consumer dead-letters every event (a record holding the error text), one acks.
   await createConsumer(work, 'audit', (p) => { throw new Error(`DEAD|${(p as { note: string }).note}`); }, { name: 'bad', maxAttempts: 1 }).poll();
   await createConsumer(work, 'audit', () => {}, { name: 'ok' }).poll();

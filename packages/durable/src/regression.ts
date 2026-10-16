@@ -2,13 +2,15 @@
 // (replayRun), diffs the DECISION POINTS (model step + tool call) of the two runs (diffRuns).
 // Scoring (LLM-judge etc.) lives in the evals package — only the interface is DEFINED here,
 // the diff logic has no dependency on evals whatsoever (dependency is one-directional: evals -> durable).
+import { settleModelContent } from './time-travel.js';
 import { runKeys } from './journal.js';
 import type { Journal, JournalEntry, JournalReader } from './journal.js';
 import { runDurable } from './run.js';
+import { minted, derivedRunIdBase, rerunRunId } from './run-id-grammar.js';
 import { runOwnerOf } from './run-identity.js';
 import { recordedInputProblem, type InputOrigin } from './request-body.js';
 import type { DurableResult, RunDurableArgs } from './run.js';
-import { argsHash, stableStringify, derivedRunIdBase } from './hash.js';
+import { argsHash, stableStringify } from './hash.js';
 import type { Guard } from './guard.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { REPLAY_RUN_NAMES, REGRESSION_REPORT_NAMES } from './option-names.js';
@@ -57,7 +59,7 @@ export function buildDecisionSequence(entries: JournalEntry[]): DecisionPoint[] 
   for (const m of models) {
     const step = modelStepFromKey(m.key);
     out.push({ step, kind: 'model', value: m.value });
-    const content = ((m.value as any)?.content ?? []) as any[];
+    const content = settleModelContent(m.value);
     for (const p of content) {
       if (p?.type === 'tool-call' && p.toolCallId) {
         const te = toolById.get(p.toolCallId);
@@ -116,14 +118,14 @@ function parseMaybeJSON(v: unknown): unknown {
 }
 
 function modelText(value: unknown): string {
-  return (((value as any)?.content ?? []) as any[])
+  return settleModelContent(value)
     .filter((p) => p?.type === 'text')
     .map((p) => p.text ?? '')
     .join('');
 }
 
 function modelToolCalls(value: unknown): { toolName: string; argsHash: string }[] {
-  return (((value as any)?.content ?? []) as any[])
+  return settleModelContent(value)
     .filter((p) => p?.type === 'tool-call')
     .map((p) => ({ toolName: p.toolName, argsHash: argsHash(parseMaybeJSON(p.input)) }));
 }
@@ -305,7 +307,7 @@ async function pickReplayRunId(journal: Journal, runId: string): Promise<string>
   const base = derivedRunIdBase(runId);
   for (let i = 0; i < 10_000; i++) {
     const seq = replaySeq++;
-    const cand = base === undefined ? `${runId}:replay:${seq}` : `${base}#replay-${seq}`;
+    const cand = base === undefined ? rerunRunId(runId, 'replay', seq) : `${base}#replay-${seq}`;
     if ((await journal.get(runKeys.input(cand))) === undefined) return cand;
   }
   throw new Error(`@gnldev/durable: replayRun could not find a free replay slot for '${runId}'.`);
@@ -348,7 +350,9 @@ export async function replayRun(cfg: ReplayRunConfig): Promise<ReplayRunResult> 
   const src = await runOwnerOf(journal, runId);
   if (src.state === 'unreadable') throw src.error;
 
-  const result = await runDurable({
+  // An id this function composed (no `newRunId`) is the engine's: marked, so a replay of a background
+  // call's run (`task:…`) may begin its copy. A caller's own `newRunId` is judged like any other.
+  const replayArgs = {
     runId: dst,
     journal,
     model,
@@ -362,7 +366,8 @@ export async function replayRun(cfg: ReplayRunConfig): Promise<ReplayRunResult> 
     system: system ?? (input.system as string | undefined),
     ...(src.state === 'owned' ? { caller: src.owner } : {}),
     ...(input.origin !== undefined ? { origin: input.origin } : {}),
-  } as any);
+  } as any;
+  const result = await runDurable(newRunId === undefined ? minted(replayArgs) : replayArgs);
 
   return { newRunId: dst, result };
 }

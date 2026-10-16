@@ -14,7 +14,7 @@ import { tool, stepCountIs } from 'ai';
 import { runDurable } from '../src/run.js';
 import { InMemoryJournal } from '../src/journal.js';
 import { withModelFallback } from '../src/model-router.js';
-import { countToolResults } from './mock.js';
+import { countToolResults, streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 
@@ -28,7 +28,7 @@ function modelSending(provider: string, input: Record<string, unknown>, opts: { 
       }
       return { content: [{ type: 'text', text: 'done' }], finishReason: 'stop', usage, warnings: [] };
     },
-    doStream: async () => { throw new Error('generate-only'); },
+    doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
   };
 }
 

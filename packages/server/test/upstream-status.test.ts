@@ -102,7 +102,6 @@ describe('an empty answer says so', () => {
     return {
       specificationVersion: 'v2' as const, provider: 'test', modelId: 'm', supportedUrls: {},
       async doGenerate() { return { content: [], finishReason: 'unknown' as never, usage, warnings: [] }; },
-      async doStream() { throw new Error('not used'); },
     };
   }
 

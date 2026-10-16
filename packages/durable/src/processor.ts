@@ -1,8 +1,10 @@
 // 8.7 — Processor pipeline (durability-infused). Input/output/tool transformers.
 // Principle: input processors run BEFORE persistInput → the transformed input is journaled →
 // it does NOT RUN AGAIN on resume (drift impossible). Non-deterministic processors journal via `ctx.step`.
+import { runRecordKey, runRecordPrefix } from './run-id-grammar.js';
 import { runKeys } from './journal.js';
 import type { Journal } from './journal.js';
+import { bornOnFirstWrite } from './run-identity.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { PROCESSOR_RETRY_NAMES } from './option-names.js';
 
@@ -309,10 +311,15 @@ export async function durableProcessorStep<T>(
 
 /** Builds a ProcessorCtx (binds journal + runId; wraps step with the memoize helper). */
 export function createProcessorCtx(journal: Journal, runId: string): ProcessorCtx {
+  // A processor's steps and reports are the run's records: the run is born at the first of them
+  // (run-identity.ts `bornOnFirstWrite`) — a ctx built by hand for an id nobody began does not leave
+  // rows that read as a run.
+  const ctx = { journal, runId };
+  bornOnFirstWrite(ctx);
   return {
     runId,
-    journal,
-    step: (name, compute) => durableProcessorStep(journal, runId, name, compute),
+    journal: ctx.journal,
+    step: (name, compute) => durableProcessorStep(ctx.journal, runId, name, compute),
   };
 }
 
@@ -355,7 +362,7 @@ export async function recordProcessorReport(
   findings: unknown,
 ): Promise<void> {
   try {
-    const key = `${ctx.runId}:procreport:${name}:${phase}`;
+    const key = runRecordKey(ctx.runId, 'procreport', `${name}:${phase}`);
     if ((await ctx.journal.get(key)) !== undefined) return;
     await ctx.journal.put(key, { v: { name, phase, findings, ts: Date.now() } satisfies ProcessorReport });
   } catch {
@@ -370,7 +377,7 @@ export async function recordProcessorReport(
  */
 export async function readProcessorReports(journal: Journal, runId: string): Promise<ProcessorReport[]> {
   if (typeof journal.listKeys !== 'function') return [];
-  const prefix = `${runId}:procreport:`;
+  const prefix = runRecordPrefix(runId, 'procreport');
   const keys = await journal.listKeys(prefix);
   const out: ProcessorReport[] = [];
   for (const key of keys) {

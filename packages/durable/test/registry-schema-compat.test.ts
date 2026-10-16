@@ -12,6 +12,7 @@ import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { tool } from 'ai';
 import { createGnl, InMemoryStorage } from '../src/index.js';
+import { streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 
@@ -27,9 +28,7 @@ function capturingModel(seen: { schema?: any }) {
       seen.schema = t?.jsonSchema ?? t;
       return { content: [{ type: 'text', text: 'ok' }], finishReason: 'stop', usage, warnings: [] };
     },
-    doStream: async () => {
-      throw new Error('generate-only');
-    },
+    doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
   } as any;
 }
 

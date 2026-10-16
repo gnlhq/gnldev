@@ -21,9 +21,6 @@ function chargeModel(counter: { gen: number }): any {
       if (done === 0) return { content: [{ type: 'tool-call', toolCallId: 'rc', toolName: 'charge', input: '{}' }], finishReason: 'tool-calls', usage, warnings: [] };
       return { content: [{ type: 'text', text: 'charged' }], finishReason: 'stop', usage, warnings: [] };
     },
-    doStream: async () => {
-      throw new Error('no stream');
-    },
   };
 }
 
@@ -72,9 +69,6 @@ describe('@gnldev/a2a', () => {
         const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
         if (done === 0) return { content: [{ type: 'tool-call', toolCallId: 'p1', toolName: 'askRemote', input: JSON.stringify({ task: 'charge' }) }], finishReason: 'tool-calls' as const, usage, warnings: [] };
         return { content: [{ type: 'text', text: 'parent done' }], finishReason: 'stop' as const, usage, warnings: [] };
-      },
-      doStream: async () => {
-        throw new Error('no stream');
       },
     });
 

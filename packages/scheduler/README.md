@@ -243,7 +243,13 @@ One upgrade note: during a rolling deploy across this change, an old poller and 
 preset the run's own lock refuses the second executor; without it, a side-effecting workflow can run
 once per poller in that window. If that matters to the workflow, drain the pollers over the upgrade.
 
-### A busy run is a deferral, not an attempt
+### A busy run is a deferral, not an attempt — and a drain is a release
+
+A fire this process gave up is not an attempt either: a drain (`RunDrainedError`) or a lost liveness
+session (`LivenessUnavailableError`) writes nothing — the trigger stays due, `attempts` as it was — and a
+process that is not leaving fires it, continuing the same run. One function answers what counts, for the
+queue too: `attemptEndOf` in `@gnldev/durable`. A fire under way is held by its process: a drain waits for
+it, and `gnl pending` lists it as running.
 
 If `runWorkflow` refuses at lock acquisition (`RunBusyError` with `atLockAcquisition` — somebody else
 is already running this exact `runId`), the trigger is **deferred by `retryMs`**: `attempts` is not

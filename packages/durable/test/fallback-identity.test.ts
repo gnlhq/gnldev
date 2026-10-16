@@ -27,6 +27,7 @@ import { withModelFallback, setChainToolShaper } from '../src/model-router.js';
 import { runDurable } from '../src/run.js';
 import { gnlTool } from '../src/types.js';
 import { stepCountIs } from 'ai';
+import { streamFromGenerate } from './mock.js';
 
 /** A model that either fails or answers, recording the tool schema it was handed. */
 function mkModel(provider: string, modelId: string, opts: { fail?: boolean; seen?: (s: any) => void } = {}): any {
@@ -41,7 +42,7 @@ function mkModel(provider: string, modelId: string, opts: { fail?: boolean; seen
         warnings: [], response: { modelId },
       };
     },
-    doStream: async () => { throw new Error('generate-only'); },
+    doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
   };
 }
 

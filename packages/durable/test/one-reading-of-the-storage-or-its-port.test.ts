@@ -8,7 +8,7 @@
 // the run journal as the work store), and `scheduleWorkflow(storage.work)` wrote a trigger the poller
 // never reads. "Is this the Storage" was decided by five different checks.
 import { describe, it, expect } from 'vitest';
-import { InMemoryStorage, toJournal, portOf, storageOf, journalOf, isStorage, purgeOrganizationWork, withOrgStorage } from '../src/index.js';
+import { InMemoryStorage, toJournal, portOf, storageOf, journalOf, isStorage, purgeOrganization, withOrgStorage } from '../src/index.js';
 
 describe('one reading of the storage or its port', () => {
   const st: any = new InMemoryStorage();
@@ -19,11 +19,11 @@ describe('one reading of the storage or its port', () => {
     for (const v of [st.runs, st.work, st.cache, toJournal(st), {}, null, undefined, 'storage']) expect(isStorage(v)).toBe(false);
   });
 
-  it('purgeOrganizationWork refuses the run journal instead of deleting from it', async () => {
+  it('purgeOrganization refuses the run journal instead of deleting from it', async () => {
     const org = withOrgStorage(st, 'acme') as any;
     await org.runs.put('r1:input', { x: 1 });
     const before = await st.runs.listKeys('');
-    await expect(purgeOrganizationWork(st.runs, 'acme')).rejects.toThrow(/it is a run journal \(storage\.runs\), not the work port\. Pass the storage, or storage\.work/);
+    await expect(purgeOrganization(st.runs, 'acme')).rejects.toThrow(/purgeOrganization needs the whole storage .* this is a run journal \(storage\.runs\)\. Pass the storage itself/);
     expect(await st.runs.listKeys('')).toEqual(before);
   });
 

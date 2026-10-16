@@ -5,7 +5,7 @@ import { optionNames } from '@gnldev/options';
 import { PROJECT_CONFIG_NAMES, type CreateGnlConfig } from '@gnldev/durable';
 import type { GnlDevConfig } from './config.js';
 
-export const DEFINE_CONFIG_NAMES = optionNames<NonNullable<Parameters<typeof import('./config.js').defineConfig>[0]>>()(['port', 'studio', 'title', 'subjects', 'surfaces', 'auth', 'license', 'licensePublicKey', 'licenseStrict', 'storage', 'journal', 'agents', 'tools', 'memory', 'memoryFactory', 'processors', 'workflows', 'networks', 'checkSuiteConsistency', 'schemaCompat', 'preset', 'suggestions', 'replayDisclosure']);
+export const DEFINE_CONFIG_NAMES = optionNames<NonNullable<Parameters<typeof import('./config.js').defineConfig>[0]>>()(['port', 'studio', 'title', 'subjects', 'surfaces', 'auth', 'license', 'licensePublicKey', 'licenseStrict', 'storage', 'journal', 'agents', 'tools', 'memory', 'memoryFactory', 'processors', 'workflows', 'networks', 'checkSuiteConsistency', 'schemaCompat', 'preset', 'suggestions', 'replayDisclosure', 'liveness', 'detached']);
 export const SCAFFOLD_OPTS_NAMES = optionNames<NonNullable<Parameters<typeof import('./scaffold.js').scaffold>[1]>>()(['name', 'template', 'features', 'answers', 'e2e', 'host', 'hostMode']);
 
 /**

@@ -31,7 +31,7 @@ import { newDb } from 'pg-mem';
 import pg from 'pg';
 import {
   InMemoryStorage, toJournal, eraseSubject, admitThreadRun, threadOwnerKey, memKey, withOrg, stampFormat,
-  scopeConfigToOrg, THREAD_RECORDS_KEY, type Storage,
+  scopeConfigToOrg, THREAD_RECORDS_KEY, type Storage, inMemoryLiveness,
 } from '../src/index.js';
 import { createGnl } from '../src/registry.js';
 import { user } from '../src/run-identity.js';
@@ -89,8 +89,11 @@ function sqliteBackend(): Backend {
   };
 }
 
-function pgBackend(pool: { query(text: string, values?: unknown[]): Promise<unknown> }): Backend {
+function pgBackend(pool: { query(text: string, values?: unknown[]): Promise<unknown> }, real = false): Backend {
   const storage = new PostgresStorage({ pool: pool as never });
+  // pg-mem is a database only this process reaches, and its pool does not say where it connects: its
+  // liveness is this process's (in-memory), as a store with none of its own would be told to take.
+  if (!real) Object.assign(storage, { processLiveness: async () => inMemoryLiveness() });
   return {
     storage,
     async oldPut(key, value) {
@@ -127,7 +130,7 @@ async function realPgBackend(): Promise<Backend> {
   const pool = new pg.Pool({ connectionString: realDb.url, max: 4, options: `-c search_path=${schema}` });
   pool.on('error', () => {});
   ends.push(() => pool.end());
-  return pgBackend(pool);
+  return pgBackend(pool, true);
 }
 
 const BACKENDS: Array<[string, () => Promise<Backend>]> = [

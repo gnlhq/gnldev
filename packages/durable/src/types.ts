@@ -200,6 +200,19 @@ export interface AnyTool {
    * `recover` answers the CRASH window after a failure; `lookup` answers BEFORE the first attempt.
    */
   lookup?(input: any, opts: { idempotencyKey: string; toolCallId: string }): Promise<{ exists: true; output: unknown } | { exists: false }>;
+  /**
+   * BACKGROUND — the call does not hold the model. The model is answered at once with a stable
+   * `{ status: 'started', taskId }` and the turn goes on; the body runs as its own durable run
+   * (`task:<parentRunId>:<toolCallId>`) on the process's executor, under every rule above (claim,
+   * crash ladder, `recover`). When it ends, its result is written to the thread once and the agent is
+   * woken once, by a continuation run (`cont:<parentRunId>:<toolCallId>`) that answers it — after the
+   * thread's live turn, if one is running. Both run as the parent run's recorded owner, in its
+   * organization, and go with it when it is deleted. `confirm` is asked before the task starts.
+   * Default (absent): the model waits for the body, as always. Read by the registry (`createGnl`):
+   * a bare `runDurable`/`streamDurable` and a sub-agent's run, which have no conversation to come
+   * back to, wait.
+   */
+  background?: boolean;
 }
 
 /** Agent tool set (name → tool). */
@@ -218,6 +231,7 @@ export type ToolDurability = Pick<
   AnyTool,
   | 'sideEffect' | 'idempotent' | 'idempotency' | 'idempotencyKey' | 'idempotencyWindow'
   | 'untrusted' | 'maxRetries' | 'timeoutMs' | 'claimTtlMs' | 'recover' | 'compensate' | 'confirm' | 'semanticIdentity' | 'lookup' | 'effectClass'
+  | 'background'
 >;
 
 /**

@@ -801,10 +801,11 @@ export async function retryDeadEvent(workArg: WorkStore, topic: string, consumer
 
 // ─── Erasure ───────────────────────────────────────────────────────────────────────────────────
 
-/** What `eraseSubject` (in `@gnldev/durable`) calls to erase one person's share of a package. */
+/** What `eraseSubject` and `purgeOrganization` (in `@gnldev/durable`) call to erase a person's, or a whole organization's, share of a package. */
 export interface SubjectEraser {
   name: string;
   erase(owner: { resourceId: string; orgId?: string }): Promise<number>;
+  eraseOrganization?(orgId: string): Promise<number>;
 }
 
 /**
@@ -815,20 +816,24 @@ export interface SubjectEraser {
  *
  * Refuses a work store that cannot delete by id prefix (`deleteIdPrefix`) and key prefix
  * (`deletePrefix`), rather than report a partial erasure as done.
+ * Handed an organization (`{ orgId }`, by `purgeOrganization`), it erases every event owned under it.
  */
 export function eventEraser(workArg: WorkStore): SubjectEraser {
   const work = portOf(workArg, 'work', 'eventEraser');
+  // One body for a person and an organization: what differs is the owner's prefix (`ownedPrefix`).
+  const eraseOwned = async (owner: { resourceId?: string; orgId?: string }) => {
+    assertRootWorkForErasure(work, '@gnldev/events: eventEraser');
+    if (typeof work.deleteIdPrefix !== 'function' || typeof work.deletePrefix !== 'function') {
+      throw new Error("@gnldev/events: this work store cannot delete by id prefix (`deleteIdPrefix`) and key prefix (`deletePrefix`), so this person's events cannot be erased through it");
+    }
+    const prefix = ownedPrefix(owner);
+    let n = await work.deleteIdPrefix(prefix);
+    for (const fam of ['evtack', 'evtatt', 'evtdead']) n += await work.deletePrefix(`${fam}:${enc(prefix)}`);
+    return n;
+  };
   return {
     name: 'events',
-    async erase(owner) {
-      assertRootWorkForErasure(work, '@gnldev/events: eventEraser');
-      if (typeof work.deleteIdPrefix !== 'function' || typeof work.deletePrefix !== 'function') {
-        throw new Error("@gnldev/events: this work store cannot delete by id prefix (`deleteIdPrefix`) and key prefix (`deletePrefix`), so this person's events cannot be erased through it");
-      }
-      const prefix = ownedPrefix(owner);
-      let n = await work.deleteIdPrefix(prefix);
-      for (const fam of ['evtack', 'evtatt', 'evtdead']) n += await work.deletePrefix(`${fam}:${enc(prefix)}`);
-      return n;
-    },
+    erase: (owner) => eraseOwned(owner),
+    eraseOrganization: (orgId) => eraseOwned({ orgId }),
   };
 }

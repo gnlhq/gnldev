@@ -19,11 +19,12 @@ import {
 } from '../src/index.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { toolCallingModel } from '../src/mock-model.js';
-import { createMockModel, toolCallResult, finalTextResult, countToolResults } from './mock.js';
+import { createMockModel, toolCallResult, finalTextResult, countToolResults, streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 let toolRuns = 0;
 const thrice: any = { specificationVersion: 'v2', provider: 'm', modelId: 'm', supportedUrls: {},
+  doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
   doGenerate: async ({ prompt }: any) => prompt.filter((m: any) => m.role === 'tool').length >= 3
     ? { content: [{ type: 'text', text: 'done' }], finishReason: 'stop', usage, warnings: [] }
     : { content: [{ type: 'tool-call', toolCallId: `c${prompt.length}`, toolName: 't', input: JSON.stringify({ n: prompt.length }) }], finishReason: 'tool-calls', usage, warnings: [] } };

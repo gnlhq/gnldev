@@ -14,7 +14,6 @@
 // An error AFTER the body started is the opposite case — the effect may have happened — and is left
 // exactly as it was: 'running', never re-run silently. Postgres runs when GNL_PG_URL is set.
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
-import { newDb } from 'pg-mem';
 import { durableTool } from '../src/durable-tool.js';
 import { InMemoryStorage, RunBusyError, SideEffectRetryBlockedError, type Storage } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
@@ -26,10 +25,17 @@ const ends: Array<() => Promise<unknown>> = [];
 afterAll(async () => { for (const e of ends.reverse()) await e(); });
 
 const PG_URL = process.env.GNL_PG_URL;
+// No pg-mem row. Every scenario here retries over a claim given back, and pg-mem answers `true` to a
+// lost `putIfAbsent` (INSERT … ON CONFLICT DO NOTHING reports a row either way — testing.ts
+// `exactClaim`): the retry "claimed" a record it never wrote, so 5 of these 6 scenarios passed on a
+// claim that did not exist, and the sixth went red whenever its body started late enough for the
+// attempt to prove its claim (Attempt.assertHeld) — the proof found the phantom and refused to run.
+// Measured: pg-mem red 12/12 under 12 parallel copies, real Postgres green 12/12 under the same load
+// (raporlar/2026-10-12-flake). The Postgres row is the real one, run by scripts/check-real-backends.mjs
+// and the CI Postgres job.
 const STORES: Array<[string, () => Promise<Storage>]> = [
   ['in-memory', async () => new InMemoryStorage()],
   ['sqlite', async () => new SqliteStorage(':memory:')],
-  ['postgres (pg-mem)', async () => { const { Pool } = newDb().adapters.createPg(); return new PostgresStorage({ pool: new Pool() }); }],
 ];
 if (PG_URL) {
   STORES.push(['postgres (real)', async () => {
@@ -204,7 +210,8 @@ describe.each(STORES)('a storage error between the claim and the body — %s', (
     const toolKey = `${runId}:tool:${KEY}`;
     const f = faulty(storage.runs, {
       armWhen: claimedTool,
-      failOn: (op, key, value) => op === 'put' && key === toolKey && (value as { status?: string } | undefined)?.status === 'succeeded',
+      // The success is written by compare-and-set over the attempt's own claim (attempt.ts).
+      failOn: (op, key, value) => (op === 'put' || op === 'putIfMatch') && key === toolKey && (value as { status?: string } | undefined)?.status === 'succeeded',
     });
     const { tool, executions } = charge();
     const call = (journal: Journal) => durableTool(tool as any, { journal, runId } as DurableCtx, 'charge').execute!({ amount: 9 }, { toolCallId: KEY } as any);

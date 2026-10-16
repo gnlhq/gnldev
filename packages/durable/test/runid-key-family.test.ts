@@ -13,6 +13,7 @@ import { describe, it, expect } from 'vitest';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable, resumeRun, assertRunIdSafe } from '../src/run.js';
 import { createMockModel, finalTextResult } from './mock.js';
+import { minted } from '../src/run-id-grammar.js';
 
 const run = (journal: InMemoryJournal, runId: string) =>
   runDurable({ runId, journal, model: createMockModel(async () => finalTextResult('ok')), prompt: 'x' } as any);
@@ -35,8 +36,14 @@ describe('runId anahtar ailesi koruması', () => {
     // batch:/sched:/net:/agent:/wfrun: motor tarafından KURULUYOR. Bunları reddetmek, çalışan
     // batch ve scheduler yollarını kırardı — düzeltmenin amacı bu değil.
     const journal = new InMemoryJournal();
-    for (const ok of ['batch:aylik:F-1', 'sched:saglik:0', 'net:r1:node', 'agent:r1:call-1', 'wfrun:w1']) {
+    for (const ok of ['batch:aylik:F-1', 'sched:saglik:0', 'wfrun:w1']) {
       await expect(run(journal, ok)).resolves.toBeTruthy();
+    }
+    // A sub-agent's and a network step's ids are begun by the engine only (run-id-grammar.ts): their
+    // spelling passes, and the run is begun with the engine's mark — a caller's begin is refused.
+    for (const ok of ['net:r1:node', 'agent:r1:call-1']) {
+      await expect(run(journal, ok)).rejects.toThrow(/made by the engine/);
+      await expect(runDurable(minted({ runId: ok, journal, model: createMockModel(async () => finalTextResult('ok')), prompt: 'x' }) as any)).resolves.toBeTruthy();
     }
   });
 
@@ -56,14 +63,12 @@ describe('runId anahtar ailesi koruması', () => {
     await expect(run(journal, 'a\nb')).rejects.toThrow(/whitespace or control/);
   });
 
-  it('resumeRun da JOURNALA DOKUNMADAN reddeder', async () => {
-    // Erken olması önemli: reddedilen bir aileyle okuma yapmak bile onu meşrulaştırır gibi görünür.
+  it('resumeRun of a reserved spelling is refused and writes nothing', async () => {
+    // A resume continues a run; no run can have been born under a reserved spelling (the gate is at the
+    // birth), so there is nothing to continue — and nothing is written under it.
     const journal = new InMemoryJournal();
-    let read = 0;
-    const spy = new Proxy(journal, { get: (t, k) => (k === 'get' ? (...a: any[]) => { read++; return (t as any).get(...a); } : (t as any)[k]) });
-    await expect(resumeRun('mem', { journal: spy as any, model: createMockModel(async () => finalTextResult('ok')) } as any))
-      .rejects.toThrow(/reserved key family/);
-    expect(read).toBe(0);
+    await expect(resumeRun('mem', { journal, model: createMockModel(async () => finalTextResult('ok')) } as any)).rejects.toThrow();
+    expect(await journal.listKeys('')).toEqual([]);
   });
 
   it('assertRunIdSafe dışa açık — hostlar aynı kuralı kendi ucunda uygulayabilsin', () => {

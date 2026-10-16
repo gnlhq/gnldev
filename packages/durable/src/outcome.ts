@@ -72,7 +72,7 @@ import { RunBusyError, CALLER_CONFLICT_CODES } from './errors.js';
  * The two that are NOT caller conflicts stay written out: a compensation and a cancel are deliberate
  * lifecycle ends, not somebody being refused.
  */
-const NOT_A_RUN_FAILURE = new Set([...Object.keys(CALLER_CONFLICT_CODES), 'CompensatedRunError', 'RunCanceledError', 'RunErasedError']);
+const NOT_A_RUN_FAILURE = new Set([...Object.keys(CALLER_CONFLICT_CODES), 'CompensatedRunError', 'RunCanceledError', 'RunErasedError', 'RunDrainedError']);
 
 /**
  * How a run's error relates to its outcome record. RunBusyError alone cannot answer this — it is
@@ -97,6 +97,35 @@ export function classifyRunError(err: unknown): 'failure' | 'contended' | 'not-a
   }
   const name = (err as { name?: string } | null)?.name;
   return name && NOT_A_RUN_FAILURE.has(name) ? 'not-a-failure' : 'failure';
+}
+
+/**
+ * WHETHER AN ATTEMPT THAT THREW COUNTS — the one answer a queue worker and a scheduler give before they
+ * spend an attempt of a unit (a job, a fire) on an error:
+ *
+ *   'released' — this process gave the unit up, it did not fail: it is draining (RunDrainedError: "another
+ *                process continues it") or cannot judge other processes right now (LivenessUnavailableError,
+ *                retryable). The attempt is given back and nothing is recorded; the unit stays due for a
+ *                process that is not leaving — or this one, shortly. Counted, a drain dead-lettered the
+ *                job on its last attempt and failed the trigger, and nobody continued them (audit C4/C5).
+ *   'deferred' — the unit's OWN run is already executing elsewhere: the engine refused this caller AT LOCK
+ *                ACQUISITION of `unitRunId` (RunBusyError `atLockAcquisition`, its `runId`). Nothing was tried;
+ *                it comes back later. Any OTHER run being busy is not the unit's run executing elsewhere: the
+ *                unit's own code ran (and may have done its work) before it called that run, so it is an
+ *                attempt — counted, bounded by maxAttempts. Read as a deferral, a handler that called a
+ *                run held for good by a frozen process re-ran its effect on every poll and never
+ *                dead-lettered (audit R2-5).
+ *   'attempt'  — everything else: the unit's own code ran and failed.
+ *
+ * By name, one `cause` deep (a library may wrap what it rethrows): a host with two resolved copies of
+ * this package must not get a different answer from a failed `instanceof`.
+ */
+export function attemptEndOf(err: unknown, unitRunId: string): 'released' | 'deferred' | 'attempt' {
+  for (let e = err as { name?: unknown; atLockAcquisition?: unknown; runId?: unknown; cause?: unknown } | null | undefined, i = 0; e && typeof e === 'object' && i < 2; e = e.cause as typeof e, i++) {
+    if (e.name === 'RunDrainedError' || e.name === 'LivenessUnavailableError') return 'released';
+    if (e.name === 'RunBusyError' && e.atLockAcquisition === true && e.runId === unitRunId) return 'deferred';
+  }
+  return 'attempt';
 }
 
 export function isRunFailure(err: unknown): boolean {

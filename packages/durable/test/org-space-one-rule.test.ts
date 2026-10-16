@@ -10,7 +10,7 @@
 // And the root run reader (`listRuns`, `readRun`) returned `org:acme:r1` (inventory k1-runs-org.ts).
 import { describe, it, expect } from 'vitest';
 import * as durable from '../src/index.js';
-import { InMemoryJournal, InMemoryStorage, withOrg, purgeOrganization, purgeOrganizationWork, type Storage } from '../src/index.js';
+import { InMemoryJournal, InMemoryStorage, withOrg, purgeOrganization, type Storage } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 
 const withRootScope = (j: unknown) => (durable as unknown as { withRootScope: (j: unknown) => any }).withRootScope(j);
@@ -107,8 +107,7 @@ describe('one owner for the organization-space rule', () => {
   });
 
   it.each([
-    ['purgeOrganization', (s: Storage, id: string) => purgeOrganization(durable.toJournal(s.runs), id)],
-    ['purgeOrganizationWork', (s: Storage, id: string) => purgeOrganizationWork(s.work!, id)],
+    ['purgeOrganization', (s: Storage, id: string) => purgeOrganization(s, id)],
   ])("%s(store, '') is refused instead of sweeping 'org::'", async (_n, purge) => {
     const s = new InMemoryStorage();
     await expect(purge(s, '')).rejects.toThrow(/invalid orgId ''/);

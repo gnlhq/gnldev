@@ -33,12 +33,14 @@ import pg from 'pg';
 import { tool } from 'ai';
 import { z } from 'zod';
 import {
-  runDurable, cancelAgentRun, forkRun, rolloverRun, createGnl, gnlTool, STAFF, stampFormat, type Storage,
+  runDurable, cancelAgentRun, forkRun, rolloverRun, createGnl, gnlTool, STAFF, stampFormat, type Storage, inMemoryLiveness,
 } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
+import { claimRunOwner } from '../src/run-identity.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { serialize } from '../src/serialize.js';
 import { parseJournalKey, relationsOfInput, deriveRunStatus, storedOutcomeOf } from '../src/journal.js';
+import { streamFromGenerate } from './mock.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
 const PG_URL = process.env.GNL_PG_URL;
@@ -131,14 +133,17 @@ const BACKENDS: Array<[string, () => Promise<Backend>]> = [
   ['Postgres (pg-mem)', async () => {
     const { Pool } = newDb().adapters.createPg();
     const pool = new Pool();
-    return { storage: new PostgresStorage({ pool }), rowLocks: false, async sql(text, params = []) { return (await pool.query(text, params)).rows; } };
+    // pg-mem is a database only this process reaches, and its pool does not say where it connects: its
+    // liveness is this process's (in-memory), as a store with none of its own would be told to take.
+    const storage = Object.assign(new PostgresStorage({ pool }), { processLiveness: async () => inMemoryLiveness() });
+    return { storage, rowLocks: false, async sql(text, params = []) { return (await pool.query(text, params)).rows; } };
   }],
 ];
 if (PG_URL) BACKENDS.push(['Postgres (real)', realPgBackend]);
 
 // ── scripted models ────────────────────────────────────────────────────────────────────────────────
 const usage2 = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
-const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {}, doStream: async () => { throw new Error('gen-only'); } };
+const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {}, doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); } };
 const toolMsgs = (prompt: any) => (prompt ?? []).filter((m: any) => m?.role === 'tool').length;
 /** Calls `pay` `n` times, one call per step, then answers. */
 const payModel = (n: number) => ({
@@ -159,7 +164,7 @@ const tools = { pay: pay as any };
 async function fanOut(storage: Storage, runId: string, n: number): Promise<void> {
   const usage = { inputTokens: { total: 10, noCache: 10 }, outputTokens: { total: 5, text: 5 } };
   const fin = (r: string) => ({ unified: r, raw: r });
-  const mock = (f: (o: any) => Promise<any>) => ({ specificationVersion: 'v4', provider: 'mock', modelId: 'm', supportedUrls: {}, doGenerate: f, doStream: async () => { throw new Error('x'); } }) as any;
+  const mock = (f: (o: any) => Promise<any>) => ({ specificationVersion: 'v4', provider: 'mock', modelId: 'm', supportedUrls: {}, doGenerate: f, doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); } }) as any;
   const t = gnlTool({ description: 't', inputSchema: z.object({}).passthrough(), execute: async () => ({ ok: true }) }, { sideEffect: true });
   const parent = mock(async ({ prompt }) => toolMsgs(prompt) > 0
     ? { content: [{ type: 'text', text: 'ok' }], finishReason: fin('stop'), usage, warnings: [] }
@@ -186,6 +191,7 @@ async function history(storage: Storage): Promise<void> {
   await runDurable({ runId: 'h-failed', journal, model: dead, prompt: 'x', resourceId: 'ayse' } as any).catch(() => {});
   await runDurable({ runId: 'h-canceled', journal, model: payModel(1), tools, prompt: 'x', ...needsApproval } as any);
   await cancelAgentRun(journal, 'h-canceled', { reason: 'operator' });
+  await claimRunOwner(journal, 'h-never', STAFF); // a cancel continues a run: born, never run
   await cancelAgentRun(journal, 'h-never', { reason: 'operator' });
   await forkRun(journal, 'h-done', 1, 'h-fork');
   await rolloverRun(journal, 'h-done', { newRunId: 'h-next' } as any);
@@ -233,7 +239,7 @@ const BEFORE: Row[] = [
   ['h-done', 3, 2, 0, null, 'completed', 'ayse', 'th-1'], // none
   ['h-failed', 0, 0, 0, 'failed', 'failed', 'ayse', null], // failed
   ['h-fork', 1, 1, 0, null, 'completed', 'ayse', 'th-1'], // none
-  ['h-never', 0, 0, 0, 'canceled', 'canceled', null, null], // canceled
+  ['h-never', 0, 0, 0, 'canceled', 'canceled', '', null], // canceled — born first (a cancel no longer begins a run), so it has a record: '' as every staff run
   ['h-next', 1, 0, 0, null, 'completed', 'ayse', 'th-1'], // none
   ['h-parent', 2, 3, 0, null, 'completed', '', null], // none
   ['h-resumed', 2, 1, 0, null, 'completed', 'bob', null], // none
@@ -289,7 +295,11 @@ for (const [name, make] of BACKENDS) {
       // :input and outcome rows written twice each) and 22 on Sqlite.
       // Parent: its own 2 model steps, :input (3), outcome (2), and per child its agent tool call — a
       // claim and a result: 2 per child (was 4 on Postgres: each preceded by the lock-only write).
-      expect(counted).toEqual({ children: [18, 18, 18], parent: 2 + 3 + 2 + 2 * 3 });
+      // A registry run executes on the STREAM path now (detached.ts), which journals its step write-ahead at
+      // each tool call it streams — before that call can run — so the parent's step with 3 calls adds 3
+      // (durable-model.ts, "Journal the step AS SOON AS IT CONTAINS A TOOL CALL"). The children run
+      // inside the parent's execution on the generate path, unchanged.
+      expect(counted).toEqual({ children: [18, 18, 18], parent: 2 + 3 + 2 + 2 * 3 + 3 });
     });
 
     it('E3: concurrent writers of one NEW key count it once — the journal row is the lock', async () => {

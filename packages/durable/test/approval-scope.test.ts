@@ -15,6 +15,7 @@ import { describe, it, expect } from 'vitest';
 import { runDurable, InMemoryStorage, SideEffectRetryBlockedError, runKeys } from '../src/index.js';
 import { tool } from 'ai';
 import { z } from 'zod';
+import { streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const CALL = 'call-charge';
@@ -40,7 +41,7 @@ function model() {
         return { content: [{ type: 'tool-call', toolCallId: CALL, toolName: 'chargeCard', input: JSON.stringify({ amount: 2000 }) }], finishReason: 'tool-calls', usage, warnings: [] };
       return { content: [{ type: 'text', text: 'done' }], finishReason: 'stop', usage, warnings: [] };
     },
-    doStream: async () => { throw new Error('generate-only'); },
+    doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
   } as any;
 }
 

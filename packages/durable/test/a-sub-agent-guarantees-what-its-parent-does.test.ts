@@ -126,10 +126,13 @@ describe('a sub-agent guarantees what the same agent guarantees directly', () =>
     }
   });
 
-  it('the preset\'s run lock is taken for it', async () => {
+  it('neither path takes the old run lock any more — one execution per run is the executor\'s record (D2)', async () => {
+    // The critical preset used to stamp `<runId>:lock` on every run, the direct one and a sub-agent's alike.
+    // A registry run now executes once by its execution record (detached.ts), and a sub-agent runs inside
+    // its parent's single execution: the same answer on both paths is "no lock record".
     for (const mode of ['direct', 'tool'] as const) {
       const r = await runAs(mode, { subCalls: [], cfg: () => ({ preset: 'critical' }) });
-      expect([mode, r.keys.includes(`${r.subRunId}:lock`)]).toEqual([mode, true]);
+      expect([mode, r.keys.includes(`${r.subRunId}:lock`)]).toEqual([mode, false]);
     }
   });
 

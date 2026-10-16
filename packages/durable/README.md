@@ -111,6 +111,61 @@ If you know `generateText`, you already know this — same arguments, same retur
 > `idempotencyKey` (next section). A tool that declares no `sideEffect` is treated as one — declare
 > `sideEffect: false` on a read tool.
 
+## A run outlives its caller (`createGnl`)
+
+A registry run — `gnl.run()`, `gnl.stream()`, and every door built on them — executes apart from the
+call that started it, on the process's executor (one per process per store). The caller follows it.
+
+```ts
+const gnl = createGnl({ storage, agents: { support } });
+
+const s = await gnl.stream('support', { prompt, threadId, resourceId });
+for await (const part of s.fullStream) console.log(part); // live, delta by delta
+const at = s.cursor();                                 // where this reader is: "41" or "41.230"
+
+// The tab closed, or this process went away. Any process, later:
+const again = await gnl.follow(s.runId, { after: at }); // continues right after `at`
+```
+
+- **Leaving does not stop it.** A closed tab, a dropped connection or a request timeout ends the
+  reading; the run goes on. `abortSignal` cancels the RUN, durably, wherever it executes
+  (`RunCanceledError` for its callers). A second call for a run in flight follows the same execution.
+- **A dead process's runs are taken over; a live one's never are.** Each store has a process liveness
+  — a Postgres session advisory lock, a Sqlite file lock (`SqliteStorage` and `PostgresStorage` bring
+  their own). A frozen process keeps its runs; a dead one releases them at once. A store other
+  processes reach with no liveness is refused (`LivenessRequiredError`): pass
+  `createGnl({ liveness: await postgresLiveness({ connectionString }) })`, or `inMemoryLiveness()` for
+  a store only this process reaches.
+- **Tuning the executor** (`createGnl({ detached: { … } })`, or `new DetachedRuns({ … })` used
+  directly): `sweepMs` — how often it looks for runs whose process is gone (default 1 s; `0` runs no
+  sweeper in this process); `pollMs` — how often a reader on another process reads the store (200 ms);
+  `coalesceMs` — the store's segment of a streamed answer (1 s); `outcomeAskMs` — the first wait
+  before a call in doubt is put to its tool again (2 s, doubling); `onComplete` — a notice per run that
+  completed or failed, at least once, with an `id` stable across deliveries. Used directly, `journal`
+  is where the execution records live and `journalFor(scope)` the journal a scope's runs are in.
+  `postgresLiveness({ heartbeatMs })` is how often a process proves its own session (5 s; at most a
+  third of the server's keepalive window, refused above it). An `id` given to a liveness (a pm2 slot, a
+  hostname) is a prefix: every process gets an id of its own (`<id>:<uuid>`), so one restarted in the
+  slot of a crashed one takes that one's work over instead of reading it as its own.
+- **The event log.** A run's events (`<runId>:ev:<seq>`) are what every reader reads, scoped and
+  erased with the run. The store gets the text in segments of about one second; a reader in the
+  executing process gets each delta as it is produced.
+- **Background tools.** `gnlTool(t, { background: true })` answers the model at once with
+  `{ status: 'started', taskId }` and the turn goes on; the body runs as its own run
+  (`task:<runId>:<toolCallId>`), and when it ends its result is written to the thread once and the
+  agent is woken once (`cont:<runId>:<toolCallId>`). Both are the parent's owner's, and deleted with it.
+- **Shutting down.** `drainOnSignal()`: on SIGTERM a new run is refused (503 `draining`), the tool a
+  run is executing finishes and is recorded, the queue and the scheduler take nothing new, then the
+  process exits and another one continues. `gnl pending` lists what the store still has in hand —
+  the same work a drain waits for: a run in its model step or tool body, a job a worker holds, a fire,
+  in this process or any other whose liveness says it is alive (a frozen one too).
+- **A call that may still report is never declared failed before it has.** When a call reaches its
+  retry ceiling and its last attempts never reported (a process cut off from the store may still be in
+  the tool's body), a tool that can still tell — it has `recover()`, or is `idempotent: true` — leaves
+  the run `waiting-outcome` (`OutcomeUnknownError`, `outcome_unknown`, 409). The run continues from the
+  call's recorded result whenever it arrives: written by the late attempt, by `recover()` (asked again,
+  backing off), or by an operator in `gnl pending`.
+
 ## Work identity (`workKey`)
 
 **A `workKey` is your name for a unit of work — not for a conversation.** While the run it opened
@@ -192,16 +247,18 @@ tomorrow's second value is an addition rather than a break.
 
 | Axis | v1 value | The second call gets |
 | --- | --- | --- |
-| `onConflict` | `'reject'` | The work is **running right now** → `409 run_busy` + `Retry-After`. |
+| `onConflict` | `'attach'` | The work is **running right now** → the second call follows the same execution and gets its answer. |
 | `onReuse` | `'replay'` | The work already **finished** → the recorded answer, nothing re-runs. |
 
-**What makes `run_busy` possible is a lock, and a lock has a TTL.** "Running right now" is not
-inferred from the journal's contents — it is a per-run lock (`lock: { ttlMs }`, default 300 000 ms)
-taken before the run starts and renewed by a heartbeat while it lasts. Two consequences follow, and
-they are the shape of the guarantee rather than caveats to it: a process that dies without releasing
-holds the run only until the TTL expires, after which a retry is admitted and replays from the
-journal; and a run that legitimately outlives its TTL keeps the lock alive by heartbeat, so the TTL
-bounds crash recovery, not run length.
+**One execution per run is the executor's, and it is held by a live process, not by a clock.** A
+registry run (`gnl.run`, `gnl.stream`, every door) executes apart from the call that started it, on
+the process's executor. Its execution record names the process executing it, and that process holds a
+liveness — a Postgres session advisory lock, a Sqlite file lock — while it lives. A second call for a
+run in flight attaches to it (one execution, one effect, both callers get the answer). Another process
+takes a run over only when the one executing it is gone: a frozen process keeps its run, a dead one
+releases it at once. A run is as long as its work, with no TTL to outlive. Workflow runs and the raw
+engine (`runDurable` / `streamDurable` with `lock: { ttlMs }`) still use a per-run lock and answer a
+concurrent duplicate `409 run_busy` + `Retry-After`.
 
 - **A run that ended in FAILURE has no answer to replay, so the same `workKey` is free to run
   again.** This is a rule, not a footnote: retrying failed work is the normal case, not an escape
@@ -925,7 +982,7 @@ a deletion that silently did nothing would be the worst possible failure here.
 | `purgeThread(journal, threadId, { memory?, vectors?, allowInFlight? })` | a THREAD, with its runs: every run on it (and their sub-agents), `mem:`, `om:` (observational memory's counters and memoized summaries), `sem:`, the whole `xthr:` family (dedup window, semantic records, tombstones, judge verdicts), the ownership traces naming it and its owner record (last) — plus, given them, the memory store's half (`memory`) and its observation vectors (`vectors`). Refuses while a run on it is in flight (`ThreadRunsInFlightError`) | a conversation must go (`AgentMemory.deleteThread` calls it with its own store) |
 | `purgeResource(journal, resourceId, { vectors?, memory? })` | the JOURNAL's share of a person (and, given the vector store, their documents). It does not reach the memory store or the work log | building your own erasure; for a request, use `eraseSubject` |
 | `purgeBatch(journal, batchId)` | one batch's bookkeeping | a batch must be re-run from scratch |
-| `purgeOrganization(journal, orgId)` | everything under `org:<id>:` | a tenant leaves |
+| `purgeOrganization(storage, orgId, { erasers?, memory? })` | an ORGANIZATION, from every store the storage holds: its partition `org:<id>:` in the journal (runs, thread state, counters), the memory store (threads, messages, observations, every working memory), the vector store (documents and observation vectors), the work store, the cache and meta; its members' owned jobs and events in the root work log, and what the `erasers` reach; its registration and budget last. Keeps only the purge marker (when) and the root `__audit__` trail. An organization registered again under the id starts empty | a tenant leaves (Studio's `DELETE /organizations/:id` runs it, given `userErasure`) |
 | `sweepRuns(journal, { olderThanMs })` | runs whose LAST activity is older than the threshold | scheduled retention |
 | `sweepThreads(journal, { olderThanMs })` | threads the memory port knows, by age | scheduled retention |
 | `sweepLog(journal, ns, opts)` | durable-log entries in one namespace | a log namespace grows without bound |
@@ -1078,6 +1135,14 @@ The exactly-once guarantee rests on one precondition: **storage never loses an a
 - **Outbound side effects:** the strongest end-to-end defense is using a provider-side **idempotency
   key** on tool calls (see the pattern in `test/idempotency-key.test.ts`) — regardless of the storage
   layer, the external system rejects the duplicate.
+- **Network partitions.** A process cut off from its store is taken for dead once its session is gone
+  (Postgres: after its keepalive, ~25 s), and another process may run the call again while the first,
+  if it wakes, finishes its own. Measured with real processes on Postgres: where the provider accepts
+  the call's key, every effect applied once; where it does not, 2 on a single partition, and at most
+  the retry ceiling on partitions in a row (`maxRetries`, 3 by default). A process that is only frozen,
+  its session alive, is never taken over.
+- **Shutdown time.** Give the process manager more time than the drain's 25 s (pm2
+  `kill_timeout: 30000`; Kubernetes `terminationGracePeriodSeconds: 30`).
 
 ## Testing your own journal (`@gnldev/durable/testing`)
 
@@ -1102,13 +1167,15 @@ journalConformance('my journal', () => ({ journal: new InMemoryJournal() }), { d
   (for Sqlite and Postgres, without the relation columns). Every lookup must still find those rows.
   `close` runs when the scenario ends, whether it passed or failed.
 - **Options:** `describe` and `it` come from your runner (vitest, jest, mocha or `node:test`).
-  Assertions use `node:assert`, so no test framework is a dependency of this package. `timeout` is
-  passed to `it`. `exactClaim: false` and `pageWalk: false` declare the two limits of the pg-mem test
+  Assertions use `node:assert`, so no test framework is a dependency of this package. `timeout` (ms)
+  is enforced by the suite itself, on every runner: a scenario still running then fails and its journal
+  is closed. It is also handed to `it` as a third argument (plus a second), for a runner that reads one,
+  so its own default does not end a scenario first. `exactClaim: false` and `pageWalk: false` declare the two limits of the pg-mem test
   double: it reports a lost `putIfAbsent` as won, and it cannot read a run list's second page. A real
   store that needs either flag cannot give the guarantee the flag skips.
 - **The scenarios:** the key-value contract (K1–K6: values, the racing claim, `putIfMatch`, literal
-  prefixes, exact counters, `applyBatch`/`getMany`); runs (R1–R4: which records name a run, the
-  summary, `readRun` in first-write order — not key or clock order, an older writer's rows too —, the status after each write of a scripted history, paging and filters); relations (L1–L2:
+  prefixes, exact counters, `applyBatch`/`getMany`); runs (R1–R5: which records name a run, the
+  summary, `readRun` in first-write order — not key or clock order, an older writer's rows too —, the status after each write of a scripted history, paging and filters, and a run after one of its records is deleted — its status, counts, person and thread, and whether it is still a run); relations (L1–L2:
   a person's and a thread's runs, owner records, rows from older writers); and the dependents model
   (D1–D7: thread delete, organization isolation, refusal while a run is in flight, a delete killed at
   every step and then retried, run purge, erasure, cross-run claims that outlive a delete). Optional
@@ -1120,8 +1187,10 @@ journalConformance('my journal', () => ({ journal: new InMemoryJournal() }), { d
   journal without a paged listing gives
   `purgeThread` and `purgeResource` no way to find the runs, so they would leave the runs and still
   report a count. A run is named by any one of its records: a `:model:` or `:tool:` entry
-  (`parseJournalKey`), its stamped `:input` (`runIdOfKey`), or its outcome record (`outcomeStatusOf`).
-  The outcome record can be the only one, as with a run canceled before it started. Its status is
+  (`parseJournalKey`), its stamped `:input` (`runIdOfKey`), or its outcome record (`outcomeStatusOf`);
+  `runRecordOf(key, value)` answers all three at once, and is the rule the shipped stores follow.
+  The outcome record can be the only one, as with a run canceled before it started. A run with no
+  record left is no run, whatever other keys its prefix still holds. Its status is
   `summarizeRun(runId, entries, outcomeRecord)`, and `pageRunsFromArray` pages the result.
 - **Not covered:** scenarios that need a memory store, a vector store or the agent engine. These stay in
   the packages that own them: `AgentMemory` thread deletes, `eraseSubject` over a whole `Storage`,

@@ -1,3 +1,5 @@
+// A refusal to an end user on a run route is 404 `run_not_found` — the answer an absent run gets
+// (no-existence-oracle.test.ts); staff keep the 403 for a run that exists.
 // The server's run gates read the engine's ONE answer (`runOwnerOf` + `decideRunAccess`) for every
 // run kind (ADR-0002 point 3, R7/R8/R9). Each case below was a way to act on a run that exists and is
 // not the caller's: an ownerless network or batch run adopted through the agent door, a shorter-prefix
@@ -55,7 +57,7 @@ describe('R7: an ownerless run of any kind is not adopted by an end user', () =>
     const { config, call, journal } = setup();
     await createGnl(config).runNetwork('support', { runId: 'net-1', task: 'STAFF-TASK', caller: STAFF } as never);
     const res = await call('ayse', '/agents/a/run', { runId: 'net-1', prompt: 'hi' });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
     expect((await journal.get('net-1:input'))?.resourceId).toBeUndefined();
     expect((await call('ayse', '/runs/net-1')).status).toBe(404);
   });
@@ -63,7 +65,7 @@ describe('R7: an ownerless run of any kind is not adopted by an end user', () =>
   it('network run started with no caller (unknown): the same', async () => {
     const { config, call, journal } = setup();
     await createGnl(config).runNetwork('support', { runId: 'net-2', task: 'STAFF-TASK' } as never);
-    expect((await call('ayse', '/agents/a/run', { runId: 'net-2', prompt: 'hi' })).status).toBe(403);
+    expect((await call('ayse', '/agents/a/run', { runId: 'net-2', prompt: 'hi' })).status).toBe(404);
     expect((await journal.get('net-2:input'))?.ownerKind).toBe('unknown');
   });
 
@@ -74,7 +76,7 @@ describe('R7: an ownerless run of any kind is not adopted by an end user', () =>
     const items = [{ ref: 'k1' }];
     const p = await batch.preflight('b1', items as never);
     await batch.run('b1', items as never, { planToken: (p as any).token });
-    expect((await call('ayse', '/agents/a/run', { runId: 'batch:b1:k1', prompt: 'hi' })).status).toBe(403);
+    expect((await call('ayse', '/agents/a/run', { runId: 'batch:b1:k1', prompt: 'hi' })).status).toBe(404);
     expect((await journal.get('batch:b1:k1:input'))?.resourceId).toBeUndefined();
   });
 });
@@ -85,7 +87,7 @@ describe('R9: a stranger naming a shorter-prefix run cannot hide or change the o
       const { call, journal } = setup();
       expect((await call('ayse', '/workflows/done/run', { runId: 'team:1', input: {} })).status).toBe(200);
       const block = await call('mallory', door, door.startsWith('/agents') ? { runId: 'team', prompt: 'hi' } : { runId: 'team', input: {} });
-      expect(block.status).toBe(403);
+      expect(block.status).toBe(404);
       expect((await call('ayse', '/workflows/runs')).body).toContain('team:1');
       await call('ayse', '/workflows/runs/team:1/cancel', {});
       expect((await journal.get('wfrun:team:1'))?.status).toBe('completed');
@@ -106,7 +108,7 @@ describe('forkRun interrupted before its last write (the fork crash takeover)', 
       await expect(forkRun(crashing, 'src', 1, 'fk')).rejects.toThrow(/crash/);
       expect(await j.get('fk:model:0')).toBeDefined();
       const takeover = await call('mallory', '/agents/a/run', { runId: 'fk', prompt: 'mine now' });
-      expect(takeover.status).toBe(403);
+      expect(takeover.status).toBe(404);
       expect((await j.get('fk:input'))?.resourceId).toBe(starter === 'ayse' ? 'u-ayse' : undefined);
       const read = await call('mallory', '/runs/fk');
       expect(read.status).toBe(404);
@@ -121,7 +123,7 @@ describe('D2: a legacy run (record missing, rows present) through REST', () => {
     expect((await call('ops', '/agents/a/run', { runId: 'legacy', prompt: 'x' })).status).toBe(200);
     await journal.deletePrefix('legacy:input');
     const start = await call('mallory', '/agents/a/run', { runId: 'legacy', prompt: 'x' });
-    expect(start.status).toBe(403);
+    expect(start.status).toBe(404);
     expect(start.body).not.toContain('STAFF-SECRET');
     expect((await call('mallory', '/agents/a/resume', { runId: 'legacy' })).status).toBe(404);
     expect((await call('mallory', '/runs/legacy/cancel', {})).status).toBe(404);

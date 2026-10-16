@@ -252,8 +252,14 @@ describe('resourceId: the WRITE paths honour the same expectation', () => {
     const { run, postOp, seen } = api();
     await run('ayse');
     seen.length = 0;
-    await postOp('/agents/a/resume', { runId: 'r-ayse' });
-    expect(seen.map((x) => x.resourceId)).toEqual(['u-ayse']);
+    // A completed run is not executed again (its execution record says it is over, @gnldev/durable): the
+    // resume answers from the run and consults nobody's memory. Whatever DOES consult it may only ever be
+    // the frozen owner — a re-execution (a failed run, an approval) runs as the RECORDED owner, which the
+    // engine-caller tests drive.
+    const rr = await postOp('/agents/a/resume', { runId: 'r-ayse' });
+    expect(rr.status).toBe(200);
+    expect((await rr.json() as { text?: string }).text).toBe('ok');
+    expect(seen.filter((x) => x.resourceId !== 'u-ayse')).toEqual([]);
   });
 });
 

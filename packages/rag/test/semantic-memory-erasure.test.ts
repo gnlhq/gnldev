@@ -51,4 +51,18 @@ describe('SemanticMemory and the thread lifecycle', () => {
     expect(r).toMatchObject({ purged: ['t1'], keptNoTs: 0 });
     expect(await journal.get(semanticLogKey('t1'))).toBeUndefined();
   });
+
+  it("a deleted run's worker takes back the turn it appended (`retract` by the run's batch key), and only that turn", async () => {
+    // The settle of a run deleted while it ran (durable's erasure-fence.ts) calls `Memory.retract` with the
+    // run's markers; without it a turn appended in that moment stayed in the thread for good (c-erasure CE-2).
+    const journal = toJournal(new InMemoryStorage().runs);
+    const sm = new SemanticMemory({ journal, embed });
+    await sm.append('t1', [{ role: 'user', content: 'kept' }], 'mem-appended:r-1');
+    await sm.append('t1', [{ role: 'user', content: 'AYSE-SECRET' }, { role: 'assistant', content: 'AYSE-ANSWER' }], 'mem-appended:r-2');
+    await sm.append('t1', [{ role: 'user', content: 'unnamed, kept' }]);
+    await sm.retract('t1', 'mem-appended:r-2');
+    expect((await sm.getMessages('t1')).map((m) => m.content)).toEqual(['kept', 'unnamed, kept']);
+    await sm.retract('t1', 'mem-appended:r-unknown'); // nothing of that name: nothing changes
+    expect((await sm.getMessages('t1')).map((m) => m.content)).toEqual(['kept', 'unnamed, kept']);
+  });
 });

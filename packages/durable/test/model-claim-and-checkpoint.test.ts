@@ -149,7 +149,7 @@ describe('Streaming mid-checkpoint', () => {
     return out;
   }
 
-  it('happy path: on full consumption the final record stays UNCHANGED (checkpoint is only EXTRA info)', async () => {
+  it('happy path: on full consumption the step is written once, whole — no periodic copy beside it', async () => {
     const journal = new InMemoryJournal();
     const model = makeChunkedStreamModel(23); // 27 parts total → checkpoints at 10 and 20
     const wrapped = withDurableModel(model, { journal, runId: 'ck1' });
@@ -160,9 +160,9 @@ describe('Streaming mid-checkpoint', () => {
     const final = await journal.get<{ parts: any[] }>('ck1:model:0');
     expect(final?.parts.length).toBe(27); // the final record contains all parts — SAME BEHAVIOR
 
-    const checkpoint = await journal.get<{ parts: any[]; partial: boolean }>('ck1:proc:__gnl_stream_checkpoint:0');
-    expect(checkpoint?.partial).toBe(true);
-    expect(checkpoint?.parts.length).toBe(20); // the last periodic checkpoint (every 10) — the INTERMEDIATE record was kept
+    // The periodic copy (every 10 parts, the whole step each time) is gone: nothing read it, and it was most of
+    // a streamed run's WAL. A detached run's event log is what keeps a text stream's progress now.
+    expect(await journal.get('ck1:proc:__gnl_stream_checkpoint:0')).toBeUndefined();
 
     // Replay: a second instance with the same journal → produces the same stream WITHOUT touching the underlying doStream AT ALL.
     const wrapped2 = withDurableModel(model, { journal, runId: 'ck1' });
@@ -171,7 +171,7 @@ describe('Streaming mid-checkpoint', () => {
     expect(replayed).toEqual(got);
   });
 
-  it('crash mid-stream: the stream cuts off with an error → the checkpoint preserves PARTIAL progress, the final record is NOT WRITTEN', async () => {
+  it('crash mid-stream: the final record is NOT WRITTEN and the crash stays visible on the claim', async () => {
     const journal = new InMemoryJournal();
     const parts: any[] = [{ type: 'stream-start', warnings: [] }];
     for (let i = 0; i < 23; i++) parts.push({ type: 'text-delta', id: '0', delta: `p${i}` });
@@ -212,12 +212,9 @@ describe('Streaming mid-checkpoint', () => {
       })(),
     ).rejects.toThrow();
 
-    // BEFORE (without this change): NOTHING would remain in the journal since flush never ran.
-    // NOW: thanks to the periodic checkpoint, at least the last marked progress is preserved.
-    const checkpoint = await journal.get<{ parts: any[]; partial: boolean }>('ck2:proc:__gnl_stream_checkpoint:0');
-    expect(checkpoint?.partial).toBe(true);
-    expect(checkpoint!.parts.length).toBeGreaterThanOrEqual(10);
-    expect(checkpoint!.parts.length).toBeLessThan(24); // NOT all parts — partial
+    // No forensic copy of the parts (removed: nothing read it). A text stream's progress lives in a detached
+    // run's event log; a step with a tool call is written ahead at the call (the safety record).
+    expect(await journal.get('ck2:proc:__gnl_stream_checkpoint:0')).toBeUndefined();
     expect(await journal.get('ck2:model:0')).toBeUndefined(); // no final record — flush did not run
     // the claim stays at least 'running' (succeeded was never reached) — the crash is VISIBLE.
     expect((await journal.get<any>('ck2:proc:__gnl_model_claim:0'))?.status).toBe('running');

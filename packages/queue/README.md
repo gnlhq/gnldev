@@ -1,6 +1,6 @@
 # @gnldev/queue
 
-**Durable background-task queue + worker** on top of the journal. Each job runs as a durable run → if the process crashes mid-job it resumes from the journal, and a side effect already recorded as done is not run again ([at-most-once](../durable/README.md#what-never-charged-twice-actually-means)). `acquireRunLock` keeps two workers off the same job at once (bounded by the lock TTL after a worker crash — see the storage notes).
+**Durable background-task queue + worker** on top of the journal. Each job runs as a durable run → if the process crashes mid-job it resumes from the journal, and a side effect already recorded as done is not run again ([at-most-once](../durable/README.md#what-never-charged-twice-actually-means)). `acquireRunLock` keeps two workers off the same job at once: a worker whose process is frozen (a GC pause, a VM migration, `SIGSTOP`) keeps its job however long, and a worker whose process died loses it at once. The process is asked through the storage's process liveness (`SqliteStorage`/`PostgresStorage` answer for themselves); without one, the lease's TTL decides.
 
 > Install: `pnpm add @gnldev/queue` — or use it from a [repo clone](https://github.com/gnlhq/gnldev): `pnpm install && pnpm -r build`.
 
@@ -27,6 +27,22 @@ const worker = createWorker(storage, {
 });
 await worker.runOnce();   // or worker.start() (poll loop)
 ```
+
+### One queue: enqueue here, run here
+
+`createQueue` is the two calls above in one: the handlers, and a worker that runs them, started in this process. Pass `worker: false` when the workers run elsewhere.
+
+```ts
+import { createQueue } from '@gnldev/queue';
+import { SqliteStorage } from '@gnldev/durable/sqlite';
+const storage = new SqliteStorage('runs.db');
+
+const queue = createQueue(storage, { 'send-email': async (payload, ctx) => { /* ... */ } });
+await queue.enqueue('send-email', { to: 'a@x.com' }, { id: 'email:order-1' });
+// on shutdown: await queue.close();
+```
+
+A job still waiting after `NO_WORKER_NOTICE_MS` (10 s) with no worker polling its store is reported once per type (`console.warn`): enqueued where nothing consumes it, it would otherwise wait without a word.
 
 ## Delays, retries, cancelling, concurrency
 
@@ -154,7 +170,8 @@ rather than report a partial erasure as done.
 ## API
 - `enqueue(work, type, payload, { id?, maxDepth?, caller?, resourceId?, orgId?, runAt? }) → jobId` — `work` is `storage.work`.
   `caller` is an engine `Caller` (`user(id, org)`, `staff(org?)`); `resourceId`/`orgId` are its shorthand.
-- `createWorker(storage, handlers, opts?) → { runOnce, drain, start, stop }` — `opts`: `owner`, `ttlMs` (stale lock reclaim), `pollMs`, `maxAttempts`, `onError`, `backoff`, `maxPollMs`, `heartbeat`, `maxRenewFailures` (after this many heartbeat renewals fail in a row — default 3 — the worker treats the lock as lost rather than risk running the job twice), `retryDelayMs`, `concurrency`, `typeConcurrency`
+- `createQueue(storage, handlers, opts?) → { enqueue, worker?, close }` — a worker over `handlers` started in this process; `opts` are `createWorker`'s plus `worker: false` (run nothing here).
+- `createWorker(storage, handlers, opts?) → { runOnce, drain, start, stop }` — `opts`: `owner`, `liveness` (default: the process's, or the storage's own; a shared store with none is refused), `ttlMs` (lease reclaim when no process can be asked), `pollMs`, `maxAttempts`, `onError`, `backoff`, `maxPollMs`, `heartbeat`, `maxRenewFailures` (after this many heartbeat renewals fail in a row — default 3 — the worker treats the lock as lost rather than risk running the job twice), `retryDelayMs`, `concurrency`, `typeConcurrency`
 - `JobCtx` gives the handler `{ journal, jobId, runId, caller, run, storage, orgId?, enqueue, signal }`. `ctx.run(args)` is
   `runDurable` on `journal`/`runId` as `caller` — it keeps the side effect at-most-once and the run the owner's.
 - `listJobs(work)` shows each job's `resourceId`/`orgId` next to its status.
@@ -164,7 +181,7 @@ rather than report a partial erasure as done.
 - `jobEraser(storage)` erases one person's jobs (see above).
 
 ## How it works
-Jobs are written to an append-only log; the worker locks a job and runs it. Crash → lock goes stale → reclaim → handler runs again → `runDurable` resumes from the journal → **a side effect already recorded as done is not repeated**; one caught in the crash window blocks and asks rather than re-firing ([at-most-once](../durable/README.md#what-never-charged-twice-actually-means)).
+Jobs are written to an append-only log; the worker leases a job and runs it. The lease names the worker's process, and another worker asks THAT process — through the store's liveness, a Postgres session lock or a Sqlite file lock — whether the lease is held, not how old it is: a frozen worker keeps its job, a dead one releases it at once (measured: taken over in ~1 s, was 30 s). Crash → the process is gone → reclaim → handler runs again → `runDurable` resumes from the journal → **a side effect already recorded as done is not repeated**; one caught in the crash window blocks and asks rather than re-firing ([at-most-once](../durable/README.md#what-never-charged-twice-actually-means)).
 
 The worker's lock is a **lease on the job** (`<runId>:lease`), not a lock on the run. That is why the
 example above works: your handler is free to take its own run lock on `ctx.runId` — a `lock` option, or
@@ -172,8 +189,14 @@ a `runWorkflow` under `preset: 'critical'` — and the two nest instead of colli
 same key, and a handler that locked its own `ctx.runId` was refused by the worker that had just called
 it, on every attempt, until the job dead-lettered without ever running.
 
+## A job whose last attempt never reported (`in-doubt`)
+A job that reaches `maxAttempts` while its last attempt never reported — its worker cut off from the store, not crashed in the handler — is `in-doubt`, not `failed`: that attempt may still finish. It is not started again. A handler that finishes after its worker lost the job records the job `done` (`late: true`), over an `in-doubt` or `failed` dead letter. `retryJob` retries an `in-doubt` job like a dead letter. A job whose handler threw is still `failed`.
+
+## Shutting down
+`drainProcess()` / `drainOnSignal()` from `@gnldev/durable` stop the worker taking new jobs and wait for the one in a handler to end, then the process exits. Give the process manager more time than the drain (pm2 `kill_timeout: 30000`). A job whose run the drain released at its next step (`RunDrainedError`) did not fail: its attempt is given back and it stays pending for another process, which continues the same run. The same holds for a lost liveness session (`LivenessUnavailableError`) and a run refused because it executes elsewhere — none of them is an attempt or reaches `onError` (`attemptEndOf` in `@gnldev/durable` decides it, for the scheduler too). While a worker holds a job, `gnl pending` lists it as running.
+
 ## Heartbeat + empty-poll backoff (both on by default)
-`heartbeat`: if a job's handler runs longer than `ttlMs`, the lock TTL can expire before the handler finishes, letting a second worker take over the same job and run it twice — `createWorker` prevents this by `renew`ing the lock every `ttlMs/3` while the handler runs. If a real takeover is detected (fencing token mismatch), this worker does NOT WRITE `qdone`/`qfail`/`qtry`, so it doesn't clobber the result of the worker that took over. Can be disabled with `heartbeat: false` (recommended only for test/debug).
+`heartbeat`: a lease written without a process (a store with no liveness) is judged by its age; if a job's handler runs longer than `ttlMs`, that lease could expire before the handler finishes, letting a second worker take over the same job and run it twice — `createWorker` prevents this by `renew`ing the lease every `ttlMs/3` while the handler runs. If a real takeover is detected (fencing token mismatch), this worker does NOT WRITE `qdone`/`qfail`/`qtry`, so it doesn't clobber the result of the worker that took over. Can be disabled with `heartbeat: false` (recommended only for test/debug).
 `backoff`: if `runOnce()` claims no job, the next poll interval starts at `pollMs` and grows ×2 (cap `maxPollMs ?? pollMs*32`); it resets to `pollMs` once a job is claimed — prevents a poll storm on an empty queue. `backoff: false` reverts to the old constant-interval behavior.
 
 ## License

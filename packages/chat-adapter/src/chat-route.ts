@@ -92,18 +92,8 @@ export interface CreateChatRouteOptions {
   allowCrossSite?: boolean;
   /** Print this door's protections when it is built (default `true`); `false` when something else already prints them. */
   protectionsBanner?: boolean;
-  /**
-   * FAZ-2 — per-run concurrency lock, ON by default (`{ ttlMs: 300_000 }`). Two CONCURRENT requests
-   * with the same runId (double-click, two tabs, a retry racing the original) used to BOTH execute;
-   * Now the loser gets the typed `409 run_busy` (+ Retry-After) and the winner's journal replay
-   * answers the retry. `lock: false` restores the old behavior. The streamed lock SELF-RENEWS on a
-   * ttl/2 heartbeat (engine parity with run()), so ttlMs is the crash-takeover window — the generous
-   * 5-minute default simply keeps takeover conservative.
-   */
-  lock?: { ttlMs?: number } | false;
 }
 
-const DEFAULT_LOCK_TTL_MS = 300_000;
 
 let anonCounter = 0;
 
@@ -141,10 +131,12 @@ function typedErrorResponse(c: Context, e: unknown, workKey?: string): Response 
   // FAZ-4 caller-conflict family — same 409-without-resumable posture as thread mismatch above.
   // K9: the map is durable's single CALLER_CONFLICT_CODES export (thread mismatch is answered by the
   // dedicated branch above; its entry here is harmless duplication by design).
-  const conflict = callerConflictAnswer(e);
+  // Rendered as durable answers it: a "not your run" refusal reads exactly as an absent run (404
+  // `run_not_found`), the rest of the family as its 409.
+  const conflict = callerConflictAnswer(e, workKey);
   if (conflict && conflict.code !== 'run_thread_mismatch') {
     if (conflict.ownership) markRefusal(c.req.raw, 'ownership', { detail: conflict.code });
-    return c.json({ error: conflict.error, code: conflict.code, detail: withWorkKey(conflict.detail, workKey) }, 409);
+    return c.json(conflict.body, conflict.status as 409);
   }
   const code = blockedErrorCode(e);
   if (code) {
@@ -158,9 +150,9 @@ function typedErrorResponse(c: Context, e: unknown, workKey?: string): Response 
     if (code === 'run_busy') res.headers.set('Retry-After', '5');
     return res;
   }
-  // A root-scope thread id under `org:` — durable's one answer for it (400 thread_id_reserved).
+  // A request the engine refused before any work — durable's one answer for it (400 thread_id_reserved, 503 draining).
   const reserved = requestRefusal(e);
-  if (reserved) return c.json(reserved.body, reserved.status);
+  if (reserved) return c.json(reserved.body, reserved.status, reserved.headers);
   const up = upstreamFailure(e);
   if (up) {
     const err = e as { message?: string } | null | undefined;
@@ -178,7 +170,7 @@ function typedErrorResponse(c: Context, e: unknown, workKey?: string): Response 
 }
 
 /** Every option createChatRoute takes in its SECOND argument, held to `CreateChatRouteOptions` by `pnpm typecheck` below. */
-const CHAT_ROUTE_OPTION_KEYS = doorOptionKeys<CreateChatRouteOptions>()(['resolveRunId', 'resolveThreadId', 'identify', 'authorize', 'onDecision', 'allowedHosts', 'allowCrossSite', 'protectionsBanner', 'lock']);
+const CHAT_ROUTE_OPTION_KEYS = doorOptionKeys<CreateChatRouteOptions>()(['resolveRunId', 'resolveThreadId', 'identify', 'authorize', 'onDecision', 'allowedHosts', 'allowCrossSite', 'protectionsBanner']);
 
 /**
  * Produces a single-endpoint Hono router from a createGnl config (or an already-built `gnl` instance)
@@ -203,9 +195,9 @@ const CHAT_ROUTE_OPTION_KEYS = doorOptionKeys<CreateChatRouteOptions>()(['resolv
  * quickstart names nobody. The retry contract is identical either way: the same message ids produce
  * the same key, and the same key lands on the same run.
  *
- * SCOPE of that idempotency (FAZ-2): serial retries dedupe via journal replay, and CONCURRENT
- * duplicates are now serialized by the default per-run lock (`CreateChatRouteOptions.lock`) — the
- * loser gets the typed 409 `run_busy` + Retry-After instead of a second execution. The effective
+ * SCOPE of that idempotency: a turn's run executes once, apart from the request (@gnldev/durable's
+ * executor) — a CONCURRENT duplicate (double-click, two tabs, a retry racing the original) follows the
+ * same run instead of executing it again, and a client that leaves gets the answer when it comes back. The effective
  * RunId is echoed on every response as `X-Gnl-Run-Id` and stamped onto interrupt chunks — a
  * CORRELATION handle, not the retry key: to retry, send the same turn again. One exception, agui's
  * too: a pre-run identity refusal (unknown agent, unaddressable scope) carries no header, because
@@ -376,12 +368,6 @@ export function createChatRoute(
     // typed body and NO X-Gnl-Run-Id, breaking the every-response header contract on exactly the
     // malformed-request path. In the catch it falls through typedErrorResponse (no match) to the
     // generic 400, which is what a malformed request is.
-    // FAZ-2 default lock: acquired by streamDurable BEFORE any setup work, released on stream
-    // finish/error — the loser throws RunBusyError synchronously into the catch below (409 run_busy).
-    const lock =
-      opts.lock === false
-        ? undefined
-        : { owner: `chat-${crypto.randomUUID()}`, ttlMs: opts.lock?.ttlMs ?? DEFAULT_LOCK_TTL_MS };
     let result: any;
     try {
       const messages = await convertToModelMessages(body.messages ?? []);
@@ -404,13 +390,8 @@ export function createChatRoute(
         // THE CALLER, from the one mapping. The seal above carries the same decision into the
         // context (it wins in the engine), and an `unknown` seals nothing: it stays closed.
         caller,
-        ...(lock ? { lock } : {}),
-        // P0.2 thread the REQUEST's AbortSignal through to generation — a client
-        // disconnect (tab close, useChat's `stop()`, navigation away) stops token generation instead of
-        // silently billing to completion. This does NOT break resumable-SSE replay: an abort simply ends
-        // generation early, the journal keeps whatever prefix already completed, and a LATER call with the
-        // SAME runId resumes/replays exactly as before (see registry.ts's RunOptions.abortSignal note).
-        abortSignal: c.req.raw.signal,
+        // No request signal: the run executes apart from this request (@gnldev/durable). A closed tab ends
+        // this response, not the turn — its answer is in the thread when the user comes back.
       });
     } catch (e: any) {
       const res = typedErrorResponse(c, e, workKey) ?? c.json({ error: String(e?.message ?? e) }, 400);

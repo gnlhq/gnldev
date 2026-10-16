@@ -2,6 +2,11 @@
 
 **HTTP 409 · `resumable: true`**
 
+> **Agent runs no longer answer this.** A registry run (`gnl.run`, `gnl.stream`, every door) executes
+> apart from its caller, and a second call for a run in flight follows the same execution instead.
+> You meet `run_busy` from workflow runs, from the raw engine (`runDurable` / `streamDurable` with
+> `lock`), and for a tool call another executor is running.
+
 ## What happened
 
 A run with this `runId` was already in flight, holding its run lock, when a second request arrived

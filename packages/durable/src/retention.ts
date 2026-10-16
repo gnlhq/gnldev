@@ -2,6 +2,7 @@
 // journal's append-only philosophy — only for legal deletion (PII purge) and retention sweeps.
 // Requires the `deletePrefix` port (InMemory/Sqlite/Postgres adapters provide it); otherwise
 // throws a clear error.
+import { runRecordKey } from './run-id-grammar.js';
 import { runKeys, summarizeRun, runIdOfKey, listRunsWhere } from './journal.js';
 import { identityOnlyInput } from './run.js';
 import { workKeyHash } from './hash.js';
@@ -14,23 +15,27 @@ import type { Journal, JournalReader } from './journal.js';
 /** What sweepRuns needs off a `:input` record: the freeze stamp, plus whatever identityOnlyInput reads. */
 type FrozenInputLike = { at?: number } & Record<string, unknown>;
 import type { WorkStore, VectorStore } from './storage.js';
-import { VECTOR_ALL_PARTITIONS, assertRootOutsideOrganizations, portOf } from './storage.js';
+import { VECTOR_ALL_PARTITIONS, assertRootOutsideOrganizations } from './storage.js';
 import type { LogItem } from './durable-log.js';
 import { createPollLoop } from './polling.js';
 import { orgPrefix, isOrganizationKey } from './organization.js';
 import type { PollLoop } from './polling.js';
 import { refuseUnknownNames } from '@gnldev/options';
-import { LOG_SWEEP_TARGET_NAMES, PURGE_RESOURCE_NAMES, PURGE_RUN_NAMES, PURGE_THREAD_NAMES, RETENTION_SWEEPER_NAMES, SWEEP_LOG_NAMES, SWEEP_RUNS_NAMES, SWEEP_THREADS_NAMES } from './option-names.js';
+import { LOG_SWEEP_TARGET_NAMES, PURGE_ORGANIZATION_NAMES, PURGE_RESOURCE_NAMES, PURGE_RUN_NAMES, PURGE_THREAD_NAMES, RETENTION_SWEEPER_NAMES, SWEEP_LOG_NAMES, SWEEP_RUNS_NAMES, SWEEP_THREADS_NAMES } from './option-names.js';
 // What a run, a thread and a person own, and the one executor that deletes by it (model.ts). The
 // journal primitives (exact and neighbour-safe deletes, the thread-key readers) live there with it.
 import {
-  requireDelete, deleteExactKey, escOwnerPart, ownershipTraceKey, planRun, planThread, executePlan, PERSON_FAMILIES,
+  requireDelete, deleteExactKey, escOwnerPart, ownershipTraceKey, planRun, planThread, planOrganization, executePlan, PERSON_FAMILIES,
   MEM_PREFIX, XTHR_PREFIX, threadIdOfMemKey, threadIdOfXthrKey, threadIdOfSemKey,
 } from './model.js';
+import type { DeleteTarget } from './model.js';
+import { storageOf, toJournal } from './storage.js';
+import type { CacheStore, MetaStore, Storage } from './storage.js';
+import { orgStorageScopeOf } from './org-storage.js';
+import type { SubjectEraser } from './erase.js';
 import type { MemoryStore } from './storage.js';
 import { ThreadRunsInFlightError } from './errors.js';
 import { orgPurgedKey, sweepRunFences } from './erasure-fence.js';
-import { randomUUID } from 'node:crypto';
 export { ownershipTraceKey, orgPurgedKey };
 
 
@@ -354,7 +359,7 @@ export async function purgeResource(
  * A memory-store thread (`@gnldev/memory`'s `AgentMemory`) passes its store as `memory` — or calls
  * `AgentMemory.deleteThread`, which does — so one call removes both halves. Before 0.11 this function
  * took the journal half and nothing else, and `MemoryStore.deleteThread` the other half and nothing
- * else; neither took the runs (raporlar/…/cplus-c/h5-before-analysis.txt).
+ * else; neither took the runs (ADR-0007).
  *
  * REFUSES, deleting nothing, while a run on the thread is in flight (`threadRunsInFlight`): pulling its
  * records out from under it would let it write its answer into a deleted thread, and let a step whose
@@ -402,81 +407,100 @@ export async function purgeThreadState(journal: Journal, threadId: string): Prom
   return executePlan({ journal }, await planThread({ journal }, threadId, { runs: false }));
 }
 
-/**
- * GDPR/KVKK deletion runbook, as ONE function — permanently deletes EVERYTHING an organization owns
- * in the ROOT journal: because `withOrg` prefixes every key unconditionally, ONE
- * `deletePrefix('org:<id>:')` covers the org's runs + journals + memory + usage/budget
- * counters (`gnl_counters`/`ctr:` — swept since the P1.6 deletePrefix fix; this function is the reason
- * that fix was load-bearing) + materialized metrics + workflow registry records (`org:<id>:wfrun:*`) +
- * cross-run dedup keys (`org:<id>:xrun:*`).
- *
- * PREFIX-BOUNDARY SAFETY: the trailing ':' makes the sweep exact — org 'acme' can never catch org
- * 'acme2' (`org:acme2:` does not start with `org:acme:`). Callers MUST reject org ids containing ':'
- * (the studio org-delete route already does).
- *
- * NOT DELETED BY THIS FUNCTION, but no longer a gap: everything `@gnldev/queue` and `@gnldev/events`
- * write lives in the WorkStore (`gnl_work_log` / `gnl_work_kv`), a different
- * port from the Journal this function sweeps. `purgeOrganizationWork(storage.work, orgId)` is the
- * matching surface — call BOTH, in either order, to erase an organization completely. They stay two
- * calls on purpose: a deployment can hold the two stores on different backends (that is what
- * `composite` is for), so one function cannot honestly promise to reach both.
- *
- * DELIBERATELY NOT DELETED (the honest rest of the runbook):
- * Root `__audit__` entries that carry this org as a PAYLOAD field: the audit trail is a root-level
- *    record with its own (usually legally-mandated) retention — sweep it on ITS schedule via
- *    `sweepLog(journal, '__audit__', ...)`, don't couple it to org deletion.
- * Orgless/shared-scope data: if the deployment ran this org's work OUTSIDE withOrg (no prefix),
- *    this function cannot attribute it — that is a deployment-model choice, not a sweep gap.
- * EE user records (auth-ee's own store) — studio's DELETE /organizations/:id removes members when
- *    `opts.users` is wired; call that surface (or the user store directly) alongside this.
- * (Covered, for the record: HERMES `sugg:`/`lesson:`/`suggstats:` families ARE swept by this
- *    function — withOrg prefixes them like every other key. The gap for them is per-PERSON deletion,
- *    documented on purgeThread.)
- */
-/**
- * The WorkStore half of an organization's erasure — queue jobs, their markers, and the event log.
- *
- * `withOrg` prefixes every work namespace AND every work key, so one prefix sweep is the whole
- * footprint. Same boundary rule as `purgeOrganization`: the trailing ':' keeps org 'acme' from
- * catching 'acme2'.
- *
- * THROWS on a WorkStore without `deletePrefix` rather than returning 0. This function exists because
- * an erasure runbook promised something the framework could not do; answering "deleted nothing"
- * with a success would recreate exactly that problem in a quieter form.
- */
-export async function purgeOrganizationWork(workArg: WorkStore, orgId: string): Promise<number> {
-  const work = portOf(workArg, 'work', 'purgeOrganizationWork');
-  const prefix = orgPrefix(orgId); // refuses '' (which would sweep `org::`) and a ':'-bearing id
-  if (typeof work.deletePrefix !== 'function') {
-    throw new Error(
-      "@gnldev/durable: this WorkStore does not implement `deletePrefix`, so an organization's queue and event records cannot be erased through it (the first-party in-memory/sqlite/postgres adapters all do). Sweep those tables directly, or the erasure is incomplete.",
-    );
-  }
-  return work.deletePrefix(prefix);
+/** What `purgeOrganization` removed: every row it deleted, in every store, and each eraser's share by its name. */
+export interface OrganizationErasureReport {
+  deleted: number;
+  byEraser: Record<string, number>;
 }
 
-export async function purgeOrganization(journal: Journal, orgId: string, now = Date.now()): Promise<number> {
-  const prefix = orgPrefix(orgId); // refuses '' (which would sweep `org::`) and a ':'-bearing id
-  const del = requireDelete(journal);
-  // FIRST, outside the prefix it deletes: a worker of this organization still running reads the marker
-  // change, stops, and deletes again what it wrote in between (erasure-fence.ts). The organization's
-  // own run fences go with its partition below, so this is the only thing such a worker can read. A
-  // fresh value each purge (`n`): a worker compares it with the one it started under.
-  const mark = randomUUID();
-  await journal.put(orgPurgedKey(orgId), { at: now, n: mark });
-  const n = await del(prefix);
-  // A boundary marker, because the audit log is NOT org-prefixed and therefore survives this.
-  //
-  // Org ids are strings a human chooses — 'acme', a company slug — so the same id being handed to a
-  // different organization later is ordinary, not exotic. Measured before this: purge removed the org's
-  // data and left every `__audit__` record tagged `org: 'acme'` in place, so the NEXT holder of that id
-  // opened /audit and read who did what in the previous tenancy.
-  //
-  // The records are not deleted. An audit log that can be erased by the operation it is meant to
-  // record is not an audit log, and the operator's own view still needs the whole history — including
-  // the purge. What changes is the org-SCOPED view: it starts at the org's current tenancy.
-  await journal.put(orgPurgedKey(orgId), { at: now, n: mark });
-  return n;
+/**
+ * Deletes an ORGANIZATION: everything it owns, in every store the storage holds (`ORGANIZATION_DEPENDENTS`,
+ * model.ts) — its partition `org:<id>:` in the journal (runs and every record of theirs, thread state,
+ * owner records, usage and budget counters, metrics, workflow records, cross-run keys, fences), in the
+ * memory store (threads, messages, observations, batch markers, every working memory), its documents and
+ * observation vectors (the namespace `org:<id>`), its queue and event namespaces, its cache and meta
+ * entries; its own and its members' owned records in the ROOT work log (`~o~<id>:…`) and what the
+ * background packages keep of them (`erasers`); and last its registration and budget records. An
+ * organization registered again under the id starts empty.
+ *
+ * `storage` is the ROOT storage; `memory` the storage its memory was built over, when that is another
+ * (its partition there goes too). `erasers`: `jobEraser(storage)`, `triggerEraser(journal)`,
+ * `eventEraser(work)` — each one's `eraseOrganization` erases everything owned under the organization;
+ * an eraser without it is refused, deleting nothing.
+ *
+ * 0.x, breaking: this used to take the journal alone, and `purgeOrganizationWork(work)` the work store;
+ * the memory store, the documents and the members' jobs had no call at all, and a new organization under
+ * the same id read the old one's threads, messages, working memory and documents (c-erasure CE-1).
+ *
+ * REFUSES, deleting nothing, a storage whose stores cannot delete what this needs: a journal without
+ * `deletePrefix`, a memory store without `deletePartition`, a vector store without `delete`, a work store
+ * without `deletePrefix`/`deleteIdPrefix`, a cache or meta store without `deletePrefix`. Every bundled
+ * store has them all.
+ *
+ * Prefix-boundary safety: `orgPrefix` refuses '' and a ':'-bearing id, and the trailing ':' keeps 'acme'
+ * from ever reaching 'acme2'.
+ *
+ * DELIBERATELY NOT DELETED:
+ * - the purge marker (`orgPurgedKey`): when it happened, nothing of anyone. A worker of the organization
+ *   still running stops on it, and the organization-scoped audit view starts after it;
+ * - root `__audit__` entries naming the organization: an audit trail erased by the operation it records
+ *   is not one — sweep it on its own schedule (`sweepLog(journal, '__audit__', …)`);
+ * - data the deployment wrote for this organization OUTSIDE its scope (no `withOrg`): nothing attributes it;
+ * - the paid user store's members (auth-ee): Studio's DELETE /organizations/:id removes them with `users`.
+ */
+export async function purgeOrganization(
+  storage: Storage,
+  orgId: string,
+  opts: { erasers?: SubjectEraser[]; memory?: Storage; now?: number } = {},
+): Promise<OrganizationErasureReport> {
+  refuseUnknownNames('purgeOrganization', opts, PURGE_ORGANIZATION_NAMES);
+  orgPrefix(orgId); // refuses '' (which would sweep `org::`) and a ':'-bearing id — before anything else
+  const blind = (opts.erasers ?? []).filter((e) => typeof e.eraseOrganization !== 'function').map((e) => e.name);
+  if (blind.length) {
+    throw new Error(
+      `@gnldev/durable: purgeOrganization deleted nothing: the eraser(s) ${blind.map((n) => `'${n}'`).join(', ')} cannot erase an organization ` +
+        "(no `eraseOrganization`), so what they hold of it would stay. Give each one `eraseOrganization` — `async () => 0` if it keeps nothing per organization.",
+    );
+  }
+  const targets = [organizationTarget(storage, 'purgeOrganization')];
+  if (opts.memory !== undefined && opts.memory !== storage) targets.push(organizationTarget(opts.memory, "purgeOrganization's `memory`"));
+  const byEraser: Record<string, number> = {};
+  const [root, ...others] = targets;
+  // The other storage holds data of the organization's, never its registration: its partition goes first,
+  // so a retry of a killed deletion still finds the organization registered.
+  let deleted = 0;
+  for (const t of others) deleted += await executePlan(t, planOrganization(orgId, { records: false }), { ...(opts.now !== undefined ? { now: opts.now } : {}) });
+  deleted += await executePlan({ ...root!, ...(opts.erasers ? { erasers: opts.erasers } : {}) }, planOrganization(orgId), { byEraser, ...(opts.now !== undefined ? { now: opts.now } : {}) });
+  return { deleted, byEraser };
+}
+
+/** The root stores of a storage, as an organization deletion reaches them — refused, deleting nothing, when one cannot delete. */
+function organizationTarget(storage: Storage, who: string): DeleteTarget {
+  // An organization's data is in every store the storage holds, so a port alone is refused (`storageOf`).
+  storageOf(storage, who);
+  const scoped = orgStorageScopeOf(storage);
+  if (scoped !== undefined) {
+    throw new Error(`@gnldev/durable: ${who} was handed organization '${scoped}''s storage. Pass the root storage and name the organization.`);
+  }
+  const journal = toJournal(storage.runs);
+  const missing: string[] = [];
+  if (typeof journal.deletePrefix !== 'function') missing.push('its journal cannot `deletePrefix`');
+  if (storage.memory && typeof storage.memory.deletePartition !== 'function') missing.push('its memory store cannot `deletePartition`');
+  if (storage.vectors && typeof storage.vectors.delete !== 'function') missing.push('its vector store cannot `delete`');
+  if (storage.work && (typeof storage.work.deletePrefix !== 'function' || typeof storage.work.deleteIdPrefix !== 'function')) missing.push('its work store cannot `deletePrefix` and `deleteIdPrefix`');
+  if (storage.cache && typeof storage.cache.deletePrefix !== 'function') missing.push('its cache cannot `deletePrefix`');
+  if (typeof storage.meta?.deletePrefix !== 'function') missing.push('its meta store cannot `deletePrefix`');
+  if (missing.length) {
+    throw new Error(`@gnldev/durable: ${who} deleted nothing: ${missing.join(', ')}, so the organization's data there would stay. Every bundled store can.`);
+  }
+  return {
+    journal,
+    ...(storage.memory ? { memory: storage.memory } : {}),
+    ...(storage.vectors ? { vectors: storage.vectors } : {}),
+    ...(storage.work ? { work: storage.work as Required<Pick<WorkStore, 'deletePrefix' | 'deleteIdPrefix'>> } : {}),
+    ...(storage.cache ? { cache: storage.cache as Required<Pick<CacheStore, 'deletePrefix'>> } : {}),
+    meta: storage.meta as Required<Pick<MetaStore, 'deletePrefix'>>,
+  };
 }
 
 export interface SweepOptions {
@@ -596,7 +620,7 @@ export interface SweepResult {
 export async function isRealRun(journal: Journal, runId: string): Promise<boolean> {
   // A failed read is not an absent key. Treating "I could not look" as "this is a ghost" would make
   // an unreachable backend look like a clean journal and quietly stop retention altogether.
-  const key = `${runId}:input`;
+  const key = runRecordKey(runId, 'input');
   try {
     // runIdOfKey, not a second spelling of the rule: it requires the record to carry stampFormat's
     // `_v`, i.e. to have been written BY the journal rather than by a caller's payload. Existence
@@ -642,7 +666,7 @@ export async function sweepRuns(journal: Journal & Partial<JournalReader>, opts:
       // BEFORE the purge — `tombstoneFor` reads the run's own `:input`, which the next line deletes.
       const tomb = opts.tombstones ? await tombstoneFor(journal, runId, now) : undefined;
       fast.deletedEntries += await purgeRunPlan(journal, runId, new Set(), true, false);
-      if (tomb) await journal.put(`${runId}:swept`, tomb);
+      if (tomb) await journal.put(runRecordKey(runId, 'swept'), tomb);
       fast.purged.push(runId);
     }
     const fencesSwept = await sweepRunFences(journal, now - opts.olderThanMs);
@@ -710,7 +734,7 @@ export async function sweepRuns(journal: Journal & Partial<JournalReader>, opts:
       if (!(await isRealRun(journal, r.runId))) { (result.skippedGhosts ??= []).push(r.runId); continue; }
       const tomb = opts.tombstones ? await tombstoneFor(journal, r.runId, now) : undefined; // BEFORE the purge
       result.deletedEntries += await purgeRunPlan(journal, r.runId, new Set(), true, false);
-      if (tomb) await journal.put(`${r.runId}:swept`, tomb);
+      if (tomb) await journal.put(runRecordKey(r.runId, 'swept'), tomb);
       result.purged.push(r.runId);
     }
   }

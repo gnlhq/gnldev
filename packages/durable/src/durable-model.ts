@@ -1,12 +1,14 @@
 import { wrapLanguageModel, simulateReadableStream } from 'ai';
-import { requestOf } from './run-identity.js';
+import { requestOf, bornOnFirstWrite } from './run-identity.js';
 import type { LanguageModelV4, LanguageModelV4CallOptions, LanguageModelV4Middleware } from '@ai-sdk/provider';
 import { argsHash } from './hash.js';
 import { claim, ctxGet, runKeys } from './journal.js';
 import { stampFormat } from './format.js';
 import { enforceStepLimits } from './limits.js';
 import { assertNotCanceled } from './cancel.js';
+import { isDraining, RunDrainedError } from './process-liveness.js';
 import { assertNotErased } from './erasure-fence.js';
+import { settleModelContent } from './time-travel.js';
 import { RunBusyError } from './errors.js';
 import { withTimeout } from './timeout.js';
 import type { DurableCtx } from './journal.js';
@@ -260,30 +262,44 @@ function warnOnPartialReplay(ctx: DurableCtx, hit: StreamStepRecord, key: string
  * missing `content`. Both used to fail cryptically (or silently). This throws a CLEAR error naming the
  * mismatch so the caller resumes through the same entry point (or starts a fresh runId).
  */
-function assertReplayEntryPoint(hit: unknown, expected: 'generate' | 'stream', key: string): void {
-  const isStreamRecord = hit != null && typeof hit === 'object' && Array.isArray((hit as { parts?: unknown }).parts);
-  if (expected === 'stream' && !isStreamRecord) {
-    throw new Error(
-      `@gnldev/durable: replay entry-point mismatch at '${key}' — this model step was journaled by the ` +
-        'NON-streaming path (runDurable/generateText) but is being replayed through the STREAMING path ' +
-        '(streamDurable/streamText). Resume the run through the SAME entry point it was created with ' +
-        '(here: runDurable), or start a fresh runId for the streaming path.',
-    );
+/**
+ * ONE STEP, EITHER PATH (design decision D5). A step journaled by one path is read by the other: a
+ * registry run executes on the stream path, while a host that resumes it directly (`resumeRun`,
+ * `runDurable`) reads on the generate path — and runs born before the stream path became the registry's
+ * were journaled as generate results. The conversion is mechanical: a generate result's content becomes
+ * the parts a provider streams for it; a streamed step's parts become the content it generated.
+ */
+function asStreamRecord(hit: unknown): StreamStepRecord {
+  const h = hit as StreamStepRecord & { content?: any[]; finishReason?: unknown; usage?: unknown; warnings?: unknown[]; providerMetadata?: unknown };
+  if (Array.isArray(h?.parts)) return h;
+  const parts: any[] = [{ type: 'stream-start', warnings: h?.warnings ?? [] }];
+  let n = 0;
+  for (const c of h?.content ?? []) {
+    if (c?.type === 'text') { const id = `t${n++}`; parts.push({ type: 'text-start', id }, { type: 'text-delta', id, delta: c.text }, { type: 'text-end', id }); }
+    else if (c?.type === 'reasoning') { const id = `r${n++}`; parts.push({ type: 'reasoning-start', id }, { type: 'reasoning-delta', id, delta: c.text }, { type: 'reasoning-end', id }); }
+    else parts.push(c);
   }
-  if (expected === 'generate' && isStreamRecord) {
-    throw new Error(
-      `@gnldev/durable: replay entry-point mismatch at '${key}' — this model step was journaled by the ` +
-        'STREAMING path (streamDurable/streamText) but is being replayed through the NON-streaming path ' +
-        '(runDurable/generateText). Resume the run through the SAME entry point it was created with ' +
-        '(here: streamDurable), or start a fresh runId for the non-streaming path.',
-    );
-  }
+  parts.push({ type: 'finish', finishReason: h?.finishReason, usage: h?.usage, ...(h?.providerMetadata ? { providerMetadata: h.providerMetadata } : {}) });
+  const { content: _c, finishReason: _f, usage: _u, warnings: _w, providerMetadata: _p, ...rest } = (h ?? {}) as Record<string, unknown>;
+  return { parts, rest };
+}
+
+function asGenerateRecord(hit: unknown): unknown {
+  const h = hit as StreamStepRecord;
+  if (!Array.isArray(h?.parts)) return hit;
+  const parts = completeIfTruncated(h) as any[];
+  // The content is time-travel's one reading of a streamed step (settleModelContent) — not a second copy.
+  const finish = parts.find((p: any) => p?.type === 'finish');
+  const warnings = parts.find((p: any) => p?.type === 'stream-start')?.warnings ?? [];
+  return { ...(h.rest ?? {}), content: settleModelContent({ parts }), finishReason: finish?.finishReason, usage: finish?.usage, warnings, ...(finish?.providerMetadata ? { providerMetadata: finish.providerMetadata } : {}) };
 }
 
 export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?: DurableModelOptions): LanguageModelV4 {
   refuseUnknownNames('withDurableModel', opts, DURABLE_MODEL_NAMES);
   refuseUnknownNames('withDurableModel: exclusiveStep', opts?.exclusiveStep, EXCLUSIVE_STEP_NAMES);
   let step = 0;
+  // The run is born at its first row (run-identity.ts `bornOnFirstWrite`).
+  bornOnFirstWrite(ctx);
   const middleware: LanguageModelV4Middleware = {
     specificationVersion: 'v4',
     wrapGenerate: async ({ doGenerate, params }) => {
@@ -295,9 +311,8 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       const hit = await ctxGet(ctx, key);
 
       if (hit !== undefined) {
-        // Reject a stream-shaped record replayed through the generate path (clear error, not a
-        // silent missing-content result).
-        assertReplayEntryPoint(hit, 'generate', key);
+        // A step the stream path journaled is read as the content it generated (see asGenerateRecord).
+        const generated = asGenerateRecord(hit);
         // Replay divergence — see warnOnModelDivergence documentation (opt-in, soft).
         await warnOnModelDivergence(ctx, claimKey, key, reqHash, 'model step');
         step++;
@@ -306,7 +321,7 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
         // does NOT LEAK); deterministic (same result) since the journal did NOT CHANGE. If the limit
         // is raised, this point is passed through.
         if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId);
-        return hit as Awaited<ReturnType<typeof doGenerate>>;
+        return generated as Awaited<ReturnType<typeof doGenerate>>;
       }
 
       // Write-ahead 'running' claim BEFORE the model call. Purpose: the crash window
@@ -325,6 +340,8 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       // …and the run was not DELETED since this attempt started (erasure-fence.ts): same boundary, one read
       // beside the flag's — the deletion took the flag with everything else.
       await Promise.all([assertNotCanceled(ctx.journal, ctx.runId), assertNotErased(ctx.journal, ctx.runId, ctx.erasure)]);
+      // GRACEFUL DRAIN (process-liveness.ts): a process shutting down starts no new model step.
+      if (isDraining()) throw new RunDrainedError(ctx.runId);
       // A new step spends budget: none left (the request's — a sibling may have used it), no step.
       if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId, 'before');
       await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
@@ -354,11 +371,10 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       const key = runKeys.model(ctx.runId, step);
       const claimKey = runKeys.proc(ctx.runId, `__gnl_model_claim:${step}`);
       const reqHash = safeRequestHash(params);
-      const hit = await ctxGet<{ parts: any[]; rest: Record<string, unknown>; partial?: boolean }>(ctx, key);
-      if (hit !== undefined) {
-        // Reject a generate-shaped record (no `.parts`) replayed through the stream path —
-        // otherwise simulateReadableStream chokes on `undefined` chunks (silent/cryptic broken stream).
-        assertReplayEntryPoint(hit, 'stream', key);
+      const stored = await ctxGet<unknown>(ctx, key);
+      if (stored !== undefined) {
+        // A step the generate path journaled is read as the parts a provider streams for it (asStreamRecord).
+        const hit = asStreamRecord(stored);
         // A write-ahead (truncated) record is still replayed — but never in silence (see warnOnPartialReplay).
         warnOnPartialReplay(ctx, hit, key, step);
         // SAME divergence check as generate (see warnOnModelDivergence).
@@ -380,6 +396,8 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       // …and the run was not DELETED since this attempt started (erasure-fence.ts): same boundary, one read
       // beside the flag's — the deletion took the flag with everything else.
       await Promise.all([assertNotCanceled(ctx.journal, ctx.runId), assertNotErased(ctx.journal, ctx.runId, ctx.erasure)]);
+      // GRACEFUL DRAIN (process-liveness.ts): a process shutting down starts no new model step.
+      if (isDraining()) throw new RunDrainedError(ctx.runId);
       // A new step spends budget: none left (the request's — a sibling may have used it), no step.
       if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId, 'before');
       await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
@@ -394,7 +412,6 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
         throw error;
       }
       const { stream, ...rest } = result;
-      const checkpointKey = runKeys.proc(ctx.runId, `__gnl_stream_checkpoint:${step}`);
       const myStep = step;
       step++;
       const parts: any[] = [];
@@ -414,10 +431,10 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       // before. A partial record is only ever read by a resume that would otherwise have re-planned,
       // which is strictly the better of the two.
       //
-      // The periodic checkpoint below stays as it was: it preserves partial progress on a long TEXT
-      // stream, which nothing reads today but which is the only trace a crash leaves. The tool-call
-      // write is additive, not a replacement — the two answer different questions.
-      const CHECKPOINT_EVERY = 10;
+      // There is no periodic copy of a long TEXT stream any more. It rewrote every part of the step so
+      // far every 10 parts — nothing read it, and it was 71–94% of a streamed run's WAL on Postgres
+      // (measured, ADR-0008). A detached run's event log (detached.ts) is what a
+      // crash leaves of a text stream now, written once per segment.
       // A write-ahead put that fails silently reopens the exact window this checkpoint was added to
       // close — the caller's stream keeps flowing and nothing anywhere records that the step is no
       // longer recoverable. Warn once per STREAM, not per chunk: a step can carry many tool calls,
@@ -443,14 +460,6 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
                   err,
                 );
               }
-            }
-          } else if (parts.length % CHECKPOINT_EVERY === 0) {
-            // Idempotent: the SAME key is overwritten with all chunks so far (overwrite, not append),
-            // so a half-finished write cannot break replay — only the forensic copy goes stale.
-            try {
-              await ctx.journal.put(checkpointKey, { parts: parts.slice(), rest, partial: true });
-            } catch {
-              /* checkpoint is best-effort — must never stop the stream */
             }
           }
           controller.enqueue(chunk);

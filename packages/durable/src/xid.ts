@@ -26,6 +26,8 @@ import { argsHash } from './hash.js';
 import { normalizeId, extractSemFields, type SemanticIdentity } from './semantic-dup.js';
 import type { Journal } from './journal.js';
 import { claim } from './journal.js';
+import { stampIsLive } from './liveness.js';
+import { procStampFor } from './process-liveness.js';
 
 export interface XidRecord {
   v: 1;
@@ -41,6 +43,10 @@ export interface XidRecord {
    * decision (see `claimXidInFlight`). Read by another call as "may have run", never as nothing.
    */
   inFlight?: true;
+  /** The claim TTL of the attempt holding an in-flight id: its liveness is judged by it (liveness.ts). */
+  ttlMs?: number;
+  /** The process holding an in-flight id (process-liveness.ts): judged by that process before the TTL. */
+  proc?: string;
   /** An in-flight claim given back by a call that failed before its effect: stands for no record. */
   released?: true;
 }
@@ -115,8 +121,8 @@ async function casXid(journal: Journal, key: string, expected: XidRecord, next: 
  *
  *  - absent → first writer wins;
  *  - released (a call that failed before its effect gave it back) → taken over by CAS;
- *  - in flight and STALE by the shared clock → taken over only by the call that left it (same run, same
- *    toolCallId). For any other call it is work that may have run, and may have SUCCEEDED;
+ *  - in flight and STALE by the shared clock and its holder's own TTL → taken over only by the call that
+ *    left it (same run, same toolCallId). For any other call it is work that may have run, and may have SUCCEEDED;
  *  - past the dedup window (`windowTtlMs`), completed or stale → no longer a duplicate of anything.
  *
  * Lost: `cur` is what stands there (live or stale in flight, or completed) — the caller decides.
@@ -129,7 +135,7 @@ export async function claimXidInFlight(
   const claimed: XidRecord = {
     v: 1, toolName: plan.toolName, identity: plan.identity, amounts: plan.amounts,
     first: { runId, toolCallId, at: now, ...(plan.channel ? { channel: plan.channel } : {}) },
-    inFlight: true,
+    inFlight: true, ttlMs: staleTtlMs, ...procStampFor(journal),
   };
   // A lost write is read again and judged again, never answered with "nothing there": two calls taking
   // the same released slot over at once must not both come away free to run. Bounded: a row that reads
@@ -142,7 +148,7 @@ export async function claimXidInFlight(
       continue;
     }
     const at = cur.first?.at ?? 0;
-    const stale = cur.inFlight === true && now - at > staleTtlMs;
+    const stale = cur.inFlight === true && !(await stampIsLive(at, cur.ttlMs ?? staleTtlMs, now, cur.proc, journal));
     const windowExpired = windowTtlMs !== undefined && cur.released !== true && (cur.inFlight !== true || stale) && now - at > windowTtlMs;
     const own = cur.first?.runId === runId && cur.first?.toolCallId === toolCallId;
     const takeable = cur.released === true || windowExpired || (stale && own);

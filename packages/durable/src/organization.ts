@@ -6,8 +6,10 @@
 // PRESERVED in the organization view (the same Journal interface). A highly requested feature that has no
 // counterpart in most agent frameworks.
 import { listRunsArray } from './journal.js';
+import { hidingView } from './journal-view.js';
 import { decodeRunCursor, encodeRunCursor, encodeChangeCursor, type ChangePosition } from './run-cursor.js';
 import type { Journal, JournalBatch, JournalReader, JournalEntry, RunChange, RunSummary } from './journal.js';
+import { withBirth, beginRunIn } from './run-identity.js';
 
 /** An organization-prefixed key. orgId must not contain ':' (it would break the key schema). */
 /**
@@ -69,6 +71,16 @@ export const ADOPTABLE_RESERVED_PREFIXES: readonly string[] = [
  */
 export const ORG_RECORD_PRE = '__org__:';
 
+/** Every organization registered in a store (an `__org__:<id>` record that is not a tombstone). */
+export async function registeredOrganizations(read: { listKeys?(prefix: string): Promise<string[]>; get<T = unknown>(key: string): Promise<T | undefined> }): Promise<string[]> {
+  if (typeof read.listKeys !== 'function') return [];
+  const out: string[] = [];
+  for (const key of await read.listKeys(ORG_RECORD_PRE)) {
+    if ((await read.get(key)) != null) out.push(key.slice(ORG_RECORD_PRE.length));
+  }
+  return out;
+}
+
 /**
  * Refuses to adopt into an organization that was never registered.
  *
@@ -99,53 +111,6 @@ export async function assertOrgRegistered(
     + `undo it, because the rows would already carry a prefix. Create the organization first `
     + `(studio: POST /organizations), or pass { allowUnregistered: true } if this deployment has no `
     + 'registration path at all.',
-  );
-}
-
-/**
- * Refuses to adopt while a run is still executing.
- *
- * Measured, on SQLite with a real model call in flight: the migration moved three of the run's keys
- * into the organization, the run then wrote its next key at the ROOT, and the store ended with the
- * SAME logical key in both places —
- *
- *   canli-kosu:proc:__gnl_model_claim:0            (root, written after the migration)
- *   org:acme:canli-kosu:proc:__gnl_model_claim:0   (moved)
- *
- * — which is the exactly-once claim marker, duplicated. That is the worst of the three outcomes: no
- * error, and no whole record either. The transaction does not help, because the run is not inside it;
- * it protects the migration from failing halfway, not the store from being written to meanwhile.
- *
- * So this is a refusal, not a warning. "Stop writes before upgrading" is advice a deployment can
- * follow accidentally; the store is the only place that knows whether it actually did.
- *
- * Detected from the outcome records rather than `listRuns`, because the summary shape differs between
- * adapters while `{status:'running'}` is written by the engine itself and is identical everywhere.
- */
-export async function assertNoRunsInFlight(
-  read: {
-    listKeys?(prefix: string): Promise<string[]>;
-    get<T = unknown>(key: string): Promise<T | undefined>;
-  },
-  allowInFlight?: boolean,
-): Promise<void> {
-  if (allowInFlight || typeof read.listKeys !== 'function') return;
-  const keys = await read.listKeys('');
-  const inFlight: string[] = [];
-  for (const k of keys) {
-    if (!k.endsWith(':outcome')) continue;
-    const rec = await read.get<{ status?: string }>(k);
-    if (rec && typeof rec === 'object' && (rec as { status?: string }).status === 'running') {
-      inFlight.push(k.slice(0, -':outcome'.length));
-    }
-  }
-  if (inFlight.length === 0) return;
-  throw new Error(
-    `@gnldev/durable: ${inFlight.length} run(s) are still executing (${inFlight.slice(0, 3).join(', ')}` +
-    `${inFlight.length > 3 ? ', …' : ''}), and adopting now would SPLIT them: the migration moves the keys `
-    + 'they have already written while they go on writing unprefixed ones, leaving the same exactly-once '
-    + 'claim marker in two places. Measured. Stop accepting work, let the runs finish, then adopt — or '
-    + 'pass { allowInFlight: true } if you know these runs are abandoned.',
   );
 }
 
@@ -203,11 +168,29 @@ export function orgSpaceSql(col: string, ph: () => string, opts: { orgId?: strin
   return prefixSql(col, opts.orgId === undefined ? ORG_KEY_PREFIX : orgPrefix(opts.orgId), ph, opts.outside === true);
 }
 
-/** `col` starts (or, with `negate`, does not start) with the bound `prefix` — characters, compared exactly. */
+/**
+ * `col` starts (or, with `negate`, does not start) with the bound `prefix` — characters, compared exactly.
+ *
+ * What a "character" is, is the database's: a UTF8 Postgres and SQLite count code points, a SQL_ASCII
+ * Postgres (`initdb --locale=C` with no encoding) counts bytes — there `é` is two. A length counted one
+ * way only made the prefix of a non-ASCII organization (`café`) match NOTHING on the other: the
+ * organization listed none of its threads and deleting it left its memory rows (measured on Postgres 15,
+ * SQL_ASCII). So a prefix whose two lengths differ is compared at both: each comparison is exact (a
+ * substring of N characters equals the prefix only if the value starts with it), and the one whose N is
+ * not the database's own can never match. pg-mem has no `length()` to ask the database instead.
+ */
 export function prefixSql(col: string, prefix: string, ph: () => string, negate = false): { cond: string; params: unknown[] } {
-  const n = ph();
-  const p = ph();
-  return { cond: `substring(${col}, 1, ${n}) ${negate ? '<>' : '='} ${p}`, params: [Array.from(prefix).length, prefix] };
+  const chars = Array.from(prefix).length;
+  const bytes = new TextEncoder().encode(prefix).length;
+  const at = (len: number): { cond: string; params: unknown[] } => {
+    const n = ph();
+    const p = ph();
+    return { cond: `substring(${col}, 1, ${n}) = ${p}`, params: [len, prefix] };
+  };
+  const a = at(chars);
+  const b = bytes === chars ? undefined : at(bytes);
+  const starts = b ? `(${a.cond} OR ${b.cond})` : a.cond;
+  return { cond: negate ? `NOT ${starts}` : starts, params: b ? [...a.params, ...b.params] : a.params };
 }
 
 /**
@@ -306,7 +289,10 @@ async function walkRunPages(
       if (items.length >= limit) {
         const exhausted = i === page.items.length - 1 && !page.nextCursor;
         const next = page.items[i + 1]?.runId;
-        return { items, ...(exhausted ? {} : { nextCursor: encodeRunCursor({ runId: r.runId, ...(next !== undefined ? { next } : {}), seen }) }) };
+        // The source run's creation time places the cursor in the source's own order even once that run
+        // and the next are gone (run-cursor.ts); a source that gives none is placed by run, then count.
+        const at = typeof r.createdAt === 'number' ? { at: r.createdAt } : {};
+        return { items, ...(exhausted ? {} : { nextCursor: encodeRunCursor({ runId: r.runId, ...at, ...(next !== undefined ? { next } : {}), seen }) }) };
       }
     }
     if (!page.nextCursor) return { items }; // underlying store exhausted
@@ -395,6 +381,10 @@ export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<J
   }
   if (journal.listKeys) {
     out.listKeys = async (p, opts) => (await journal.listKeys!(prefix + p, opts)).map((k) => k.slice(prefix.length));
+  }
+  if (journal.readRange) {
+    out.readRange = async <T>(p: string, opts: { after?: string; limit: number; desc?: boolean }) =>
+      (await journal.readRange!<T>(prefix + p, { ...opts, ...(opts.after !== undefined ? { after: prefix + opts.after } : {}) })).map(([k, v]) => [k.slice(prefix.length), v] as [string, T]);
   }
   // The person's owner records in THIS organization: the prefix goes down to the store, so another
   // organization's record naming the same id — somebody else — is never read.
@@ -495,7 +485,7 @@ export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<J
   if (typeof reader.readRunStats === 'function') {
     out.readRunStats = (runId: string) => reader.readRunStats!.call(journal, prefix + runId);
   }
-  return out;
+  return withBirth(out);
 }
 
 /** The journal a `withRootScope` view hides organizations' rows of. */
@@ -519,8 +509,9 @@ export function rootScopeParentOf(journal: unknown): Journal | undefined {
  * returned acme's journal (measured: the model's answer, the prompt). This is the one owner of that
  * rule for runs; a door hands it out wherever it serves the root scope.
  *
- * READS ONLY. `get`, `getMany`, `getCounters`, `listKeys`, `listOwnerRecords`, `readRun`, `readRunStats`, `listRuns`,
- * `listRunsPaged`, `listStaleRuns`, `countRuns` and `listRunsChangedSince` answer as if no `org:` key existed (`isOrganizationKey`);
+ * READS ONLY. Every read of the Journal port answers as if no `org:` key existed (`isOrganizationKey`) — the
+ * reads by key derived from that one rule (journal-view.ts `hidingView`, which also refuses a method the
+ * port does not have), the reads by run (`readRun`, `listRuns`, `countRuns` …) answered below;
  * `countRunsByStatus` answers only while no organization holds a row — it counts every organization's
  * runs and takes no filter — and otherwise resolves `undefined` (a caller falls back to `listRuns`, as
  * it does under `withOrg`). Writes pass through unchanged: a
@@ -540,60 +531,47 @@ export function withRootScope<J extends Partial<Journal> & Partial<JournalReader
   }
   const j = journal as Partial<Journal> & Partial<JournalReader>;
   const hidden = isOrganizationKey;
-  const overrides: Record<PropertyKey, unknown> = {
-    [ROOT_SCOPE_OF]: journal,
-    get: j.get && (async (key: string) => (hidden(key) ? undefined : j.get!(key))),
-    getMany: j.getMany && (async (keys: string[]) => {
-      const shown = keys.filter((k) => !hidden(k));
-      const got = shown.length ? await j.getMany!(shown) : [];
-      let i = 0;
-      return keys.map((k) => (hidden(k) ? undefined : got[i++]));
-    }),
-    getCounters: j.getCounters && (async (key: string) => (hidden(key) ? undefined : j.getCounters!(key))),
-    listKeys: j.listKeys && (async (p: string, o?: unknown) =>
-      (hidden(p) ? [] : (await (j.listKeys as (pp: string, oo?: unknown) => Promise<string[]>)(p, o)).filter((k) => !hidden(k)))),
-    listOwnerRecords: j.listOwnerRecords && (async (rid: string, o?: { prefix?: string }) =>
-      (hidden(o?.prefix ?? '') ? [] : (await j.listOwnerRecords!(rid, o)).filter((k) => !hidden(k)))),
-    readRun: j.readRun && (async (runId: string) => (hidden(runId) ? [] : j.readRun!(runId))),
-    readRunStats: j.readRunStats && (async (runId: string) => (hidden(runId) ? { entries: 0, bytes: 0 } : j.readRunStats!(runId))),
-    listRuns: j.listRuns && (async () =>
-      (await listRunsArray({ listRuns: (q) => (j.listRuns as (qq?: unknown) => Promise<unknown>).call(journal, q) }))
-        .filter((r) => !hidden(r.runId))),
-    listRunsPaged: j.listRunsPaged
-      && ((q?: Parameters<NonNullable<JournalReader['listRunsPaged']>>[0]) => walkRunPages(j, journal, q, (r) => (hidden(r.runId) ? undefined : r))),
-    listStaleRuns: j.listStaleRuns && (async (cutoffTs: number, o?: { includeSuspended?: boolean }) =>
-      (await j.listStaleRuns!(cutoffTs, o)).filter((runId) => !hidden(runId))),
-    // The root's runs are every run less the organizations' range: two counts over the run id's index,
-    // never a listing. A prefix inside the organizations' space counts nothing; one the space starts
-    // with (`'o'`, `''`) holds all of it and subtracts it; any other prefix is disjoint from it.
-    countRuns: j.countRuns && (async (q?: { runIdPrefix?: string }) => {
-      const p = q?.runIdPrefix ?? '';
-      if (hidden(p)) return 0;
-      const all = await j.countRuns!.call(journal, q);
-      return ORG_KEY_PREFIX.startsWith(p) ? all - (await j.countRuns!.call(journal, { runIdPrefix: ORG_KEY_PREFIX })) : all;
-    }),
-    // Walked like `listRunsPaged`: every organization's changes in the window are read and dropped, so
-    // the cost follows how much the whole store is changing — a window of seconds, not its size.
-    listRunsChangedSince: j.listRunsChangedSince
-      && ((cursor?: string, o?: Parameters<NonNullable<JournalReader['listRunsChangedSince']>>[1]) => walkChangePages(j, journal, cursor, o, (r) => (hidden(r.runId) ? undefined : r))),
-    // Counted by the store only while no organization holds a row: then the store's count IS the
-    // root's. Once one does, `undefined` — the store's aggregate takes no filter — and a caller falls
-    // back to `listRuns`, as under `withOrg`. One indexed probe, so a single-tenant deployment keeps
-    // the cheap count. A reader that cannot list keys cannot be probed, and keeps its count: a number,
-    // never a row, and the push-down paging that depends on it (Studio's `GET /runs?limit=`).
-    countRunsByStatus: j.countRunsByStatus && (async () => {
-      if (typeof j.listKeys === 'function' && (await j.listKeys(ORG_KEY_PREFIX, { limit: 1 })).length > 0) return undefined;
-      return j.countRunsByStatus!();
-    }),
-  };
-  return new Proxy(journal, {
-    get(t, prop) {
-      if (Object.prototype.hasOwnProperty.call(overrides, prop)) return overrides[prop];
-      const v = Reflect.get(t, prop, t);
-      return typeof v === 'function' ? v.bind(t) : v;
+  // Every read by key follows `hidden` (journal-view.ts); the reads by run are this scope's own answers.
+  // The root scope offers the birth (run-identity.ts `withBirth`) through its own view.
+  const view: J = hidingView(journal, {
+    hides: hidden,
+    hidesPrefix: hidden,
+    marks: { [ROOT_SCOPE_OF]: journal, beginRun: (runId: string, ctx?: Parameters<typeof beginRunIn>[2]) => beginRunIn(view as unknown as Journal, runId, ctx) },
+    runs: {
+      readRun: j.readRun && (async (runId: string) => (hidden(runId) ? [] : j.readRun!(runId))),
+      readRunStats: j.readRunStats && (async (runId: string) => (hidden(runId) ? { entries: 0, bytes: 0 } : j.readRunStats!(runId))),
+      listRuns: j.listRuns && (async () =>
+        (await listRunsArray({ listRuns: (q) => (j.listRuns as (qq?: unknown) => Promise<unknown>).call(journal, q) }))
+          .filter((r) => !hidden(r.runId))),
+      listRunsPaged: j.listRunsPaged
+        && ((q?: Parameters<NonNullable<JournalReader['listRunsPaged']>>[0]) => walkRunPages(j, journal, q, (r) => (hidden(r.runId) ? undefined : r))),
+      listStaleRuns: j.listStaleRuns && (async (cutoffTs: number, o?: { includeSuspended?: boolean }) =>
+        (await j.listStaleRuns!(cutoffTs, o)).filter((runId) => !hidden(runId))),
+      // The root's runs are every run less the organizations' range: two counts over the run id's index,
+      // never a listing. A prefix inside the organizations' space counts nothing; one the space starts
+      // with (`'o'`, `''`) holds all of it and subtracts it; any other prefix is disjoint from it.
+      countRuns: j.countRuns && (async (q?: { runIdPrefix?: string }) => {
+        const p = q?.runIdPrefix ?? '';
+        if (hidden(p)) return 0;
+        const all = await j.countRuns!.call(journal, q);
+        return ORG_KEY_PREFIX.startsWith(p) ? all - (await j.countRuns!.call(journal, { runIdPrefix: ORG_KEY_PREFIX })) : all;
+      }),
+      // Walked like `listRunsPaged`: every organization's changes in the window are read and dropped, so
+      // the cost follows how much the whole store is changing — a window of seconds, not its size.
+      listRunsChangedSince: j.listRunsChangedSince
+        && ((cursor?: string, o?: Parameters<NonNullable<JournalReader['listRunsChangedSince']>>[1]) => walkChangePages(j, journal, cursor, o, (r) => (hidden(r.runId) ? undefined : r))),
+      // Counted by the store only while no organization holds a row: then the store's count IS the
+      // root's. Once one does, `undefined` — the store's aggregate takes no filter — and a caller falls
+      // back to `listRuns`, as under `withOrg`. One indexed probe, so a single-tenant deployment keeps
+      // the cheap count. A reader that cannot list keys cannot be probed, and keeps its count: a number,
+      // never a row, and the push-down paging that depends on it (Studio's `GET /runs?limit=`).
+      countRunsByStatus: j.countRunsByStatus && (async () => {
+        if (typeof j.listKeys === 'function' && (await j.listKeys(ORG_KEY_PREFIX, { limit: 1 })).length > 0) return undefined;
+        return j.countRunsByStatus!();
+      }),
     },
-    has: (t, prop) => (Object.prototype.hasOwnProperty.call(overrides, prop) ? overrides[prop] !== undefined : Reflect.has(t, prop)),
   });
+  return view;
 }
 
 /**

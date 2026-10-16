@@ -133,7 +133,7 @@ describe.each(STORES)('an erased run stays erased — %s', (_name, make) => {
       } else if (deletion === 'purgeThread') {
         await purgeThread(root, thread); // not refused: nothing of it reads as in flight
       } else {
-        await purgeOrganization(root, org);
+        await purgeOrganization(storage, org);
       }
       expect(await holding(root, secret)).toEqual([]);
       const afterDeletion = executions;

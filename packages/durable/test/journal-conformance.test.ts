@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { newDb } from 'pg-mem';
 import pg from 'pg';
-import { InMemoryStorage, toJournal, parseJournalKey, runIdOfKey, outcomeStatusOf, summarizeRun, pageRunsFromArray } from '@gnldev/durable';
+import { InMemoryStorage, toJournal, parseJournalKey, runRecordOf, summarizeRun, pageRunsFromArray } from '@gnldev/durable';
 import type { Journal, JournalReader, JournalEntry, RunSummary } from '@gnldev/durable';
 import { journalConformance, type ConformanceSubject } from '@gnldev/durable/testing';
 import { SqliteStorage } from '../src/sqlite-storage.js';
@@ -87,8 +87,8 @@ if (PG_URL) {
 /**
  * A journal as a user writes one against the documented port: a Map of keys, the optional atomic
  * primitives (each atomic because nothing awaits between its read and its write), and the reader built
- * from the public helpers — `parseJournalKey` for a run's entries, `runIdOfKey` and `outcomeStatusOf` for the records that
- * register a run, `summarizeRun` for its status, `pageRunsFromArray` for the page.
+ * from the public helpers — `parseJournalKey` for a run's entries, `runRecordOf` for the records that make
+ * a run, `summarizeRun` for its status, `pageRunsFromArray` for the page.
  */
 class MapJournal implements Journal, JournalReader {
   private readonly m = new Map<string, unknown>();
@@ -123,7 +123,7 @@ class MapJournal implements Journal, JournalReader {
   async listRuns(): Promise<RunSummary[]> {
     const ids = new Set<string>();
     for (const [key, value] of this.m) {
-      const id = parseJournalKey(key)?.runId ?? runIdOfKey(key, value) ?? (outcomeStatusOf(key, value) !== null ? key.slice(0, -':outcome'.length) : null);
+      const id = runRecordOf(key, value)?.runId;
       if (id) ids.add(id);
     }
     const out: RunSummary[] = [];

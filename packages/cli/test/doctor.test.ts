@@ -57,6 +57,9 @@ describe('doctorStamps', () => {
     const d = await import('@gnldev/durable');
     const journal = freshJournal();
     await seedRun(journal, 'r-old');
+    // A millisecond apart: runs created in the same millisecond are ordered by id (as on Sqlite and
+    // Postgres), and 'r-new' < 'r-old' — the age order this test is about needs two ages.
+    await new Promise((r) => setTimeout(r, 2));
     await seedRun(journal, 'r-new');
     await recordIncident(journal, 'r-new', incident({ at: 3_000_000 }));
     await recordIncident(journal, 'r-old', incident({ at: 1_000_000 }));

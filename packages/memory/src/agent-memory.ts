@@ -3,6 +3,7 @@
 //   • MemoryStore (storage.memory): thread/message/working-memory/observations (derived, queryable).
 //   • RunJournal   (storage.runs):   OM's LLM memoization + durable progress (replay is deterministic).
 // loadContext runs BEFORE persistInput, so the whole context freezes into `:input` = replayable.
+import { REPLAYED_SEGMENT_RE } from '@gnldev/durable';
 import { cosineSimilarity } from 'ai';
 import { requireCapability, durableProcessorStep, workingMemoryScope, OM_LEAVES, OM_VECTOR_SOURCE, OBSERVATION_VECTOR_KEY, type OmLeaf } from '@gnldev/durable';
 import { threadOwnerOf, threadRecordOwner, toJournal, purgeThread, orgStorageScopeOf, orgPrefix, orgVectorId, vectorWriteBatch, VECTOR_PARTITION, assertRootThreadId, assertRootOutsideOrganizations, type Memory } from '@gnldev/durable';
@@ -58,7 +59,7 @@ const HUGE = 1_000_000_000; // "fetch everything" page limit (parity; a real con
 function assertOmThreadId(tid: string): string {
   // Segment-based, not colon-based: colons in thread ids are long-standing supported behaviour
   // (sweepThreads suffix inference); the collision is a SEGMENT named 'model'/'tool'.
-  if (/(^|:)(model|tool)(:|$)/.test(tid)) {
+  if (REPLAYED_SEGMENT_RE.test(tid)) {
     throw new Error(
       `@gnldev/memory: thread id '${tid}' would collide with the journal's key schema — ` +
       `a ':'-delimited segment named 'model' or 'tool' reads as a run record (see parseJournalKey in @gnldev/durable)`,
@@ -350,6 +351,16 @@ export class AgentMemory implements Required<Memory> {
       rows.push({ threadId, role: message?.role ?? 'user', text, embedding, metadata: message?.metadata, ts: Date.now(), message });
     }
     return this.store.appendMessagesOnce(threadId, rows, batchKey);
+  }
+
+  /**
+   * `Memory.retract`: the rows `appendOnce` wrote under `batchKey`, and its record — through the store's
+   * `retractBatch`. Called by a run whose deletion landed while it was appending (@gnldev/durable's
+   * erasure-fence.ts). A store without `retractBatch` keeps them; every bundled store has it.
+   */
+  async retract(threadId: string, batchKey: string): Promise<void> {
+    this.scoped(threadId);
+    await this.store.retractBatch?.(threadId, batchKey);
   }
 
   /** Track 1: last N + query-based topK recall. */

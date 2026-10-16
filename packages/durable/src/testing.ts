@@ -19,9 +19,11 @@
  * `AgentMemory` thread delete, `eraseSubject` over a whole `Storage`, adoption) stay in the packages
  * that own them; everything below is expressed on the journal alone.
  */
+import { leafSuffix } from './run-id-grammar.js';
+import { runRecordKey } from './run-id-grammar.js';
 import assert from 'node:assert/strict';
 import type { Journal, JournalReader, RunSummary, RunStatus, RunListQuery } from './journal.js';
-import { claim, parseJournalKey, runIdOfKey, outcomeStatusOf, deriveRunStatus, isOwnerRecordKey, ownerOfRecord, nestedAgentRunId, runKeys } from './journal.js';
+import { claim, runRecordOf, deriveRunStatus, isOwnerRecordKey, ownerOfRecord, nestedAgentRunId, runKeys } from './journal.js';
 import { stampFormat } from './format.js';
 import { withOrg, ORG_RECORD_PRE, parseOrganizationKey, orgPrefix } from './organization.js';
 import { RUN_FENCE_PREFIX, runFenceKey } from './erasure-fence.js';
@@ -55,9 +57,16 @@ export interface ConformanceSubject {
 export interface JournalConformanceOptions {
   /** Your runner's `describe` (vitest, jest, mocha, `node:test`). */
   describe: (name: string, fn: () => void) => unknown;
-  /** Your runner's `it`; `timeout` is passed as its third argument. */
+  /**
+   * Your runner's `it`. With `timeout` set it also gets a third argument — `timeout` plus a second — for
+   * a runner that reads one (vitest, jest), so its own default does not cut a scenario before `timeout`
+   * does; a runner that does not (`node:test`, mocha) ignores it.
+   */
   it: (name: string, fn: () => Promise<void>, timeout?: number) => unknown;
-  /** Per-scenario timeout in ms, handed to `it`. */
+  /**
+   * Per-scenario limit in ms, enforced by the suite itself on every runner: a scenario still running then
+   * fails, naming the limit, and its journal is closed. Unset, the runner's own limit is the only one.
+   */
   timeout?: number;
   /**
    * `false` only for a test double that cannot report a lost `putIfAbsent` (pg-mem answers `true` to
@@ -89,11 +98,24 @@ export function journalConformance(
   refuseUnknownNames('journalConformance', opts, JOURNAL_CONFORMANCE_NAMES);
   const exactClaim = opts.exactClaim !== false;
   const pageWalk = opts.pageWalk !== false;
+  const limit = opts.timeout;
+  // The limit is the suite's own timer, not only an argument to `it`: `node:test` takes its options
+  // before the function and mocha reads `this.timeout()`, so a third argument was dropped in silence there
+  // and a store that hung, hung the run (release audit d-status, J3).
   const scenario = (title: string, body: (s: Subject) => Promise<void>) => opts.it(title, async () => {
-    const made = await make();
-    const s: Subject = { ...made, older: made.writeAsOlderVersion ? (k, v) => made.writeAsOlderVersion!(k, v) : (k, v) => made.journal.put(k, v), pageWalk };
-    try { await body(s); } finally { await made.close?.(); }
-  }, opts.timeout);
+    let made: ConformanceSubject | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ran = (async () => {
+      made = await make();
+      const m = made;
+      await body({ ...m, older: m.writeAsOlderVersion ? (k, v) => m.writeAsOlderVersion!(k, v) : (k, v) => m.journal.put(k, v), pageWalk });
+    })();
+    ran.catch(() => {}); // after an expiry, its eventual failure is not the scenario's to report
+    const expired = limit === undefined ? undefined : new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`journal conformance: '${title}' did not finish within ${limit} ms (the \`timeout\` option)`)), limit);
+    });
+    try { await (expired ? Promise.race([ran, expired]) : ran); } finally { clearTimeout(timer); await made?.close?.(); }
+  }, ...(limit === undefined ? [] : [limit + 1_000]) as [number?]);
 
   opts.describe(`journal conformance — ${name}`, () => {
     // ── The key-value contract ───────────────────────────────────────────────────────────────────
@@ -336,9 +358,9 @@ export function journalConformance(
       const owners = ['u-a', 'u-b', 'u-a', undefined, 'u-a', 'u-b', 'u-a'];
       for (let i = 0; i < owners.length; i++) {
         const id = `pg${i}`;
-        if (owners[i]) await j.put(`${id}:input`, stampFormat({ at: 1, resourceId: owners[i], agent: i % 2 ? 'beta' : 'alpha', ...(i === 2 ? { parentRunId: 'pg0' } : {}) }));
-        await j.put(`${id}:model:0`, { ok: true });
-        if (i % 3 === 0) await j.put(`${id}:tool:c1`, { status: 'suspended', output: {} });
+        if (owners[i]) await j.put(runRecordKey(id, 'input'), stampFormat({ at: 1, resourceId: owners[i], agent: i % 2 ? 'beta' : 'alpha', ...(i === 2 ? { parentRunId: 'pg0' } : {}) }));
+        await j.put(runRecordKey(id, 'model', '0'), { ok: true });
+        if (i % 3 === 0) await j.put(runRecordKey(id, 'tool', 'c1'), { status: 'suspended', output: {} });
       }
       const all = await listAll(reader, {}, pageWalk);
       assert.equal(all.length, owners.length);
@@ -351,6 +373,61 @@ export function journalConformance(
         const desc = (await listAll(reader, { ...f, order: 'desc' }, pageWalk, 2)).map((r) => r.runId);
         assert.deepEqual(desc, [...want].reverse(), `${JSON.stringify(f)}: descending`);
       }
+    });
+
+    scenario('R5 deleting one record of a run: the run reads what its remaining records say — status, counts, person and thread, and whether it is a run at all', async ({ journal: j }) => {
+      const reader = requireReader(j);
+      assert.equal(typeof j.deletePrefix, 'function', 'deletePrefix is how retention and erasure delete');
+      const suspendedRec = { status: 'suspended', output: { __gnl_suspend: { toolCallId: 'c-a', toolName: 'pay', reason: 'approve' } } };
+      const input = (f: Record<string, unknown>) => stampFormat({ at: 1, ...f });
+      await j.put('del:input', input({ resourceId: 'ayse', threadId: 't-del' }));
+      await j.put('del:model:0', { text: 'a' });
+      await j.put('del:model:1', { text: 'b' });
+      await j.put('del:tool:a', suspendedRec);
+      await j.put('del:tool:b', { status: 'succeeded', output: 1 });
+      await j.put('del:outcome', { status: 'failed', at: 1, error: '401' });
+      await j.put('del:lock', { at: 1 }); // the run's, but not a record that makes it one
+      await j.put('del2:input', input({ resourceId: 'ayse', threadId: 't-del' })); // a run whose id extends it
+      await j.put('del2:tool:a', suspendedRec);
+      const steps: Array<[string, () => Promise<unknown>]> = [
+        ['the start', async () => {}],
+        ['its one suspended tool record', () => j.deletePrefix!('del:tool:a')],
+        ['its outcome record', () => j.deletePrefix!('del:outcome')],
+        ['one model record', () => j.deletePrefix!('del:model:1')],
+        ['the tool record written again, suspended', () => j.put('del:tool:a', suspendedRec)],
+        ['… and resolved', () => j.put('del:tool:a', { status: 'succeeded', output: 2 })],
+        ['suspended once more', () => j.put('del:tool:b', suspendedRec)],
+        ['a key under its prefix that is no record of it', async () => {
+          assert.equal(await j.deletePrefix!('del:lock'), 1, 'the key is deleted and counted, though no run is changed');
+          assert.equal(await j.get('del:lock'), undefined);
+        }],
+        ['its :input', () => j.deletePrefix!('del:input')],
+        ['every tool record, by a shorter prefix', () => j.deletePrefix!('del:tool:')],
+        ['a prefix that ends inside a segment: its last record', () => j.deletePrefix!('del:mod')],
+        ['a step written to it again', () => j.put('del:model:7', { text: 'c' })],
+        ['its last record', () => j.deletePrefix!('del:model:7')],
+      ];
+      for (const [step, write] of steps) {
+        await write();
+        const expected = await runsFromRecords(j);
+        const listed = await listAll(reader, {}, pageWalk);
+        assert.deepEqual(
+          Object.fromEntries(listed.map((r) => [r.runId, { status: r.status, modelSteps: r.modelSteps, toolCalls: r.toolCalls }])),
+          Object.fromEntries(Object.entries(expected).map(([id, r]) => [id, { status: r.status, modelSteps: r.modelSteps, toolCalls: r.toolCalls }])),
+          `after deleting '${step}': the listing`,
+        );
+        for (const st of ['completed', 'suspended', 'failed'] as RunStatus[]) {
+          assert.deepEqual((await listAll(reader, { status: st }, pageWalk)).map((r) => r.runId).sort(),
+            listed.filter((r) => r.status === st).map((r) => r.runId).sort(), `after '${step}': status '${st}'`);
+        }
+        if (typeof reader.countRuns === 'function') assert.equal(await reader.countRuns(), listed.length, `after '${step}': countRuns`);
+        const ids = async (q: RunListQuery) => (await listAll(reader, q, pageWalk)).map((r) => r.runId).sort();
+        const named = (f: 'resourceId' | 'threadId', v: string) => Object.entries(expected).filter(([, r]) => r[f] === v).map(([id]) => id).sort();
+        assert.deepEqual(await ids({ resourceId: 'ayse' }), named('resourceId', 'ayse'), `after '${step}': ayse's runs`);
+        assert.deepEqual(await ids({ threadId: 't-del' }), named('threadId', 't-del'), `after '${step}': thread t-del's runs`);
+      }
+      assert.ok(!('del' in await runsFromRecords(j)), 'the history ends with no record that makes `del` a run');
+      assert.equal((await runsFromRecords(j))['del2']?.status, 'suspended', 'a run whose id extends it is untouched');
     });
 
     // ── Relations: whose a run is, where it ran, whose a thread is ───────────────────────────────
@@ -537,21 +614,36 @@ async function statusesFromRecords(j: ConformanceJournal): Promise<Record<string
   const at = (id: string) => runs.get(id) ?? (runs.set(id, { suspended: false }), runs.get(id)!);
   for (const key of await j.listKeys!('')) {
     const value = await j.get(key);
-    const p = parseJournalKey(key);
-    if (p) {
-      const r = at(p.runId);
-      if (p.kind === 'tool' && (value as { status?: unknown } | undefined)?.status === 'suspended') r.suspended = true;
-      continue;
-    }
-    const owner = runIdOfKey(key, value);
-    if (owner) at(owner);
-    const oc = outcomeStatusOf(key, value);
-    if (oc !== null) at(key.slice(0, -':outcome'.length)).outcome = oc;
+    const rec = runRecordOf(key, value);
+    if (!rec) continue;
+    const r = at(rec.runId);
+    if (rec.role === 'tool' && (value as { status?: unknown } | undefined)?.status === 'suspended') r.suspended = true;
+    if (rec.role === 'outcome') r.outcome = rec.outcome;
   }
   return Object.fromEntries([...runs].map(([id, r]) => [id, deriveRunStatus(r.suspended, r.outcome ? { status: r.outcome } : null)] as const));
 }
 
-const dropZeros = (o: Record<string, number>) => Object.fromEntries(Object.entries(o).filter(([, n]) => n > 0));
+/** The reference for a whole run: its status, its counts, and the person and thread its `:input` names — read from its records alone. */
+async function runsFromRecords(j: ConformanceJournal): Promise<Record<string, { status: RunStatus; modelSteps: number; toolCalls: number; resourceId?: string; threadId?: string }>> {
+  const statuses = await statusesFromRecords(j);
+  const out: Record<string, { status: RunStatus; modelSteps: number; toolCalls: number; resourceId?: string; threadId?: string }> = {};
+  for (const [id, status] of Object.entries(statuses)) {
+    const inp = (await j.get(runRecordKey(id, 'input'))) as { resourceId?: unknown; threadId?: unknown } | undefined;
+    out[id] = {
+      status, modelSteps: 0, toolCalls: 0,
+      ...(typeof inp?.resourceId === 'string' && inp.resourceId ? { resourceId: inp.resourceId } : {}),
+      ...(typeof inp?.threadId === 'string' && inp.threadId ? { threadId: inp.threadId } : {}),
+    };
+  }
+  for (const key of await j.listKeys!('')) {
+    const rec = runRecordOf(key, await j.get(key));
+    if (rec?.role === 'model') out[rec.runId]!.modelSteps++;
+    if (rec?.role === 'tool') out[rec.runId]!.toolCalls++;
+  }
+  return out;
+}
+
+const dropZeros =(o: Record<string, number>) => Object.fromEntries(Object.entries(o).filter(([, n]) => n > 0));
 
 /** What a run fence holds once its moment is set aside: `{ erased: true }` and a number, nothing of anyone (erasure-fence.ts). */
 const FENCE_SHAPE = '<run fence>';
@@ -581,8 +673,8 @@ const isFence = (key: string): boolean => {
 function fencesOf(footprint: Set<string>): string[] {
   const out: string[] = [];
   for (const k of footprint) {
-    if (!k.endsWith(':input')) continue;
-    const id = k.slice(0, -':input'.length);
+    if (!k.endsWith(leafSuffix('input'))) continue;
+    const id = k.slice(0, -leafSuffix('input').length);
     const own = parseOrganizationKey(id);
     out.push(own ? orgPrefix(own.orgId) + runFenceKey(own.rest) : runFenceKey(id));
   }

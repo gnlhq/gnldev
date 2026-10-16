@@ -24,7 +24,9 @@ describe('an attempt counts when it starts', () => {
     }
     const job = (await listJobs(storage.work!)).find((j) => j.id === 'poison');
     expect(starts).toBe(3);
-    expect(job).toMatchObject({ status: 'failed', attempts: 3 });
+    // Never started again; whether its last attempt ran is unknown (it never reported), so it is not
+    // called failed (a-job-whose-attempts-never-reported-is-not-dead.test.ts).
+    expect(job).toMatchObject({ status: 'in-doubt', attempts: 3 });
   });
 
   it('a crash while a failure is being recorded still leaves the attempt counted', async () => {

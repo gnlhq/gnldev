@@ -14,6 +14,7 @@
 import { describe, it, expect } from 'vitest';
 import { InMemoryJournal } from '../src/journal.js';
 import { createGnl } from '../src/registry.js';
+import { claimRunOwner, STAFF } from '../src/run-identity.js';
 import { scoreSample, assertDistinctScorerNames, memoizeScoring } from '../src/scoring.js';
 import { createMockModel, finalTextResult } from './mock.js';
 
@@ -83,6 +84,7 @@ describe('scoring.ts — the one owner of the sample and the name rule', () => {
 
   it('memoizeScoring: same basis → replayed; another basis → recomputed', async () => {
     const j = new InMemoryJournal();
+    await claimRunOwner(j, 'r', STAFF); // a score's memo is the run's record: the run exists
     let n = 0;
     const step = (basis: unknown) => memoizeScoring(j, 'r', 'eval:s', basis, () => ++n);
     expect(await step({ a: 1 })).toBe(1);

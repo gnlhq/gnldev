@@ -21,7 +21,7 @@
 //   --template minimal               the static starter; --template full is a retired alias
 import type { Command } from './types.js';
 import { positional, flag, flagBool } from '../args.js';
-import { TEMPLATES, RETIRED_TEMPLATES, recipeDeps, type TemplateName } from '../scaffold.js';
+import { TEMPLATES, RETIRED_TEMPLATES, recipeDeps, writtenConfigFields, type TemplateName } from '../scaffold.js';
 import { FEATURE_IDS, RECIPES, recipeContents, type Recipe } from '../recipes.js';
 import { HOST_IDS, HOSTS } from '../hosts.js';
 import {
@@ -335,7 +335,7 @@ export const initCommand: Command = {
 
       console.log(`\nThen: ${bold('gnl dev')} — REST + Studio Playground against your new gnl.config.ts.`);
       writeLastAnswers(resolved.answers);
-      await summarize(resolved);
+      await summarize(resolved, recipes);
       return;
     }
 
@@ -364,7 +364,7 @@ export const initCommand: Command = {
       console.log(dim(`  --template ${res.aliasedFrom} is now --features ${(retired ?? []).join(',')} — same project, one less template to keep in sync.`));
     }
     report(res, dir);
-    await summarize(resolved);
+    await summarize(resolved, (res.features ?? []).map((f) => RECIPES[f]).filter((r): r is Recipe => r !== undefined));
   },
 };
 
@@ -393,11 +393,11 @@ function report(res: { dir: string; files: string[]; template: string; features?
  * WHAT IT CANNOT DO, and why. `gnl dev` reads the project's OWN gnl.config.ts through the project's
  * OWN @gnldev/durable. Neither exists yet: the directory was created ninety milliseconds ago and has
  * no node_modules, so importing the config it just wrote would fail on its first import line. What is
- * passed instead is a SHAPE built from the same `answers` that generateConfig was handed — the same
+ * passed instead is a SHAPE built from the same `answers` and recipes generateConfig was handed — the same
  * input, one function apart. Honest about its limit: it reports the config as WRITTEN, and `gnl
  * doctor` reports the config as LOADED, which is the one that counts once there is something to load.
  */
-async function summarize(resolved: ResolvedAnswers): Promise<void> {
+async function summarize(resolved: ResolvedAnswers, recipes: Recipe[]): Promise<void> {
   const chosen = QUESTIONS.filter((q) => resolved.from[q.id] !== 'default');
   console.log('');
   console.log(
@@ -412,7 +412,11 @@ async function summarize(resolved: ResolvedAnswers): Promise<void> {
     const Adapter = resolved.answers.store === 'pg'
       ? class PostgresStorage {}
       : class SqliteStorage {};
+    // Every top-level field the written config has, from the function that wrote it — the value stands
+    // in for an import the summary cannot load; describeProtections asks only whether the field is there.
+    const fields = Object.fromEntries(writtenConfigFields(recipes).map((f) => [/^[A-Za-z_$][\w$]*/.exec(f)![0], {}]));
     const shape = {
+      ...fields,
       storage: new Adapter(),
       preset: resolved.answers.preset,
       subjects: resolved.answers.identity,

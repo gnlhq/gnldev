@@ -15,12 +15,15 @@ import { describe, it, expect } from 'vitest';
 import { InMemoryJournal } from '../src/journal.js';
 import { resolveApprovals, decisionOf, type ApprovalRecord } from '../src/run.js';
 import { runKeys } from '../src/journal.js';
+import { claimRunOwner, STAFF } from '../src/run-identity.js';
 
 const KEY = (r: string, t: string) => runKeys.approval(r, t);
 
 describe('onay kaydı — imza', () => {
   it('karar KİM ve NE ZAMAN ile birlikte yazılır', async () => {
     const j = new InMemoryJournal();
+
+    for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
     await resolveApprovals(j, 'r1', { 'call-1': true }, { actor: 'ayse' });
     const rec = await j.get<ApprovalRecord>(KEY('r1', 'call-1'));
     expect(rec?.v).toBe(1);
@@ -31,6 +34,8 @@ describe('onay kaydı — imza', () => {
 
   it('aktör bilinmiyorsa alan HİÇ yazılmaz — boş bir imza uydurulmaz', async () => {
     const j = new InMemoryJournal();
+
+    for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
     await resolveApprovals(j, 'r2', { 'call-1': false });
     const rec = await j.get<ApprovalRecord>(KEY('r2', 'call-1'));
     expect(rec?.decision).toBe(false);
@@ -41,6 +46,8 @@ describe('onay kaydı — imza', () => {
 describe('onay kaydı — durum', () => {
   it('İŞ YAPILMADIYSA fikir değiştirilebilir: onay → ret', async () => {
     const j = new InMemoryJournal();
+
+    for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
     await resolveApprovals(j, 'r3', { 'call-1': true }, { actor: 'op' });
     // Tur çöktü; tool kaydı hâlâ 'suspended' (terminal değil).
     await j.put(runKeys.tool('r3', 'call-1'), { status: 'suspended' });
@@ -54,6 +61,8 @@ describe('onay kaydı — durum', () => {
 
   it('İŞ YAPILDIYSA karar dondu: sonraki cevap yok sayılır', async () => {
     const j = new InMemoryJournal();
+
+    for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
     await resolveApprovals(j, 'r4', { 'call-1': true });
     await j.put(runKeys.tool('r4', 'call-1'), { status: 'succeeded' }); // etki gerçekleşti
     const merged = await resolveApprovals(j, 'r4', { 'call-1': false }, {
@@ -65,6 +74,8 @@ describe('onay kaydı — durum', () => {
 
   it('hasRun bilinmiyorsa DEĞİŞTİRME — belirsizlik güvenli yöne yatar', async () => {
     const j = new InMemoryJournal();
+
+    for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
     await resolveApprovals(j, 'r5', { 'call-1': true });
     const merged = await resolveApprovals(j, 'r5', { 'call-1': false }); // hasRun verilmedi
     expect(merged?.['call-1']).toBe(true);
@@ -72,6 +83,8 @@ describe('onay kaydı — durum', () => {
 
   it('aynı cevabın tekrarı bir çatışma değildir (at-least-once istemcinin re-POSTu)', async () => {
     const j = new InMemoryJournal();
+
+    for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
     await resolveApprovals(j, 'r6', { 'call-1': true }, { actor: 'ayse' });
     const before = await j.get<ApprovalRecord>(KEY('r6', 'call-1'));
     await resolveApprovals(j, 'r6', { 'call-1': true }, { actor: 'ayse', hasRun: async () => false });
@@ -85,6 +98,8 @@ describe('onay kaydı — geriye uyum', () => {
     // Migration yok: eski satırlar anlamını korur, yoksa yayınlanmış journalların yarısı
     // "cevap yok" diye okunur ve bekleyen her iş yeniden sorulur.
     const j = new InMemoryJournal();
+
+    for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
     await j.put(KEY('r7', 'call-1'), true);
     const merged = await resolveApprovals(j, 'r7', undefined);
     expect(merged?.['call-1']).toBe(true);
@@ -93,6 +108,8 @@ describe('onay kaydı — geriye uyum', () => {
 
   it('harcanmış yuva (attempt kapsamı) hâlâ "cevap yok"', async () => {
     const j = new InMemoryJournal();
+
+    for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
     await j.put(KEY('r8', 'call-1'), { __gnl_approval_spent: true, at: 1 });
     expect(decisionOf(await j.get(KEY('r8', 'call-1')))).toBeUndefined();
     // Ve insanın TAZE cevabı onu devralır (mevcut davranış korunuyor).

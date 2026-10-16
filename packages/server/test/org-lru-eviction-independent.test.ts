@@ -27,7 +27,6 @@ function mkModel(text = 'ok'): any {
   return {
     specificationVersion: 'v2', provider: 'mock', modelId: 'm', supportedUrls: {},
     doGenerate: async () => ({ content: [{ type: 'text', text }], finishReason: 'stop', usage, warnings: [] }),
-    doStream: async () => { throw new Error('no stream'); },
   };
 }
 
@@ -217,7 +216,6 @@ describe('state that does NOT live in the journal', () => {
         if (JSON.stringify(o.prompt).includes('HOLD-ME')) await gate;
         return { content: [{ type: 'text', text: 'late' }], finishReason: 'stop', usage, warnings: [] };
       },
-      doStream: async () => { throw new Error('no stream'); },
     };
     const t = tracker();
     const { api, journal } = mkApi(t, 1, slow);
@@ -341,7 +339,6 @@ describe('conversation memory across an eviction', () => {
         seen.push(JSON.stringify(o.prompt));
         return { content: [{ type: 'text', text: 'ok' }], finishReason: 'stop', usage, warnings: [] };
       },
-      doStream: async () => { throw new Error('no stream'); },
     };
   }
 

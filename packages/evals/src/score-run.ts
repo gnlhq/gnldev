@@ -1,4 +1,4 @@
-import { runScoreSample, scoreRunMemoized, assertDistinctScorerNames } from '@gnldev/durable';
+import { runScoreSample, scoreRunMemoized, assertDistinctScorerNames, existingRun } from '@gnldev/durable';
 import type { JournalReader, Journal, JournalEntry } from '@gnldev/durable';
 import type { Scorer, ScoreResult, ScoreSample } from './scorer.js';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -61,6 +61,9 @@ export async function scoreRun(
   const { output, input } = sample;
 
   const canMemo = opts.memo !== false && typeof j.get === 'function' && typeof j.put === 'function';
+  // The memo is written under the run: a score continues a run and does not begin one. Absent, it is
+  // refused and nothing is written (@gnldev/durable `existingRun`).
+  if (canMemo) await existingRun(j as Journal, runId);
 
   const scores: Record<string, ScoreResult> = {};
   for (const s of scorers) {

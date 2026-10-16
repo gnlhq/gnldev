@@ -49,6 +49,9 @@ const SOURCES = [
     LIMIT_ERROR_CODES: (cls) => `limit (${cls})`,
     RESERVED_ID_ERROR_CODES: (cls) => `reserved id (${cls})`,
     REQUEST_ERROR_CODES: (cls) => `request shape (${cls})`,
+    ADOPTION_ERROR_CODES: (cls) => `adoption (${cls})`,
+    DRAIN_ERROR_CODES: (cls) => `drain (${cls})`,
+    VISIBILITY_ERROR_CODES: (cls) => `visibility (${cls})`,
   } },
   { dist: ['packages', 'server', 'dist', 'edge-errors.js'], build: '@gnldev/server', status: 'EDGE_ERROR_STATUS', maps: {
     EDGE_ERROR_CODES: (cls) => `HTTP edge (${cls})`,

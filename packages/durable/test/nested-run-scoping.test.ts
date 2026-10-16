@@ -13,6 +13,7 @@
 // hands out stable ids. Which is to say: it bites where it is hardest to notice.
 import { describe, it, expect } from 'vitest';
 import { runDurable, createAgentTool, InMemoryStorage } from '../src/index.js';
+import { streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 
@@ -28,7 +29,7 @@ function parentModel(answerFor: string) {
       const text = JSON.stringify(last?.content?.[0]?.output ?? '');
       return { content: [{ type: 'text', text }], finishReason: 'stop', usage, warnings: [] };
     },
-    doStream: async () => { throw new Error('generate-only'); },
+    doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
   } as any;
 }
 
@@ -40,7 +41,7 @@ function subModel() {
       const asked = JSON.stringify(prompt).includes('acme') ? 'acme-answer' : 'globex-answer';
       return { content: [{ type: 'text', text: asked }], finishReason: 'stop', usage, warnings: [] };
     },
-    doStream: async () => { throw new Error('generate-only'); },
+    doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
   } as any;
 }
 

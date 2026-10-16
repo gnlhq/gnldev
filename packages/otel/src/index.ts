@@ -1,6 +1,7 @@
 // @gnldev/otel — converts the journal into a real OpenTelemetry trace and sends it to a SpanExporter (or an
 // OTLP endpoint). Deterministic ids → idempotent; post-hoc from the journal → complete even after a crash,
 // consistent across replays = exactly-once / crash-proof observability (frameworks that live-instrument cannot offer this).
+import { runRecordKey } from '@gnldev/durable';
 import {
   BasicTracerProvider,
   SimpleSpanProcessor,
@@ -87,7 +88,7 @@ export async function exportRun(
   // degrades to the old derivation rather than throwing.
   const outcome = typeof (reader as { get?: unknown }).get === 'function'
     ? await (reader as unknown as { get<T>(k: string): Promise<T | undefined> })
-        .get<{ status?: string; error?: string }>(`${runId}:outcome`).catch(() => undefined)
+        .get<{ status?: string; error?: string }>(runRecordKey(runId, 'outcome')).catch(() => undefined)
     : undefined;
   // A run with no journal entries and no outcome did not happen — exporting it produced a root span
   // marked OK and `completed` for a runId nothing ever ran under. Refused, before any span is made.

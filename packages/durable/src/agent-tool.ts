@@ -4,6 +4,7 @@ import { tool, stepCountIs } from 'ai';
 import type { Tool } from 'ai';
 import { z } from 'zod';
 import { runDurable } from './run.js';
+import { minted } from './run-id-grammar.js';
 import { readRunTaint, markRunTainted } from './taint.js';
 import type { Journal } from './journal.js';
 import type { Guard, Interrupt } from './guard.js';
@@ -230,7 +231,8 @@ export function createAgentTool(
   refuseRunLimitNames('createAgentTool: limits', config.limits);
   return delegationTool(opts?.description ?? 'Delegate a task to an expert sub-agent', config.journal, async (task, nestedRunId, frame) => {
     const model = typeof config.model === 'function' ? await config.model(nestedRunId) : config.model;
-    const res = await runDurable({
+    // The sub-agent's id is the engine's (`agent:<parent>:<call>`): begun here, from the parent's call.
+    const res = await runDurable(minted({
       runId: nestedRunId,
       journal: config.journal,
       model,
@@ -247,7 +249,7 @@ export function createAgentTool(
       ...(config.actor ? { actor: config.actor } : {}),
       ...(config.channel ? { channel: config.channel } : {}),
       ...(config.toolPolicy ? { toolPolicy: config.toolPolicy } : {}),
-    } as any);
+    } as any));
     return { text: res.text, interrupts: res.interrupts, steps: res.steps };
   }, { ...(config.parentRunId ? { parentRunId: config.parentRunId } : {}), ...(config.approvals ? { approvals: config.approvals } : {}) });
 }

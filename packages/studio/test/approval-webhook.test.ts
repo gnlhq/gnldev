@@ -133,7 +133,6 @@ describe('the inbox and cross-run tools', () => {
       doGenerate: async ({ prompt }: any) => ((prompt ?? []).filter((m: any) => m.role === 'tool').length === 0
         ? { content: [{ type: 'tool-call', toolCallId, toolName: 'charge', input: JSON.stringify({ orderId: 'X' }) }], finishReason: 'tool-calls', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, warnings: [], response: { modelId: 'm' } }
         : { content: [{ type: 'text', text: 'done' }], finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, warnings: [], response: { modelId: 'm' } }),
-      doStream: async () => { throw new Error('no stream'); },
     });
 
     const journal = new InMemoryJournal();

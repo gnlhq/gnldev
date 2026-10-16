@@ -3,7 +3,7 @@
 // vector search. Durable/replayable: the recall result falls into runDurable's input journaling
 // (frozen on resume); embeddings persist in the journal. (Most semantic-recall implementations don't come with these guarantees.)
 import { cosineSimilarity } from 'ai';
-import { matchFilter, memKey, semanticLogKey, appendToJournalLog, readJournalLog } from '@gnldev/durable';
+import { matchFilter, memKey, semanticLogKey, appendToJournalLog, retractFromJournalLog, readJournalLog } from '@gnldev/durable';
 import type { Memory, Journal } from '@gnldev/durable';
 import type { Embed } from './vector-store.js';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -122,7 +122,7 @@ export class SemanticMemory implements Memory {
    * other — measured, 10 concurrent appends kept 1. Embedding outside the serialised write keeps the
    * slow network call from holding up every other turn on the thread.
    */
-  async append(threadId: string, messages: any[]): Promise<void> {
+  async append(threadId: string, messages: any[], batchKey?: string): Promise<void> {
     const key = this.key(threadId);
     const entries: LogEntry[] = [];
     for (const message of messages) {
@@ -130,7 +130,12 @@ export class SemanticMemory implements Memory {
       const embedding = text ? await this.embed(text) : undefined;
       entries.push({ message, text, embedding, metadata: message?.metadata });
     }
-    await appendToJournalLog(this.journal, key, entries);
+    await appendToJournalLog(this.journal, key, entries, batchKey);
+  }
+
+  /** `Memory.retract`: the entries appended under `batchKey` (a deleted run's turn — see @gnldev/durable's erasure-fence.ts). */
+  async retract(threadId: string, batchKey: string): Promise<void> {
+    await retractFromJournalLog(this.journal, this.key(threadId), batchKey);
   }
 
   // Built by @gnldev/durable's own memKey rather than by hand. Writing the same string here looked

@@ -3,7 +3,7 @@
 // organization sees only itself in /organizations, and the read surface is automatically scoped
 // to its own organization.
 import { describe, it, expect, vi } from 'vitest';
-import { InMemoryJournal } from '@gnldev/durable';
+import { InMemoryJournal, InMemoryStorage, toJournal } from '@gnldev/durable';
 import { roleAuth, type AuthProvider } from '@gnldev/auth';
 import { createStudioApi } from '../src/server.js';
 import { call } from './call.js';
@@ -156,8 +156,9 @@ describe('@gnldev/studio auth↔org', () => {
   });
 
   it('B: create/delete an organization — POST registers it (no runs yet), DELETE removes all traces + the record/budget', async () => {
-    const journal = new InMemoryJournal();
-    const app = createStudioApi({ reader: journal, auth: AUTH(), org: {} });
+    const storage = new InMemoryStorage();
+    const journal = toJournal(storage.runs);
+    const app = createStudioApi({ reader: journal, auth: AUTH(), org: {}, userErasure: { storage } });
     const H = { 'content-type': 'application/json', authorization: 'Bearer adm' };
 
     // capabilities: orgManage is on
@@ -180,8 +181,8 @@ describe('@gnldev/studio auth↔org', () => {
     expect(del.status).toBe(200);
     expect((await del.json()).deleted).toBeGreaterThan(0);
     expect(await journal.get('org:acme:r1:model:0')).toBeUndefined();
-    expect(await journal.get('__org__:acme')).toBeNull();
-    expect(await journal.get('__budget__:acme')).toBeNull();
+    expect(await journal.get('__org__:acme')).toBeUndefined();
+    expect(await journal.get('__budget__:acme')).toBeUndefined();
 
     // create + delete landed in audit (new action names: org.create/org.delete — the old
     // tenant.create/tenant.delete were fully removed).
@@ -461,8 +462,9 @@ describe('@gnldev/studio auth↔org', () => {
     const users = fakeUserStore();
     users.mem.set('a@acme.co', { id: 'a@acme.co', roles: ['viewer'], orgId: 'acme', createdAt: 1 });
     users.mem.set('g@globex.co', { id: 'g@globex.co', roles: ['viewer'], orgId: 'globex', createdAt: 1 });
-    const journal = new InMemoryJournal();
-    const app = createStudioApi({ reader: journal, auth: AUTH(), users, org: {} });
+    const storage = new InMemoryStorage();
+    const journal = toJournal(storage.runs);
+    const app = createStudioApi({ reader: journal, auth: AUTH(), users, org: {}, userErasure: { storage } });
     const H = { authorization: 'Bearer adm' };
 
     const del = await call(app, '/organizations/acme', { method: 'DELETE', headers: H });

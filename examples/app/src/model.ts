@@ -40,5 +40,6 @@ export const supportModel: any = {
     }
     return text('Your refund request has been processed and approved ✅. The amount will be credited to your card shortly. Can I help with anything else?');
   },
-  doStream: async () => { throw new Error('stream not supported (demo)'); },
+  // No doStream: a model that only generates is streamed from its generate answer by the registry, whose
+  // runs all execute on the stream path. A doStream that throws would be called — and fail every run.
 };

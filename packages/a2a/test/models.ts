@@ -6,7 +6,6 @@ export function textModel(text: string, calls: { n: number } = { n: 0 }): any {
   return {
     specificationVersion: 'v2', provider: 'mock', modelId: 'm', supportedUrls: {},
     doGenerate: async () => { calls.n++; return { content: [{ type: 'text', text }], finishReason: 'stop', usage, warnings: [] }; },
-    doStream: async () => { throw new Error('no stream'); },
   };
 }
 
@@ -17,6 +16,5 @@ export function chargeModel(): any {
     doGenerate: async ({ prompt }: any) => ((prompt ?? []).filter((m: any) => m.role === 'tool').length === 0
       ? { content: [{ type: 'tool-call', toolCallId: 'c1', toolName: 'charge', input: JSON.stringify({ amount: 5000 }) }], finishReason: 'tool-calls', usage, warnings: [] }
       : { content: [{ type: 'text', text: 'Charged.' }], finishReason: 'stop', usage, warnings: [] }),
-    doStream: async () => { throw new Error('no stream'); },
   };
 }

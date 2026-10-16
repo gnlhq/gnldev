@@ -5,8 +5,11 @@ import type { Guard } from './guard.js';
 import type { RunLimits, ToolSeat } from './limits.js';
 import type { Processor } from './processor.js';
 import { stableStringify } from './hash.js';
-import { pageRunsFromArray, decodeChangeCursor, encodeChangeCursor, type RunOrder } from './run-cursor.js';
+import { pageRunsFromArray, compareRunKey, decodeChangeCursor, encodeChangeCursor, type RunOrder } from './run-cursor.js';
 import { isVersionedKey, upgradeFormat } from './format.js';
+import { runRecordKey, RECORD_KEY_RE, REPLAYED_SEGMENT_RE, leafSuffix, composeRunId, RUN_KEYED_FAMILIES } from './run-id-grammar.js';
+import { PROCESS_LOCAL } from './process-liveness.js';
+import { withBirth } from './run-identity.js';
 
 export type ToolJournalRecord = (
   // ToolName — carried so loop detection (checkToolLoop) can match SUCCEEDED records by
@@ -96,6 +99,19 @@ export type ToolJournalRecord = (
    * keyed by run alone, all three mirrors were unwound).
    */
   ranBy?: { runId: string; toolCallId: string };
+  /**
+   * The call's idempotency key — what the tool's body, `recover()` and `lookup()` are handed, and what
+   * `compensateRun` asks the provider about. Decided once, by the call's first record, and carried by
+   * every record written over it (durable-tool.ts idempotencyKeyOf); never derived again. Absent from
+   * records written before it was kept here.
+   */
+  idempotencyKey?: string;
+  /**
+   * Set on a result an OPERATOR declared (`declareInDoubtDone`, `gnl pending`): the call's effect was
+   * in doubt and a person said it happened. Who, when, and what they noted — the declaration is the
+   * record of it.
+   */
+  declaredBy?: { by: string; at: number; note?: string };
 };
 
 /**
@@ -147,6 +163,14 @@ export interface Journal {
    */
   listKeys?(prefix: string, opts?: { limit?: number }): Promise<string[]>;
   /**
+   * (optional) The records under `prefix`, in byte order of their keys, after the key `after` (before it,
+   * with `desc`), at most `limit` — ONE read of an index range, not a listing of the whole prefix. What a
+   * run's event log is read with (run-events.ts): a reader asks for what follows its cursor, and a run with
+   * fifty thousand events is not listed fifty thousand times. A store without it is read through
+   * `listKeys` + `get`.
+   */
+  readRange?<T = unknown>(prefix: string, opts: { after?: string; limit: number; desc?: boolean }): Promise<Array<[string, T]>>;
+  /**
    * (optional) The keys of the thread OWNER RECORDS (`…thread:<id>:owner`, see `isOwnerRecordKey`) under
    * `prefix` whose record names `resourceId` — what an erasure asks instead of opening every thread's
    * record. Exact: a key is listed only when its record names this person, however the store finds it.
@@ -159,7 +183,9 @@ export interface Journal {
   /**
    * Retention/GDPR (optional): PERMANENTLY deletes ALL keys starting with a prefix, returns the
    * number deleted. The single exception to the journal's append-only philosophy — only for lawful
-   * deletion (PII purge) and retention sweeps; never used in the normal flow.
+   * deletion (PII purge) and retention sweeps; never used in the normal flow. A run whose records it
+   * takes only some of (`<run>:tool:x`, `<run>:outcome`) then reads what its remaining records say —
+   * status, counts, person and thread — and a run left with none is no run (conformance R5).
    */
   deletePrefix?(prefix: string): Promise<number>;
   /**
@@ -267,16 +293,25 @@ export function nestedAgentRunId(
   toolCallId: string,
   prefix: 'agent' | 'wf' = 'agent',
 ): string {
-  return parentRunId ? `${prefix}:${parentRunId}:${toolCallId}` : `${prefix}:${toolCallId}`;
+  return composeRunId(prefix, parentRunId, toolCallId);
 }
+
+/**
+ * The runs a BACKGROUND tool call makes (types.ts `background`): its task, which executes the body, and
+ * the continuation that wakes the agent with the result. Pure functions of (parentRunId, toolCallId),
+ * like `nestedAgentRunId`: the erasure model re-derives them from the parent's tool records
+ * (model.ts `RUN_DEPENDENTS.children`), so it never has to be told they exist.
+ */
+export const deferredTaskRunId = (parentRunId: string, toolCallId: string): string => composeRunId('task', parentRunId, toolCallId);
+export const deferredContinuationRunId = (parentRunId: string, toolCallId: string): string => composeRunId('cont', parentRunId, toolCallId);
 
 export const runKeys = {
   /** Run input (prompt/messages/system) — invisible to parseJournalKey. */
-  input: (runId: string) => `${runId}:input`,
+  input: (runId: string) => runRecordKey(runId, 'input'),
   /** LLM step record (deterministic replay). step: a number; may come as a string in fork copies. */
-  model: (runId: string, step: number | string) => `${runId}:model:${step}`,
+  model: (runId: string, step: number | string) => runRecordKey(runId, 'model', String(step)),
   /** Tool call record (exactly-once; the key is the AI SDK toolCallId). */
-  tool: (runId: string, toolCallId: string) => `${runId}:tool:${toolCallId}`,
+  tool: (runId: string, toolCallId: string) => runRecordKey(runId, 'tool', toolCallId),
   /**
    * The journal key is NOT the
    * toolCallId, but a `hash` derived from the tool arguments (or the user's `idempotencyKey`).
@@ -288,7 +323,7 @@ export const runKeys = {
    */
   toolByArgs: (runId: string, toolName: string, hash: string) => {
     assertNoColonInToolName(toolName);
-    return `${runId}:tool:args-${toolName}-${hash}`;
+    return runRecordKey(runId, 'tool', `args-${toolName}-${hash}`);
   },
   /**
    * Like `toolByArgs`, but WITHOUT a
@@ -337,7 +372,7 @@ export const runKeys = {
   },
   /** Every request-window record of one request (`toolRequest`) — `args-` closes the prefix, so run 'a'
    *  never reaches run 'a:b''s. */
-  toolRequestPrefix: (requestRunId: string) => `xreq:${requestRunId}:args-`,
+  toolRequestPrefix: (requestRunId: string) => RUN_KEYED_FAMILIES['request-window'].prefix(requestRunId),
   /** Whether a key is a request-window record (`toolRequest`). */
   isToolRequest: (key: string) => key.startsWith('xreq:'),
   /** The same request-window record, in another request's window (a fork is a request of its own). */
@@ -350,8 +385,44 @@ export const runKeys = {
     assertNoColonInToolName(toolName);
     return `xthr:${threadId}:args-${toolName}-${hash}`;
   },
+  /**
+   * Which background call's continuation holds the thread's turn (deferred.ts `takeThreadTurn`): one
+   * writer a background tool adds, at a time. Thread state like the families above — the thread's delete
+   * takes it.
+   */
+  threadTurn: (threadId: string) => {
+    assertThreadId(threadId);
+    return `xthr:${threadId}:turn`;
+  },
+  /**
+   * Where the LATE REPORTS of a call are kept (call-outcome.ts): beside the call's record, derived from
+   * the record's key alone — so every reader of the record finds them, whichever run or call reaches it
+   * (a window's record is reached by many), and the deletion that takes the record takes them.
+   *  - a run's call `<runId>:tool:<suffix>` → `<runId>:proc:late-<suffix>` (under the run);
+   *  - a window's record `xreq:<request>:` / `xthr:<thread>:` / `xrun:` + `args-<tool>-<hash>` → the same
+   *    family with `late-` for `args-`: the request's deletion (`toolRequestLatePrefix`), the thread's
+   *    and the cross-run purge each take it, and a listing of a window's `args-` records never lists it.
+   */
+  lateOf: (recordKey: string): string => {
+    if (/^(xreq|xthr|xrun):/.test(recordKey)) {
+      // A tool name holds no ':', so the LAST ':args-' (or the leading 'xrun:args-') is the family's boundary.
+      const i = recordKey.lastIndexOf(':args-');
+      if (i >= 0) return `${recordKey.slice(0, i)}:late-${recordKey.slice(i + ':args-'.length)}`;
+    }
+    const t = recordKey.lastIndexOf(':tool:');
+    if (t > 0) return runKeys.proc(recordKey.slice(0, t), `late-${recordKey.slice(t + ':tool:'.length)}`);
+    throw new Error(`@gnldev/durable: '${recordKey}' is not a tool call's record`);
+  },
+  /** The late reports of every request-window record of one request (`lateOf` of `toolRequest`). */
+  toolRequestLatePrefix: (requestRunId: string) => RUN_KEYED_FAMILIES['request-window-late'].prefix(requestRunId),
+  /**
+   * The spec a BACKGROUND call's launcher recorded (deferred.ts `TaskSpec`), under the run that made the
+   * call: its presence is what makes `<runId>`'s call `<toolCallId>` a background call, whose effect and
+   * outcome are its task's (`deferredTaskRunId`), not the launcher's answer.
+   */
+  taskSpec: (parentRunId: string, toolCallId: string) => runRecordKey(parentRunId, 'task-spec', toolCallId),
   /** Non-deterministic processor step — invisible to parseJournalKey. */
-  proc: (runId: string, name: string) => `${runId}:proc:${name}`,
+  proc: (runId: string, name: string) => runRecordKey(runId, 'proc', name),
   /** Memory append idempotency marker — resume/retry doesn't double-write. Two-phase record (see run.ts
    *  claimMemoryAppend/markMemoryAppendDone): `{status:'pending', startedAt}` (claimed but not yet
    *  finished — taken over via self-heal if stale) → promoted to `true` (done) once the append succeeds. */
@@ -369,9 +440,9 @@ export const runKeys = {
    * recall hits with similarity, recent-window count, OM observations, WM injection, and the
    * echo-trim/incoming counts run.ts adds. Read by studio's GET /runs/:id/memory-context.
    */
-  memoryContext: (runId: string) => `${runId}:memctx`,
+  memoryContext: (runId: string) => runRecordKey(runId, 'memctx'),
   /** Frozen model selection (the fallback winner) — invisible to parseJournalKey, resume sticks to the same model. */
-  cfgModel: (runId: string) => `${runId}:cfg:model`,
+  cfgModel: (runId: string) => runRecordKey(runId, 'cfg', 'model'),
   /**
    * The run's `limits` (RunLimits — plain serializable numbers/strings/booleans) frozen at run
    * start. `limits` is a runtime RunOptions value, not part of AgentConfig, so `resumeRun`/the CLI
@@ -379,7 +450,7 @@ export const runKeys = {
    * maxCost/maxTokens/loopDetection/taintedSideEffects/sideEffectDuplicates. Persisting it here lets
    * resume recover it when the caller doesn't pass `limits`. Outside the `:model:`/`:tool:` pattern →
    * invisible to parseJournalKey (like input/proc/cfgModel), doesn't affect step counting. */
-  cfgLimits: (runId: string) => `${runId}:cfg:limits`,
+  cfgLimits: (runId: string) => runRecordKey(runId, 'cfg', 'limits'),
   /**
    * AUDIT (approval first-class): the human approval decision (result of require-approval). Outside
    * the `':approval:'` pattern (model|tool) → invisible to parseJournalKey (doesn't leak into the
@@ -388,7 +459,7 @@ export const runKeys = {
    * crashed before the tool ran' scenario, the next resume reads the decision from the journal and
    * applies it even if the `approvals` parameter isn't given.
    */
-  approval: (runId: string, toolCallId: string) => `${runId}:approval:${toolCallId}`,
+  approval: (runId: string, toolCallId: string) => runRecordKey(runId, 'approval', toolCallId),
   /**
    * How the run ENDED. Written once at each terminal boundary — 'completed' on the success path,
    * 'failed' when the run threw — and OVERWRITTEN (a plain put, not a claim) so a resume that finally
@@ -398,7 +469,7 @@ export const runKeys = {
    * the `:model:`/`:tool:` pattern → invisible to parseJournalKey, so replay and time-travel are
    * unaffected. Purged with the run by the `${runId}:` prefix.
    */
-  outcome: (runId: string) => `${runId}:outcome`,
+  outcome: (runId: string) => runRecordKey(runId, 'outcome'),
   /**
    * The output the run RETURNED when output processors changed it: `{ text }`, written at completion
    * by run.ts (generate and stream paths) through `recordRunOutput`, read by `runScoreSample`. The
@@ -408,7 +479,7 @@ export const runKeys = {
    * the returned text is then its last model step's. Suffix-anchored and outside the `:model:`/`:tool:`
    * pattern like `:memctx` → invisible to parseJournalKey; purged with the run by the `${runId}:` prefix.
    */
-  output: (runId: string) => `${runId}:output`,
+  output: (runId: string) => runRecordKey(runId, 'output'),
 } as const;
 
 /**
@@ -421,7 +492,7 @@ export const runKeys = {
  * Returns null for every other key, so a caller can use it as "is this an outcome write at all".
  */
 export function outcomeStatusOf(key: string, value: unknown): 'running' | 'failed' | 'canceled' | 'completed' | null {
-  if (!key.endsWith(':outcome')) return null;
+  if (!key.endsWith(leafSuffix('outcome'))) return null;
   // The key suffix alone is not proof: `appendLog(journal, ns, payload, 'outcome')` writes
   // `${ns}:outcome` with a caller's payload. Only the engine's own record — whose status is exactly
   // one of the four lifecycle values — is treated as an outcome.
@@ -723,6 +794,14 @@ export interface RunSummary {
    * top-level runs and on runs recorded by an earlier version.
    */
   parentRunId?: string;
+  /**
+   * When the run was created: epoch ms of its first record, as the writing process's clock read it
+   * (`gnl_runs.created_at` on Sqlite and Postgres). With `runId` it is the key every run listing is
+   * ordered and paged by, so a listing built from an array of summaries (the Studio's, the server's,
+   * an organization's view) resumes after its last run exactly as a table does (run-cursor.ts). Every
+   * first-party store fills it; a custom reader that leaves it out is paged by run id alone.
+   */
+  createdAt?: number;
 }
 
 /** One run as a change feed hands it out: its summary and when it last changed (`gnl_runs.updated_at`). */
@@ -991,7 +1070,7 @@ export function asReaderJournal<T extends object>(journal: T): T {
 
 /** Parse a `<runId>:model:<step>` / `<runId>:tool:<toolCallId>` key (runId may contain colons). */
 export function parseJournalKey(key: string): { runId: string; kind: JournalEntryKind } | null {
-  const m = /^(.*):(model|tool):.+$/.exec(key);
+  const m = RECORD_KEY_RE.exec(key);
   return m ? { runId: m[1]!, kind: m[2] as JournalEntryKind } : null;
 }
 
@@ -1015,7 +1094,7 @@ export function parseJournalKey(key: string): { runId: string; kind: JournalEntr
  * refused, since that is the only shape the regex above can claim.
  */
 export function assertThreadId(threadId: string, what = 'thread id'): void {
-  if (/(^|:)(model|tool)(:|$)/.test(threadId)) {
+  if (REPLAYED_SEGMENT_RE.test(threadId)) {
     throw new Error(
       `@gnldev/durable: ${what} '${threadId}' would collide with the journal's key schema — ` +
       `a ':'-delimited segment named 'model' or 'tool' reads as a run record (see parseJournalKey in journal.ts)`,
@@ -1063,10 +1142,10 @@ export function assertThreadId(threadId: string, what = 'thread id'): void {
  * same way in both.
  */
 export function runIdOfKey(key: string, value?: unknown): string | null {
-  const withTail = /^(.*):(model|tool):.+$/.exec(key);
+  const withTail = RECORD_KEY_RE.exec(key);
   if (withTail) return withTail[1]!;
-  const asInput = /^(.*):input$/.exec(key);
-  return asInput && isVersionedRecord(value) ? asInput[1]! : null;
+  const input = leafSuffix('input');
+  return key.endsWith(input) && isVersionedRecord(value) ? key.slice(0, key.length - input.length) : null;
 }
 
 /**
@@ -1095,8 +1174,69 @@ export function runRelationsOf(key: string, value: unknown): (RunRelations & { r
   // The run `runIdOfKey` registers, and only when this key IS that run's `:input`: `r9:tool:call:input`
   // is a tool record of r9, not the input of a run `r9:tool:call` (it once made Postgres list one).
   const runId = runIdOfKey(key, value);
-  if (runId === null || key !== `${runId}:input`) return undefined;
+  if (runId === null || key !== runRecordKey(runId, 'input')) return undefined;
   return { runId, ...relationsOfInput(value) };
+}
+
+/**
+ * What a record is to a run: THE attribution rule, which every store's run listing, run counters, change
+ * feed and retention age follow, and the conformance suite's reference reads.
+ *  - `<run>:model:…` / `<run>:tool:…` (`parseJournalKey`): an entry of the run — a step, a tool call;
+ *  - `<run>:input` carrying stampFormat's `_v` (`runIdOfKey`): the run's frozen input — registers it;
+ *  - `<run>:outcome` holding one of the four lifecycle statuses (`outcomeStatusOf`): its outcome — the
+ *    write-ahead 'running' may be a run's first record, so it registers the run too.
+ * `null` for every other key: it may live under a run's prefix (`:lock`, `:proc:`, `:memctx`), but it
+ * neither makes a run nor changes what one reports. A run is the set of its records; with none left it
+ * is no run.
+ *
+ * It was spelled out by hand in each place that needed it (the SQL adapters' run-row derivation, the
+ * in-memory listing and change feed, the conformance reference) — one rule, kept in step by care.
+ */
+export type RunRecord =
+  | { runId: string; role: 'model' | 'tool' | 'input' }
+  | { runId: string; role: 'outcome'; outcome: 'running' | 'failed' | 'canceled' | 'completed' };
+export function runRecordOf(key: string, value: unknown): RunRecord | null {
+  const p = parseJournalKey(key);
+  if (p) return { runId: p.runId, role: p.kind };
+  const input = runIdOfKey(key, value);
+  if (input !== null) return { runId: input, role: 'input' };
+  const outcome = outcomeStatusOf(key, value);
+  if (outcome !== null) return { runId: key.slice(0, -leafSuffix('outcome').length), role: 'outcome', outcome };
+  return null;
+}
+
+/**
+ * The runs a `deletePrefix(prefix)` deletes only SOME records of: every id that, followed by `:`, is a
+ * proper prefix of `prefix` (`r:tool:a` cuts into `r` — and into `r:tool`, should that be a run). A run
+ * whose id starts with `prefix` loses all of its records and its row with them; these keep a row that
+ * must then say what their remaining records say. Shortest first, which is also run-id order.
+ * @internal — the SQL adapters' `deletePrefix`.
+ */
+export function runsCutBy(prefix: string): string[] {
+  const out: string[] = [];
+  for (let i = prefix.indexOf(':'); i !== -1 && i < prefix.length - 1; i = prefix.indexOf(':', i + 1)) out.push(prefix.slice(0, i));
+  return out;
+}
+
+/**
+ * The order a writer takes row locks in — journal keys, run ids, counter keys: their UTF-8 bytes, which
+ * is the order of a `COLLATE "C"` index (the one Postgres's prefix ranges read) and of Sqlite's default
+ * collation. Not `<`: JavaScript compares UTF-16 code units, which disagrees with byte order past U+FFFF.
+ * @internal — the SQL adapters.
+ */
+export function compareKeys(a: string, b: string): number {
+  // UTF-8 byte order is code point order. UTF-16 units agree with it except for a surrogate (a code point
+  // past U+FFFF), which sorts after every unit that is not one.
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a.charCodeAt(i);
+    const y = b.charCodeAt(i);
+    if (x === y) continue;
+    const sx = x >= 0xd800 && x <= 0xdfff;
+    const sy = y >= 0xd800 && y <= 0xdfff;
+    return sx === sy ? x - y : sx ? 1 : -1;
+  }
+  return a.length - b.length;
 }
 
 /**
@@ -1115,6 +1255,10 @@ export interface RunRowChange {
   relations?: RunRelations;
   /** The run's outcome record was written: `gnl_runs.outcome` (`storedOutcomeOf`) and the status follow it. */
   outcome?: 'running' | 'failed' | 'canceled' | 'completed';
+  /** The run's outcome record was DELETED: no outcome (NULL), and the status follows. */
+  outcomeGone?: true;
+  /** The run's `:input` was DELETED: the run is unplaced (NULL person and thread — read from the record, which is gone). */
+  inputGone?: true;
 }
 
 /**
@@ -1127,8 +1271,13 @@ export interface RunRowChange {
  * statements — 34 row versions per 5-step child and 4 per child on the PARENT's row, which every child's
  * tool-call record touches. Every one of those is a new tuple and a lock on that row.
  *
- * `noteWrite` is the one derivation of which run(s) a write belongs to, shared by both SQL adapters
- * and every write path (put, putIfAbsent, putIfMatch, applyBatch), so the paths cannot drift.
+ * `noteWrite` and `noteDelete` are the one derivation of what a record's change does to its run
+ * (`runRecordOf`), shared by both SQL adapters and every path that changes a record (put, putIfAbsent,
+ * putIfMatch, applyBatch, deletePrefix), so the paths cannot drift. Each is a DIFFERENCE, from the row
+ * the change replaced or removed as read under that row's lock: added to the run's row, it commutes with
+ * every other transaction's difference, so the row is a function of the records as committed whatever
+ * order concurrent writers commit in. Nothing counts a run's records over again — a recount reads rows
+ * it has not locked, and overwrote a concurrent writer's difference (release audit d-status, F2).
  */
 export class RunRowChanges {
   private readonly byRun = new Map<string, RunRowChange>();
@@ -1138,8 +1287,10 @@ export class RunRowChanges {
     cur.models += c.models ?? 0;
     cur.tools += c.tools ?? 0;
     cur.suspendedDelta += c.suspendedDelta ?? 0;
-    if (c.relations) cur.relations = c.relations;
-    if (c.outcome) cur.outcome = c.outcome;
+    if (c.relations) { cur.relations = c.relations; delete cur.inputGone; }
+    if (c.inputGone) { cur.inputGone = true; delete cur.relations; }
+    if (c.outcome) { cur.outcome = c.outcome; delete cur.outcomeGone; }
+    if (c.outcomeGone) { cur.outcomeGone = true; delete cur.outcome; }
     this.byRun.set(runId, cur);
     return this;
   }
@@ -1150,31 +1301,45 @@ export class RunRowChanges {
    * outcome may be a brand-new run's first write — the upsert creates its row). Any other key: nothing.
    */
   noteWrite(key: string, value: unknown, prev: { suspended: boolean } | undefined): this {
-    const p = parseJournalKey(key);
-    if (p) {
-      const suspended = p.kind === 'tool' && (value as ToolJournalRecord | undefined)?.status === 'suspended';
-      const fresh = prev === undefined;
-      return this.add(p.runId, {
-        models: fresh && p.kind === 'model' ? 1 : 0,
-        tools: fresh && p.kind === 'tool' ? 1 : 0,
-        suspendedDelta: (suspended ? 1 : 0) - (prev?.suspended ? 1 : 0),
-      });
+    const r = runRecordOf(key, value);
+    if (!r) return this;
+    switch (r.role) {
+      case 'model':
+      case 'tool': {
+        const suspended = r.role === 'tool' && (value as ToolJournalRecord | undefined)?.status === 'suspended';
+        const fresh = prev === undefined;
+        return this.add(r.runId, {
+          models: fresh && r.role === 'model' ? 1 : 0,
+          tools: fresh && r.role === 'tool' ? 1 : 0,
+          suspendedDelta: (suspended ? 1 : 0) - (prev?.suspended ? 1 : 0),
+        });
+      }
+      case 'input': return this.add(r.runId, { relations: relationsOfInput(value) });
+      case 'outcome': return this.add(r.runId, { outcome: r.outcome });
     }
-    const owner = runIdOfKey(key, value);
-    if (owner) this.add(owner);
-    const rel = runRelationsOf(key, value);
-    if (rel) this.add(rel.runId, { relations: { resourceId: rel.resourceId, threadId: rel.threadId } });
-    const oc = outcomeStatusOf(key, value);
-    if (oc !== null) this.add(key.slice(0, -':outcome'.length), { outcome: oc });
-    return this;
+  }
+  /**
+   * One record of run `runId` that a deletion REMOVED: `key`, and whether the row held it suspended (read
+   * by the DELETE itself, under the row's lock). The inverse of `noteWrite`: an entry stops counting, an
+   * outcome record takes the outcome with it, an `:input` the run's person and thread. By key alone —
+   * the value is gone — so the caller names the run: only a run that keeps a row (`runsCutBy`).
+   */
+  noteDelete(runId: string, key: string, wasSuspended: boolean): this {
+    if (key === runRecordKey(runId, 'input')) return this.add(runId, { inputGone: true });
+    if (key === runRecordKey(runId, 'outcome')) return this.add(runId, { outcomeGone: true });
+    const p = parseJournalKey(key);
+    if (p?.runId !== runId) return this;
+    return this.add(runId, { models: p.kind === 'model' ? -1 : 0, tools: p.kind === 'tool' ? -1 : 0, suspendedDelta: wasSuspended ? -1 : 0 });
   }
   get size(): number { return this.byRun.size; }
+  /** One run's merged change, if the transaction has one. */
+  get(runId: string): RunRowChange | undefined { return this.byRun.get(runId); }
   /**
    * In run-id order: every writer takes run-row locks in this order, so two transactions that touch the
    * same runs cannot each hold one the other waits for.
    */
   entries(): [string, RunRowChange][] {
-    return [...this.byRun.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return [...this.byRun.entries()].sort(([a], [b]) => compareKeys(a, b));
   }
 }
 
@@ -1317,6 +1482,11 @@ export function summarizeRun(
  */
 export class InMemoryJournal implements Journal, JournalReader {
   private store = new Map<string, unknown>();
+  constructor() {
+    // Only this process can reach it: `DetachedRuns` may judge every other process id dead here.
+    Object.defineProperty(this, PROCESS_LOCAL, { value: true, enumerable: true });
+    withBirth(this);
+  }
   /** @internal — key renaming for `Storage.adoptIntoOrg`. Not part of the Journal port.
    *  `undefined` from `rename` leaves the entry where it is, which is how platform keys stay put. */
   rekey(rename: (k: string) => string | undefined): number {
@@ -1333,6 +1503,37 @@ export class InMemoryJournal implements Journal, JournalReader {
       n++;
     }
     return n;
+  }
+  /** @internal — `Storage.adoptIntoOrg`: the record keys `rename` would move onto a record this journal already holds. */
+  recordCollisions(rename: (k: string) => string | undefined): string[] {
+    const out: string[] = [];
+    for (const k of this.store.keys()) {
+      const to = rename(k);
+      if (to !== undefined && to !== k && this.store.has(to)) out.push(to);
+    }
+    return out;
+  }
+  /**
+   * @internal — `Storage.adoptIntoOrg`: each counter `rename` would move onto an existing counter is
+   * ADDED to it and removed (`onAdoptionCollision`: a counter is a sum). Answers how many were summed.
+   */
+  sumCounters(rename: (k: string) => string | undefined): number {
+    let n = 0;
+    for (const [k, fields] of [...this.counters]) {
+      const to = rename(k);
+      const into = to === undefined || to === k ? undefined : this.counters.get(to);
+      if (!into) continue;
+      for (const [f, v] of Object.entries(fields)) into[f] = (into[f] ?? 0) + v;
+      this.counters.delete(k);
+      n++;
+    }
+    return n;
+  }
+  /** @internal — removes one key, for `Storage.adoptIntoOrg` (a scope fact it drops). Not part of the Journal port. */
+  drop(key: string): void {
+    this.store.delete(key);
+    this.times.delete(key);
+    this.mtimes.delete(key);
   }
   private times = new Map<string, number>(); // key → first write time (OTEL timing)
   /**
@@ -1431,7 +1632,7 @@ export class InMemoryJournal implements Journal, JournalReader {
       // A run's age is the age of its NEWEST key — including the non-entry ones. A run that died
       // before its first model step has only those, and skipping them left it undateable and so
       // never swept: its persisted prompt outlived every retention window.
-      const owner = p ? p.runId : runIdOfKey(key, value);
+      const owner = runRecordOf(key, value)?.runId;
       if (!owner) continue;
       const ts = this.times.get(key) ?? 0;
       const cur = last.get(owner) ?? { ts: 0, suspended: false };
@@ -1482,6 +1683,16 @@ export class InMemoryJournal implements Journal, JournalReader {
     return out;
   }
 
+  /** @internal — the `Journal` port's range read (journal.ts `readRange`); the engine is its caller. */
+  async readRange<T = unknown>(prefix: string, opts: { after?: string; limit: number; desc?: boolean }): Promise<Array<[string, T]>> {
+    const keys = [...this.store.keys()].filter((k) => k.startsWith(prefix) && (opts.after === undefined || (opts.desc ? k < opts.after : k > opts.after)));
+    keys.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    if (opts.desc) keys.reverse();
+    const out: Array<[string, T]> = [];
+    for (const k of keys.slice(0, opts.limit)) out.push([k, (await this.get<T>(k)) as T]);
+    return out;
+  }
+
   async listKeys(prefix: string, opts?: { limit?: number }): Promise<string[]> {
     refuseUnknownNames('listKeys', opts, LIST_KEYS_NAMES);
     const limit = opts?.limit;
@@ -1529,28 +1740,25 @@ export class InMemoryJournal implements Journal, JournalReader {
 
   async listRuns(): Promise<RunSummary[]> {
     const byRun = new Map<string, JournalEntry[]>();
+    // A run's creation time: its earliest record that names it — the row the SQL stores create
+    // `gnl_runs` with, and the time they keep as `created_at`.
+    const created = new Map<string, number>();
+    const named = (runId: string, key: string) => {
+      const t = this.times.get(key) ?? 0;
+      const was = created.get(runId);
+      if (was === undefined || t < was) created.set(runId, t);
+    };
     let seq = 0;
     for (const [key, value] of this.store) {
-      const p = parseJournalKey(key);
-      if (!p) {
-        // Not a replayable entry, but possibly still part of a run. Register the run with NO entries
-        // rather than skipping it, or a run that died before its first model step (which wrote only
-        // `:input` and a claim marker) never appears here — and so is never reached by sweepRuns,
-        // leaving its persisted prompt outside every retention window. summarizeRun stays pure: the
-        // entry list it is handed is genuinely empty.
-        const owner = runIdOfKey(key, value);
-        if (owner && !byRun.has(owner)) byRun.set(owner, []);
-        // The write-ahead can be a run's FIRST key — it registers the run even before `:input` does.
-        const oc = outcomeStatusOf(key, value);
-        if (oc !== null) {
-          const runId = key.slice(0, -':outcome'.length);
-          if (!byRun.has(runId)) byRun.set(runId, []);
-        }
-        continue;
-      }
-      const list = byRun.get(p.runId) ?? [];
-      list.push({ key, runId: p.runId, kind: p.kind, value, seq: seq++ });
-      byRun.set(p.runId, list);
+      const r = runRecordOf(key, value);
+      if (!r) continue;
+      const list = byRun.get(r.runId) ?? [];
+      byRun.set(r.runId, list);
+      named(r.runId, key);
+      // `:input` and the outcome register the run with no entry — a run that died before its first model
+      // step (only `:input` and a claim marker) must still be listed, or sweepRuns never reaches it and its
+      // persisted prompt outlives every retention window. summarizeRun stays pure: its entries are the steps.
+      if (r.role === 'model' || r.role === 'tool') list.push({ key, runId: r.runId, kind: r.role, value, seq: seq++ });
     }
     // AUDIT (threadId first-class): summarizeRun stays PURE (doesn't see `:input`) — we separately
     // MERGE threadId from the run's invisible `:input` entry. Map.get is O(1) — NOT N+1
@@ -1558,9 +1766,9 @@ export class InMemoryJournal implements Journal, JournalReader {
     return [...byRun.entries()].map(([runId, entries]) => {
       // Same O(1) point-read as `:input` below — the outcome is not an entry, so summarizeRun cannot
       // see it on its own.
-      const out = this.store.get(`${runId}:outcome`) as { status?: RunOutcomeRecord['status'] } | undefined;
+      const out = this.store.get(runRecordKey(runId, 'outcome')) as { status?: RunOutcomeRecord['status'] } | undefined;
       const s = summarizeRun(runId, entries, out as never);
-      const inp = this.store.get(`${runId}:input`) as { threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string } | undefined;
+      const inp = this.store.get(runRecordKey(runId, 'input')) as { threadId?: string; agent?: string; resourceId?: string; workKey?: string; parentRunId?: string } | undefined;
       return {
         ...s,
         ...(inp?.threadId ? { threadId: inp.threadId } : {}),
@@ -1568,8 +1776,9 @@ export class InMemoryJournal implements Journal, JournalReader {
         ...(inp?.resourceId ? { resourceId: inp.resourceId } : {}),
         ...(inp?.workKey ? { workKey: inp.workKey } : {}),
         ...(inp?.parentRunId ? { parentRunId: inp.parentRunId } : {}),
+        createdAt: created.get(runId) ?? 0,
       };
-    });
+    }).sort(compareRunKey); // the order every listing pages in, so the array and its pages agree
   }
 
   /**
@@ -1601,8 +1810,7 @@ export class InMemoryJournal implements Journal, JournalReader {
     const limit = opts?.limit ?? 200;
     const at = new Map<string, number>();
     for (const [key, value] of this.store) {
-      const p = parseJournalKey(key);
-      const runId = p ? p.runId : runIdOfKey(key, value) ?? (outcomeStatusOf(key, value) !== null ? key.slice(0, -':outcome'.length) : undefined);
+      const runId = runRecordOf(key, value)?.runId;
       if (!runId) continue;
       at.set(runId, Math.max(at.get(runId) ?? 0, this.mtimes.get(key) ?? this.times.get(key) ?? 0));
     }

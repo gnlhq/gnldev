@@ -22,9 +22,11 @@
  *
  * No HTTP here: the engine answers `allow | deny | missing`, and each door maps that to its own wire.
  */
-import { claim, runKeys, isVersionedRecord, type Journal } from './journal.js';
+import { runRecordKey, isBookkeepingRest, isRunRecordRest, isEngineBegunRunId, admitRunId, ENGINE_MINT, withMintOf } from './run-id-grammar.js';
+import { claim, runKeys, isVersionedRecord, type Journal, type JournalBatch } from './journal.js';
 import { stampFormat } from './format.js';
-import { RunOwnerMismatchError, RunTargetMismatchError } from './errors.js';
+import { RunOwnerMismatchError, RunTargetMismatchError, RunNotFoundError } from './errors.js';
+import { erasureBaseline, assertNotErased, runErasedSince, RunErasedError } from './erasure-fence.js';
 
 import type { Caller, RunIdentity, GnlToolContext, StaffCaller, UnknownCaller, UserCaller } from './identity-types.js';
 export type { UserCaller, StaffCaller, UnknownCaller, Caller, RunIdentity, GnlToolContext } from './identity-types.js';
@@ -247,7 +249,7 @@ function kindOf(rec: OwnerRecord): RunKind {
 }
 
 /** Rows a run writes early, read point by point when the journal cannot list (the bounded fallback). */
-const PROBE_KEYS = (runId: string) => [runKeys.model(runId, 0), `${runId}:outcome`, `${runId}:wf:_input`, `${runId}:net:route:0`];
+const PROBE_KEYS = (runId: string) => [runKeys.model(runId, 0), runRecordKey(runId, 'outcome'), runRecordKey(runId, 'wf', '_input'), runRecordKey(runId, 'net', 'route:0')];
 
 /**
  * Keys the engine writes under a run's id that say nothing about the run having STARTED: the locks
@@ -257,9 +259,7 @@ const PROBE_KEYS = (runId: string) => [runKeys.model(runId, 0), `${runId}:outcom
  * is resolved before the run is entered) and the retention tombstone a sweep leaves after deleting a
  * run (a late retry of a swept run is a new run — `tombstonePolicy` decides that, not ownership).
  */
-function isBookkeeping(rest: string): boolean {
-  return rest === 'lock' || rest.endsWith(':lock') || rest === 'swept' || rest.startsWith('cfg:') || rest.startsWith('proc:__gnl_taint');
-}
+const isBookkeeping = isBookkeepingRest; // the families run-id-grammar.ts marks `bookkeeping`
 /** A run has a handful of bookkeeping keys at most; a probe this wide always sees past them. */
 const PROBE_LIMIT = 16;
 
@@ -326,6 +326,20 @@ export function decideRunAccess(owner: RunOwner, caller: Caller): RunDecision {
   return owner.owner.kind === 'user' && owner.owner.id === caller.id ? 'allow' : 'deny';
 }
 
+/**
+ * `decideRunAccess` as a DOOR asks it, for a run id a request named. One difference, and it is the
+ * grammar's: an id of a family only the engine begins (`task:`, `cont:`, `agent:`, `wf:`, `net:` —
+ * run-id-grammar.ts) is never a door caller's to start, because no door holds the engine's mark. So when
+ * it does not exist it is `deny`, not `missing` — the answer a foreign run gets — and a door answers the
+ * two alike (`runNotFound`, errors.ts) BEFORE any other gate runs: a budget gate between them answered
+ * an over-budget organization's stranger 402 for the absent id and 404 for the existing one.
+ * @internal — the door packages' gate; gnl builds its argument, no host writes it.
+ */
+export function decideDoorRunAccess(owner: RunOwner, caller: Caller, runId: string): RunDecision {
+  const d = decideRunAccess(owner, caller);
+  return d === 'missing' && isEngineBegunRunId(runId) ? 'deny' : d;
+}
+
 export async function decideRun(journal: RawJournal, runId: string, caller: Caller): Promise<RunDecision> {
   return decideRunAccess(await runOwnerOf(journal, runId), caller);
 }
@@ -361,9 +375,148 @@ export function ownerFields(c: Caller): { resourceId?: string; orgId?: string; o
  */
 export async function claimRunOwner(journal: RawJournal, runId: string, caller: Caller, fields: Record<string, unknown> = {}): Promise<Caller> {
   assertRaw(journal, 'claimRunOwner');
+  // THE run-id gate, at the one place a run is born (run-id-grammar.ts): its spelling, and — for an id
+  // only the engine begins — the engine's mark, which the birth record carries (`withMintOf`) and which
+  // is not written.
+  const { [ENGINE_MINT]: mint, ...record } = fields as Record<string | symbol, unknown>;
+  await admitRunId(runId, { journal, mint });
+  // A run deleted under a live worker stays deleted (erasure-fence.ts): its id is not born again — for
+  // any kind, by any path, before anything of it is written.
+  if (await runErasedSince(journal, runId, undefined)) throw new RunErasedError(runId);
   const key = runKeys.input(runId);
-  await claim(journal, key, stampFormat({ at: Date.now(), ...fields, ...ownerFields(caller) }));
-  return recordOwner(await journal.get<OwnerRecord>(key)) ?? callerOf(caller);
+  await claim(journal, key, stampFormat({ at: Date.now(), ...record, ...ownerFields(caller) }));
+  const recorded = recordOwner(await journal.get<OwnerRecord>(key)) ?? callerOf(caller);
+  // Two births racing for one id: the claim has one winner, and a loser that may not act on the
+  // winner's run is refused HERE — for every kind of birth, so no birth site has to remember to look.
+  if (decideRunAccess({ state: 'owned', owner: recorded, kind: 'other', recorded: true }, caller) === 'deny') throw runOwnerRefusal(runId, recorded, caller);
+  return recorded;
+}
+
+/**
+ * The run a primitive writes under, born before its first row. `durableTool`, `withDurableModel` and
+ * the tools `withIdempotency` wraps can be handed any `{ journal, runId }` — a host's own loop, a door's
+ * test run — and their rows used to land under an id nobody had begun: rows without an owner record
+ * read as a run that exists (`runOwnerOf`: staff's), so the id was taken from whoever it belonged to.
+ *
+ * Now the ctx's journal births the run at the first write of one of ITS records (`<runId>:<family>…`;
+ * a primitive that writes nothing under the id — `withIdempotency`'s cross-run window — begins no
+ * run): a run that exists is continued as it is (its entry judged who may act); one that does not is
+ * born through the one birth, for the ctx's identity, and an id that may not be born (its spelling, an
+ * engine-begun family without the engine's mark) is refused before anything is written. The write is
+ * judged where it happens, so no write site in a primitive has to remember to ask. A ctx the engine
+ * built after its own admission is marked born and left as it is.
+ */
+const bornCtx = new WeakSet<object>();
+const BIRTH_ON_WRITE = Symbol('gnl.birthOnWrite');
+/** Marks a ctx the engine built for a run it has just admitted (and so born). @internal */
+export function engineBorn<T extends object>(ctx: T): T {
+  bornCtx.add(ctx);
+  return ctx;
+}
+/** @internal — what a primitive does to the ctx it is handed, before it uses it. */
+export function bornOnFirstWrite(ctx: { journal: Journal; runId: string; identity?: Caller | RunIdentity }): void {
+  if (bornCtx.has(ctx) || (ctx.journal as unknown as Record<symbol, unknown>)[BIRTH_ON_WRITE] === ctx.runId) return;
+  const journal = ctx.journal;
+  const runId = ctx.runId;
+  const head = `${runId}:`;
+  const ofRun = (key: unknown) => typeof key === 'string' && key.startsWith(head) && isRunRecordRest(key.slice(head.length)) && !isBookkeepingRest(key.slice(head.length));
+  let born: Promise<void> | undefined;
+  const birth = (): Promise<void> => (born ??= birthIfMissing(journal, runId, ctx.identity ? callerOf(ctx.identity) : UNKNOWN, ctx).catch((e) => { born = undefined; throw e; }));
+  ctx.journal = new Proxy(journal, {
+    get(target, prop) {
+      if (prop === BIRTH_ON_WRITE) return runId;
+      const v = Reflect.get(target, prop, target);
+      if (typeof v !== 'function') return v;
+      if (prop === 'put' || prop === 'putIfAbsent' || prop === 'putIfMatch' || prop === 'incrBy') {
+        return async (key: string, ...rest: unknown[]) => { if (ofRun(key)) await birth(); return (v as (...a: unknown[]) => unknown).call(target, key, ...rest); };
+      }
+      if (prop === 'applyBatch') {
+        return async (batch: JournalBatch) => {
+          const keys = [batch.claim?.key, ...(batch.puts ?? []).map((p) => p.key), ...(batch.incrs ?? []).map((p) => p.key)];
+          if (keys.some(ofRun)) await birth();
+          return (v as (b: JournalBatch) => unknown).call(target, batch);
+        };
+      }
+      return (v as (...a: unknown[]) => unknown).bind(target);
+    },
+  });
+}
+/** A run that does not exist is born for `caller` (the engine's mark read off `marked`); one that does is left as it is. @internal */
+export async function birthIfMissing(journal: Journal, runId: string, caller: Caller, marked: unknown): Promise<void> {
+  const owner = await runOwnerOf(journal as RawJournal, runId);
+  if (owner.state === 'unreadable') throw owner.error;
+  if (owner.state === 'missing') await claimRunOwner(journal as RawJournal, runId, caller, withMintOf({}, marked));
+}
+
+/**
+ * What a journal offers a package that cannot depend on this one (@gnldev/workflow): the ENTRY of a
+ * run, through the same rules every other run kind meets. `beginRun(runId, ctx)` before the caller's
+ * first write under the id:
+ *  - who may act: `admitRun`, the one rule the agent door uses — a run that does not exist is born for
+ *    `ctx.identity` (`claimRunOwner`, which holds the run-id gate and refuses a deleted id), the loser
+ *    of a birth race is held to the winner, and a run the identity may not act on is refused
+ *    (`RunOwnerMismatchError`, which a door answers as `run_not_found`); a fork (`from`) is born for its
+ *    source's owner; a run another target began is refused;
+ *  - whether it still exists: the lease it returns. `live()` at every step boundary refuses a run
+ *    deleted since it began (`RunErasedError`); `settle()` after the attempt's last write takes back
+ *    what it wrote if the run was deleted meanwhile, and refuses — the fence is written first and read
+ *    last, as for an agent run (erasure-fence.ts).
+ * A store without it keeps no owners and no fences, as before.
+ */
+export interface RunBirth {
+  beginRun(runId: string, ctx?: { identity?: Caller | RunIdentity; from?: string }): Promise<RunLease>;
+}
+/** A run's entry, as `beginRun` hands it back. @see RunBirth */
+export interface RunLease {
+  /** Who the run acts for: its caller for a new run, its recorded owner for one that exists. */
+  readonly acting: Caller;
+  /** Throws `RunErasedError` when the run was deleted since it began. */
+  live(): Promise<void>;
+  /** After the attempt's last write: a run deleted meanwhile has that write taken back, and this throws `RunErasedError`. */
+  settle(): Promise<void>;
+}
+/** Gives `journal` its `beginRun` (not enumerable: a spread copy of a view must not carry the view's birth). */
+export function withBirth<J extends Journal>(journal: J): J & RunBirth {
+  const beginRun = (runId: string, ctx?: { identity?: Caller | RunIdentity; from?: string }) => beginRunIn(journal, runId, ctx);
+  Object.defineProperty(journal, 'beginRun', { value: beginRun, enumerable: false, configurable: true, writable: true });
+  return journal as J & RunBirth;
+}
+
+/** THE `beginRun`, through `journal` (a view passes itself, so the owner record lands in its scope). @internal */
+export async function beginRunIn(journal: Journal, runId: string, ctx?: { identity?: Caller | RunIdentity; from?: string }): Promise<RunLease> {
+  const birth = withMintOf({ workflow: '' }, ctx);
+  const parent = (ctx?.identity as { parentRunId?: unknown } | undefined)?.parentRunId;
+  const erasure = await erasureBaseline(journal, typeof parent === 'string' ? parent : undefined);
+  // A fork is born to its source's owner, like every run born from another; every other entry is the
+  // one the agent door makes (`admitRun`).
+  const acting = ctx?.from !== undefined
+    ? await inheritRunOwner(journal as RawJournal, ctx.from, runId, birth)
+    : (await admitRun(journal as RawJournal, runId, ctx?.identity ? callerOf(ctx.identity) : UNKNOWN, birth)).acting;
+  const live = () => assertNotErased(journal, runId, erasure);
+  await live();
+  return {
+    acting,
+    live,
+    settle: async () => {
+      if (!(await runErasedSince(journal, runId, erasure))) return;
+      // Read here, not imported: the deletion plan sits above the journals that hand out this lease.
+      const { settleErasedRun } = await import('./model.js');
+      await settleErasedRun(journal, runId, erasure);
+      throw new RunErasedError(runId);
+    },
+  };
+}
+
+/**
+ * An operation on a run that is not its birth — a cancel, an unwind, a score — needs the run. Absent, it
+ * is refused as `RunNotFoundError` and writes nothing: its rows would have made the id read as a run that
+ * exists (staff's), lost to whoever could still begin it.
+ */
+export async function existingRun(journal: Journal, runId: string): Promise<Extract<RunOwner, { state: 'owned' }>> {
+  const owner = await runOwnerOf(journal as RawJournal, runId);
+  if (owner.state === 'unreadable') throw owner.error;
+  if (owner.state === 'missing') throw new RunNotFoundError(runId);
+  return owner;
 }
 
 /**
@@ -479,12 +632,10 @@ export async function admitRun(
   const requested = runTargetOf(birth);
   if (requested && owner.state === 'owned') assertRunTarget(owner.record, requested, runId);
   if (owner.state === 'missing' && birth) {
-    // Two births racing for one id: the claim has one winner, and the loser is held to it.
+    // Two births racing for one id: the claim has one winner, and the loser is held to it (claimRunOwner).
     const recorded = await claimRunOwner(journal, runId, acting, birth);
     const born: RunOwner = { state: 'owned', owner: recorded, kind: 'other', recorded: true };
-    const again = actingCaller(born, caller);
-    if (!again) throw refuse(recorded);
-    return { acting: again, owner: born };
+    return { acting: actingCaller(born, caller)!, owner: born };
   }
   return { acting, owner };
 }

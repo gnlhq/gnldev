@@ -13,7 +13,7 @@
 // released, and an org-scoped view only shows what happened after. The operator's unscoped view is
 // unchanged and still shows everything, including the purge.
 import { describe, it, expect } from 'vitest';
-import { InMemoryJournal, appendLog, countLog, withOrg, purgeOrganization, orgPurgedKey } from '@gnldev/durable';
+import { InMemoryJournal, InMemoryStorage, toJournal, appendLog, countLog, withOrg, purgeOrganization, orgPurgedKey } from '@gnldev/durable';
 import { createStudioApi } from '../src/server.js';
 import { call } from './call.js';
 
@@ -23,20 +23,21 @@ const audit = async (app: unknown, headers: Record<string, string> = {}) =>
   ((await (await call(app as never, '/audit', { headers })).json()) as { items: Row[] }).items;
 
 /** Seeds an org with one data key and one audit record naming `actor`. */
-async function seedTenant(journal: InMemoryJournal, org: string, actor: string, runId: string) {
+async function seedTenant(journal: InMemoryJournal | ReturnType<typeof toJournal>, org: string, actor: string, runId: string) {
   await withOrg(journal, org).put(`${runId}:input`, { prompt: 'x' });
   await appendLog(journal, '__audit__', { actor, action: 'run.cancel', target: runId, org });
 }
 
 describe('an org id that is reused after a purge', () => {
   it('does not show the previous tenant\'s audit records to the new one', async () => {
-    const journal = new InMemoryJournal();
+    const storage = new InMemoryStorage();
+    const journal = toJournal(storage.runs);
     const app = createStudioApi({ reader: journal, org: {} });
 
     await seedTenant(journal, 'acme', 'previous-tenant', 'r1');
     expect(await audit(app, { 'x-gnl-org': 'acme' }), 'the first tenant should see its own record').toHaveLength(1);
 
-    await purgeOrganization(journal, 'acme');
+    await purgeOrganization(storage, 'acme');
     // The id is handed to somebody else, who then does something of their own.
     await new Promise((r) => setTimeout(r, 5));
     await appendLog(journal, '__audit__', { actor: 'new-tenant', action: 'run.start', target: 'r9', org: 'acme' });
@@ -48,11 +49,12 @@ describe('an org id that is reused after a purge', () => {
   it('still shows the operator everything, including the purged tenancy', async () => {
     // The other half, and the reason the records are not deleted: whoever runs the platform must be
     // able to answer "what happened to that org" after it is gone.
-    const journal = new InMemoryJournal();
+    const storage = new InMemoryStorage();
+    const journal = toJournal(storage.runs);
     const app = createStudioApi({ reader: journal, org: {} });
 
     await seedTenant(journal, 'acme', 'previous-tenant', 'r1');
-    await purgeOrganization(journal, 'acme');
+    await purgeOrganization(storage, 'acme');
     await new Promise((r) => setTimeout(r, 5));
     await appendLog(journal, '__audit__', { actor: 'new-tenant', action: 'run.start', target: 'r9', org: 'acme' });
 
@@ -70,12 +72,13 @@ describe('an org id that is reused after a purge', () => {
   });
 
   it('purging one org does not shorten another org\'s history', async () => {
-    const journal = new InMemoryJournal();
+    const storage = new InMemoryStorage();
+    const journal = toJournal(storage.runs);
     const app = createStudioApi({ reader: journal, org: {} });
     await seedTenant(journal, 'acme', 'acme-user', 'r1');
     await seedTenant(journal, 'globex', 'globex-user', 'r2');
 
-    await purgeOrganization(journal, 'acme');
+    await purgeOrganization(storage, 'acme');
 
     expect((await audit(app, { 'x-gnl-org': 'globex' })).map((i) => i.actor)).toEqual(['globex-user']);
     expect(await audit(app, { 'x-gnl-org': 'acme' })).toHaveLength(0);

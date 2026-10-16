@@ -96,7 +96,8 @@ const runner = {
 
 const ops = buildOps(storage, runner, async (alert) => {
   alerts.push(alert);
-  const out = (await incidentWorkflow.run(alert, { runId: `wf:${alert.incidentId}`, journal })) as Resolved;
+  // `incident:`, not `wf:` — `wf:<parent>:<call>` is the id the engine gives a workflow run as a tool.
+  const out = (await incidentWorkflow.run(alert, { runId: `incident:${alert.incidentId}`, journal })) as Resolved;
   // The restart is announced only after it actually happened — the workflow may be sitting on an
   // approval, in which case there is nothing to watch yet and the event would schedule a watch over
   // A restart that never occurred.

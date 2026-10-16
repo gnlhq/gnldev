@@ -15,6 +15,9 @@ export default defineConfig({
     // known failures that the next fixes turn green, so a red here always means a new regression.
     exclude: [...configDefaults.exclude, 'packages/upgrade-tests/**'],
     environment: 'node',
+    // Every file runs under the birth witness: no record is written under a run id that was never born
+    // (test/birth-witness.setup.ts). It replaces a hand-kept list of entry points.
+    setupFiles: ['test/birth-witness.setup.ts'],
     /**
      * Vitest's default is 5s, which this suite exceeds under load rather than because anything is slow.
      * Measured twice on one machine: `pricing-command.test.ts` timed out during a full run and passed

@@ -1,9 +1,8 @@
-// P0.2 (AUDIT-R2): the request AbortSignal must reach generation — a client disconnect stops
-// token generation instead of silently billing to completion. Registry-level: RunOptions.abortSignal ->
-// runDurable/streamDurable's `...rest` spread -> generateText/streamText's own `abortSignal` option ->
-// (via wrapLanguageModel's default passthrough) the mock LanguageModelV2's doStream `options.abortSignal`
-// (field name verified against @ai-sdk/provider's LanguageModelV2CallOptions). Route-level: createChatRoute
-// wires `c.req.raw.signal` — a server-level smoke exercising the SAME capture through the HTTP route.
+// A run executes apart from the request that started it (@gnldev/durable, design decision D2):
+//  · registry: RunOptions.abortSignal is the caller saying STOP — it cancels the run, and the generation
+//    in progress is aborted (the model's own signal), not merely the caller's reading of it;
+//  · route: a client that disconnects (a closed tab) does NOT stop the turn — the route never wires the
+//    request's signal into the run; the answer is there when the user comes back.
 import { describe, it, expect } from 'vitest';
 import { InMemoryJournal, createGnl } from '@gnldev/durable';
 import { createChatRoute } from '../src/index.js';
@@ -50,7 +49,7 @@ async function readUntil(reader: ReadableStreamDefaultReader<any>, predicate: (v
 }
 
 describe('@gnldev/chat-adapter abort forwarding', () => {
-  it('registry: gnl.stream forwards RunOptions.abortSignal into the model call', async () => {
+  it('registry: RunOptions.abortSignal cancels the run — the generation in progress is aborted', async () => {
     const captured: { signal?: AbortSignal } = {};
     const gnl = createGnl({ journal: new InMemoryJournal(), agents: { chat: { model: controllableMock(captured), maxSteps: 4 } } });
     const controller = new AbortController();
@@ -62,10 +61,12 @@ describe('@gnldev/chat-adapter abort forwarding', () => {
     expect(captured.signal).toBeInstanceOf(AbortSignal);
     expect(captured.signal?.aborted).toBe(false);
     controller.abort();
+    // The cancellation is recorded first (durably), then the execution here is stopped.
+    for (let i = 0; i < 50 && !captured.signal?.aborted; i++) await new Promise((r) => setTimeout(r, 10));
     expect(captured.signal?.aborted).toBe(true);
   });
 
-  it('server-level smoke: createChatRoute forwards the HTTP request signal (c.req.raw.signal) into the model call', async () => {
+  it('route: a client that disconnects does not stop the turn — the request signal never reaches the run', async () => {
     const captured: { signal?: AbortSignal } = {};
     const app = createChatRoute({ journal: new InMemoryJournal(), agents: { chat: { model: controllableMock(captured), maxSteps: 4 } } });
     const controller = new AbortController();
@@ -90,6 +91,8 @@ describe('@gnldev/chat-adapter abort forwarding', () => {
 
     expect(captured.signal).toBeInstanceOf(AbortSignal);
     controller.abort();
-    expect(captured.signal?.aborted).toBe(true);
+    await reader.cancel().catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(captured.signal?.aborted, 'a closed tab stopped the generation').toBe(false);
   });
 });

@@ -129,7 +129,8 @@ describe('standalone chat route: a user cannot read another user\'s thread', () 
     const w = world();
     expect((await w.say(P.ayse, 'T-ayse', 'AYSE-PRIVATE note', { runId: 'r-ayse' })).status).toBe(200);
     const r = await w.say(P.mallory, 'T-mallory', 'replay it', { runId: 'r-ayse' });
-    expect(r.status).toBe(409);
+    // A foreign run reads as an absent one (run_not_found, 404): the answer names no owner and no existence.
+    expect(r.status).toBe(404);
     expect(r.body).not.toContain('noted');
     expect(w.leaked('AYSE-PRIVATE')).toBe(false);
   });

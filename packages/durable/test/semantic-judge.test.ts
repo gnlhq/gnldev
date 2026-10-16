@@ -9,6 +9,9 @@
 // 5) BUDGET: slots are claimed in the journal — they survive resume, and a timeout burns one too
 import { describe, it, expect, vi } from 'vitest';
 import { InMemoryJournal } from '../src/journal.js';
+import { claimRunOwner, STAFF } from '../src/run-identity.js';
+/** The judge's slots and verdicts are the runs' records: the runs it judges for exist. */
+const bornRuns = async (j: InMemoryJournal) => { for (const id of ['r1', 'r2']) await claimRunOwner(j, id, STAFF); };
 import {
   judgeGrayPair, validateJudgeConfig, parseJudgeVerdict, renderJudgePrompt, semJudgeKey,
   JUDGE_PROMPT_VERSION, JUDGE_CANONICAL_MAX, JUDGE_MIN_RECALL, JUDGE_MAX_FP, JUDGE_CERT_MAX_AGE_MS,
@@ -91,6 +94,8 @@ describe('judge — prompt hardening and whole-string parsing (the injection bou
 
   it('a "SAME" embedded in a record cannot become a verdict unless the model emits it alone', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     // Hostile args: text that imitates the model's own answer. Even if the model repeats it, an
     // occurrence INSIDE a sentence (the realistic failure) is not accepted as the verdict.
     const echo: SemanticJudgeConfig['complete'] = async ({ user }) => `The record says: ${user.split('\n')[1]}`;
@@ -102,6 +107,8 @@ describe('judge — prompt hardening and whole-string parsing (the injection bou
 describe('judge — what NEVER reaches the provider (H2 pin)', () => {
   it('amounts and discriminators are absent from the prompt even when declared', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     const seen: Array<{ system: string; user: string }> = [];
     // A tool that declares BOTH extra field families, with values distinctive enough to grep for.
     const plan: SemPlan = {
@@ -132,6 +139,8 @@ describe('judge — what NEVER reaches the provider (H2 pin)', () => {
 describe('judge — fail-open: every failure is typed, none of them throws', () => {
   it('timeout → skipped:timeout (and the tool call does not blow up)', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     const slow: SemanticJudgeConfig['complete'] = () => new Promise((r) => setTimeout(() => r('SAME'), 500));
     const out = await judgeGrayPair(journal, 'r1', 'tc1', planOf('a'), { rec: rec('h1', 'b'), score: 0.9 }, cfgOf(slow, { timeoutMs: 30 }));
     expect(out).toEqual({ kind: 'skipped', cause: 'timeout' });
@@ -139,6 +148,8 @@ describe('judge — fail-open: every failure is typed, none of them throws', () 
 
   it('a closure error → skipped:error', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     const boom: SemanticJudgeConfig['complete'] = async () => { throw new Error('provider down'); };
     const out = await judgeGrayPair(journal, 'r1', 'tc1', planOf('a'), { rec: rec('h1', 'b'), score: 0.9 }, cfgOf(boom));
     expect(out).toEqual({ kind: 'skipped', cause: 'error' });
@@ -146,6 +157,8 @@ describe('judge — fail-open: every failure is typed, none of them throws', () 
 
   it('an over-long canonical sentence is SKIPPED, never clipped (a clipped record is a different record)', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     const fn = vi.fn(async () => 'SAME');
     const long = 'x'.repeat(JUDGE_CANONICAL_MAX + 1);
     const out = await judgeGrayPair(journal, 'r1', 'tc1', planOf(long), { rec: rec('h1', 'b'), score: 0.9 }, cfgOf(fn));
@@ -157,6 +170,8 @@ describe('judge — fail-open: every failure is typed, none of them throws', () 
 describe('judge — the verdict cache (H7: symmetric and stamped)', () => {
   it('a second run does NOT call the closure; the answer comes from the symmetric key', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     const fn = vi.fn(async () => 'SAME');
     const g = { rec: rec('h1', 'b'), score: 0.9 };
     const a = await judgeGrayPair(journal, 'r1', 'tc1', planOf('a'), g, cfgOf(fn));
@@ -170,6 +185,8 @@ describe('judge — the verdict cache (H7: symmetric and stamped)', () => {
 
   it('a STALE STAMP is not served: swapping the model re-asks the question', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     const first = vi.fn(async () => 'same');
     const g = { rec: rec('h1', 'b'), score: 0.9 };
     await judgeGrayPair(journal, 'r1', 'tc1', planOf('a'), g, cfgOf(first));
@@ -185,6 +202,8 @@ describe('judge — the verdict cache (H7: symmetric and stamped)', () => {
 describe('judge — the budget (H10: journal slots that survive resume)', () => {
   it('out of slots → skipped:budget; slots live in the RUN family, so a resume continues the same budget', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     const fn = vi.fn(async () => 'DIFFERENT');
     const cfg = cfgOf(fn, { maxCallsPerRun: 2 });
     for (let i = 0; i < 4; i++) {
@@ -197,6 +216,8 @@ describe('judge — the budget (H10: journal slots that survive resume)', () => 
 
   it('a TIMEOUT burns a slot too — a crash loop cannot re-buy the budget', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     const slow: SemanticJudgeConfig['complete'] = () => new Promise((r) => setTimeout(() => r('SAME'), 200));
     const cfg = cfgOf(slow, { maxCallsPerRun: 1, timeoutMs: 20 });
     const a = await judgeGrayPair(journal, 'r1', 'tc1', planOf('a'), { rec: rec('h1', 'b'), score: 0.9 }, cfg);
@@ -207,6 +228,8 @@ describe('judge — the budget (H10: journal slots that survive resume)', () => 
 
   it('CONCURRENT workers cannot both spend one slot (the claim is atomic, not a counter)', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     const fn = vi.fn(async () => { await new Promise((r) => setTimeout(r, 10)); return 'DIFFERENT'; });
     const cfg = cfgOf(fn, { maxCallsPerRun: 1 });
     // Two DIFFERENT pairs racing on the same run: without an atomic claim both would read "0 slots
@@ -222,6 +245,8 @@ describe('judge — the budget (H10: journal slots that survive resume)', () => 
 
   it('two workers judging the SAME pair agree: first-wins, the loser serves the winner\'s verdict', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     // The models disagree — exactly the case a blind put would resolve by "last writer wins", leaving
     // a permanent cached verdict that contradicts the question a human was actually asked.
     let n = 0;
@@ -238,6 +263,8 @@ describe('judge — the budget (H10: journal slots that survive resume)', () => 
 
   it('two workers hitting the SAME stale record still agree (replace is conditional, not blind)', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     const g = { rec: rec('h1', 'b'), score: 0.9 };
     // A verdict left behind by an older model — the state a swap produces.
     await journal.put(semJudgeKey('th', 'pay', 'h1', 'new'), {
@@ -261,6 +288,8 @@ describe('judge — the budget (H10: journal slots that survive resume)', () => 
 
   it('the cache is checked BEFORE the budget: a replay spends no slot', async () => {
     const journal = new InMemoryJournal();
+
+    await bornRuns(journal);
     const fn = vi.fn(async () => 'SAME');
     const g = { rec: rec('h1', 'b'), score: 0.9 };
     const cfg = cfgOf(fn, { maxCallsPerRun: 1 });

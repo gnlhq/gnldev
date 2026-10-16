@@ -3,14 +3,19 @@
 // Correctness matters, not perf (naive filter/sort). Date.now/Math.random are free to use here (runtime code).
 import { cosineSimilarity } from 'ai';
 import { serialize, deserialize, copyValue } from './serialize.js';
-import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope } from './storage.js';
+import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition } from './storage.js';
 import { memoryPartitionOf, inMemoryPartition, type MemoryPartitionOption } from './storage.js';
 import { InMemoryJournal } from './journal.js';
+import { withBirth } from './run-identity.js';
+import { PROCESS_LOCAL } from './process-liveness.js';
+import { ROOT_EXEC_RECORDS } from './adoption.js';
 import { pageRunsFromArray } from './run-cursor.js';
 import { runUpgrade, threadRecordsStep, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
 import { UPGRADE_NAMES } from './option-names.js';
 import { stableStringify } from './hash.js';
-import { ENGINE_META_KEYS, assertNoRunsInFlight, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
+import { assertNoRunsInFlight } from './model.js';
+import { ENGINE_META_KEYS, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
+import { isScopeFact, scopeFactKeys, scopeFactsDroppedByAdoption, staysAtRoot, adoptionConflict } from './adoption.js';
 import type { JournalEntry, RunSummary } from './journal.js';
 import { decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision, vectorInOrganization, vectorDocumentOf, vectorFilterDocument } from './storage.js';
 import type {
@@ -65,14 +70,28 @@ function rekeyMap<V>(m: Map<string, V>, rename: (k: string) => string | undefine
   return n;
 }
 
+/** The new keys `rename` would move entries of `m` onto that `m` already holds — an adoption's collisions. */
+function rekeyCollisions(m: Map<string, unknown>, rename: (k: string) => string | undefined): string[] {
+  const out: string[] = [];
+  for (const k of m.keys()) {
+    const to = rename(k);
+    if (to !== undefined && to !== k && m.has(to)) out.push(to);
+  }
+  return out;
+}
+
 class InMemoryRunJournal implements RunJournal {
-  constructor(readonly journal = new InMemoryJournal()) {}
+  constructor(readonly journal = new InMemoryJournal()) {
+    Object.defineProperty(this, PROCESS_LOCAL, { value: true, enumerable: true });
+    withBirth(this as never); // the birth a package without this one reaches through it (run-identity.ts)
+  }
   get<T = unknown>(k: string) { return this.journal.get<T>(k); }
   put(k: string, v: unknown) { return this.journal.put(k, v); }
   putIfAbsent(k: string, v: unknown) { return this.journal.putIfAbsent(k, v); }
   /** H1: delegates to InMemoryJournal.putIfMatch (stableStringify comparison, structurally atomic). */
   putIfMatch(k: string, e: unknown, v: unknown) { return this.journal.putIfMatch(k, e, v); }
   listKeys(p: string, opts?: { limit?: number }) { return this.journal.listKeys(p, opts); }
+  readRange<T = unknown>(p: string, opts: { after?: string; limit: number; desc?: boolean }) { return this.journal.readRange<T>(p, opts); }
   listOwnerRecords(resourceId: string, opts?: { prefix?: string }) { return this.journal.listOwnerRecords(resourceId, opts); }
   readRun(runId: string): Promise<JournalEntry[]> { return this.journal.readRun(runId); }
   // Capability parity with the real adapters (sqlite/postgres expose these as extra methods and
@@ -104,6 +123,10 @@ class InMemoryMemoryStore implements MemoryStore {
    * organization — which lists and reads by those ids — saw none of its adopted threads and none of
    * their messages (measured, C+ step C; Sqlite and Postgres saw them all).
    */
+  /** @internal — see Storage.adoptIntoOrg: the ids `f` would move a thread, its messages, memory or markers onto that are taken. */
+  _collisions(f: (k: string) => string | undefined): string[] {
+    return [this.threads, this.messages, this.wm, this.obs, this.batches].flatMap((m) => rekeyCollisions(m as Map<string, unknown>, f));
+  }
   _rekey(f: (k: string) => string | undefined): number {
     const moved = rekeyMap(this.threads, f) + rekeyMap(this.messages, f) + rekeyMap(this.wm, f) + rekeyMap(this.obs, f)
       + rekeyMap(this.batches, f);
@@ -136,9 +159,8 @@ class InMemoryMemoryStore implements MemoryStore {
     return paginate(all, q);
   }
   async deleteThread(id: string) {
-    const t = this.threads.get(id);
-    // Soft delete, and the record keeps nothing the person wrote: its title is often their first message.
-    if (t) this.threads.set(id, { id: t.id, resourceId: t.resourceId, createdAt: t.createdAt, updatedAt: t.updatedAt, deletedAt: Date.now() });
+    // The record goes with the rest (see `MemoryStore.deleteThread`): a tombstone kept the owner's id.
+    this.threads.delete(id);
     this.messages.delete(id);
     this.wm.delete(workingMemoryScope.thread(id));
     const legacy = legacyWorkingMemoryScope.thread(id);
@@ -247,6 +269,29 @@ class InMemoryMemoryStore implements MemoryStore {
     const removed = log.length - kept.length;
     if (removed > 0) this.messages.set(threadId, kept);
     return removed;
+  }
+
+  /** See `MemoryStore.retractBatch`: the rows the batch wrote (`[from, to)`) and its record. */
+  async retractBatch(threadId: string, batchKey: string): Promise<number> {
+    const b = this.batches.get(threadId);
+    const range = b?.get(batchKey);
+    if (!b || !range) return 0;
+    b.delete(batchKey);
+    if (b.size === 0) this.batches.delete(threadId);
+    const log = this.messages.get(threadId) ?? [];
+    const kept = log.filter((m) => m.seq < range.from || m.seq >= range.to);
+    if (kept.length === 0) this.messages.delete(threadId); else this.messages.set(threadId, kept);
+    return log.length - kept.length;
+  }
+
+  /** See `MemoryStore.deletePartition`: every map, by the key that names the partition. */
+  async deletePartition(partition: string): Promise<number> {
+    assertOrganizationPartition(partition);
+    let n = 0;
+    for (const m of [this.threads, this.messages, this.wm, this.obs, this.batches] as Map<string, unknown>[]) {
+      for (const k of [...m.keys()]) if (k.startsWith(partition)) { m.delete(k); n++; }
+    }
+    return n;
   }
 }
 
@@ -463,6 +508,13 @@ class InMemoryWorkStore implements WorkStore {
 class InMemoryCacheStore implements CacheStore {
   /** @internal — see Storage.adoptIntoOrg. */
   _rekey(f: (k: string) => string | undefined): number { return rekeyMap(this.m, f); }
+  /** @internal — see Storage.adoptIntoOrg: a content-addressed entry the organization holds already stays its; the root's copy goes. */
+  _keepOrganization(f: (k: string) => string | undefined): void {
+    for (const k of [...this.m.keys()]) {
+      const to = f(k);
+      if (to !== undefined && to !== k && this.m.has(to)) this.m.delete(k);
+    }
+  }
 
   // Values are held SERIALIZED, as the SQLite and Postgres cache stores hold them: a store that kept
   // the object itself handed every reader the same instance, so a caller's mutation of a cached value
@@ -478,15 +530,27 @@ class InMemoryCacheStore implements CacheStore {
     this.m.set(key, { v: serialize(value), exp: opts?.ttlMs != null ? Date.now() + opts.ttlMs : undefined });
   }
   async delete(key: string) { this.m.delete(key); }
+  async deletePrefix(prefix: string): Promise<number> { return deleteKeysWithPrefix(this.m, prefix); }
 }
 
 class InMemoryMetaStore implements MetaStore {
   /** @internal — see Storage.adoptIntoOrg. */
   _rekey(f: (k: string) => string | undefined): number { return rekeyMap(this.m, f); }
+  /** @internal — see Storage.adoptIntoOrg: the meta keys `f` would move onto that are taken. */
+  _collisions(f: (k: string) => string | undefined): string[] { return rekeyCollisions(this.m, f); }
 
   private m = new Map<string, string>();
   async get(key: string) { return this.m.get(key); }
   async set(key: string, value: string) { this.m.set(key, value); }
+  async deletePrefix(prefix: string): Promise<number> { return deleteKeysWithPrefix(this.m, prefix); }
+}
+
+/** A literal prefix delete over one map (an empty prefix deletes nothing, as the SQL stores' range does). */
+function deleteKeysWithPrefix(m: Map<string, unknown>, prefix: string): number {
+  if (prefix === '') return 0;
+  let n = 0;
+  for (const k of [...m.keys()]) if (k.startsWith(prefix)) { m.delete(k); n++; }
+  return n;
 }
 
 const ALL_FULL: CapabilityMatrix = { runs: 'full', memory: 'full', vectors: 'full', work: 'full', cache: 'full' };
@@ -523,10 +587,15 @@ export class InMemoryStorage implements Storage {
     const dryRun = opts?.dryRun === true;
     const skipped = new Set<string>();
     let alreadyScoped = 0;
+    // The root's execution records go (ROOT_EXEC_RECORDS): the runs they name move to the organization.
+    if (!dryRun) for (const k of [...this.runs.journal.keys()]) if (k.startsWith(ROOT_EXEC_RECORDS)) this.runs.journal.drop(k);
     const rename = (k: string): string | undefined => {
       if (isOrganizationKey(k)) { alreadyScoped++; return undefined; }
+      if (k.startsWith(ROOT_EXEC_RECORDS)) return undefined;
       // The engine's own meta rows stay and are not platform keys, so not reported — as on Sqlite and Postgres.
       if (ENGINE_META_KEYS.includes(k)) return undefined;
+      // A scope's fact stays with the scope (`scopeFactsDroppedByAdoption`), and is not data to report.
+      if (isScopeFact(k)) return undefined;
       if (isPlatformKey(k)) { skipped.add(k.split(':')[0]!); return undefined; }
       return prefix + k;
     };
@@ -536,12 +605,24 @@ export class InMemoryStorage implements Storage {
 
     // Vectors are checked first, before anything moves: a rename onto a taken id refuses the adoption.
     const vectors = this.vectors._stamp(prefix.slice(0, -1), true);
-    // So is a work-log record whose id the organization's log already holds. The rule is spelled out
-    // rather than passing `rename`, whose counters belong to the adoption, not to this question.
-    const clash = this.work._logCollision((k) => (isOrganizationKey(k) || isPlatformKey(k) ? undefined : prefix + k));
-    if (clash) throw new Error(`@gnldev/durable: adoptIntoOrg would move a work-log record onto '${clash}', which the organization's log already holds. Nothing was moved.`);
+    // So is a work-store key (`workKeyAdoption`). The rules are spelled out rather than passing `rename`,
+    // whose counters belong to the adoption, not to this question.
     const kvPlan = this.work._kvPlan((k) => (isOrganizationKey(k) || isPlatformKey(k) ? undefined : prefix + k));
     if (kvPlan.collision) throw kvPlan.collision;
+    // Then every entry whose organization twin exists, by its kind (`onAdoptionCollision`, adoption.ts):
+    // records refuse — journal records, runs, threads and their rows, meta, a log record's id — while
+    // counters are summed and cache entries kept below. This used to overwrite the organization's entry.
+    const target = (k: string): string | undefined => (isOrganizationKey(k) || staysAtRoot(k) ? undefined : prefix + k);
+    const runIds = new Set((await this.runs.journal.listRuns()).map((r) => r.runId));
+    const conflicts = [
+      ...this.runs.journal.recordCollisions(target),
+      ...[...runIds].map(target).filter((to): to is string => to !== undefined && runIds.has(to)),
+      ...this.memory._collisions(target),
+      ...this.meta._collisions(target),
+    ];
+    const clash = this.work._logCollision((k) => (isOrganizationKey(k) || isPlatformKey(k) ? undefined : prefix + k));
+    if (clash) conflicts.push(clash);
+    if (conflicts.length) throw adoptionConflict(orgId, conflicts);
     if (dryRun) {
       const moved = {
         runs: count([...this.runs.journal.keys()]),
@@ -551,8 +632,13 @@ export class InMemoryStorage implements Storage {
       return { orgId, dryRun, moved, alreadyScoped, skippedPlatformKeys: [...skipped].sort(), resetPositions: kvPlan.resets };
     }
     const resetPositions: string[] = [];
+    const facts = new Set<string>();
+    for (const k of scopeFactKeys(prefix)) if ((await this.runs.journal.get(k)) !== undefined) facts.add(k);
+    for (const k of scopeFactsDroppedByAdoption(prefix, facts)) this.runs.journal.drop(k);
+    const summed = this.runs.journal.sumCounters(target);
+    this.cache._keepOrganization(target);
     const moved = {
-      runs: this.runs.journal.rekey(rename),
+      runs: this.runs.journal.rekey(rename) + summed,
       memory: this.memory._rekey(rename),
       work: this.work._rekey(rename, resetPositions),
       cache: this.cache._rekey(rename),

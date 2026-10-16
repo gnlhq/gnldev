@@ -311,17 +311,19 @@ describe('createRetentionSweeper (Phase 8.3 — opt-in automatic retention)', ()
 // GDPR runbook helper (purgeOrganization) — the org:<id>: boundary sweep incl. counters (the P1.6
 // deletePrefix fix is what makes this complete) + prefix-boundary safety.
 import { purgeOrganization } from '../src/retention.js';
+import { InMemoryStorage, toJournal } from '../src/index.js';
 
 describe('purgeOrganization (GDPR runbook)', () => {
   it('sweeps the org exactly: journal keys + incrBy counters + org wfrun records; neighbor org and root audit intact', async () => {
-    const journal = new InMemoryJournal();
+    const storage = new InMemoryStorage();
+    const journal = toJournal(storage.runs);
     await journal.put('org:acme:r1:model:0', { content: [] });
     await journal.incrBy!('org:acme:__usage__', { runs: 3, costUsd: 1.5 }); // GDPR: usage counters must go too
     await journal.put('org:acme:wfrun:w1', { runId: 'w1', status: 'suspended', updatedAt: 1 });
     await journal.put('org:acme2:r9:model:0', { content: [] }); // prefix-SHARING neighbor ('acme' vs 'acme2')
     await appendLog(journal, '__audit__', { actor: 'op', action: 'x', target: 'y', org: 'acme' }); // root trail
 
-    const deleted = await purgeOrganization(journal, 'acme');
+    const { deleted } = await purgeOrganization(storage, 'acme');
     expect(deleted).toBeGreaterThanOrEqual(2);
     expect(await journal.get('org:acme:r1:model:0')).toBeUndefined();
     expect(await journal.getCounters!('org:acme:__usage__')).toBeUndefined(); // counter swept
@@ -331,6 +333,6 @@ describe('purgeOrganization (GDPR runbook)', () => {
   });
 
   it("rejects an org id containing ':' (would break the prefix boundary)", async () => {
-    await expect(purgeOrganization(new InMemoryJournal(), 'a:b')).rejects.toThrow(/must not contain/);
+    await expect(purgeOrganization(new InMemoryStorage(), 'a:b')).rejects.toThrow(/must not contain/);
   });
 });

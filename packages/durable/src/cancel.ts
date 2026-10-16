@@ -16,6 +16,7 @@
 // the compensated-run story. Deliberately NO "uncancel": a cancel may have been ordered for
 // safety/compliance reasons and silently reviving the same runId would erase that decision's meaning.
 import type { Journal } from './journal.js';
+import { existingRun } from './run-identity.js';
 import { runKeys } from './journal.js';
 import { runCanceled } from './outcome.js';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -51,6 +52,8 @@ export class RunCanceledError extends Error {
  */
 export async function cancelAgentRun(journal: Journal, runId: string, opts: { reason?: unknown } = {}): Promise<void> {
   refuseUnknownNames('cancelAgentRun', opts, CANCEL_RUN_NAMES);
+  // A cancel continues a run; it does not begin one. Absent, nothing is written (run-identity.ts).
+  await existingRun(journal, runId);
   const record = { at: Date.now(), ...(opts.reason !== undefined ? { reason: opts.reason } : {}) };
   if (journal.putIfAbsent) {
     await journal.putIfAbsent(cancelKey(runId), record); // first cancel wins — idempotent

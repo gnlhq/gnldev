@@ -12,7 +12,6 @@ function mkModel(text: string): any {
   return {
     specificationVersion: 'v2', provider: 'mock', modelId: 'm', supportedUrls: {},
     doGenerate: async () => ({ content: [{ type: 'text', text }], finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, warnings: [] }),
-    doStream: async () => { throw new Error('no stream'); },
   };
 }
 

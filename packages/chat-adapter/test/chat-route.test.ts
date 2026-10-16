@@ -4,7 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { tool } from 'ai';
 import { z } from 'zod';
-import { InMemoryJournal, BasicMemory } from '@gnldev/durable';
+import { InMemoryJournal, BasicMemory, inMemoryLiveness } from '@gnldev/durable';
 import { createChatRoute } from '../src/index.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
@@ -370,9 +370,13 @@ function slowMock(delayMs: number): any {
   };
 }
 
-describe('FAZ-2: default lock + approval round-trip', () => {
-  it('two CONCURRENT requests with the same runId: one streams, the loser gets 409 run_busy + Retry-After', async () => {
-    const app = createChatRoute({ journal: new InMemoryJournal(), agents: { chat: { model: slowMock(40), maxSteps: 4 } } });
+describe('FAZ-2: concurrent turns + approval round-trip', () => {
+  it('two CONCURRENT requests with the same runId: one execution, both answered (the second follows the run)', async () => {
+    // The turn's run executes once, apart from the requests (@gnldev/durable): a concurrent duplicate —
+    // a double-click, two tabs — follows the same run instead of executing it again or being refused.
+    let streams = 0;
+    const counted: any = { ...slowMock(40), doStream: async (o: any) => { streams++; return slowMock(40).doStream(o); } };
+    const app = createChatRoute({ journal: new InMemoryJournal(), agents: { chat: { model: counted, maxSteps: 4 } } });
     const post = () =>
       app.request('/agents/chat/chat', {
         method: 'POST',
@@ -380,32 +384,12 @@ describe('FAZ-2: default lock + approval round-trip', () => {
         body: JSON.stringify({ id: 'lk1', messages: [{ id: 'm1', role: 'user', parts: [{ type: 'text', text: 'go' }] }] }),
       });
     const [a, b] = await Promise.all([post(), post()]);
-    const statuses = [a.status, b.status].sort();
-    expect(statuses).toEqual([200, 409]);
-    const loser = a.status === 409 ? a : b;
-    const body = await loser.json();
-    expect(body.code).toBe('run_busy');
-    expect(body.resumable).toBe(true);
-    expect(loser.headers.get('Retry-After')).toBe('5');
-    expect(loser.headers.get('X-Gnl-Run-Id')).toBe('lk1:m1');
-    const winner = a.status === 200 ? a : b;
-    await winner.text(); // drain → lock released
-  });
-
-  it('lock:false restores the old concurrent behavior (no 409)', async () => {
-    const app = createChatRoute(
-      { journal: new InMemoryJournal(), agents: { chat: { model: slowMock(30), maxSteps: 4 } } },
-      { lock: false },
-    );
-    const post = () =>
-      app.request('/agents/chat/chat', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ id: 'lk2', messages: [{ id: 'm1', role: 'user', parts: [{ type: 'text', text: 'go' }] }] }),
-      });
-    const [a, b] = await Promise.all([post(), post()]);
     expect([a.status, b.status]).toEqual([200, 200]);
-    await Promise.all([a.text(), b.text()]);
+    const [ta, tb] = await Promise.all([a.text(), b.text()]);
+    expect(ta).toContain('slow');
+    expect(tb).toContain('slow');
+    expect(a.headers.get('X-Gnl-Run-Id')).toBe('lk1:m1');
+    expect(streams, 'the model was called for a second execution').toBe(1);
   });
 
   it('Idempotency-Key header is an alias AFTER body.runId', async () => {
@@ -503,8 +487,8 @@ describe('FAZ-2: replay parity + conversion determinism (panel test assignments)
 
 // FAZ-2 audit findings (K8×2 + K14) — the lock lifecycle's abort and setup-throw exits are pinned
 // down; proved that the default lock works at the route level even against a capability-less (CAS-less) journal.
-describe('FAZ-2 audit fixes: lock release paths', () => {
-  it('abort releases the lock — the immediate same-runId retry gets 200, not 5 minutes of 409', async () => {
+describe('FAZ-2 audit fixes: a turn that is left, refused, or stored minimally', () => {
+  it('a client that disconnects mid-answer does not stop the turn — the retry follows the same run', async () => {
     let calls = 0;
     const abortableMock: any = {
       specificationVersion: 'v2',
@@ -550,17 +534,22 @@ describe('FAZ-2 audit fixes: lock release paths', () => {
     expect(first.status).toBe(200);
     const reader = (first.body as ReadableStream).getReader();
     await reader.read(); // the stream is live
-    controller.abort(); // user hit stop / closed the tab
-    await new Promise((r) => setTimeout(r, 100)); // let onAbort's release land
+    controller.abort(); // the user closed the tab
+    await reader.cancel().catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 100));
 
+    // The retry is answered at once and follows the SAME run (still generating) — not a second execution.
     const retry = await app.request('/agents/chat/chat', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body,
     });
-    // Without the onAbort release, this is 409 run_busy for the remaining ~5 minutes of TTL.
     expect(retry.status).toBe(200);
-    await retry.text();
+    const r2 = (retry.body as ReadableStream).getReader();
+    const { value } = await r2.read();
+    expect(value).toBeDefined();
+    await r2.cancel();
+    expect(calls, 'the closed tab stopped the run, and the retry started it again').toBe(1);
   });
 
   it('a setup-throw after acquire (thread mismatch) releases the lock — the CORRECT retry is not blocked', async () => {
@@ -584,13 +573,15 @@ describe('FAZ-2 audit fixes: lock release paths', () => {
     await right.text();
   });
 
-  it('default lock works on a capability-less (get/put only) journal — fallback path at route level', async () => {
+  it('a capability-less (get/put only) journal runs a turn and replays it', async () => {
     const m = new Map<string, unknown>();
     const plainJournal: any = {
       async get(k: string) { return m.has(k) ? structuredClone(m.get(k)) : undefined; },
       async put(k: string, v: unknown) { m.set(k, structuredClone(v)); },
     };
-    const app = createChatRoute({ journal: plainJournal, agents: { chat: { model: textMock(), maxSteps: 4 } } });
+    // A hand-written journal cannot say whether other processes reach it: the app says so (here: only this
+    // process — a Map). Without it the registry refuses to guess (LivenessRequiredError).
+    const app = createChatRoute({ journal: plainJournal, liveness: inMemoryLiveness(), agents: { chat: { model: textMock(), maxSteps: 4 } } } as never);
     const post = () =>
       app.request('/agents/chat/chat', {
         method: 'POST',
@@ -598,7 +589,7 @@ describe('FAZ-2 audit fixes: lock release paths', () => {
         body: JSON.stringify({ id: 'pl1', messages: [{ id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }] }] }),
       });
     const first = await post();
-    expect(first.status).toBe(200); // default-on lock must not crash adapters without putIfAbsent/putIfMatch
+    expect(first.status).toBe(200); // a journal without putIfAbsent/putIfMatch/listKeys still runs a turn
     await first.text();
     const replay = await post();
     expect(replay.status).toBe(200);

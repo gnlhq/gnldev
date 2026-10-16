@@ -7,6 +7,7 @@ import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
 import { createProcessorCtx, recordProcessorReport, readProcessorReports } from '../src/processor.js';
 import type { Processor } from '../src/processor.js';
+import { claimRunOwner, STAFF } from '../src/run-identity.js';
 import { countToolResults, toolCallResult, finalTextResult, createMockModel } from './mock.js';
 
 describe('8.7 processor pipeline', () => {
@@ -103,6 +104,7 @@ describe('recordProcessorReport / readProcessorReports (audit reports — additi
 
   it('overwrite-safe: a second call for the same name+phase does NOT OVERWRITE the previous record (written only once)', async () => {
     const journal = new InMemoryJournal();
+    await claimRunOwner(journal, 'r2', STAFF); // a report is the run's record: the run exists
     const ctx = createProcessorCtx(journal, 'r2');
     await recordProcessorReport(ctx, 'moderation', 'output', { hit: 'first' });
     await recordProcessorReport(ctx, 'moderation', 'output', { hit: 'second' }); // different findings — must be IGNORED

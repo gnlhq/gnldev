@@ -24,6 +24,7 @@
 import { ORG_SCOPE, orgPrefix, orgScopeOf, withOrg } from './organization.js';
 import { toJournal, orgVectorId, workingMemoryScope, MEMORY_PARTITION, VECTOR_PARTITION, partitionReadCount, assertRootOutsideOrganizations } from './storage.js';
 import { asReaderJournal, type Journal, type JournalReader } from './journal.js';
+import { withBirth } from './run-identity.js';
 import { recordThreadCreated } from './thread-owner.js';
 import type {
   CacheStore, CapabilityMatrix, ListQuery, LogRecord, MemoryStore, MessageRecord, MessageAppend, MetaStore,
@@ -133,7 +134,8 @@ function scopedRuns(runs: RunJournal, p: string, orgId: string): RunJournal {
   // Both answers are right; they are just not the same answer. Left as-is rather than trimmed, because
   // removing a working capability to make two surfaces match is a worse trade than documenting it.
   const bridged = withOrg(toJournal(runs), orgId) as unknown as Record<string, unknown>;
-  return {
+  // Its birth, through this organization's view (a spread drops `withOrg`'s, which is not enumerable).
+  return withBirth({
     ...bridged,
     readRun: (runId: string) => runs.readRun(add(p, runId)),
     listRuns: (q?: ListQuery) => drainOwned(
@@ -141,7 +143,7 @@ function scopedRuns(runs: RunJournal, p: string, orgId: string): RunJournal {
       (r: RunSummary) => { const id = strip(p, r.runId); return id === undefined ? undefined : { ...r, runId: id }; },
       q,
     ),
-  } as unknown as RunJournal;
+  } as never) as unknown as RunJournal;
 }
 
 /** Stores already told that the partition did not reach them — the warning is once per store. */
@@ -285,6 +287,10 @@ function scopedMemory(memory: MemoryStore, p: string, ownerJournal: Journal): Me
   if (memory.deleteMessagesAfter) {
     scoped.deleteMessagesAfter = (threadId, afterSeq) => memory.deleteMessagesAfter!(add(p, threadId), afterSeq);
   }
+  if (memory.retractBatch) {
+    scoped.retractBatch = (threadId, batchKey) => memory.retractBatch!(add(p, threadId), batchKey);
+  }
+  // `deletePartition` is NOT forwarded: an organization's deletion is the root's to run (`purgeOrganization`).
   return scoped;
 }
 
@@ -404,6 +410,8 @@ export function withOrgStorage(storage: Storage, orgId: string): Storage {
     ...(storage.vectors ? { vectors: scopedVectors(storage.vectors, p, orgId) } : {}),
     ...(storage.work ? { work: scopedWork(storage.work, p, orgId) } : {}),
     ...(storage.cache ? { cache: scopedCache(storage.cache, p) } : {}),
+    // A process's liveness is the process's, not the organization's: the root store's.
+    ...(storage.processLiveness ? { processLiveness: () => storage.processLiveness!() } : {}),
   };
   // Enumerable for the same reason `withOrg`'s marker is: a scope you cannot see is a scope nobody
   // debugs. `Symbol.for` keys never appear in `Object.keys`, a spread, or `JSON.stringify`.

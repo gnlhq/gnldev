@@ -13,6 +13,7 @@
 //     answer to the agent's question, not a failure of it
 import { describe, it, expect } from 'vitest';
 import { createGnl, InMemoryJournal } from '../src/index.js';
+import { streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 
@@ -31,7 +32,7 @@ function delegatingModel(toolName: string) {
       }
       return { content: [{ type: 'text', text: 'pipeline done' }], finishReason: 'stop' as const, usage, warnings: [] as any[] };
     },
-    doStream: async () => { throw new Error('no'); },
+    doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
   };
 }
 

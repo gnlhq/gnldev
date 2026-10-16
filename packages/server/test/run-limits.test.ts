@@ -21,7 +21,6 @@ function mkModel(tokens = 15): any {
         warnings: [],
       };
     },
-    doStream: async () => { throw new Error('no stream'); },
   };
 }
 

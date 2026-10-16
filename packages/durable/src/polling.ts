@@ -12,6 +12,19 @@
 
 import { refuseUnknownNames } from '@gnldev/options';
 import { POLL_LOOP_NAMES } from './option-names.js';
+import { isDraining, within, settledExceptOwn, outsideHeld } from './process-liveness.js';
+
+/** The ticks running now in this process, across every loop — what a drain waits for (drain.ts). */
+const ticking = new Set<Promise<void>>();
+
+/**
+ * Resolves when no tick of any poll loop in this process is running. While the process drains no
+ * new tick starts (see `tick`), so once this resolves the loops have nothing left in hand.
+ */
+export function pollLoopsIdle(): Promise<void> {
+  // Except the tick the caller runs inside: a job that drains would otherwise wait for its own tick.
+  return settledExceptOwn(() => ticking);
+}
 export interface PollLoopOptions {
   /** Tick interval (ms). Default 200. */
   pollMs?: number;
@@ -41,16 +54,28 @@ export function createPollLoop(fn: () => Promise<boolean>, opts: PollLoopOptions
 
   async function tick() {
     if (polling) return;
+    // GRACEFUL DRAIN (process-liveness.ts): a process shutting down starts no new tick — the queue
+    // takes no job, the scheduler fires no trigger. The chain stays scheduled: the flag belongs to the
+    // process, and a test that ends a drain (`endDrain`) gets its loop back.
+    if (isDraining()) {
+      if (timer !== undefined) timer = setTimeout(tick, currentPollMs);
+      return;
+    }
     polling = true;
     let progressed = false;
+    let done!: () => void;
+    const running = new Promise<void>((r) => (done = r));
+    ticking.add(running);
     try {
-      progressed = await fn();
+      progressed = await within(running, fn);
     } catch (err) {
       // fn() usually swallows its own work/handler errors internally; this is the last resort only
       // for unexpected (e.g. storage I/O) errors — it matters that the chain NOT DIE (the next tick can still be scheduled).
       console.warn('@gnldev/durable: poll-loop tick failed (chain continues):', err);
     } finally {
       polling = false;
+      ticking.delete(running);
+      done();
     }
     currentPollMs = !backoffOn ? pollMs : progressed ? pollMs : Math.min(currentPollMs * 2, maxPollMs);
     if (timer !== undefined) timer = setTimeout(tick, currentPollMs); // don't reschedule if stop() set timer to undefined in the meantime
@@ -60,7 +85,8 @@ export function createPollLoop(fn: () => Promise<boolean>, opts: PollLoopOptions
     start() {
       if (timer !== undefined) return; // already running
       currentPollMs = pollMs;
-      timer = setTimeout(tick, currentPollMs);
+      // Outside any held unit: the loop outlives whatever started it, and its ticks are nobody's part.
+      timer = outsideHeld(() => setTimeout(tick, currentPollMs));
     },
     stop() {
       if (timer) clearTimeout(timer);

@@ -8,6 +8,7 @@
 // The mark is JOURNALED (survives crash/resume — replay sees the same taint the live run saw) and
 // FIRST-WINS (claim): the recorded source is the FIRST untrusted content that entered, which is the
 // earliest point after which nothing downstream can be assumed clean.
+import { runRecordKey } from './run-id-grammar.js';
 import { claim } from './journal.js';
 import { argsHash } from './hash.js';
 import type { Journal } from './journal.js';
@@ -25,7 +26,7 @@ export interface RunTaint {
   reason?: string;
 }
 
-const taintKey = (runId: string): string => `${runId}:proc:__gnl_taint`;
+const taintKey = (runId: string): string => runRecordKey(runId, 'proc', '__gnl_taint');
 
 /**
  * (memory-recall half, opt-in `limits.taintScope: 'thread'`): the THREAD-scoped taint key.
@@ -59,7 +60,7 @@ export const threadTaintProvenanceKey = (threadId: string): string => `thread:${
  * the window and the taint could never expire — the documented transitive-echo bound). Written only
  * under `taintScope: 'thread'` (the sole consumer, content-window expiry, requires it).
  */
-const directTaintKey = (runId: string): string => `${runId}:proc:__gnl_taint_direct`;
+const directTaintKey = (runId: string): string => runRecordKey(runId, 'proc', '__gnl_taint_direct');
 
 /** PHASE 3: the provenance record. `overflow` = the hash cap was hit — visibility can no longer be
  *  proven absent, so the expiry check treats the content as permanently visible (fail toward gating). */

@@ -13,6 +13,8 @@ longer exists fails it too.
 | `UPSTREAM_ERROR_CODES` | `@gnldev/durable` | the model provider failed |
 | `LIMIT_ERROR_CODES` | `@gnldev/durable` | a run stopped at a `limits` ceiling or a tool loop |
 | `RESERVED_ID_ERROR_CODES` | `@gnldev/durable` | an id the caller's scope may not name |
+| `VISIBILITY_ERROR_CODES` | `@gnldev/durable` | a run the caller may not reach — absent or someone else's, one answer |
+| `ADOPTION_ERROR_CODES` | `@gnldev/durable` | an operator's `adoptIntoOrg` refused |
 | `EDGE_ERROR_CODES` | `@gnldev/server` | refusals the HTTP layer writes itself |
 | `STUDIO_ERROR_CODES` | `@gnldev/studio` | the operator console's own refusals |
 
@@ -34,6 +36,14 @@ The code is the stable part — the same string in the HTTP body, the SSE `error
 library. The sentence beside it is written for the moment of failure; these pages are for the ten
 minutes afterwards.
 
+## A run you cannot reach — 404
+
+Absent and someone else's answer the same, so the answer cannot tell a stranger which ids are real.
+
+| Code | Status | In one line |
+| --- | --- | --- |
+| [`run_not_found`](./run_not_found.md) | 404 | No such run for this caller — it does not exist, or it is not yours. |
+
 ## Caller conflicts — 409, no `resumable`
 
 Something about the request needs fixing: the id, its content, or who is asking. No retry clears
@@ -44,8 +54,8 @@ them.
 | [`run_thread_mismatch`](./run_thread_mismatch.md) | This runId already belongs to a different conversation. |
 | [`thread_owner_mismatch`](./thread_owner_mismatch.md) | The subject and the thread belong to different people. |
 | [`run_input_mismatch`](./run_input_mismatch.md) | Same runId, different content (`critical` profile). |
-| [`run_actor_mismatch`](./run_actor_mismatch.md) | Same runId, different actor (`critical` profile). |
-| [`run_owner_mismatch`](./run_owner_mismatch.md) | A derived (`run1_`) run addressed by a different subject. |
+| [`run_actor_mismatch`](./run_actor_mismatch.md) | Same runId, different actor (`critical` profile). A door answers it as `run_not_found`. |
+| [`run_owner_mismatch`](./run_owner_mismatch.md) | A run addressed by a different subject. A door answers it as `run_not_found`. |
 | [`run_swept`](./run_swept.md) | Retention deleted this run; a late retry would repeat its effects. |
 | [`run_target_mismatch`](./run_target_mismatch.md) | This runId was started for another agent, workflow, network or batch. |
 | [`batch_plan_mismatch`](./batch_plan_mismatch.md) | The items do not match the plan that was approved. |
@@ -60,6 +70,7 @@ The same runId succeeds once the block clears.
 | [`side_effect_retry_blocked`](./side_effect_retry_blocked.md) | 409 | A side-effecting tool cannot be retried without a decision. |
 | [`step_retry_blocked`](./step_retry_blocked.md) | 409 | The workflow form of the above. |
 | [`retry_limit_exceeded`](./retry_limit_exceeded.md) | 422 | A tool hit `maxRetries` and is permanently failed. |
+| [`outcome_unknown`](./outcome_unknown.md) | 409 | A tool hit `maxRetries` without ever reporting; the run waits for what happened. |
 
 ## The model provider failed
 
@@ -95,6 +106,16 @@ the error is thrown. Every door (REST, Studio, chat, AG-UI) answers it through `
 | [`thread_id_reserved`](./thread_id_reserved.md) | 400 | A root-scope request named a thread under `org:`, the organizations' reserved id space. |
 | [`invalid_json`](./invalid_json.md) | 400 | The request body is not a JSON object. |
 | [`caller_system_message`](./caller_system_message.md) | 400 | A request's `messages` included a `system` one. |
+| [`invalid_cursor`](./invalid_cursor.md) | 400 | A reader's cursor (`Last-Event-ID`, `after`) is not one a run's stream gave. |
+
+## Adopting the root's data into an organization
+
+`adoptIntoOrg` (`gnl adopt-org`) refused — `ADOPTION_ERROR_CODES` in `@gnldev/durable`. An operator's
+migration, not a request: the status is what a door would answer if one ever carried it.
+
+| Code | Status | In one line |
+| --- | --- | --- |
+| [`adoption_conflict`](./adoption_conflict.md) | 409 | The organization already holds ids the root would move onto; nothing was moved. |
 
 ## Written at the HTTP edge
 

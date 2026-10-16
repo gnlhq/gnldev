@@ -34,6 +34,7 @@
 // fail-CLOSED: prepareInjection throwing aborts the run BEFORE anything is journaled (a safe,
 // retryable refusal), because the alternative — silently injecting an empty block when the freeze
 // could not be read or written — would poison the runId's fingerprint contract on retry.
+import { runRecordKey } from './run-id-grammar.js';
 import { generateText } from 'ai';
 import { randomUUID } from 'node:crypto';
 import { claim as journalClaim } from './journal.js';
@@ -130,7 +131,7 @@ export interface EvidenceQuality {
 export const suggKey = (id: string): string => `sugg:${id}`;
 export const personalLessonKey = (resourceId: string, suggId: string): string => `lesson:res:${resourceId}:${suggId}`;
 export const orgLessonKey = (suggId: string): string => `lesson:org:${suggId}`;
-export const lessonProvenanceKey = (runId: string): string => `${runId}:cfg:lessons`;
+export const lessonProvenanceKey = (runId: string): string => runRecordKey(runId, 'cfg', 'lessons');
 
 const DAY_MS = 86_400_000;
 const DEFAULT_MERGE_SIMILARITY = 0.85;
@@ -320,7 +321,7 @@ export function createSuggestions(journal: Journal, cfg: SuggestionsConfig): Sug
   async function generateFor(input: { runId: string; resourceId?: string; threadId?: string; prompt?: string; output: string }): Promise<{ id: string; merged: boolean } | null> {
     if (!cfg.generate) return null;
     if (!input.resourceId) return null; // a personal lesson needs an owner — resourceless runs don't learn
-    const memoKey = `${input.runId}:sugg:gen`;
+    const memoKey = runRecordKey(input.runId, 'sugg', 'gen');
     const memo = await journal.get<{ suggId: string | null; merged?: boolean }>(memoKey);
     if (memo !== undefined) return memo.suggId ? { id: memo.suggId, merged: memo.merged === true } : null;
     // AT-MOST-ONCE: the claim lands BEFORE the model call. A crash mid-generation loses one proposal

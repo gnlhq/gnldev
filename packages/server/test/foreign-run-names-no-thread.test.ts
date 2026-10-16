@@ -39,16 +39,16 @@ describe('a foreign run id with my own thread: the refusal names nobody', () => 
     it(`chat (standalone), ${label}`, async () => {
       const { config } = await world(owner);
       const r = await chat(config, MAL, { id: 't-mine', runId: 'r-victim', messages: turn('hi') });
-      expect(r.status).toBe(409);
-      expect(JSON.parse(r.body).code).toBe('run_owner_mismatch');
+      expect(r.status).toBe(404); // read as absent: run_not_found names no owner and no existence
+      expect(JSON.parse(r.body).code).toBe('run_not_found');
       expect(r.body).not.toContain(VICTIM_THREAD);
     });
 
     it(`agui (standalone), ${label}`, async () => {
       const { config } = await world(owner);
       const r = await agui(config, MAL, { runId: 'r-victim', threadId: 't-mine', prompt: 'hi' });
-      expect(r.status).toBe(409);
-      expect(JSON.parse(r.body).code).toBe('run_owner_mismatch');
+      expect(r.status).toBe(404); // read as absent: run_not_found names no owner and no existence
+      expect(JSON.parse(r.body).code).toBe('run_not_found');
       expect(r.body).not.toContain(VICTIM_THREAD);
     });
 
@@ -58,7 +58,7 @@ describe('a foreign run id with my own thread: the refusal names nobody', () => 
       await gnl.run('a', { runId: 'r-victim', prompt: 'V', threadId: VICTIM_THREAD, caller: owner.kind === 'user' ? user('u-ayse') : STAFF });
       const who = { kind: 'subject', id: 'u-mallory', roles: [] };
       const r = await chat({ gnl }, who, { id: 't-mine', runId: 'r-victim', messages: turn('hi') });
-      expect(r.status).toBe(409);
+      expect(r.status).toBe(404);
       expect(r.body).not.toContain(VICTIM_THREAD);
     });
 

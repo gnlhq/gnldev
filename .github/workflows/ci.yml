@@ -168,19 +168,22 @@ jobs:
       - run: pnpm -r build
       # Run from the root: the root vitest.config include is 'packages/*/test/**', so running from
       # inside a package directory reports "No test files found" (a known monorepo quirk).
-      # prefix-astral-postgres is the reason this job has TWO collation legs. The SQLite twin of these
-      # assertions cannot fail — SQLite's default collation IS byte order — so before this file the
-      # Postgres half of the fix had no test anywhere that could turn red.
-      # postgres-vector-store is here because it is env-gated the same way and was running nowhere:
-      # skipped by default for want of a server, and absent from this line. `scripts/check-real-backends.mjs`
-      # runs the same files locally — the two lists are meant to stay identical, since a repository
-      # with no remote never reaches this job at all.
-      - run: pnpm exec vitest run packages/durable/test/integration-real.test.ts packages/durable/test/prefix-astral-postgres.test.ts packages/rag/test/postgres-vector-store.test.ts packages/otel/test/metrics-org-postgres.test.ts packages/durable/test/run-cursor-parity.test.ts
-      # A SEPARATE run, after the one above, as check-real-backends.mjs does: integration-real's
-      # failover case terminates every backend on the database, and in the same vitest run it reached
-      # these contracts' open pools (4 uncaught 57P01 errors, a red caused by the schedule).
-      # One erasure over every store, the vector write rule, and owned names on the real servers.
-      - run: pnpm exec vitest run packages/durable/test/erasure-store-contract.test.ts packages/durable/test/vector-store-contract.test.ts packages/durable/test/owned-name-namespaces.test.ts
+      #
+      # WHICH files: every test that reads GNL_PG_URL, GNL_PG_ADMIN_URL or GNL_PGVECTOR_URL, itself or
+      # through a local helper — found by scripts/real-backend-tests.mjs, not listed here. Such a test
+      # skips itself without a server, so the default job is green whether it ran or not; this line used
+      # to name files by hand and, measured on 12 Oct 2026, 67 real-Postgres tests were named nowhere
+      # (test/real-backend-tests-run.test.ts holds this job to the rule). scripts/check-real-backends.mjs
+      # runs the same two groups locally.
+      #
+      # TWO runs, in this order: the `alone` group terminates every backend on the database
+      # (integration-real's failover case), and in the same vitest run it reached the other files' open
+      # pools (4 uncaught 57P01 errors, a red caused by the schedule, not by any store).
+      # --maxWorkers=3: the runner's own default on four cores, written down so a larger machine running
+      # the same line (check-real-backends.mjs) does not exceed the server's 100 connections — the
+      # multi-process tests open several pools per file.
+      - run: node scripts/real-backend-tests.mjs --run alone
+      - run: node scripts/real-backend-tests.mjs --run shared -- --maxWorkers=3 --minWorkers=1
 
   upgrade-from-0-9-0:
     name: upgrade from 0.9.0 (known failures, not yet gating)

@@ -21,9 +21,6 @@ function mkModel(): any {
       }
       return { content: [{ type: 'text', text: 'Done.' }], finishReason: 'stop', usage, warnings: [] };
     },
-    doStream: async () => {
-      throw new Error('no stream');
-    },
   };
 }
 

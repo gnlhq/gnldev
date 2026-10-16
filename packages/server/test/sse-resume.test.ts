@@ -90,7 +90,7 @@ function makeApi(execs: { n: number }) {
 }
 
 describe('@gnldev/server SSE — resumable (W3)', () => {
-  it('when lastEventId is not given, behavior is the same as before; id starts at 0 and increments', async () => {
+  it('when lastEventId is not given, every event carries its place in the run\'s log as its id (increasing)', async () => {
     const execs = { n: 0 };
     const api = makeApi(execs);
     const res = await call(api, '/agents/echoAgent/stream', {
@@ -100,7 +100,12 @@ describe('@gnldev/server SSE — resumable (W3)', () => {
     });
     const events = await readSSE(res);
     expect(events.length).toBeGreaterThan(1);
-    expect(events.map((e) => e.id)).toEqual(events.map((_, i) => String(i)));
+    // The id is the event's place in the run's log (a run executes apart from the request; the log is
+    // what any process serves a reconnect from): increasing, not necessarily consecutive — the log also
+    // holds the run's own status entries, which are not stream events.
+    const ids = events.map((e) => Number(e.id));
+    for (let i = 1; i < ids.length; i++) expect(ids[i]!).toBeGreaterThanOrEqual(ids[i - 1]!);
+    expect(ids.every(Number.isFinite)).toBe(true);
     expect(events[events.length - 1].event).toBe('done');
     expect(events.some((e) => e.event === 'tool-call')).toBe(true);
     expect(execs.n).toBe(1);

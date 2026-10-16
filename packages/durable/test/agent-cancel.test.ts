@@ -6,6 +6,8 @@ import { tool } from 'ai';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
 import { cancelAgentRun, agentRunCanceled, RunCanceledError } from '../src/cancel.js';
+import { claimRunOwner, STAFF } from '../src/run-identity.js';
+import { RunNotFoundError } from '../src/errors.js';
 import { reconstructState } from '../src/time-travel.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
@@ -18,6 +20,8 @@ const textOnly = (text: string) => createMockModel(async () => finalTextResult(t
 describe('cancel.ts — durable agent-run cancel', () => {
   it('a canceled run refuses to (re)start/resume forever (terminal, like compensation)', async () => {
     const journal = new InMemoryJournal();
+    // A cancel continues a run: the run exists (born, nothing run yet) before it is canceled.
+    await claimRunOwner(journal, 'r-c1', STAFF);
     await cancelAgentRun(journal, 'r-c1', { reason: 'operator' });
     await expect(
       runDurable({ runId: 'r-c1', journal, model: textOnly('hi') as any, prompt: 'x' }),
@@ -58,8 +62,17 @@ describe('cancel.ts — durable agent-run cancel', () => {
 
   it('an UNRELATED run on the same journal is unaffected', async () => {
     const journal = new InMemoryJournal();
+    await claimRunOwner(journal, 'r-other', STAFF);
     await cancelAgentRun(journal, 'r-other');
     const r = await runDurable({ runId: 'r-free', journal, model: textOnly('done') as any, prompt: 'x' });
+    expect((r as any).text).toBe('done');
+  });
+
+  it('a cancel of a run that does not exist is not found, and writes nothing — the id stays free to be begun', async () => {
+    const journal = new InMemoryJournal();
+    await expect(cancelAgentRun(journal, 'r-none', { reason: 'operator' })).rejects.toBeInstanceOf(RunNotFoundError);
+    expect(await journal.listKeys('r-none')).toEqual([]);
+    const r = await runDurable({ runId: 'r-none', journal, model: textOnly('done') as any, prompt: 'x' });
     expect((r as any).text).toBe('done');
   });
 });

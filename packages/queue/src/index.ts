@@ -7,10 +7,11 @@
 import { randomUUID } from 'node:crypto';
 import {
   acquireRunLock, requireCapability, createPollLoop, orgPrefix, withOrgStorage, orgStorageScopeOf, ownedName, ownedPrefix,
-  claimRunOwner, runDurable, user, staff, UNKNOWN, toJournal, ownerOfName, assertRootWorkForErasure, portOf, storageOf } from '@gnldev/durable';
-import type { Storage, WorkStore, RunJournal, LogRecord, Caller, RunDurableArgs, DurableResult } from '@gnldev/durable';
+  claimRunOwner, runDurable, user, staff, UNKNOWN, toJournal, ownerOfName, assertRootWorkForErasure, portOf, storageOf,
+  processLiveness, storeLiveness, isProcessLocal, isDraining, LivenessRequiredError, attemptEndOf, holdWhile, settledExceptOwn, handNamePrefix } from '@gnldev/durable';
+import type { Storage, WorkStore, RunJournal, LogRecord, Caller, RunDurableArgs, DurableResult, ProcessLiveness } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
-import { ENQUEUE_OPTIONS_NAMES, RETRY_JOB_OPTS_NAMES, CREATE_WORKER_OPTS_NAMES, MOVE_JOB_TO_NAMES } from './option-names.js';
+import { ENQUEUE_OPTIONS_NAMES, RETRY_JOB_OPTS_NAMES, CREATE_WORKER_OPTS_NAMES, CREATE_QUEUE_OPTS_NAMES, MOVE_JOB_TO_NAMES } from './option-names.js';
 
 /** What `ctx.run` takes: `runDurable`'s arguments without the four the job already decides. */
 export type JobRunArgs = RunDurableArgs extends infer A ? (A extends unknown ? Omit<A, 'journal' | 'runId' | 'caller' | 'resourceId'> : never) : never;
@@ -92,10 +93,11 @@ type JobRecord = { type: string; payload: unknown; ownerKind?: 'staff'; runId?: 
 
 /**
  * The per-job KV markers that make up a job's state. `qdone`/`qfail`/`qcancel` are terminal; `qtry` is
- * the attempt record (`TryRecord`); `qatt` is the attempt count a worker before 0.10 wrote.
+ * the attempt record (`TryRecord`); `qatt` is the attempt count a worker before 0.10 wrote; `qlate` is a
+ * handler that finished after its worker lost the job (`recordLateSuccess`).
  * One list, read by `moveJob` (copies them) and `jobEraser` (deletes them, with the lease's `qown`).
  */
-const STATE_MARKERS = ['qdone', 'qfail', 'qcancel', 'qatt', 'qtry'] as const;
+const STATE_MARKERS = ['qdone', 'qfail', 'qcancel', 'qatt', 'qtry', 'qlate'] as const;
 
 /**
  * A job's attempts, in ONE record under its own key (`qtry`): how many STARTED, and after a failure the
@@ -176,7 +178,7 @@ function jobOwnerOf(opts: EnqueueOptions): JobOwner & { ownerKind?: 'staff' } {
  * The per-organization depth index: one small log per owner group, holding one record per job under
  * the job's own id. `maxDepth` counts this log, so the cost is O(min(depth, maxDepth)) pages of the
  * caller's OWN organization, never the whole shared queue. Under `org:<id>:` so that
- * `purgeOrganizationWork` takes it with the organization; an owned record's id is the job's owned id,
+ * `purgeOrganization` takes it with the organization; an owned record's id is the job's owned id,
  * so a person's erasure takes it too.
  */
 const depthNs = (orgId: string | undefined) => (orgId === undefined ? 'qdepth' : `${orgPrefix(orgId)}qdepth`);
@@ -186,8 +188,21 @@ export type JobHandler = (payload: any, ctx: JobCtx) => Promise<any>;
 
 export interface QueueWorkerOptions {
   owner?: string;
-  /** Lock TTL: locks older than this (crashed) are reclaimed. */
+  /**
+   * The lease's TTL — consulted only when the holder's process cannot be asked. With a process
+   * liveness (below) a job held by a live process stays with it however long it is frozen, and a dead
+   * process's job is taken at once; without one, a lease older than this reads as crashed and is taken.
+   */
   ttlMs?: number;
+  /**
+   * This process's liveness (@gnldev/durable `sqliteLiveness`/`postgresLiveness`): whether the worker
+   * holding a job is alive is asked of it, not of the lease's age. Default: the one installed in this
+   * process, else the one the storage makes for itself (a SqliteStorage or PostgresStorage answers for
+   * itself), installed for the process. A store only this process reaches (in memory) needs none; any
+   * other store without one is refused (`LivenessRequiredError`) — guessed by age, a frozen worker's job
+   * is taken and its side effect runs twice.
+   */
+  liveness?: ProcessLiveness;
   /** start() poll interval (also the base for backoff growth on an empty queue). */
   pollMs?: number;
   /** How many failed attempts before a job becomes dead-letter (qfail). */
@@ -217,6 +232,10 @@ export interface QueueWorkerOptions {
    * reset by any SUCCESSFUL renew (a single hiccup never PRODUCES a lockLost — current behavior, see tests).
    */
   maxRenewFailures?: number;
+  /**
+   * Called with a handler's error that counts as a failed attempt — not for a job this process released
+   * (a drain, a lost liveness session), one whose run was executing elsewhere, or one cancelled while it ran.
+   */
   onError?: (err: unknown, jobId: string) => void;
   /**
    * The wait before the next attempt of a failed job, in ms: a number, or `(attempt, err) => ms` where
@@ -244,7 +263,12 @@ export interface QueueWorkerOptions {
 export interface JobStatus extends JobOwner {
   id: string;
   type: string;
-  status: 'pending' | 'done' | 'failed' | 'cancelled';
+  /**
+   * `in-doubt`: the job reached `maxAttempts` with its last attempt never reporting (its process stopped
+   * or was cut off while the handler ran) — whether it ran is unknown, so it is not called failed. Like a
+   * dead letter it is not started again (`retryJob` retries it); a late report of its handler makes it `done`.
+   */
+  status: 'pending' | 'done' | 'failed' | 'cancelled' | 'in-doubt';
   /**
    * Attempts STARTED, counted as each begins: a job done on its first try shows 1, and an attempt the
    * process died in counts. A dead letter shows `maxAttempts`.
@@ -364,6 +388,7 @@ async function appendJob(
   // The depth index, under the SAME id (idempotent with the job). A crash between the two appends
   // under-counts this one job by one; never over-counts.
   await work.append(depthNs(opts.orgId), { type }, id);
+  noticeIfUnconsumed(work, type, id);
   return id;
 }
 
@@ -394,7 +419,9 @@ export async function listJobs(workArg: WorkStore): Promise<JobStatus[]> {
     const cancelled = await work.get(`qcancel:${j.id}`);
     const { attempts } = await attemptsOf(work, j.id);
     // A job cancelled while it ran, and which then finished, ran: `done` wins over `cancelled`.
-    const status = done ? 'done' : fail ? 'failed' : cancelled !== undefined ? 'cancelled' : 'pending';
+    // `in-doubt`: dead-lettered with its outcome unknown (its last attempt never reported) — a late
+    // report makes it `done`.
+    const status = done ? 'done' : fail ? ((fail as { inDoubt?: unknown }).inDoubt === true ? 'in-doubt' : 'failed') : cancelled !== undefined ? 'cancelled' : 'pending';
     const notBefore = status === 'pending' ? await notBeforeOf(work, j) : 0;
     out.push({
       id: j.id,
@@ -425,6 +452,69 @@ async function findJob(
     if (!page.nextCursor) return undefined;
     cursor = page.nextCursor;
   }
+}
+
+/**
+ * A handler that finished after its worker lost the job (a takeover after a partition, a stall): the job
+ * ran, and that is a fact about the job, not this worker's account of itself — the same rule as a late
+ * tool success in @gnldev/durable (attempt.ts). It is kept (`qlate`); `settleFromLateReport` is its one
+ * reader. Never into a job that is gone (its attempt record goes with an erasure).
+ */
+async function recordLateSuccess(work: WorkStore, jobId: string): Promise<void> {
+  // A worker back from a partition finds its connections gone: the first statements fail while the pool
+  // reconnects. Tried a few times, a beat apart.
+  for (let round = 0; round < 5; round++) {
+    try {
+      if ((await work.get(`qtry:${jobId}`)) === undefined) return;
+      // Written through the erasure fence like every write of a job's state (`putJobMarker`): this worker
+      // no longer holds the job, and its owner's erasure ran between the read above and this write —
+      // `qlate` stayed under the erased person's id for good (audit Q2).
+      if (!(await putJobMarker(work, jobId, 'qlate', { at: Date.now() }))) return;
+      await settleFromLateReport(work, jobId);
+      console.warn(`[queue] job ${jobId} finished after its worker lost it — kept (qlate)`);
+      return;
+    } catch (err) {
+      if (round === 4) console.warn(`[queue] job ${jobId} finished after its worker lost it, and that could not be recorded:`, err);
+      else await new Promise((r) => setTimeout(r, 200 * (round + 1)));
+    }
+  }
+}
+
+/**
+ * EVERY WRITE OF A JOB'S STATE BY A WORKER — the attempt record, a result, a dead letter, a late report —
+ * and the job's ERASURE FENCE read after it (@gnldev/durable erasure-fence.ts: written first, read last).
+ * A worker cannot keep its job's owner from being erased between its own check and its write (the holder
+ * past `stillOwns`, a worker that lost the job reporting late); the write then stayed under the erased
+ * person's id for good (audit Q2). The fence is `qown`: written at the job's first lease and the FIRST
+ * record `jobEraser` deletes — so a write lands either before the erasure reaches it (and goes with it),
+ * or before this read sees the fence gone, and is taken back here. False when it was.
+ *
+ * A store without `putIfMatch` writes no `qown`: the attempt record stands in (a late report's fence;
+ * the holder there has no fencing at all — the documented fallback of such a store).
+ */
+async function putJobMarker(work: WorkStore, jobId: string, marker: (typeof STATE_MARKERS)[number], value: unknown): Promise<boolean> {
+  await work.put(`${marker}:${jobId}`, value);
+  if ((await work.get(`${work.putIfMatch ? 'qown' : 'qtry'}:${jobId}`)) !== undefined) return true;
+  // Erased meanwhile. A work store deletes by prefix, so this reaches `<marker>:<id>…` too: ids that
+  // extend this one carry the same owner prefix (`ownedName`) and were erased with it.
+  await work.deletePrefix?.(`${marker}:${jobId}`);
+  return false;
+}
+
+/**
+ * THE ONE READER OF A LATE REPORT. A job whose handler is known to have finished (`qlate`) RAN; it is
+ * `done` (`late: true`) once no other worker can still report for it — the engine's rule for a late tool
+ * success (attempt.ts): never over a live holder. That is so when the job is in doubt (its last attempt
+ * never reported), or when the caller is the worker that holds the job now and is about to decide it: to
+ * start the handler again, or to write off its own failed attempt, which only met the effect the first
+ * one made. Before, only the in-doubt case was read, so an attempt started after the report re-ran the
+ * handler and the job ended failed although it had run (audit Q1). True when the job is done.
+ */
+async function settleFromLateReport(work: WorkStore, jobId: string, holder = false): Promise<boolean> {
+  if ((await work.get(`qdone:${jobId}`)) !== undefined) return true;
+  if ((await work.get(`qlate:${jobId}`)) === undefined) return false;
+  if (!holder && (await work.get<{ inDoubt?: unknown }>(`qfail:${jobId}`))?.inDoubt !== true) return false;
+  return putJobMarker(work, jobId, 'qdone', { at: Date.now(), ok: true, late: true });
 }
 
 /**
@@ -462,6 +552,7 @@ export async function retryJob(
   if (!rec) return null;
   const fail = await work.get(`qfail:${id}`);
   if (!fail) return null; // only dead-letter jobs are retried — pending/done is a no-op
+  if ((await work.get(`qdone:${id}`)) !== undefined) return null; // a late report settled it: it ran
   const { newRun, ...enqueueOpts } = opts;
   // The copy is the same user's, in the same organization: a retry must not turn their job into the system's.
   return appendJob(
@@ -492,13 +583,84 @@ export async function cancelJob(workArg: WorkStore, id: string): Promise<boolean
   return work.ackOnce(`qcancel:${id}`);
 }
 
+// ─── Who consumes the queue ────────────────────────────────────────────────────────────────────
+
+/**
+ * How long a job may wait with no live worker on its store before it is reported (`console.warn`, once
+ * per type in this process). A job enqueued where nothing consumes it otherwise waits without a word.
+ */
+export const NO_WORKER_NOTICE_MS = 10_000;
+
+/**
+ * Every polling worker on a store announces itself in `__qworkers__`, every ttlMs/3: `owner → { at, ttlMs }`. It
+ * answers "is anyone polling now", so it is judged by its age alone — a process that is alive and no
+ * longer polls (a worker stopped, a one-off `drain()` long done) consumes nothing. Advisory: it decides
+ * no job, only whether "nobody consumes this" is said. One key per store: a worker takes every job it
+ * sees (a type it has no handler for is dead-lettered), so the question is whether a worker polls, not
+ * which types it handles.
+ */
+// `__`: a platform key (organization.ts `isPlatformKey`) — process state, never moved into an organization.
+const PRESENCE = '__qworkers__';
+interface Presence { at: number; ttlMs: number }
+
+function livePresence(map: Record<string, Presence> | undefined, now: number): Record<string, Presence> {
+  return Object.fromEntries(Object.entries(map ?? {}).filter(([, p]) => p.at + p.ttlMs >= now));
+}
+
+/** Writes (`entry`) or removes (`undefined`) one worker's presence; entries no longer live are dropped. */
+async function setPresence(work: WorkStore, owner: string, entry: Presence | undefined): Promise<void> {
+  // A lost race is redone at the next announcement: the record says who runs, it guards nothing.
+  for (let i = 0; i < 3; i++) {
+    const cur = await work.get<Record<string, Presence>>(PRESENCE);
+    const next = livePresence(cur, Date.now());
+    if (entry) next[owner] = entry;
+    else delete next[owner];
+    if (cur === undefined || !work.putIfMatch) { await work.put(PRESENCE, next); return; }
+    if (await work.putIfMatch(PRESENCE, cur, next)) return;
+  }
+}
+
+/** Types already reported (or being checked) per store, in this process. */
+const noticed = new WeakMap<WorkStore, Set<string>>();
+
+/**
+ * After NO_WORKER_NOTICE_MS: job `id` still waiting and no live worker on the store → said, once per type.
+ * A finished job, or a live worker, re-arms the check for the type's next job.
+ */
+function noticeIfUnconsumed(work: WorkStore, type: string, id: string): void {
+  let types = noticed.get(work);
+  if (!types) noticed.set(work, (types = new Set()));
+  if (types.has(type)) return;
+  types.add(type);
+  const timer = setTimeout(() => {
+    void (async () => {
+      if ((await isTerminal(work, id)) || Object.keys(livePresence(await work.get(PRESENCE), Date.now())).length > 0) {
+        types.delete(type);
+        return;
+      }
+      console.warn(
+        `[queue] job '${id}' (type '${type}') is waiting and no worker is consuming this queue — it runs once one starts: ` +
+          'createQueue(storage, handlers) runs one in this process; createWorker(storage, handlers).start() runs one anywhere.',
+      );
+    })().catch(() => types.delete(type));
+  }, NO_WORKER_NOTICE_MS);
+  (timer as { unref?: () => void }).unref?.();
+}
+
 export interface Worker {
   /** Claims and runs one pending job. Returns true if a job was processed. */
   runOnce(): Promise<boolean>;
   /** Calls runOnce until no pending jobs remain. Returns the number of jobs processed. */
   drain(): Promise<number>;
   start(): void;
+  /** Takes nothing new. The job a call holds finishes on its own; `close()` waits for it. */
   stop(): void;
+  /**
+   * Stops, then resolves once every job this worker holds has settled (`runOnce` from its loops or from
+   * a caller). Before this, closing returned at once: the application closed the store, the process lock
+   * went with it, and another worker took the job and ran the handler a second time (audit C2).
+   */
+  close(): Promise<void>;
 }
 
 export function createWorker(
@@ -527,7 +689,42 @@ export function createWorker(
       throw new TypeError(`@gnldev/queue: typeConcurrency['${type}'] must be a positive integer, got ${String(n)}`);
     }
   }
+  // Who answers "is the worker holding this job alive?" — the same answer every holder stamp in this
+  // process gets (process-liveness.ts). Refused up front when nothing can give it.
+  if (!opts.liveness && !processLiveness() && typeof storage.processLiveness !== 'function' && !isProcessLocal(runs)) {
+    throw new LivenessRequiredError();
+  }
+  let livenessReady: Promise<ProcessLiveness | undefined> | undefined;
+  const liveness = (): Promise<ProcessLiveness | undefined> => {
+    // The store's liveness in this process — the same one its run executor stamps the store with
+    // (@gnldev/durable storeLiveness: one per store, so a process on two databases is alive in each).
+    livenessReady ??= storeLiveness(journal, {
+      ...(opts.liveness ? { given: opts.liveness } : {}),
+      own: () => storage.processLiveness?.(),
+    });
+    // A failed construction (a pool that does not say where it connects) is not kept: the next call says it again.
+    livenessReady.catch(() => { livenessReady = undefined; });
+    return livenessReady;
+  };
   const journal = toJournal(runs);
+  // This worker's presence (PRESENCE above): announced while it polls, at most every ttlMs/3.
+  let announcedAt = -Infinity;
+  let announcing = false;
+  let stopped = false;
+  async function announce(): Promise<void> {
+    if (stopped || announcing || performance.now() - announcedAt < ttlMs / 3) return;
+    announcing = true;
+    try {
+      await setPresence(work, owner, { at: Date.now(), ttlMs });
+      announcedAt = performance.now();
+      // Stopped while this was written (a poll already under way when stop() ran): taken back.
+      if (stopped) await setPresence(work, owner, undefined);
+    } catch {
+      // Advisory: a failed announcement only risks a "no worker" warning, never a job.
+    } finally {
+      announcing = false;
+    }
+  }
   /** The clock eligibility is judged by: the journal's own (`now()`), else this process's. */
   const now = async (): Promise<number> => (journal.now ? journal.now() : Date.now());
   const retryDelay = (attempt: number, err: unknown): number => {
@@ -568,7 +765,19 @@ export function createWorker(
     return (await notBeforeOf(work, job)) > (await now()) ? 'waiting' : 'ready';
   }
 
-  async function runOnce(): Promise<boolean> {
+  // The jobs this worker holds — every `runOnce`, whoever called it. One set: `close()` waits for it.
+  // Each is a held unit of its own (`holdWhile`): what it runs — a handler — runs as part of it, so a
+  // close from inside a handler waits for every other one, not for itself (R2-7).
+  const held = new Set<Promise<boolean>>();
+  function runOnce(): Promise<boolean> {
+    const p = holdWhile(runOnceHeld);
+    held.add(p);
+    void p.finally(() => held.delete(p)).catch(() => {});
+    return p;
+  }
+  async function runOnceHeld(): Promise<boolean> {
+    const live = await liveness();
+    await announce();
     let cursor = await work.get<string>(QCURSOR);
     for (;;) {
       const page = await work.list<JobRecord>('qjob', { cursor });
@@ -579,6 +788,10 @@ export function createWorker(
         if (before === 'finished') continue;
         allTerminal = false; // a waiting job is not finished: the cursor must not pass it
         if (before === 'waiting') continue;
+        // GRACEFUL DRAIN (@gnldev/durable drainProcess): a process shutting down takes no new job — the
+        // same boundary rule as a run's next step. A scan under way when the drain began stops here; the
+        // job is left for a process that is not leaving.
+        if (isDraining()) return false;
         const runId = runIdOfJob(job); // `job:<id>`, or the run a retried dead letter continues
         // THE LEASE'S KEY — deliberately NOT the runId.
         //
@@ -602,6 +815,7 @@ export function createWorker(
         //
         // The WorkStore fencing chain below is unaffected: `qown:<jobId>` stores `lock.token`, and a
         // token is a token whichever key it was minted on.
+        const stampedBy = live?.id;
         const lock = await acquireRunLock(runs, `${runId}:lease`, owner, ttlMs);
         if (!lock) continue; // held by another worker / fresh lease
         // "Is it finished?" is answered AGAIN, now that this worker holds the lease. The check above
@@ -615,6 +829,13 @@ export function createWorker(
         if ((await mayStart(job)) !== 'ready') {
           await lock.release();
           continue;
+        }
+        // A process that cannot prove it still holds its own liveness (its session is gone — a partition)
+        // may already be judged dead elsewhere, its job taken: it starts nothing. Nor when the lease names
+        // an id it no longer holds (its session came back under a new one).
+        if (live && !live.processOnly && (live.id !== stampedBy || !(await live.confirm()))) {
+          await lock.release();
+          return false;
         }
         // The fleet-wide per-type limit: taken after the job's lease (so a slot is never held for a
         // job this worker lost), given back with it.
@@ -697,72 +918,114 @@ export function createWorker(
           if (!work.putIfMatch) return true;
           return work.putIfMatch(fencingKey, lock.token, lock.token);
         };
-        try {
-          // The attempt is counted when it STARTS: a process that dies while the handler runs (a crash,
-          // an OOM, a kill) has used an attempt too. Counted at the end, such a job never reached maxAttempts.
-          const started = await attemptsOf(work, job.id);
-          if (started.attempts >= maxAttempts) {
-            if (await stillOwns()) await work.put(`qfail:${job.id}`, { error: `the job did not finish in ${started.attempts} attempts (the process stopped while it ran)`, attempts: started.attempts });
-            return true;
-          }
-          if (!(await stillOwns())) return false;
-          await work.put(`qtry:${job.id}`, { attempts: started.attempts + 1, notBefore: started.notBefore });
-          const handler = handlers[job.payload.type];
-          if (!handler) {
-            if (await stillOwns()) await work.put(`qfail:${job.id}`, { error: `no handler: ${job.payload.type}` });
-            return true;
-          }
-          const rec = job.payload;
-          const orgId = rec.orgId;
-          const scoped = orgId !== undefined ? withOrgStorage(storage, orgId) : storage;
-          const caller = callerOfJob(rec);
-          // ADR-0002 5a: the job's run belongs to the job's recorded owner WITHOUT the handler passing
-          // it. Recorded here, before the handler runs (first write wins, so a retry or a resumed run
-          // keeps the owner it was born with). A handler that starts `runId` as anyone else — the old
-          // `runDurable({ runId: ctx.runId, … })` with the user forgotten — is now refused by the
-          // engine's own admission instead of producing a run nobody but staff can see.
-          await claimRunOwner(toJournal(scoped.runs), runId, caller);
-          const followUp = (o: EnqueueOptions = {}): EnqueueOptions => {
-            if (o.caller !== undefined) return o;
-            const base = ownerOptionsOf(rec);
-            if (o.resourceId !== undefined) delete base.caller;
-            else if (base.caller && o.orgId !== undefined) base.caller = staff(o.orgId);
-            return { ...base, ...o };
-          };
-          await handler(rec.payload, {
-            journal: scoped.runs, jobId: job.id, runId, storage: scoped, caller,
-            ...(orgId !== undefined ? { orgId } : {}),
-            run: (args) => runDurable({
-              ...args,
-              abortSignal: args.abortSignal ? AbortSignal.any([args.abortSignal, cancel.signal]) : cancel.signal,
-              journal: toJournal(scoped.runs), runId, caller,
-            }),
-            enqueue: (type, payload, o) => enqueue(work, type, payload, followUp(o)),
-            signal: cancel.signal,
-          });
-          if (await stillOwns()) await work.put(`qdone:${job.id}`, { at: Date.now(), ok: true });
-        } catch (err) {
-          if (await stillOwns()) {
-            const n = (await attemptsOf(work, job.id)).attempts; // this attempt was counted when it started
-            const delay = n < maxAttempts ? retryDelay(n, err) : 0;
-            await work.put(`qtry:${job.id}`, { attempts: n, notBefore: delay > 0 ? (await now()) + delay : 0 });
-            if (n >= maxAttempts) {
-              await work.put(`qfail:${job.id}`, { error: String((err as any)?.message ?? err), attempts: n });
+        // THE JOB IN HAND, from here to its lease's release (@gnldev/durable `holdWhile`): a drain waits for
+        // it whoever called runOnce, and `gnl pending` lists it — from this process, or from its shadow in
+        // another (audit C7). The unit IS this block: it ends when the block does, on every way out, and the
+        // handler runs as part of it — a handler that closes its worker or drains the process does not wait
+        // for itself (R2-7).
+        return await holdWhile(async (): Promise<boolean> => {
+          // The attempt record as it was before this attempt counted itself: what a release gives back.
+          let started: TryRecord | undefined;
+          try {
+            // The attempt is counted when it STARTS: a process that dies while the handler runs (a crash,
+            // an OOM, a kill) has used an attempt too. Counted at the end, such a job never reached maxAttempts.
+            started = await attemptsOf(work, job.id);
+            if (started.attempts >= maxAttempts) {
+              // Its last attempt started and never reported: its OUTCOME IS UNKNOWN, not failed — a worker
+              // judged gone because it was cut off from the store (a partition) can still be in the handler
+              // and finish it after this (measured, ADR-0008: 5 partitions in a row,
+              // the job dead-lettered while the handler then finished). No attempt starts again (the
+              // ceiling holds); the job reads `in-doubt` until a report settles it — that worker's own
+              // late `qdone` (below), or an operator's `retryJob`.
+              if (await stillOwns()) {
+                await putJobMarker(work, job.id, 'qfail', { error: `the job's last attempt did not report in ${started.attempts} attempts (its process stopped or was cut off while it ran) — its outcome is unknown`, attempts: started.attempts, inDoubt: true });
+                // Written first, read second (recordLateSuccess does the reverse): a handler that finished
+                // late is seen by one side or the other.
+                await settleFromLateReport(work, job.id);
+              }
+              return true;
             }
+            if (!(await stillOwns())) return false;
+            if (await settleFromLateReport(work, job.id, true)) return true;
+            if (!(await putJobMarker(work, job.id, 'qtry', { attempts: started.attempts + 1, notBefore: started.notBefore }))) return true;
+            const handler = handlers[job.payload.type];
+            if (!handler) {
+              if (await stillOwns()) await putJobMarker(work, job.id, 'qfail', { error: `no handler: ${job.payload.type}` });
+              return true;
+            }
+            const rec = job.payload;
+            const orgId = rec.orgId;
+            const scoped = orgId !== undefined ? withOrgStorage(storage, orgId) : storage;
+            const caller = callerOfJob(rec);
+            // ADR-0002 5a: the job's run belongs to the job's recorded owner WITHOUT the handler passing
+            // it. Recorded here, before the handler runs (first write wins, so a retry or a resumed run
+            // keeps the owner it was born with). A handler that starts `runId` as anyone else — the old
+            // `runDurable({ runId: ctx.runId, … })` with the user forgotten — is now refused by the
+            // engine's own admission instead of producing a run nobody but staff can see.
+            await claimRunOwner(toJournal(scoped.runs), runId, caller);
+            const followUp = (o: EnqueueOptions = {}): EnqueueOptions => {
+              if (o.caller !== undefined) return o;
+              const base = ownerOptionsOf(rec);
+              if (o.resourceId !== undefined) delete base.caller;
+              else if (base.caller && o.orgId !== undefined) base.caller = staff(o.orgId);
+              return { ...base, ...o };
+            };
+            await handler(rec.payload, {
+              journal: scoped.runs, jobId: job.id, runId, storage: scoped, caller,
+              ...(orgId !== undefined ? { orgId } : {}),
+              run: (args) => runDurable({
+                ...args,
+                abortSignal: args.abortSignal ? AbortSignal.any([args.abortSignal, cancel.signal]) : cancel.signal,
+                journal: toJournal(scoped.runs), runId, caller,
+              }),
+              enqueue: (type, payload, o) => enqueue(work, type, payload, followUp(o)),
+              signal: cancel.signal,
+            });
+            // The handler returned: it ran. Whether this worker still holds the job decides only where that
+            // goes — a worker cut off from the store cannot even ask (its session was terminated), and that
+            // is not the handler failing.
+            const owns = await stillOwns().catch(() => false);
+            if (owns) { if (!(await settleFromLateReport(work, job.id, true))) await putJobMarker(work, job.id, 'qdone', { at: Date.now(), ok: true }); }
+            else await recordLateSuccess(work, job.id);
+          } catch (err) {
+            // NOT AN ATTEMPT (@gnldev/durable `attemptEndOf`, the one answer the scheduler gives too): this
+            // process released the job — it drains, or cannot judge other processes right now — or the job's
+            // run is executing elsewhere. The attempt counted at its start is given back and nothing else is
+            // written; the lease goes below and the job stays due for another process (or this one, later).
+            // Not reported to onError: the job did not fail.
+            if (attemptEndOf(err, runId) !== 'attempt') {
+              if (started && (await stillOwns().catch(() => false))) await putJobMarker(work, job.id, 'qtry', started).catch(() => undefined);
+              return false;
+            }
+            // Ended while it ran — cancelled (cancelJob: "else `cancelled`"), or settled by a late report:
+            // not a failed attempt. A handler that stopped on ctx.signal used to dead-letter the job as
+            // `failed` on its last attempt (audit C9).
+            if (await isTerminal(work, job.id).catch(() => false)) return true;
+            if (await stillOwns() && !(await settleFromLateReport(work, job.id, true))) {
+              const n = (await attemptsOf(work, job.id)).attempts; // this attempt was counted when it started
+              const delay = n < maxAttempts ? retryDelay(n, err) : 0;
+              await putJobMarker(work, job.id, 'qtry', { attempts: n, notBefore: delay > 0 ? (await now()) + delay : 0 });
+              if (n >= maxAttempts) {
+                await putJobMarker(work, job.id, 'qfail', { error: String((err as any)?.message ?? err), attempts: n });
+              }
+            }
+            opts.onError?.(err, job.id);
+            // swallowed: the worker loop continues; the job (unless qfail) retries on the next turn → crash-resume.
+          } finally {
+            if (heartbeat) clearInterval(heartbeat);
+            await slot.release();
+            // While lockLost=true (a real takeover), release() is naturally a no-op because this
+            // worker's token no longer matches the current record (see run-lock.ts mkLock.release) —
+            // it never overwrites the lock of the worker that took over. On a transient renew error
+            // (lockLost stays false) the token is STILL OURS, so release() here deliberately, genuinely
+            // frees the lock (the job was already written as terminal).
+            await lock.release();
           }
-          opts.onError?.(err, job.id);
-          // swallowed: the worker loop continues; the job (unless qfail) retries on the next turn → crash-resume.
-        } finally {
-          if (heartbeat) clearInterval(heartbeat);
-          await slot.release();
-          // While lockLost=true (a real takeover), release() is naturally a no-op because this
-          // worker's token no longer matches the current record (see run-lock.ts mkLock.release) —
-          // it never overwrites the lock of the worker that took over. On a transient renew error
-          // (lockLost stays false) the token is STILL OURS, so release() here deliberately, genuinely
-          // frees the lock (the job was already written as terminal).
-          await lock.release();
-        }
-        return true; // one job was processed (success or retry)
+          return true; // one job was processed (success or retry)
+        }, {
+          journal: toJournal((job.payload.orgId !== undefined ? withOrgStorage(storage, job.payload.orgId) : storage).runs),
+          name: runId, what: `job '${job.payload.type}' is running`,
+        });
       }
       if (allTerminal) {
         if (!page.nextCursor) return false; // end of log, all terminal — nothing to process
@@ -799,11 +1062,79 @@ export function createWorker(
   // slowest job, and the other slots sit idle behind it.
   const loops = Array.from({ length: concurrency }, () => createPollLoop(runOnce, { pollMs, backoff: backoffOn, maxPollMs }));
 
+  let presenceTimer: ReturnType<typeof setInterval> | undefined;
   return {
     runOnce,
     drain,
-    start: () => { for (const l of loops) l.start(); },
-    stop: () => { for (const l of loops) l.stop(); },
+    start: () => {
+      stopped = false;
+      for (const l of loops) l.start();
+      if (presenceTimer) return;
+      // Announced on its own clock too: a backed-off poll loop may tick less often than ttlMs/3.
+      void announce();
+      presenceTimer = setInterval(() => { void announce(); }, Math.max(1, Math.floor(ttlMs / 3)));
+      (presenceTimer as { unref?: () => void }).unref?.();
+    },
+    stop: () => {
+      stopped = true;
+      for (const l of loops) l.stop();
+      if (presenceTimer) clearInterval(presenceTimer);
+      presenceTimer = undefined;
+      announcedAt = -Infinity;
+      void setPresence(work, owner, undefined).catch(() => {});
+    },
+    close: async () => {
+      stopped = true;
+      for (const l of loops) l.stop();
+      if (presenceTimer) clearInterval(presenceTimer);
+      presenceTimer = undefined;
+      // Every job this worker holds except the one the caller runs inside: a job closing its own worker
+      // would otherwise wait for itself, and neither would ever settle (R2-7).
+      await settledExceptOwn(() => held);
+      announcedAt = -Infinity;
+      await setPresence(work, owner, undefined).catch(() => {});
+    },
+  };
+}
+
+// ─── A queue: enqueue, and the worker that runs it here ─────────────────────────────────────────
+
+export interface QueueOptions extends QueueWorkerOptions {
+  /**
+   * Run the jobs in this process (default `true`): a worker over `handlers` starts with the queue. `false`
+   * for an application whose workers run elsewhere (`createWorker(storage, handlers).start()`); its jobs
+   * wait for them, and a job still waiting with no live worker on the store is reported.
+   */
+  worker?: boolean;
+}
+
+export interface Queue {
+  /** `enqueue(storage.work, type, payload, options)`. */
+  enqueue(type: string, payload: unknown, options?: EnqueueOptions): Promise<string>;
+  /** The worker running here; absent with `worker: false`. */
+  readonly worker?: Worker;
+  /** Stops the worker running here (the job it holds finishes; nothing new is taken). */
+  close(): Promise<void>;
+}
+
+/**
+ * The queue of an application: where it enqueues, and — unless `worker: false` — the worker that runs
+ * the jobs, started in this process. One call instead of two that had to be remembered together: an
+ * application that enqueued and started no worker anywhere had its jobs wait forever without a word.
+ */
+export function createQueue(storageArg: Storage, handlers: Record<string, JobHandler>, opts: QueueOptions = {}): Queue {
+  refuseUnknownNames('createQueue', opts, CREATE_QUEUE_OPTS_NAMES);
+  const { worker: runHere = true, ...rest } = opts;
+  const workerOpts: QueueWorkerOptions = { ...rest, owner: rest.owner ?? `w-${Math.random().toString(36).slice(2, 8)}` };
+  const storage = storageOf(storageArg, 'createQueue');
+  requireCapability(storage, 'work');
+  const work = storage.work!;
+  const worker = runHere ? createWorker(storage, handlers, workerOpts) : undefined;
+  worker?.start();
+  return {
+    enqueue: (type, payload, options) => enqueue(work, type, payload, options),
+    ...(worker ? { worker } : {}),
+    close: async () => { await worker?.close(); },
   };
 }
 
@@ -847,10 +1178,11 @@ export async function moveJob(workArg: WorkStore, fromId: string, to: Omit<Enque
   return toId;
 }
 
-/** What `eraseSubject` (in `@gnldev/durable`) calls to erase one person's share of a package. */
+/** What `eraseSubject` and `purgeOrganization` (in `@gnldev/durable`) call to erase a person's, or a whole organization's, share of a package. */
 export interface SubjectEraser {
   name: string;
   erase(owner: { resourceId: string; orgId?: string }): Promise<number>;
+  eraseOrganization?(orgId: string): Promise<number>;
 }
 
 /**
@@ -862,31 +1194,40 @@ export interface SubjectEraser {
  * reporting a partial erasure as done, when a store cannot delete: the work store needs
  * `deleteIdPrefix` and `deletePrefix`, the run journal `deletePrefix`.
  *
- * Pass it to `eraseSubject({ …, erasers: [jobEraser(storage)] }, id)`, or call `.erase(owner)`.
+ * Pass it to `eraseSubject({ …, erasers: [jobEraser(storage)] }, id)`, or call `.erase(owner)`. Handed an
+ * organization (`{ orgId }`, by `purgeOrganization`), it erases every job owned under it, its members' too.
  */
 export function jobEraser(storageArg: Storage): SubjectEraser {
   const storage = storageOf(storageArg, 'jobEraser');
+  // One body for a person and an organization: what differs is the owner's prefix (`ownedPrefix`).
+  const eraseOwned = async (owner: { resourceId?: string; orgId?: string }): Promise<number> => {
+    requireCapability(storage, 'work');
+    const work = storage.work!;
+    assertRootWorkForErasure(work, '@gnldev/queue: jobEraser');
+    if (typeof work.deleteIdPrefix !== 'function' || typeof work.deletePrefix !== 'function') {
+      throw new Error("@gnldev/queue: this work store cannot delete by id prefix (`deleteIdPrefix`) and key prefix (`deletePrefix`), so this person's jobs cannot be erased through it");
+    }
+    const root = toJournal(storage.runs);
+    const scoped = owner.orgId !== undefined ? toJournal(withOrgStorage(storage, owner.orgId).runs) : root;
+    if (typeof root.deletePrefix !== 'function' || typeof scoped.deletePrefix !== 'function') {
+      throw new Error("@gnldev/queue: the run journal cannot deletePrefix, so this person's job runs and locks cannot be erased");
+    }
+    const prefix = ownedPrefix(owner);
+    let n = await work.deleteIdPrefix(prefix);
+    // The fence FIRST (`qown`, then the attempt record that stands in for it — `putJobMarker`): a worker
+    // reads it after every write of a job's state, so a write lands either before this erasure reaches
+    // it or before that worker's read sees the fence gone, and the worker takes it back.
+    for (const m of ['qown', 'qtry', ...STATE_MARKERS.filter((x) => x !== 'qtry')]) n += await work.deletePrefix(`${m}:${prefix}`);
+    // The lease lock lives in the ROOT journal (`job:<id>:lease:lock`); the run in the job's organization.
+    n += await root.deletePrefix(`job:${prefix}`);
+    if (owner.orgId !== undefined) n += await scoped.deletePrefix(`job:${prefix}`);
+    // The shadows of the processes holding these jobs (@gnldev/durable `holdWhile`): they name the jobs' runs.
+    n += await root.deletePrefix(handNamePrefix(owner.orgId, `job:${prefix}`));
+    return n;
+  };
   return {
     name: 'jobs',
-    async erase(owner) {
-      requireCapability(storage, 'work');
-      const work = storage.work!;
-      assertRootWorkForErasure(work, '@gnldev/queue: jobEraser');
-      if (typeof work.deleteIdPrefix !== 'function' || typeof work.deletePrefix !== 'function') {
-        throw new Error("@gnldev/queue: this work store cannot delete by id prefix (`deleteIdPrefix`) and key prefix (`deletePrefix`), so this person's jobs cannot be erased through it");
-      }
-      const root = toJournal(storage.runs);
-      const scoped = owner.orgId !== undefined ? toJournal(withOrgStorage(storage, owner.orgId).runs) : root;
-      if (typeof root.deletePrefix !== 'function' || typeof scoped.deletePrefix !== 'function') {
-        throw new Error("@gnldev/queue: the run journal cannot deletePrefix, so this person's job runs and locks cannot be erased");
-      }
-      const prefix = ownedPrefix(owner);
-      let n = await work.deleteIdPrefix(prefix);
-      for (const m of [...STATE_MARKERS, 'qown']) n += await work.deletePrefix(`${m}:${prefix}`);
-      // The lease lock lives in the ROOT journal (`job:<id>:lease:lock`); the run in the job's organization.
-      n += await root.deletePrefix(`job:${prefix}`);
-      if (owner.orgId !== undefined) n += await scoped.deletePrefix(`job:${prefix}`);
-      return n;
-    },
+    erase: (owner) => eraseOwned(owner),
+    eraseOrganization: (orgId) => eraseOwned({ orgId }),
   };
 }

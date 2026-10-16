@@ -2,7 +2,7 @@
 // R22: `maxDepth` is counted per organization at O(min(depth, maxDepth)) pages — not by reading every
 // other organization's backlog (measured before: 40 pages read for an organization with 0 jobs).
 import { describe, it, expect } from 'vitest';
-import { InMemoryStorage, purgeOrganizationWork, user } from '@gnldev/durable';
+import { InMemoryStorage, purgeOrganization, user } from '@gnldev/durable';
 import { enqueue, createWorker, listJobs, moveJob, QueueDepthExceededError } from '../src/index.js';
 
 describe('moving a pre-upgrade job to its owner', () => {
@@ -76,9 +76,10 @@ describe('maxDepth reads only the caller\'s own organization', () => {
   });
 
   it('the depth index goes with the organization when it is purged', async () => {
-    const work = new InMemoryStorage().work!;
+    const storage = new InMemoryStorage();
+    const work = storage.work!;
     for (let i = 0; i < 3; i++) await enqueue(work, 'r', i, { orgId: 'acme' });
-    await purgeOrganizationWork(work, 'acme');
+    await purgeOrganization(storage, 'acme');
     await expect(enqueue(work, 'r', 0, { orgId: 'acme', maxDepth: 3 })).resolves.toBeTruthy();
   });
 });

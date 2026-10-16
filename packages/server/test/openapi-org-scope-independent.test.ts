@@ -20,7 +20,6 @@ const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const model: any = {
   specificationVersion: 'v2', provider: 'mock', modelId: 'm', supportedUrls: {},
   doGenerate: async () => ({ content: [{ type: 'text', text: 'ok' }], finishReason: 'stop', usage, warnings: [] }),
-  doStream: async () => { throw new Error('no stream'); },
 };
 
 /** Two org-owned agents and one global one, plus a workflow. */

@@ -288,11 +288,11 @@ stored every turn in the shared root, so those older turns are not in any organi
   `body.runId` and `resolveRunId` still win, and both stay raw — they name an *id*, and a host
   holding one has already decided the addressing. The `Idempotency-Key` header is read AFTER them (a
   gateway-stamped header must not silently override an application decision).
-- **A per-run lock is ON by default** (`lock: { ttlMs: 300_000 }`): two concurrent requests with the
-  same runId (double-click, two tabs, a retry racing the original) no longer both execute — the
-  loser gets a typed `409 { code: 'run_busy', resumable: true }` + `Retry-After`, and retrying the
-  same runId lands on the journal replay. `lock: false` restores the old behavior. Scope note: this
-  serializes CONCURRENT duplicates; serial retries were already deduped by the runId derivation.
+- **One execution per run.** Two concurrent requests with the same runId (double-click, two tabs, a
+  retry racing the original) follow the same execution: one effect, both responses carry the answer.
+  The run executes apart from the request, so a closed tab does not stop it; a reconnect with the same
+  turn reads the run again. (The `lock` option of 0.10 is gone: the process's executor keeps a run to
+  one execution, and a frozen process keeps its run while a dead one releases it at once.)
 - **`X-Gnl-Idempotency-Status` on success responses**: `new` on a fresh run, `replay` when this
   runId had prior journaled input (a retry/resume landing on journal state) — an observability
   contract for client-side reconciliation, not a byte-identity guarantee.

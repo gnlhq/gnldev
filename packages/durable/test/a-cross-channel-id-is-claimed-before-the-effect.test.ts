@@ -19,6 +19,7 @@ import { InMemoryStorage, type Storage, purgeResource, withOrg, xidKey } from '.
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { createGnl } from '../src/registry.js';
+import { inMemoryLiveness } from '../src/process-liveness.js';
 import type { DurableCtx, Journal } from '../src/journal.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
@@ -262,11 +263,13 @@ describe.each(STORES)('a cross-channel id is claimed before the effect — %s', 
     const ch1 = `ch1-${unique()}`;
     const died = gate();
     const dying = diesAt(storage.runs, isCompletedXid, died.open);
-    void createGnl({ journal: dying as any, preset: 'headless', agents: { p: { model: model('a1'), tools: { pay: tool } } } })
+    // A death simulated INSIDE this process: a store's process liveness would (rightly) call it alive, so
+    // both registries run with this process's own in-memory identity, as a single process does.
+    void createGnl({ journal: dying as any, liveness: inMemoryLiveness(), preset: 'headless', agents: { p: { model: model('a1'), tools: { pay: tool } } } })
       .run('p', { runId: ch1, prompt: 'pay', threadId: `thread-A-${ch1}`, resourceId: USER, channel: 'chat' });
     await died.p;
     expect(paid).toBe(1);
-    const second = await createGnl({ journal: storage.runs as any, preset: 'headless', agents: { p: { model: model('b1'), tools: { pay: tool } } } })
+    const second = await createGnl({ journal: storage.runs as any, liveness: inMemoryLiveness(), preset: 'headless', agents: { p: { model: model('b1'), tools: { pay: tool } } } })
       .run('p', { runId: `bt1-${unique()}`, prompt: 'pay', threadId: `thread-B-${ch1}`, resourceId: USER, channel: 'batch' })
       .then(() => 'finished', (e) => `refused: ${String(e?.message)}`);
     expect(paid).toBe(1);

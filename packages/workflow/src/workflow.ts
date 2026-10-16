@@ -23,6 +23,15 @@ export interface JournalLike {
   /** Optional: read counter fields written via incrBy (undefined if absent). */
   getCounters?(key: string): Promise<Record<string, number> | undefined>;
   /**
+   * Optional: the run's ENTRY, on a journal that keeps run owners (every @gnldev/durable journal has it).
+   * Called before a run's first write: the owner is recorded for `ctx.identity` (or, with `from`, the
+   * source run's), an id the store may not begin under is refused, and a run the identity may not act
+   * on is refused — with nothing written. What it returns is the run's lease (`WorkflowRunLease`): the
+   * engine asks it at every step boundary whether the run still exists, and once more after the
+   * attempt's last write. A journal without it keeps no owners, as before.
+   */
+  beginRun?(runId: string, ctx?: { identity?: WorkflowRunIdentity; from?: string }): Promise<WorkflowRunLease | void>;
+  /**
    * P0.4 (optional): keys starting with a prefix — structurally compatible with @gnldev/durable
    * Journal.listKeys. Only `listWorkflowRuns` (the suspended-run registry query) needs it; every
    * engine path works without it.
@@ -99,6 +108,51 @@ export interface StepCtx {
 }
 
 // ── P0.4 key builders (single source of truth for the new key shapes) ──────────
+/**
+ * What a journal that keeps owners hands back at a run's entry (structurally @gnldev/durable's
+ * `RunLease`). A run can be deleted while a step of it is running — a person's erasure does not wait
+ * for a step that holds no claim — and the step's output, written after the deletion, would bring back
+ * what was deleted. So the engine asks `live()` before every step and `settle()` after the attempt's
+ * last write: a run deleted meanwhile has what it wrote taken back, and the call throws instead of
+ * returning.
+ */
+export interface WorkflowRunLease {
+  live(): Promise<void>;
+  settle(): Promise<void>;
+}
+
+/** The run's entry, on a journal that keeps owners (`JournalLike.beginRun`) — before its first write. */
+async function beginRunOn(journal: JournalLike, runId: string, ctx: { identity?: WorkflowRunIdentity; from?: string }): Promise<WorkflowRunLease | undefined> {
+  if (typeof journal.beginRun !== 'function') return undefined;
+  return (await journal.beginRun(runId, ctx)) ?? undefined;
+}
+
+/** An attempt under its lease: settled after its last write, whichever way it ends — a deletion meanwhile wins over the outcome. */
+async function underLease<T>(lease: WorkflowRunLease | undefined, attempt: () => Promise<T>): Promise<T> {
+  if (!lease) return attempt();
+  let out: T;
+  try {
+    out = await attempt();
+  } catch (e) {
+    await lease.settle();
+    throw e;
+  }
+  await lease.settle();
+  return out;
+}
+
+/**
+ * Thrown by an operation that continues a workflow run (`cancelWorkflowRun`) on a run that does not
+ * exist: nothing is written. Same name as @gnldev/durable's, so a door answers both alike.
+ */
+export class RunNotFoundError extends Error {
+  readonly code = 'run_not_found' as const;
+  constructor(readonly runId: string) {
+    super(`@gnldev/workflow: run '${runId.slice(0, 80)}' does not exist — this operation continues a run and does not begin one.`);
+    this.name = 'RunNotFoundError';
+  }
+}
+
 /** A run started without an identity is `unknown` — never staff by omission. */
 function withIdentity(entry: WorkflowEntryCtx): StepCtx {
   return entry.identity ? (entry as StepCtx) : { ...entry, identity: { kind: 'unknown', runId: entry.runId } };
@@ -844,10 +898,16 @@ export class Workflow<I = any, O = any> {
   /** Run the workflow durably. Calling again with the same runId = resume (completed steps don't re-run).
    * Note: if it contains a suspending step (sleep/waitFor), use `runResumable` (run() throws the suspend). */
   async run(input: I, entry: WorkflowEntryCtx): Promise<O> {
+    const lease = await beginRunOn(entry.journal, entry.runId, entry);
     const ctx = withIdentity(entry);
-    let cur: any = input;
-    for (const s of this.steps) cur = await runStep(s, cur, ctx);
-    return cur as O;
+    return underLease(lease, async () => {
+      let cur: any = input;
+      for (const s of this.steps) {
+        await lease?.live();
+        cur = await runStep(s, cur, ctx);
+      }
+      return cur as O;
+    });
   }
 
   /**
@@ -896,7 +956,17 @@ export class Workflow<I = any, O = any> {
     } = {},
   ): Promise<WorkflowResult<O>> {
     refuseUnknownNames('runResumable', opts, RUN_RESUMABLE_NAMES);
-    const ctx = withIdentity(entry);
+    const lease = await beginRunOn(entry.journal, entry.runId, entry);
+    return underLease(lease, () => this.attempt(input, withIdentity(entry), opts, lease));
+  }
+
+  /** One attempt of `runResumable`, after its entry. */
+  private async attempt(
+    input: I,
+    ctx: StepCtx,
+    opts: { maxSteps?: number; resume?: Record<string, unknown>; signal?: AbortSignal; workflowName?: string },
+    lease: WorkflowRunLease | undefined,
+  ): Promise<WorkflowResult<O>> {
     const limit = opts.maxSteps ?? Infinity;
     const journal = ctx.journal;
     // Deliver typed resume payloads FIRST (plain put — before consumption an operator may overwrite a
@@ -915,6 +985,8 @@ export class Workflow<I = any, O = any> {
       // P0.4 cancel — checked at EVERY step boundary: the durable flag (cross-process; one cheap point
       // read per step) and the in-process signal. Order matters: the flag wins even if the signal is
       // quiet (another worker/operator canceled), and an in-process abort is made durable immediately.
+      // A deleted run is checked first: it is not canceled, it is gone — nothing of it is written again.
+      await lease?.live();
       const flag = await journal.get<{ reason?: unknown }>(canceledKey(ctx.runId));
       if (flag !== undefined || opts.signal?.aborted) {
         if (flag === undefined) await journal.put(canceledKey(ctx.runId), { at: Date.now(), reason: 'signal' });
@@ -1121,6 +1193,20 @@ export async function forkWorkflowRun(
     }
   }
 
+  // The fork is born before a row is copied — its owner the source's (`JournalLike.beginRun`).
+  const lease = await beginRunOn(journal, dstRunId, { from: srcRunId });
+  return underLease(lease, () => copyForkedSteps(journal, order, at, srcRunId, fromStepId, dstRunId));
+}
+
+/** `forkWorkflowRun`'s copy, after the fork's birth. */
+async function copyForkedSteps(
+  journal: JournalLike,
+  order: string[],
+  at: number,
+  srcRunId: string,
+  fromStepId: string,
+  dstRunId: string,
+): Promise<{ dstRunId: string; copiedSteps: string[] }> {
   const kept = order.slice(0, at);
   // Which keys travel is decided by `forkedStepKeys`, the one rule every fork path uses (Studio's
   // fork door keeps a pinned copy, held to this one by a parity test). Without `listKeys` the only
@@ -1208,6 +1294,9 @@ export async function cancelWorkflowRun(
 ): Promise<boolean> {
   refuseUnknownNames('cancelWorkflowRun', opts, CANCEL_WORKFLOW_RUN_OPTS_NAMES);
   const st = await journal.get<WorkflowRunStatus>(statusKey(runId));
+  // A cancel continues a run; it does not begin one. A run with no registry record and no step record
+  // does not exist: refused, nothing written — its flag would have made the id read as a run.
+  if (st === undefined && !(await hasStepRecords(journal, runId))) throw new RunNotFoundError(runId);
   if (st?.status === 'completed') return false;
   await journal.put(canceledKey(runId), { at: Date.now(), ...(opts.reason !== undefined ? { reason: opts.reason } : {}) });
   await journal.put(statusKey(runId), {
@@ -1221,6 +1310,12 @@ export async function cancelWorkflowRun(
     updatedAt: Date.now(),
   } satisfies WorkflowRunStatus);
   return true;
+}
+
+/** Whether anything of the run's own is journaled under `<runId>:wf:`. A store that cannot list cannot tell: assumed. */
+async function hasStepRecords(journal: JournalLike, runId: string): Promise<boolean> {
+  if (typeof journal.listKeys !== 'function') return true;
+  return (await journal.listKeys(`${runId}:wf:`)).length > 0;
 }
 
 /** Reads one run's registry record (undefined: the run never wrote one — pre-P0.4, or still mid-flight without a suspend). */

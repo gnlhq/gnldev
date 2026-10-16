@@ -8,13 +8,13 @@
 // A door, like @gnldev/agui and @gnldev/chat-adapter (ADR-0002 point 0): it depends on @gnldev/durable
 // and @gnldev/auth only, never on @gnldev/server. Nothing below decides identity or ownership on its own:
 //   who        → @gnldev/auth `doorGate` (identify → engineCallerOf, authorize, the open-surface rule)
-//   whose run  → @gnldev/durable `runOwnerOf` + `decideRunAccess`, the one rule every door asks
+//   whose run  → @gnldev/durable `runOwnerOf` + `decideDoorRunAccess`, the one rule every door asks
 //   which run  → @gnldev/durable `resolveWorkIdentity`: a task id IS a run id
 //   approval   → a suspended run is an `input-required` task; the reply carries `approvals`
 //   cancel     → @gnldev/durable `cancelAgentRun` (durable, terminal) + this process's in-flight abort
 import {
-  createGnl, scopeConfigToOrg, resolveWorkIdentity, sealRequestContext, sealFieldsOf, runOwnerOf, decideRunAccess,
-  cancelAgentRun, readRunOutcome, summarizeRun, surfacedInterrupts, callerConflictAnswer, agentVisibleToOrg, readJsonObject, assertRunTarget,
+  createGnl, scopeConfigToOrg, resolveWorkIdentity, sealRequestContext, sealFieldsOf, runOwnerOf, decideDoorRunAccess,
+  cancelAgentRun, readRunOutcome, summarizeRun, settleModelContent, surfacedInterrupts, callerConflictAnswer, agentVisibleToOrg, readJsonObject, assertRunTarget,
 } from '@gnldev/durable';
 import type { CreateGnlConfig, Journal, JournalReader, RawJournal, Caller, Interrupt, RunOwner } from '@gnldev/durable';
 import { doorGate, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify, refuseMisplacedOptions, doorOptionKeys } from '@gnldev/auth';
@@ -175,13 +175,14 @@ export function createA2AServer(config: CreateGnlConfig, opts: A2AServerOptions 
     const record = owner.record as { threadId?: string } | undefined;
     const contextId = record?.threadId ?? runId;
     const models = entries.filter((e) => e.kind === 'model');
-    const last = models[models.length - 1]?.value as { content?: unknown } | undefined;
+    const last = models[models.length - 1]?.value;
     // A suspended tool record keeps the sentinel; `surfacedInterrupts` is the engine's one reading of it.
     const interrupts: Interrupt[] = entries
       .filter((e) => e.kind !== 'model' && (e.value as { status?: string } | undefined)?.status === 'suspended')
       .flatMap((e) => surfacedInterrupts((e.value as { output?: { __gnl_suspend?: unknown } }).output?.__gnl_suspend));
     const state: A2ATaskState = status === 'suspended' ? 'input-required' : status === 'running' ? 'working' : status;
-    return toTask(runId, contextId, state, textOf(last?.content), interrupts);
+    // Either path's step record (a streamed one keeps parts): the engine's one reading of it.
+    return toTask(runId, contextId, state, textOf(settleModelContent(last)), interrupts);
   };
 
   const toTask = (runId: string, contextId: string, state: A2ATaskState, text: string, interrupts: Interrupt[]): A2ATask => {
@@ -206,7 +207,7 @@ export function createA2AServer(config: CreateGnlConfig, opts: A2AServerOptions 
    */
   const ownedTask = async (req: Request, journal: Journal, runId: string, caller: Caller, agent: string): Promise<(RunOwner & { state: 'owned' }) | undefined> => {
     const owner = await runOwnerOf(journal as RawJournal, runId);
-    const decision = decideRunAccess(owner, caller);
+    const decision = decideDoorRunAccess(owner, caller, runId);
     if (decision === 'deny') markRefusal(req, 'ownership', { detail: 'run belongs to another caller' });
     if (decision !== 'allow' || owner.state !== 'owned') return undefined;
     try {
@@ -349,7 +350,9 @@ export function createA2AServer(config: CreateGnlConfig, opts: A2AServerOptions 
         ...(approvals ? { approvals } : {}),
         context: sealRequestContext({}, sealFieldsOf(runAs, org)),
         caller: runAs,
-        abortSignal: AbortSignal.any([req.signal, ctrl.signal]),
+        // Only an explicit tasks/cancel (ctrl) stops the run: it executes apart from this request
+        // (@gnldev/durable), so a dropped connection leaves it running and a re-send reads its answer.
+        abortSignal: ctrl.signal,
       } as never) as { text: string; interrupts?: Interrupt[] };
       const interrupts = r.interrupts ?? [];
       return rpcResult(id, toTask(runId, threadId ?? runId, interrupts.length ? 'input-required' : 'completed', r.text ?? '', interrupts));

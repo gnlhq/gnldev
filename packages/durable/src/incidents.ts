@@ -12,6 +12,7 @@
 //    model/tool/input) and purged with the run (`${runId}:` prefix delete) — same as procreport.
 // ADVISORY telemetry, never load-bearing: a failed incident write must NEVER break the run
 //    (recordIncident swallows errors); exactly-once semantics live in the tool records, not here.
+import { runRecordKey, runRecordPrefix } from './run-id-grammar.js';
 import type { Journal } from './journal.js';
 
 /** A guard decision worth an operator's attention — what fired, on which call, and why (verbatim). */
@@ -34,7 +35,7 @@ export interface RunIncident {
 }
 
 const incidentKey = (runId: string, i: Pick<RunIncident, 'toolCallId' | 'source' | 'action'>): string =>
-  `${runId}:incident:${i.toolCallId}:${i.source}:${i.action}`;
+  runRecordKey(runId, 'incident', `${i.toolCallId}:${i.source}:${i.action}`);
 
 /** Journals one incident (idempotent by key — see the design note). Never throws. */
 export async function recordIncident(journal: Journal, runId: string, incident: RunIncident): Promise<void> {
@@ -58,7 +59,7 @@ export async function recordIncident(journal: Journal, runId: string, incident: 
  *  fallback as readProcessorReports/audit). */
 export async function readIncidents(journal: Journal, runId: string): Promise<RunIncident[]> {
   if (typeof journal.listKeys !== 'function') return [];
-  const keys = await journal.listKeys(`${runId}:incident:`);
+  const keys = await journal.listKeys(runRecordPrefix(runId, 'incident'));
   const out: RunIncident[] = [];
   for (const key of keys) {
     const hit = await journal.get<{ v: RunIncident }>(key);

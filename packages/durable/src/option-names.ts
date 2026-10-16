@@ -19,7 +19,7 @@ import type { SuggestionsConfig } from './suggestions.js';
 
 export const CREATE_GNL_NAMES = optionNames<CreateGnlConfig>()([
   'storage', 'journal', 'agents', 'tools', 'memory', 'memoryFactory', 'processors', 'workflows', 'networks',
-  'checkSuiteConsistency', 'schemaCompat', 'preset', 'suggestions', 'replayDisclosure',
+  'checkSuiteConsistency', 'schemaCompat', 'preset', 'suggestions', 'replayDisclosure', 'liveness', 'detached',
 ]);
 export const AGENT_NAMES = optionNames<AgentConfig>()([
   'description', 'model', 'tools', 'system', 'guard', 'maxSteps', 'processors', 'agents', 'workflows', 'scorers',
@@ -34,12 +34,12 @@ export const NETWORK_NAMES = optionNames<NetworkConfig>()(['router', 'agents', '
 
 export const RUN_NAMES = optionNames<RunOptions>()([
   'runId', 'workKey', 'prompt', 'messages', 'threadId', 'resourceId', 'caller', 'approvals', 'context', 'model',
-  'temperature', 'topP', 'system', 'tools', 'limits', 'lock', 'toolPolicy', 'strictInput', 'trustRecordedInput',
+  'temperature', 'topP', 'system', 'tools', 'limits', 'toolPolicy', 'strictInput', 'trustRecordedInput',
   'conflictLedger', 'auditOnReject', 'replayDisclosure', 'channel', 'tombstonePolicy', 'actor', 'replay', 'timeouts',
-  'exclusiveModelStep', 'onBlocked', 'abortSignal',
+  'exclusiveModelStep', 'onBlocked', 'abortSignal', 'after',
 ]);
 const TIMEOUT_NAMES = optionNames<NonNullable<RunOptions['timeouts']>>()(['modelStepMs', 'toolMs', 'claimTtlMs']);
-const LOCK_NAMES = optionNames<NonNullable<RunOptions['lock']>>()(['owner', 'ttlMs', 'maxHoldMs']);
+const LOCK_NAMES = ['owner', 'ttlMs', 'maxHoldMs'] as const;
 export const WORKFLOW_RUN_NAMES = optionNames<WorkflowRunOpts>()([
   'runId', 'workKey', 'workScope', 'maxSteps', 'resume', 'signal', 'resourceId', 'caller', 'parent', 'actor', 'threadId', 'context',
 ]);
@@ -139,7 +139,6 @@ export function refuseSuggestionsNames(s: SuggestionsConfig): void {
 export function refuseRunNames(where: string, opts: RunOptions): void {
   refuseUnknownNames(where, opts, RUN_NAMES);
   refuseUnknownNames(`${where}: timeouts`, opts.timeouts, TIMEOUT_NAMES);
-  refuseUnknownNames(`${where}: lock`, opts.lock, LOCK_NAMES);
   refuseUnknownNames(`${where}: exclusiveModelStep`, opts.exclusiveModelStep, EXCLUSIVE_STEP_NAMES);
   refuseRunLimitNames(`${where}: limits`, opts.limits);
 }
@@ -191,6 +190,7 @@ export const COMPENSATE_RUN_NAMES = optionNames<NonNullable<Parameters<typeof im
 export const AGENT_TOOL_NAMES = optionNames<NonNullable<Parameters<typeof import('./agent-tool.js').createAgentTool>[0]>>()(['journal', 'model', 'tools', 'system', 'guard', 'maxSteps', 'limits', 'actor', 'channel', 'toolPolicy', 'approvals', 'parentRunId']);
 export const PURGE_RUN_NAMES = optionNames<NonNullable<Parameters<typeof import('./retention.js').purgeRun>[3]>>()(['ownershipTrace']);
 export const PURGE_THREAD_NAMES = optionNames<NonNullable<Parameters<typeof import('./retention.js').purgeThread>[2]>>()(['memory', 'vectors', 'allowInFlight']);
+export const PURGE_ORGANIZATION_NAMES = optionNames<NonNullable<Parameters<typeof import('./retention.js').purgeOrganization>[2]>>()(['erasers', 'memory', 'now']);
 export const PURGE_RESOURCE_NAMES = optionNames<NonNullable<Parameters<typeof import('./retention.js').purgeResource>[2]>>()(['vectors', 'memory', 'outsideOrganizations']);
 export const RETENTION_SWEEPER_NAMES = optionNames<NonNullable<Parameters<typeof import('./retention.js').createRetentionSweeper>[1]>>()(['intervalMs', 'sweep', 'logSweep', 'onError']);
 export const SWEEP_RUNS_NAMES = optionNames<NonNullable<Parameters<typeof import('./retention.js').sweepRuns>[1]>>()(['olderThanMs', 'keepSuspended', 'suspendedTtlMs', 'tombstones', 'now']);
@@ -208,7 +208,7 @@ export const SUBJECT_MEMORY_NAMES = optionNames<NonNullable<Parameters<typeof im
 export const POLL_LOOP_NAMES = optionNames<NonNullable<Parameters<typeof import('./polling.js').createPollLoop>[1]>>()(['pollMs', 'backoff', 'maxPollMs']);
 export const FORMAT_PROTECTIONS_NAMES = optionNames<NonNullable<Parameters<typeof import('./protections.js').formatProtections>[1]>>()(['title']);
 export const PROTECTION_CONTEXT_NAMES = optionNames<NonNullable<Parameters<typeof import('./protections.js').describeProtections>[1]>>()(['identity', 'devOnly', 'surface']);
-export const TOOL_DURABILITY_NAMES = optionNames<NonNullable<Parameters<typeof import('./types.js').gnlTool>[1]>>()(['sideEffect', 'idempotent', 'idempotency', 'idempotencyKey', 'idempotencyWindow', 'untrusted', 'maxRetries', 'timeoutMs', 'claimTtlMs', 'recover', 'compensate', 'confirm', 'semanticIdentity', 'lookup', 'effectClass']);
+export const TOOL_DURABILITY_NAMES = optionNames<NonNullable<Parameters<typeof import('./types.js').gnlTool>[1]>>()(['sideEffect', 'idempotent', 'idempotency', 'idempotencyKey', 'idempotencyWindow', 'untrusted', 'maxRetries', 'timeoutMs', 'claimTtlMs', 'recover', 'compensate', 'confirm', 'semanticIdentity', 'lookup', 'effectClass', 'background']);
 export const LIST_LOG_NAMES = optionNames<NonNullable<Parameters<typeof import('./durable-log.js').listLog>[2]>>()(['limit']);
 export const POLICY_GUARD_NAMES = optionNames<NonNullable<Parameters<typeof import('./policy.js').policyGuard>[1]>>()(['key', 'fallback']);
 export const ROLLOVER_NAMES = optionNames<NonNullable<Parameters<typeof import('./rollover.js').rolloverRun>[2]>>()(['newRunId', 'carry']);
@@ -247,3 +247,18 @@ export const LIST_STALE_RUNS_NAMES = optionNames<NonNullable<Parameters<import('
 export const COUNT_RUNS_NAMES = optionNames<NonNullable<Parameters<import('./journal.js').InMemoryJournal['countRuns']>[0]>>()(['runIdPrefix']);
 export const LIST_RUNS_CHANGED_NAMES = optionNames<NonNullable<Parameters<import('./journal.js').InMemoryJournal['listRunsChangedSince']>[1]>>()(['limit', 'since', 'runIdPrefix']);
 export const JOURNAL_CONFORMANCE_NAMES = optionNames<import('./testing.js').JournalConformanceOptions>()(['describe', 'it', 'timeout', 'exactClaim', 'pageWalk']);
+
+export const DRAIN_NAMES = optionNames<import('./drain.js').DrainOptions>()(['deadlineMs']);
+export const DRAIN_ON_SIGNAL_NAMES = optionNames<import('./drain.js').DrainOnSignalOptions>()(['deadlineMs', 'signals', 'onDrained']);
+export const POSTGRES_LIVENESS_NAMES = optionNames<import('./process-liveness.js').PostgresLivenessOptions>()(['connectionString', 'client', 'id', 'heartbeatMs']);
+export const DETACHED_RUNS_NAMES = optionNames<import('./detached.js').DetachedRunsOptions>()([
+  'journal', 'journalFor', 'resume', 'liveness', 'signal', 'pollMs', 'sweepMs', 'coalesceMs', 'outcomeAskMs', 'onComplete', 'handles',
+]);
+export const FOLLOW_NAMES = optionNames<Parameters<import('./detached.js').DetachedRuns['follow']>[0]>()([
+  'runId', 'scope', 'after', 'afterOffset', 'signal', 'untilPause', 'idleCheckMs',
+]);
+export const EXEC_CANCEL_NAMES = optionNames<Parameters<import('./detached.js').DetachedRuns['cancel']>[0]>()([
+  'runId', 'scope', 'reason',
+]);
+
+export const ADMIT_RUN_ID_NAMES = optionNames<Parameters<typeof import('./run-id-grammar.js').admitRunId>[1]>()(['journal', 'mint']);

@@ -105,8 +105,22 @@ export interface Memory {
    * `resourceId`/`scope` (Phase 14): for resource-scope recall (a user's entire threads); simple memory ignores this.
    */
   getMessages(threadId: string, opts?: { query?: string; resourceId?: string; scope?: 'thread' | 'resource' }): Promise<any[]>;
-  /** Append new messages to a thread. */
-  append(threadId: string, messages: any[]): Promise<void>;
+  /**
+   * Append new messages to a thread. `batchKey`, when given, names the append so `retract` can take it
+   * back: run.ts passes the run's own marker (`mem-appended:<runId>`, `mem-user-appended:<runId>`). A
+   * memory that keeps no names ignores it.
+   */
+  append(threadId: string, messages: any[], batchKey?: string): Promise<void>;
+  /**
+   * Take back what was appended under `batchKey` (`append` handed it, or `appendOnce`) — OPTIONAL.
+   *
+   * Called by a worker whose run was deleted while it ran, after its last write (`settleErasedRun`,
+   * erasure-fence.ts): the turn it appended in the moment between its last read of the fence and the
+   * deletion is the deleted run's, and only the worker knows which batch it was. A memory without it
+   * keeps such a turn — nothing names it afterwards, so no later erasure finds it. BasicMemory,
+   * AgentMemory (@gnldev/memory) and SemanticMemory (@gnldev/rag) implement it.
+   */
+  retract?(threadId: string, batchKey: string): Promise<void>;
   /**
    * Append AT MOST ONCE under `batchKey`; false means that key already landed and nothing was written.
    *
@@ -273,8 +287,11 @@ const logQueues = new WeakMap<object, Map<string, Promise<void>>>();
  * a 0.9.0 log, or an earlier 0.10 append). It is what dates a message that carries no timestamp of its
  * own — every message an agent turn stores (the AI SDK message has no time field), so without it the
  * thread sweep could never age a real conversation (`sweepThreads`, `keptNoTs`).
+ *
+ * `batches[i]` names the append that wrote part `i` (`null` when it was not named): what
+ * `retractFromJournalLog` takes back.
  */
-interface JournalLogValue { gnlLog: 1; parts: string[]; appendedAt?: Array<number | null> }
+interface JournalLogValue { gnlLog: 1; parts: string[]; appendedAt?: Array<number | null>; batches?: Array<string | null> }
 
 function isLogValue(v: unknown): v is JournalLogValue {
   return typeof v === 'object' && v !== null && (v as JournalLogValue).gnlLog === 1 && Array.isArray((v as JournalLogValue).parts);
@@ -357,13 +374,46 @@ function decodeLog<T>(stored: unknown): T[] {
  * A journal without `putIfMatch`/`putIfAbsent` gets the queue alone: safe within one process, not
  * across several. Every first-party journal implements both.
  */
-export async function appendToJournalLog(journal: Journal, key: string, entries: readonly unknown[]): Promise<void> {
+export async function appendToJournalLog(journal: Journal, key: string, entries: readonly unknown[], batchKey?: string): Promise<void> {
+  const part = serialize(entries); // once, outside the retry loop
+  return queuedOnLog(journal, key, () => casAppend(journal, key, part, batchKey ?? null));
+}
+
+/**
+ * Takes back the parts appended under `batchKey` (`appendToJournalLog`'s fourth argument), with the same
+ * per-key queue and compare-and-set as an append, so neither loses the other's write. Returns how many
+ * entries went. A log emptied by it stays as an empty log: deleting the key could not be compared, and an
+ * append landing in between would be deleted with it.
+ */
+export async function retractFromJournalLog(journal: Journal, key: string, batchKey: string): Promise<number> {
+  return queuedOnLog(journal, key, async () => {
+    const cas = typeof journal.putIfMatch === 'function';
+    for (let attempt = 0; ; attempt++) {
+      const current = await journal.get<unknown>(key);
+      if (!isLogValue(current) || !current.batches?.includes(batchKey)) return 0;
+      const keep = current.parts.map((_, i) => current.batches?.[i] !== batchKey);
+      const removed = current.parts.reduce((n, part, i) => n + (keep[i] ? 0 : deserialize<unknown[]>(part).length), 0);
+      const next: JournalLogValue = {
+        gnlLog: 1,
+        parts: current.parts.filter((_, i) => keep[i]),
+        appendedAt: priorTimes(current).filter((_, i) => keep[i]),
+        batches: priorBatches(current).filter((_, i) => keep[i]),
+      };
+      if (!cas) { await journal.put(key, next); return removed; }
+      if (await journal.putIfMatch!(key, current, next)) return removed;
+      if (attempt + 1 >= JOURNAL_LOG_MAX_ATTEMPTS) throw new JournalLogContentionError(key, attempt + 1);
+      await backoff(attempt + 1);
+    }
+  });
+}
+
+/** One in-process queue per journal and key: appends and retractions from one process never contend. */
+function queuedOnLog<T>(journal: Journal, key: string, fn: () => Promise<T>): Promise<T> {
   let queues = logQueues.get(journal);
   if (!queues) { queues = new Map(); logQueues.set(journal, queues); }
   const prior = queues.get(key) ?? Promise.resolve();
-  const part = serialize(entries); // once, outside the retry loop
-  const run = prior.then(() => casAppend(journal, key, part));
-  const tail = run.then(() => undefined, () => undefined); // a failed append must not stall the next one
+  const run = prior.then(fn);
+  const tail = run.then(() => undefined, () => undefined); // a failed write must not stall the next one
   queues.set(key, tail);
   void tail.finally(() => { if (queues!.get(key) === tail) queues!.delete(key); });
   return run;
@@ -372,7 +422,7 @@ export async function appendToJournalLog(journal: Journal, key: string, entries:
 /** Full jitter, capped: lost rounds spread the writers out instead of having them all re-read at once. */
 const backoff = (lost: number) => new Promise<void>((r) => setTimeout(r, Math.floor(Math.random() * Math.min(1000, 2 ** Math.min(lost, 10)))));
 
-async function casAppend(journal: Journal, key: string, part: string): Promise<void> {
+async function casAppend(journal: Journal, key: string, part: string, batch: string | null): Promise<void> {
   const cas = typeof journal.putIfMatch === 'function' && typeof journal.putIfAbsent === 'function';
   let lost = 0;
   let unchanged = 0;
@@ -380,6 +430,9 @@ async function casAppend(journal: Journal, key: string, part: string): Promise<v
   for (;;) {
     const current = await journal.get<unknown>(key);
     const next: JournalLogValue = { gnlLog: 1, parts: [...priorParts(current), part], appendedAt: [...priorTimes(current), Date.now()] };
+    // Only a log that names an append carries the field: an unnamed one is stored as it always was.
+    const batches = priorBatches(current);
+    if (batch !== null || batches.some((b) => b !== null)) next.batches = [...batches, batch];
     if (!cas) return journal.put(key, next);
     // A 0.9.0 log is the entries themselves, compared through `asStored` — see there.
     const won = current === undefined
@@ -432,6 +485,13 @@ function priorTimes(current: unknown): Array<number | null> {
   if (current === undefined || current === null) return [];
   if (Array.isArray(current)) return current.length ? [null] : [];
   return isLogValue(current) ? current.parts.map((_, i) => current.appendedAt?.[i] ?? null) : [];
+}
+
+/** `batches` aligned with `priorParts`: `null` where a part's append was not named. */
+function priorBatches(current: unknown): Array<string | null> {
+  if (current === undefined || current === null) return [];
+  if (Array.isArray(current)) return current.length ? [null] : [];
+  return isLogValue(current) ? current.parts.map((_, i) => current.batches?.[i] ?? null) : [];
 }
 
 function priorParts(current: unknown): string[] {
@@ -496,8 +556,12 @@ export class BasicMemory implements Memory {
     return readJournalLog<any>(this.journal, memKey(threadId, 'messages'));
   }
 
-  async append(threadId: string, messages: any[]): Promise<void> {
-    await appendToJournalLog(this.journal, memKey(threadId, 'messages'), messages);
+  async append(threadId: string, messages: any[], batchKey?: string): Promise<void> {
+    await appendToJournalLog(this.journal, memKey(threadId, 'messages'), messages, batchKey);
+  }
+
+  async retract(threadId: string, batchKey: string): Promise<void> {
+    await retractFromJournalLog(this.journal, memKey(threadId, 'messages'), batchKey);
   }
 
   async getWorkingMemory(threadId: string): Promise<string | undefined> {

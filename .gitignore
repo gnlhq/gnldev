@@ -13,6 +13,8 @@ coverage/
 *.sqlite
 *.db
 runs.db
+# A Sqlite store's process lock files (process-liveness.ts: <db>.procs/<id>.lock)
+*.db.procs/
 # …except the databases an earlier release wrote, which the upgrade tests open (packages/upgrade-tests)
 !packages/upgrade-tests/fixtures/**/*.db
 

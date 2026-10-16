@@ -134,7 +134,6 @@ describe('#27b the ctx must reach the ENGINE, not just the call', () => {
     specificationVersion: 'v2', provider: 'm', modelId: 'm', supportedUrls: {},
     doGenerate: async () => ({ content: [{ type: 'text', text: 'ok' }], finishReason: 'stop',
       usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 }, warnings: [] }),
-    doStream: async () => { throw new Error('no stream'); },
   } as any;
 
   it('a dynamic system() sees the calling organization', async () => {

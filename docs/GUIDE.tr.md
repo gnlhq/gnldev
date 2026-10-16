@@ -152,7 +152,9 @@ Kritik ayrıntılar:
 | `<runId>:proc:<ad>` | Deterministik olmayan ara kararların (LLM'li moderasyon, skorlama...) dondurulmuş sonucu. |
 | `<runId>:wf:<adımId>` | Workflow adım çıktıları. |
 | `<runId>:net:route:<i>` / `net:step:<i>` | Dinamik ajan ağında (aşağıda) yönlendirici kararları + adım sonuçları. |
-| `<runId>:lock` | Koşu kilidi (aynı koşuyu iki sunucunun aynı anda işlemesini önler). |
+| `<runId>:ev:<seq>` | Koşunun olay günlüğü (okuyucunun izlediği: metin, araç çağrıları, sonuçlar, bitiş); koşu akarken yaklaşık saniyede bir yazılır. |
+| `__exec__:<scope>/<runId>#` | Koşunun yürütme kaydı: onu şu an hangi canlı sürecin yürüttüğü. Başka bir süreç koşuyu ancak o süreç öldüğünde devralır. Koşuyla birlikte silinir. |
+| `<runId>:lock` | Ham motorun koşu kilidi (`lock` ile `runDurable` / `streamDurable`). Kayıt defteri koşusu (`gnl.run`, `gnl.stream`, her kapı) bunu yazmaz: onu tek yürütmede tutan yürütme kaydıdır. |
 | `agent:<çağrıId>` / `net:<runId>:<i>` | Alt-ajanların KENDİ defterleri (her alt-ajan tam teşekküllü bir koşudur). |
 
 ### 5.2 Depolama mimarisi: 6 "liman" (port), 4 adaptör
@@ -508,16 +510,17 @@ ayarlanacak bir alan da yok), ama adları bugünden sabit:
 
 | Eksen | v1 değeri | İkinci çağrı ne alır |
 | --- | --- | --- |
-| `onConflict` | `'reject'` | İş **şu an koşuyor** → `409 run_busy` + `Retry-After`. |
+| `onConflict` | `'attach'` | İş **şu an koşuyor** → ikinci çağrı aynı yürütmeyi izler, aynı cevabı alır. |
 | `onReuse` | `'replay'` | İş **bitmiş** → kayıtlı cevap döner, hiçbir şey yeniden koşmaz. |
 
-**`run_busy`'yi mümkün kılan şey bir kilit, ve kilidin bir TTL'i var.** "Şu an koşuyor", journal'ın
-içeriğinden çıkarılmıyor: koşum başlamadan alınan ve koşum sürdükçe kalp atışıyla yenilenen koşum
-başına bir kilit var (`lock: { ttlMs }`, varsayılan 300 000 ms). Bundan iki sonuç çıkıyor ve ikisi de
-garantinin şekli — yanındaki çekinceler değil: kilidi bırakmadan ölen bir süreç koşumu yalnız TTL
-dolana kadar tutar, sonrasında yeniden deneme kabul edilir ve journal'dan tekrar oynar; TTL'ini
-meşru şekilde aşan bir koşum ise kilidi kalp atışıyla canlı tutar. Yani TTL koşumun uzunluğunu
-değil, çökme sonrası kurtarmayı sınırlar.
+**Koşunun tek yürütmede kalmasını saat değil, canlı süreç sağlar.** Kayıt defteri koşusu (`gnl.run`,
+`gnl.stream`, her kapı) onu başlatan çağrıdan ayrı, sürecin yürütücüsünde koşar. Yürütme kaydı koşuyu
+yürüten süreci adlandırır; o süreç yaşadığı sürece bir canlılık tutar (Postgres oturum kilidi, Sqlite
+dosya kilidi). Koşmakta olan bir koşuya gelen ikinci çağrı ona bağlanır: tek yürütme, tek efekt, iki
+çağıran da cevabı alır. Başka bir süreç koşuyu ancak yürüten süreç öldüğünde devralır: donmuş süreç
+koşusunu tutar, ölen hemen bırakır. Aşılacak bir TTL yok; koşu işi kadar sürer. İş akışı koşuları ve
+ham motor (`lock: { ttlMs }` ile `runDurable` / `streamDurable`) koşu kilidini kullanmaya devam eder ve
+eşzamanlı tekrarı `409 run_busy` + `Retry-After` ile cevaplar.
 
 Ve dipnot değil, madde: **başarısız biten koşunun döndürülecek sonucu yoktur; aynı `workKey`
 yeniden koşabilir.** Başarısız işi yeniden denemek normal durumdur, kaçış kapısı değil.

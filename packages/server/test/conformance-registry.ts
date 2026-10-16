@@ -19,7 +19,7 @@ import { chatSurface } from '../../chat-adapter/src/surface.js';
 import { createAguiRoute, aguiSurface } from '../../agui/src/route.js';
 import { createMcpServer } from '../../mcp/src/server.js';
 import { createStudioApi } from '../../studio/src/server.js';
-import { enqueue, createWorker } from '../../queue/src/index.js';
+import { createQueue, createWorker } from '../../queue/src/index.js';
 import { emit, createConsumer } from '../../events/src/index.js';
 import { scheduleWorkflow, pollScheduler } from '../../scheduler/src/index.js';
 
@@ -124,6 +124,24 @@ const UNCHECKED: Record<State, CallerKey[]> = { normal: [], ownerless: [], 'reco
 
 // ── the world ───────────────────────────────────────────────────────────────────────────────────
 export const SECRET = 'SECRET-OF-THE-TARGET';
+/**
+ * Whether a listing shows the run `runId`: a listed run with that id (or a thread/entry naming it as its
+ * id), not any text containing it. A caller's OWN run may carry the target's id as its `workKey` — the
+ * name it chose for its own work (its id is derived from it, `run1_…`); that is the caller's run, not the
+ * target. Measured: an attacker's MCP run declared `workKey: 'tgtS'` and the substring check called its
+ * own listing a leak of tgtS. A body that is not a JSON listing falls back to the substring.
+ */
+function listsRun(body: string, runId: string): boolean {
+  let parsed: unknown;
+  try { parsed = JSON.parse(body); } catch { return body.includes(runId); }
+  const items = Array.isArray(parsed) ? parsed : Array.isArray((parsed as { items?: unknown })?.items) ? (parsed as { items: unknown[] }).items : undefined;
+  if (!items) return body.includes(runId);
+  return items.some((r) => {
+    const x = r as Record<string, unknown>;
+    return x?.runId === runId || x?.id === runId || x?.threadId === runId || JSON.stringify({ ...x, workKey: undefined }).includes(`"${runId}"`);
+  });
+}
+
 function world() {
   const storage = new InMemoryStorage();
   const runs = storage.runs as any;
@@ -246,15 +264,18 @@ function ownerFor(who: Who): { caller: Caller } | { orgId?: string } {
 function queueDoor(w: W) {
   return lazy(w, 'queue', () => {
     const results: unknown[] = [];
-    const worker = createWorker(w.storage, {
+    const handlers = {
       // "continue this run in the background": the run named in the payload, for the job's owner.
-      cont: async (payload: any, ctx) => { results.push(await runDurable({ runId: payload.runId, journal: ctx.journal as never, model: echo, prompt: payload.prompt, caller: ctx.caller })); },
+      cont: async (payload: any, ctx: any) => { results.push(await runDurable({ runId: payload.runId, journal: ctx.journal as never, model: echo, prompt: payload.prompt, caller: ctx.caller })); },
       // a job's own run, as the README writes it.
-      own: async (payload: any, ctx) => { results.push(await ctx.run({ model: echo, prompt: payload.prompt } as never)); },
-    }, { maxAttempts: 1 });
+      own: async (payload: any, ctx: any) => { results.push(await ctx.run({ model: echo, prompt: payload.prompt } as never)); },
+    };
+    // Enqueued through the queue (its worker off here), run by a worker drained in step with the request.
+    const queue = createQueue(w.storage, handlers, { worker: false });
+    const worker = createWorker(w.storage, handlers, { maxAttempts: 1 });
     return async (who: Who, type: 'cont' | 'own', payload: unknown, id?: string): Promise<Res> => {
       results.length = 0;
-      const jobId = await enqueue(w.storage.work!, type, payload, { ...ownerFor(who), ...(id ? { id } : {}) });
+      const jobId = await queue.enqueue(type, payload, { ...ownerFor(who), ...(id ? { id } : {}) });
       await worker.drain();
       return { status: 200, body: JSON.stringify({ jobId, results }) };
     };
@@ -383,7 +404,8 @@ export const BIRTHS: Record<string, Birth> = {
     start: async (w, who) => { const e = ctxOf(w, who); await e.gnl.run('l', { runId: 'tgtL', prompt: 'x', caller: e.caller }); return { runId: 'tgtL' }; },
   },
   'studio workflow fork': {
-    sites: ['studio/src/server.ts'], starters: [],
+    // Born through the engine's fork birth (time-travel.ts beginFork), as forkRun's fork is.
+    sites: ['durable/src/time-travel.ts'], starters: [],
     start: async (w, who) => {
       const e = ctxOf(w, who);
       await e.gnl.runWorkflow('w', { s: SECRET }, { runId: 'tgtVs', caller: e.caller });
@@ -413,12 +435,17 @@ export const BIRTHS: Record<string, Birth> = {
 export const NOT_A_BIRTH: Record<string, string> = {
   resumeRun: 'continues an existing run (engine door op "resumeRun"), never starts one',
   admitRun: 'THE entry every birth calls, not a birth itself',
+  existingRun: 'the refusal of an operation that continues a run (cancel, unwind, score) on one that does not exist — writes nothing, starts nothing',
+  runNotFound: 'renders the wire answer for a run a caller may not reach (errors.ts) — writes nothing, starts nothing',
+  admitAgentRun: 'the agent admission every agent birth calls (and the executor asks before it executes or attaches) — a gate, not a birth',
+  followedRun: 'a reading (follows a run already started)', 'gnl.follow': 'a reading (follows a run already started)',
+  'gnl.cancel': 'stops a run already started (its cancel record) — writes nothing a run is born from; the door decides who may',
   admitThreadRun: 'the thread gate',
   decideRun: 'a decision', runOwnerOf: 'a reading', runTargetOf: 'a reading', isRealRun: 'a reading', runStarted: 'a reading',
-  runCanceled: 'a reading', runCompensated: 'a reading', summarizeRun: 'a reading', runIdOfKey: 'key parsing',
+  runCanceled: 'a reading', runCompensated: 'a reading', summarizeRun: 'a reading', runIdOfKey: 'key parsing', runRecordOf: 'key parsing', runEventKey: 'key building', runRecordKey: 'key building (run-id grammar)', runRecordPrefix: 'key building (run-id grammar)', runIdFamilyOf: 'id parsing (run-id grammar)',
   runIdentity: 'builds an identity value', forkRunId: 'derives an id', rolloverKey: 'derives a key',
   runBusyMessage: 'an error message', streamFinishError: 'an error helper',
-  cancelAgentRun: 'stops a run (REST/studio cancel op)', compensateRun: 'unwinds a run (studio op)', purgeRun: 'erasure',
+  cancelAgentRun: 'stops a run (REST/studio cancel op)', cancelPendingRun: 'stops a run (gnl pending: cancelAgentRun through the run\'s scope)', compensateRun: 'unwinds a run (studio op)', purgeRun: 'erasure',
   runMigrationCheck: 'schema migration, not a run', runRuleLadder: 'semantic rules, not a run',
   runScoreSample: 'reads a finished run to build a scoring sample, starts none',
   createProcessorCtx: 'a processor context', createRetentionSweeper: 'erasure worker', createSuggestions: 'suggestion store',
@@ -515,7 +542,7 @@ export const DOORS: Record<string, Door> = {
     },
   },
   'queue worker': {
-    factories: ['createWorker'],
+    factories: ['createWorker', 'createQueue'],
     ops: {
       'job continuing the named run': { kind: 'write', act: (w, t, who) => queueDoor(w)(who, 'cont', { runId: t.runId, prompt: 'x' }) },
       'job with the owner\'s job name': { kind: 'write', act: (w, _t, who) => queueDoor(w)(who, 'own', { prompt: 'x' }, 'tgtQ') },
@@ -681,7 +708,7 @@ export async function walk(filter?: { births?: string[]; doors?: string[] }) {
               // Another organization may hold a run of its own under the same id (an earlier cell started
               // it there); its listing showing that id is its own run, not the target.
               const sameIdInOwnOrg = orgOf(CALLERS[ck]) !== ORG && (await w.storage.runs.listKeys!(`org:${orgOf(CALLERS[ck])}:${t.runId}:`)).length > 0;
-              if (op.kind === 'list' && res.body.includes(t.runId) && !sameIdInOwnOrg) findings.push(`${label(cell)} | ${res.status} | listing shows ${t.runId}`);
+              if (op.kind === 'list' && listsRun(res.body, t.runId) && !sameIdInOwnOrg) findings.push(`${label(cell)} | ${res.status} | listing shows ${t.runId}`);
               if (changed.length) findings.push(`${label(cell)} | ${res.status} | changed ${changed.slice(0, 3).join(',')}`);
               // ORACLE: an end user (or unknown) must not tell "exists, not yours" from "does not exist".
               // Where the same operation on an id that never existed answers 404, the target must too.

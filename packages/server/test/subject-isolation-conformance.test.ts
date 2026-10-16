@@ -45,6 +45,7 @@ export const VERDICTS: Record<string, { verdict: Verdict; why: string }> = {
   'GET /workflows/runs': { verdict: 'owned-read', why: 'workflow run inventory' },
   'POST /agents/:name/run': { verdict: 'owned-write', why: 'replays a run / appends to a thread' },
   'POST /agents/:name/stream': { verdict: 'owned-write', why: 'replays a run / appends to a thread' },
+  'GET /runs/:id/events': { verdict: 'owned-read', why: 'one run\'s events' },
   'POST /agents/:name/echo': { verdict: 'owned-write', why: 'a surface: the stream door under another wire format' },
   'POST /agents/:name/resume': { verdict: 'owned-write', why: 'approves a suspended tool call' },
   'POST /runs/:id/cancel': { verdict: 'owned-write', why: 'terminally stops a run' },

@@ -7,6 +7,8 @@ import * as S from '../../generate/shapes.mjs';
 import { itMigrates, notes090, openFixture } from '../support.js';
 
 const R = S.WORKFLOW_RUNS;
+// A run 0.9.0 wrote has no owner record, so it is staff's: the operator resumes it as staff (CHANGELOG, Breaking).
+const staffOf = (runId: string) => ({ kind: 'staff' as const, runId });
 
 describe('upgrade from 0.9.0 — workflow', () => {
   itMigrates('workflow.db');
@@ -35,7 +37,7 @@ describe('upgrade from 0.9.0 — workflow', () => {
     const { storage } = await openFixture('workflow.db');
     const j = toJournal(storage.runs);
     const calls: string[] = [];
-    const r = await S.voidWorkflow(w, calls).runResumable(1, { runId: R.void, journal: j }, { resume: { approve: 'yes' } });
+    const r = await S.voidWorkflow(w, calls).runResumable(1, { runId: R.void, journal: j, identity: staffOf(R.void) }, { resume: { approve: 'yes' } });
     expect(r).toEqual({ status: 'completed', output: { approved: 'yes' } });
     // CHANGELOG [Unreleased]: "a plain void step re-runs once, as on 0.9.0, and is then rewritten in the new shape".
     expect(calls).toEqual(['notify', 'final']);
@@ -45,9 +47,9 @@ describe('upgrade from 0.9.0 — workflow', () => {
   it('after that resume, running the run again runs nothing', async () => {
     const { storage } = await openFixture('workflow.db');
     const j = toJournal(storage.runs);
-    await S.voidWorkflow(w, []).runResumable(1, { runId: R.void, journal: j }, { resume: { approve: 'yes' } });
+    await S.voidWorkflow(w, []).runResumable(1, { runId: R.void, journal: j, identity: staffOf(R.void) }, { resume: { approve: 'yes' } });
     const calls: string[] = [];
-    const again = await S.voidWorkflow(w, calls).runResumable(1, { runId: R.void, journal: j }, { resume: { approve: 'yes' } });
+    const again = await S.voidWorkflow(w, calls).runResumable(1, { runId: R.void, journal: j, identity: staffOf(R.void) }, { resume: { approve: 'yes' } });
     expect(again).toEqual({ status: 'completed', output: { approved: 'yes' } });
     expect(calls).toEqual([]);
   });
@@ -56,7 +58,7 @@ describe('upgrade from 0.9.0 — workflow', () => {
     const { storage } = await openFixture('workflow.db');
     const j = toJournal(storage.runs);
     const calls: string[] = [];
-    const r = await S.nestedWorkflow(w, calls).runResumable(2, { runId: R.nested, journal: j }, { resume: { ship: 'today' } });
+    const r = await S.nestedWorkflow(w, calls).runResumable(2, { runId: R.nested, journal: j, identity: staffOf(R.nested) }, { resume: { ship: 'today' } });
     expect(r).toEqual({ status: 'completed', output: { shipped: 'today' } });
     expect(calls).toEqual(['final']);
   });
@@ -64,8 +66,18 @@ describe('upgrade from 0.9.0 — workflow', () => {
   it('a 0.9.0 run resumed from a restarted process (a second open of the file) runs nothing twice', async () => {
     const f = await openFixture('workflow.db');
     const calls: string[] = [];
-    await S.nestedWorkflow(w, calls).runResumable(2, { runId: R.nested, journal: toJournal(f.storage.runs) }, { resume: { ship: 'today' } });
-    await S.nestedWorkflow(w, calls).runResumable(2, { runId: R.nested, journal: toJournal(f.reopen().runs) }, { resume: { ship: 'today' } });
+    await S.nestedWorkflow(w, calls).runResumable(2, { runId: R.nested, journal: toJournal(f.storage.runs), identity: staffOf(R.nested) }, { resume: { ship: 'today' } });
+    await S.nestedWorkflow(w, calls).runResumable(2, { runId: R.nested, journal: toJournal(f.reopen().runs), identity: staffOf(R.nested) }, { resume: { ship: 'today' } });
     expect(calls).toEqual(['final']);
+  });
+
+  it('a 0.9.0 run resumed without an identity is refused, and nothing of it runs (CHANGELOG, Breaking)', async () => {
+    const { storage } = await openFixture('workflow.db');
+    const j = toJournal(storage.runs);
+    const calls: string[] = [];
+    await expect(S.voidWorkflow(w, calls).runResumable(1, { runId: R.void, journal: j }, { resume: { approve: 'yes' } }))
+      .rejects.toThrow(/belongs to a different subject/);
+    expect(calls).toEqual([]);
+    expect(await w.getWorkflowRunStatus(j, R.void)).toMatchObject({ status: 'suspended', waitId: 'approve' });
   });
 });

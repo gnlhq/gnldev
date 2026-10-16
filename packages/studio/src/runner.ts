@@ -1,7 +1,8 @@
 // Converts a createGnl instance into the Playground/Tools runner (StudioAgentRunner). Pure adapter — does not import `ai`.
 // @gnldev/cli and the studio CLI `--config` share this → single source of truth.
+import { runRecordKey } from '@gnldev/durable';
 import type { AgentMeta, StudioAgentRunner, StudioCallbackCtx, ToolMeta, ToolListItem } from './server.js';
-import { durableTool, toolDescriptionText, sealRequestContext, serverIdentityOf, runIdentity, userIdOf, UNKNOWN, refuseConfigNames } from '@gnldev/durable';
+import { durableTool, toolDescriptionText, sealRequestContext, serverIdentityOf, runIdentity, userIdOf, UNKNOWN, refuseConfigNames, runOwnerOf, decideRunAccess } from '@gnldev/durable';
 import type { Guard, Journal, WorkflowMeta, WorkflowRunResult } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
 import { CREATE_STUDIO_RUNNER_OPTS_NAMES } from './option-names.js';
@@ -231,10 +232,17 @@ export function createStudioRunner(
       // APPROVE/DENY: resumes a suspended durable tool test — reads args from the suspended sentinel, continues with approvals.
       if (runOpts?.approve && config.journal) {
         const { runId, toolCallId, approved } = runOpts.approve;
-        const rec: any = await config.journal.get(`${runId}:tool:${toolCallId}`);
+        // An approval continues a run; it does not begin one. A run that does not exist — or one this
+        // caller may not act on — is not found, and nothing is written under it: this path used to run
+        // the tool under whatever id the request named, and its rows made that id a run (staff's),
+        // lost to whoever could still begin it. A run that is reached acts for its recorded owner.
+        const owner = await runOwnerOf(config.journal, runId);
+        const acting = decideRunAccess(owner, caller) === 'allow' && owner.state === 'owned' ? owner.owner : undefined;
+        if (!acting) return { error: 'run not found' };
+        const rec: any = await config.journal.get(runRecordKey(runId, 'tool', toolCallId));
         const args = rec?.output?.__gnl_suspend ? rec.output.__gnl_suspend.args : input;
         try {
-          const out: any = await durableTool(t as any, { journal: config.journal, runId, guard, identity: runIdentity(caller, runId), approvals: { [toolCallId]: approved } }, name).execute(args, { toolCallId });
+          const out: any = await durableTool(t as any, { journal: config.journal, runId, guard, identity: runIdentity(acting, runId), approvals: { [toolCallId]: approved } }, name).execute(args, { toolCallId });
           if (out && out.__gnl_suspend) return { error: 'still awaiting approval', blocked: 'approval', runId };
           if (out && out.__denied) return { error: `approval denied${out.reason ? ': ' + out.reason : ''}`, blocked: 'deny', runId };
           return { result: out, runId };

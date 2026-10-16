@@ -15,7 +15,6 @@ function mockModel(text: string) {
     modelId: 'mock-model',
     supportedUrls: {},
     doGenerate: async () => ({ content: [{ type: 'text', text }], finishReason: 'stop' as const, usage, warnings: [] as any[] }),
-    doStream: async () => { throw new Error('mock: doStream is not supported'); },
   };
 }
 

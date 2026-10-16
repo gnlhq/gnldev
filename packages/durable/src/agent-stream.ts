@@ -46,6 +46,8 @@ export async function* agentStreamEvents(result: any, runId: string, codes: Agen
         case 'tool-result':
           // The three sentinels are internal API: suspend is carried by `interrupt`, limit/blocked by the terminal `error`.
           if (part.output?.__gnl_suspend || part.output?.__gnl_limit_exceeded || part.output?.__gnl_blocked) break;
+          // A streaming tool's yield before its last: progress of a call still running (`tool-progress`).
+          if (part.preliminary) { yield { event: 'tool-progress', data: { toolCallId: part.toolCallId, toolName: part.toolName, progress: part.output } }; break; }
           yield { event: 'tool-result', data: { toolCallId: part.toolCallId, toolName: part.toolName, output: part.output } }; break;
         case 'reasoning-start': yield { event: 'reasoning-start', data: { id: part.id } }; break;
         case 'reasoning-delta': { const text = part.text ?? part.delta ?? ''; if (text) yield { event: 'reasoning-delta', data: { id: part.id, text } }; break; }

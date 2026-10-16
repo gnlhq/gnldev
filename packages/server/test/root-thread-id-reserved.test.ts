@@ -10,7 +10,7 @@
 // reserved space for root-scope callers with `thread_id_reserved` (400) before anything runs.
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, RESERVED_ID_ERROR_CODES, type Storage } from '@gnldev/durable';
-import { SqliteStorage } from '../../durable/src/sqlite-storage.js';
+import { SqliteStorage } from '@gnldev/durable/sqlite';
 import { echoModel } from '@gnldev/durable/mock';
 import { memoryPreset } from '../../memory/src/index.js';
 import { createChatRoute } from '../../chat-adapter/src/index.js';

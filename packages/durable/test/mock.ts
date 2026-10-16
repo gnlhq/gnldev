@@ -76,10 +76,31 @@ export function createMockModel(doGenerate: (options: any) => Promise<any>): any
     modelId: 'mock-model',
     supportedUrls: {},
     doGenerate: async (options: any) => toWireResult(await doGenerate(options)),
-    doStream: async () => {
-      throw new Error('mock: doStream not supported');
-    },
+    // The same answer, streamed: a registry run executes on the stream path (detached.ts), as it does
+    // with a real provider, so a generate-only mock would test a path production never takes.
+    doStream: async (options: any) => ({ stream: streamOf(toWireResult(await doGenerate(options))) }),
   };
+}
+
+/** A generate result as a stream — for a scripted model's `doStream` (`this.doGenerate` gives the answer). */
+export async function streamFromGenerate(model: { doGenerate: (o: any) => Promise<any>; specificationVersion?: string }, options: any): Promise<{ stream: ReadableStream<any> }> {
+  // A model of an earlier specification streams in ITS shapes (a string finish reason, flat usage): the
+  // AI SDK's compatibility layer converts them, as it converts that model's generate result.
+  const r = await model.doGenerate(options);
+  return { stream: streamOf(model.specificationVersion === 'v4' ? toWireResult(r) : r) };
+}
+
+/** A generate result as the stream parts a provider sends for it. */
+function streamOf(r: any): ReadableStream<any> {
+  const parts: any[] = [{ type: 'stream-start', warnings: r.warnings ?? [] }];
+  let n = 0;
+  for (const c of r.content ?? []) {
+    if (c.type === 'text') { const id = `t${n++}`; parts.push({ type: 'text-start', id }, { type: 'text-delta', id, delta: c.text }, { type: 'text-end', id }); }
+    else if (c.type === 'reasoning') { const id = `r${n++}`; parts.push({ type: 'reasoning-start', id }, { type: 'reasoning-delta', id, delta: c.text }, { type: 'reasoning-end', id }); }
+    else parts.push(c);
+  }
+  parts.push({ type: 'finish', finishReason: r.finishReason, usage: r.usage, ...(r.providerMetadata ? { providerMetadata: r.providerMetadata } : {}) });
+  return new ReadableStream({ start(c) { for (const p of parts) c.enqueue(p); c.close(); } });
 }
 
 /** Agent mock that streams based on conversation state (for streamDurable e2e). 0 tool results → chargeCard

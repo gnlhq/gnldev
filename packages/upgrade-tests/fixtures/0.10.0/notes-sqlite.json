@@ -1,0 +1,40 @@
+{
+ "writtenBy": "packages/upgrade-tests/generate/0.10.0.mjs",
+ "version": "0.10.0",
+ "clockStart": "2026-10-05T12:00:00.000Z",
+ "notes": {
+  "written": {
+   "r-done-alice": "ok",
+   "r-done-alice-b": "ok",
+   "r-susp-alice": "suspended",
+   "r-fail-bob": "error:Error",
+   "r-cancel-bob": "suspended",
+   "r-sub-carol": "suspended",
+   "r-subdone-carol": "ok",
+   "r-staff": "ok",
+   "r-erin-1": "ok",
+   "r-erin-2": "suspended",
+   "r-approved-alice": "suspended",
+   "r-approved-alice:resume": "ok",
+   "erase-erin": [
+    "byEraser",
+    "journalRows",
+    "memoryThreads",
+    "unreachedThreads",
+    "workRecords",
+    "workingMemory"
+   ],
+   "o-done-dave": "ok",
+   "o-susp-dave": "suspended",
+   "o-fail-frank": "error:Error",
+   "o-sub-frank": "suspended",
+   "o-done-alice": "ok",
+   "effects": [
+    "note:{\"n\":1}",
+    "note:{\"n\":2}",
+    "note:{\"n\":1}",
+    "pay:{\"amt\":5}"
+   ]
+  }
+ }
+}

@@ -7,6 +7,7 @@
 // agent-tool; the sub-agent's own journal separately handles mid-crash resume). The loop is
 // bounded by `maxIterations` (default 6); once the limit is exceeded, the router is "forced to
 // finalize" — an unbounded router loop is structurally impossible.
+import { runRecordKey, runRecordPrefix, composeRunId, minted, withMintOf } from './run-id-grammar.js';
 import { generateText } from 'ai';
 import { claim, frozenGet } from './journal.js';
 import type { Journal } from './journal.js';
@@ -26,9 +27,20 @@ export interface NetworkTarget {
   /** Definition the router sees when choosing an agent (if absent, only the name is listed). */
   description?: string;
   /** Durably runs the given task under a nested runId (the registry wires this to the engine's own agent run, one frame below the network run).
-   * If `interrupts` is non-empty, the sub-agent is suspended — the network step does NOT FREEZE, the interrupt is propagated upward. */
-  run(task: string, nestedRunId: string): Promise<{ text: string; interrupts?: Interrupt[]; status?: 'completed' | 'failed'; failed?: Array<{ tool: string; kind: string; message: string }> }>;
+   * If `interrupts` is non-empty, the sub-agent is suspended — the network step does NOT FREEZE, the interrupt is propagated upward.
+   *
+   * `nestedRunId` (`net:<network run>:<step>`) is an id only the engine may begin. A target that begins
+   * a run under it begins it with `child`, the network's run arguments for this step:
+   * `runDurable({ ...child, journal, model, prompt: task })`. A target that runs no durable run under
+   * it (a plain function) ignores both. */
+  run(task: string, nestedRunId: string, child: NetworkChildRun): Promise<{ text: string; interrupts?: Interrupt[]; status?: 'completed' | 'failed'; failed?: Array<{ tool: string; kind: string; message: string }> }>;
 }
+
+/**
+ * The run arguments a network hands its target for one step: the step's run id, carrying the engine's
+ * mark for it (run-id-grammar.ts `minted`). Spread into the arguments of the run that begins it.
+ */
+export type NetworkChildRun = { readonly runId: string };
 
 export interface RunNetworkOptions {
   runId: string;
@@ -153,16 +165,16 @@ export interface NetworkResult {
 
 /** Network journal keys — do not match the `:(model|tool):` pattern → invisible to parseJournalKey. */
 export const netKeys = {
-  route: (runId: string, i: number | 'final') => `${runId}:net:route:${i}`,
-  step: (runId: string, i: number) => `${runId}:net:step:${i}`,
+  route: (runId: string, i: number | 'final') => runRecordKey(runId, 'net', `route:${i}`),
+  step: (runId: string, i: number) => runRecordKey(runId, 'net', `step:${i}`),
   /** The runId of the sub-agent's own journal (deterministic — NOT tied to toolCallId).
    * NOTE: this nested run appears in listRuns/Studio Runs as a SEPARATE top-level run
    *  (nested-run ontology — see the core-hardening review). */
-  nestedRunId: (runId: string, i: number) => `net:${runId}:${i}`,
+  nestedRunId: (runId: string, i: number) => composeRunId('net', runId, i),
   /** P2-network: a delegation veto (`onAgentStart` returning `{skip:true}`) — claim-keyed, frozen
    * BEFORE the step itself so a crash between the two claims still replays the SAME veto on resume
    *  (mirrors the `route`/`step` two-record freezing pattern above). */
-  veto: (runId: string, i: number) => `${runId}:net:veto:${i}`,
+  veto: (runId: string, i: number) => runRecordKey(runId, 'net', `veto:${i}`),
 } as const;
 
 /** Steps-so-far digest — shared by the router prompt AND the observer's `onRouteStart` notification. */
@@ -266,7 +278,7 @@ export async function runNetwork(opts: RunNetworkOptions): Promise<NetworkResult
   // A run birth like every other (run-identity.ts admitRun): the owner is recorded before the first
   // row, a run someone else owns is refused, and a re-entry acts for the recorded owner. Without it
   // this exported primitive wrote route rows under no owner record (read as staff's, not recorded).
-  await admitRun(opts.journal, opts.runId, opts.caller ?? UNKNOWN, { network: '' });
+  await admitRun(opts.journal, opts.runId, opts.caller ?? UNKNOWN, withMintOf({ network: '' }, opts));
   return runNetworkAdmitted(opts);
 }
 
@@ -346,7 +358,9 @@ export async function runNetworkAdmitted(opts: RunNetworkOptions): Promise<Netwo
         }
         if (obs) await notify(obs.onAgentFinish, i, decision.agent, { text: res.text });
       } else {
-        const r = await target.run(decision.task, netKeys.nestedRunId(opts.runId, i));
+        // The step's run is the engine's: the target begins it with these marked arguments.
+        const child: NetworkChildRun = minted({ runId: netKeys.nestedRunId(opts.runId, i) });
+        const r = await target.run(decision.task, child.runId, child);
         if (r.interrupts && r.interrupts.length > 0) {
           return {
             runId: opts.runId, text: '', steps, iterations: i,
@@ -388,11 +402,12 @@ export async function getNetworkTrace(
   if (typeof journal.listKeys !== 'function') {
     throw new Error('@gnldev/durable network: getNetworkTrace requires a journal that supports `listKeys`');
   }
-  const keys = await journal.listKeys(`${runId}:net:`);
+  const prefix = runRecordPrefix(runId, 'net');
+  const keys = await journal.listKeys(prefix);
   const routes: { i: number | 'final'; decision: RouteDecision }[] = [];
   const steps: NetworkStep[] = [];
   for (const key of keys) {
-    const suffix = key.slice(`${runId}:net:`.length);
+    const suffix = key.slice(prefix.length);
     const rec = await journal.get<{ v: any }>(key);
     if (rec === undefined) continue;
     if (suffix.startsWith('route:')) {

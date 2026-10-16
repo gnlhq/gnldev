@@ -40,7 +40,8 @@ it('concurrency slots and seats', async () => {
   }
   expect(out).toEqual([
     'R1 stale slot, cap 1: finished, ran 1',
-    'R2 cancel while waiting: ended: AbortError',
+    // A run's abortSignal cancels the RUN (design decision D2): the waiting run ends canceled.
+    'R2 cancel while waiting: ended: RunCanceledError',
     'R3 limit 1, A timed out and still running, then B: effects ["A"]',
   ]);
 }, 60_000);

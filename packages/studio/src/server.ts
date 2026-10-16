@@ -1,11 +1,12 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { runRecordKey, runRecordPrefix, runIdFamilyOf, runIdentity, UNKNOWN } from '@gnldev/durable';
 import { randomUUID } from 'node:crypto';
 import { toFetchHandler, type FetchHandler } from './handler.js';
 import { Hono, type Context } from 'hono';
 import { sseResponse } from './sse.js';
 
 import { STUDIO_ERROR_CODES } from './error-codes.js';
-import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, inheritRunOwner, LIMIT_ERROR_CODES, requestRefusal, eraseSubject, subjectRuns, toJournal, decodeStepRecord, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
+import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, beginFork, settleModelContent, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, LIMIT_ERROR_CODES, requestRefusal, eraseSubject, subjectRuns, toJournal, decodeStepRecord, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
 import type { JournalReader, Journal, Memory, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser, RunSummary, RunChange } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
@@ -769,6 +770,9 @@ export interface StudioApiOptions {
    * `triggerEraser`, `eventEraser`); `memory` a storage your memory was built over, when it is another.
    * Without it, `DELETE /users/:id` refuses (409) unless the caller says `?keepData=true`.
    *
+   * `DELETE /organizations/:id` erases through the same storage and erasers (`purgeOrganization`): an
+   * organization's data is in every store. Without it, that route refuses (409) too.
+   *
    * `settleMs` (default 10 000): how long the delete waits for the person's runs that are still writing
    * — a turn inside the model when the delete arrives writes its answer and the thread's messages after
    * it. Past it, those runs are cancelled and the delete answers 409 `user_runs_in_flight`, erasing
@@ -1276,6 +1280,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     ...(typeof (rawReader as any).get === 'function' ? { get: (k: string) => (scopedNow() as any).get(k) } : {}),
     ...(typeof (rawReader as any).put === 'function' ? { put: (k: string, v: unknown) => (scopedNow() as any).put(k, v) } : {}),
     ...(typeof (rawReader as any).putIfAbsent === 'function' ? { putIfAbsent: (k: string, v: unknown) => (scopedNow() as any).putIfAbsent(k, v) } : {}),
+    // The birth (run-identity.ts `withBirth`) the scoped view offers: a managed workflow is born through it.
+    ...(typeof (rawReader as any).put === 'function' ? { beginRun: (id: string, ctx?: unknown) => (scopedNow() as any).beginRun?.(id, ctx) } : {}),
     ...(typeof (rawReader as any).listKeys === 'function' ? { listKeys: (p: string) => (scopedNow() as any).listKeys(p) } : {}),
     // deletePrefix is bridged too (purge/retention call it via `rw`); since ALS is never set up on the
     // write path (see the middleware), scopedNow() always falls through to the raw journal — behavior unchanged.
@@ -1561,7 +1567,9 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const journal: Journal = mem
       ? ({ get: async (k: string) => mem.get(k), put: async (k: string, v: unknown) => { mem.set(k, v); } } as unknown as Journal)
       : (rw as unknown as Journal);
-    const ctx = { runId, journal };
+    // The run acts for the request's caller: on a journal that keeps owners, the workflow is born for
+    // them (`beginRun`) — or refused, if the id names a run they may not act on.
+    const ctx = { runId, journal, identity: runIdentity(callCtx?.caller ?? UNKNOWN, runId) };
     let output: unknown; let suspended = false; let paused = false; let canceled = false; let stepId: string | undefined; let reason: unknown;
     if (wf.runResumable) {
       const rOpts = {
@@ -1577,7 +1585,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       output = await wf.run(input, ctx);
     }
     const steps: { id: string; kind: string; output: unknown }[] = [];
-    for (const s of wf.build()) steps.push({ id: s.id, kind: 'agent', output: decodeStepRecord(await ctx.journal.get(`${runId}:wf:${s.id}`)) });
+    for (const s of wf.build()) steps.push({ id: s.id, kind: 'agent', output: decodeStepRecord(await ctx.journal.get(runRecordKey(runId, 'wf', s.id))) });
     return { runId, output, suspended, paused, canceled, ...(dryRun ? { dryRun: true } : {}), stepId, reason, steps };
   }
 
@@ -2029,7 +2037,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const entries = await reader.readRun(id);
     const q = Number(c.req.query('step'));
     const step = Number.isFinite(q) ? q : entries.length;
-    const seed = writable ? await rw.get!(`${id}:input`) : undefined;
+    const seed = writable ? await rw.get!(runRecordKey(id, 'input')) : undefined;
     return c.json(reconstructState(entries, step, seed as any));
   });
 
@@ -2042,7 +2050,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allowP(c.req.raw, 'threads:read'))) return deny(c.req.raw, 'read');
     if (!writable) return c.json({ context: null });
     const id = decodeURIComponent(c.req.param('id'));
-    const ctx = await rw.get!(`${id}:memctx`).catch(() => undefined);
+    const ctx = await rw.get!(runRecordKey(id, 'memctx')).catch(() => undefined);
     return c.json({ context: ctx ?? null });
   });
 
@@ -2058,7 +2066,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
     if (!writable || typeof rw.listKeys !== 'function') return c.json({ scores: {} });
     const id = decodeURIComponent(c.req.param('id'));
-    const prefix = `${id}:proc:eval:`;
+    const prefix = `${runRecordPrefix(id, 'proc')}eval:`;
     const keys = await rw.listKeys!(prefix).catch(() => [] as string[]);
     const scores: Record<string, unknown> = {};
     for (const k of keys) {
@@ -2114,7 +2122,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const toolNames = new Map<string, string>();
     for (const e of entries) {
       if (e.kind !== 'model') continue;
-      for (const p of ((e.value as any)?.content ?? []) as any[]) {
+      for (const p of settleModelContent(e.value)) {
         if (p?.type === 'tool-call' && p.toolCallId) toolNames.set(p.toolCallId, p.toolName ?? 'tool');
       }
     }
@@ -2152,7 +2160,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const id = decodeURIComponent(c.req.param('id'));
     const entries = await reader.readRun(id);
     const step = Math.max(1, Number(c.req.query('step') ?? entries.length));
-    const seed = writable ? await rw.get!(`${id}:input`) : undefined;
+    const seed = writable ? await rw.get!(runRecordKey(id, 'input')) : undefined;
     const cur = reconstructState(entries, step, seed as any);
     const prev = reconstructState(entries, step - 1, seed as any);
     return c.json({ step, added: cur.messages.slice(prev.messages.length), pendingBefore: prev.pending, pendingAfter: cur.pending });
@@ -2339,7 +2347,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       // Identity-only records (workflow/network/batch, written by claimIdentityInput) carry these
       // fields in exactly the same place as a frozen request does; nothing here needs to tell them apart.
       const frozen = writable
-        ? await rw.get!<{ resourceId?: string; actor?: string; workKey?: string }>(`${r.runId}:input`).catch(() => undefined)
+        ? await rw.get!<{ resourceId?: string; actor?: string; workKey?: string }>(runRecordKey(r.runId, 'input')).catch(() => undefined)
         : undefined;
       const ownerResource = frozen?.resourceId ?? r.resourceId;
       // WHICH JOB the question is about, riding the same `:input` blob as WHOSE it is. An
@@ -2597,26 +2605,36 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   };
   app.post('/organizations', createOrganization);
 
-  // DELETE org (GDPR/cleanup): PERMANENTLY delete ALL `org:<id>:` data + the record + the budget document (irreversible).
+  // DELETE org (GDPR/cleanup): PERMANENTLY delete everything the organization owns, in every store (irreversible).
   const deleteOrganization = async (c: Context) => {
     if (!(await allowP(c.req.raw, 'org:write'))) return deny(c.req.raw, 'write');
     if (!writable) return c.json({ error: 'org management requires a writable journal' }, 501);
     if (!multiOrganizationEnabled) return c.json({ error: 'multi-org is not enabled (single org)' }, 501);
     { const denied = requirePlatformAdmin(c, 'an org-bound identity cannot delete an org'); if (denied) return denied; }
-    const rootJ = rawReader as unknown as Journal;
-    if (typeof rootJ.deletePrefix !== 'function') {
-      return c.json({ error: 'org deletion requires journal deletePrefix support (Sqlite/Postgres/InMemory provide it)' }, 501);
-    }
     // Note: the standalone `const` handler uses the generic Hono `Context` type (no route-specific path
     // literal) → ':id' therefore needs `!`.
     const id = decodeURIComponent(c.req.param('id')!);
     if (id.includes(':')) return c.json({ error: "invalid org: cannot contain ':'" }, 400);
-    // GDPR runbook: purgeOrganization = the same org:<id>: sweep this line used to do inline, now the
-    // ONE documented deletion surface (covers counters/metrics/wfrun/xrun too — see its JSDoc for what
-    // is deliberately NOT deleted: root __audit__ retention, orgless-scope data, EE users [handled below]).
-    const deleted = await purgeOrganization(rootJ, id);       // the org's entire run/memory/queue trail
-    await rootJ.put(ORG_PRE + id, null);                     // remove the record
-    await rootJ.put(BUDGET_PRE + id, null);                     // remove the budget document
+    /**
+     * The organization's data is in EVERY store — its runs in the journal, its threads, messages and
+     * working memory in the memory store, its documents in the vector store, its jobs in the work log —
+     * so the deletion takes the storage (`purgeOrganization`, durable's one plan of what an organization
+     * owns), the one `userErasure` names. It used to sweep the journal alone: a new organization given
+     * the same id then read the old one's threads, messages, working memory and documents (c-erasure
+     * CE-1). Without `userErasure` Studio cannot reach the other stores, and it does not pretend: 409.
+     */
+    if (!opts.userErasure) {
+      return c.json({
+        error: "deleting an organization erases its data in every store, and this Studio has no `userErasure` configured " +
+          '(the root storage your agents run on, and the background erasers). Configure it, or delete the organization ' +
+          "with @gnldev/durable's `purgeOrganization(storage, id, { erasers })`.",
+      }, 409);
+    }
+    const { storage, erasers, memory } = opts.userErasure;
+    // Its registration and budget records go last, inside the plan: a failed deletion leaves an
+    // organization the operator can still see and delete again.
+    const report = await purgeOrganization(storage, id, { ...(erasers ? { erasers } : {}), ...(memory ? { memory } : {}) });
+    const deleted = report.deleted;
     // Prevent orphaned EE users: if members bound to the org aren't also deleted when the org is
     // deleted, their tokens still validate (a ghost of the deleted org remains). Remove members too if opts.users is given.
     let removedUsers = 0;
@@ -3428,7 +3446,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       if (code) return c.json({ error: err.message, code, ...(err.detail !== undefined ? { detail: err.detail } : {}) }, 409);
       // A run whose recorded input the engine will not use (durable recordedInputProblem): 400 + its code.
       const refused = requestRefusal(e);
-      if (refused) return c.json(refused.body, refused.status);
+      if (refused) return c.json(refused.body, refused.status, refused.headers);
       return c.json({ error: err.message ?? String(e) }, 500);
     }
     await audit(c, 'fork', id, { step: body.step ?? 0, newRunId: fork.newRunId });
@@ -3451,7 +3469,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     // Yanlış tetiklenmesi de yapısal olarak imkânsız: `run1_` ile başlayan bir id `batch:` ile
     // başlayamaz, yani türetilmiş bir koşumun onayı ASLA bu dala düşüp "batch kararı kaydedildi"
     // cevabıyla geri dönmez — dönseydi operatör resume beklerken hiç koşmayan bir işi onaylamış olurdu.
-    if (id.startsWith('batch:')) {
+    if (runIdFamilyOf(id) === 'batch') {
       if (typeof rw.put !== 'function') return c.json({ error: 'journal is read-only — decisions cannot be recorded' }, 501);
       // Görünürlük: item-run'ın :input'u yok; herhangi bir tool kaydı varlığı yeter (org-scoped rw → sızıntı yok).
       const anyKey = typeof rw.listKeys === 'function' ? (await rw.listKeys(`${id}:`).catch(() => [] as string[])).length > 0 : true;
@@ -3499,7 +3517,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       if (code) return c.json({ error: err.message, code, ...(err.detail !== undefined ? { detail: err.detail } : {}) }, 409);
       // A run whose recorded input the engine will not use (durable recordedInputProblem): 400 + its code.
       const refused = requestRefusal(e);
-      if (refused) return c.json(refused.body, refused.status);
+      if (refused) return c.json(refused.body, refused.status, refused.headers);
       return c.json({ error: err.message ?? String(e) }, 500);
     }
     // THE RECORD, NOT THE WISH. This used to audit `body.approvals` — what the caller ASKED for —
@@ -3551,7 +3569,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    */
   async function runVisible (id: string): Promise<boolean> {
     if (typeof rw.get !== 'function') return true; // read-only journal: presence cannot be established
-    return (await rw.get(`${id}:input`).catch(() => undefined)) !== undefined;
+    return (await rw.get(runRecordKey(id, 'input')).catch(() => undefined)) !== undefined;
   }
 
   app.post('/runs/:id/cancel', async (c) => {
@@ -3648,7 +3666,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       return c.json({ ok: true, ...report });
     } catch (e: any) {
       const refused = requestRefusal(e);
-      if (refused) return c.json(refused.body, refused.status);
+      if (refused) return c.json(refused.body, refused.status, refused.headers);
       return c.json({ error: String(e?.message ?? e) }, 400);
     }
   });
@@ -3962,7 +3980,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    */
   function reservedIdResponse(c: Context, e: unknown): Response | undefined {
     const f = requestRefusal(e);
-    return f ? c.json(f.body, f.status) : undefined;
+    return f ? c.json(f.body, f.status, f.headers) : undefined;
   }
   /**
    * K1/W1: the SAME mapping as `limitErrorResponse`/`blockedErrorResponse` in @gnldev/server — but Studio is
@@ -5344,15 +5362,16 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
 
     const upto = Math.max(0, Math.min(body.upto ?? stepIds.length, stepIds.length));
     const keep = new Set(stepIds.slice(0, upto));
-    const dst = body.newRunId ?? `${src}:fork:${Date.now()}`;
-    // The fork is BORN its source's — owner record first, before a single row is copied (the one start
-    // point every run kind shares). A copy with no owner record read as an ownerless run: nobody's to
-    // continue but staff's, and never the source owner's.
+    // The fork is BORN its source's — its id admitted and its owner record written before a single row
+    // is copied (the engine's `beginFork`, the birth every fork path takes). A copy with no owner record
+    // read as an ownerless run: nobody's to continue but staff's, and never the source owner's. The id is
+    // the engine's to build: a fork of a workflow tool's run (`wf:<p>:<c>`) keeps a family only the
+    // engine may begin.
     const source = await runOwnerOf(rw as Journal, src);
     if (source.state === 'unreadable') throw source.error;
     if (source.state === 'missing') return c.json({ error: `run '${src}' not found` }, 404);
-    await inheritRunOwner(rw as Journal, src, dst, { workflow: name, forkedFrom: src });
-    const prefix = `${src}:wf:`;
+    const dst = await beginFork(rw as Journal, src, body.newRunId, { workflow: name, forkedFrom: src });
+    const prefix = runRecordPrefix(src, 'wf');
     const keys = await rw.listKeys!(prefix).catch(() => [] as string[]);
     let copied = 0;
     // Composite sub-keys travel with their step (foreach[0], loop#2, nested:child …); which keys those
@@ -5365,7 +5384,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       if (v !== undefined) held.set(rest, v);
     }
     for (const rest of forkedWorkflowStepKeys(held.keys(), stepIds, keep)) {
-      await rw.put!(`${dst}:wf:${rest}`, held.get(rest));
+      await rw.put!(runRecordKey(dst, 'wf', rest), held.get(rest));
       copied++;
     }
     await audit(c, 'fork', src, { workflow: name, upto, newRunId: dst });
@@ -5401,7 +5420,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       return c.json({ error: `workflow '${name}' not found` }, 404);
     }
 
-    const pre = `${runId}:wf:`;
+    const pre = runRecordPrefix(runId, 'wf');
     const jkeys = rw.listKeys.bind(rw);
     const jget = rw.get.bind(rw);
     const start = begin;
@@ -5439,7 +5458,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
     if (!rw.listKeys || !rw.get) return c.json({ error: 'wf run state requires listKeys+get' }, 501);
     const runId = decodeURIComponent(c.req.param('runId'));
-    const pre = `${runId}:wf:`;
+    const pre = runRecordPrefix(runId, 'wf');
     const keys = await rw.listKeys(pre);
     const steps: { stepId: string; output: unknown }[] = [];
     let suspend: unknown = null;
@@ -5482,7 +5501,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       let status: 'completed' | 'suspended' = 'completed';
       if (e.suspend) {
         // _suspend is sticky: if the suspended step's output now exists, the run was resumed and completed.
-        const s = (await rw.get(`${runId}:wf:_suspend`).catch(() => null)) as { stepId?: string } | null;
+        const s = (await rw.get(runRecordKey(runId, 'wf', '_suspend')).catch(() => null)) as { stepId?: string } | null;
         status = s?.stepId && e.steps.has(s.stepId) ? 'completed' : 'suspended';
       }
       const tail = runId.slice(prefix.length);
@@ -5542,7 +5561,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       const need = rows.filter((r) => r.runId && (!r.workflowName || !r.workKey));
       if (need.length === 0) return rows;
       type InputRec = { workflow?: unknown; workKey?: unknown } | undefined;
-      const keys = need.map((r) => `${r.runId}:input`);
+      const keys = need.map((r) => runRecordKey(r.runId, 'input'));
       let recs: InputRec[] = [];
       try {
         recs = typeof rw.getMany === 'function'
@@ -5636,14 +5655,14 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const statusKey = `wfrun:${runId}`;
     const existing = (await rw.get!(statusKey).catch(() => undefined)) as
       { status?: string; stepId?: string; waitId?: string } | undefined;
-    const visible = existing !== undefined || (await rw.get!(`${runId}:wf:_suspend`).catch(() => undefined)) !== undefined;
+    const visible = existing !== undefined || (await rw.get!(runRecordKey(runId, 'wf', '_suspend')).catch(() => undefined)) !== undefined;
     if (!visible) return c.json({ error: `workflow run '${runId}' not found` }, 404);
     if (existing?.status === 'completed') {
       await audit(c, 'workflow.cancel', runId, { cancelled: false });
       return c.json({ ok: true, cancelled: false, note: 'run already completed' });
     }
     const now = Date.now();
-    await rw.put!(`${runId}:wf:_canceled`, { at: now });
+    await rw.put!(runRecordKey(runId, 'wf', '_canceled'), { at: now });
     await rw.put!(statusKey, {
       runId, status: 'canceled', updatedAt: now,
       ...(existing?.stepId ? { stepId: existing.stepId } : {}),

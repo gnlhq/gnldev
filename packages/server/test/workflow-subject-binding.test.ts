@@ -76,10 +76,10 @@ describe('POST /workflows/:name/run — an end user is bound to itself', () => {
     expect((await journal.get<{ resourceId?: string }>('wf-1:input'))?.resourceId).toBe('mallory');
   });
 
-  it("YABANCI özne aynı runId'yle geri gelemez — replay 403, adım çıktısı sızmaz", async () => {
+  it("YABANCI özne aynı runId'yle geri gelemez — replay 404 (yokmuş gibi), adım çıktısı sızmaz", async () => {
     const { api } = await seeded();
     const res = await post(api, '/workflows/w/run', MALLORY, { runId: 'wf-ayse', input: 'hi' });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
     expect(await res.text()).not.toContain('AYSE-SECRET');
   });
 
@@ -88,7 +88,7 @@ describe('POST /workflows/:name/run — an end user is bound to itself', () => {
     // eşleşmeyi kendi sağlardı — kapı var gibi görünüp hiçbir şey yapmazdı.
     const { api } = await seeded();
     const res = await post(api, '/workflows/w/run', MALLORY, { runId: 'wf-ayse', resourceId: 'u-ayse', input: 'hi' });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
   });
 
   it('KENDİ koşumuna geri dönebilir — bağlama bir duvar değil, bir sınır', async () => {

@@ -7,7 +7,7 @@
 // list and a clone read it exactly as they read "no entry".
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, createGnl, STAFF, type Storage } from '@gnldev/durable';
-import { SqliteStorage } from '../../durable/src/sqlite-storage.js';
+import { SqliteStorage } from '@gnldev/durable/sqlite';
 import { AgentMemory } from '../../memory/src/index.js';
 import { createRestApi } from '../src/index.js';
 

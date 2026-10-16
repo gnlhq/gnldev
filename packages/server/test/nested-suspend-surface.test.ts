@@ -46,7 +46,6 @@ function parentMock(): any {
 function childMock(): any {
   return {
     specificationVersion: 'v2', provider: 'mock', modelId: 'm', supportedUrls: {},
-    doStream: async () => { throw new Error('no stream'); },
     doGenerate: async ({ prompt }: any) => {
       const done = (prompt ?? []).filter((m: any) => m.role === 'tool').length;
       return done === 0

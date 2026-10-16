@@ -63,6 +63,8 @@ runs for everything mounted after.
 | POST | `/agents/:name/stream` | **SSE** streaming run (schema below) |
 | POST | `/agents/:name/resume` | `{runId, approvals?}` — the input is read from the journal |
 | GET | `/runs` · `/runs/:id` | Run summaries / journal timeline |
+| GET | `/runs/:id/events` | **SSE** — follow a run already started, by any process, from `Last-Event-ID` (or `?after=`) |
+| POST | `/runs/:id/cancel` | Cancel a run, in whichever process executes it |
 | GET | `/openapi.json` | Generated schema |
 | GET | `/health` | Liveness — process is alive. No storage access. **Unauthenticated** |
 | GET | `/ready` | Readiness — can serve traffic; 503 if the journal is unreachable. **Unauthenticated** |
@@ -93,16 +95,19 @@ readinessProbe: { httpGet: { path: /ready,  port: 3000 } }
 ### SSE schema (`/stream`)
 `event` + JSON `data`: `text-delta {text}` · `tool-call {toolCallId,toolName,input}` · `tool-result {...}` · `error {error}` · `interrupt {interrupts[]}` (when the stream ends) · `done {runId,finishReason,usage}`. The same schema is also used in the `@gnldev/studio` playground → [`@gnldev/client`](../client) connects to both ends.
 
-### Reconnect recovery (resumable SSE, opt-in)
-Every SSE event carries a deterministic, monotonically increasing `id:` field starting at 0. Calling the
-stream again with the same `runId` is deterministic journal replay (the model/tools do NOT actually run
-again) → fullStream produces the same chunk sequence, so the same event sequence comes out with the SAME ids.
+### A run outlives its connection; a reader resumes where it left off
+A run executes apart from the request that started it, on the process's executor. A closed tab, a
+dropped connection or a proxy timeout stops the reading, never the run; only `POST /runs/:id/cancel`
+(or an `abortSignal` your own code passes) stops it. A second request for a run in flight follows the
+same execution — one effect, both get the answer.
 
-The browser's `EventSource` automatically sends the last `id:` it saw via the `Last-Event-ID` header when
-reconnecting after a dropped connection — the server reads this (or `lastEventId` in the body) and for
-events with `id <= lastEventId` it **produces them but does not write them to the client** (production is
-cheap: replay does not call the model/tools). Only events with `id > lastEventId` are sent. If `lastEventId`
-is not given, behavior is identical to before (aside from the added id).
+Every SSE event's `id:` is its place in the run's event log: the event's `seq`, or `seq.offset` in the
+middle of an answer (how much of the next segment's text the reader already holds). The browser's
+`EventSource` sends the last `id:` it saw as `Last-Event-ID` when it reconnects; `/stream` (also
+`lastEventId` in the body) and `GET /runs/:id/events` (also `?after=`) continue right after it — from
+any process, with no gap and nothing sent twice. A reader on the executing process gets each delta as
+it is produced; the store gets the text in segments of about one second, which is what a reader on
+another process reads.
 
 ## Other wire formats and browsers (`surfaces`, `cors`)
 
@@ -158,20 +163,15 @@ model call, no tool, no charge. It is the header to log if you want to know how 
 is retries, and the one to assert on if you are verifying that your client's retry logic is actually
 deduplicating.
 
-**`run_busy` (409) is a narrower condition than it looks.** It does not mean "this id has been used";
-it means the run is executing **right now**, in this process or another one. A per-run lock is taken
-before execution and renewed by a heartbeat while it lasts, and a concurrent second call — a
-double-click, two tabs, a retry racing its original — is declined instead of executing a second time.
-Three consequences:
+**A concurrent second call for an agent run follows it.** A double-click, two tabs, a retry racing
+its original: the second call attaches to the execution in flight — in this process or another — and
+gets the same answer; nothing executes twice. A run that has already **finished** replays (see the
+header above). Workflow runs still answer a concurrent duplicate `409 run_busy` + `Retry-After`: the
+same request is correct, only early.
 
-- The response carries `Retry-After`. The *same* request is correct; it is only early. Honour the
-  delay and send it again — it will replay.
-- A process that dies without releasing holds the run only until the lock's TTL expires (default
-  300 000 ms), after which a retry is admitted and replays from the journal.
-- A long run does not time itself out of its own lock: the heartbeat keeps it alive, so the TTL bounds
-  crash recovery, not run length.
-
-A run that has already **finished** does not produce this at all — it replays (see the header above).
+**On SIGTERM the process drains.** `drainOnSignal()` from `@gnldev/durable` (or `api.drain()`): a new run gets `503 draining`
+with `Retry-After`, the tool a run is executing finishes and is recorded, then the process exits and
+another one continues the run. Give your process manager more time than the drain's 25 s.
 
 **Auth (opt-in, but no silent openness in production):** `createRestApi(config, { auth })` accepts an `AuthProvider` (the free `@gnldev/auth` `roleAuth`, or the paid `@gnldev/auth-ee`) or a backward-compatible `{read, write}` pair. If `auth` is not given, endpoints are open; but under `NODE_ENV=production` this is only possible DELIBERATELY, via `allowOpenAccess: true` — without the flag, setup throws a clear error ("auth required in production"). Outside production, a setup without auth works, with a one-time `console.warn` on the first request, so a silent fail-open cannot survive unnoticed.
 

@@ -9,8 +9,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+**A run no longer lives inside the request that started it.** Every registry run — `gnl.run()`,
+`gnl.stream()` and every door — is executed by the process's executor and followed by its caller. The
+answer still streams on the same connection, word by word. A closed tab, a dropped connection or a
+request timeout leaves the run going; reconnecting, from any process, reads on from where the reader
+left off; a dead process's runs are taken over by a live one, and a live one's never are. Long tool
+work can run in the background (`background: true`) while the conversation goes on. What a run
+promises about a side effect, measured with real processes on Postgres: exactly once where the tool's
+provider accepts the call's idempotency key; where it does not, at most the retry ceiling (a tool's
+`maxRetries`, 3 by default; a queue job's `maxAttempts`, 5) — 2 on a single network partition. A run
+whose call may still report is never declared failed before it has (`waiting-outcome`).
+
 **A new thread no longer reads the store's other runs, and a run list resumes from its last run**
-(ADR-0006). Who may reach a thread is unchanged. When you upgrade from 0.10:
+(ADR-0006). Who may reach a thread is unchanged.
+
+### Upgrading from 0.10
 
 - **Stop every 0.10 process, run `gnl upgrade` (or `await storage.upgrade()`), then start this
   version.** Not a rolling deploy: this version refuses a Sqlite or Postgres store until the upgrade's
@@ -31,8 +44,256 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Deleting a thread now deletes its runs** (see Breaking). If anything of yours reads a thread's runs
   after the thread is gone — an audit export, a bill — read it first. `sweepThreads` deletes through the
   same plan, so an idle BasicMemory thread now leaves with its runs.
+- **Before you stop the 0.10 processes, run `gnl pending`.** A tool call stopped mid-body or a run still
+  executing blocks the upgrade (exit code 2); finish or decide them first — `gnl upgrade` refuses while
+  they remain.
+- **Remove `lock:`** from `gnl.run()` / `gnl.stream()` options and from `chatRoute`. A second call for
+  a run in flight now follows the same execution; it no longer gets `409 run_busy`.
+- **A request's disconnect no longer cancels its run.** If you relied on it, cancel explicitly:
+  `POST /runs/:id/cancel`, or abort the `abortSignal` you pass to `gnl.run()` / `gnl.stream()`.
+- **SSE ids are positions in the run's event log** (`seq` or `seq.offset`). A `Last-Event-ID` saved by
+  a 0.10 client means something else; start that follow over.
+- **Give every store other processes reach a liveness.** `SqliteStorage` and `PostgresStorage` bring
+  their own. A `PostgresStorage` over a pool that does not say where it connects, a custom store, or a
+  store behind a transaction-mode pooler: pass `liveness: await postgresLiveness({ connectionString })`
+  (a direct URL) to `createGnl` and `createWorker`, or `inMemoryLiveness()` for a store only this
+  process reaches. Without it, `createGnl` throws `LivenessRequiredError`.
+- **Shut down with a drain.** Call `drainOnSignal()` in your server entry (`gnl init --host` writes
+  it), and give your process manager more time than the drain's 25 s: pm2 `kill_timeout: 30000`,
+  Kubernetes `terminationGracePeriodSeconds: 30`. pm2's default 1.6 s kills the process mid-drain.
+- **Test doubles: give a mock model a `doStream`.** A run calls the model's stream; the AI SDK's
+  `MockLanguageModelV3({ doGenerate })` throws from its default `doStream` (see Breaking for the fix).
+- **Code that read `failed` as the end of a call that ran out of retries** may now read
+  `waiting-outcome` (runs) or `in-doubt` (queue jobs); see Breaking.
 
 ### Breaking
+
+- **"Not yours" and "not there" are one answer: 404 `run_not_found`.** A stranger used to learn that a
+  run existed from the refusal: on `POST /agents/:name/run` another user's run answered **403**
+  ("belongs to a different resourceId") and an engine-begun id nobody had made (`task:`, `cont:`,
+  `agent:`, `wf:`, `net:`) answered **409** `run_owner_mismatch`. Now both — and an absent id on the
+  read and continue routes — answer the same bytes, `404 {"error":"run not found","code":"run_not_found"}`,
+  with no `X-Gnl-Run-Id`, on every door: `/agents/:name/run`, `/stream`, `/resume`, the chat and AG-UI
+  surfaces and standalone routes, `/workflows/:name/run`, `/runs/:id`, `/runs/:id/events`,
+  `/runs/:id/cancel`, `/workflows/runs/:id/cancel` (A2A already answered "Task not found"). The engine's
+  `run_owner_mismatch` and `run_actor_mismatch` reach a door as this answer too; they stay the engine's
+  codes for an embedded caller. An absent engine-begun id is refused before the budget gate (an
+  over-budget organization answered it 402 and the existing run 403). One mapping does it:
+  `callerConflictAnswer(err, workKey?)` in `@gnldev/durable` now returns the wire `status` and `body`
+  (new fields `status`, `body`, `hidden`), and the door gates read `decideDoorRunAccess` and render
+  `runNotFound()`. Staff (an operator credential) keep the 403 for a run that exists and belongs to a
+  user other than the one they named — they list every run, so there is nothing to hide from them.
+  `thread_owner_mismatch` is unchanged. **Migration:** a client that branched on 403, or on 409
+  `run_owner_mismatch`/`run_actor_mismatch`, from a run route branches on 404 `run_not_found`; the
+  404s that were already there (`/runs/:id`, `/resume`, cancel) gained `code: "run_not_found"` and say
+  `run not found` without the id.
+- **A run is born in one place, and the run-id gate lives there.** `claimRunOwner` — the owner record,
+  a run's first record — now holds the whole gate (the id's spelling, and the engine's mark for an
+  id only the engine begins); the entry points no longer call `admitRunId` themselves. Every writer
+  that used to put rows under an id nobody had begun now goes through that birth or refuses:
+  - `durableTool`, `withDurableModel` and the tools `withIdempotency` wraps, handed any
+    `{ journal, runId }`, birth the run at the first write of one of its records, for the ctx's
+    identity — or refuse the id, with nothing written. Before, their rows made the id read as a run
+    that exists (staff's): Studio's tool test-run approve ran a tool under any `runId` in the request
+    and an engine-begun id it named (`agent:<run>:<call>`) could never be born for its owner. The
+    approve itself now answers `run not found` for a run that does not exist or that the caller may not
+    act on, and acts for the run's recorded owner.
+  - `@gnldev/workflow` (`run`, `runResumable`, `forkWorkflowRun`) calls the journal's new
+    `beginRun` before its first write; every `@gnldev/durable` journal (`InMemoryJournal`,
+    `toJournal(...)`, `withOrg(...)`, `withRootScope(...)`) has it. Studio's managed workflows are born
+    through it, for the request's caller. A store without `beginRun` keeps no owners, as before.
+  - `cancelAgentRun`, `compensateRun`, `cancelWorkflowRun` and a memoized `scoreRun` continue a run;
+    on one that does not exist they throw the new `RunNotFoundError` (`code: 'run_not_found'`) and
+    write nothing. Before, a cancel was a run's first key: the id read as a canceled run nobody could
+    start again.
+  - `resumeRun` of an id that was never born says it has no recorded input (it used to name the
+    spelling rule first).
+  **Migration:** a host that cancels a run before it starts births it first (`claimRunOwner`, or start
+  it); a host that calls `durableTool`/`withDurableModel` with an engine-family id (`task:`, `cont:`,
+  `agent:`, `wf:`, `net:`) or a reserved spelling gets the gate's refusal where it used to get rows; a
+  custom journal handed to `@gnldev/workflow` gains owners by implementing `beginRun` (or by
+  `withBirth(journal)`).
+- **A workflow run is entered through the rules an agent run is: `beginRun` admits, and returns the
+  run's lease.** `beginRun(runId, ctx)` used to keep its own copy of the entry: a run that existed was
+  continued for whoever named it, and the loser of two births racing for one new id ran too. Measured
+  (`raporlar/2026-10-16-verify`): `wf.run` by a second identity on another's run returned its steps'
+  outputs; two identities starting one id both ran, the second inside the first's run; a run deleted
+  while a step was in flight was written back by that step — its output, and a `wfrun:` record saying
+  `completed`; a deleted id could be begun again. Now:
+  - `beginRun` is `admitRun`, the agent door's rule: a run the identity may not act on is refused
+    (`RunOwnerMismatchError`, which a door answers `run_not_found`) before its target is named, and a run
+    written before owners were recorded is staff's — continue such a run with `identity: { kind: 'staff', … }`.
+  - The loser of a birth race is refused in `claimRunOwner` itself, so every birth holds it — workflow,
+    fork, rollover, a primitive born at its first write.
+  - `claimRunOwner` refuses an id whose run was deleted under a live worker (`RunErasedError`), for every
+    kind of run.
+  - `beginRun` returns a lease (`RunLease` / `WorkflowRunLease`): the engine asks `live()` before every
+    step and `settle()` after the attempt's last write. A run deleted meanwhile has what that attempt
+    wrote taken back, and `run`/`runResumable`/`forkWorkflowRun` throw `RunErasedError`.
+  **Migration:** a custom `JournalLike.beginRun` may keep returning nothing (no lease: no erasure
+  check, as before); a host that resumed a pre-owner workflow run with no identity passes `STAFF`.
+- **`rolloverRun`'s `newRunId`, the exported `runNetwork` and `createBatch(...).run` pass the run-id
+  gate (`admitRunId`)** like every other run birth. Before, `rolloverRun(journal, x, { newRunId:
+  'task:P:c' })` wrote the next period's owner record under an engine-begun id nobody had made, the
+  standalone `runNetwork` took any spelling `gnl.runNetwork` refuses, and a batch id or item key named
+  like a record family (`tool`, `ev`, …) put its item run inside another run's records. **Migration:**
+  give the next period, the network run or the batch an id the gate accepts; an id `rolloverRun` picks
+  itself is unaffected.
+
+- **A run id may not contain a record segment the engine lists by prefix, nor be only the root of
+  ids it composes.** One table now says what is written under a run id (`RUN_RECORD_FAMILIES`) and
+  which ids the engine composes (`RUN_ID_FAMILIES`, exported from `@gnldev/durable`); the gate every
+  entry point calls (`admitRunId`) is derived from it. Refused now, beyond `:model`, `:tool` and `:ev`:
+  a segment `:proc`, `:procreport`, `:approval`, `:incident`, `:net` or `:wf` (each is a family something
+  reads as a prefix, so `x:wf:…` was listed as run `x`'s workflow steps), and an id that is only nesting
+  roots (`agent`, `wf`, `net`, `task`, `cont`, or chains of them — `agent` would read every
+  `agent:wf:…` sub-run's records as its own). Ids the engine composes (`agent:wf:<parent>:<call>`) still
+  pass. A run already journalled under such an id can no longer be resumed; `purgeRun` still deletes it.
+
+- **`POST /runs/:id/cancel` always cancels, wherever the run executes, and says how.** The
+  `?durable=` switch is gone: every cancel writes the durable cancel record (the run refuses every later
+  resume), and the answer is `{ ok: true, cancel: 'delivered' }` (it executed in this process and was
+  stopped now) or `{ ok: true, cancel: 'recorded', note }` (another process executes it and stops it at
+  its next event, or nothing does). The old `cancelled` count of this instance's in-flight requests is
+  gone. New: `gnl.cancel(runId)` (the same answer) and `DetachedRuns.cancel()`; `DetachedRuns.stopLocal()`
+  is removed.
+- **A reader's cursor that is not one is refused** (`invalid_cursor`, 400) — on `GET /runs/:id/events`,
+  `/stream`'s `Last-Event-ID` / `lastEventId`, and `after` of `gnl.stream()` / `gnl.follow()` (which throw
+  `InvalidCursorError`). It used to be read as no cursor and the whole run was sent again. Each part
+  of a cursor must be a safe integer.
+- **`withRootScope` and `withSubjectJournal` serve the Journal port only.** A method the port does not
+  have (an adapter's own, such as Sqlite's `hasRunRecords`) is `undefined` through them, and the end
+  user's view no longer answers `listStaleRuns`.
+
+- **`assertNoRunsInFlight(runs, allowInFlight?)` takes a store's `runs` port or a `Storage`** (it read
+  any `{ listKeys, get }`), and lists runs instead of outcome records. `subjectRuns` reports a run parked
+  on a person as `inFlight: false`.
+- **A run id may not contain `:ev`** (as a whole segment), as it may not contain `:model` or `:tool`:
+  it is the event log's record family under a run. `x:ev:1` was read back as events of run `x` and
+  deleted with it. `x:evening`, `ev:x` are fine. A run with such an id written before keeps working
+  only for `purgeRun`. **`task:` and `cont:` ids are the engine's**: a caller naming one that no
+  background call made is refused (`run_owner_mismatch`; at a door, 404 `run_not_found`), instead of being
+  admitted as its own run.
+- **`agent:`, `wf:` and `net:` ids are the engine's too.** `agent:<run>:<call>` (a sub-agent's run),
+  `wf:<run>:<call>` (a workflow run as a tool) and `net:<run>:<step>` (a network step's run) are begun
+  by the engine only, as `task:`/`cont:` are: a caller naming one the engine has not made is refused
+  the same way, before anything is written. Before, a stranger who knew a parent run id took the id
+  first: the owner's sub-agent or workflow tool was refused, the owner's whole network run failed, and
+  the owner's `eraseSubject`/`purgeRun` — which find these ids from the owner's records — deleted the
+  stranger's run. Continuing one that exists is unchanged (resume, approvals, Studio's inbox), and so
+  are runs in an existing journal. The ways through:
+  - **A `NetworkTarget` of your own** (the `runNetwork` primitive) that begins a durable run under the
+    step's id: `run(task, nestedRunId, child)` now gets a third parameter, the network's run arguments
+    for the step — begin the run with them: `runDurable({ ...child, journal, model, prompt: task })`.
+    A target that spells `runId: nestedRunId` alone is refused; a two-parameter target that begins no
+    run under the id is unchanged.
+  - **`forkRun(journal, src, step, newRunId)`** with a `newRunId` in one of these families is refused:
+    leave `newRunId` out (the engine names the fork, `<src>:fork:<time>`, and keeps the family) or pick
+    another id. Studio's workflow fork names its fork the same way, through the new `beginFork` (the
+    birth every fork takes: its id admitted, then the source's owner).
+  - **Your own run ids that start with `agent:`, `wf:` or `net:`** (e.g. `runWorkflow('w', input,
+    { runId: 'wf:42' })`): pick another prefix (`incident:42`). The oncall-triage example now names its
+    workflow runs `incident:<id>`.
+- **@gnldev/queue: `Worker.close()` and `Queue.close()` wait for the job the worker holds.** `stop()`
+  still returns at once (takes nothing new). A handler that never returns keeps `close()` waiting.
+- **A liveness id is unique to one process lifetime.** The `id` given to `sqliteLiveness(dbPath, id)`,
+  `postgresLiveness({ id })` or `inMemoryLiveness(id)` is a prefix: the process's id is `<id>:<uuid>`.
+  Code that compared `liveness.id` with the id it passed in, or probed `isAlive('<id>')`, reads the
+  returned `liveness.id` instead. Two processes given one id no longer collide (the second used to be
+  refused at startup on Postgres).
+- **@gnldev/queue and @gnldev/scheduler: an error that is not the unit's own failure is not an attempt.**
+  A drain (`RunDrainedError`), a lost liveness session (`LivenessUnavailableError`) and a run refused at
+  lock acquisition because it executes elsewhere leave the job or trigger due, its attempt not spent and
+  nothing written; `onError` is not called for them, nor for a job cancelled while it ran. One function
+  answers it for both packages: `attemptEndOf(err)` in @gnldev/durable.
+- **`drainOnSignal` called a second time with other options throws** (it returned the first
+  installation and dropped them). The same options still return the same uninstaller.
+
+- **A registry run executes apart from the call that started it.** `gnl.run()`, `gnl.stream()` and every
+  door start the run on the process's executor (one per process per store, `DetachedRuns`) and follow
+  it. Whose run it is is decided by the engine's own admission, before anything executes or attaches.
+  - A caller leaving no longer stops the run. `abortSignal` (`RunOptions`) cancels the RUN, durably and
+    in whichever process executes it (`cancelAgentRun`), at its next step or tool boundary; it used to
+    abort only this process's call. The doors no longer pass a request's signal to the run: a
+    disconnect only stops the reading. Stop a run with `POST /runs/:id/cancel`, or by aborting a signal
+    you pass yourself. A canceled run's `gnl.run()` rejects with `RunCanceledError`.
+  - `RunOptions.lock` and `@gnldev/chat-adapter`'s `lock` option are removed. One execution per run is
+    the executor's: two concurrent calls for the same run follow the same execution — one effect, both
+    get the answer — where the second used to get `409 run_busy`. Remove `lock:`. Workflow runs and
+    the raw engine (`runDurable` / `streamDurable` with `lock`) still answer `run_busy`.
+  - `gnl.stream()` returns a followed run: `fullStream`, `textStream`, `steps`, `text`, `finishReason`,
+    `usage`, `totalUsage`, `toUIMessageStream()`, `toUIMessageStreamResponse()`,
+    `toTextStreamResponse()`, `consumeStream()` and `cursor()`. It is read from the run's event log,
+    not the AI SDK's `StreamTextResult`: members of that object not listed here are not there. A step
+    produced again after a takeover is dropped from `steps` and `text`; a live `fullStream` may show at
+    most one partial step before it. `gnl.run()`'s result is read from the same log: the last step's
+    text, or the output a processor returned.
+  - An SSE event's `id:` (@gnldev/server) is its place in the run's event log — the event's `seq`, or
+    `seq.offset` in the middle of an answer — not a counter of the reply. `Last-Event-ID` reads on
+    after it, from any process, with no gap and nothing sent twice.
+  - A store other processes reach needs a process liveness (see Upgrading). `createGnl` refuses a
+    store with none (`LivenessRequiredError`); it used to run as if no other process existed.
+  - A generate-only test model (no `doStream` at all) is streamed from its generate answer, in one
+    piece. A model that has a `doStream` is always streamed (next entry).
+  - The streaming model step's periodic copy (`<runId>:proc:__gnl_stream_checkpoint:<step>`) is no
+    longer written. Nothing read it, and it was 71–94% of a streamed run's write-ahead log.
+  - A store's `close()` stops the executor running on it, after its runs settle.
+
+- **A call whose attempts never reported is no longer declared failed at its retry ceiling** when its
+  tool can still report — it has `recover()`, or is `idempotent: true`. The run waits instead: a new
+  run state, `waiting-outcome` (`RunState`), and a new error, `OutcomeUnknownError` (code
+  `outcome_unknown`, a `RetryLimitExceededError` too, so `instanceof RetryLimitExceededError` still
+  matches). A door answers it 409 with `resumable: true`, not 422. `gnl.run()` throws it, as it throws
+  for a run waiting on a person. Code that read `failed` / `retry_limit_exceeded` as the end of such a
+  run reads `waiting-outcome` / `outcome_unknown` now; the run continues on its own when the call's
+  result is recorded (see Fixed). A tool with neither still fails at its ceiling, as before.
+- **@gnldev/queue: a job whose last attempt never reported reads `in-doubt`, not `failed`, at
+  `maxAttempts`** (`JobStatus.status`). It is not started again, and `retryJob` retries it like a dead
+  letter. A job whose handler threw is still `failed`. A handler that finishes after its worker lost
+  the job now records the job `done` (`late: true`), over an `in-doubt` or `failed` dead letter.
+
+- **A registry run calls the model's `doStream`.** Every run executes on the stream path (design
+  decision D5), so a model that has a `doStream` is streamed — always. A provider model is unaffected.
+  A test double that implements only `doGenerate` and has no `doStream` keeps working: it is streamed
+  from its generate answer, in one piece. But the AI SDK's `MockLanguageModelV3({ doGenerate })` HAS a
+  `doStream` — one that throws "Not implemented" — so a test suite built on it now sees that error where
+  0.10 returned the answer. Give the mock a `doStream` too:
+
+  ```ts
+  import { MockLanguageModelV3, simulateReadableStream } from 'ai/test';
+  const usage = { inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
+                  outputTokens: { total: 1, text: 1, reasoning: undefined } };
+  const model = new MockLanguageModelV3({
+    doGenerate: async () => ({ /* … as before … */ }),
+    doStream: async () => ({
+      stream: simulateReadableStream({ chunks: [
+        { type: 'text-start', id: 't' }, { type: 'text-delta', id: 't', delta: 'hi' }, { type: 'text-end', id: 't' },
+        { type: 'finish', finishReason: { unified: 'stop', raw: 'stop' }, usage },
+      ] }),
+    }),
+  });
+  ```
+
+  There is no fallback from a failing `doStream` to `doGenerate`: on a real provider error it would call
+  (and bill) the model twice.
+
+- **@gnldev/server: `drain()` drains the process, and resolves `{ drained }`.** It used to stop the
+  run executors only. It is now `drainProcess()` (@gnldev/durable): the queue and the scheduler in the
+  process take nothing new too, and it waits for the jobs they hold. It takes `{ deadlineMs }`.
+
+- **@gnldev/queue: a worker on a store other processes reach needs a process liveness.** `createWorker`
+  asks the holding process whether a job's lease is held, not the lease's age (see Fixed).
+  `SqliteStorage` and `PostgresStorage` answer for themselves. A `PostgresStorage` over a pool that does
+  not say where it connects, or a custom store, is refused (`LivenessRequiredError`, or the first
+  `runOnce` rejecting) — pass `liveness: await postgresLiveness({ connectionString })`, or
+  `inMemoryLiveness()` for a store only this process reaches.
+
+- **A process liveness answers for one store.** A store's liveness is its own (the executor's and the
+  queue worker's, settled once by `storeLiveness()`), not one installed for the process from whichever
+  store opened first (see Fixed). A store with none of its own — a `PostgresStorage` over a pool that
+  does not say where it connects, a custom store — no longer borrows another store's: it is refused as
+  above; pass `liveness:`. `installProcessLiveness()` still stands in for such a store. A
+  `PostgresStorage` holds one connection beyond its pool while its liveness is open (one per database).
 
 - **Deleting a thread deletes its runs, and everything else the thread owns, in one call** — one model
   of what a run, a thread, a person and an organization own (`model.ts` in `@gnldev/durable`), and one
@@ -126,6 +387,211 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   back: pass `nextCursor` back, or use `order: 'desc'` for newest first.
 
 ### Fixed
+
+- **An erasure on Postgres could fail as a deadlock victim while a run took back its deleted turn**:
+  `retractBatch` locked the batch marker, then its rows, without the thread's lock, while a thread
+  deletion (lock, rows, then markers) held them the other way round. It now takes the thread's lock
+  first, like every other write to the thread (real Postgres, under the shared suite's load).
+
+- **A unit of work was listed for `gnl pending` only after it had started**: its record in the store
+  was written in the background, so another process could read "nothing blocks" while a job's handler
+  already ran, and `gnl upgrade` could go ahead under it (CI, Postgres under load). The record is now
+  written before the work starts.
+
+- **Erasing a running detached run deleted a run named `<id>:ev-delivered…`** (audit R2-1). The
+  executor's cleanup deleted the delivery mark as a prefix; it now deletes it by its exact key, and the
+  event log by the family prefix the gate keeps exact.
+- **A stranger could take a background call's task id first through the workflow or network door**
+  (audit R2-2, and the same hole on `runNetwork`, `forkRun`, `replayRun`, `resumeRun` and the
+  executor's `start`). `task:`/`cont:` ids are begun only with the engine's mark on the arguments it
+  built; a caller may continue such a run (its owner record judges), never begin one. One gate,
+  `admitRunId`, is called by every entry point instead of a check on the agent door only.
+- **Purging run `x` deleted records of runs whose id extends it**: the request window of a run named
+  `x:args-…`, and the network sub-runs of a run named `x:5` (`net:x:5:…`). Run-keyed families outside a
+  run's namespace are now deleted by owner, and a network's sub-runs are found from its own route
+  records.
+- **Run `x` read as in flight while a run named `x:y` had a running call**, and `readIdemLedger({ runId: 'x' })`
+  listed `x:y`'s refusals. Both now read `x`'s own families only.
+- **`gnl pending` kept the process alive after it answered**: it never closed the store, so on Postgres
+  the answer printed at 0.46 s and the process ended at 10.5 s (the pool's idle timeout) — every call in
+  a deploy script paid 10 s. It now closes the store however it ends; `gnl upgrade` now does too on
+  every path (before, a step that threw, or a store with no steps, left it open).
+- **One Sqlite process frozen mid-write stopped every other process from even reading the store.** A
+  process stopped (SIGSTOP, a paused VM) inside a write keeps the database's write lock until it runs
+  again, and opening a store wrote a row each time, so `gnl pending` and `gnl upgrade` died at open with
+  `database is locked` after the 15 s busy wait (exit 1). Opening a store whose schema is current now
+  writes nothing, and closing one no longer waits for a writer to checkpoint the WAL: read-only commands
+  answer at once while such a process is frozen. A WRITE from another process still waits for the lock
+  and fails after the busy wait — SQLite has one writer, and a stopped one keeps it.
+- **A run streamed with `streamDurable` directly was not work in hand**: a drain answered `drained`
+  over its tool body. It is now held for the run's own life, as `runDurable`'s run is: the engine reads
+  the run's stream to its end itself, so the run finishes — and stops being held — whether its reader
+  reads it, cancels it, or never reads it. Held until the reader's callbacks instead, a reader that went
+  away kept the run "executing" for the life of the process: a drain never finished and `gnl pending`
+  listed a run nothing executed. A caller's `abortSignal` still stops the run.
+- **Work in hand ends on every ending, and a wait never waits for itself.** A queue job that closed its
+  own worker (`worker.close()` from a handler), or a job, a fire or a tool body that drained the process,
+  waited for itself and never settled. Every wait for the work in hand — a drain, a worker's close, an
+  executor's drain or close — now waits for everything except the units its caller runs inside.
+- **A queue job or a scheduler fire refused by ANOTHER run's lock was not counted as an attempt.** Only
+  the unit's own run, refused at its lock, is a deferral; any other run being busy is an attempt of the
+  unit (its code ran first). Before, a handler that called a run held by a frozen process ran its effect
+  again on every poll and never reached `maxAttempts`. `RunBusyError` now carries the `runId` it refused.
+- **Erasing one run of a thread took back other runs' late reports.** A late report written for an
+  erased run is now removed alone from a window's row (thread, request, cross-run); the row goes whole
+  only when everything on it went with what was deleted. Before, another live run's proof that a call's
+  effect happened went with it, and the call read `in-doubt`.
+- **Two processes opening one Sqlite file through two hard links did not see each other alive.** The
+  liveness lock directory is now keyed by the file's device and inode (`.<dev>-<ino>.gnl-procs` beside
+  the real file), and the first opener creates the file so every opener reads one identity.
+- **A cancel stopped only the requests this server instance held** — a run executing in another
+  process (another worker, a takeover) ran on to `completed`, every token billed, and the cancel
+  answered `200 ok`. The executor now obeys the cancel record itself: read before each event it writes
+  and, while an answer streams, at most every 250 ms; a process sharing a signal (`pgRunSignal`) hears
+  it at once. A door that only writes the record (A2A, Studio) stops the run the same way.
+- **The root scope and an end user's view handed out rows through `readRange`** (and the end user's
+  view through `getMany`, `getCounters`, `listOwnerRecords`, `listStaleRuns`) that their `get` hides.
+  Every read by key of a view now follows its one key rule (`hidingView`); a port method added later
+  does not compile until it is classified.
+- **A follower in another process could end without the run's last events** (no `finish`, no
+  `completed`, or a missed `waiting-approval`): the end is now read from the log after the execution
+  record says nobody executes the run.
+- **A second caller attached to a run executing here was told `from: 0`** until the execution had read
+  its log, and read an earlier execution's ending (`failed` for a retry that completed). Where an
+  execution starts is now its record's `from`, from the moment it exists.
+- **A process whose takeover could not continue a run (an agent this deployment lacks) held it
+  `running` forever** and nobody else could take it. A failed resume now takes the failed launch's path:
+  a run that had begun is parked with the reason (`gnl pending` names it); one that never began has its
+  record removed.
+- **A cursor longer than a safe integer replayed the whole run** to a reader that said it held
+  everything (`99999999999999999999999` was read as `1e+23`).
+
+- **Unwinding a run that made a background call refunded twice.** `compensateRun(parent)` handed the
+  tool's `compensate()` the launcher's answer (`{ status: 'started', taskId }`) as if it were the
+  effect's result, and unwinding the task as well called `compensate()` again, with the real result and
+  another idempotency key. A background call is now its task's call: unwinding the parent condemns the
+  task and undoes the task's call, under the task's keys, so unwinding the parent, the task, or both is
+  one compensation with one key. A call whose task never reached its call is not reported.
+- **A call's late report is read by every reader of the call.** An attempt that finished its body after
+  it lost the call keeps its success beside the call's record. It was kept under the late attempt's own
+  run and call id: another run reaching the same `thread`/`run`-window record never saw it and could run
+  the effect again. It is now kept beside the record (`<run>:proc:late-<call>`, or `late-` in the
+  window's own family), and the unwind and a background task's ending read it too: a failed call with a
+  late report is undone with the reported result instead of being `uncertain`, and a task whose call
+  failed beside one ends `completed`.
+- **A late success no longer replaces a person's `denied`** (or a `reflected` nudge). The run was told
+  the answer and went on from it; the success is kept beside it as a late report, and `compensateRun`
+  undoes the effect.
+- **A late report could outlive the run's deletion.** Written while the run (or its parent, or the
+  thread or request whose window record it belongs to) was being deleted, it stayed — with the call's
+  output. It is now written through one fenced writer, which takes it back when its owner was erased.
+- **`adoptIntoOrg` refused a deployment whose run waited on a person** and advised to "let the runs
+  finish", which only a person can do. A run parked on a person is not in flight: it writes nothing until
+  answered. Adoption, `subjectRuns` and a thread's deletion now ask one rule; the refusal names the runs
+  that may still write, says how to stop them (`cancelAgentRun`), and counts the parked ones apart.
+- **A SIGTERM drain dead-lettered a queue job as `failed`, and a scheduled fire as `failed`, on their last
+  attempt** — the run said "another process continues it" and nobody did. They are released: the job or
+  trigger stays due and another process continues the same run (measured with real processes on Sqlite
+  and Postgres: the tool body once, the job `done`).
+- **`gnl pending` / `gnl upgrade` read "nothing blocks" while a run was in its model step, or a worker held
+  a job**, and the upgrade went ahead. What a process holds — a run, a job, a fire — is now listed from
+  the same set its drain waits for: from the process itself, and from any other through a record the
+  holder writes while it holds the unit (`__hand__:` in the platform journal), judged by its process's
+  liveness. A frozen holder still blocks; a dead one does not, and its record is reclaimed by the next
+  process holding work in that store. The erasure model deletes these records with the run they name.
+- **`gnl pending` listed a call as in doubt although its late report said the body had finished** — an
+  operator was asked to decide an effect the store already knew, and the upgrade was blocked for it. It
+  now reads a call through the call's one reader (`readCallOutcome`), as the engine does.
+- **A drain did not wait for a job taken by a `runOnce()`/`drain()` called by hand, or a fire of a
+  `pollScheduler` called by hand** — they are held like the loops' own.
+- **A process restarted under the configured liveness id of one that crashed holding a job read that job
+  as its own, and nobody ever took it over** (Sqlite and Postgres). See Breaking: an id is now unique to
+  one lifetime.
+- **The lock files of a Sqlite process that died (`<db>.procs/<id>.lock` and its journal) were never
+  removed.** The probe that finds the process dead now removes them while it holds their lock.
+- **A queue job cancelled while its handler ran read `failed`** when the handler stopped on `ctx.signal`
+  (on its last attempt). It reads `cancelled`, as `cancelJob` says.
+- **A job's state could be written under an erased person's id**: a late report (`qlate`), or the holder's
+  result, landing after the erasure of its owner. Every write of a job's state now reads the job's fence
+  after it (`qown`, which `jobEraser` deletes first) and takes the write back when the job is gone.
+- **A run named `x:ev:…` showed its text to the reader of run `x`, and erasing a running `x` deleted it**
+  — the run-id gate now refuses the event family too (one gate, every entry point).
+- **A stranger who knew a parent run id and a tool call id could take a background call's task or
+  continuation id first**; the owner's task never ran and the agent was never woken. Such an id is now
+  born only by the engine from the recorded call.
+- **Two paths to one Sqlite file (a symlink) ran a job twice**: the lock directory was found by the path
+  string, so each process judged the other's live holder dead. It is now keyed by the file's real path.
+- **`Queue.close()` returned while its job ran**; closing the store then released the lock and another
+  worker ran the handler a second time. It now waits for the held job.
+- **A drain did not wait for a run started with `runDurable`**: SIGTERM reported a clean drain and
+  exited with the tool body cut off. Such a run is now held by the process until it settles.
+- **@gnldev/queue: a job whose handler was known to have finished (`qlate`) was started again** and
+  ended failed. The late report is now read before a new attempt and before a failure is written —
+  never over another live holder.
+- **On a SQL_ASCII database with a linguistic collation, every prefix range matched nothing** (erasure
+  included): the collation probe used a character SQL_ASCII cannot hold, and its error was read as
+  "byte ordered". The probe is now ASCII-only, and a probe that fails takes `COLLATE "C"`.
+
+- **An organization whose id is not ASCII (`café`) listed none of its threads on a SQL_ASCII Postgres,
+  and deleting it left its memory rows.** A prefix was compared at its length in code points; a
+  SQL_ASCII database (`initdb --locale=C` with no encoding) counts bytes, where `é` is two. A prefix
+  whose two lengths differ is now compared at both — each comparison is exact, and only the database's
+  own can match. Present since organizations; found when CI first ran this test on its `C` leg.
+
+- **A process whose Postgres liveness session was cut ran a new run beside the process that took it
+  over, and answered a 500.** Measured with `pg_terminate_backend` on the session: a run started right
+  after was executed here and by another process's sweep, which read the id as dead (model calls 1 and
+  1); attaching to another process's live run threw the driver's "Client has encountered a connection
+  error" to the caller. Now a process that cannot prove its own lock starts, attaches to and takes over
+  nothing, and a question about another process is refused rather than guessed —
+  `LivenessUnavailableError`, which every door answers **503 `liveness_unavailable`** with
+  `Retry-After` (`docs/errors/liveness_unavailable.md`). The liveness reopens by itself under a **new**
+  process id (the old one is dead for good: the others may have acted on it), and a tool call or a queue
+  lease stamped with the old id is no longer this process's — its body does not start.
+
+- **A process on two databases had its live claims in the second taken over.** Postgres scopes advisory
+  locks to a session's database, and a process had one liveness, made from the first store it opened:
+  a claim it wrote into another database (a database per tenant) named an id with no lock there, and
+  that database's worker ran the body beside the live one (measured: 1 execution beside the holder,
+  0 now). A stamp is now written and judged by the liveness of the store it is in.
+
+- **A closed store kept a connection to its database**, the liveness session nothing ended
+  (`DROP DATABASE` refused). `close()` ends the store's own liveness after its executor stops.
+
+- **Closing a store under a run being settled raised an unhandled rejection** ("Cannot use a pool after
+  calling end on the pool"), which Node turns into an exit. The executor now waits for its runs to settle
+  before the store under them closes.
+
+- **A run whose call's effect happened no longer ends `failed`.** When a call reached its retry ceiling
+  (`maxRetries`) with its last attempts never reporting, it was given up at once — but an attempt judged
+  gone because its process was cut off from the store (a partition) can still be in the tool's body and
+  land the effect afterwards. Measured on Postgres with real processes and three partitions in a row:
+  the run ended `failed` 20 times in 20, and the effect then landed once. Now, when the tool can still
+  report, the run waits for the call's outcome (`waiting-outcome`; `gnl pending` lists the call in doubt)
+  and continues from the call's recorded result whenever it arrives: written by the late attempt
+  itself, by `recover()` (asked again by the executor's sweep, backing off from `outcomeAskMs`, 2 s by
+  default, 12 times at most), or by an operator in `gnl pending`. No timer decides the outcome, and no
+  attempt is started past the ceiling, so the count of executions under a partition is unchanged. A
+  late attempt's success is recorded over the claim of a later attempt that is itself gone (never over
+  a live one); one that finds the call already settled is kept beside it as evidence
+  (`<runId>:proc:late-<toolCallId>`) and logged. The same rule settles a queue job (see Breaking).
+
+- **A call's idempotency key is decided once and kept in its record.** The key a tool's body,
+  `recover()` and `lookup()` are handed is written into the call's claim and carried by every record
+  written over it; a retry, a takeover and `compensateRun` read it back instead of deriving it again.
+  `compensateRun` derived its own: for an `idempotency: 'args'` call it asked `recover()` about
+  `<run>:<toolCallId>` while the body had carried `<request>:<tool>:<hash>` — the provider answered
+  "never happened" for an effect that had, and it was not unwound. Records written before keep the old
+  derivation.
+
+- **@gnldev/queue: a worker frozen past its lease kept running the job while a second worker ran it
+  too.** A process stopped by the scheduler, a GC pause or a VM migration stopped renewing; past `ttlMs`
+  another worker took the job and ran the handler, and the first finished its own: the side effect
+  twice. Measured with separate OS processes and `SIGSTOP` inside the handler, on SQLite and Postgres:
+  `effect B, effect A` before, `effect A` now. A run lock (the queue's lease, its type slots, the
+  scheduler's fire lock) now names its holding process while a liveness is installed, and is held
+  exactly while that process lives: a frozen holder keeps it, a dead one loses it at once (a `SIGKILL`ed
+  worker's job is taken in about a second instead of after `ttlMs`).
 
 - **A run deleted while its worker was still running came back — and ran its side effect again.**
   The erasure order (`cancelAgentRun`, wait until `subjectRuns` lists nothing `inFlight`,
@@ -359,6 +825,92 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`JournalLike.beginRun?(runId, ctx)`** (@gnldev/workflow) and **`withBirth(journal)`,
+  `existingRun(journal, runId)`, `RunNotFoundError`** (@gnldev/durable): the birth a package without a
+  durable dependency reaches through the journal it is handed, and the refusal of an operation on a run
+  that does not exist.
+- **`gnl pending --wait` and `gnl upgrade --wait` end: `--timeout <dur>`, default `10m`** (the syntax of
+  `gnl sweep --older-than`: `45s`, `30m`, `2h`). Before, the wait had no bound: a holder that is alive but
+  frozen (SIGSTOP, a paused VM — alive to every liveness check) held a deploy script forever. When the
+  timeout passes nothing is canceled: the list is printed with the process holding each item and since
+  when, the exit code is 2 (the answer without `--wait`), `--json` adds `timedOut: true`, and `gnl
+  upgrade` runs no step past the format steps. The "waiting for N running…" line now comes every 15 s,
+  not four times a second. `RunningWork` (`pendingWork`) gains `holder` and `since`.
+- **`gnl.follow(runId, { after })`**, and **`GET /runs/:id/events`** (@gnldev/server) on it: read a run
+  already started — by any process — from a reader's cursor, without starting or joining anything.
+  The door applies its own rule for who may read the run. A run that finished before it had an event
+  log is replayed from its journal.
+- **`stream(agent, { after })`**: a stream that continues after a cursor (`cursor()` of an earlier
+  stream of the run).
+- **A run's event log** (`<runId>:ev:<seq>`, event schema v1: `encodePart` / `decodeEvent`,
+  `formatCursor` / `parseCursor`). The store gets a run's text in segments of about one second
+  (`coalesceMs`); a reader in the executing process gets each delta as it is produced. It is scoped
+  and erased with the run. Measured on Postgres against a segment per delta: 17–41 KB of write-ahead
+  log per run instead of 123–355 KB, the same runs per second.
+- **`Journal.readRange(prefix, { after, limit, desc })`** (optional): the keys after a cursor in one
+  index range. InMemory, Sqlite and Postgres implement it, and `withOrg` and `toJournal` bridge it. A
+  follower of a 30-second answer listed 54 243 keys without it, none with it. A journal without it
+  reads its event log by key.
+- **`createGnl({ liveness })`** and `processLiveness`, `storeLiveness`, `postgresLiveness`,
+  `sqliteLiveness`, `inMemoryLiveness`: what a process holds while it lives — a Postgres session
+  advisory lock, a Sqlite file lock — and what another process asks before it takes over a run, a
+  tool call or a job. A frozen process keeps what it holds; a dead one holds nothing from the moment
+  it is gone.
+
+- **`gnl pending`, and `gnl upgrade` waits for it.** What the store still has in hand, in three groups:
+  calls in doubt (a side-effecting call stopped mid-body by a process that is gone) and running work
+  BLOCK a shutdown or an upgrade; runs awaiting an approval do not. A call in doubt is put to its tool's
+  `recover()` first, with the key the call carried — an effect it finds is recorded as the result, one
+  it says never happened is left for the run to re-run. In a terminal a person decides the rest: done
+  (recorded on the result as `declaredBy`), cancel the run, or leave it to the version that started it;
+  a running run can be canceled, an approval rejected. Without a terminal nothing is asked: the list is
+  printed (`--json` too) and the exit code is 2 while something blocks. `--wait` waits while only
+  running work blocks. `gnl upgrade` runs its steps only when nothing blocks (exit 2 otherwise);
+  `--list` / `--dry-run` are not held back. In code: `pendingWork`, `recoverInDoubt`,
+  `declareInDoubtDone`, `cancelPendingRun` (@gnldev/durable).
+
+- **One shutdown path: `drainProcess()` and `drainOnSignal()` (@gnldev/durable).** On SIGTERM a process
+  finishes what it holds and takes nothing new: a new run is refused with 503 `draining` and
+  `Retry-After` by every door; a run's running tool finishes and is recorded, no new step starts, the
+  run is released for another process; the queue takes no new job and the job in a handler runs to its
+  end; the scheduler fires nothing. Then the process exits — 0 when everything finished, 1 when
+  `DRAIN_DEADLINE_MS` (25 s) passed first. Nothing is written to the store. `gnl init --host <x>`
+  writes `drainOnSignal()` into `src/server.ts` and an `ecosystem.config.cjs` whose `kill_timeout`
+  (30 s) is above the drain — pm2's own 1.6 s killed the process mid-drain. Another process manager
+  needs the same margin (Kubernetes: `terminationGracePeriodSeconds` > 25).
+
+- **@gnldev/queue: `createQueue(storage, handlers)`** — enqueue, and a worker that runs the jobs started
+  in this process (`worker: false` when the workers run elsewhere). A job still waiting after
+  `NO_WORKER_NOTICE_MS` (10 s) with no worker polling its store is reported once per type, instead of
+  waiting without a word. `createWorker` takes `liveness`.
+
+- **Background tools: `gnlTool(t, { background: true })`.** The model is answered at once with
+  `{ status: 'started', taskId }` and the turn goes on. The body runs as its own durable run
+  (`task:<runId>:<toolCallId>`) on the process's executor — claim, crash ladder and `recover()` as
+  ever, taken over only from a dead process. When it ends, its result is written to the thread once and
+  the agent is woken once, by a continuation run (`cont:<runId>:<toolCallId>`) that waits for the
+  thread's live turn before it writes. Both run as the parent run's recorded owner, in its organization,
+  and are deleted with it (`RUN_DEPENDENTS.children`). Default unchanged: a tool without `background`
+  holds the model as before. Read by the registry (`createGnl`); a bare `runDurable`/`streamDurable`
+  and a sub-agent's run wait. Proven across real processes on Sqlite (Postgres for erasure):
+  `a-background-tool-across-processes.test.ts`.
+  - The wake is the task's ENDING (`LaunchEnd`, below): a store error or a drain during it releases the
+    task and the next sweep ends it again — woken once, not dropped (`a-background-tool-wake.test.ts` W1,
+    W2, Sqlite and Postgres).
+  - Continuations take the thread's turn (`xthr:<thread>:turn`, compare-and-set, deleted with the
+    thread): two tasks of one thread that end together answer one after the other (W4).
+  - A task stopped for a human (`side_effect_retry_blocked`) is answered on its own id
+    (`stream(agent, { runId: 'task:…', approvals })`): the call is continued as the task, and the
+    engine's admission judges the caller against its owner — a stranger is refused (W3).
+- `Launch` results may carry `end(state, signal)` (type `LaunchEnd`): work of the run's ending, called by
+  whichever execution ends the run completed or failed, before its execution record goes; a throw
+  releases the record to the next sweep.
+- `purgeThread(storage.runs, …)` deletes the thread's runs: a storage's own run journal is listed
+  through its `listRuns`. It found none before, and deleted only the rest of the thread. A journal that
+  lists no runs at all is refused before anything is deleted.
+- A run made by another run (a sub-agent, a background task or continuation) is now stopped by its
+  parent's erasure fence as by its own (`ErasureBaseline.lineage`), and its parent is recorded with its
+  owner at birth.
 - **`@gnldev/durable/testing`**: `journalConformance(name, make, { describe, it, timeout?, exactClaim?, pageWalk? })`
   registers the journal conformance scenarios with any test runner. It covers the key-value contract,
   the racing claim, which records name a run and its status, paging, a person's and a thread's runs
@@ -406,6 +958,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   old way. `SchemaCheckResult.missingIndexes`.
 
 ### Known limits
+- Sqlite liveness: two HARD LINKS to one database file in DIFFERENT directories still keep two lock
+  directories (the directory lives beside the file, the one place every opener on any host or container
+  sharing the volume can reach). A file with more than one link is said at startup. Open the database by
+  one name; a symlink is fine.
+- What a side effect can do under a network partition is bounded, not prevented. A process cut off
+  from its store (a partition, a frozen virtual machine) is taken for dead once its session is gone —
+  Postgres drops it after its keepalive, ~25 s — and another process may run the call again while the
+  first, if it wakes, finishes its own. Measured with real processes on Postgres, 20 trials a
+  scenario: a provider that accepts the call's idempotency key applied every effect once; one that
+  does not saw 2 on a single partition, and at most the retry ceiling on partitions in a row (a tool's
+  `maxRetries`, 3; a queue job's `maxAttempts`, 5). A process that is only frozen, its session alive,
+  is never taken over (Postgres and Sqlite, 140 trials).
+- Background tools: a caller who can guess a parent's run id and tool call id can start a run under a derived id first (as with
+  `agent:<runId>:<toolCallId>` today): the parent's owner then gets no continuation (no data reaches
+  the caller). A user turn that starts while a continuation runs follows the concurrent-turn rule (send
+  order, completion order).
 - `adoptIntoOrg` moves the root work log's namespaces whole (every store alike). Owned jobs and events
   live in the root log with their owner in the id (`~o~<org>:<user>:…`), so adopting into `acme2` also
   moves `acme`'s owned records into `org:acme2:…`, and a root person's (`~o~:<user>:…`) stops matching

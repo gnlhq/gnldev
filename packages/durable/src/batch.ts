@@ -36,6 +36,7 @@ import { resolveApprovals, hasRunProbe } from './run.js';
 import { readXid, xidPlanOf, xidWhen, amountsDifferOf } from './xid.js';
 import { identityUnusableReason } from './semantic-dup.js';
 import { BatchPlanMismatchError } from './errors.js';
+import { batchItemRunId } from './run-id-grammar.js';
 import type { AnyTool } from './types.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { CREATE_BATCH_NAMES } from './option-names.js';
@@ -102,7 +103,7 @@ function assertSafeId(kind: string, v: string): void {
   if (!SAFE_ID.test(v)) throw new Error(`@gnldev/durable: batch ${kind} '${v.slice(0, 40)}' must match ${SAFE_ID} — it becomes part of journal keys and runIds.`);
 }
 
-const itemRunId = (batchId: string, key: string) => `batch:${batchId}:${key}`;
+const itemRunId = batchItemRunId;
 const itemToolCallId = (key: string) => `item:${key}`;
 const planKey = (batchId: string) => `batch:${batchId}:plan`;
 const reportKey = (batchId: string) => `batch:${batchId}:report`;
@@ -229,6 +230,9 @@ export function createBatch(journal: Journal, cfg: BatchConfig) {
         { batchId, expectedToken: opts.planToken, actualToken: token },
       );
     }
+    // Every item's id is composed — and held to the spelling rule (`batchItemRunId`) — before the plan
+    // that names them is written. Each item is then born through the one birth (`admitRun` below).
+    for (const { key } of keyed) itemRunId(batchId, key);
     // Plan first-wins; claim KAYBI ≠ 409 (hakem tuzak 2): token eşitse bu, raporun meşru replay'idir.
     const won = await claim(journal, planKey(batchId), { v: 1, token, at: Date.now(), itemKeys: keyed.map((k) => k.key) });
     if (!won) {

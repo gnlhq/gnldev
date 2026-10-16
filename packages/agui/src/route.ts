@@ -401,10 +401,11 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
       }
       // FAZ-4 caller-conflict family (K9: durable's single map — this route was the consumer the
       // first cut forgot; a critical-profile input/actor/swept refusal must not collapse to a bare 400).
-      const conflict = callerConflictAnswer(e);
+      // Rendered as durable answers it: "not your run" reads exactly as an absent run (404 `run_not_found`).
+      const conflict = callerConflictAnswer(e, declared);
       if (conflict) {
         if (conflict.ownership) markRefusal(c.req.raw, 'ownership', { detail: conflict.code });
-        return c.json({ error: conflict.error, code: conflict.code, detail: withWorkKey(conflict.detail, declared) }, 409);
+        return c.json(conflict.body, conflict.status as 409);
       }
       const blocked = blockedErrorCode(e);
       if (blocked) {
@@ -416,9 +417,9 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
         if (blocked === 'run_busy') res.headers.set('Retry-After', '5');
         return res;
       }
-      // A root-scope thread id under `org:` — durable's one answer for it (400 thread_id_reserved).
+      // A request the engine refused before any work — durable's one answer for it (400 thread_id_reserved, 503 draining).
       const reserved = requestRefusal(e);
-      if (reserved) return c.json(reserved.body, reserved.status);
+      if (reserved) return c.json(reserved.body, reserved.status, reserved.headers);
       if (name === 'RunLimitExceededError' || name === 'ToolLoopDetectedError') {
         const code = name === 'RunLimitExceededError' ? LIMIT_ERROR_CODES.runLimitExceeded : LIMIT_ERROR_CODES.toolLoopDetected;
         return c.json({ error: e.message, code, detail: e.detail, resumable: true }, 422);

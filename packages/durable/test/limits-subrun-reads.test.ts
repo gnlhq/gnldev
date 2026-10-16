@@ -23,6 +23,7 @@
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, runKeys, RunLimitExceededError } from '../src/index.js';
 import { enforceStepLimits } from '../src/limits.js';
+import { streamFromGenerate } from './mock.js';
 
 const NESTED = 'sub-1';
 
@@ -136,7 +137,7 @@ describe('fan-out spend after the parent keeps working', () => {
         content: [{ type: 'text', text: 'sub' }], finishReason: 'stop',
         usage: bigUsage, warnings: [], response: { modelId: 'gpt-4o' },
       }),
-      doStream: async () => { throw new Error('generate-only'); },
+      doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
     };
     // A ceiling the sub-agent alone does not hit, so it completes and leaves its counters behind.
     const expert = createAgentTool({ journal, model: childModel, limits: { maxCostUsd: 1000 } } as never);
@@ -156,7 +157,7 @@ describe('fan-out spend after the parent keeps working', () => {
         }
         return { content: [{ type: 'text', text: 'done' }], finishReason: 'stop', usage: small, warnings: [], response: { modelId: 'gpt-4o' } };
       },
-      doStream: async () => { throw new Error('generate-only'); },
+      doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); },
     };
 
     // A ceiling high enough that the run completes — the point is what is VISIBLE afterwards.

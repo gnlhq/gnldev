@@ -6,7 +6,7 @@ let wfAnonCounter = 0; // runWorkflow's anon-fallback uniqueness within a proces
 import type { ToolSchemaRuleLike } from './types.js';
 import { decodeStepRecord } from './step-record.js';
 import { stepCountIs, tool as aiTool, jsonSchema } from 'ai';
-import { runDurable, streamDurable, assertRunIdSafe } from './run.js';
+import { runDurable, streamDurable } from './run.js';
 import type { StreamBreach } from './run.js';
 import { resolveModel, withModelFallback, type FallbackCandidate } from './model-router.js';
 import { delegationTool, runDelegated, type ChildFrame, childOutcome } from './agent-tool.js';
@@ -14,7 +14,7 @@ import { assertNoCallerSystemMessage } from './request-body.js';
 import { runNetworkAdmitted as runNetworkCore, type NetworkResult, type NetworkTarget } from './network.js';
 import { acquireRunLock } from './run-lock.js';
 import { claim as journalClaim, runKeys } from './journal.js';
-import { argsHash, derivedRunId, isDerivedRunId, DEPLOYMENT_SCOPE, type WorkScope, type WorkScopeKind } from './hash.js';
+import { argsHash, derivedRunId, DEPLOYMENT_SCOPE, type WorkScope, type WorkScopeKind } from './hash.js';
 import { RunBusyError, runBusyMessage, RunSweptError, RunInputMismatchError, RunOwnerMismatchError, ThreadOwnerMismatchError } from './errors.js';
 import { admitThreadRun } from './thread-owner.js';
 import { user, staff, callerOf, callerFromResourceId, userIdOf, resolveCaller, identityOf, runIdentity, admitRun, childIdentity, requestOf, type Caller, type RunIdentity } from './run-identity.js';
@@ -34,7 +34,24 @@ import type { ModelInput, ToolSet } from './types.js';
 import type { Processor } from './processor.js';
 import type { RunLimits } from './limits.js';
 import { refuseUnknownNames } from '@gnldev/options';
-import { refuseCreateGnlNames, refuseRunNames, WORKFLOW_RUN_NAMES } from './option-names.js';
+import type { DetachedRuns, DetachedRunsOptions, ExecRecord, Launch, LaunchEnd } from './detached.js';
+import { executorFor } from './executors.js';
+import { followedRun } from './followed-run.js';
+import { lastRunEvent, readCursor } from './run-events.js';
+import { streamable } from './generate-as-stream.js';
+import { errorOf } from './event-codec.js';
+import { admitAgentRun } from './run.js';
+import { RunCanceledError } from './cancel.js';
+import { runOwnerOf } from './run-identity.js';
+import { orgScopeOf } from './organization.js';
+import type { ProcessLiveness } from './process-liveness.js';
+import { refuseCreateGnlNames, refuseRunNames, WORKFLOW_RUN_NAMES, TOOL_DURABILITY_NAMES, CANCEL_RUN_NAMES } from './option-names.js';
+import { deferredTaskRunId, deferredContinuationRunId } from './journal.js';
+import { minted, withMintOf, runIdFamilyOf, isDerivedRunId, runRecordKey } from './run-id-grammar.js';
+import { erasureBaseline, assertNotErased } from './erasure-fence.js';
+import { encodeTaskSpec, decodeTaskSpec, taskModel, taskOutcome, continuationPrompt, takeThreadTurn, toolCallIdOf, type TaskSpec } from './deferred.js';
+import type { AnyTool } from './types.js';
+import type { GnlToolContext } from './identity-types.js';
 
 // Registry/DI: a single top-level `createGnl({...})` factory. Register agents/tools, run durably by name.
 
@@ -473,6 +490,16 @@ export interface WorkflowRunResult {
 }
 
 export interface CreateGnlConfig {
+  /**
+   * This process's liveness (process-liveness.ts): what its executor holds while it lives, and what
+   * another process asks before continuing its runs. Default: the one installed for the process, else the
+   * storage's own (`storage.processLiveness()`: a Sqlite file lock, a Postgres session); a store only this
+   * process reaches (in memory) needs none. Behind a transaction-mode pooler pass
+   * `await postgresLiveness({ connectionString: <direct URL> })`.
+   */
+  liveness?: ProcessLiveness;
+  /** Tuning of the process's run executor (detached.ts), taken from the first registry on a store. */
+  detached?: Pick<DetachedRunsOptions, 'sweepMs' | 'pollMs' | 'coalesceMs' | 'outcomeAskMs' | 'signal' | 'onComplete'>;
   /** Storage (RunJournal + optional MemoryStore/...). Preferred over `journal` (composite + memory). */
   storage?: Storage;
   /** Low-level journal (if no storage). runDurable works with this; `storage` is required for memory. */
@@ -690,15 +717,6 @@ export interface RunOptions {
   /** W1 (opt-in): per-run cost cap + loop detection — INHERITED by sub-agents. */
   limits?: RunLimits;
   /**
-   * Run-lock for multiple workers
-   * running the SAME runId concurrently. `runDurable` supported this, but the registry (createGnl/
-   * gnl.run) did NOT forward it → the lock was silently dropped in the high-level API. Without the lock,
-   * different workers' distinct toolCallIds bypass the toolCallId-keyed tool-claim (two LIVE runs of the
-   * same runId) → only tools marked `idempotency: 'args'` get deduped. The lock SERIALIZES the run: only
-   * one runs, the other gets RunBusyError. (Not needed for single-worker usage.)
-   */
-  lock?: { owner: string; ttlMs: number; /** FAZ-7 stream-only: renewal cap (default 60min) — the abandonment bound; test-injectable. */ maxHoldMs?: number };
-  /**
    * These protections lived only on the low-level runDurable args and were unreachable through
    * createGnl — the documented main path could not enable strict tool-policy, strict replay, timeouts, or
    * model-step exclusivity. Opt-in; forwarded to runDurable/streamDurable (toolPolicy also to sub-agents).
@@ -727,15 +745,19 @@ export interface RunOptions {
    */
   onBlocked?: (breach: StreamBreach) => void | Promise<void>;
   /**
-   * P0.2 thread a request's AbortSignal into generation — forwarded AS-IS to
-   * runDurable/streamDurable, which don't destructure it (see the `...rest` spread ~run.ts:650/885) so it
-   * lands directly in `generateText`/`streamText`'s own `abortSignal` option. Lets a caller (e.g.
-   * @gnldev/chat-adapter's chat route, wired to `c.req.raw.signal`) stop token generation on client disconnect
-   * WITHOUT touching the resumable-SSE replay story: an abort just ends generation early — the journal
-   * keeps whatever prefix already completed, and a later call with the SAME runId resumes/replays exactly
-   * as it would have without an abort ever happening.
+   * CANCELS THE RUN — not the call. A run executes apart from the call that started it (detached.ts):
+   * the caller leaving (a closed tab, a dropped connection) does not stop it, and a door never wires a
+   * request's own signal here. Aborting this signal is the caller saying "stop": the run is canceled
+   * durably, in whichever process executes it — as `gnl.cancel(runId)` does: at once here, at its next
+   * event elsewhere.
    */
   abortSignal?: AbortSignal;
+  /**
+   * `stream()`: the reader's cursor — what `cursor()` of an earlier stream of this run said (a door's
+   * `Last-Event-ID`: an event's `seq`, or `seq.offset` mid-answer). The returned stream continues after it;
+   * nothing the reader has is sent again.
+   */
+  after?: number | string;
 }
 
 /**
@@ -873,11 +895,11 @@ function toolsDeclaringEffectClass(config: CreateGnlConfig): string[] {
  */
 const CHILD_RUN_POLICY = {
   runId: 'own', workKey: 'own', prompt: 'own', messages: 'own', model: 'own', temperature: 'own', topP: 'own',
-  system: 'own', tools: 'own', lock: 'own', replay: 'own', trustRecordedInput: 'own',
+  system: 'own', tools: 'own', replay: 'own', trustRecordedInput: 'own',
   threadId: 'frame', resourceId: 'frame', caller: 'frame', approvals: 'frame', abortSignal: 'frame',
   context: 'inherit', limits: 'inherit', toolPolicy: 'inherit', strictInput: 'inherit', conflictLedger: 'inherit',
   auditOnReject: 'inherit', replayDisclosure: 'inherit', channel: 'inherit', tombstonePolicy: 'inherit', actor: 'inherit',
-  timeouts: 'inherit', exclusiveModelStep: 'inherit', onBlocked: 'inherit',
+  timeouts: 'inherit', exclusiveModelStep: 'inherit', onBlocked: 'inherit', after: 'own',
 } as const satisfies Record<keyof RunOptions, 'inherit' | 'own' | 'frame'>;
 
 /** A child's run options: what it inherits from the parent's, plus its own. */
@@ -968,7 +990,7 @@ export function createGnl(config: CreateGnlConfig) {
     const candidates: FallbackCandidate[] = [];
     for (let i = 0; i < chain.length; i++) {
       const m = chain[i]!;
-      candidates.push(typeof m === 'string' ? { spec: m, model: await resolveModel(m) } : { spec: `#${i}`, model: m });
+      candidates.push(typeof m === 'string' ? { spec: m, model: await resolveModel(m) } : { spec: `#${i}`, model: streamable(m) });
     }
     return withModelFallback(candidates, journal, runId);
   }
@@ -1021,12 +1043,13 @@ export function createGnl(config: CreateGnlConfig) {
           // unique within a completion, not across runs.
           // Ajan İÇİNDEN doğan iş akışı: ebeveynin kimliğini devralır. "Org düzeyi iş, öznesi yok"
           // muafiyeti bu doğum yolu için yanlış — bu, belli bir kullanıcının koşumundan çıkıyor.
-          const r = await runWorkflow(wfName, input ?? {}, {
+          // The workflow run's id is the engine's (`wf:<parent>:<call>`): begun here, from the parent's call.
+          const r = await runWorkflow(wfName, input ?? {}, minted({
             runId: nestedAgentRunId(options?.parentRunId, options?.toolCallId, 'wf'),
             // The calling run's identity (options.gnl) — a child run is its parent's caller.
             parent: identityOf(options),
             ...(identity?.actor ? { actor: identity.actor } : {}),
-          });
+          }));
           return r.suspended
             ? { suspended: true, stepId: r.stepId, reason: r.reason, runId: r.runId }
             : { output: r.output, runId: r.runId };
@@ -1051,7 +1074,8 @@ export function createGnl(config: CreateGnlConfig) {
         sub.description ?? `Delegate a task to the '${subName}' agent`,
         journal,
         async (task, nestedRunId, frame) => {
-          const r = await runAgent(subName, childRunOptions(parentOpts, { runId: nestedRunId, prompt: task, context: rc }), frame);
+          // The sub-agent's id is the engine's (`agent:<parent>:<call>`): begun here, from the parent's call.
+          const r = await runAgent(subName, minted(childRunOptions(parentOpts, { runId: nestedRunId, prompt: task, context: rc })), frame);
           return { text: r.text, interrupts: r.interrupts, steps: r.steps };
         },
         { agent: subName },
@@ -1060,8 +1084,366 @@ export function createGnl(config: CreateGnlConfig) {
     return out;
   }
 
+  /**
+   * What a COMPLETED agent run gets after it ended, whichever path ran it (a direct `run()`, a sub-agent):
+   * its scorers (memoized per run — exactly once), and the learning pass (not for a sub-agent's run).
+   */
+  async function afterCompletedRun(name: string, opts: RunOptions, runId: string, result: any, who: { resourceId?: string; threadId?: string; frame?: ChildFrame } = {}): Promise<void> {
+    const a = agent(name);
+    const effectiveResourceId = who.resourceId;
+    const effectiveThreadId = who.threadId;
+    const frame = who.frame;
+    // C4 runtime scoring: only on a COMPLETED run (not suspended). Each scorer is memoized to the
+    // journal → doesn't rerun on resume/repeat calls (exactly-once), returns the same score.
+    // P1.2: opt-in sampling (AgentConfig.scorerSampling) gates the WHOLE block — a skipped run writes
+    // NOTHING (durableProcessorStep, and hence the `proc:eval:*` journal key, is never reached), and the
+    // decision is deterministic per runId so resume/replay can't flip it (see shouldSampleScorers).
+    if (a.scorers?.length && result.interrupts.length === 0 && shouldSampleScorers(runId, effectiveScorerRate(a))) {
+      const scores: Record<string, unknown> = {};
+      // The sample and the memo are the run-scoring owner's (scoring.ts: runScoreSample,
+      // scoreRunMemoized) — the same calls scoreRun makes, so scoring this run again from Studio
+      // replays this memo instead of asking the judge twice. The output is the owner's too: the run's
+      // journaled returned output when an output processor changed it (result.text is that same text).
+      // RAG context isn't available here — see ScorerLike.
+      const sample = await runScoreSample(journal, runId, { output: (result as any).text ?? '' });
+      for (const s of a.scorers) {
+        scores[s.name] = await scoreRunMemoized(journal, runId, s, sample);
+      }
+      (result as any).scores = scores;
+      // P2-skor a SECOND, ADDITIVE metrics pass — recordRunMetrics (run.ts's
+      // completion choke points) already ran and cannot see `scores` (computed HERE, after it runs —
+      // see the comment on that call below). Best-effort/non-blocking: a scoring bug or a journal
+      // without incrBy/applyBatch must never fail an otherwise-successful run. Only reached on the
+      // sampled-IN path (shouldSampleScorers above) — see recordRunScores's JSDoc for the resulting bias.
+      recordRunScores(journal, runId, name, scores as Record<string, number | { score: number }>).catch(() => {});
+    }
+
+    // HERMES generate: the learning pass runs only on a COMPLETED run (an interrupted run is an
+    // unfinished story — no lesson yet), memoized AT-MOST-ONCE per runId inside generateFor, and
+    // best-effort by contract: a learning failure must never fail an otherwise-successful run.
+    // stream() has no auto-pass (a stream returns before completion); hosts call
+    // gnl.suggestions.generateFor from their finish hook when they want streamed runs to learn.
+    // A sub-agent's run applies the person's lessons (above) but does not learn: what it did comes back
+    // in its parent's answer, and the parent's run is the one the person had — one learning pass per
+    // request, not one per delegation, and no lesson drawn from a task a model wrote for another.
+    if (suggestionsApi && config.suggestions?.generate && result.interrupts.length === 0 && !frame) {
+      try {
+        await suggestionsApi.generateFor({
+          runId,
+          resourceId: effectiveResourceId,
+          threadId: effectiveThreadId,
+          ...(typeof opts.prompt === 'string' && opts.prompt ? { prompt: opts.prompt } : {}),
+          output: (result as any).text ?? '',
+        });
+      } catch { /* best-effort — see the contract above */ }
+    }
+
+  }
+
+  // ── DETACHED: an agent run executes apart from the call that started it (detached.ts) ──────────
+  //
+  // `stream()` and `run()` start the run on this process's executor for the store (executors.ts) — or
+  // join it, when it already executes here or in a live process — and return a FOLLOW of it (`stream`)
+  // or a wait for its end (`run`). Whose run it is, is the engine's own admission (`admitAgentRun`),
+  // asked before anything is executed or joined. A process that dies mid-run has its runs continued by
+  // another, from the journal.
+  function executor(): Promise<DetachedRuns> {
+    return executorFor(journal, {
+      resume: (rec) => resumeLaunch(rec),
+      // The store's liveness: given, else the store's own (the storage's, or the run journal's own when
+      // only a journal was handed over).
+      liveness: {
+        ...(config.liveness ? { given: config.liveness } : {}),
+        own: () => {
+          const source = (config.storage ?? journal) as { processLiveness?: () => ProcessLiveness | Promise<ProcessLiveness> };
+          return source.processLiveness?.();
+        },
+      },
+      ...(config.detached ? { options: config.detached } : {}),
+    });
+  }
+
+  /**
+   * How this process continues a run it did not start (a takeover, an approval that arrived elsewhere):
+   * as its RECORDED owner, from its recorded input — nothing of the original call is needed, and nothing
+   * about a person is kept outside the run's own records.
+   */
+  async function resumeLaunch(rec: ExecRecord): Promise<Launch> {
+    const agentName = (rec.meta as { agent?: string } | undefined)?.agent;
+    if (!agentName) throw new Error(`@gnldev/durable: run '${rec.runId}' names no agent to continue it with`);
+    const owner = await runOwnerOf(journal as any, rec.runId);
+    if (owner.state !== 'owned') throw new Error(`@gnldev/durable: run '${rec.runId}' has no owner to continue it as`);
+    // A background call's task or continuation is continued from what made it (deferred.ts), never
+    // from a call: the spec its launcher recorded, the task's own record.
+    const deferred = (rec.meta as { deferred?: string } | undefined)?.deferred;
+    if (deferred) {
+      const parentRunId = (owner.record as { parentRunId?: unknown } | undefined)?.parentRunId;
+      if (typeof parentRunId !== 'string') throw new Error(`@gnldev/durable: run '${rec.runId}' names no run it was made for`);
+      const toolCallId = toolCallIdOf(rec.runId, deferred === 'task' ? 'task' : 'cont', parentRunId);
+      if (!toolCallId) throw new Error(`@gnldev/durable: run '${rec.runId}' is not a background call's run`);
+      if (deferred === 'task') return taskLaunch(agentName, await taskArgs(agentName, rec.runId, await taskSpecOf(parentRunId, toolCallId)));
+      const c = await continuationFor(agentName, parentRunId, toolCallId);
+      if (!c) throw new Error(`@gnldev/durable: run '${rec.runId}' has no ended task to answer`);
+      return (signal) => streamDurable({ ...c.args, abortSignal: signal });
+    }
+    const threadId = (owner.record as { threadId?: unknown } | undefined)?.threadId;
+    const args = await streamArgs(agentName, { runId: rec.runId, caller: owner.owner, ...(typeof threadId === 'string' ? { threadId } : {}) });
+    return (signal) => streamDurable({ ...args, abortSignal: signal });
+  }
+
+  // ── BACKGROUND TOOLS (types.ts `background`, deferred.ts) ─────────────────────────────────────────
+  //
+  // A background tool reaches the model as a LAUNCHER: an idempotent call that starts the task run and
+  // answers `{ status: 'started', taskId }`. The task executes the tool's body; its end wakes the agent
+  // with ONE continuation run. Each is started through this process's executor and admitted by the
+  // engine as the parent's recorded owner; nothing here decides whose a run is.
+
+  /** The tool a launcher stands for. */
+  const BACKGROUND_BODY = Symbol('gnl.backgroundBody');
+  /**
+   * The spec a task executes, recorded by its launcher under the PARENT (the run that made the call, and
+   * whose erasure takes it) before the task exists — a key under the task's own id would be a row of a
+   * run with no owner yet. A takeover of the task reads it there; so does every reader of the call's
+   * outcome, for which it makes the call its task's (call-outcome.ts `callRecordKey`).
+   */
+  const taskSpecKey = runKeys.taskSpec;
+
+  function withBackgroundTools(name: string, tools: ToolSet): ToolSet {
+    let out: ToolSet | undefined;
+    for (const [toolName, t] of Object.entries(tools)) {
+      if ((t as AnyTool | undefined)?.background !== true) continue;
+      // The launcher keeps the tool's surface (description, schema) and its `confirm` — a person is asked
+      // before the task starts — and none of its durability: the body's declarations are the task's.
+      const launcher: Record<string | symbol, unknown> = { ...t };
+      for (const k of TOOL_DURABILITY_NAMES) delete launcher[k];
+      Object.assign(launcher, {
+        idempotent: true,
+        ...((t as AnyTool).confirm !== undefined ? { confirm: (t as AnyTool).confirm } : {}),
+        execute: async (input: unknown, options: { toolCallId?: string; gnl?: GnlToolContext }) =>
+          ({ status: 'started', taskId: await startTask(name, toolName, input, options) }),
+        [BACKGROUND_BODY]: t,
+      });
+      (out ??= { ...tools })[toolName] = launcher as AnyTool;
+    }
+    return out ?? tools;
+  }
+
+  /** The launcher's work: record the spec, start the task (or find it started). Returns its run id. */
+  async function startTask(name: string, toolName: string, input: unknown, options: { toolCallId?: string; gnl?: GnlToolContext }): Promise<string> {
+    const parent = options.gnl?.identity;
+    if (!parent?.runId || !options.toolCallId) throw new Error(`@gnldev/durable: background tool '${toolName}' was called outside a run`);
+    const runId = deferredTaskRunId(parent.runId, options.toolCallId);
+    const spec: TaskSpec = { gnlTask: 1, tool: toolName, parentRunId: parent.runId, toolCallId: options.toolCallId, requestRunId: requestOf(parent), input };
+    // First writer wins: a repeated or replayed call executes the spec the first one recorded.
+    await journalClaim(journal, taskSpecKey(spec.parentRunId, spec.toolCallId), spec);
+    const args = await taskArgs(name, runId, await taskSpecOf(spec.parentRunId, spec.toolCallId));
+    const runs = await executor();
+    const scope = orgScopeOf(journal);
+    await runs.start(withMintOf({ runId, ...(scope !== undefined ? { scope } : {}), admit: () => admitAgentRun(args), meta: { agent: name, deferred: 'task' }, launch: taskLaunch(name, args) }, args));
+    return runId;
+  }
+
+  async function taskSpecOf(parentRunId: string, toolCallId: string): Promise<TaskSpec> {
+    const spec = decodeTaskSpec(JSON.stringify((await journal.get(taskSpecKey(parentRunId, toolCallId))) ?? null));
+    if (!spec) throw new Error(`@gnldev/durable: run '${parentRunId}' recorded no background call '${toolCallId}'`);
+    return spec;
+  }
+
+  /** The parent's recorded owner and thread — whom its background call's runs are for, and where they answer. */
+  async function parentRecordOf(parentRunId: string, runId: string) {
+    // A run made by a deleted run is deleted with it: refused before anything of it is built.
+    await assertNotErased(journal, runId, await erasureBaseline(journal, parentRunId));
+    const owner = await runOwnerOf(journal as any, parentRunId);
+    if (owner.state !== 'owned') throw new Error(`@gnldev/durable: run '${parentRunId}' has no owner for its background call`);
+    const threadId = (owner.record as { threadId?: unknown } | undefined)?.threadId;
+    return { owner: owner.owner, ...(typeof threadId === 'string' ? { threadId } : {}) };
+  }
+
+  /** The task's run: the agent's run settings, the task model, the one tool, no memory, as the parent's owner. */
+  async function taskArgs(name: string, runId: string, spec: TaskSpec): Promise<any> {
+    const { owner, threadId } = await parentRecordOf(spec.parentRunId, runId);
+    const base = await streamArgs(name, { runId, caller: owner, prompt: encodeTaskSpec(spec), ...(threadId ? { threadId } : {}) });
+    const launcher = base.tools?.[spec.tool] as Record<symbol, unknown> | undefined;
+    const t = launcher?.[BACKGROUND_BODY] as AnyTool | undefined;
+    if (!t) throw new Error(`@gnldev/durable: agent '${name}' has no background tool '${spec.tool}' to run task '${runId}' with`);
+    const { background: _b, confirm: _c, ...body } = t;
+    // Built by the engine from the parent's recorded call: the one place a task's run is begun from.
+    return minted({
+      ...base,
+      model: taskModel(),
+      tools: { [spec.tool]: body },
+      caller: runIdentity(owner, runId, { ...(threadId ? { threadId } : {}), parentRunId: spec.parentRunId, ...(spec.requestRunId ? { requestRunId: spec.requestRunId } : {}) }),
+      // The call was already gated in the parent (guard, confirm); the task speaks to nobody.
+      memory: false, system: undefined, guard: undefined, processors: undefined, approvals: undefined,
+      stopWhen: stepCountIs(2),
+    });
+  }
+
+  /**
+   * The task's run, whose ENDING wakes the agent (detached.ts `LaunchEnd`): the executor calls it when an
+   * execution ends the task — the one that ran it, or one that only closes it after its process died —
+   * and releases the task to the next sweep when it throws, so a wake that a store error or a drain
+   * interrupted is done again instead of dropped.
+   */
+  function taskLaunch(name: string, args: any): Launch {
+    return async (signal) => {
+      const result: any = await streamDurable({ ...args, abortSignal: signal });
+      const spec = decodeTaskSpec(args.prompt)!;
+      const end: LaunchEnd = (_state, s) => wake(name, spec, s);
+      return Object.assign(result, { end });
+    };
+  }
+
+  /**
+   * The continuation of a task that ended: its question (the result, from the task's record), and its
+   * run's arguments — the agent's own run on the parent's thread, as the parent's owner. `undefined`
+   * when the task has not ended.
+   */
+  async function continuationFor(name: string, parentRunId: string, toolCallId: string) {
+    const runId = deferredContinuationRunId(parentRunId, toolCallId);
+    const taskRunId = deferredTaskRunId(parentRunId, toolCallId);
+    const { owner, threadId } = await parentRecordOf(parentRunId, runId);
+    const outcome = await taskOutcome(journal, taskRunId, toolCallId);
+    if (!outcome) return undefined;
+    const spec = await taskSpecOf(parentRunId, toolCallId);
+    const base = await streamArgs(name, { runId, caller: owner, prompt: continuationPrompt(taskRunId, spec.tool, outcome), ...(threadId ? { threadId } : {}) });
+    return { runId, threadId, args: minted({ ...base, caller: runIdentity(owner, runId, { ...(threadId ? { threadId } : {}), parentRunId }) }) };
+  }
+
+  /** Wakes the agent once: when the thread has no live turn, the continuation is started (or found started). */
+  async function wake(name: string, spec: TaskSpec, signal: AbortSignal): Promise<void> {
+    const taskRunId = deferredTaskRunId(spec.parentRunId, spec.toolCallId);
+    const runs = await executor();
+    const scope = orgScopeOf(journal);
+    // A refusal here (the conversation was deleted meanwhile) ends the task with it: the executor reads
+    // the erasure and settles the task away.
+    const c = await continuationFor(name, spec.parentRunId, spec.toolCallId);
+    // Ended while its call may have run (its claim is there, its outcome is not): not ended — given back,
+    // and the next execution takes the call up where the crash ladder says. A call that never ran is
+    // decided by `taskOutcome` (the task failed).
+    if (!c) throw new Error(`@gnldev/durable: background task '${taskRunId}' ended before its call was settled`);
+    if (c.threadId) {
+      await takeThreadTurn(journal, c.threadId, { runId: c.runId, parentRunId: spec.parentRunId, waiting: taskRunId, baseline: await erasureBaseline(journal, spec.parentRunId) },
+        (ids) => runs.executing(scope, ids), { pollMs: config.detached?.pollMs ?? 200, signal });
+    }
+    await runs.start(withMintOf({
+      runId: c.runId, ...(scope !== undefined ? { scope } : {}),
+      admit: () => admitAgentRun(c.args), meta: { agent: name, deferred: 'continuation' },
+      launch: (s) => streamDurable({ ...c.args, abortSignal: s }),
+    }, c.args));
+  }
+
+  /**
+   * The run a call names, when it is a background call's task or continuation that exists: its arguments
+   * as what made it builds them (the task's spec and model, the continuation's question), with the
+   * CALLER's identity, actor and approvals — so the engine's admission judges this caller against the
+   * run's recorded owner, as for any run (a stranger is refused there), and an approval reaches the run it
+   * names. `undefined` for any other run (and for an id nobody has made: that is a run like any other).
+   */
+  async function derivedRunFor(name: string, requested: any): Promise<{ kind: 'task' | 'continuation'; args: any } | undefined> {
+    const runId: string = requested.runId;
+    const family = runIdFamilyOf(runId);
+    const kind = family === 'task' ? 'task' : family === 'cont' ? 'continuation' : undefined;
+    if (!kind) return undefined;
+    const owner = await runOwnerOf(journal as any, runId);
+    const parentRunId = owner.state === 'owned' ? (owner.record as { parentRunId?: unknown } | undefined)?.parentRunId : undefined;
+    if (typeof parentRunId !== 'string') return undefined;
+    const toolCallId = toolCallIdOf(runId, kind === 'task' ? 'task' : 'cont', parentRunId);
+    if (!toolCallId) return undefined;
+    const base = kind === 'task'
+      ? await taskArgs(name, runId, await taskSpecOf(parentRunId, toolCallId))
+      : (await continuationFor(name, parentRunId, toolCallId))?.args;
+    if (!base) return undefined;
+    const place = { ...(base.caller?.threadId ? { threadId: base.caller.threadId } : {}), parentRunId, ...(base.caller?.requestRunId ? { requestRunId: base.caller.requestRunId } : {}) };
+    return {
+      kind,
+      args: {
+        ...base,
+        caller: runIdentity(requested.caller, runId, place),
+        ...(requested.actor !== undefined ? { actor: requested.actor } : {}),
+        approvals: requested.approvals,
+      },
+    };
+  }
+
+  /** Starts (or joins) the run a call names, and follows it from the caller's cursor. */
+  async function startFollowed(name: string, opts: RunOptions, surface: 'stream' | 'run') {
+    const { abortSignal, after, ...rest } = opts;
+    if (surface === 'run') refuseRunNames(`run('${name}')`, rest);
+    // The reader's cursor, read before anything is started: one that is not a cursor is refused.
+    const from = after === undefined ? undefined : readCursor(after);
+    const requested = await streamArgs(name, rest);
+    // A background call's run named by a caller (an answer to the task's question for a human): it is
+    // continued as what it is — from what made it — for THIS caller, whom the admission below judges.
+    const derived = await derivedRunFor(name, requested);
+    const args = derived?.args ?? requested;
+    // A background call's task and continuation are begun by the engine only, from the parent's recorded
+    // call (`derived` above carries its mark); the run-id gate at their birth (`claimRunOwner`, reached
+    // through `admitAgentRun`) refuses a caller naming one the engine has not made — before, it was
+    // admitted as an ordinary run owned by that caller, so a stranger who knew a parent run id and a tool
+    // call id took the id first and the owner's task never ran (audit B1).
+    const runId: string = args.runId;
+    // Whether this call lands on a run that already had its input (a retry, a resume): a door's
+    // `X-Gnl-Idempotency-Status: replay`. Read before the admission writes a new run's owner.
+    const priorInput = await journal.get<{ prompt?: unknown; messages?: unknown }>(runKeys.input(runId)).catch(() => undefined);
+    const priorRun = priorInput !== undefined && (priorInput.prompt !== undefined || priorInput.messages !== undefined);
+    const runs = await executor();
+    const scope = orgScopeOf(journal);
+    const started = await runs.start(withMintOf({
+      runId, ...(scope !== undefined ? { scope } : {}),
+      admit: () => admitAgentRun(args),
+      meta: { agent: name, ...(derived ? { deferred: derived.kind } : {}) },
+      resumeIntent: opts.approvals !== undefined,
+      launch: derived?.kind === 'task' ? taskLaunch(name, args) : (signal) => streamDurable({ ...args, abortSignal: signal }),
+    }, args));
+    // The caller's "stop": the run is canceled, durably, wherever it executes (see RunOptions.abortSignal).
+    if (abortSignal) {
+      const cancel = () => {
+        void runs.cancel({ runId, ...(scope !== undefined ? { scope } : {}), reason: String((abortSignal.reason as Error | undefined)?.message ?? abortSignal.reason ?? 'aborted') }).catch(() => undefined);
+      };
+      if (abortSignal.aborted) cancel(); else abortSignal.addEventListener('abort', cancel, { once: true });
+    }
+    // A run that ended before runs had an event log (or whose log is gone) has nothing to follow: its
+    // answer is replayed from its journal instead — a completed run calls no model and runs no tool.
+    if (started.state === 'finished' && !(await lastRunEvent(journal, runId))) {
+      const replayed: any = await streamDurable({ ...args });
+      Object.defineProperty(replayed, '__gnlPriorRun', { value: priorRun });
+      return { args, followed: replayed };
+    }
+    const followed = followedRun(runs, { runId, ...(scope !== undefined ? { scope } : {}), journal, after: from ?? started.from, state: started.state });
+    Object.defineProperty(followed, '__gnlPriorRun', { value: priorRun });
+    return { args, followed };
+  }
+
+  async function stream(name: string, opts: RunOptions) {
+    return (await startFollowed(name, opts, 'stream')).followed;
+  }
+
+  /**
+   * The run's result when it has ended (or waits on a human): its text (the RETURNED output when an
+   * output processor changed it), steps, interrupts, finish reason and usage. A run that failed rejects
+   * with its error — same name and code as the error the engine threw.
+   */
   async function run(name: string, opts: RunOptions) {
-    return runAgent(name, opts);
+    const { args, followed } = await startFollowed(name, opts, 'run');
+    const [ending, steps, finishReason, usage] = await Promise.all([followed.ended, followed.steps, followed.finishReason, followed.usage]);
+    // A run that stopped for a human because nothing could settle a call (side_effect_retry_blocked): it
+    // waits (pending lists it), and the caller is told why, as before — with the engine's error.
+    if (ending?.state === 'waiting-approval' && ending.error) throw errorOf(ending.error);
+    // A call whose outcome is unknown (OutcomeUnknownError): the run waits for its result and continues
+    // from it on its own (detached.ts); the caller is told why now, as for a run waiting on a human.
+    if (ending?.state === 'waiting-outcome') throw errorOf(ending.error ?? { message: `run '${followed.runId}' waits for a call's outcome`, name: 'OutcomeUnknownError' });
+    if (ending?.state === 'canceled') throw ending.error ? errorOf(ending.error) : new RunCanceledError(followed.runId);
+    if (ending?.state === 'failed') throw errorOf(ending.error ?? { message: `run '${followed.runId}' failed` });
+    const returned = await journal.get<{ text?: unknown }>(runKeys.output(followed.runId)).catch(() => undefined);
+    const text = typeof returned?.text === 'string' ? returned.text : (steps[steps.length - 1]?.text ?? '');
+    const result: any = {
+      runId: followed.runId, text, steps, finishReason, usage, totalUsage: usage,
+      toolCalls: steps.flatMap((x: any) => x.toolCalls), toolResults: steps.flatMap((x: any) => x.toolResults),
+      interrupts: ending?.state === 'waiting-approval' ? (ending.interrupts ?? []) : [],
+    };
+    await afterCompletedRun(name, opts, followed.runId, result, { resourceId: userIdOf(args.caller), ...(args.threadId ? { threadId: args.threadId } : {}) });
+    return result;
   }
 
   /**
@@ -1075,7 +1457,6 @@ export function createGnl(config: CreateGnlConfig) {
       opts = {
         ...opts,
         toolPolicy: opts.toolPolicy ?? 'strict-critical',
-        lock: opts.lock ?? { owner: `critical-${randomUUID()}`, ttlMs: 300_000 },
         exclusiveModelStep: opts.exclusiveModelStep ?? {},
         // Sınıf-bazlı matris (heyet): beyansız araç default hücresiyle BUGÜNKÜ davranışta kalır
         // (thread-suspend); beyanlı araç kendi hücresini alır (idempotent-write'ta soru sorulmaz vb.).
@@ -1141,7 +1522,9 @@ export function createGnl(config: CreateGnlConfig) {
       const inj = await suggestionsApi.prepareInjection(runId, effectiveResourceId);
       if (inj.text) effectiveSystem = effectiveSystem ? `${effectiveSystem}\n\n${inj.text}` : inj.text;
     }
-    const result = await runDurable({
+    // A run the engine begins for an id only it may begin (a sub-agent's, a network step's) carries its
+    // mark from the options it was handed (`minted`) — the mark is bound to the id, so nothing else passes.
+    const result = await runDurable(withMintOf({
       runId,
       journal: journal,
       agentName: name,
@@ -1170,7 +1553,6 @@ export function createGnl(config: CreateGnlConfig) {
       ...(opts.topP != null ? { topP: opts.topP } : {}),
       ...(processors.length ? { processors } : {}),
       ...(opts.limits ? { limits: opts.limits } : {}),
-      ...(opts.lock ? { lock: opts.lock } : {}), // : forward the distributed run-lock to runDurable (see the RunOptions.lock note)
       // Forward the protections that were previously runDurable-only.
       ...(opts.toolPolicy ? { toolPolicy: opts.toolPolicy } : {}),
       // FAZ-4 critical-profile forwards (no-ops unless set — see RunOptions).
@@ -1190,52 +1572,9 @@ export function createGnl(config: CreateGnlConfig) {
       // a person can read. Only present when the id was DERIVED — a raw runId declared nothing.
       ...(identity.work ? { workKey: identity.work.workKey, workScope: identity.work.workScope } : {}),
       ...(opts.messages ? { messages: opts.messages } : { prompt: opts.prompt }),
-    } as any);
+    } as any, opts));
 
-    // C4 runtime scoring: only on a COMPLETED run (not suspended). Each scorer is memoized to the
-    // journal → doesn't rerun on resume/repeat calls (exactly-once), returns the same score.
-    // P1.2: opt-in sampling (AgentConfig.scorerSampling) gates the WHOLE block — a skipped run writes
-    // NOTHING (durableProcessorStep, and hence the `proc:eval:*` journal key, is never reached), and the
-    // decision is deterministic per runId so resume/replay can't flip it (see shouldSampleScorers).
-    if (a.scorers?.length && result.interrupts.length === 0 && shouldSampleScorers(runId, effectiveScorerRate(a))) {
-      const scores: Record<string, unknown> = {};
-      // The sample and the memo are the run-scoring owner's (scoring.ts: runScoreSample,
-      // scoreRunMemoized) — the same calls scoreRun makes, so scoring this run again from Studio
-      // replays this memo instead of asking the judge twice. The output is the owner's too: the run's
-      // journaled returned output when an output processor changed it (result.text is that same text).
-      // RAG context isn't available here — see ScorerLike.
-      const sample = await runScoreSample(journal, runId, { output: (result as any).text ?? '' });
-      for (const s of a.scorers) {
-        scores[s.name] = await scoreRunMemoized(journal, runId, s, sample);
-      }
-      (result as any).scores = scores;
-      // P2-skor a SECOND, ADDITIVE metrics pass — recordRunMetrics (run.ts's
-      // completion choke points) already ran and cannot see `scores` (computed HERE, after it runs —
-      // see the comment on that call below). Best-effort/non-blocking: a scoring bug or a journal
-      // without incrBy/applyBatch must never fail an otherwise-successful run. Only reached on the
-      // sampled-IN path (shouldSampleScorers above) — see recordRunScores's JSDoc for the resulting bias.
-      recordRunScores(journal, runId, name, scores as Record<string, number | { score: number }>).catch(() => {});
-    }
-
-    // HERMES generate: the learning pass runs only on a COMPLETED run (an interrupted run is an
-    // unfinished story — no lesson yet), memoized AT-MOST-ONCE per runId inside generateFor, and
-    // best-effort by contract: a learning failure must never fail an otherwise-successful run.
-    // stream() has no auto-pass (a stream returns before completion); hosts call
-    // gnl.suggestions.generateFor from their finish hook when they want streamed runs to learn.
-    // A sub-agent's run applies the person's lessons (above) but does not learn: what it did comes back
-    // in its parent's answer, and the parent's run is the one the person had — one learning pass per
-    // request, not one per delegation, and no lesson drawn from a task a model wrote for another.
-    if (suggestionsApi && config.suggestions?.generate && result.interrupts.length === 0 && !frame) {
-      try {
-        await suggestionsApi.generateFor({
-          runId,
-          resourceId: effectiveResourceId,
-          threadId: effectiveThreadId,
-          ...(typeof opts.prompt === 'string' && opts.prompt ? { prompt: opts.prompt } : {}),
-          output: (result as any).text ?? '',
-        });
-      } catch { /* best-effort — see the contract above */ }
-    }
+    await afterCompletedRun(name, opts, runId, result, { resourceId: effectiveResourceId, threadId: effectiveThreadId, frame });
 
     // P1.6b: materialized metrics recording moved from here DOWN into run.ts's completion choke points
     // (next to recordRunUsage in runDurableInner AND in streamDurable's onFinish) — ONE source covers
@@ -1252,13 +1591,13 @@ export function createGnl(config: CreateGnlConfig) {
   // the crash-takeover window, not a worst-case-duration estimate.
   // P1.6b: streamed runs' materialized-metrics recording lives in streamDurable's onFinish (run.ts,
   // next to recordRunUsage) — the former TODO here is closed; no backfill dependency remains.
-  async function stream(name: string, opts: RunOptions) {
+  /** Everything `streamDurable` is called with for this agent and call — resolved once, the same way `runAgent` resolves it. */
+  async function streamArgs(name: string, opts: RunOptions): Promise<any> {
     refuseRunNames(`stream('${name}')`, opts);
     if (config.preset === 'critical') {
       opts = {
         ...opts,
         toolPolicy: opts.toolPolicy ?? 'strict-critical',
-        lock: opts.lock ?? { owner: `critical-${randomUUID()}`, ttlMs: 300_000 },
         exclusiveModelStep: opts.exclusiveModelStep ?? {},
         // Sınıf-bazlı matris (heyet): beyansız araç default hücresiyle BUGÜNKÜ davranışta kalır
         // (thread-suspend); beyanlı araç kendi hücresini alır (idempotent-write'ta soru sorulmaz vb.).
@@ -1310,14 +1649,15 @@ export function createGnl(config: CreateGnlConfig) {
     const system = opts.system ?? (a.system ? await resolveDyn(a.system, rc) : undefined);
     const processors = [...(config.processors ?? []), ...(a.processors ?? [])];
     const mergedTools = { ...config.tools, ...agentTools, ...subTools, ...wfTools };
-    const runTools = opts.tools ? Object.fromEntries(Object.entries(mergedTools).filter(([n]) => opts.tools!.includes(n))) : mergedTools;
+    // A background tool reaches the model as its launcher (see BACKGROUND TOOLS above).
+    const runTools = withBackgroundTools(name, opts.tools ? Object.fromEntries(Object.entries(mergedTools).filter(([n]) => opts.tools!.includes(n))) : mergedTools);
     // HERMES apply: same frozen-injection contract as run() — see the note there.
     let effectiveSystem = system;
     if (suggestionsApi) {
       const inj = await suggestionsApi.prepareInjection(runId, effectiveResourceId);
       if (inj.text) effectiveSystem = effectiveSystem ? `${effectiveSystem}\n\n${inj.text}` : inj.text;
     }
-    return streamDurable({
+    return ({
       runId,
       journal: journal,
       agentName: name,
@@ -1346,7 +1686,6 @@ export function createGnl(config: CreateGnlConfig) {
       ...(opts.limits ? { limits: opts.limits } : {}),
       // + B3(a): same protection forwards as run(), now INCLUDING lock (streamDurable enforces
       // it — see the stream lock note above; FAZ-7: heartbeat parity with run() included).
-      ...(opts.lock ? { lock: opts.lock } : {}),
       ...(opts.toolPolicy ? { toolPolicy: opts.toolPolicy } : {}),
       // FAZ-4 critical-profile forwards (no-ops unless set — see RunOptions).
       ...(opts.strictInput !== undefined ? { strictInput: opts.strictInput } : {}),
@@ -1355,6 +1694,9 @@ export function createGnl(config: CreateGnlConfig) {
       ...((opts.replayDisclosure ?? config.replayDisclosure) ? { replayDisclosure: opts.replayDisclosure ?? config.replayDisclosure } : {}),
       ...(opts.channel ? { channel: opts.channel } : {}),
       ...(opts.tombstonePolicy ? { tombstonePolicy: opts.tombstonePolicy } : {}),
+      // Parity with runAgent: the stream path dropped it, so a strict provider's schema rules never applied
+      // to a streamed (now: every registry) run.
+      ...(config.schemaCompat ? { schemaCompat: config.schemaCompat } : {}),
       ...(opts.replay ? { replay: opts.replay } : {}),
       ...(opts.timeouts ? { timeouts: opts.timeouts } : {}),
       ...(opts.exclusiveModelStep ? { exclusiveModelStep: opts.exclusiveModelStep } : {}),
@@ -1415,7 +1757,6 @@ export function createGnl(config: CreateGnlConfig) {
     // KENDİ koşum kimliği. Süzgeç model çözümlemesinden ve her journal I/O'sundan önce — türetilmiş
     // id de buradan geçer, ama geçeceği baştan bellidir: `run1_<32 hex>` rezervasyonun kabul ettiği
     // TEK şekil. Süzgecin işi hâlâ ham, çağıran seçimi bir adın başkasının ailesini sahiplenmesi.
-    assertRunIdSafe(runId);
     // THREAD SAHİPLİĞİ — iş akışı yoluna kurulan kapının (runWorkflow, yukarıda) aynısı, aynı gerekçeyle.
     // Ağ yolu da gövdeden `threadId` + `resourceId` alıyor, yani `{resourceId:'mallory',
     // threadId:'t-ayse'}` burada da yazılabiliyordu: `net-x:input` mallory'yi sahip, Ayşe'nin thread'ini
@@ -1469,12 +1810,13 @@ export function createGnl(config: CreateGnlConfig) {
       targets[subName] = {
         description: sub.description,
         // The same birth as an agent-as-tool child (runAgent), one frame below the network run.
-        run: (task, nestedRunId) =>
+        // `child` is the network's run arguments for this step: its mark goes on to the member's run.
+        run: (task, nestedRunId, child) =>
           runDelegated(journal, runId, nestedRunId, requestOf(netIdentity), async () => {
-            const r = await runAgent(subName, childRunOptions(
+            const r = await runAgent(subName, withMintOf(childRunOptions(
               { limits: opts.limits, context: rc, ...(effectiveActor ? { actor: effectiveActor } : {}), ...(opts.channel ? { channel: opts.channel } : {}) },
               { runId: nestedRunId, prompt: task },
-            ), { identity: childIdentity(netIdentity, nestedRunId), parentRunId: runId, ...(opts.approvals ? { approvals: opts.approvals } : {}) });
+            ), child), { identity: childIdentity(netIdentity, nestedRunId), parentRunId: runId, ...(opts.approvals ? { approvals: opts.approvals } : {}) });
             return { text: r.text, interrupts: r.interrupts, ...childOutcome(r.steps) };
           }),
       };
@@ -1558,7 +1900,7 @@ export function createGnl(config: CreateGnlConfig) {
     const because = derived
       ? 'this id was DERIVED from a workKey, so the engine vouches for it on every profile'
       : "the 'critical' profile vouches for a named run";
-    if ((await journal.get(`${wfRunId}:swept`)) !== undefined) {
+    if ((await journal.get(runRecordKey(wfRunId, 'swept'))) !== undefined) {
       await recordIdemConflict(journal, { runId: wfRunId, code: 'run_swept' });
       throw new RunSweptError(
         `@gnldev/durable: workflow run '${wfRunId}' was retention-swept — its dedup window is gone; a late retry must not silently re-run the steps (${because}). ` +
@@ -1592,7 +1934,7 @@ export function createGnl(config: CreateGnlConfig) {
     // owner record reads as an existing, ownerless run (run-identity.ts), i.e. nobody's to start.
     const acting = await enterWorkflowRun(name, wfRunId, opts, work);
     const inputHash = argsHash(input);
-    const frozen = await journal.get<{ hash?: string }>(`${wfRunId}:wf:_input`);
+    const frozen = await journal.get<{ hash?: string }>(runRecordKey(wfRunId, 'wf', '_input'));
     // RESUME ESCAPES (denetçi blokeri — F7'nin K6 dersi, workflow'a taşınmış hali): the REAL resume
     // surfaces (Studio inbox, @gnldev/server's resume route) re-send NO input — `input` arrives
     // undefined and `opts.resume` carries the HITL payload. Both are journal-anchored resume
@@ -1602,9 +1944,9 @@ export function createGnl(config: CreateGnlConfig) {
       // K4: the claim's boolean IS decision data — a same-instant twin with DIFFERENT input can
       // lose the claim silently and then run as if ITS input were the frozen one. The loser
       // re-reads and holds itself to the winner's fingerprint.
-      const won = await journalClaim(journal, `${wfRunId}:wf:_input`, { hash: inputHash, at: Date.now() });
+      const won = await journalClaim(journal, runRecordKey(wfRunId, 'wf', '_input'), { hash: inputHash, at: Date.now() });
       if (!won) {
-        const winner = await journal.get<{ hash?: string }>(`${wfRunId}:wf:_input`);
+        const winner = await journal.get<{ hash?: string }>(runRecordKey(wfRunId, 'wf', '_input'));
         if (winner?.hash !== undefined && winner.hash !== inputHash) {
           await recordIdemConflict(journal, { runId: wfRunId, code: 'run_input_mismatch', detail: { expectedHash: winner.hash, actualHash: inputHash } });
           throw new RunInputMismatchError(
@@ -1632,12 +1974,12 @@ export function createGnl(config: CreateGnlConfig) {
     const seal = serverIdentityOf(opts?.context ?? {});
     const actor = seal.resourceId ?? opts?.actor;
     const thread = seal.threadId ?? opts?.threadId;
-    const { acting } = await admitRun(journal, runId, workflowCaller(opts), {
+    const { acting } = await admitRun(journal, runId, workflowCaller(opts), withMintOf({
       ...(actor ? { actor } : {}),
       ...(thread ? { threadId: thread } : {}),
       ...(work ? { workKey: work.workKey, workScope: work.workScope } : {}),
       workflow: name,
-    });
+    }, opts));
     return acting;
   }
 
@@ -1687,7 +2029,7 @@ export function createGnl(config: CreateGnlConfig) {
     // seçmedi; üretilen ad zaten güvenli aileden. workKey'den TÜRETİLEN id ise (bir üstteki kapı) bu
     // satıra bir runId olarak gelir ve sorgulanır: motorun kendi bastığı ad da süzgeçten geçsin, çünkü
     // "bizim bastığımız güvenlidir" varsayımı tam olarak yeni bir ailenin fark edilmeden doğduğu yerdir.
-    if (opts?.runId !== undefined) assertRunIdSafe(opts.runId);
+    // A workflow tool's run (`wf:<parent>:<call>`) carries the engine's mark from the tool that begins it.
     // THREAD SAHİPLİĞİ — ajan yolundaki kapının (run.ts, ThreadOwnerMismatchError) iş akışı hali.
     // Ajan yollarında bu kapı vardı, iş akışı yolunda YOKTU ve sahip kaydı `wfThread`'i sorgusuz
     // yazıyordu. Ölçülen sonuç: `{runId:'x', resourceId:'mallory', threadId:'t-ayse'}` → `x:input`
@@ -1745,7 +2087,7 @@ export function createGnl(config: CreateGnlConfig) {
       const lockHandle = await acquireRunLock(journal, wfRunId, `critical-wf-${randomUUID()}`, lockTtl);
       if (!lockHandle) {
         await recordIdemConflict(journal, { runId: wfRunId, code: 'run_busy' });
-        throw Object.assign(new RunBusyError(runBusyMessage(`workflow run '${wfRunId}' is already running — it is locked by another process`)), { atLockAcquisition: true });
+        throw new RunBusyError(runBusyMessage(`workflow run '${wfRunId}' is already running — it is locked by another process`), { runId: wfRunId, atLockAcquisition: true });
       }
       let hbInflight: Promise<unknown> = Promise.resolve();
       const beat = setInterval(() => { hbInflight = lockHandle.renew(lockTtl).catch(() => false); }, Math.floor(lockTtl / 2));
@@ -1853,12 +2195,12 @@ export function createGnl(config: CreateGnlConfig) {
       // output then came back as a substitution marker and made a step that never failed report that
       // it had. The prefix stops that collision; the brand stops any other value from posing as one,
       // since what is read here is a journal a host also writes to.
-      const raw = await journal.get<unknown>(`${runId}:wf:${s.id}:_fallback`);
+      const raw = await journal.get<unknown>(runRecordKey(runId, 'wf', `${s.id}:_fallback`));
       const fallback = isFallbackMarker(raw) ? { attempts: raw.attempts, stepId: raw.stepId } : undefined;
       steps.push({
         id: s.id,
         kind: workflowStepKind(s.id),
-        output: decodeStepRecord(await journal.get(`${runId}:wf:${s.id}`)),
+        output: decodeStepRecord(await journal.get(runRecordKey(runId, 'wf', s.id))),
         ...(fallback ? { fallback } : {}),
       });
     }
@@ -1879,5 +2221,29 @@ export function createGnl(config: CreateGnlConfig) {
    */
   // HERMES v1: `suggestions` is `undefined` when the config block is absent — the feature's very
   // handle is opt-in, matching the promotion block's own no-block-no-code-path rule.
-  return { agent, run, stream, listWorkflows, runWorkflow, runNetwork, listNetworks, memory: resolvedMemory, suggestions: suggestionsApi };
+  /**
+   * Follows a run already started (by any process) from a reader's cursor, without starting or joining
+   * anything: a door's `GET /runs/:id/events`. The door decides whether this caller may read it (its own
+   * ownership rule, the same as for reading the run's record); this only reads.
+   */
+  /**
+   * Cancels a run of this scope, wherever it executes (detached.ts `DetachedRuns.cancel`): the durable
+   * cancel record, which every executor obeys, and the holder told to read it now. `'delivered'`: it
+   * executes in this process and was stopped now; `'recorded'`: it executes elsewhere (stopped at its
+   * next event) or nowhere (it never starts again). The door decides whether this caller may cancel it.
+   */
+  async function cancel(runId: string, opts: { reason?: unknown } = {}): Promise<'delivered' | 'recorded'> {
+    refuseUnknownNames('gnl.cancel', opts, CANCEL_RUN_NAMES);
+    const runs = await executor();
+    const scope = orgScopeOf(journal);
+    return runs.cancel({ runId, ...(scope !== undefined ? { scope } : {}), ...(opts.reason !== undefined ? { reason: opts.reason } : {}) });
+  }
+
+  async function follow(runId: string, opts: { after?: number | string } = {}) {
+    const runs = await executor();
+    const scope = orgScopeOf(journal);
+    return followedRun(runs, { runId, ...(scope !== undefined ? { scope } : {}), journal, after: readCursor(opts.after), state: 'following' });
+  }
+
+  return { agent, run, stream, follow, cancel, listWorkflows, runWorkflow, runNetwork, listNetworks, memory: resolvedMemory, suggestions: suggestionsApi };
 }

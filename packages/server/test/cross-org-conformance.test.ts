@@ -35,6 +35,7 @@ const VERDICTS: Record<string, { verdict: Verdict; why: string }> = {
   'GET /openapi.json': { verdict: 'org-scoped', why: 'publishes agent names, which agentGate withholds' },
   'POST /agents/:name/run': { verdict: 'org-scoped', why: 'runs under the caller\'s org, gated by agentGate' },
   'POST /agents/:name/stream': { verdict: 'org-scoped', why: 'runs under the caller\'s org, gated by agentGate' },
+  'GET /runs/:id/events': { verdict: 'org-scoped', why: 'a run\'s events belong to its organization (the same rule as GET /runs/:id)' },
   'POST /agents/:name/resume': { verdict: 'org-scoped', why: 'continues a run belonging to one org' },
   'GET /runs': { verdict: 'org-scoped', why: 'the run list is org data' },
   'GET /runs/:id': { verdict: 'org-scoped', why: 'a run belongs to one organization' },
@@ -178,7 +179,7 @@ describe('the conformance table covers the router exactly', () => {
     const { api } = await makeApi();
     const inventory = api.routeTable.map((r: { method: string; path: string }) => `${r.method} ${r.path}`);
 
-    expect(inventory.length, 'the inventory is empty — the suite would pass vacuously').toBe(20);
+    expect(inventory.length, 'the inventory is empty — the suite would pass vacuously').toBe(21);
     expect(inventory.filter((r: string) => !(r in VERDICTS)),
       'a route has no cross-org verdict. An unexamined route is exactly how every isolation gap here '
       + 'shipped — add it to VERDICTS with a reason rather than letting it pass silently.').toEqual([]);
@@ -242,7 +243,7 @@ describe('the ownership control — acme must SEE what globex must not', () => {
   const CONTROLLED = ['GET /runs', 'GET /runs/:id', 'GET /agents', 'GET /openapi.json', 'GET /usage',
     'GET /workflows/runs', 'POST /workflows/runs/:id/cancel', 'POST /runs/:id/cancel',
     'POST /agents/:name/run', 'POST /agents/:name/resume', 'POST /agents/:name/stream',
-    'GET /threads', 'GET /threads/:id/messages'];
+    'GET /threads', 'GET /threads/:id/messages', 'GET /runs/:id/events'];
 
   it.each(CONTROLLED)('%s answers its owner, and differently from a stranger', async (key) => {
     const { api } = await makeApi();

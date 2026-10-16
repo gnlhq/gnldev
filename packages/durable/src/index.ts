@@ -1,13 +1,13 @@
 // @gnldev/durable — an exactly-once + deterministic-replay layer for Vercel AI SDK agents.
 // Drop-in: generateText -> runDurable. Composable: withDurableModel + durableTools.
 
-export { InMemoryJournal, parseJournalKey, assertThreadId, summarizeRun, claim, frozenGet, runKeys, deriveRunStatus, nestedAgentRunId, listRunsArray, asReaderJournal, runIdOfKey, outcomeStatusOf } from './journal.js';
+export { InMemoryJournal, parseJournalKey, assertThreadId, summarizeRun, claim, frozenGet, runKeys, deriveRunStatus, nestedAgentRunId, listRunsArray, asReaderJournal, runIdOfKey, outcomeStatusOf, runRecordOf } from './journal.js';
 export { isRunCursor, pageRunsFromArray, type RunOrder } from './run-cursor.js';
 // H13 — journal format versioning: an API that keeps old records readable across SDK-major transitions.
 export { JOURNAL_FORMAT_VERSION, JournalFormatError, registerFormatUpgrade, stampFormat, upgradeFormat, isVersionedKey } from './format.js';
 export { acquireRunLock } from './run-lock.js';
 export type { RunLock } from './run-lock.js';
-export { reconstructState, forkRun, settleModelContent } from './time-travel.js';
+export { reconstructState, forkRun, beginFork, settleModelContent } from './time-travel.js';
 export { appendLog, listLog, countLog, consumeOnce } from './durable-log.js';
 export type { LogItem } from './durable-log.js';
 export type { ReconstructedState, ReconstructSeed, ForkResult } from './time-travel.js';
@@ -22,8 +22,9 @@ export type {
   ToolJournalRecord,
   RunStatus,
   RunOutcomeRecord,
+  RunRecord,
 } from './journal.js';
-export { BasicMemory, appendToJournalLog, readJournalLog, JournalLogContentionError, JOURNAL_LOG_MAX_ATTEMPTS, PROVENANCE_RECENT_CAP, messagePreview, memKey, MEM_LEAVES, OM_LEAVES, OM_VECTOR_SOURCE, semanticLogKey, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX, type OmLeaf } from './memory.js';
+export { BasicMemory, appendToJournalLog, retractFromJournalLog, readJournalLog, JournalLogContentionError, JOURNAL_LOG_MAX_ATTEMPTS, PROVENANCE_RECENT_CAP, messagePreview, memKey, MEM_LEAVES, OM_LEAVES, OM_VECTOR_SOURCE, semanticLogKey, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX, type OmLeaf } from './memory.js';
 export type { Memory, MemoryContextProvenance, RecalledMessageRef, MemLeaf } from './memory.js';
 export { getRunCost, toTraceSpans } from './cost.js';
 // Sibling packages (@gnldev/otel's span builder) read the same journal records and hit the same
@@ -38,12 +39,12 @@ export { DEFAULT_PRICING, priceFor, costOf, PRICING_KEY, readPricing, effectiveP
 export { usageAndCostFromModelValue, modelRecordFacts } from './cost.js';
 export type { ModelPricing, PricingDoc } from './pricing.js';
 export {
-  DivergenceError, RunBusyError, SideEffectRetryBlockedError, RetryLimitExceededError,
+  DivergenceError, RunBusyError, SideEffectRetryBlockedError, RetryLimitExceededError, OutcomeUnknownError,
   SuiteVersionMismatchError, RunThreadMismatchError, RunTargetMismatchError, ThreadRunsInFlightError,
-  RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, RunSweptError, BatchPlanMismatchError,
+  RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunNotFoundError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, RunSweptError, BatchPlanMismatchError, AdoptionConflictError,
   CALLER_CONFLICT_CODES, callerConflictCode, callerConflictAnswer, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, FOREIGN_PARTY_DETAIL_FIELDS,
   BLOCKED_ERROR_CODES, blockedErrorCode, upstreamFailure, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES,
-  RESERVED_ID_ERROR_CODES, REQUEST_ERROR_CODES, requestRefusal,
+  RESERVED_ID_ERROR_CODES, VISIBILITY_ERROR_CODES, runNotFound, REQUEST_ERROR_CODES, ADOPTION_ERROR_CODES, DRAIN_ERROR_CODES, requestRefusal,
   // The HTTP status of every wire code, for a client or a door that maps a code to a response.
   WIRE_ERROR_STATUS,
   // The error→note→help formatter. Exported because the refusals a user actually meets are split
@@ -99,7 +100,7 @@ export { gnlTool } from './types.js';
 // must resolve to nothing rather than to a stringified function.
 export { toolDescriptionText } from './types.js';
 export type { ToolDurability } from './types.js';
-export { runDurable, resumeRun, streamDurable, limitBreachFromSteps, blockedFromSteps, surfacedInterrupts, resolveApprovals, decisionOf, hasRunProbe, assertRunIdSafe, type ApprovalRecord } from './run.js';
+export { runDurable, resumeRun, streamDurable, admitAgentRun, limitBreachFromSteps, blockedFromSteps, surfacedInterrupts, resolveApprovals, decisionOf, hasRunProbe, assertRunIdSafe, type ApprovalRecord } from './run.js';
 export type { RunDurableArgs, StreamDurableArgs, DurableResult, ResumeAgentConfig, StreamBreach, MemoryContextRecord } from './run.js';
 // K1/W1 (B): sentinel→error conversion helper for code that consumes streamDurable directly.
 export { streamFinishError } from './run.js';
@@ -111,7 +112,7 @@ export { threadRecordOwner, CapabilityError, requireCapability, portOf, storageO
 // the one answer to "does this run exist, and whose is it" (run-identity.ts).
 export {
   STAFF, UNKNOWN, user, staff, userIdOf, sealFieldsOf, resolveCaller, type SealFields, runIdentity, childIdentity, toolContextFor, identityOf,
-  runOwnerOf, decideRunAccess, decideRun, admitRun, claimRunOwner, inheritRunOwner, assertRunTarget, runTargetOf, type RunTarget, SUBJECT_VIEW,
+  runOwnerOf, decideRunAccess, decideDoorRunAccess, decideRun, admitRun, claimRunOwner, inheritRunOwner, existingRun, withBirth, type RunBirth, type RunLease, assertRunTarget, runTargetOf, type RunTarget, SUBJECT_VIEW,
   type Caller, type UserCaller, type StaffCaller, type UnknownCaller, type RunIdentity, type GnlToolContext,
   type RunOwner, type RunKind, type RunDecision, type RawJournal,
 } from './run-identity.js';
@@ -129,7 +130,7 @@ export { durableProcessorStep, createProcessorCtx, ProcessorTripwire, recordProc
 // D4-retry turn-level retry-with-feedback ladder (see run.ts).
 export { ProcessorRetry, RetryExhaustedByProcessorError } from './processor.js';
 export { recordIncident, readIncidents } from './incidents.js';
-export { readRunOutcome, recordRunOutcome, runStarted, runCanceled, isRunFailure } from './outcome.js';
+export { readRunOutcome, recordRunOutcome, runStarted, runCanceled, isRunFailure, attemptEndOf } from './outcome.js';
 export { acquireLease, releaseLease, readLease } from './lease.js';
 export type { Lease } from './lease.js';
 export type { RunIncident } from './incidents.js';
@@ -157,16 +158,17 @@ export { describeProtections, formatProtections } from './protections.js';
 export type { ProtectionRow, ProtectionMark, ProtectionSource, ProtectionContext } from './protections.js';
 // Dynamic multi-agent routing (Supervisor/`.network()` parity) — decisions are CAS-frozen.
 export { runNetwork, getNetworkTrace, netKeys } from './network.js';
-export type { NetworkResult, NetworkStep, NetworkTarget, RouteDecision, RunNetworkOptions } from './network.js';
-export { withOrg, withRootScope, orgScopeOf, orgPrefix, isOrganizationKey, parseOrganizationKey, orgSpaceSql, ORG_KEY_PREFIX, isPlatformKey, assertOrgRegistered, assertNoRunsInFlight, ORG_RECORD_PRE, ADOPTABLE_RESERVED_PREFIXES, ENGINE_META_KEYS } from './organization.js';
+export type { NetworkResult, NetworkStep, NetworkTarget, NetworkChildRun, RouteDecision, RunNetworkOptions } from './network.js';
+export { withOrg, withRootScope, orgScopeOf, orgPrefix, isOrganizationKey, parseOrganizationKey, orgSpaceSql, ORG_KEY_PREFIX, isPlatformKey, assertOrgRegistered, ORG_RECORD_PRE, ADOPTABLE_RESERVED_PREFIXES, ENGINE_META_KEYS } from './organization.js';
+export { assertNoRunsInFlight } from './model.js';
 export { withOrgStorage, orgStorageScopeOf, scopeConfigToOrg } from './org-storage.js';
 export { MEMORY_PARTITION, memoryPartitionOf, inMemoryPartition, assertRootThreadId, ReservedThreadIdError, type MemoryPartition, type MemoryPartitionOption } from './storage.js';
 export { withSubjectJournal, withSubjectMemory, type SubjectViewOptions, type SubjectMemoryOptions } from './subject-view.js';
 export { threadOwnerOf, admitThreadRun, threadOwnerKey, threadSeenKey, THREAD_RECORDS_KEY, copyThreadOwnership, assignThreadOwner, recordThreadCreated, type ThreadOwnership } from './thread-owner.js';
 export { ownedName, ownerOfName, assertSystemName, ownedPrefix, ownerIdProblem, assertOwnerId, OwnerIdError, RESERVED_OWNER_PREFIXES } from './owned-name.js';
 export { eraseSubject, subjectRuns, assertRootWorkForErasure, findReservedRootThreads, type ReservedRootThread, type EraseOptions, type EraseReport, type SubjectEraser, type SubjectRun } from './erase.js';
-export { orgPurgedKey, purgeRun, isRealRun, purgeThread, purgeThreadState, purgeResource, purgeBatch, purgeOrganization, purgeOrganizationWork, sweepRuns, sweepLog, sweepThreads, listOrphanThreadState, createRetentionSweeper } from './retention.js';
-export type { LogSweepTarget, RetentionSweeperOptions, RetentionSweepSummary, RetentionSweeper } from './retention.js';
+export { orgPurgedKey, purgeRun, isRealRun, purgeThread, purgeThreadState, purgeResource, purgeBatch, purgeOrganization, sweepRuns, sweepLog, sweepThreads, listOrphanThreadState, createRetentionSweeper } from './retention.js';
+export type { LogSweepTarget, RetentionSweeperOptions, RetentionSweepSummary, RetentionSweeper, OrganizationErasureReport } from './retention.js';
 export { recordIdemConflict, readIdemLedger } from './idem-ledger.js';
 export { semKey, semTombKey, SEM_TEMPLATE_VERSION } from './semantic-dup.js';
 export type { SemanticDupConfig, SemanticIdentity, SemDupRecord, GrayCandidate } from './semantic-dup.js';
@@ -201,7 +203,7 @@ export type {
 } from './suggestions.js';
 export type { IdemConflictRecord } from './idem-ledger.js';
 // Phase 8.1: the common poll-loop core for queue/events/scheduler (a setTimeout chain with backoff).
-export { createPollLoop } from './polling.js';
+export { createPollLoop, pollLoopsIdle } from './polling.js';
 export type { PollLoopOptions, PollLoop } from './polling.js';
 // H3: hand off a long-lived run to a new period (the safe, core-untouched solution for journal compaction).
 export { rolloverRun, toModelMessages, rolloverKey } from './rollover.js';
@@ -259,3 +261,24 @@ export { agentStreamEvents, interruptsFromSteps, type AgentStreamEvent, type Age
 export type { StreamSurface, StreamSurfaceInput } from './stream-surface.js';
 // The one reading of a request body as a JSON object, for every door.
 export { readJsonObject, callerMessagesProblem, CallerSystemMessageError, type JsonObjectBody } from './request-body.js';
+// Detached execution: a run started by a caller, executed apart from it, followed by anyone from a
+// cursor, continued by another process when its own is gone (detached.ts, run-events.ts, process-liveness.ts).
+export { DetachedRuns, DrainingError, LivenessRequiredError, pgRunSignal, newRunId, type ExecRecord, type Launch, type LaunchEnd, type RunSignal, type DetachedRunsOptions, type StartState, type Started, type StartRequest } from './detached.js';
+export { formatCursor, parseCursor, readCursor, InvalidCursorError, type RunCursor } from './run-events.js';
+export { RUN_EVENT_VERSION, encodePart, decodeEvent, errorData, errorOf, type ErrorData } from './event-codec.js';
+export { executorFor, drainExecutors } from './executors.js';
+export { drainProcess, drainOnSignal, DRAIN_DEADLINE_MS, type DrainOptions, type DrainOnSignalOptions } from './drain.js';
+export { pendingWork, recoverInDoubt, declareInDoubtDone, cancelPendingRun, type PendingWork, type InDoubtCall, type RunningWork, type AwaitingApproval } from './pending-work.js';
+export { followedRun, type FollowedRun, type RunEnding } from './followed-run.js';
+export { appendRunEvent, readRunEvents, lastRunEvent, endsFollow, runEventKey, type RunEvent, type RunState } from './run-events.js';
+export {
+  installProcessLiveness, processLiveness, storeLiveness, livenessFor, unbindLiveness, inMemoryLiveness, sqliteLiveness, postgresLiveness, beginDrain, isDraining, endDrain,
+  holdWhile, settledExceptOwn, handNamePrefix, type HandFace, RunDrainedError, LivenessUnavailableError, procLockKey, isProcessLocal, type ProcessLiveness, type PgProcessSession, type PostgresLivenessOptions,
+} from './process-liveness.js';
+// The run-id grammar: every family written under a run id, every family of id the engine composes, and
+// the one admission gate (run-id-grammar.ts). The packages on this one spell run keys through it.
+export {
+  RUN_RECORD_FAMILIES, RUN_ID_FAMILIES, RUN_KEYED_FAMILIES, runRecordKey, runRecordPrefix, composeRunId, rerunRunId, runIdFamilyOf,
+  isEngineBegunRunId, admitRunId, REPLAYED_SEGMENT_RE,
+  type RunRecordFamily, type ListedRunRecordFamily, type RunIdFamily, type RunKeyedFamily,
+} from './run-id-grammar.js';

@@ -1,6 +1,6 @@
 // Governance endpoints: /approvals (approval inbox), /audit (audit log), /organizations (org counters + budget).
 import { describe, it, expect, vi } from 'vitest';
-import { InMemoryJournal, recordRunMetrics, withOrg } from '@gnldev/durable';
+import { InMemoryJournal, InMemoryStorage, toJournal, recordRunMetrics, withOrg } from '@gnldev/durable';
 import { createStudioApi } from '../src/server.js';
 import { call } from './call.js';
 
@@ -272,7 +272,7 @@ describe('governance: /organizations (counters + budget)', () => {
 });
 
 describe('governance: /organizations (CRUD + audit)', () => {
-  async function seedOrgRun(journal: InMemoryJournal, org: string, runId: string) {
+  async function seedOrgRun(journal: Pick<InMemoryJournal, 'put'>, org: string, runId: string) {
     await journal.put(`org:${org}:${runId}:model:0`, {
       content: [{ type: 'text', text: 'ok' }],
       finishReason: 'stop',
@@ -292,9 +292,11 @@ describe('governance: /organizations (CRUD + audit)', () => {
   });
 
   it('DELETE /organizations/:id and PUT /organizations/:id/budget write/delete; org.* actions land in audit', async () => {
-    const journal = new InMemoryJournal();
+    const storage = new InMemoryStorage();
+    const journal = toJournal(storage.runs);
     await seedOrgRun(journal, 'acme', 'r1');
-    const app = createStudioApi({ reader: journal, org: {} }); // DELETE requires multi-org
+    // DELETE requires multi-org, and the storage it erases the organization from (`userErasure`).
+    const app = createStudioApi({ reader: journal, org: {}, userErasure: { storage } });
 
     const put = await call(app, '/organizations/acme/budget', {
       method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tokenLimit: 50 }),
@@ -305,7 +307,7 @@ describe('governance: /organizations (CRUD + audit)', () => {
     const del = await call(app, '/organizations/acme', { method: 'DELETE' });
     expect(del.status).toBe(200);
     expect(await journal.get('org:acme:r1:model:0')).toBeUndefined();
-    expect(await journal.get('__budget__:acme')).toBeNull();
+    expect(await journal.get('__budget__:acme')).toBeUndefined();
 
     // org.* action names land in audit.
     const audit = await (await call(app, '/audit')).json();
@@ -317,8 +319,9 @@ describe('governance: /organizations (CRUD + audit)', () => {
   it('an operator org-management audit record fills the "org" field from the target (the column doesn\'t stay empty)', async () => {
     // Regression: an operator actor has no orgId → the audit "org" column always looked empty.
     // For org.create/org.delete/org.budget, the relevant org IS the target → org=target should hold.
-    const journal = new InMemoryJournal();
-    const app = createStudioApi({ reader: journal, org: {} });
+    const storage = new InMemoryStorage();
+    const journal = toJournal(storage.runs);
+    const app = createStudioApi({ reader: journal, org: {}, userErasure: { storage } });
 
     await call(app, '/organizations', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'blk1' }),
@@ -338,8 +341,9 @@ describe('governance: /organizations (CRUD + audit)', () => {
   it('a deleted organization (no runs, only registered) does NOT remain in the GET /organizations list (tombstone filter)', async () => {
     // Regression: "0 records deleted but it stays on screen". Delete writes null to __org__:id (tombstone),
     // but the old GET still listed it via listKeys → the org came back.
-    const journal = new InMemoryJournal();
-    const app = createStudioApi({ reader: journal, org: {} });
+    const storage = new InMemoryStorage();
+    const journal = toJournal(storage.runs);
+    const app = createStudioApi({ reader: journal, org: {}, userErasure: { storage } });
 
     const create = await call(app, '/organizations', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'blk1' }),

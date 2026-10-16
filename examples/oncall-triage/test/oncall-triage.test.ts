@@ -64,8 +64,11 @@ describe('the logs the agent reads carry secrets', () => {
   it('masks the DSN credentials and the customer email before the model sees them', async () => {
     const { gnl, model } = await buildTriage(new InMemoryStorage());
     const seen: string[] = [];
-    const orig = model.doGenerate.bind(model);
-    model.doGenerate = async (o: any) => { seen.push(JSON.stringify(o.prompt)); return orig(o); };
+    // Both of the model's entry points: a registry run streams (doStream); a resume may generate.
+    const gen = model.doGenerate.bind(model);
+    const str = model.doStream.bind(model);
+    model.doGenerate = async (o: any) => { seen.push(JSON.stringify(o.prompt)); return gen(o); };
+    model.doStream = async (o: any) => { seen.push(JSON.stringify(o.prompt)); return str(o); };
 
     await run(gnl, 'i4', MEMORY_ALERT, 'checkout');
     const sent = seen.join('\n');

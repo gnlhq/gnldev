@@ -30,6 +30,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
+import { helperPool } from '../../../test/support/pg-admin.js';
 
 const PG_URL = process.env.GNL_PG_URL;
 const ends: Array<() => Promise<void> | void> = [];
@@ -166,7 +167,9 @@ if (PG_URL) OLD_STORES.push(['Postgres (real)', async () => {
   const name = `h7_u_${process.pid}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
   await admin.query(`CREATE DATABASE ${name}`);
   const u = new URL(PG_URL!); u.pathname = `/${name}`;
-  const raw = new pg.Pool({ connectionString: u.toString(), max: 1 });
+  // The seed's own pool is not a store's, so it gets the listeners a store gives its pools: the cleanup
+  // force-drops the database right after `end()`, which can reach a session still closing (57P01 in CI).
+  const raw = helperPool(u.toString());
   const pools = [raw];
   ends.push(async () => { for (const p of pools) await p.end().catch(() => {}); await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`); await admin.end(); });
   await raw.query(OLD_JOURNAL_DDL);

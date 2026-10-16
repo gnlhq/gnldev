@@ -118,40 +118,18 @@ try {
   // was skipped by its own `skipIf` on every run of this gate, and the gate said nothing.
   const env = { ...process.env, GNL_INTEGRATION: '1', GNL_PG_URL: PG_URL, GNL_PGVECTOR_URL: PGVECTOR_URL };
 
-  step('real Postgres (integration-real, prefix ranges, pgvector)', () =>
-    run('pnpm', ['exec', 'vitest', 'run',
-      'packages/durable/test/integration-real.test.ts',
-      'packages/durable/test/prefix-astral-postgres.test.ts',
-      'packages/rag/test/postgres-vector-store.test.ts',
-      // Organization isolation for the metrics export: an in-memory journal addresses counters by
-      // exact key, so the cross-tenant read this guards against cannot even be written against it.
-      'packages/otel/test/metrics-org-postgres.test.ts',
-      // Run-list keyset paging: a row comparison pg-mem cannot parse, so its real coverage is here.
-      'packages/durable/test/run-cursor-parity.test.ts'], { env }).status === 0);
-
-  // A SEPARATE vitest run, after the one above, on purpose. integration-real's failover case
-  // terminates every backend on the database (`pg_terminate_backend` over pg_stat_activity), and
-  // vitest runs files in parallel: measured with these files in the list above, the kill reached the
-  // vector contract's open pools and vitest reported 4 uncaught `57P01` errors — a red gate caused
-  // by the schedule, not by any store.
-  step('real Postgres + pgvector (erasure, vector and owned-name contracts)', () =>
-    run('pnpm', ['exec', 'vitest', 'run',
-      // One erasure, every store: SQLite and pg-mem run in the default suite; the real Postgres row
-      // (and the cross-store drift check over it) only runs here.
-      'packages/durable/test/erasure-store-contract.test.ts',
-      // The vector write rule on a real Postgres and on rag's PostgresVectorStore over real pgvector.
-      'packages/durable/test/vector-store-contract.test.ts',
-      // Owned names on a real Postgres, where a lone surrogate would become U+FFFD.
-      'packages/durable/test/owned-name-namespaces.test.ts',
-      // An organization id outside the BMP on a real Postgres (pg-mem's substring counts UTF-16 units).
-      'packages/durable/test/memory-partition-edges.test.ts',
-      // Work-log numbering under REPEATABLE READ / SERIALIZABLE defaults, which pg-mem does not have.
-      'packages/durable/test/work-log-numbering-readers.test.ts',
-      // The EE user directory: seats, concurrent writes and the create rollback on a real Postgres,
-      // where transactions and row locks are real (pg-mem does neither), against the journal store.
-      // packages/auth-ee is the paid tier and is withheld from the public snapshot, which is not
-      // part of this repository there — so the entry runs only where the file exists.
-      ...(existsSync(join(root, 'packages/auth-ee/test/user-store-drift.test.ts')) ? ['packages/auth-ee/test/user-store-drift.test.ts'] : [])], { env }).status === 0);
+  // Every test that needs the server, found by rule (scripts/real-backend-tests.mjs) — the same two
+  // runs as the CI integration job. These were named by hand here and in ci.yml, and on 12 Oct 2026
+  // 64 real-Postgres tests were named in neither; test/real-backend-tests-run.test.ts holds both to it.
+  //
+  // `alone` first and by itself: integration-real's failover case terminates every backend on the
+  // database, and run beside the others it reached their open pools (4 uncaught 57P01 errors, a red
+  // caused by the schedule, not by any store). --maxWorkers=3 keeps a many-core machine under the
+  // server's 100 connections — the multi-process tests open several pools per file.
+  step('real Postgres — the tests that terminate backends, alone', () =>
+    run('node', ['scripts/real-backend-tests.mjs', '--run', 'alone'], { env }).status === 0);
+  step('real Postgres + pgvector — every other real-backend test', () =>
+    run('node', ['scripts/real-backend-tests.mjs', '--run', 'shared', '--', '--maxWorkers=3', '--minWorkers=1'], { env }).status === 0);
 
   step('real model provider', () => {
     if (!process.env.NVIDIA_API_KEY && !process.env.OPENAI_API_KEY) {

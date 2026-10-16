@@ -5,7 +5,7 @@
  * WHY. "What goes with a thread" used to be written down in eight places — the three stores'
  * `deleteThread`, the organization view's, `purgeThread`, `eraseSubject`'s own thread loop, and the
  * adoption table lists — and the copies had drifted. Measured on 35b70348 with one world on InMemory,
- * Sqlite, pg-mem and real Postgres (raporlar/…/ekler/cplus-c/h5-before-analysis.txt):
+ * Sqlite, pg-mem and real Postgres (ADR-0007):
  *  - deleting a thread (`MemoryStore.deleteThread`, `AgentMemory.deleteThread`, Studio's
  *    `DELETE /threads/:id`) took its 9 memory-store rows and nothing else: its 6 runs with their 46
  *    journal keys (prompts, tool arguments, the approval waiting on the thread), the observer's
@@ -16,7 +16,7 @@
  * Each copy was right about something the others missed. One list cannot disagree with itself.
  *
  * THE SHAPE. The model is data (`THREAD_DEPENDENTS`, `RUN_DEPENDENTS`, `PERSON_FAMILIES`,
- * `SCOPE_TABLES`). The planner reads the store only to FIND entities — the runs on a thread by their
+ * `ORGANIZATION_DEPENDENTS`, `SCOPE_TABLES`). The planner reads the store only to FIND entities — the runs on a thread by their
  * relation column, a run's sub-agent children by its tool records — and turns "delete thread T" or
  * "purge run R" into an ordered list of concrete steps. The executor runs that list against the stores
  * it is handed. Each adapter keeps its own primitives (a prefix DELETE, the memory store's own
@@ -32,19 +32,29 @@
  *    subtracted after its records (the counted-marker among them) are gone, so a retry never subtracts
  *    it again.
  */
-import { runKeys, nestedAgentRunId, runIdOfKey, executedHere, listRunsWhere } from './journal.js';
+import { runRecordPrefix, composeRunId, ownKeysOf, leafSuffix, RUN_KEYED_FAMILIES, type RunKeyedFamily } from './run-id-grammar.js';
+import { randomUUID } from 'node:crypto';
+import { runKeys, nestedAgentRunId, runIdOfKey, executedHere, listRunsWhere, asReaderJournal, deferredTaskRunId, deferredContinuationRunId } from './journal.js';
 import type { Journal, JournalReader, RunSummary } from './journal.js';
 import { MEM_LEAVES, OM_LEAVES, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX, OM_VECTOR_SOURCE } from './memory.js';
 import { threadOwnerKey, threadSeenKey } from './thread-owner.js';
 import { isOrganizationKey } from './organization.js';
 import { ThreadRunsInFlightError } from './errors.js';
-import type { MemoryStore, VectorStore } from './storage.js';
+import type { CacheStore, MemoryStore, MetaStore, RunJournal, Storage, VectorStore, WorkStore } from './storage.js';
+import { VECTOR_PARTITION, toJournal } from './storage.js';
+import type { Memory } from './memory.js';
+import { orgPrefix, ORG_RECORD_PRE, orgParentOf, orgScopeOf } from './organization.js';
+import { execKey, execScopePrefix } from './exec-record.js';
+import { handRunPrefix, handScopePrefix } from './process-liveness.js';
+import { ownedPrefix } from './owned-name.js';
+import { BUDGET_PRE } from './budget.js';
 import { getRunCost } from './cost.js';
 import { metricsRunKey, metricsDoneKey, metricsScoresDoneKey } from './metrics.js';
 import { USAGE_KEY, usageCountedKey } from './budget.js';
 import type { OrganizationUsage } from './budget.js';
-import { fenceRun, runErasedSince } from './erasure-fence.js';
+import { fenceRun, runErasedSince, orgPurgedKey, fenceThroughLineage } from './erasure-fence.js';
 import type { ErasureBaseline } from './erasure-fence.js';
+import type { AdoptedKind } from './adoption.js';
 
 // ── How a thread id is read back out of a key ────────────────────────────────────────────────────
 // Thread ids may contain ':' (memory.ts keeps it legal on purpose), so a thread's keys are recognised
@@ -63,7 +73,7 @@ const MEM_SUFFIXES = MEM_LEAVES.map((leaf) => `:${leaf}`);
 // splitting on ':', because a threadId may contain ':' itself (memory.ts says so explicitly).
 // Ordered longest-first so ':semtomb-' is never mistaken for ':sem-' + 'tomb-'.
 export const XTHR_PREFIX = 'xthr:';
-const XTHR_FAMILIES = [':semjudge-', ':semtomb-', ':sem-', ':dup-', ':args-'] as const;
+const XTHR_FAMILIES = [':semjudge-', ':semtomb-', ':sem-', ':dup-', ':args-', ':late-', ':turn'] as const;
 
 // `om:<threadId>:<leaf>` and `om:<threadId>:proc:<step>`. The step names (`observe:0`, `vec:0:1`)
 // never contain ':proc:', so the LAST ':proc:' is the boundary, whatever the thread id holds.
@@ -161,6 +171,24 @@ export async function deleteExactKey(journal: Journal, key: string): Promise<num
 }
 
 /**
+ * Deletes a run's keys in a run-keyed family outside its namespace (run-id-grammar.ts `RUN_KEYED_FAMILIES`):
+ * one prefix delete when every key under the prefix is the run's, else each of its own by exact key.
+ * Without listKeys nothing can tell the keys apart, and the prefix delete stands (stated, as for
+ * `purgeOwnNamespace`; every adapter shipped here lists).
+ */
+export async function deleteOwnKeyed(journal: Journal, family: RunKeyedFamily, runId: string): Promise<number> {
+  const del = requireDelete(journal);
+  const prefix = RUN_KEYED_FAMILIES[family].prefix(runId);
+  if (typeof journal.listKeys !== 'function') return del(prefix);
+  const { own, all } = await ownKeysOf(journal as { listKeys(p: string): Promise<string[]> }, family, runId);
+  if (own.length === 0) return 0;
+  if (own.length === all) return del(prefix);
+  let total = 0;
+  for (const k of own) total += await deleteExactKey(journal, k);
+  return total;
+}
+
+/**
  * Deletes everything under `${runId}:` WITHOUT taking a run whose id extends this one.
  *
  * `${runId}:` looks like a safe prefix because it carries the separator — and against `r-1` vs `r-10`
@@ -196,7 +224,7 @@ export async function purgeOwnNamespace(journal: Journal & Partial<JournalReader
   for (const k of keys) {
     // runIdOfKey reads the value only for `:input` keys — a point-read on every key here turned a
     // nightly sweep over a large namespace into O(keys) round-trips for values it never looked at.
-    const owner = runIdOfKey(k, k.endsWith(':input') ? await journal.get(k) : undefined);
+    const owner = runIdOfKey(k, k.endsWith(leafSuffix('input')) ? await journal.get(k) : undefined);
     if (owner && owner !== runId && owner.startsWith(prefix)) neighbours.add(owner);
   }
   if (neighbours.size === 0) return del(prefix);
@@ -357,7 +385,7 @@ export interface ThreadNamespace {
 /** The journal namespaces a thread owns. */
 export const THREAD_NAMESPACES: readonly ThreadNamespace[] = [
   { prefix: MEM_PREFIX, ownerOf: threadIdOfMemKey, holds: 'BasicMemory: the messages and the working memory (`mem:<t>:messages|working`)' },
-  { prefix: XTHR_PREFIX, ownerOf: threadIdOfXthrKey, holds: 'the thread idempotency window, duplicate markers, semantic records, tombstones and judge verdicts' },
+  { prefix: XTHR_PREFIX, ownerOf: threadIdOfXthrKey, holds: 'the thread idempotency window, duplicate markers, semantic records, tombstones and judge verdicts, and which background continuation holds its turn' },
   { prefix: OM_PREFIX, ownerOf: threadIdOfOmKey, holds: "observational memory's counters and memoized observer output — the model's summary of the conversation" },
   { prefix: SEMANTIC_LOG_PREFIX, ownerOf: threadIdOfSemKey, holds: "SemanticMemory's message log (@gnldev/rag)" },
 ];
@@ -395,18 +423,25 @@ export const THREAD_DEPENDENTS = {
 export const RUN_DEPENDENTS = {
   /** Every record under its own id (`<runId>:…`), a run whose id extends it excepted (`purgeOwnNamespace`). */
   namespace: (runId: string): string => `${runId}:`,
-  /** Prefix families outside the namespace: the request window it opened, its network steps. */
-  prefixes: [runKeys.toolRequestPrefix, (runId: string): string => `net:${runId}:`] as const,
+  /** Run-keyed families outside the namespace (run-id-grammar.ts): the request window it opened, its records and their late reports — its own keys only (`ownKeysOf`). */
+  keyed: ['request-window', 'request-window-late'] as const satisfies readonly RunKeyedFamily[],
   /** Keys outside the namespace that END where the run id ends — deleted exactly, never as a prefix (`deleteExactKey`). */
   exactKeys: [runKeys.memAppended, runKeys.memUserAppended, workflowStatusKey, metricsRunKey, metricsDoneKey, metricsScoresDoneKey] as const,
   /**
    * Its child runs, read from its own tool records before it goes: a sub-agent and a workflow-as-tool,
-   * each in the parent-scoped shape and the bare legacy one, and its network steps (`net:<runId>:<i>`).
+   * each in the parent-scoped shape and the bare legacy one, a background call's task and the
+   * continuation that answered it, and its network steps (`net:<runId>:<i>`).
    */
   children: (runId: string, toolCallId: string): string[] => [
-    nestedAgentRunId(runId, toolCallId), `agent:${toolCallId}`, nestedAgentRunId(runId, toolCallId, 'wf'), `wf:${toolCallId}`,
+    nestedAgentRunId(runId, toolCallId), composeRunId('agent', undefined, toolCallId), nestedAgentRunId(runId, toolCallId, 'wf'), composeRunId('wf', undefined, toolCallId),
+    deferredTaskRunId(runId, toolCallId), deferredContinuationRunId(runId, toolCallId),
   ],
-  /** A request-window record this run EXECUTED (`executedHere`): its output, kept under the request's family. */
+  /**
+   * Its records in the platform journal, outside every scope, each closed by '#': its detached execution
+   * record (`execKey`) and the shadows of the processes holding it (`handRunPrefix`, process-liveness.ts).
+   */
+  platformKeys: (scope: string | undefined, runId: string): string[] => [execKey(scope, runId), handRunPrefix(scope, runId)],
+  /** A request-window record this run EXECUTED (`executedHere`): its output, kept under the request's family — and its late reports (`runKeys.lateOf`). */
   mirrors: 'executedHere',
   /** Its share of the usage counter, subtracted before it goes (`usageCountedKey` marks that it was counted). */
   usage: usageCountedKey,
@@ -432,6 +467,42 @@ export const PERSON_DEPENDENTS = {
 } as const;
 
 /**
+ * Everything an ORGANIZATION owns — its partition `org:<id>:` in every store, and what its members own
+ * outside it. Deleting an organization (`purgeOrganization`, Studio's DELETE /organizations/:id) runs
+ * `planOrganization`, in this order:
+ *
+ * It used to be two calls, each reaching one store — `purgeOrganization(journal)` and
+ * `purgeOrganizationWork(work)`, of which Studio called only the first — and both left the memory store,
+ * the documents and the members' jobs in the root work log. A new organization registered under the
+ * same id then listed the old one's threads and read their messages, working memory and documents
+ * (measured on InMemory, Sqlite and Postgres, c-erasure CE-1).
+ */
+export const ORGANIZATION_DEPENDENTS = {
+  /**
+   * 1. First: the purge marker (`orgPurgedKey`, outside the partition). A worker of the organization still
+   * running reads it change, stops, and deletes again what it wrote (erasure-fence.ts). It stays: it is
+   * also where the organization-scoped audit view starts — nothing of anyone, only when.
+   */
+  marker: orgPurgedKey,
+  /**
+   * 2. The partition, in every store, by the prefix `withOrgStorage` writes: the journal (runs, their
+   * records, thread state, owner records, counters, fences — `deletePrefix`), the memory store (threads,
+   * messages, observations, batch markers, every working memory — `deletePartition`, the memory rows of
+   * `SCOPE_TABLES`), the documents and observation vectors (`delete` by the namespace `org:<id>`), the
+   * work store (its queue and event namespaces and keys), the cache and the meta store (`deletePrefix`).
+   */
+  /** 2b. Its platform records outside the partition: detached execution records and held-work shadows. */
+  platformPrefixes: [execScopePrefix, handScopePrefix] as const,
+  partition: { journal: 'deletePrefix', memory: 'deletePartition', vectors: 'delete({ namespace })', work: 'deletePrefix', cache: 'deletePrefix', meta: 'deletePrefix' },
+  /** 3. What it owns OUTSIDE the partition: its and its members' owned records in the root work log (`ownedPrefix({ orgId })`). */
+  owned: 'work.deleteIdPrefix(ownedPrefix({ orgId }))',
+  /** 4. What each background package keeps of those owned records, in its own format: its eraser's `eraseOrganization`. */
+  erasers: 'SubjectEraser.eraseOrganization(orgId)',
+  /** 5. Last: the records that say the organization exists — its registration and its budget. Until they go, a retry finds it. */
+  records: [(orgId: string): string => `${ORG_RECORD_PRE}${orgId}`, (orgId: string): string => `${BUDGET_PRE}${orgId}`] as const,
+} as const;
+
+/**
  * Every table whose rows belong to a scope by one key column — what `adoptIntoOrg` moves into an
  * organization, on Sqlite and Postgres alike (InMemory moves the same things out of its maps).
  * `counted`: whether the moved rows add to the report (a second column of a table already counted does not).
@@ -440,24 +511,42 @@ export const PERSON_DEPENDENTS = {
  * adopted run's `readRun` came back empty (time travel, cost, a purge's child discovery), while
  * InMemory, which reads the key, answered in full — and `gnl_threads.parent_thread_id`, which left an
  * adopted clone pointing at the root's id.
+ *
+ * `kind`: what a row the organization already holds under the adopted id means (`onAdoptionCollision`,
+ * adoption.ts) — a `record` refuses the adoption, a `counter` is summed, a `content-addressed` entry is
+ * the organization's already. `undefined` for a column whose rows follow another one (a journal row's
+ * run, a thread's parent) or that has its own rule (the work log is appended after the organization's,
+ * a work-store key follows `workKeyAdoption`).
  */
-export const SCOPE_TABLES: ReadonlyArray<readonly [table: string, column: string, store: 'runs' | 'memory' | 'work' | 'cache', counted: boolean]> = [
-  ['gnl_run_journal', 'key', 'runs', true],
-  ['gnl_run_journal', 'run_id', 'runs', false],
-  ['gnl_runs', 'run_id', 'runs', true],
-  ['gnl_counters', 'key', 'runs', true],
-  ['gnl_threads', 'id', 'memory', true],
-  ['gnl_threads', 'parent_thread_id', 'memory', false],
-  ['gnl_messages', 'thread_id', 'memory', true],
-  ['gnl_working_memory', 'scope_id', 'memory', true],
-  ['gnl_observations', 'thread_id', 'memory', true],
+export const SCOPE_TABLES: ReadonlyArray<readonly [table: string, column: string, store: 'runs' | 'memory' | 'work' | 'cache', counted: boolean, kind: AdoptedKind | undefined]> = [
+  ['gnl_run_journal', 'key', 'runs', true, 'record'],
+  ['gnl_run_journal', 'run_id', 'runs', false, undefined],
+  ['gnl_runs', 'run_id', 'runs', true, 'record'],
+  ['gnl_counters', 'key', 'runs', true, 'counter'],
+  ['gnl_threads', 'id', 'memory', true, 'record'],
+  ['gnl_threads', 'parent_thread_id', 'memory', false, undefined],
+  ['gnl_messages', 'thread_id', 'memory', true, 'record'],
+  ['gnl_working_memory', 'scope_id', 'memory', true, 'record'],
+  ['gnl_observations', 'thread_id', 'memory', true, 'record'],
   // Missed here, an adopted thread keeps its batch markers under the OLD id: a retry of an in-flight
   // batch is then unmarked and applies twice, and the stale rows sit in the global partition forever.
-  ['gnl_message_batches', 'thread_id', 'memory', true],
-  ['gnl_work_log', 'ns', 'work', true],
-  ['gnl_work_kv', 'key', 'work', true],
-  ['gnl_cache', 'key', 'cache', true],
+  ['gnl_message_batches', 'thread_id', 'memory', true, 'record'],
+  ['gnl_work_log', 'ns', 'work', true, undefined],
+  ['gnl_work_kv', 'key', 'work', true, undefined],
+  ['gnl_cache', 'key', 'cache', true, 'content-addressed'],
 ];
+
+/**
+ * Every SQL column whose adopted rows can meet a twin in the organization, with what that twin means:
+ * `SCOPE_TABLES`' columns that have a kind, and `gnl_meta` (moved apart from them: its engine rows
+ * stay). Both SQL stores ask exactly these.
+ */
+export function adoptedColumns(): Array<readonly [table: string, column: string, kind: AdoptedKind]> {
+  const out: Array<readonly [string, string, AdoptedKind]> = [];
+  for (const [table, col, , , kind] of SCOPE_TABLES) if (kind !== undefined) out.push([table, col, kind]);
+  out.push(['gnl_meta', 'k', 'record']);
+  return out;
+}
 
 // ── The planner: "delete this" → concrete steps, in order ────────────────────────────────────────
 
@@ -472,7 +561,15 @@ export type DeleteStep =
   /** A thread's memory-store half. */
   | { kind: 'thread-store'; threadId: string }
   /** The thread's mark and owner record — always the last step for its thread. */
-  | { kind: 'thread-records'; threadId: string };
+  | { kind: 'thread-records'; threadId: string }
+  /** An organization's purge marker — always its first step. */
+  | { kind: 'org-marker'; orgId: string }
+  /** An organization's partition, in every store the target holds. */
+  | { kind: 'org-partition'; orgId: string }
+  /** What the organization and its members own outside the partition: owned work records, and the erasers'. */
+  | { kind: 'org-owned'; orgId: string }
+  /** Its registration and budget records — always its last step. */
+  | { kind: 'org-records'; orgId: string };
 
 /**
  * A run and every run under it, children first. Reads the run's tool records (and its `net:` keys) to
@@ -504,11 +601,14 @@ export async function planRun(journal: Journal & Partial<JournalReader>, runId: 
   }
   const lk = journal.listKeys;
   if (typeof lk === 'function') {
+    // Its network steps' runs, from its OWN route records (`<runId>:net:route:<i>`, frozen before step i's
+    // run begins) — not from the prefix `net:<runId>:`, which also starts the network runs of a run whose
+    // id extends this one (`x:5` → `net:x:5:0`).
     const kids = new Set<string>();
-    for (const k of await lk.call(journal, `net:${runId}:`)) {
-      const rest = k.slice(`net:${runId}:`.length);
-      const cut = rest.indexOf(':');
-      if (cut > 0) kids.add(`net:${runId}:${rest.slice(0, cut)}`);
+    const routes = `${runRecordPrefix(runId, 'net')}route:`;
+    for (const k of await lk.call(journal, routes)) {
+      const i = k.slice(routes.length);
+      if (/^\d+$/.test(i)) kids.add(composeRunId('net', runId, Number(i)));
     }
     for (const kid of kids) steps.push(...(await planRun(journal, kid, seen)));
   }
@@ -516,32 +616,81 @@ export async function planRun(journal: Journal & Partial<JournalReader>, runId: 
   return steps;
 }
 
-/** What a thread deletion reaches beside the journal: the memory store holding the thread's other half, and its observation vectors. */
-export interface ThreadTarget {
+/**
+ * The stores a deletion reaches. A thread's: the journal, the memory store holding the thread's other
+ * half (`deleteThread`), its observation vectors. An organization's: the ROOT stores — every port the
+ * storage holds, and the background packages' erasers.
+ */
+export interface DeleteTarget {
   journal: Journal & Partial<JournalReader>;
-  memory?: Pick<MemoryStore, 'deleteThread'>;
-  /** Called with `{ filter: { source, threadId } }`; a caller adds its scope (an organization's namespace, `outsideOrganizations`). */
+  memory?: Partial<Pick<MemoryStore, 'deleteThread' | 'deletePartition'>>;
+  /** A thread's step calls it with `{ filter: { source, threadId } }`, and a caller adds its scope (an organization's namespace, `outsideOrganizations`). */
   vectors?: Pick<VectorStore, 'delete'>;
+  work?: Pick<WorkStore, 'deletePrefix' | 'deleteIdPrefix'>;
+  cache?: Pick<CacheStore, 'deletePrefix'>;
+  meta?: Pick<MetaStore, 'deletePrefix'>;
+  /** The background packages' share of an organization (`jobEraser`, `triggerEraser`, `eventEraser`). */
+  erasers?: ReadonlyArray<{ name: string; eraseOrganization?(orgId: string): Promise<number> }>;
 }
 
 /**
- * The runs on a thread that may still write — what a thread deletion refuses to pull out from under.
+ * IN FLIGHT — the one rule for "may this run still write", asked by every operation that must not pull a
+ * run out from under its worker: a thread's deletion (`planThread`), a person's erasure order
+ * (erase.ts `subjectRuns`) and an adoption into an organization (`assertNoRunsInFlight`).
  *
  * In flight: the run's status is `running` (its write-ahead outcome with nothing suspended — a turn
  * that is executing, or whose worker died and nobody canceled), or one of its model steps or tool calls
- * is claimed `running` right now (the step a canceled run is still inside). A SUSPENDED run is not: it
- * writes nothing until someone answers it, and its approval goes with the thread.
+ * is claimed `running` right now (the step a canceled run is still inside). A run PARKED ON A PERSON
+ * (status `suspended`: its outcome still says `running`, a question is open) is not: it writes nothing
+ * until someone answers it — and that answer is a new request, which the deletion's fence refuses and
+ * which, after an adoption, arrives in the organization like any other.
  *
  * A `completed` run's claims are not read: its outcome is the run's own LAST write, so nothing of it
  * runs after it — and it is the common case (on the 1M store every run of the deleted threads), where
  * the claim listing was most of what this check cost.
  */
-export async function threadRunsInFlight(journal: Journal & Partial<JournalReader>, runs: RunSummary[]): Promise<string[]> {
+export async function runsInFlight(journal: Journal & Partial<JournalReader>, runs: RunSummary[]): Promise<string[]> {
   const out: string[] = [];
   for (const r of runs) {
     if (r.status === 'running' || (r.status !== 'completed' && (await hasRunningClaim(journal, r.runId)))) out.push(r.runId);
   }
   return out;
+}
+
+/**
+ * Refuses to adopt while a run is still executing (`runsInFlight` — a run waiting on a person is not).
+ *
+ * Measured, on SQLite with a real model call in flight: the migration moved three of the run's keys
+ * into the organization, the run then wrote its next key at the ROOT, and the store ended with the
+ * SAME logical key in both places —
+ *
+ *   canli-kosu:proc:__gnl_model_claim:0            (root, written after the migration)
+ *   org:acme:canli-kosu:proc:__gnl_model_claim:0   (moved)
+ *
+ * — the exactly-once claim marker, duplicated: no error, and no whole record either. The transaction
+ * does not help, because the run is not inside it. So this is a refusal, not a warning: "stop writes
+ * before upgrading" is advice a deployment can follow accidentally; the store is the only place that
+ * knows whether it actually did.
+ *
+ * Before, every run whose outcome record said `running` was refused — a run parked on a person too, and
+ * the advice ("let the runs finish") could not be followed: it finishes when a person answers (release
+ * audit D5). The organization's own runs (`org:<id>:…`) are already where an adoption puts them.
+ */
+export async function assertNoRunsInFlight(source: RunJournal | Storage, allowInFlight?: boolean): Promise<void> {
+  if (allowInFlight) return;
+  const journal = toJournal(source);
+  const runs = ((await listRunsWhere(journal, {})) ?? []).filter((r) => !isOrganizationKey(r.runId));
+  const inFlight = await runsInFlight(journal, runs);
+  if (inFlight.length === 0) return;
+  const parked = runs.filter((r) => r.status === 'suspended' && !inFlight.includes(r.runId)).length;
+  throw new Error(
+    `@gnldev/durable: ${inFlight.length} run(s) are still executing (${inFlight.slice(0, 3).join(', ')}` +
+    `${inFlight.length > 3 ? ', …' : ''}), and adopting now would SPLIT them: the migration moves the keys ` +
+    'they have already written while they go on writing unprefixed ones, leaving the same exactly-once ' +
+    'claim marker in two places. Measured. Stop accepting work, then let these runs finish or cancel them ' +
+    '(`cancelAgentRun(journal, runId)`) and adopt again — or pass { allowInFlight: true } if their workers are gone.' +
+    (parked > 0 ? ` ${parked} run(s) waiting on a person are not counted: they write nothing until answered, and move with the rest.` : ''),
+  );
 }
 
 /** The run-scoped pointer to a tool claim held under a window (`xreq:`/`xthr:`/`xrun:`) — see `hasRunningClaim`. */
@@ -558,11 +707,14 @@ export const windowClaimPointerKey = (runId: string, toolCallId: string): string
  */
 export async function hasRunningClaim(journal: Journal, runId: string): Promise<boolean> {
   if (typeof journal.listKeys !== 'function') return false;
-  for (const k of await journal.listKeys(`${runId}:`)) {
-    if (!k.includes(':proc:') && !k.includes(':tool:')) continue;
+  // The run's own claim families, by their exact prefixes (run-id-grammar.ts): its namespace also holds a
+  // run whose id extends this one (`x:y` under `x:`), and that run's running call is not this run's.
+  const pointers = windowClaimPointerKey(runId, '');
+  const keys = [...(await journal.listKeys(runRecordPrefix(runId, 'proc'))), ...(await journal.listKeys(runRecordPrefix(runId, 'tool')))];
+  for (const k of keys) {
     const v = await journal.get<{ status?: unknown; claim?: unknown }>(k);
     if (v && typeof v === 'object' && v.status === 'running') return true;
-    if (k.includes(':proc:__gnl_window_claim:') && v && typeof v.claim === 'string') {
+    if (k.startsWith(pointers) && v && typeof v.claim === 'string') {
       const claimed = await journal.get<{ status?: unknown }>(v.claim);
       if (claimed && typeof claimed === 'object' && claimed.status === 'running') return true;
     }
@@ -571,14 +723,39 @@ export async function hasRunningClaim(journal: Journal, runId: string): Promise<
 }
 
 /**
- * The last thing an attempt of a run does: when the run was deleted while the attempt ran (its fence,
- * or its organization's purge since `baseline`), delete again what the attempt wrote into it — the same
- * plan the deletion ran — and answer true. Read AFTER the attempt's last write: that order is what
- * makes the fence close the run's own key space (erasure-fence.ts).
+ * The thread memory a run appends to — what its settle takes back from. `retract` is `Memory.retract`;
+ * the batches are the run's own (`runKeys.memUserAppended`, `runKeys.memAppended`).
  */
-export async function settleErasedRun(journal: Journal & Partial<JournalReader>, runId: string, baseline: ErasureBaseline | undefined): Promise<boolean> {
+export interface RunAppends { memory: Pick<Memory, 'retract'>; threadId: string }
+
+/**
+ * The last thing an attempt of a run does: when the run was deleted while the attempt ran (its fence,
+ * or its organization's purge since `baseline`), delete again what the attempt wrote — the turn it
+ * appended to its thread (`appends`), then its records, by the same plan the deletion ran — and answer
+ * true. Read AFTER the attempt's last write: that order is what makes the fence close everything the
+ * attempt writes (erasure-fence.ts).
+ *
+ * The thread's messages are not the run's to delete otherwise (a purged run's turn stays in a live
+ * thread, as retention needs it to); a FENCED attempt's are, because the run they answer was deleted
+ * before they were written, or while: whatever landed after the deletion took the thread is this
+ * attempt's alone, and only this attempt knows its batches. Without it a turn appended in that moment
+ * stayed in the deleted thread for good — nothing named it, so no later erasure found it (CE-2).
+ */
+export async function settleErasedRun(
+  journal: Journal & Partial<JournalReader>,
+  runId: string,
+  baseline: ErasureBaseline | undefined,
+  appends?: RunAppends,
+): Promise<boolean> {
   if (!(await runErasedSince(journal, runId, baseline))) return false;
-  if (typeof journal.deletePrefix === 'function') await executePlan({ journal }, await planRun(journal, runId));
+  await fenceThroughLineage(journal, runId, baseline);
+  if (appends?.memory.retract) {
+    for (const batch of [runKeys.memUserAppended(runId), runKeys.memAppended(runId)]) await appends.memory.retract(appends.threadId, batch);
+  }
+  // No fence of its own: the deletion it completes has already left its mark (the run's fence, or the
+  // organization's purge marker). Written here, after an organization's purge, it landed inside the
+  // purged partition — a record the next tenant of the id inherited.
+  if (typeof journal.deletePrefix === 'function') await executePlan({ journal }, await planRun(journal, runId), { fence: false });
   return true;
 }
 
@@ -587,7 +764,14 @@ export async function settleErasedRun(journal: Journal & Partial<JournalReader>,
  * every organization's runs too (`org:<id>:…`), and acme's `t-a` is another thread than the root's.
  */
 async function runsOnThread(journal: Journal, threadId: string): Promise<RunSummary[]> {
-  return ((await listRunsWhere(journal, { threadId })) ?? []).filter((r) => !isOrganizationKey(r.runId));
+  // A storage's own run journal (`storage.runs`, what the docs hand a thread delete) lists through
+  // `listRuns`, a page at a time, filtered by thread: read through the reader shape. Without it the
+  // listing answered nothing, and the delete took the thread's messages and left all of its runs.
+  const listed = await listRunsWhere(asReaderJournal(journal), { threadId });
+  // A journal that cannot list runs cannot say which are the thread's: refused before anything is deleted,
+  // never "the thread had no runs" (its runs would stay, and the count would look done).
+  if (listed === undefined) throw new Error('@gnldev/durable: deleting a thread needs a journal that lists runs (listRuns / listRunsPaged) — its runs could not be found');
+  return listed.filter((r) => !isOrganizationKey(r.runId));
 }
 
 /**
@@ -595,12 +779,12 @@ async function runsOnThread(journal: Journal, threadId: string): Promise<RunSumm
  * memory-store half, its records. `runs: false` is a thread MOVE's half (`purgeThreadState`): the state
  * goes, the runs stay with the id they name.
  */
-export async function planThread(target: ThreadTarget, threadId: string, opts: { runs?: boolean; allowInFlight?: boolean } = {}): Promise<DeleteStep[]> {
+export async function planThread(target: DeleteTarget, threadId: string, opts: { runs?: boolean; allowInFlight?: boolean } = {}): Promise<DeleteStep[]> {
   const steps: DeleteStep[] = [];
   if (opts.runs !== false) {
     const runs = await runsOnThread(target.journal, threadId);
     if (!opts.allowInFlight) {
-      const inFlight = await threadRunsInFlight(target.journal, runs);
+      const inFlight = await runsInFlight(target.journal, runs);
       if (inFlight.length > 0) throw new ThreadRunsInFlightError(threadId, inFlight);
     }
     const seen = new Set<string>();
@@ -613,6 +797,19 @@ export async function planThread(target: ThreadTarget, threadId: string, opts: {
   return steps;
 }
 
+/**
+ * An organization's deletion, as steps (`ORGANIZATION_DEPENDENTS`): the marker, the partition in every
+ * store, what it owns outside it, its records last. `records: false` for a second storage that holds
+ * only data of the organization's (`purgeOrganization`'s `memory`), never its registration.
+ * Throws for an id `orgPrefix` refuses — before any step exists.
+ */
+export function planOrganization(orgId: string, opts: { records?: boolean } = {}): DeleteStep[] {
+  orgPrefix(orgId);
+  const steps: DeleteStep[] = [{ kind: 'org-marker', orgId }, { kind: 'org-partition', orgId }];
+  if (opts.records !== false) steps.push({ kind: 'org-owned', orgId }, { kind: 'org-records', orgId });
+  return steps;
+}
+
 // ── The executor ─────────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -622,9 +819,16 @@ export async function planThread(target: ThreadTarget, threadId: string, opts: {
  * have been idle for longer than the horizon after which a fence is swept anyway.
  */
 export async function executePlan(
-  target: ThreadTarget,
+  target: DeleteTarget,
   steps: DeleteStep[],
-  opts: { ownershipTrace?: string; fence?: boolean } = {},
+  opts: {
+    ownershipTrace?: string;
+    fence?: boolean;
+    /** When an organization's marker says it was purged (epoch ms). */
+    now?: number;
+    /** Filled with what each eraser removed, by its name. */
+    byEraser?: Record<string, number>;
+  } = {},
 ): Promise<number> {
   const journal = target.journal;
   const del = requireDelete(journal);
@@ -639,16 +843,23 @@ export async function executePlan(
         if (opts.ownershipTrace === step.runId) await writeOwnershipTrace(journal, step.runId);
         // What its usage was, read while its records are still there; subtracted once they are gone.
         const usage = await usageToSubtract(journal, step.runId);
-        for (const key of step.mirrors) total += await deleteExactKey(journal, key);
+        for (const key of step.mirrors) total += (await deleteExactKey(journal, key)) + (await deleteExactKey(journal, runKeys.lateOf(key)));
         // The request's own window (`xreq:<runId>:args-…`), when this run started one: every record its
-        // tree deduped against. `args-` closes the prefix — run 'a' must not reach run 'a:b''s request.
-        for (const prefix of RUN_DEPENDENTS.prefixes) total += await del(prefix(step.runId));
+        // tree deduped against — by owner, not by prefix: `xreq:a:args-` also starts the window of a run
+        // named `a:args-…`.
+        for (const family of RUN_DEPENDENTS.keyed) total += await deleteOwnKeyed(journal, family, step.runId);
         // MEASURED, on both InMemoryJournal and SqliteStorage: `del('mem-appended:r-1')` also removed
         // `mem-appended:r-10`. These keys end where the runId ends, so a prefix delete of one is a prefix
         // delete of a neighbour's — the wfrun: boundary deleteExactKey was written for. The per-run metrics
         // rows are top-level too, and their keys carry the runId — which for an owned job or trigger run
         // is its owner's name (`job:~o~acme:ayse:…`). The aggregate counters stay.
         for (const key of RUN_DEPENDENTS.exactKeys) total += await deleteExactKey(journal, key(step.runId));
+        // Its execution record and held-work shadows, in the platform journal every process shares: they
+        // name the run, and a sweep would otherwise find the record and try to continue a deleted run.
+        {
+          const root = (orgParentOf(journal) ?? journal) as Journal;
+          if (root.deletePrefix) for (const k of RUN_DEPENDENTS.platformKeys(orgScopeOf(journal), step.runId)) total += await root.deletePrefix(k);
+        }
         // The run's own records LAST: they are how a second attempt finds it (its `:input` lists it on its
         // thread and its person, its keys answer `hasTrace` from its parent). Gone first, a deletion killed
         // just after left its metrics rows behind for good — measured, dependents-model.test.ts P6.
@@ -665,7 +876,7 @@ export async function executePlan(
         total += await target.vectors!.delete!({ filter: { source: THREAD_DEPENDENTS.vectors.source, threadId: step.threadId } });
         break;
       case 'thread-store':
-        await target.memory!.deleteThread(step.threadId);
+        await target.memory!.deleteThread!(step.threadId);
         break;
       case 'thread-records':
         // The owner record names a person, and with the thread gone it guards nothing — so it goes, and
@@ -673,6 +884,37 @@ export async function executePlan(
         // Exactly, not as a prefix: thread ids may contain ':', so `thread:x:owner` is a prefix of thread
         // `x:owner:y`'s record — a prefix delete of x's took y's owner, and y stood ungated.
         for (const key of THREAD_DEPENDENTS.records) total += await deleteExactKey(journal, key(step.threadId));
+        break;
+      case 'org-marker':
+        // A fresh value each purge (`n`): a worker compares it with the one it started under.
+        await journal.put(ORGANIZATION_DEPENDENTS.marker(step.orgId), { at: opts.now ?? Date.now(), n: randomUUID() });
+        break;
+      case 'org-partition': {
+        // The trailing ':' is the boundary: org 'acme' never reaches 'acme2' (`org:acme2:` does not start with `org:acme:`).
+        const prefix = orgPrefix(step.orgId);
+        const ns = prefix.slice(0, -1); // `org:acme`, the vector namespace withOrgStorage writes
+        total += await del(prefix);
+        // Its detached execution records and shadows live outside the partition, under the organization's scope.
+        for (const p of ORGANIZATION_DEPENDENTS.platformPrefixes) total += await del(p(step.orgId));
+        if (target.memory) total += await target.memory.deletePartition!(prefix);
+        if (target.vectors) total += await target.vectors.delete!({ namespace: ns, [VECTOR_PARTITION]: ns });
+        if (target.work) total += await target.work.deletePrefix!(prefix);
+        if (target.cache) total += await target.cache.deletePrefix!(prefix);
+        if (target.meta) total += await target.meta.deletePrefix!(prefix);
+        break;
+      }
+      case 'org-owned': {
+        if (target.work) total += await target.work.deleteIdPrefix!(ownedPrefix({ orgId: step.orgId }));
+        for (const e of target.erasers ?? []) {
+          const n = await e.eraseOrganization!(step.orgId);
+          if (opts.byEraser) opts.byEraser[e.name] = (opts.byEraser[e.name] ?? 0) + n;
+          total += n;
+        }
+        break;
+      }
+      case 'org-records':
+        // Exactly: `__org__:acme` is a prefix of `__org__:acme2`.
+        for (const key of ORGANIZATION_DEPENDENTS.records) total += await deleteExactKey(journal, key(step.orgId));
         break;
     }
   }

@@ -13,7 +13,7 @@ import {
   InMemoryStorage, createGnl, user, eraseSubject, withOrgStorage, scopeConfigToOrg, workingMemoryScope, toJournal, staff,
   type Storage, type VectorStore,
 } from '@gnldev/durable';
-import { SqliteStorage } from '../../durable/src/sqlite-storage.js';
+import { SqliteStorage } from '@gnldev/durable/sqlite';
 import { VECTOR_ALL_PARTITIONS } from '@gnldev/durable';
 import { AgentMemory, memoryPreset, migrateWorkingMemoryKeys } from '../src/index.js';
 

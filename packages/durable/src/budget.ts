@@ -1,6 +1,7 @@
 // Data-driven budget/quota: limits live in the journal (editable from Studio, the policy.ts pattern),
 // hosts (@gnldev/server) read them LIVE via checkBudget on the write path and return 402 on overrun → a
 // limit change does not require a deploy. Usage is computed post-hoc/exactly from journaled usage (cost.ts).
+import { runRecordKey } from './run-id-grammar.js';
 import type { Journal, JournalReader, RunSummary } from './journal.js';
 import { claim, listRunsArray, asReaderJournal } from './journal.js';
 import { OPEN_RUN_STATUSES } from './run-cursor.js';
@@ -87,7 +88,7 @@ function warnUsageCasFallback(journal: object): void {
  * goes away too when the run is deleted).
  */
 export function usageCountedKey(runId: string): string {
-  return `${runId}:usage-counted`;
+  return runRecordKey(runId, 'usage-counted');
 }
 
 export interface BudgetLimit {

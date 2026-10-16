@@ -21,10 +21,12 @@ import {
   recordRunOutcome, runStarted, cancelAgentRun, RunCanceledError, runKeys,
 } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
+import { claimRunOwner, STAFF } from '../src/run-identity.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
+import { streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
-const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {}, doStream: async () => { throw new Error('gen-only'); } };
+const base = { specificationVersion: 'v2', provider: 'scripted', modelId: 'm', supportedUrls: {}, doStream: async function (this: any, o: any) { return streamFromGenerate(this, o); } };
 const good = { ...base, doGenerate: async () => ({ content: [{ type: 'text', text: 'ok' }], finishReason: 'stop', usage, warnings: [] }) } as any;
 const dead = { ...base, doGenerate: async () => { throw new Error('401 invalid api key'); } } as any;
 
@@ -94,10 +96,12 @@ for (const [name, make] of adapters) {
     it('a run canceled before it ever started reads canceled, not completed', async () => {
       const journal = make();
       // Nothing has run: no entries, no outcome. This is the case that read 'completed' — the absence
-      // of a terminal record and "ended fine" were the same answer.
+      // of a terminal record and "ended fine" were the same answer. The run is born (its owner
+      // recorded) — a cancel continues a run, it does not begin one (run-identity.ts existingRun).
+      await claimRunOwner(journal, 'never-ran', STAFF);
       await cancelAgentRun(journal, 'never-ran', { reason: 'operator' });
       expect(await statusOf(journal, 'never-ran')).toBe('canceled');
-      // And the run LISTS at all: the cancel may be a run's very first key.
+      // And the run LISTS: the cancel may be its first key after the owner record.
       expect((await listRunsArray(journal)).map((r: any) => r.runId)).toContain('never-ran');
     });
 
@@ -138,6 +142,7 @@ for (const [name, make] of adapters) {
       const journal = make();
       await runDurable({ runId: 'f-done', journal, model: good, prompt: 'x' } as any);
       await runDurable({ runId: 'f-died', journal, model: dead, prompt: 'x' } as any).catch(() => {});
+      await claimRunOwner(journal, 'f-stop', STAFF);
       await cancelAgentRun(journal, 'f-stop', { reason: 'operator' });
 
       // A bare JournalReader filters through `listRunsPaged`; an adapter's RunJournal takes the query
@@ -189,6 +194,7 @@ for (const [name, make] of adapters) {
 describe('the cancel verdict under a race', () => {
   it('a straggling start marker cannot resurrect a canceled run', async () => {
     const journal = new InMemoryJournal();
+    await claimRunOwner(journal, 'r', STAFF);
     await cancelAgentRun(journal, 'r', { reason: 'operator' });
     const at = (await readRunOutcome(journal, 'r'))!.at;
     // A worker that passed assertNotCanceled microseconds BEFORE the flag landed reaches runStarted
@@ -200,6 +206,7 @@ describe('the cancel verdict under a race', () => {
 
   it('but a run that genuinely finished despite a late cancel says so', async () => {
     const journal = new InMemoryJournal();
+    await claimRunOwner(journal, 'r', STAFF);
     await cancelAgentRun(journal, 'r', { reason: 'operator' });
     const at = (await readRunOutcome(journal, 'r'))!.at;
     // The cancel takes effect at the NEXT fresh model step; against a run on its last step it simply
@@ -211,6 +218,7 @@ describe('the cancel verdict under a race', () => {
 
   it('re-cancelling is idempotent and keeps the ORIGINAL decision`s moment', async () => {
     const journal = new InMemoryJournal();
+    await claimRunOwner(journal, 'r', STAFF);
     await cancelAgentRun(journal, 'r', { reason: 'first' });
     const first = (await readRunOutcome(journal, 'r'))!;
     await new Promise((r) => setTimeout(r, 5));

@@ -12,11 +12,12 @@ import type { RunSummary, RunStatus } from './journal.js';
  * does not move it.
  *
  * - `runId` — the last run handed out. Every reader can place it.
- * - `at` — that run's `created_at`, when the source keeps one in the order (Sqlite, Postgres). A
- *   source that orders an array it built (InMemory) does not, and a database reader resolves
- *   a position without it from the run itself.
- * - `next` — the run the next page starts with, as the source saw it. An array source places the
- *   cursor by it when the run above is gone (purged while the page was on screen).
+ * - `at` — that run's `created_at` (`RunSummary.createdAt`), the first half of the key every listing
+ *   is ordered by. With it any reader — a table or an array — places the position after the run even
+ *   when that run is gone. Absent only from a listing whose source gives no creation time (a custom
+ *   array reader); a database reader then resolves it from the run itself.
+ * - `next` — the run the next page starts with, as the source saw it. A position without `at` is
+ *   placed by it when the run above is gone (purged while the page was on screen).
  * - `seen` — how many runs this listing has handed out so far. Used only when neither run is left
  *   and the source cannot place the position any other way.
  *
@@ -109,33 +110,64 @@ export const rangeOrder = (column: RunRelationRead['column'], dir: 'ASC' | 'DESC
   `ORDER BY r.${column} ${dir}, r.created_at ${dir}, r.run_id ${dir}`;
 
 /**
- * One page of runs from an array already in ascending creation order — the shape InMemory and a legacy
- * array reader produce. Filters before it slices (the listRunsPaged contract), and
- * places the cursor by its run: the position after `runId`, wherever that run now sits. When that
- * run is gone, the page starts at `next`; when both are gone, at `seen` — the best an array without
- * creation times can do.
+ * The order every run listing pages by: `(createdAt, runId)` ascending, the key of Sqlite's and
+ * Postgres's `gnl_runs_created` index. Run ids compare by UTF-16 code unit, which is the tables' order
+ * on Sqlite and on a `C`-collated Postgres; two runs of one millisecond on a linguistically collated
+ * Postgres may tie the other way round there.
+ * @internal — the in-memory journal lists its runs in it.
+ */
+export function compareRunKey(a: RunSummary, b: RunSummary): number {
+  return a.createdAt! - b.createdAt! || (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0);
+}
+
+/**
+ * One page of runs from an array — the shape InMemory, a legacy array reader and the Studio's and
+ * server's lists produce. Filters before it slices (the listRunsPaged contract).
+ *
+ * When every summary carries `createdAt` (every first-party store's do), it pages exactly as a table
+ * does: sorted by `(createdAt, runId)` and resumed STRICTLY AFTER the cursor's position, whether or not
+ * that run is still there — so a run purged or created between two requests neither repeats nor skips
+ * a surviving one, and a cursor from either kind of reader is read by the other. An array whose
+ * summaries carry no creation time is taken in its own (creation) order and placed by the cursor's run,
+ * then by the run after it, then by the count handed out so far — all an array without a position can
+ * do, exact while the list does not change.
  *
  * @internal — engine plumbing shared with the Studio and server run lists; gnl builds its argument from a validated request, no host writes it.
  */
 export function pageRunsFromArray(
-  ascending: readonly RunSummary[],
+  source: readonly RunSummary[],
   q?: RunFilter & { limit?: number; cursor?: string; order?: RunOrder },
 ): { items: RunSummary[]; nextCursor?: string } {
   const pos = decodeRunCursor(q?.cursor);
-  let list = ascending.filter((r) => matchesRunFilter(r, q));
-  if (q?.order === 'desc') list = list.reverse();
+  const keyed = source.every((r) => typeof r.createdAt === 'number');
+  let list = source.filter((r) => matchesRunFilter(r, q));
+  if (keyed) list.sort(compareRunKey);
+  const desc = q?.order === 'desc';
+  if (desc) list = list.reverse();
   const limit = q?.limit ?? 50;
   let start = 0;
   if (pos) {
     const i = list.findIndex((r) => r.runId === pos.runId);
-    const n = i >= 0 || pos.next === undefined ? -1 : list.findIndex((r) => r.runId === pos.next);
-    start = i >= 0 ? i + 1 : n >= 0 ? n : Math.min(pos.seen, list.length);
+    if (i >= 0) start = i + 1;
+    else if (keyed && pos.at !== undefined) {
+      const at = { runId: pos.runId, createdAt: pos.at } as RunSummary;
+      const past = list.findIndex((r) => (desc ? compareRunKey(r, at) < 0 : compareRunKey(r, at) > 0));
+      start = past >= 0 ? past : list.length;
+    } else {
+      const n = pos.next === undefined ? -1 : list.findIndex((r) => r.runId === pos.next);
+      start = n >= 0 ? n : Math.min(pos.seen, list.length);
+    }
   }
   const items = list.slice(start, start + limit);
   const last = items[items.length - 1];
   const following = list[start + limit];
   const seen = (pos?.seen ?? 0) + items.length;
-  return { items, ...(following && last ? { nextCursor: encodeRunCursor({ runId: last.runId, next: following.runId, seen }) } : {}) };
+  return {
+    items,
+    ...(following && last
+      ? { nextCursor: encodeRunCursor({ runId: last.runId, ...(keyed ? { at: last.createdAt! } : {}), next: following.runId, seen }) }
+      : {}),
+  };
 }
 
 /** One run as a database listing reads it: its summary and the `created_at` the order is keyed on. */
@@ -245,7 +277,7 @@ export async function keysetRunPage(
   const items = out.slice(0, limit);
   const last = items[items.length - 1];
   return {
-    items: items.map((r) => r.summary),
+    items: items.map((r) => ({ ...r.summary, createdAt: r.at })),
     ...(out.length > limit && last ? { nextCursor: encodeRunCursor({ runId: last.summary.runId, at: last.at, next: out[limit]!.summary.runId, seen: (pos?.seen ?? 0) + items.length }) } : {}),
   };
 }

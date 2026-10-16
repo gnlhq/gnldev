@@ -24,6 +24,11 @@ turn green, so a red root suite still means a new regression. Run it with `pnpm 
 | `generate/shapes.mjs` | The workflows, models, documents and ids both sides build: the generator from 0.9.0, the tests from the workspace. |
 | `test/from-0.9.0/` | One file per area: queue, events, workflow, scheduler, memory, rag, evals, PII tool results; `work-real-backends` for Postgres. |
 | `test/mixed-0.9.0/` | A rolling deploy: a 0.9.0 process (a child, `run-0.9.0.mjs`) and the current code on one file. |
+| `fixtures/0.10.0/runs.db`, `postgres-runs.sql` | A store as 0.10.0 left it: runs of every kind (completed, suspended, failed, canceled, one left running, sub-agents, staff, approved), a person erased on 0.10.0, an organization. |
+| `fixtures/0.10.0/notes-*.json` | What each call answered on 0.10.0 while writing them, and the side effects in order. |
+| `generate/0.10.0.mjs` | Writes the 0.10.0 fixtures, with the 0.10.0 code. |
+| `generate/runs.mjs` | The run history and the questions asked of it: the generator writes it with 0.10.0, the tests write it again with the current code and compare every answer. |
+| `test/from-0.10.0/` | 0.10.0 → this version (the `run-status` upgrade): opening and listing change nothing; after `gnl upgrade`, and after `--only run-status,schema` alone, every answer equals a store this version wrote with the same history; what a user does next repeats no side effect. |
 
 ## Run
 
@@ -59,6 +64,18 @@ node generate/0.9.0.mjs --check                          # regenerate into a tem
 GNL_PG_URL=postgres://postgres:pw@localhost:5432/postgres GNL_PG_DUMP='docker exec -i <container> pg_dump' \
   node generate/0.9.0.mjs --backend postgres
 ```
+
+For 0.10.0 (`GNL_0100_ROOT`: a built checkout of the 0.10.0 tag, or an install of the published packages;
+without it the generator installs them from npm):
+
+```sh
+node generate/0.10.0.mjs                                 # fixtures/0.10.0/runs.db
+node generate/0.10.0.mjs --check
+GNL_PG_URL=… GNL_PG_DUMP='docker exec -i <container> pg_dump' node generate/0.10.0.mjs --backend postgres [--db <name>]
+```
+
+The 0.10.0 Postgres dump is not byte-for-byte reproducible: 0.10.0's metrics counters read the database's
+own clock (`now()`), and the dump's row order is the heap's. The Sqlite file is.
 
 The clock, `Math.random` and `randomUUID` are fixed, and reset before each fixture
 (`generate/deterministic.mjs`), so a regeneration writes the same bytes: the SQLite files and the
