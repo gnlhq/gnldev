@@ -132,6 +132,12 @@ whose call may still report is never declared failed before it has (`waiting-out
     wrote taken back, and `run`/`runResumable`/`forkWorkflowRun` throw `RunErasedError`.
   **Migration:** a custom `JournalLike.beginRun` may keep returning nothing (no lease: no erasure
   check, as before); a host that resumed a pre-owner workflow run with no identity passes `STAFF`.
+- **Scheduling or enqueueing work under the id of an erased run throws `RunErasedError`.** After
+  `eraseSubject`, `scheduleWorkflow` under an erased trigger's id, `enqueue` under an erased job's id and
+  `retryJob` of such a job refuse at once instead of returning ok and never running (see Fixed). A host
+  that re-registers every trigger at startup, one per person, now gets this error for an erased person.
+  **Migration:** catch `RunErasedError` (`code: 'run_erased'`) and skip that person, or give the work a
+  new id.
 - **`rolloverRun`'s `newRunId`, the exported `runNetwork` and `createBatch(...).run` pass the run-id
   gate (`admitRunId`)** like every other run birth. Before, `rolloverRun(journal, x, { newRunId:
   'task:P:c' })` wrote the next period's owner record under an engine-begun id nobody had made, the
@@ -387,6 +393,24 @@ whose call may still report is never declared failed before it has (`waiting-out
   back: pass `nextCursor` back, or use `order: 'desc'` for newest first.
 
 ### Fixed
+
+- **A job or trigger under a run id an erasure deleted was accepted, then failed on every attempt with
+  a false reason.** After `eraseSubject`, `enqueue(…, { id: 'weekly:w42', caller: user('ayse') })`
+  returned ok; the job's run `job:<id>` was fenced, so each attempt was refused at its birth and the job
+  was retried until `failed`, every attempt reporting "deleted while it was running" about a run that
+  never ran again. The same held for `scheduleWorkflow` under the id of an erased trigger (its fires'
+  runs start at `sched:<id>:0`), and for `retryJob` on a dead letter whose run was deleted. Now:
+  - `enqueue`, `retryJob` and `scheduleWorkflow` refuse such an id with `RunErasedError` (`run_erased`)
+    before writing anything — the rule a run's birth applies (`refuseErasedRunId`, run-identity.ts).
+    Use a new id; `retryJob(…, { newRun: true })` still starts the job over.
+  - A job or fire that meets the deletion later (its run deleted while it waited, or while it ran) ends
+    at once, `failed`, with that error, instead of spending its remaining attempts: `attemptEndOf`
+    answers `'erased'` for the unit's own run.
+  - `RunErasedError`'s message no longer says "while it was running": it is also thrown for a run that
+    was not.
+  - The door reaches the run journal through the work port (`enqueue(storage.work, …)`): the built-in
+    storages and `composite` mark their port as theirs. A host's own work store is answered by its
+    worker, at the first attempt.
 
 - **An erasure on Postgres could fail as a deadlock victim while a run took back its deleted turn**:
   `retractBatch` locked the batch marker, then its rows, without the thread's lock, while a thread

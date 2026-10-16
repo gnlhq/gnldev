@@ -115,15 +115,21 @@ export function classifyRunError(err: unknown): 'failure' | 'contended' | 'not-a
  *                attempt — counted, bounded by maxAttempts. Read as a deferral, a handler that called a
  *                run held for good by a frozen process re-ran its effect on every poll and never
  *                dead-lettered (audit R2-5).
+ *   'erased'   — the unit's OWN run was deleted (RunErasedError of `unitRunId`): refused at its birth, or
+ *                stopped while it ran. It can never run again under that id, so no attempt is left to
+ *                spend: the unit ends now, failed, with that error — retried, it reported a deletion
+ *                "while it was running" on every attempt of a run that no longer ran (e2e F1). Another
+ *                run deleted under the unit is the unit's own code failing: an attempt.
  *   'attempt'  — everything else: the unit's own code ran and failed.
  *
  * By name, one `cause` deep (a library may wrap what it rethrows): a host with two resolved copies of
  * this package must not get a different answer from a failed `instanceof`.
  */
-export function attemptEndOf(err: unknown, unitRunId: string): 'released' | 'deferred' | 'attempt' {
+export function attemptEndOf(err: unknown, unitRunId: string): 'released' | 'deferred' | 'erased' | 'attempt' {
   for (let e = err as { name?: unknown; atLockAcquisition?: unknown; runId?: unknown; cause?: unknown } | null | undefined, i = 0; e && typeof e === 'object' && i < 2; e = e.cause as typeof e, i++) {
     if (e.name === 'RunDrainedError' || e.name === 'LivenessUnavailableError') return 'released';
     if (e.name === 'RunBusyError' && e.atLockAcquisition === true && e.runId === unitRunId) return 'deferred';
+    if (e.name === 'RunErasedError' && e.runId === unitRunId) return 'erased';
   }
   return 'attempt';
 }

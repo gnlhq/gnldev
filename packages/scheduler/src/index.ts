@@ -2,7 +2,7 @@
 // Keeps triggers in the journal (definition immutable, state mutable). The poll loop (now=Date.now())
 // fires due triggers exactly-once (acquireRunLock + per-fireCount runId). The workflow run carries its
 // own durable guarantee. Time = DATA (nextRunAt in the journal) → resolve-then-freeze, replay-safe.
-import { acquireRunLock, argsHash, attemptEndOf, createPollLoop, holdWhile, isDraining, orgPrefix, ownedName, ownedPrefix, ownerOfName, stableStringify, user, staff, UNKNOWN } from '@gnldev/durable';
+import { acquireRunLock, argsHash, attemptEndOf, createPollLoop, holdWhile, isDraining, orgPrefix, ownedName, ownedPrefix, ownerOfName, stableStringify, user, staff, UNKNOWN, refuseErasedRunId, withOrg } from '@gnldev/durable';
 import type { Journal, Caller } from '@gnldev/durable';
 import { canonicalTimeZone, cronNeverFires, nextCronTime } from './cron.js';
 import { rootJournal } from './root-journal.js';
@@ -552,7 +552,11 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
     }
     return id;
   }
-  // A trigger nobody has seen before: both halves are written here, and only here.
+  // A trigger nobody has seen before: both halves are written here, and only here. Its first fire's run
+  // (`sched:<id>:0`) is born at that fire (`claimRunOwner`); an erasure that took this id's earlier fires
+  // fenced it, and a fenced id is never born again — refused here by that same rule, before anything is
+  // written, instead of a trigger that fails at every fire (e2e F1, its scheduler sibling).
+  await refuseErasedRunId(def.orgId !== undefined ? withOrg(journal, def.orgId) : journal, `sched:${id}:0`);
   await writeTrigger(journal, id, def, { nextRunAt: firstRunAt(def, now), attempts: 0, fireCount: 0, status: 'pending' });
   return id;
 }
@@ -791,6 +795,15 @@ export async function pollScheduler(
           // drain failed the trigger for good on its last attempt (audit C5).
           if (end === 'released') {
             out.skipped++;
+            return;
+          }
+          // ITS RUN WAS DELETED: no fire can run it again under this id — the trigger fails now, with
+          // that error, instead of spending its attempts on a run that no longer runs.
+          if (end === 'erased') {
+            if (await commit({ ...state, attempts: state.attempts + 1, status: 'failed' }, 'failed')) {
+              await journal.put(FAIL(id), { error: String((e as any)?.message ?? e), at: now, erased: true });
+              out.failed++;
+            }
             return;
           }
           if (end === 'deferred') {

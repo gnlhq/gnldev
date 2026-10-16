@@ -7,7 +7,7 @@ import { closeExecutorFor } from './executors.js';
 import { sqliteLiveness, inMemoryLiveness, unbindLiveness, type ProcessLiveness } from './process-liveness.js';
 import { ROOT_EXEC_RECORDS } from './adoption.js';
 import { prefixUpperBound } from './organization.js';
-import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition } from './storage.js';
+import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition, markWorkOf } from './storage.js';
 import { memoryPartitionOf, memoryPartitionSql, type MemoryPartitionOption } from './storage.js';
 import { createRequire } from 'node:module';
 import { statSync, existsSync } from 'node:fs';
@@ -307,6 +307,7 @@ export class SqliteStorage implements Storage {
     this.memory = new SqliteMemoryStore(db);
     this.vectors = new SqliteVectorStore(db);
     this.work = new SqliteWorkStore(db);
+    markWorkOf(this);
     this.cache = new SqliteCacheStore(db);
     this.meta = new SqliteMetaStore(db);
   }

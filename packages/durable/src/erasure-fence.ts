@@ -64,11 +64,16 @@ export function orgPurgedKey(orgId: string): string {
   return `__org_purged__:${orgId}`;
 }
 
-/** Thrown by a worker whose run was deleted while it ran. Not a failure of the run: nothing is recorded for it. */
+/**
+ * The run was deleted: thrown by a worker whose run was deleted while it ran, and by the birth of an id a
+ * deletion fenced (`claimRunOwner`, and the doors that accept work under a caller-chosen run id before
+ * it is born). Not a failure of the run: nothing is recorded for it. The message holds for both — the
+ * error reaches a job or a trigger that never ran again, and "while it was running" told them it had.
+ */
 export class RunErasedError extends Error {
   readonly code = 'run_erased';
   constructor(readonly runId: string) {
-    super(`run '${runId}' was deleted while it was running — nothing more of it is written, and it cannot be resumed; start the work again under a new runId`);
+    super(`run '${runId}' was deleted — nothing more of it is written, and it cannot be started or resumed again; start the work under a new runId`);
     this.name = 'RunErasedError';
   }
 }

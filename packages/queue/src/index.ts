@@ -8,7 +8,8 @@ import { randomUUID } from 'node:crypto';
 import {
   acquireRunLock, requireCapability, createPollLoop, orgPrefix, withOrgStorage, orgStorageScopeOf, ownedName, ownedPrefix,
   claimRunOwner, runDurable, user, staff, UNKNOWN, toJournal, ownerOfName, assertRootWorkForErasure, portOf, storageOf,
-  processLiveness, storeLiveness, isProcessLocal, isDraining, LivenessRequiredError, attemptEndOf, holdWhile, settledExceptOwn, handNamePrefix } from '@gnldev/durable';
+  processLiveness, storeLiveness, isProcessLocal, isDraining, LivenessRequiredError, attemptEndOf, holdWhile, settledExceptOwn, handNamePrefix,
+  refuseErasedRunId, storageOfWork, isStorage } from '@gnldev/durable';
 import type { Storage, WorkStore, RunJournal, LogRecord, Caller, RunDurableArgs, DurableResult, ProcessLiveness } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
 import { ENQUEUE_OPTIONS_NAMES, RETRY_JOB_OPTS_NAMES, CREATE_WORKER_OPTS_NAMES, CREATE_QUEUE_OPTS_NAMES, MOVE_JOB_TO_NAMES } from './option-names.js';
@@ -327,7 +328,18 @@ export async function enqueue(
 ): Promise<string> {
   refuseUnknownNames('enqueue', options, ENQUEUE_OPTIONS_NAMES);
   const work = portOf(workArg, 'work', 'enqueue');
-  return appendJob(work, type, payload, options);
+  return appendJob(work, type, payload, options, undefined, workArg);
+}
+
+/**
+ * The run journal a job's run is born in (the worker's `scoped.runs`), when the door can reach it: the
+ * storage that marked the work port as its own (`storageOfWork`), or the storage handed in. `undefined`
+ * for a host's own work store — its worker answers instead (`attemptEndOf` → 'erased').
+ */
+function jobRunsOf(work: WorkStore, given: unknown, orgId: string | undefined) {
+  const storage = storageOfWork(work) ?? (isStorage(given) ? given : undefined);
+  if (storage === undefined) return undefined;
+  return toJournal((orgId !== undefined ? withOrgStorage(storage, orgId) : storage).runs);
 }
 
 /** `enqueue`, plus the one field only `retryJob` writes (the run a retry continues). */
@@ -337,6 +349,7 @@ async function appendJob(
   payload: unknown,
   options: EnqueueOptions,
   runId?: string,
+  given?: unknown,
 ): Promise<string> {
   const opts: EnqueueOptions = { ...options, ...jobOwnerOf(options), caller: undefined };
   const ownerKind = options.caller?.kind === 'staff' ? ('staff' as const) : undefined;
@@ -384,7 +397,15 @@ async function appendJob(
   // An owned job always has an engine-written owned id: that is where erasure finds it.
   const owned = opts.resourceId !== undefined || opts.orgId !== undefined;
   const name = opts.id ?? (owned ? randomUUID() : undefined);
-  const id = await work.append('qjob', rec, name === undefined ? undefined : ownedName(name, { resourceId: opts.resourceId, orgId: opts.orgId }));
+  const stored = name === undefined ? undefined : ownedName(name, { resourceId: opts.resourceId, orgId: opts.orgId });
+  // The job's run is born at its first lease (`claimRunOwner`), under `job:<id>` or the run a retry
+  // continues. An id a deletion fenced is never born again, so a job under it could never run: refused
+  // here by that same rule, before anything is written — not accepted, then failed on every attempt
+  // (e2e F1). A fresh random id was never anybody's run; only a caller-chosen one is asked.
+  const runOfJob = runId ?? (opts.id !== undefined && stored !== undefined ? `job:${stored}` : undefined);
+  const runs = runOfJob === undefined ? undefined : jobRunsOf(work, given, opts.orgId);
+  if (runOfJob !== undefined && runs !== undefined) await refuseErasedRunId(runs, runOfJob);
+  const id = await work.append('qjob', rec, stored);
   // The depth index, under the SAME id (idempotent with the job). A crash between the two appends
   // under-counts this one job by one; never over-counts.
   await work.append(depthNs(opts.orgId), { type }, id);
@@ -555,12 +576,14 @@ export async function retryJob(
   if ((await work.get(`qdone:${id}`)) !== undefined) return null; // a late report settled it: it ran
   const { newRun, ...enqueueOpts } = opts;
   // The copy is the same user's, in the same organization: a retry must not turn their job into the system's.
+  // A run that was deleted cannot be continued: refused (`RunErasedError`) — `{ newRun: true }` starts over.
   return appendJob(
     work,
     rec.payload.type,
     rec.payload.payload,
     { ...enqueueOpts, ...ownerOptionsOf(rec.payload) },
     newRun ? undefined : runIdOfJob(rec),
+    workArg,
   );
 }
 
@@ -993,9 +1016,20 @@ export function createWorker(
             // run is executing elsewhere. The attempt counted at its start is given back and nothing else is
             // written; the lease goes below and the job stays due for another process (or this one, later).
             // Not reported to onError: the job did not fail.
-            if (attemptEndOf(err, runId) !== 'attempt') {
+            const end = attemptEndOf(err, runId);
+            if (end === 'released' || end === 'deferred') {
               if (started && (await stillOwns().catch(() => false))) await putJobMarker(work, job.id, 'qtry', started).catch(() => undefined);
               return false;
+            }
+            // ITS RUN WAS DELETED: refused at its birth, or stopped while it ran. No attempt can run it
+            // again, so none is left to spend — the job ends here, failed with that error, reported once.
+            if (end === 'erased') {
+              if (await stillOwns().catch(() => false)) {
+                const n = (await attemptsOf(work, job.id)).attempts;
+                await putJobMarker(work, job.id, 'qfail', { error: String((err as any)?.message ?? err), attempts: n, erased: true });
+              }
+              opts.onError?.(err, job.id);
+              return true;
             }
             // Ended while it ran — cancelled (cancelJob: "else `cancelled`"), or settled by a late report:
             // not a failed attempt. A handler that stopped on ctx.signal used to dead-letter the job as

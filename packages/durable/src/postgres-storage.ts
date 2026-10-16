@@ -8,7 +8,7 @@ import { closeExecutorFor } from './executors.js';
 import { postgresLiveness, unbindLiveness, type PgProcessSession } from './process-liveness.js';
 import { ROOT_EXEC_RECORDS } from './adoption.js';
 import { prefixUpperBound } from './organization.js';
-import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition } from './storage.js';
+import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition, markWorkOf } from './storage.js';
 import { memoryPartitionOf, memoryPartitionSql, type MemoryPartitionOption } from './storage.js';
 import { createRequire } from 'node:module';
 import { cosineSimilarity } from 'ai';
@@ -541,6 +541,7 @@ export class PostgresStorage implements Storage {
     }
     this.vectors = new PgVectorStore(q, tx);
     this.work = new PgWorkStore(q, tx, this.prefixShape);
+    markWorkOf(this);
     this.cache = new PgCacheStore(q);
     this.meta = new PgMetaStore(q);
   }

@@ -107,12 +107,12 @@ export { streamFinishError } from './run.js';
 // Greenfield storage contracts (ports + Storage + capability + composite).
 // The one reader of a run's limits and of a budget limit, for a door that takes them as its own options.
 export { refuseRunLimitNames, refuseBudgetLimitNames, refuseConfigNames, PROJECT_CONFIG_NAMES } from './option-names.js';
-export { threadRecordOwner, CapabilityError, requireCapability, portOf, storageOf, journalOf, isStorage, composite, toJournal, matchFilter, visibleToSubject, SHARED_ONLY, vectorWriteBatch, vectorQueryScope, vectorDeletePlan, vectorDeleteMatcher, vectorInOrganization, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorMetadataMatches, OBSERVATION_VECTOR_KEY, VECTOR_DOCUMENT_KEY, vectorDocumentOf, vectorFilterDocument, vectorItemCopy, assertSameVectorOwner, assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, orgVectorId, VECTOR_PARTITION, VECTOR_ALL_PARTITIONS, type VectorAllPartitionsOption, assertRootOutsideOrganizations, ReservedVectorNameError, assertRootVectorNames, type VectorPartitionOption } from './storage.js';
+export { threadRecordOwner, CapabilityError, requireCapability, portOf, storageOf, journalOf, isStorage, composite, toJournal, storageOfWork, matchFilter, visibleToSubject, SHARED_ONLY, vectorWriteBatch, vectorQueryScope, vectorDeletePlan, vectorDeleteMatcher, vectorInOrganization, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorMetadataMatches, OBSERVATION_VECTOR_KEY, VECTOR_DOCUMENT_KEY, vectorDocumentOf, vectorFilterDocument, vectorItemCopy, assertSameVectorOwner, assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, orgVectorId, VECTOR_PARTITION, VECTOR_ALL_PARTITIONS, type VectorAllPartitionsOption, assertRootOutsideOrganizations, ReservedVectorNameError, assertRootVectorNames, type VectorPartitionOption } from './storage.js';
 // ADR-0002: the caller a door hands the engine, the one identity channel to tools and child runs, and
 // the one answer to "does this run exist, and whose is it" (run-identity.ts).
 export {
   STAFF, UNKNOWN, user, staff, userIdOf, sealFieldsOf, resolveCaller, type SealFields, runIdentity, childIdentity, toolContextFor, identityOf,
-  runOwnerOf, decideRunAccess, decideDoorRunAccess, decideRun, admitRun, claimRunOwner, inheritRunOwner, existingRun, withBirth, type RunBirth, type RunLease, assertRunTarget, runTargetOf, type RunTarget, SUBJECT_VIEW,
+  runOwnerOf, decideRunAccess, decideDoorRunAccess, decideRun, admitRun, claimRunOwner, refuseErasedRunId, inheritRunOwner, existingRun, withBirth, type RunBirth, type RunLease, assertRunTarget, runTargetOf, type RunTarget, SUBJECT_VIEW,
   type Caller, type UserCaller, type StaffCaller, type UnknownCaller, type RunIdentity, type GnlToolContext,
   type RunOwner, type RunKind, type RunDecision, type RawJournal,
 } from './run-identity.js';

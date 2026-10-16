@@ -3,7 +3,7 @@
 // Correctness matters, not perf (naive filter/sort). Date.now/Math.random are free to use here (runtime code).
 import { cosineSimilarity } from 'ai';
 import { serialize, deserialize, copyValue } from './serialize.js';
-import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition } from './storage.js';
+import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition, markWorkOf } from './storage.js';
 import { memoryPartitionOf, inMemoryPartition, type MemoryPartitionOption } from './storage.js';
 import { InMemoryJournal } from './journal.js';
 import { withBirth } from './run-identity.js';
@@ -570,6 +570,7 @@ export class InMemoryStorage implements Storage {
   readonly work = new InMemoryWorkStore();
   readonly cache = new InMemoryCacheStore();
   readonly meta = new InMemoryMetaStore();
+  constructor() { markWorkOf(this); }
 
   /**
    * See `Storage.adoptIntoOrg`.

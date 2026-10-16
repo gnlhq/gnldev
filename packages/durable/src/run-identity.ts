@@ -364,6 +364,16 @@ export function ownerFields(c: Caller): { resourceId?: string; orgId?: string; o
 }
 
 /**
+ * Whether `runId` may still be born: an id a deletion fenced never is (erasure-fence.ts) — throws
+ * `RunErasedError`. The rule `claimRunOwner` applies at a birth, asked by the doors that take work now
+ * under a run id born later (a queued job, a scheduled trigger), so they refuse it when it is handed in
+ * instead of accepting work that can never run.
+ */
+export async function refuseErasedRunId(journal: Journal, runId: string): Promise<void> {
+  if (await runErasedSince(journal, runId, undefined)) throw new RunErasedError(runId);
+}
+
+/**
  * THE common start point of every run birth: agent (run.ts bornAs), workflow, network, batch item,
  * MCP call, fork, rollover, replay. Writes the owner record UNCONDITIONALLY — ownerless too — first
  * write wins, and returns the owner that is recorded afterwards (the winner's, on a race).
@@ -382,7 +392,7 @@ export async function claimRunOwner(journal: RawJournal, runId: string, caller: 
   await admitRunId(runId, { journal, mint });
   // A run deleted under a live worker stays deleted (erasure-fence.ts): its id is not born again — for
   // any kind, by any path, before anything of it is written.
-  if (await runErasedSince(journal, runId, undefined)) throw new RunErasedError(runId);
+  await refuseErasedRunId(journal, runId);
   const key = runKeys.input(runId);
   await claim(journal, key, stampFormat({ at: Date.now(), ...record, ...ownerFields(caller) }));
   const recorded = recordOwner(await journal.get<OwnerRecord>(key)) ?? callerOf(caller);

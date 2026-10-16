@@ -1318,6 +1318,25 @@ export function isStorage(x: unknown): x is Storage {
  * The journal view every reader takes (Studio's `reader`, `exportRun`, `sweepRuns`, …), from a
  * `Storage` or from its `runs` port; anything else is refused naming what it is.
  */
+/**
+ * The storage a work port belongs to (not enumerable, like `JOURNAL_SOURCE`). A job is accepted through
+ * the work port alone (`enqueue(storage.work, …)`) but runs in the storage's run journal; the door reads
+ * that journal through this mark to refuse a job its run could never be born for (an erased run id).
+ * Each built-in storage marks its own port; `composite` marks the port it hands out as its own, since
+ * its jobs run in its run journal. A port nothing marked (a host's own store) is answered by its worker.
+ */
+const WORK_OF = Symbol.for('@gnldev/durable.workOf');
+/** @internal — a storage marks its work port as its own. */
+export function markWorkOf<S extends Storage>(storage: S): S {
+  if (storage.work) Object.defineProperty(storage.work, WORK_OF, { value: storage, enumerable: false, configurable: true, writable: false });
+  return storage;
+}
+/** @internal — the storage that marked this work port, if one did. */
+export function storageOfWork(work: unknown): Storage | undefined {
+  const s = (work as Record<symbol, unknown> | null | undefined)?.[WORK_OF];
+  return s !== undefined && isStorage(s) ? s : undefined;
+}
+
 /** The store behind a `toJournal` bridge (not enumerable: it is the bridge's identity, never copied onto a wrapper). */
 export const JOURNAL_SOURCE = Symbol.for('@gnldev/durable.journalSource');
 
@@ -1487,7 +1506,7 @@ export function composite(cfg: CompositeConfig): Storage {
     cache: cacheStorage.capabilities.cache,
   };
 
-  return {
+  return markWorkOf({
     name: `composite(${cfg.default.name})`,
     capabilities,
     runs: cfg.default.runs,
@@ -1502,5 +1521,5 @@ export function composite(cfg: CompositeConfig): Storage {
     async close() {
       for (const b of storages) await b.close?.();
     },
-  };
+  });
 }
