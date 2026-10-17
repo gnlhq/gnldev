@@ -7,7 +7,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.11.1] — 2026-10-17
+
+**A schedule's fire, a queued job and a batch item belong to the owner they were made for, and a model
+step is answered once.** Two defects in 0.11.0, each fixed at its rule: a run id a package composes for
+someone is begun only by that package, and the first answer recorded for a model step is the one every
+attempt returns. Upgrading from 0.11.0 needs no store step; the renamed exports are listed under Breaking.
 
 ### Security
 
