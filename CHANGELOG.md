@@ -7,7 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.11.0] — 2026-10-16
 
 **A run no longer lives inside the request that started it.** Every registry run — `gnl.run()`,
 `gnl.stream()` and every door — is executed by the process's executor and followed by its caller. The
