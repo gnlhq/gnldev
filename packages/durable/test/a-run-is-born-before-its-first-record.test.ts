@@ -36,7 +36,7 @@ describe('B1 — a primitive handed any id (Studio\'s approve path: durableTool 
   it('an engine-begun id it names is refused before a row is written: the owner\'s sub-agent can still be born there', async () => {
     const j = new InMemoryJournal();
     const t = durableTool(echo() as any, { journal: j, runId: 'agent:victim:c1', identity: runIdentity(STAFF, 'agent:victim:c1'), approvals: { t1: true } } as any, 'echo');
-    await expect(t.execute!({ x: 'forged' } as any, { toolCallId: 't1' } as any)).rejects.toThrow(/made by the engine/);
+    await expect(t.execute!({ x: 'forged' } as any, { toolCallId: 't1' } as any)).rejects.toThrow(/composed by/);
     expect(await j.listKeys('agent:victim:c1')).toEqual([]);
   });
 
@@ -57,7 +57,7 @@ describe('B1 — a primitive handed any id (Studio\'s approve path: durableTool 
   it('SIBLING — the model primitive (withDurableModel) refuses an engine-begun id before its first step', async () => {
     const j = new InMemoryJournal();
     const m = withDurableModel(text() as any, { journal: j, runId: 'task:victim:c', identity: runIdentity(STAFF, 'task:victim:c') } as any);
-    await expect((m as any).doGenerate({ prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })).rejects.toThrow(/made by the engine/);
+    await expect((m as any).doGenerate({ prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })).rejects.toThrow(/composed by/);
     expect(await j.listKeys('task:victim:c')).toEqual([]);
   });
 
@@ -74,7 +74,7 @@ describe('B2 — @gnldev/workflow, which cannot depend on this package, births t
   it('an engine-begun id (Studio\'s runManaged with the request\'s runId) is refused, nothing written', async () => {
     const j = new InMemoryJournal();
     const wf = workflow<any>().then(step('s', async () => 1));
-    await expect((wf as any).runResumable({}, { runId: 'agent:victim:c2', journal: j })).rejects.toThrow(/made by the engine/);
+    await expect((wf as any).runResumable({}, { runId: 'agent:victim:c2', journal: j })).rejects.toThrow(/composed by/);
     expect(await j.listKeys('agent:victim:c2')).toEqual([]);
     expect(await j.listKeys('wfrun:')).toEqual([]);
   });
@@ -109,7 +109,7 @@ describe('B2 — @gnldev/workflow, which cannot depend on this package, births t
   it('SIBLING — every durable journal carries the birth: an organization view, the storage bridge', async () => {
     for (const j of [withOrg(new InMemoryJournal(), 'acme'), toJournal(new InMemoryStorage().runs)]) {
       const wf = workflow<any>().then(step('s', async () => 1));
-      await expect(wf.run({}, { runId: 'task:p:c', journal: j as any })).rejects.toThrow(/made by the engine/);
+      await expect(wf.run({}, { runId: 'task:p:c', journal: j as any })).rejects.toThrow(/composed by/);
     }
   });
 
@@ -119,7 +119,7 @@ describe('B2 — @gnldev/workflow, which cannot depend on this package, births t
     await wf.run({}, { runId: 'src-w', journal: j, identity: { kind: 'user', id: 'ayse', runId: 'src-w' } });
     await forkWorkflowRun(j, wf, 'src-w', 'b', 'dst-w');
     expect(await ownerOf(j, 'dst-w')).toBe('user:ayse');
-    await expect(forkWorkflowRun(j, wf, 'src-w', 'b', 'task:p:c')).rejects.toThrow(/made by the engine/);
+    await expect(forkWorkflowRun(j, wf, 'src-w', 'b', 'task:p:c')).rejects.toThrow(/composed by/);
     expect(await j.listKeys('task:p:c')).toEqual([]);
   });
 

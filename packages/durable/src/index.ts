@@ -112,7 +112,7 @@ export { threadRecordOwner, CapabilityError, requireCapability, portOf, storageO
 // the one answer to "does this run exist, and whose is it" (run-identity.ts).
 export {
   STAFF, UNKNOWN, user, staff, userIdOf, sealFieldsOf, resolveCaller, type SealFields, runIdentity, childIdentity, toolContextFor, identityOf,
-  runOwnerOf, decideRunAccess, decideDoorRunAccess, decideRun, admitRun, claimRunOwner, refuseErasedRunId, inheritRunOwner, existingRun, withBirth, type RunBirth, type RunLease, assertRunTarget, runTargetOf, type RunTarget, SUBJECT_VIEW,
+  runOwnerOf, decideRunAccess, decideDoorRunAccess, decideRun, admitRun, claimRunOwner, refuseRunIdThatCannotBeBorn, inheritRunOwner, existingRun, withBirth, type RunBirth, type RunLease, assertRunTarget, runTargetOf, type RunTarget, SUBJECT_VIEW,
   type Caller, type UserCaller, type StaffCaller, type UnknownCaller, type RunIdentity, type GnlToolContext,
   type RunOwner, type RunKind, type RunDecision, type RawJournal,
 } from './run-identity.js';
@@ -279,6 +279,6 @@ export {
 // the one admission gate (run-id-grammar.ts). The packages on this one spell run keys through it.
 export {
   RUN_RECORD_FAMILIES, RUN_ID_FAMILIES, RUN_KEYED_FAMILIES, runRecordKey, runRecordPrefix, composeRunId, rerunRunId, runIdFamilyOf,
-  isEngineBegunRunId, admitRunId, REPLAYED_SEGMENT_RE,
+  isComposedRunId, composerMark, admitRunId, REPLAYED_SEGMENT_RE,
   type RunRecordFamily, type ListedRunRecordFamily, type RunIdFamily, type RunKeyedFamily,
 } from './run-id-grammar.js';

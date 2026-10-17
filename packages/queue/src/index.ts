@@ -7,9 +7,9 @@
 import { randomUUID } from 'node:crypto';
 import {
   acquireRunLock, requireCapability, createPollLoop, orgPrefix, withOrgStorage, orgStorageScopeOf, ownedName, ownedPrefix,
-  claimRunOwner, runDurable, user, staff, UNKNOWN, toJournal, ownerOfName, assertRootWorkForErasure, portOf, storageOf,
+  claimRunOwner, composerMark, runDurable, user, staff, UNKNOWN, toJournal, ownerOfName, assertRootWorkForErasure, portOf, storageOf,
   processLiveness, storeLiveness, isProcessLocal, isDraining, LivenessRequiredError, attemptEndOf, holdWhile, settledExceptOwn, handNamePrefix,
-  refuseErasedRunId, storageOfWork, isStorage } from '@gnldev/durable';
+  refuseRunIdThatCannotBeBorn, storageOfWork, isStorage } from '@gnldev/durable';
 import type { Storage, WorkStore, RunJournal, LogRecord, Caller, RunDurableArgs, DurableResult, ProcessLiveness } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
 import { ENQUEUE_OPTIONS_NAMES, RETRY_JOB_OPTS_NAMES, CREATE_WORKER_OPTS_NAMES, CREATE_QUEUE_OPTS_NAMES, MOVE_JOB_TO_NAMES } from './option-names.js';
@@ -404,7 +404,9 @@ async function appendJob(
   // (e2e F1). A fresh random id was never anybody's run; only a caller-chosen one is asked.
   const runOfJob = runId ?? (opts.id !== undefined && stored !== undefined ? `job:${stored}` : undefined);
   const runs = runOfJob === undefined ? undefined : jobRunsOf(work, given, opts.orgId);
-  if (runOfJob !== undefined && runs !== undefined) await refuseErasedRunId(runs, runOfJob);
+  // Asked here too: a spelling no run can carry (`job:…:tool`) is refused at enqueue, not failed at every
+  // attempt. The queue composes the job's run id (a retry's is the run the queue composed before).
+  if (runOfJob !== undefined && runs !== undefined) await refuseRunIdThatCannotBeBorn(runs, runOfJob, composerMark(runOfJob));
   const id = await work.append('qjob', rec, stored);
   // The depth index, under the SAME id (idempotent with the job). A crash between the two appends
   // under-counts this one job by one; never over-counts.
@@ -985,7 +987,9 @@ export function createWorker(
             // keeps the owner it was born with). A handler that starts `runId` as anyone else — the old
             // `runDurable({ runId: ctx.runId, … })` with the user forgotten — is now refused by the
             // engine's own admission instead of producing a run nobody but staff can see.
-            await claimRunOwner(toJournal(scoped.runs), runId, caller);
+            // The queue composed `job:<id>`, so the queue begins it (run-id-grammar.ts `begin: 'composer'`);
+            // a run a retry continues was born already, and the mark changes nothing for it.
+            await claimRunOwner(toJournal(scoped.runs), runId, caller, composerMark(runId));
             const followUp = (o: EnqueueOptions = {}): EnqueueOptions => {
               if (o.caller !== undefined) return o;
               const base = ownerOptionsOf(rec);

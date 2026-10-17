@@ -552,8 +552,8 @@ export async function claim(journal: Journal, key: string, value: unknown): Prom
 /**
  * CAS-frozen memoize (general primitive): if a record exists, return it (compute NEVER runs);
  * otherwise compute and write via `claim` — the loser of the race DISCARDS its own result and reads
- * the winner's record (a single truth under multi-worker). Difference from `durableProcessorStep` in
- * processor.ts: not get+put but CAS → two concurrent workers can't produce different results for the same decision.
+ * the winner's record (a single truth under multi-worker): two concurrent workers can't produce
+ * different results for the same decision. `durableProcessorStep` (processor.ts) is this.
  *
  * RECORD FORMAT CONTRACT: the value is written wrapped as `{ v }` — this makes `undefined` results
  * distinguishable from "no record". This format is compatible with old records in the journal

@@ -1110,7 +1110,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
    */
   async function runAccess(c: Context, s: Instance, runId: string, named?: unknown): Promise<{ decision: RunDecision; owner: RunOwner }> {
     const owner = await runOwnerOf(rawOf(s).journal as RawJournal, runId);
-    // The DOOR's reading: an engine-begun id nobody has made is `deny`, as a foreign run is — no door
+    // The DOOR's reading: a composed id nobody has made (run-id-grammar.ts) is `deny`, as a foreign run is — no door
     // may begin one, so "absent" is not the caller's to start (decideDoorRunAccess).
     const decision = decideDoorRunAccess(owner, callerOf(c, named ?? namedOnRead(c)), runId);
     if (decision === 'deny' && kindOf(c) === 'operator' && owner.state === 'owned' && owner.owner.kind !== 'user') return { decision: 'allow', owner };
@@ -1145,7 +1145,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
    * absent run gets, so a refusal cannot say "this one exists" (it used to: 403 here, 404 or 409 there).
    * Staff naming a user keep the 403 for a run that EXISTS: staff list every run of their organization,
    * so there is nothing for this answer to hide from them, and the 403 tells them the user they named is
-   * the wrong one. An absent engine-begun id is not a run, so staff get the 404 for it too.
+   * the wrong one. An absent composed id is not a run, so staff get the 404 for it too.
    */
   const runRefused = (c: Context, runId: string, owner: RunOwner): Response =>
     kindOf(c) === 'operator' && owner.state === 'owned' ? foreignRun(c) : runNotFoundResponse(c);

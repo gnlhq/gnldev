@@ -6,6 +6,7 @@ import {
   createRetentionSweeper, runKeys, stampFormat,
 } from '../src/index.js';
 import { claimRunOwner, user } from '../src/run-identity.js';
+import { composerMark } from '../src/run-id-grammar.js';
 
 const HOUR = 60 * 60 * 1000;
 
@@ -184,7 +185,7 @@ describe('sweepRuns — kimlik amaçlı :input', () => {
     const now = Date.now();
     await claimRunOwner(journal, 'wf-eski', user('u-ayse'), { at: now - 3 * HOUR, workflow: 'aylik-rapor' });
     await claimRunOwner(journal, 'wf-yeni', user('u-ayse'), { at: now - 1000, workflow: 'aylik-rapor' });
-    await claimRunOwner(journal, 'batch:f-1:F-9', user('u-ayse'), { at: now - 3 * HOUR, batch: 'f-1' });
+    await claimRunOwner(journal, 'batch:f-1:F-9', user('u-ayse'), { at: now - 3 * HOUR, batch: 'f-1', ...composerMark('batch:f-1:F-9') });
     await claimRunOwner(journal, 'net-eski', user('u-ayse'), { at: now - 3 * HOUR, network: 'destek' });
 
     const res = await sweepRuns(journal, { olderThanMs: HOUR, now });

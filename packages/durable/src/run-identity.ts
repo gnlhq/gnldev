@@ -22,7 +22,7 @@
  *
  * No HTTP here: the engine answers `allow | deny | missing`, and each door maps that to its own wire.
  */
-import { runRecordKey, isBookkeepingRest, isRunRecordRest, isEngineBegunRunId, admitRunId, ENGINE_MINT, withMintOf } from './run-id-grammar.js';
+import { runRecordKey, isBookkeepingRest, isRunRecordRest, isComposedRunId, admitRunId, ENGINE_MINT, withMintOf } from './run-id-grammar.js';
 import { claim, runKeys, isVersionedRecord, type Journal, type JournalBatch } from './journal.js';
 import { stampFormat } from './format.js';
 import { RunOwnerMismatchError, RunTargetMismatchError, RunNotFoundError } from './errors.js';
@@ -328,8 +328,9 @@ export function decideRunAccess(owner: RunOwner, caller: Caller): RunDecision {
 
 /**
  * `decideRunAccess` as a DOOR asks it, for a run id a request named. One difference, and it is the
- * grammar's: an id of a family only the engine begins (`task:`, `cont:`, `agent:`, `wf:`, `net:` —
- * run-id-grammar.ts) is never a door caller's to start, because no door holds the engine's mark. So when
+ * grammar's: an id of a family only its composer begins (the engine's `task:`, `cont:`, `agent:`, `wf:`,
+ * `net:`, and `batch:`, `sched:`, `job:` — run-id-grammar.ts) is never a door caller's to start, because
+ * no door holds a composer's mark. So when
  * it does not exist it is `deny`, not `missing` — the answer a foreign run gets — and a door answers the
  * two alike (`runNotFound`, errors.ts) BEFORE any other gate runs: a budget gate between them answered
  * an over-budget organization's stranger 402 for the absent id and 404 for the existing one.
@@ -337,7 +338,7 @@ export function decideRunAccess(owner: RunOwner, caller: Caller): RunDecision {
  */
 export function decideDoorRunAccess(owner: RunOwner, caller: Caller, runId: string): RunDecision {
   const d = decideRunAccess(owner, caller);
-  return d === 'missing' && isEngineBegunRunId(runId) ? 'deny' : d;
+  return d === 'missing' && isComposedRunId(runId) ? 'deny' : d;
 }
 
 export async function decideRun(journal: RawJournal, runId: string, caller: Caller): Promise<RunDecision> {
@@ -363,14 +364,22 @@ export function ownerFields(c: Caller): { resourceId?: string; orgId?: string; o
   return { ownerKind: 'unknown' };
 }
 
-/**
- * Whether `runId` may still be born: an id a deletion fenced never is (erasure-fence.ts) — throws
- * `RunErasedError`. The rule `claimRunOwner` applies at a birth, asked by the doors that take work now
- * under a run id born later (a queued job, a scheduled trigger), so they refuse it when it is handed in
- * instead of accepting work that can never run.
- */
-export async function refuseErasedRunId(journal: Journal, runId: string): Promise<void> {
+/** An id a deletion fenced is never born again (erasure-fence.ts) — throws `RunErasedError`. */
+async function refuseErasedRunId(journal: Journal, runId: string): Promise<void> {
   if (await runErasedSince(journal, runId, undefined)) throw new RunErasedError(runId);
+}
+
+/**
+ * The rules `claimRunOwner` applies at a birth, asked AHEAD by a package that takes work now under a run
+ * id it will begin later (a queued job at its lease, a trigger at its fire): the id's spelling and who
+ * may begin it (`admitRunId` — `fields` carries the asker's `composerMark` for an id it composed), and
+ * the erasure fence. So such work is refused when it is handed in, with nothing written, instead of
+ * being accepted and then failing at every attempt (e2e F1; a job or trigger named `tool`). The same
+ * rules, from the same functions, as the birth itself: nothing here is a second copy of them.
+ */
+export async function refuseRunIdThatCannotBeBorn(journal: Journal, runId: string, fields: Record<string | symbol, unknown> = {}): Promise<void> {
+  await admitRunId(runId, { journal, mint: (fields as Record<symbol, unknown>)[ENGINE_MINT] });
+  await refuseErasedRunId(journal, runId);
 }
 
 /**
@@ -386,8 +395,8 @@ export async function refuseErasedRunId(journal: Journal, runId: string): Promis
 export async function claimRunOwner(journal: RawJournal, runId: string, caller: Caller, fields: Record<string, unknown> = {}): Promise<Caller> {
   assertRaw(journal, 'claimRunOwner');
   // THE run-id gate, at the one place a run is born (run-id-grammar.ts): its spelling, and — for an id
-  // only the engine begins — the engine's mark, which the birth record carries (`withMintOf`) and which
-  // is not written.
+  // only its composer begins — the composer's mark, which the birth record carries (`withMintOf`,
+  // `composerMark`) and which is not written.
   const { [ENGINE_MINT]: mint, ...record } = fields as Record<string | symbol, unknown>;
   await admitRunId(runId, { journal, mint });
   // A run deleted under a live worker stays deleted (erasure-fence.ts): its id is not born again — for
@@ -412,7 +421,7 @@ export async function claimRunOwner(journal: RawJournal, runId: string, caller: 
  * a primitive that writes nothing under the id — `withIdempotency`'s cross-run window — begins no
  * run): a run that exists is continued as it is (its entry judged who may act); one that does not is
  * born through the one birth, for the ctx's identity, and an id that may not be born (its spelling, an
- * engine-begun family without the engine's mark) is refused before anything is written. The write is
+ * composed family without its composer's mark) is refused before anything is written. The write is
  * judged where it happens, so no write site in a primitive has to remember to ask. A ctx the engine
  * built after its own admission is marked born and left as it is.
  */

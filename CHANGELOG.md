@@ -7,6 +7,63 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Security
+
+- **A schedule's fire, a queued job and a batch item can no longer be taken by a stranger.** Their run
+  ids (`sched:<trigger>:<n>`, `job:<id>`, `batch:<batch>:<item>`) are composed by the package for the
+  owner it works for, and could be begun by anyone who spelled them first — through every door, as a
+  plain end user. Measured on 0.11.0: an end user who began `sched:~o~:alice:weekly:0` over HTTP got
+  200; alice's trigger then retried and ended `failed` without her workflow running; her queued job
+  failed every attempt; her batch item ran zero times; and her erasure, which finds these ids by her
+  name, deleted the stranger's run. A system trigger or job (no owner in the id) was open the same way.
+  Now the one birth gate holds every family of RUN_ID_FAMILIES to one rule: whoever composes the id
+  begins it. A door answers such an id that does not exist `404 run_not_found`, as it answers a
+  sub-agent's.
+  `eval:<scope>:<case>` stays the caller's own name, judged like any id a caller chooses: the dataset
+  runner hands it to the host's `run` callback, which begins the run with it.
+
+### Breaking
+
+- **`refuseErasedRunId` is now `refuseRunIdThatCannotBeBorn(journal, runId, fields?)`**: the same
+  question asked ahead of a birth, now with all of the birth's rules — the spelling and who may begin
+  the id, as well as the erasure fence. A trigger or job named `tool`, `wf` or `model` (a record family,
+  which no run id can carry) is refused at `scheduleWorkflow` / `enqueue`; it used to be accepted and
+  then never run — the job failed every attempt, the trigger was deferred at every fire.
+- **`isEngineBegunRunId` is now `isComposedRunId`, and `RUN_ID_FAMILIES[f].begin` is `'composer'` or
+  `'caller'`** (was `'engine'` or `'anyone'`). Each family also names who composes it (`by`). The refusal
+  reads "is composed by …" (was "is made by the engine").
+- **A run of `sched:`, `job:` or `batch:` is begun only by its package.** Code that began one itself —
+  `gnl.run(name, { runId: 'job:…' })` for a run that does not exist yet — is refused; continuing one that
+  exists is unchanged. Each package begins the run itself, for the owner, before it hands the run on:
+  the queue at a job's lease (as before), the scheduler at a fire (new — a runner, createGnl or a host's
+  own, is handed a run that exists), the batch per item. So a queue handler's `runDurable({ runId:
+  ctx.runId })` and a host's own `WorkflowRunner` keep working unchanged. The birth carries the new
+  `composerMark(runId)`.
+
+### Added
+
+- `composerMark(runId)` (@gnldev/durable): the mark a package puts on the birth of a run whose id it
+  composed. `check:hygiene` section 6 fails if a package that serves requests (the doors, server,
+  studio) uses it.
+
+### Fixed
+
+- **A model step is answered once.** The first answer recorded for a step is the step's, and every
+  attempt at it returns that answer: a worker that lost its claim to a takeover (a partition, a stall)
+  and woke after the takeover had answered, or a twin resume calling the model beside it. Before, the
+  late attempt wrote its own answer over the recorded one and handed its run its own plan — other tool
+  calls under other ids, so their side effects ran beside the recorded plan's (measured on Postgres
+  with two processes: two charges for one step, and a replay that read the other plan). On the stream
+  path an attempt that finds the step answered stops its stream (`AttemptLost`) before handing over a
+  tool call of its own. `exclusiveStep`'s takeover of a stale claim and the claim's outcome are written
+  by compare-and-set over the attempt's own claim, so two takers no longer both win and a stale
+  attempt's failure is not written over the taker's success.
+- **A processor's journaled decision (`ctx.step`, `durableProcessorStep`) is made once.** It was a
+  get-then-put; two attempts computing it together both now return the one recorded first
+  (`frozenGet`). `pnpm check:hygiene` fails on a plain `put` in the files that write decided records.
+
 ## [0.11.0] — 2026-10-16
 
 **A run no longer lives inside the request that started it.** Every registry run — `gnl.run()`,

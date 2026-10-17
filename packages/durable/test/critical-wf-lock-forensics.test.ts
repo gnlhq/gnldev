@@ -20,6 +20,8 @@ import { SqliteStorage } from '../src/sqlite-storage.js';
 import { createGnl } from '../src/registry.js';
 import { acquireRunLock } from '../src/run-lock.js';
 import { RunBusyError } from '../src/errors.js';
+import { claimRunOwner, UNKNOWN } from '../src/run-identity.js';
+import { composerMark } from '../src/run-id-grammar.js';
 
 interface LockRecord { owner: string; expires: number; token: string }
 const lockOf = (j: InMemoryJournal, runId: string) => j.get<LockRecord>(`${runId}:lock`);
@@ -60,6 +62,8 @@ describe('critical workflow run-lock — what the record says afterwards', () =>
     // pass to runWorkflow. A perfectly reasonable thing to do — until the callee locks the same key.
     const outer = await acquireRunLock(journal, 'sched:saglik-5dk:0', 'sched-lui6tf', 60_000);
     expect(outer).not.toBeNull();
+    // And, as it does now, begin the fire's run before it calls the runner.
+    await claimRunOwner(journal, 'sched:saglik-5dk:0', UNKNOWN, composerMark('sched:saglik-5dk:0'));
 
     const err = await gnl.runWorkflow('w', {}, { runId: 'sched:saglik-5dk:0' }).catch((e) => e);
     expect(err).toBeInstanceOf(RunBusyError);

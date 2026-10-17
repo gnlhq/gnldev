@@ -23,8 +23,9 @@ Two answers would be an existence oracle. Before this code, a stranger naming an
 had made got **409** `run_owner_mismatch` ("there is no such run for this caller"). The difference
 told them which ids were real.
 
-The same reasoning covers the ids only the engine begins — `task:`, `cont:`, `agent:`, `wf:`, `net:`
-(a background call, its continuation, a sub-agent, a workflow tool, a network step). No door can start
+The same reasoning covers the ids only their composer begins — the engine's `task:`, `cont:`,
+`agent:`, `wf:`, `net:` (a background call, its continuation, a sub-agent, a workflow tool, a network
+step), and `sched:`, `job:`, `batch:` (a schedule's fire, a queued job, a batch item). No door can start
 one, so an absent one is answered as a foreign one, before any other gate. That includes the budget
 gate: an over-budget organization used to answer the absent id 402 and the existing one 403.
 
@@ -38,8 +39,8 @@ as this answer too (`callerConflictAnswer` in `@gnldev/durable`).
 - **Check who you are calling as.** A run belongs to the user it was started for. An application
   credential names the user in the request (`resourceId`); naming a different user than the run's
   owner gets this answer.
-- **To start a new run**, send an id of your own spelling (or a `workKey`). An absent id that is not
-  engine-begun is yours to start — that request runs, it does not get this answer.
+- **To start a new run**, send an id of your own spelling (or a `workKey`). An absent id that is not of a
+  composed family is yours to start — that request runs, it does not get this answer.
 
 **Staff** (an operator credential) list every run in their organization, so there is nothing for this
 answer to hide from them: staff naming a user on a run that exists and belongs to someone else still

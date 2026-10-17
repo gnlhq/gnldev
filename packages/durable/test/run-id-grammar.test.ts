@@ -19,7 +19,7 @@ import { LISTED_RUN_RECORD_FAMILIES, minted, mintOf, withMintOf } from '../src/r
 /** Ids the gate must refuse, each with the reason it is refused — derived from the table, not typed here. */
 const refused: Array<[string, RegExp]> = [
   ...LISTED_RUN_RECORD_FAMILIES.flatMap((f): Array<[string, RegExp]> => [[`p:${f}`, /record separator/], [`p:${f}:z`, /record separator/], [`a:b:${f}:z`, /record separator/]]),
-  ...Object.entries(RUN_ID_FAMILIES).filter(([, f]) => f.begin === 'engine').map(([root]): [string, RegExp] => [`${root}:p:c`, /made by the engine/]),
+  ...Object.entries(RUN_ID_FAMILIES).filter(([, f]) => f.begin === 'composer').map(([root]): [string, RegExp] => [`${root}:p:c`, /composed by/]),
   ...Object.entries(RUN_ID_FAMILIES).filter(([, f]) => 'nests' in f).map(([root]): [string, RegExp] => [root, /only the root/]),
   ['mem:x', /reserved key family/],
   ['run1_deadbeef', /reserved for engine-derived ids/],
@@ -40,7 +40,7 @@ describe('the run-id gate is the birth: every refused family, refused where a ru
 
   it('an engine-begun id is born with the engine\'s mark — bound to its id — and nothing writes the mark', async () => {
     const j = new InMemoryJournal();
-    await expect(claimRunOwner(j, 'task:p:c', STAFF, withMintOf({}, minted({ runId: 'task:p:other' })))).rejects.toThrow(/made by the engine/);
+    await expect(claimRunOwner(j, 'task:p:c', STAFF, withMintOf({}, minted({ runId: 'task:p:other' })))).rejects.toThrow(/composed by/);
     await claimRunOwner(j, 'task:p:c', STAFF, withMintOf({}, minted({ runId: 'task:p:c' })));
     expect(Object.getOwnPropertySymbols(await j.get(runKeys.input('task:p:c')) as object)).toEqual([]);
     // continuing it (it exists) needs no mark; the owner gate judges who
@@ -62,11 +62,11 @@ describe('the run-id gate is the birth: every refused family, refused where a ru
 
   it('an engine-begun id is admitted with the engine\'s mark, or once the run exists (continued, owner-judged)', async () => {
     const j = new InMemoryJournal();
-    await expect(admitRunId('task:p:c', { journal: j })).rejects.toThrow(/made by the engine/);
+    await expect(admitRunId('task:p:c', { journal: j })).rejects.toThrow(/composed by/);
     const args = minted({ runId: 'task:p:c' });
     await expect(admitRunId('task:p:c', { journal: j, mint: (args as any)[Object.getOwnPropertySymbols(args)[0]!] })).resolves.toBeUndefined();
     // the mark is bound to its id: the args of one run do not begin another
-    await expect(admitRunId('task:p:other', { journal: j, mint: (args as any)[Object.getOwnPropertySymbols(args)[0]!] })).rejects.toThrow(/made by the engine/);
+    await expect(admitRunId('task:p:other', { journal: j, mint: (args as any)[Object.getOwnPropertySymbols(args)[0]!] })).rejects.toThrow(/composed by/);
     await j.put(runKeys.input('task:p:c'), { at: 1 });
     await expect(admitRunId('task:p:c', { journal: j })).resolves.toBeUndefined();
   });

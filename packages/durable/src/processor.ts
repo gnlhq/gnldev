@@ -2,7 +2,7 @@
 // Principle: input processors run BEFORE persistInput → the transformed input is journaled →
 // it does NOT RUN AGAIN on resume (drift impossible). Non-deterministic processors journal via `ctx.step`.
 import { runRecordKey, runRecordPrefix } from './run-id-grammar.js';
-import { runKeys } from './journal.js';
+import { runKeys, frozenGet, claim } from './journal.js';
 import type { Journal } from './journal.js';
 import { bornOnFirstWrite } from './run-identity.js';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -292,8 +292,9 @@ export class RetryExhaustedByProcessorError extends Error {
  * Journals a non-deterministic processor step: `${runId}:proc:${name}` (invisible to
  * parseJournalKey). Replays if a record exists → same decision on resume, no duplicate LLM-judge
  * call. The `{ v }` wrapper also makes `undefined` results distinguishable.
- * NOTE: this get+put is a memoize (sufficient for single-process resume); for places that need two
- * concurrent workers to not be able to write different results to the same key, use the CAS variant: journal.ts's `frozenGet`.
+ * The decision is made once (journal.ts `frozenGet`): two attempts computing it together both return
+ * the one recorded first. It was a get+put of its own, and the later writer replaced the decision the
+ * earlier attempt had already acted on.
  */
 export async function durableProcessorStep<T>(
   journal: Journal,
@@ -301,12 +302,7 @@ export async function durableProcessorStep<T>(
   name: string,
   compute: () => Promise<T> | T,
 ): Promise<T> {
-  const key = runKeys.proc(runId, name);
-  const hit = await journal.get<{ v: T }>(key);
-  if (hit !== undefined) return hit.v;
-  const v = await compute();
-  await journal.put(key, { v });
-  return v;
+  return frozenGet(journal, runKeys.proc(runId, name), async () => compute());
 }
 
 /** Builds a ProcessorCtx (binds journal + runId; wraps step with the memoize helper). */
@@ -363,8 +359,7 @@ export async function recordProcessorReport(
 ): Promise<void> {
   try {
     const key = runRecordKey(ctx.runId, 'procreport', `${name}:${phase}`);
-    if ((await ctx.journal.get(key)) !== undefined) return;
-    await ctx.journal.put(key, { v: { name, phase, findings, ts: Date.now() } satisfies ProcessorReport });
+    await claim(ctx.journal, key, { v: { name, phase, findings, ts: Date.now() } satisfies ProcessorReport });
   } catch {
     // Audit reports are optional observability — if journal/ctx is missing, it does NOT AFFECT the main flow.
   }

@@ -33,16 +33,19 @@ describe('runId anahtar ailesi koruması', () => {
   });
 
   it('MOTORUN KENDİ bileşik idleri geçer — onların öneki gerçekten kendilerinin', async () => {
-    // batch:/sched:/net:/agent:/wfrun: motor tarafından KURULUYOR. Bunları reddetmek, çalışan
-    // batch ve scheduler yollarını kırardı — düzeltmenin amacı bu değil.
+    // batch:/sched:/net:/agent:/wfrun: motor ya da bir paket tarafından KURULUYOR. Yazımları bu
+    // korumadan geçer; batch: ve sched: bir run'ı yalnız onları kuran paketin işaretiyle başlatır
+    // (run-id-grammar.ts `begin: 'composer'`), wfrun: bir aile değildir.
     const journal = new InMemoryJournal();
-    for (const ok of ['batch:aylik:F-1', 'sched:saglik:0', 'wfrun:w1']) {
-      await expect(run(journal, ok)).resolves.toBeTruthy();
+    for (const ok of ['batch:aylik:F-1', 'sched:saglik:0']) {
+      await expect(run(journal, ok)).rejects.toThrow(/composed by/);
+      await expect(runDurable(minted({ runId: ok, journal, model: createMockModel(async () => finalTextResult('ok')), prompt: 'x' }) as any)).resolves.toBeTruthy();
     }
+    await expect(run(journal, 'wfrun:w1')).resolves.toBeTruthy();
     // A sub-agent's and a network step's ids are begun by the engine only (run-id-grammar.ts): their
     // spelling passes, and the run is begun with the engine's mark — a caller's begin is refused.
     for (const ok of ['net:r1:node', 'agent:r1:call-1']) {
-      await expect(run(journal, ok)).rejects.toThrow(/made by the engine/);
+      await expect(run(journal, ok)).rejects.toThrow(/composed by/);
       await expect(runDurable(minted({ runId: ok, journal, model: createMockModel(async () => finalTextResult('ok')), prompt: 'x' }) as any)).resolves.toBeTruthy();
     }
   });

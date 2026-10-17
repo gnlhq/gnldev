@@ -482,7 +482,7 @@ export function runNotFound(): { status: 404; body: { error: string; code: 'run_
 /**
  * The caller-conflict codes that mean "this RUN is not yours": answered as `runNotFound`, never as
  * themselves. `run_owner_mismatch` covers both an existing run of another subject (`admitRun`, the
- * derived-owner check) and an engine-begun id nobody has made (`admitRunId`, at the birth); `run_actor_mismatch` is
+ * derived-owner check) and a composed id nobody has made (`admitRunId`, at the birth); `run_actor_mismatch` is
  * an existing run another actor began. `thread_owner_mismatch` is about a conversation, not a run, and
  * keeps its own answer.
  */

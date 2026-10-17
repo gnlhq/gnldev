@@ -2,7 +2,7 @@
 // Keeps triggers in the journal (definition immutable, state mutable). The poll loop (now=Date.now())
 // fires due triggers exactly-once (acquireRunLock + per-fireCount runId). The workflow run carries its
 // own durable guarantee. Time = DATA (nextRunAt in the journal) → resolve-then-freeze, replay-safe.
-import { acquireRunLock, argsHash, attemptEndOf, createPollLoop, holdWhile, isDraining, orgPrefix, ownedName, ownedPrefix, ownerOfName, stableStringify, user, staff, UNKNOWN, refuseErasedRunId, withOrg } from '@gnldev/durable';
+import { acquireRunLock, argsHash, attemptEndOf, createPollLoop, holdWhile, isDraining, orgPrefix, ownedName, ownedPrefix, ownerOfName, stableStringify, user, staff, UNKNOWN, refuseRunIdThatCannotBeBorn, withOrg, claimRunOwner, composerMark } from '@gnldev/durable';
 import type { Journal, Caller } from '@gnldev/durable';
 import { canonicalTimeZone, cronNeverFires, nextCronTime } from './cron.js';
 import { rootJournal } from './root-journal.js';
@@ -18,7 +18,10 @@ export interface WorkflowRunner {
   runWorkflow(
     name: string,
     input: unknown,
-    /** `caller` is the trigger's recorded owner (see `ScheduleSpec.caller`), decided by the scheduler. */
+    /**
+     * `caller` is the trigger's recorded owner (see `ScheduleSpec.caller`), decided by the scheduler.
+     * The run `runId` names is already born, for that owner, by the scheduler: the runner continues it.
+     */
     opts?: { runId?: string; caller?: Caller },
   ): Promise<{ runId: string; suspended?: boolean; output?: unknown }>;
 }
@@ -556,7 +559,9 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
   // (`sched:<id>:0`) is born at that fire (`claimRunOwner`); an erasure that took this id's earlier fires
   // fenced it, and a fenced id is never born again — refused here by that same rule, before anything is
   // written, instead of a trigger that fails at every fire (e2e F1, its scheduler sibling).
-  await refuseErasedRunId(def.orgId !== undefined ? withOrg(journal, def.orgId) : journal, `sched:${id}:0`);
+  // Asked here too: an id whose fires no run could carry (`sched:tool:0` — `:tool` is where a run's tool
+  // records start) is refused at scheduling, not deferred at every fire. The scheduler composes the id.
+  await refuseRunIdThatCannotBeBorn(def.orgId !== undefined ? withOrg(journal, def.orgId) : journal, `sched:${id}:0`, composerMark(`sched:${id}:0`));
   await writeTrigger(journal, id, def, { nextRunAt: firstRunAt(def, now), attempts: 0, fireCount: 0, status: 'pending' });
   return id;
 }
@@ -770,7 +775,14 @@ export async function pollScheduler(
           }
           // The fire runs AS the trigger's recorded owner (ADR-0002): the caller is decided here, once,
           // from the definition — the runner does not get to pick it, and forgetting it cannot happen.
-          result = await target.runWorkflow(def.name, def.input, { runId, caller: callerOfTrigger(def) });
+          // The scheduler composed `sched:<trigger>:<fire>`, so the scheduler begins it, here, for the
+          // trigger's owner (run-id-grammar.ts `begin: 'composer'`) — as the queue begins a job's run at
+          // its lease. The runner is handed a run that exists and continues it, whatever it is: createGnl,
+          // a wrapper, a runDurable of its own. A stranger who named the id first could not have begun it.
+          // In the organization's run space, where the runner for that organization keeps its runs.
+          const caller = callerOfTrigger(def);
+          await claimRunOwner((def.orgId !== undefined ? withOrg(journal, def.orgId) : journal) as never, runId, caller, composerMark(runId));
+          result = await target.runWorkflow(def.name, def.input, { runId, caller });
         } catch (e) {
           // DEFERRAL, not attempt: the run is already in flight elsewhere — the engine refused this poller AT
           // LOCK ACQUISITION, before the run did anything. Nothing was tried and nothing went wrong; counting it

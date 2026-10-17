@@ -44,7 +44,23 @@
 //    gate was green, because typecheck is all CI did with examples. Each example now carries a test
 //    under `examples/<name>/test/`, which the root `vitest run` collects — or a reason here why not.
 //
-// The shape all five share: the failure is INVISIBLE rather than loud, so the only defence is a
+// 6) A door that can mark a run as its composer's. A run id a package composes for someone (`sched:`,
+//    `job:`, `batch:`, and the engine's own families) is born only with its composer's mark
+//    (`composerMark`, run-id-grammar.ts). The mark is a symbol, so no request body can carry it; what
+//    keeps it out of a request is that the code serving requests never makes one. Measured before the
+//    rule: an end user named `sched:~o~:alice:weekly:0` through every door (42 of 42 paths × families
+//    open), and alice's trigger failed without running. This check reads the sources of every package
+//    that serves requests.
+//
+// 7) A decided record written by a plain `put`. A model step's answer and a processor's decision are
+//    made once: the first one recorded is the run's history, and every later attempt returns it. Both
+//    were written with `put`, so a twin resume or a stale worker waking after a takeover replaced the
+//    answer the run had already acted on — measured: a second plan's tool call ran, two charges for one
+//    step, while a replay read the other plan. Every test passed, because a test runs one attempt. The
+//    files that write decided records write them by compare-and-set (`answerStep`, `frozenGet`,
+//    `claim`); a `put` there is a finding unless it is listed below with why it decides nothing.
+//
+// The shape all seven share: the failure is INVISIBLE rather than loud, so the only defence is a
 // check that goes looking. That is what this file is.
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { join, dirname, relative } from 'node:path';
@@ -233,8 +249,49 @@ if (existsSync(exDir)) for (const name of readdirSync(exDir)) {
   if (count > 0 && name in EXAMPLE_NO_TEST) untested.push(`${name} (has tests now — remove it from EXAMPLE_NO_TEST)`);
 }
 
+// ── 6. a request door that makes a composer's mark ────────────────────────────────────────────────
+// Every package that turns a request into a run: the four doors, and the two that compose them.
+const REQUEST_DOORS = [...DOORS, 'server', 'studio'];
+const MARK_USE = /\bcomposerMark\b/;
+const marking = [];
+for (const door of REQUEST_DOORS) {
+  const src = join(pkgDir, door, 'src');
+  if (!existsSync(src)) continue;
+  for (const file of walk(src)) {
+    const lines = readFileSync(file, 'utf8').split('\n');
+    lines.forEach((line, i) => { if (MARK_USE.test(line)) marking.push(`${relative(root, file)}:${i + 1}`); });
+  }
+}
+
+// ── 7. decided records written by a plain put ─────────────────────────────────────────────────────
+/** File → the `put` lines it may keep, each a regex on the line and why it decides nothing. */
+const DECIDED_WRITERS = {
+  'packages/durable/src/durable-model.ts': [
+    [/\.put\(claimKey, mine\)/, 'the write-ahead marker of a step without exclusivity: it gates nothing, and the answer is decided by answerStep'],
+  ],
+  'packages/durable/src/processor.ts': [],
+};
+const blindDecided = [];
+for (const [file, allowed] of Object.entries(DECIDED_WRITERS)) {
+  const lines = readFileSync(join(root, file), 'utf8').split('\n');
+  lines.forEach((line, i) => {
+    if (/^\s*(\*|\/\/)/.test(line) || !/\.put\(/.test(line)) return;
+    if (!allowed.some(([re]) => re.test(line))) blindDecided.push(`${file}:${i + 1} — ${line.trim().slice(0, 110)}`);
+  });
+}
+
 // ── report ────────────────────────────────────────────────────────────────────────────────────────
 let failed = false;
+
+if (blindDecided.length) {
+  failed = true;
+  console.error('\n✗ a decided record written by a plain put — a twin or a stale attempt replaces the answer the run');
+  console.error('  already acted on, and a replay then tells it something else:\n');
+  for (const line of blindDecided) console.error(`    ${line}`);
+  console.error('\n  Fix: write it by compare-and-set over what this attempt last wrote (answerStep, frozenGet, claim),');
+  console.error('  and return what is recorded when the write loses. If the write decides nothing, list it in');
+  console.error('  DECIDED_WRITERS with why.\n');
+}
 
 if (unbuilt.length) {
   failed = true;
@@ -259,6 +316,15 @@ if (coupled.length) {
   console.error('\n  Fix: move what it needs down to @gnldev/durable or @gnldev/auth, which every door already');
   console.error('  depends on, and import it from there. A developer who installs only this door must get a');
   console.error('  working door.\n');
+}
+
+if (marking.length) {
+  failed = true;
+  console.error('\n✗ a package that serves requests uses `composerMark` — the mark that lets a run of a composed');
+  console.error('  family (`sched:`, `job:`, `batch:`, the engine\'s own) be born. A request must never get it:\n');
+  for (const line of marking) console.error(`    ${line}`);
+  console.error('\n  Fix: a door begins runs under ids the caller names, or continues runs that exist. Only the code');
+  console.error('  that composes an id (the scheduler, the queue, the batch) marks its birth.\n');
 }
 
 if (untested.length) {
@@ -295,7 +361,9 @@ const scanned = [...walk(root)].length;
 console.log(`✓ ${scanned} text files carry no control bytes (grep and git diff can read all of them)`);
 console.log('✓ every package with test files has a `test` script (none is silently skipped)');
 console.log(`✓ no door package (${DOORS.join(', ')}) needs another door, @gnldev/server or @gnldev/studio`);
+console.log(`✓ no package that serves requests (${REQUEST_DOORS.join(', ')}) makes a composer's mark`);
 console.log(`✓ ${toProbe.length} dist modules the manifests call side-effect free import with no top-level effect`);
+console.log(`✓ ${Object.keys(DECIDED_WRITERS).length} files that write decided records write them by compare-and-set only`);
 
 /**
  * Imports each file in turn and reports, per file, what changed in state any other code can observe:

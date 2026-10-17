@@ -282,8 +282,14 @@ export function parseDerivedRunId(runId: string): DerivedRunIdParts | undefined 
 // ── run ids the engine composes ────────────────────────────────────────────────────────────────────
 
 interface IdFamily {
-  /** Who may BEGIN a run with an id of this family: only the engine, or anyone (then the owner gate judges). */
-  readonly begin: 'engine' | 'anyone';
+  /**
+   * Who may BEGIN a run with an id of this family: only the code that composes the id (`composer` — it
+   * marks the birth, `composerMark`), or the caller, who names its own run as with any id it chooses
+   * (then the owner gate judges).
+   */
+  readonly begin: 'composer' | 'caller';
+  /** Who composes it, for the refusal. */
+  readonly by: string;
   readonly shape: string;
   /** Why `begin` is what it is. */
   readonly why: string;
@@ -293,23 +299,28 @@ interface IdFamily {
 
 /**
  * Every family of run id the engine (or a package on it) composes, by its first segment. `begin:
- * 'engine'` is enforced by `admitRunId` at the run's birth: a caller may continue such a run (the
- * owner gate judges it), never begin one — the id names someone else's call, and taking it first took
- * the call (audit B1, R2-2): the owner's sub-agent, workflow tool or whole network failed, and the
- * owner's erasure, which re-derives these ids from its own records, deleted the taker's run. Every
- * family the engine composes from a parent run is engine-begun; the others are begun by a package
- * under its caller, whom the owner gate judges.
+ * 'composer'` is enforced by `admitRunId` at the run's birth: a caller may continue such a run (the
+ * owner gate judges it), never begin one — the id names a call made for someone else, and taking it
+ * first took the call. Measured twice: the engine's own families (audit B1, R2-2 — the owner's
+ * sub-agent, workflow tool or whole network failed) and then the families packages compose for an owner
+ * (a schedule's fire, a queued job, a batch item: the owner's work never ran, and the owner's erasure,
+ * which finds these ids by the owner's records or name, deleted the taker's run). Who composes the id
+ * is the one who begins it, the engine or a package; that is one rule, not two.
+ *
+ * `eval:` is the exception, and not by omission: the dataset runner hands the id to the host's own
+ * `run` callback, which begins its run with it as with any id it names (`gnl.run(name, { runId:
+ * ctx.runId })`). It is the caller's own name, judged like one.
  */
 export const RUN_ID_FAMILIES = {
-  task: { begin: 'engine', nests: true, shape: 'task:<parent run>:<tool call>', why: "a background call's task, begun from the parent's recorded call only" },
-  cont: { begin: 'engine', nests: true, shape: 'cont:<parent run>:<tool call>', why: "the continuation that answers a background call, begun when its task ended" },
-  agent: { begin: 'engine', nests: true, shape: 'agent:<parent run>:<tool call> (legacy agent:<tool call>)', why: "a sub-agent's run, begun from the parent's call by its delegation tool — a registered agent's sub-agent or createAgentTool" },
-  wf: { begin: 'engine', nests: true, shape: 'wf:<parent run>:<tool call> (legacy wf:<tool call>)', why: "a workflow run as a tool, begun from the parent's call by the workflow tool" },
-  net: { begin: 'engine', nests: true, shape: 'net:<parent run>:<step>', why: "a network step's run, begun by the network for its member — a host's NetworkTarget begins it with the run arguments the network hands it" },
-  batch: { begin: 'anyone', shape: 'batch:<batch>:<item>', why: 'a batch item: begun by the batch, under its caller' },
-  sched: { begin: 'anyone', shape: 'sched:<schedule>:<fire>', why: '@gnldev/scheduler: begun by a fire, under the schedule\'s owner' },
-  eval: { begin: 'anyone', shape: 'eval:<scope>:<case>', why: '@gnldev/evals: begun by the dataset runner' },
-  job: { begin: 'anyone', shape: 'job:<job id>', why: '@gnldev/queue: a job without a run id names itself' },
+  task: { begin: 'composer', by: 'the engine', nests: true, shape: 'task:<parent run>:<tool call>', why: "a background call's task, begun from the parent's recorded call only" },
+  cont: { begin: 'composer', by: 'the engine', nests: true, shape: 'cont:<parent run>:<tool call>', why: "the continuation that answers a background call, begun when its task ended" },
+  agent: { begin: 'composer', by: 'the engine', nests: true, shape: 'agent:<parent run>:<tool call> (legacy agent:<tool call>)', why: "a sub-agent's run, begun from the parent's call by its delegation tool — a registered agent's sub-agent or createAgentTool" },
+  wf: { begin: 'composer', by: 'the engine', nests: true, shape: 'wf:<parent run>:<tool call> (legacy wf:<tool call>)', why: "a workflow run as a tool, begun from the parent's call by the workflow tool" },
+  net: { begin: 'composer', by: 'the engine', nests: true, shape: 'net:<parent run>:<step>', why: "a network step's run, begun by the network for its member — a host's NetworkTarget begins it with the run arguments the network hands it" },
+  batch: { begin: 'composer', by: 'the batch', shape: 'batch:<batch>:<item>', why: 'a batch item, begun by its batch for the batch\'s caller' },
+  sched: { begin: 'composer', by: '@gnldev/scheduler', shape: 'sched:<schedule>:<fire>', why: 'a fire of a schedule, begun by the scheduler for the schedule\'s owner' },
+  eval: { begin: 'caller', by: '@gnldev/evals', shape: 'eval:<scope>:<case>', why: 'a dataset case, named by the runner for the host\'s own run callback, which begins it' },
+  job: { begin: 'composer', by: '@gnldev/queue', shape: 'job:<job id>', why: 'a queued job\'s run, begun at its first lease for the job\'s owner' },
 } as const satisfies Record<string, IdFamily>;
 
 export type RunIdFamily = keyof typeof RUN_ID_FAMILIES;
@@ -360,17 +371,18 @@ export function rerunRunId(src: string, kind: 'fork' | 'replay', n: number): str
   return `${src}:${kind}:${n}`;
 }
 
-/** Whether only the engine may begin a run with this id. */
-export function isEngineBegunRunId(runId: unknown): boolean {
+/** Whether only the code that composes this id may begin a run with it (`begin: 'composer'`). */
+export function isComposedRunId(runId: unknown): boolean {
   if (typeof runId !== 'string') return false;
   const f = runIdFamilyOf(runId);
-  return f !== undefined && RUN_ID_FAMILIES[f].begin === 'engine';
+  return f !== undefined && RUN_ID_FAMILIES[f].begin === 'composer';
 }
 
 /**
- * The engine's mark on run arguments it built itself, for an id only it may begin. A symbol no request
- * body can carry, not exported from the package: `{ [ENGINE_MINT]: runId }` on the args object (object
- * spread keeps it). Bound to the id, so the args of one run cannot begin another.
+ * The composer's mark on run arguments it built itself, for an id only it may begin. A symbol no request
+ * body can carry: `{ [ENGINE_MINT]: runId }` on the args object (object spread keeps it). Bound to the
+ * id, so the args of one run cannot begin another. The symbol is not exported; a package that composes
+ * ids gets the mark from `composerMark`.
  * @internal
  */
 export const ENGINE_MINT: unique symbol = Symbol('gnl.engineMint');
@@ -384,6 +396,20 @@ export function minted<T extends { runId?: unknown }>(args: T): T {
 export function withMintOf<T extends object>(target: T, from: unknown): T {
   const mark = mintOf(from);
   return mark === undefined ? target : Object.assign(target, { [ENGINE_MINT]: mark });
+}
+
+/**
+ * The mark a package puts on the birth of a run whose id it composed (`sched:`, `job:`, `batch:` —
+ * RUN_ID_FAMILIES `begin: 'composer'`): spread into the run arguments (`{ runId, caller,
+ * ...composerMark(runId) }`) or passed as the birth fields of `claimRunOwner`. Without it such a run is
+ * not born.
+ *
+ * What it protects against is a REQUEST naming the id: a request body is data and cannot carry a
+ * symbol. So the one rule for this function is where it may be called: by the code that composes the id,
+ * never on an id a request handed in. The door packages do not import it (check:hygiene section 6).
+ */
+export function composerMark(runId: string): { readonly [ENGINE_MINT]: string } {
+  return { [ENGINE_MINT]: runId };
 }
 
 /** The engine's mark on these arguments, if any. @internal */
@@ -500,18 +526,19 @@ interface AdmitStore { get(key: string): Promise<unknown> }
  * under (test/birth-witness.setup.ts), not by a list of entry points.
  *
  *  1. The spelling (`assertRunIdSafe`).
- *  2. Who may begin it: an id of an engine-begun family (`task:`, `cont:`, `agent:`, `wf:`, `net:`) is
- *     begun only with the engine's mark (`minted`) for that id. Without it, the run must already exist — continuing a run is
- *     judged by its owner record, like any other; beginning one is taking an id the engine owes someone.
+ *  2. Who may begin it: an id of a composed family (`task:`, `cont:`, `agent:`, `wf:`, `net:`, `batch:`,
+ *     `sched:`, `job:`) is begun only with its composer's mark (`minted`, `composerMark`) for that id.
+ *     Without it, the run must already exist — continuing a run is judged by its owner record, like any
+ *     other; beginning one is taking an id its composer owes someone.
  */
 export async function admitRunId(runId: unknown, ctx: { journal: AdmitStore; mint?: unknown }): Promise<void> {
   refuseUnknownNames('admitRunId', ctx, ADMIT_RUN_ID_NAMES);
   assertRunIdSafe(runId);
-  if (!isEngineBegunRunId(runId) || ctx.mint === runId) return;
+  if (!isComposedRunId(runId) || ctx.mint === runId) return;
   if ((await ctx.journal.get(runRecordKey(runId, 'input'))) !== undefined) return;
   const family = runIdFamilyOf(runId)!;
   throw new RunOwnerMismatchError(
-    `@gnldev/durable: run '${runId.slice(0, 80)}' is made by the engine (${RUN_ID_FAMILIES[family].why}); ` +
+    `@gnldev/durable: run '${runId.slice(0, 80)}' is composed by ${RUN_ID_FAMILIES[family].by} (${RUN_ID_FAMILIES[family].why}); ` +
       'there is no such run for this caller, and a caller cannot begin one',
     { runId, owner: '', requested: '' },
   );

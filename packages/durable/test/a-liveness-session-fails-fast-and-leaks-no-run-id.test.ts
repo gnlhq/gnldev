@@ -19,8 +19,8 @@ describe('T7: the run-event signal carries no run id', () => {
     const journal = new InMemoryJournal();
     const runs = new DetachedRuns({ journal, liveness: inMemoryLiveness(), signal, resume: () => { throw new Error('no'); }, sweepMs: 0 });
     const model = streamingModel({ words: ['a ', 'b '], gapMs: 1 });
-    await runs.start({ runId: 'job:ayse-yilmaz', scope: 'acme', launch: (s) => streamDurable({ journal, runId: 'job:ayse-yilmaz', model, prompt: 'p', resourceId: 'ayse', abortSignal: s } as any) });
-    for await (const _ of runs.follow({ runId: 'job:ayse-yilmaz', scope: 'acme' })) { /* to the end */ }
+    await runs.start({ runId: 'ayse-yilmaz-report', scope: 'acme', launch: (s) => streamDurable({ journal, runId: 'ayse-yilmaz-report', model, prompt: 'p', resourceId: 'ayse', abortSignal: s } as any) });
+    for await (const _ of runs.follow({ runId: 'ayse-yilmaz-report', scope: 'acme' })) { /* to the end */ }
     expect(sent.length).toBeGreaterThan(0);
     for (const p of sent) {
       expect(p).not.toContain('ayse');

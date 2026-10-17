@@ -1,8 +1,9 @@
 import { wrapLanguageModel, simulateReadableStream } from 'ai';
 import { requestOf, bornOnFirstWrite } from './run-identity.js';
 import type { LanguageModelV4, LanguageModelV4CallOptions, LanguageModelV4Middleware } from '@ai-sdk/provider';
-import { argsHash } from './hash.js';
-import { claim, ctxGet, runKeys } from './journal.js';
+import { argsHash, stableStringify } from './hash.js';
+import { ctxGet, runKeys } from './journal.js';
+import { AttemptLost, compareAndSet } from './attempt.js';
 import { stampFormat } from './format.js';
 import { enforceStepLimits } from './limits.js';
 import { assertNotCanceled } from './cancel.js';
@@ -60,14 +61,22 @@ async function journalNow(ctx: DurableCtx): Promise<number> {
 }
 
 /**
+ * The claim one attempt at a model step wrote: its later writes to the claim are compare-and-sets over
+ * exactly this value, so an attempt whose claim was taken over writes nothing over the taker's.
+ */
+type ModelClaim = { hold: string | undefined; mine: ModelClaimRecord };
+
+/**
  * §5.3: write the model-step 'running' claim — with an optional exclusivity gate.
  *
- * exclusive OFF (default): existing behavior EXACTLY — unconditional `put` (overwrites), never throws.
+ * exclusive OFF (default): unconditional `put` (overwrites), never throws. Two attempts may then call
+ * the model for one step; the step is still answered once (`answerStep`).
  * exclusive ON: tries an atomic `claim` (putIfAbsent); if lost, checks the existing record:
  * 'running' + LIVE (`claimIsLive`: held by an attempt in this process, or by a live process, else younger than
  *     ttlMs) → `RunBusyError` (another worker is processing that step).
- * 'running' + STALE / 'failed' / other → existing behavior: overwrite, continue (the double-call
- *     risk is deliberately accepted — the FAST resume after a real crash happens in this window).
+ * 'running' + STALE / 'failed' / other → taken over by compare-and-set over the record read (the
+ *     double-call risk is deliberately accepted — the FAST resume after a real crash happens in this
+ *     window). Two takers of one stale claim: one wins, the other meets a live claim and is busy.
  * NOTE: RunBusyError is thrown WITHOUT touching the claim (the record belongs to the other worker) and
  * since it's not an APICallError, it isn't swallowed by the AI SDK's retry — it reaches the caller as-is.
  */
@@ -76,30 +85,67 @@ async function acquireModelClaim(
   claimKey: string,
   reqHash: string | undefined,
   exclusive: ExclusiveStepOptions | undefined,
-): Promise<string | undefined> {
+): Promise<ModelClaim> {
   if (!exclusive) {
-    await ctx.journal.put(claimKey, { status: 'running', startedAt: Date.now(), reqHash });
-    return undefined;
+    const mine: ModelClaimRecord = { status: 'running', startedAt: Date.now(), reqHash };
+    await ctx.journal.put(claimKey, mine);
+    return { hold: undefined, mine };
   }
   // The claim names this process and this call (liveness.ts): a holder that stalls past the step TTL keeps
   // it — judged by the one rule every claim is judged by, not by its age alone.
   await bindOwnLiveness(ctx.journal);
-  const now = await journalNow(ctx);
-  const hold = newHoldId();
-  const record = { status: 'running' as const, startedAt: now, reqHash, ...procStampFor(ctx.journal), hold };
   const ttlMs = exclusive.ttlMs ?? DEFAULT_EXCLUSIVE_TTL_MS;
-  if (!(await claim(ctx.journal, claimKey, record))) {
+  for (let round = 0; ; round++) {
+    const now = await journalNow(ctx);
+    const hold = newHoldId();
+    const mine = { status: 'running' as const, startedAt: now, reqHash, ...procStampFor(ctx.journal), hold };
     const existing = await ctx.journal.get<ModelClaimRecord & { proc?: string; hold?: string }>(claimKey);
-    if (await claimIsLive(existing, now, ttlMs, ctx.journal)) {
+    const busy = existing !== undefined && (await claimIsLive(existing, now, ttlMs, ctx.journal));
+    // STALE running (crash) / failed (retry) / leftover succeeded → taken over, over the record read.
+    if (!busy && (await compareAndSet(ctx.journal, claimKey, existing, mine))) {
+      holdHere(hold, ctx.journal);
+      return { hold, mine };
+    }
+    if (busy || round >= 2) {
       throw new RunBusyError(
         `model step '${claimKey}' is being processed by another worker (claim ${now - (existing?.startedAt ?? now)}ms old, ttl ${ttlMs}ms)`,
       );
     }
-    // STALE running (crash) / failed (retry) / leftover succeeded → existing behavior: overwrite, continue.
-    await ctx.journal.put(claimKey, record);
   }
-  holdHere(hold, ctx.journal);
-  return hold;
+}
+
+/** The claim's outcome, written over this attempt's own claim only: one that was taken over is the taker's to settle. */
+async function settleModelClaim(ctx: DurableCtx, claimKey: string, claimed: ModelClaim, status: 'succeeded' | 'failed', reqHash: string | undefined): Promise<void> {
+  await compareAndSet(ctx.journal, claimKey, claimed.mine, { status, startedAt: Date.now(), reqHash });
+}
+
+/**
+ * A model step is answered ONCE. The first complete answer recorded for (run, step) is the step's
+ * answer, and every attempt at the step returns it — the attempt that recorded it, a twin that called
+ * the model beside it, a holder that stalled or was partitioned past its claim and woke after a
+ * takeover had answered. An attempt's own answer is another plan: other tool calls under other
+ * toolCallIds, which durableTool cannot collapse into the recorded ones, so returning it ran a second
+ * set of side effects beside the first (measured: two charges for one step). The answer is the run's
+ * history; nothing writes over it.
+ *
+ * `mine` is what this attempt has tried to write to the step so far (the write-ahead copies of its own
+ * stream; empty on the generate path): the next write is a compare-and-set over the last of them. A
+ * write whose outcome it never saw (the journal threw) may or may not have landed, so what stands
+ * there is read: nothing, or a copy of its own, is still its own to write over. Returns the step's
+ * answer as recorded — this attempt's own when it won, or the one that was there (`lost: true`).
+ */
+async function answerStep(ctx: DurableCtx, key: string, mine: object[], next: object): Promise<{ lost: boolean; recorded: unknown }> {
+  let expected: unknown = mine[mine.length - 1];
+  mine.push(next);
+  for (let round = 0; round < 3; round++) {
+    if (await compareAndSet(ctx.journal, key, expected, next)) return { lost: false, recorded: next };
+    const raw = await ctx.journal.get<unknown>(key);
+    if (raw !== undefined && !mine.some((m) => stableStringify(m) === stableStringify(raw))) break;
+    expected = raw;
+  }
+  const recorded = await ctxGet<unknown>(ctx, key);
+  if (recorded === undefined) throw new AttemptLost(key); // the step's record went away under this attempt (an erasure)
+  return { lost: true, recorded };
 }
 
 // DETERMINISTIC components of the model request: messages/tool schema/sampling parameters.
@@ -353,22 +399,25 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       if (isDraining()) throw new RunDrainedError(ctx.runId);
       // A new step spends budget: none left (the request's — a sibling may have used it), no step.
       if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId, 'before');
-      const hold = await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
+      const claimed = await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
       let result: Awaited<ReturnType<typeof doGenerate>>;
       try {
         // Y1: opt-in step timeout — a timeout falls into the catch, claim becomes 'failed' (retry key does not shift).
-        result = opts?.stepTimeoutMs
+        const generated = opts?.stepTimeoutMs
           ? await withTimeout(doGenerate(), opts.stepTimeoutMs, `model step ${step}`)
           : await doGenerate();
-        await ctx.journal.put(key, stampFormat(result as object)); // H13: format stamp (a copy — _v does not leak into result)
-        await ctx.journal.put(claimKey, { status: 'succeeded', startedAt: Date.now(), reqHash });
+        // H13: format stamp (a copy — _v does not leak into result). The step is answered once: an
+        // answer recorded meanwhile is this step's, and this attempt returns it instead of its own.
+        const answered = await answerStep(ctx, key, [], stampFormat(generated as object));
+        result = answered.lost ? (asGenerateRecord(answered.recorded) as typeof generated) : generated;
+        await settleModelClaim(ctx, claimKey, claimed, 'succeeded', reqHash);
       } catch (error) {
         // Transient error: mark the claim as 'failed' → the NEXT attempt (retry/resume) continues
         // immediately — the existing "retry does not shift the replay key" behavior is PRESERVED (step did not advance).
-        await ctx.journal.put(claimKey, { status: 'failed', startedAt: Date.now(), reqHash });
+        await settleModelClaim(ctx, claimKey, claimed, 'failed', reqHash);
         throw error;
       } finally {
-        releaseHold(hold, ctx.journal);
+        releaseHold(claimed.hold, ctx.journal);
       }
       step++;
       // Checked AFTER the step is SUCCESSFULLY journaled (journal is already consistent) —
@@ -411,7 +460,7 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       if (isDraining()) throw new RunDrainedError(ctx.runId);
       // A new step spends budget: none left (the request's — a sibling may have used it), no step.
       if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId, 'before');
-      const hold = await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
+      const claimed = await acquireModelClaim(ctx, claimKey, reqHash, opts?.exclusiveStep);
       let result: Awaited<ReturnType<typeof doStream>>;
       try {
         // Y1: in stream, the timeout is applied to the doStream call (up to the first byte) — see DurableModelOptions.
@@ -419,12 +468,12 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
           ? await withTimeout(doStream(), opts.stepTimeoutMs, `model stream step ${step}`)
           : await doStream();
       } catch (error) {
-        await ctx.journal.put(claimKey, { status: 'failed', startedAt: Date.now(), reqHash });
+        await settleModelClaim(ctx, claimKey, claimed, 'failed', reqHash);
         throw error;
       } finally {
         // Held while the provider is asked (the call a twin would repeat), not while the caller reads the
         // stream: a stream nobody finishes reading would otherwise hold the step in this process forever.
-        releaseHold(hold, ctx.journal);
+        releaseHold(claimed.hold, ctx.journal);
       }
       const { stream, ...rest } = result;
       const myStep = step;
@@ -455,13 +504,26 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       // longer recoverable. Warn once per STREAM, not per chunk: a step can carry many tool calls,
       // and a journal that is down is down for all of them (one line per chunk is noise, not signal).
       let writeAheadFailureWarned = false;
+      // The step is answered once (`answerStep`), on this path too. A stream cannot take back what it has
+      // already handed its reader, so an attempt that finds the step answered by another stops its
+      // stream there with `AttemptLost` — before the tool call that would have run its own plan — and
+      // its run's next attempt replays the recorded answer.
+      const mine: object[] = [];
       const recorder = new TransformStream<any, any>({
         async transform(chunk, controller) {
           parts.push(chunk);
           if (chunk?.type === 'tool-call') {
             try {
-              await ctx.journal.put(runKeys.model(ctx.runId, myStep), stampFormat({ parts: parts.slice(), rest, partial: true }));
+              const answered = await answerStep(ctx, runKeys.model(ctx.runId, myStep), mine, stampFormat({ parts: parts.slice(), rest, partial: true }));
+              if (answered.lost) {
+                controller.error(new AttemptLost(runKeys.model(ctx.runId, myStep)));
+                return;
+              }
             } catch (err) {
+              if (err instanceof AttemptLost) {
+                controller.error(err);
+                return;
+              }
               // Best-effort stays best-effort: a journal hiccup must not stop the stream the caller
               // is reading. But it is said out loud.
               if (!writeAheadFailureWarned) {
@@ -480,9 +542,10 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
           controller.enqueue(chunk);
         },
         flush: async () => {
-          // Happy path: EXACTLY the same as the behavior so far — the final record is written with the full `parts`.
-          await ctx.journal.put(runKeys.model(ctx.runId, myStep), stampFormat({ parts, rest })); // H13
-          await ctx.journal.put(claimKey, { status: 'succeeded', startedAt: Date.now(), reqHash });
+          // Happy path: the final record is written with the full `parts` (H13), over this attempt's own copy.
+          const answered = await answerStep(ctx, runKeys.model(ctx.runId, myStep), mine, stampFormat({ parts, rest }));
+          await settleModelClaim(ctx, claimKey, claimed, 'succeeded', reqHash);
+          if (answered.lost) throw new AttemptLost(runKeys.model(ctx.runId, myStep));
           // SAME post-hoc check as generate (see wrapGenerate) — the step is already journaled.
           if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId);
         },

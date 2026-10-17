@@ -36,7 +36,7 @@ import { resolveApprovals, hasRunProbe } from './run.js';
 import { readXid, xidPlanOf, xidWhen, amountsDifferOf } from './xid.js';
 import { identityUnusableReason } from './semantic-dup.js';
 import { BatchPlanMismatchError } from './errors.js';
-import { batchItemRunId } from './run-id-grammar.js';
+import { batchItemRunId, composerMark } from './run-id-grammar.js';
 import type { AnyTool } from './types.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { CREATE_BATCH_NAMES } from './option-names.js';
@@ -283,7 +283,8 @@ export function createBatch(journal: Journal, cfg: BatchConfig) {
       // as "not started", and any end user could adopt it through the agent door.
       // The same entry as every run kind (run-identity.ts admitRun): an item run that is someone
       // else's is refused, a re-entry runs as the recorded owner.
-      const { acting } = await admitRun(journal, runId, batchCaller, { batch: batchId, itemKey: key });
+      // The batch composed this id, so the batch begins it (run-id-grammar.ts `begin: 'composer'`).
+      const { acting } = await admitRun(journal, runId, batchCaller, { batch: batchId, itemKey: key, ...composerMark(runId) });
       const ctx: DurableCtx = {
         journal, runId, approvals: resolved,
         identity: runIdentity(acting, runId),

@@ -276,8 +276,8 @@ async function pickForkRunId(journal: Journal, srcRunId: string): Promise<string
  * the source's, written through the one birth (`claimRunOwner`, which holds the run-id gate) before a
  * single row is copied. A crash after it leaves a fork that belongs to the source's owner however far the copy got.
  *
- * `newRunId` given → the caller's id, admitted as any caller's (a family only the engine begins —
- * `agent:`, `task:`… — is refused: pick another id). Omitted → `pickForkRunId` builds it, and the
+ * `newRunId` given → the caller's id, admitted as any caller's (a composed family —
+ * `agent:`, `task:`, `job:`… — is refused: pick another id). Omitted → `pickForkRunId` builds it, and the
  * engine begins it: a fork of a sub-agent's run (`agent:<p>:<c>:fork:<ts>`) keeps its source's family.
  * Returns the fork's id.
  */

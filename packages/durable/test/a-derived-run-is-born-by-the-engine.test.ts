@@ -157,7 +157,7 @@ describe.each(STORES)('a derived run is born by the engine, erasure, %s', (_n, m
       const worker = createMockModel(async () => finalTextResult('w'));
       const parent = createMockModel(async ({ prompt }: any) => prompt.some((m: any) => m.role === 'tool') ? finalTextResult('done') : toolCallResult('agent_w', 'tc1', { task: 'x' }));
       const gnl: any = createGnl({ storage, agents: { parent: { model: parent, agents: ['w'] }, w: { model: worker } } } as any);
-      await expect(gnl.run('w', { runId: child, prompt: 'MALLORY-SECRET', caller: user(`mallory-${u}`) })).rejects.toThrow(/made by the engine/);
+      await expect(gnl.run('w', { runId: child, prompt: 'MALLORY-SECRET', caller: user(`mallory-${u}`) })).rejects.toThrow(/composed by/);
       expect(await storage.runs.listKeys(child)).toEqual([]);
       await gnl.run('parent', { runId: P, prompt: 'go', caller: user(alice) });
       expect(await ownerLabel(storage, child)).toBe(`user:${alice}`);
@@ -172,7 +172,7 @@ describe.each(STORES)('a derived run is born by the engine, erasure, %s', (_n, m
       const wf = { build: () => [{ id: 's1' }], run: async (input: any) => ({ got: input }) };
       const parent = createMockModel(async ({ prompt }: any) => prompt.some((m: any) => m.role === 'tool') ? finalTextResult('done') : toolCallResult('workflow_w', 'tc1', { input: {} }));
       const gnl: any = createGnl({ storage, workflows: { w: wf }, agents: { parent: { model: parent, workflows: ['w'] } } } as any);
-      await expect(gnl.runWorkflow('w', { who: 'MALLORY-SECRET' }, { runId: child, resourceId: `mallory-${u}`, caller: user(`mallory-${u}`) })).rejects.toThrow(/made by the engine/);
+      await expect(gnl.runWorkflow('w', { who: 'MALLORY-SECRET' }, { runId: child, resourceId: `mallory-${u}`, caller: user(`mallory-${u}`) })).rejects.toThrow(/composed by/);
       expect(await storage.runs.listKeys(child)).toEqual([]);
       await gnl.run('parent', { runId: P, prompt: 'go', caller: user(alice) });
       expect(await ownerLabel(storage, child)).toBe(`user:${alice}`);
@@ -196,8 +196,8 @@ describe.each(STORES)('a derived run is born by the engine, net steps 0..N, %s',
     });
     const gnl: any = createGnl({ storage, agents: { w: { model: worker } }, networks: { n: { router, agents: ['w'] } } } as any);
     for (const i of [0, 1, 2, 3]) {
-      await expect(gnl.run('w', { runId: `net:${P}:${i}`, prompt: 'MALLORY-SECRET', caller: user(`mallory-${u}`) })).rejects.toThrow(/made by the engine/);
-      await expect(gnl.run('w', { runId: `net:${P}:${i}`, prompt: 'MALLORY-SECRET' })).rejects.toThrow(/made by the engine/);
+      await expect(gnl.run('w', { runId: `net:${P}:${i}`, prompt: 'MALLORY-SECRET', caller: user(`mallory-${u}`) })).rejects.toThrow(/composed by/);
+      await expect(gnl.run('w', { runId: `net:${P}:${i}`, prompt: 'MALLORY-SECRET' })).rejects.toThrow(/composed by/);
     }
     expect(await storage.runs.listKeys(`net:${P}:`)).toEqual([]);
     expect(workerTasks).toEqual([]);
@@ -232,7 +232,7 @@ describe('a derived run is born by the engine: the ways through', () => {
     await expect(runNetwork({
       runId: 'N2', journal, routerModel: routeOnce(), task: 'go',
       agents: { a: { run: async (task, nestedRunId) => runDurable({ runId: nestedRunId, journal, model: echo, prompt: task }) } },
-    })).rejects.toThrow(/made by the engine/);
+    })).rejects.toThrow(/composed by/);
     const plain = await runNetwork({
       runId: 'N3', journal, routerModel: routeOnce(), task: 'go',
       agents: { a: { run: async (task: string) => ({ text: `plain ${task}` }) } },
@@ -251,7 +251,7 @@ describe('a derived run is born by the engine: the ways through', () => {
     expect(await ownerLabel(storage, fork.newRunId)).toBe('user:alice');
     const resumed = await resumeRun(fork.newRunId, { journal: storage.runs, model: worker, caller: user('alice') } as any);
     expect(resumed.text).toBe('w');
-    await expect(forkRun(storage.runs, 'agent:P:tc1', 0, 'agent:Q:tc9')).rejects.toThrow(/made by the engine/);
+    await expect(forkRun(storage.runs, 'agent:P:tc1', 0, 'agent:Q:tc9')).rejects.toThrow(/composed by/);
     expect(await storage.runs.listKeys('agent:Q:')).toEqual([]);
   });
 });

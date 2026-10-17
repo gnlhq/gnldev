@@ -422,7 +422,9 @@ export const BIRTHS: Record<string, Birth> = {
     },
   },
   'scheduler fire': {
-    sites: ['durable/src/registry.ts'], starters: [],
+    // The scheduler begins the fire's run itself (it composes `sched:<trigger>:<n>`), then the runner
+    // continues it through runWorkflow.
+    sites: ['scheduler/src/index.ts', 'durable/src/registry.ts'], starters: [],
     start: async (w, who) => {
       await schedulerDoor(w)(who, 'tgtC', { s: SECRET });
       const k = (await w.storage.runs.listKeys!('')).find((x) => x.includes('sched:') && x.endsWith(':input'))!;

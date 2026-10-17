@@ -20,11 +20,13 @@ describe('@gnldev/scheduler', () => {
   it('at (past): fires once, second poll is a no-op', async () => {
     const j = new InMemoryJournal();
     const runner = mockRunner(() => ({ output: 'ok' }));
-    await scheduleWorkflow(j, { name: 'wf', at: 1000 }, 1000);
+    // An id of its own: the default id is the workflow's name, and `wf` is a record family a fire's run
+    // id cannot carry (refused at scheduling — a-composed-id-is-spelled-where-it-is-composed.test.ts).
+    await scheduleWorkflow(j, { id: 'once', name: 'wf', at: 1000 }, 1000);
 
     const r1 = await pollScheduler(j, runner, 2000);
     expect(r1.fired).toBe(1);
-    expect(runner.calls).toEqual([{ name: 'wf', runId: 'sched:wf:0' }]);
+    expect(runner.calls).toEqual([{ name: 'wf', runId: 'sched:once:0' }]);
 
     const r2 = await pollScheduler(j, runner, 3000);
     expect(r2.fired).toBe(0); // status done

@@ -167,7 +167,7 @@ describe('siblings: the same answer holds where the old one leaked through anoth
     const { callerConflictAnswer, runNotFound, RunOwnerMismatchError, RunActorMismatchError, RunInputMismatchError } = await import('@gnldev/durable') as any;
     for (const e of [
       new RunOwnerMismatchError('belongs to a different subject', { runId: 'r1', owner: 'alice', requested: 'mallory' }),
-      new RunOwnerMismatchError('made by the engine; no such run for this caller', { runId: 'r1', owner: '', requested: '' }),
+      new RunOwnerMismatchError('composed by the engine; no such run for this caller', { runId: 'r1', owner: '', requested: '' }),
       new RunActorMismatchError('belongs to a different actor', { runId: 'r1', ownerActor: 'alice', requestedActor: 'mallory' }),
     ]) {
       const a = callerConflictAnswer(e, 'invoice-7');

@@ -184,16 +184,27 @@ describe('replaying a partial (write-ahead) model step', () => {
 });
 
 describe('a write-ahead checkpoint the journal refuses', () => {
-  /** Rejects exactly the mid-stream write-ahead put (the model key carrying `partial: true`); the
-   *  final flush write and everything else go through, as a transient journal fault would. */
+  /** Rejects exactly the mid-stream write-ahead write (the model key carrying `partial: true`) by
+   *  whichever write it arrives through — the step's answer is written by compare-and-set; the final
+   *  flush write and everything else go through, as a transient journal fault would. */
   class RejectsWriteAhead extends InMemoryJournal {
     rejected = 0;
+    private refuses(key: string, value: unknown): boolean {
+      if (!(key.includes(':model:') && (value as { partial?: boolean })?.partial === true)) return false;
+      this.rejected++;
+      return true;
+    }
     override async put(key: string, value: unknown): Promise<void> {
-      if (key.includes(':model:') && (value as { partial?: boolean })?.partial === true) {
-        this.rejected++;
-        throw new Error('journal write rejected (simulated outage)');
-      }
+      if (this.refuses(key, value)) throw new Error('journal write rejected (simulated outage)');
       return super.put(key, value);
+    }
+    override async putIfAbsent(key: string, value: unknown): Promise<boolean> {
+      if (this.refuses(key, value)) throw new Error('journal write rejected (simulated outage)');
+      return super.putIfAbsent(key, value);
+    }
+    override async putIfMatch(key: string, expected: unknown, value: unknown): Promise<boolean> {
+      if (this.refuses(key, value)) throw new Error('journal write rejected (simulated outage)');
+      return super.putIfMatch(key, expected, value);
     }
   }
 
