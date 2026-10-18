@@ -545,6 +545,36 @@ export class PostgresStorage implements Storage {
     this.cache = new PgCacheStore(q);
     this.meta = new PgMetaStore(q);
   }
+  /**
+   * Serialises the schema block across instances (see `ensureReady`). Returns its release, or undefined when
+   * no lock was taken (a backend without advisory locks — pg-mem — which has no second writer to race).
+   *
+   * A pool that says where it connects gets a client of its own, outside the pool: one checked out of a
+   * pool of `max: 1` would leave the block below no connection to run on. A pool that does not say keeps
+   * the former session lock through itself — correct only while it has one connection, as before.
+   */
+  private async takeBootLock(): Promise<(() => Promise<void>) | undefined> {
+    const options = (this._pool as unknown as { options?: Record<string, unknown> }).options ?? {};
+    if (!options.connectionString && !options.host) {
+      const locked = await this._pool.query('SELECT pg_advisory_lock(47110001)').then(() => true, () => false);
+      return locked ? async () => { await this._pool.query('SELECT pg_advisory_unlock(47110001)').catch(() => {}); } : undefined;
+    }
+    const { Client } = createRequire(import.meta.url)('pg') as { Client: new (c: any) => any };
+    const c = new Client({ ...options });
+    c.on('error', () => undefined); // a dropped lock connection ends the transaction, which releases the lock
+    try {
+      await c.connect();
+      await c.query('BEGIN');
+      await c.query('SELECT pg_advisory_xact_lock(47110001)');
+    } catch {
+      await c.end().catch(() => undefined);
+      return undefined;
+    }
+    return async () => {
+      await c.query('COMMIT').catch(() => undefined);
+      await c.end().catch(() => undefined);
+    };
+  }
   private ensureReady(): Promise<void> {
     if (!this.ready) {
       const booting = (async () => {
@@ -568,7 +598,15 @@ export class PostgresStorage implements Storage {
         // backend without advisory locks at all — pg-mem, which this suite runs most of its Postgres
         // tests against — must still come up: it has no second writer to race with, so losing the
         // lock costs it nothing. Failing here instead would trade a rare boot race for a certain one.
-        const locked = await this._pool.query('SELECT pg_advisory_lock(47110001)').then(() => true, () => false);
+        //
+        // The lock is TRANSACTION-scoped, held by one checked-out client that keeps its transaction open
+        // until the block ends. It was a session lock taken and released through the pool: the release
+        // could run on another pooled connection (it failed with a warning, and the lock stayed on the
+        // first one until the pool closed it), and behind a transaction-mode pooler the lock stayed on a
+        // shared server connection — the next boots, direct ones too, waited ~10 min (measured on a
+        // managed pooler, 2026-10-18). A transaction pins one server connection under every pooler, and
+        // its end releases the lock wherever it is: COMMIT, ROLLBACK, or the connection dying.
+        const bootLock = await this.takeBootLock();
         try {
           // A run table in an earlier version's format (status flags) is refused before anything is
           // created or read: this version neither reads nor writes the flags, so serving it would read
@@ -683,7 +721,7 @@ export class PostgresStorage implements Storage {
             );
           }
         } finally {
-          if (locked) await this._pool.query('SELECT pg_advisory_unlock(47110001)').catch(() => {});
+          await bootLock?.();
         }
       })();
       this.ready = booting;

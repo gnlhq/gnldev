@@ -16,6 +16,37 @@ measures every backend before it is called one.
 
 ### Breaking
 
+- **A process whose liveness session ends keeps its id, and is read as dead only after a grace**
+  (`reconnectGraceMs`, `@gnldev/durable`, `@gnldev/durable/mysql`, `@gnldev/durable/mongo`). A session
+  ends under a live process too — a terminated backend, a restart, a failover, a pooler closing it. The
+  process came back under a NEW id and its old one read dead at once: measured on Postgres, cutting only
+  the holder's liveness session while its tool body ran, another process took the call over two seconds
+  later and ran the body beside it — 2 effects in 5 of 5 rounds (1 with no cut). Now `postgresLiveness`,
+  `mysqlLiveness` and `mongoLiveness` take their lock back under the same id, and a holder reads as dead
+  (`judgeAlive`, for every reader: a tool call's takeover, the executor's owner check, `gnl pending`)
+  only once its lock has been gone at looks spanning `reconnectGraceMs` — 5 s by default. Measured after:
+  1 effect in every round, the cut process's lock held again under its id. What changes: a crashed
+  process's runs and calls are taken over after the grace (measured 5.1 s) instead of at once (~90 ms);
+  `ProcessLiveness.id` no longer changes after a cut (code that compared ids across a cut must not);
+  `reconnectGraceMs: 0` restores the old reading, and with it the double effect.
+- **A tool body is told when its process's session is gone and not back** (`abortSignal`). Half a grace
+  after the loss the bodies the process is running get an aborted `abortSignal` (reason
+  `LivenessUnavailableError`): from about then another process may take the call over. A body that
+  honours it stops (measured: 0.3 s at a 0.6 s grace); one that ignores it finishes — its effect may then
+  happen twice, and the provider's `idempotencyKey` is what folds the two.
+- **A Postgres liveness behind a transaction-mode pooler is refused at open** (`TransactionPoolerError`,
+  `@gnldev/durable`). `postgresLiveness` and `PostgresStorage.processLiveness()` check, once, that the
+  session holds its lock alone: a second session tries the same lock, then the holder asks whether the
+  lock is still on the backend it is on now. Before, both opened on a pooler (PgBouncer
+  `pool_mode=transaction`, a managed "-pooler" endpoint): measured on a managed pooler, a killed
+  process read alive 60 s later (its runs and calls were never taken over), and a second client took
+  the first one's lock 10 of 10 times. Refused 10 of 10 there and 300 of 300 on a busy PgBouncer in
+  transaction mode; opened 5 of 5 on a direct managed endpoint and on a local server. A direct
+  `durableTool` / `durableModel` / `runDurable` on such a store is refused before its body, every
+  call, unless a liveness is installed (`installProcessLiveness`) — it used to warn and judge claims by
+  their age, which ran a frozen holder's effect twice (measured). **What to do:** give the liveness a
+  direct or session-mode URL (`liveness: await postgresLiveness({ connectionString: <direct URL> })`),
+  or build the store from the direct URL. The store itself may stay on the pooler.
 - **A store must provide every guarantee: `putIfAbsent`, `putIfMatch`, `applyBatch`, `incrBy`,
   `getCounters`, `listKeys`, `deletePrefix`, `now`** (`JOURNAL_GUARANTEES`). A store missing one is
   refused, naming what it lacks, by `createGnl`, `runDurable`, `streamDurable`, `toJournal`, `withOrg`,
@@ -52,6 +83,18 @@ measures every backend before it is called one.
 
 ### Fixed
 
+- **A body that lost its call answered its caller with its own result.** When a tool body finished after
+  its call was taken over (a stall, a cut session), its success could not be the call's record — kept as
+  a late report — yet its caller was handed the body's own output while the journal, and every later
+  reader, held the takeover's: one call, two answers (measured on Postgres: `{ok:"holder"}` returned,
+  `{ok:true}` recorded). The caller now gets what a fresh call gets: the record that answers the call, or
+  busy (`RunBusyError`) while the other attempt still holds it.
+- **The schema lock at boot could be released on another connection.** `PostgresStorage` took it with
+  `pg_advisory_lock` through its pool and released it through the pool again: the release could run on
+  another pooled connection, and behind a transaction-mode pooler the lock stayed on a shared server
+  connection, so the next boots, direct ones too, waited ~10 min (measured on a managed pooler). It is
+  now a transaction lock held on a connection of its own for the block; the transaction's end releases
+  it wherever it is. 10 of 10 boots through the pooler, none waited.
 - **Six of seven vector stores accepted a vector of another length**, after which every query of the
   store failed. Measured with the vector kit; refused at the write now (above).
 - **The pgvector store read `{ key: undefined }` differently in a query ("has metadata") and a delete

@@ -32,7 +32,7 @@ import { cosineSimilarity } from 'ai';
 import { refuseUnknownNames } from '@gnldev/options';
 import { leafSuffix, runRecordKey } from './run-id-grammar.js';
 import { closeExecutorFor } from './executors.js';
-import { unbindLiveness, livenessIdOf, LivenessUnavailableError, type ProcessLiveness } from './process-liveness.js';
+import { unbindLiveness, livenessIdOf, LivenessUnavailableError, reconnectGraceOf, sessionSignals, type ProcessLiveness } from './process-liveness.js';
 import { ROOT_EXEC_RECORDS, isScopeFact, scopeFactKeys, scopeFactsDroppedByAdoption, staysAtRoot, onAdoptionCollision, adoptionConflict } from './adoption.js';
 import { prefixUpperBound, ENGINE_META_KEYS, assertOrgRegistered, isPlatformKey, orgPrefix, ORG_KEY_PREFIX } from './organization.js';
 import {
@@ -1552,6 +1552,8 @@ export interface MongoLivenessOptions {
   id?: string;
   /** How often this process proves its own connection (and how stale a proof `confirm()` accepts). Default 5 s. */
   heartbeatMs?: number;
+  /** How long a holder's connection must be gone before it reads as dead, and a live process has to open it again (see `postgresLiveness`). Default 5 s. */
+  reconnectGraceMs?: number;
 }
 
 /** A process liveness on MongoDB, and which connections it can see. */
@@ -1582,15 +1584,16 @@ const appNameMax = 100;
  * connection, and refuses when it cannot see it; and it registers its user in `gnl_liveness_users`,
  * refusing to run beside another user when either of the two sees only its own.
  *
- * The connection is this process's only for as long as it is the same connection: when the driver
- * closes it (a network error, a failover, a pool clear) the id is dead for good — others may already
- * have acted on it — and the process comes back under a new id and connection, as `postgresLiveness`
- * does. `confirm()` is false until then.
+ * When the driver closes the connection (a network error, a failover, a pool clear) the process is not
+ * gone: it opens a connection under the SAME name again, and the others read it as dead only once no
+ * connection of that name has been seen for `reconnectGraceMs` (see `postgresLiveness`). `confirm()` is
+ * false until it is back.
  */
 export async function mongoLiveness(opts: MongoLivenessOptions): Promise<MongoProcessLiveness> {
   refuseUnknownNames('mongoLiveness', opts, MONGO_LIVENESS_NAMES);
   const heartbeatMs = opts.heartbeatMs ?? 5_000;
   if (!(heartbeatMs > 0 && heartbeatMs <= 60_000)) throw new Error(`@gnldev/durable: mongoLiveness heartbeatMs must be between 1 and 60000 ms; got ${heartbeatMs}`);
+  const reconnectGraceMs = reconnectGraceOf('mongoLiveness', opts.reconnectGraceMs);
   if (!opts?.connectionString) throw new Error('@gnldev/durable: mongoLiveness needs a connectionString');
   if (opts.id !== undefined && opts.id.length > appNameMax - 40) throw new Error(`@gnldev/durable: mongoLiveness id must be at most ${appNameMax - 40} characters (it names the connection); got ${opts.id.length}`);
   const url = opts.connectionString;
@@ -1617,31 +1620,33 @@ export async function mongoLiveness(opts: MongoLivenessOptions): Promise<MongoPr
       throw e;
     }
   };
-  held = await open(livenessIdOf(opts.id));
-  // The id and visibility last held: kept while a lost connection is replaced (`confirm()` is false meanwhile).
-  let id = held.id;
+  const id = livenessIdOf(opts.id);
+  held = await open(id);
+  // The visibility last held: kept while a lost connection is replaced (`confirm()` is false meanwhile).
   let visibility = held.visibility;
   let healthy = true;
   let closed = false;
   let provenAt = performance.now();
   let reopening: Promise<void> | undefined;
-  /** The connection is gone: its id is dead for good; the process comes back under a new id and connection. */
+  const signals = sessionSignals(reconnectGraceMs);
+  /** The connection is gone, the process is not: it opens one under the SAME name again (see postgresLiveness). */
   function lost(): void {
     healthy = false;
     const was = held;
     held = undefined;
     void was?.client.close().catch(() => undefined);
+    signals.lost();
     if (closed || reopening) return;
     reopening = (async () => {
-      for (let wait = 100; !closed; wait = Math.min(wait * 2, 5_000)) {
+      for (let wait = 50; !closed; wait = Math.min(wait * 2, 1_000)) {
         try {
-          const next = await open(livenessIdOf(opts.id));
+          const next = await open(id);
           if (closed) { await next.client.close().catch(() => undefined); return; }
           held = next;
-          id = next.id;
           visibility = next.visibility;
           provenAt = performance.now();
           healthy = true;
+          signals.back();
           return;
         } catch {
           await new Promise((r) => setTimeout(r, wait).unref?.());
@@ -1667,7 +1672,9 @@ export async function mongoLiveness(opts: MongoLivenessOptions): Promise<MongoPr
   const beat = setInterval(() => { void holdsOwn(); }, heartbeatMs);
   beat.unref?.();
   return {
-    get id() { return id; },
+    id,
+    reconnectGraceMs,
+    sessionSignal: signals.signal,
     get visibility() { return visibility; },
     async isAlive(other) {
       const h = current();
@@ -1688,6 +1695,7 @@ export async function mongoLiveness(opts: MongoLivenessOptions): Promise<MongoPr
       if (closed) return;
       closed = true;
       clearInterval(beat);
+      signals.close();
       healthy = false;
       const h = held;
       held = undefined;
