@@ -38,6 +38,10 @@
       "types": "./dist/postgres-storage.d.ts",
       "default": "./dist/postgres-storage.js"
     },
+    "./mysql": {
+      "types": "./dist/mysql-storage.d.ts",
+      "default": "./dist/mysql-storage.js"
+    },
     "./libsql": {
       "types": "./dist/libsql-storage.d.ts",
       "default": "./dist/libsql-storage.js"
@@ -65,6 +69,7 @@
     "@gnldev/tool-schema": "workspace:^",
     "ai": "^7.0.0",
     "libsql": "^0.5.0",
+    "mysql2": "^3.11.0",
     "pg": "^8.0.0",
     "zod": "^3.25.76 || ^4.1.8"
   },
@@ -73,6 +78,9 @@
       "optional": true
     },
     "libsql": {
+      "optional": true
+    },
+    "mysql2": {
       "optional": true
     },
     "pg": {
@@ -86,6 +94,7 @@
     "@gnldev/workflow": "workspace:*",
     "ai": "^7.0.0",
     "libsql": "^0.5.29",
+    "mysql2": "^3.11.0",
     "pg": "^8.0.0",
     "pg-mem": "^3.0.14",
     "zod": "^3.25.0"
@@ -94,7 +103,7 @@
     "@gnldev/options": "workspace:^",
     "superjson": "^2.2.6"
   },
-  "author": "Karaca Y\u0131lmaz (https://gnl.dev)",
+  "author": "Karaca Yılmaz (https://gnl.dev)",
   "homepage": "https://gnl.dev",
   "bugs": {
     "url": "https://github.com/gnlhq/gnldev/issues"

@@ -131,7 +131,7 @@ const again = await gnl.follow(s.runId, { after: at }); // continues right after
   reading; the run goes on. `abortSignal` cancels the RUN, durably, wherever it executes
   (`RunCanceledError` for its callers). A second call for a run in flight follows the same execution.
 - **A dead process's runs are taken over; a live one's never are.** Each store has a process liveness
-  — a Postgres session advisory lock, a Sqlite file lock (`SqliteStorage` and `PostgresStorage` bring
+  — a Postgres session advisory lock, a MySQL named lock, a Sqlite file lock (`SqliteStorage`, `PostgresStorage` and `MysqlStorage` bring
   their own; the executor, the queue worker, and `durableTool` / `durableModel` / `runDurable` called
   directly bind it on their first call — on Postgres one connection per store per process). A frozen
   process keeps its runs and its calls; a dead one releases them at once. In the process that holds it,
@@ -1154,6 +1154,10 @@ The exactly-once guarantee rests on one precondition: **storage never loses an a
 - **Postgres (recommended `runs` backend):** run it with `synchronous_commit = on` +
   `synchronous_standby_names` (quorum). Under **asynchronous replication**, a primary failover can lose
   acknowledged CAS writes → the same tool can run twice.
+- **MySQL / MariaDB:** `innodb_flush_log_at_trx_commit = 1` (the default), and for failover
+  semi-synchronous replication or a Group Replication / Galera cluster, so an acknowledged commit is on
+  a replica before it returns. `storage.runs.durabilityReport()` reads the first; it does not inspect
+  replication.
 - **SQLite:** meant for a single node; WAL mode gives sufficient filesystem durability.
 - **Outbound side effects:** the strongest end-to-end defense is using a provider-side **idempotency
   key** on tool calls (see the pattern in `test/idempotency-key.test.ts`) — regardless of the storage
@@ -1166,6 +1170,72 @@ The exactly-once guarantee rests on one precondition: **storage never loses an a
   its session alive, is never taken over.
 - **Shutdown time.** Give the process manager more time than the drain's 25 s (pm2
   `kill_timeout: 30000`; Kubernetes `terminationGracePeriodSeconds: 30`).
+
+## MySQL and MariaDB (`@gnldev/durable/mysql`)
+
+One store for both servers, MySQL 8.4+ and MariaDB 11+, with the same ports, guarantees and derived
+run table as `PostgresStorage`: the run journal, work, memory, vectors, cache and meta, `upgrade()`,
+erasure, organizations, and a process liveness of its own. `mysql2` is an optional peer dependency.
+
+```ts
+import { MysqlStorage } from '@gnldev/durable/mysql';      // npm i mysql2
+
+const storage = new MysqlStorage({ connectionString: 'mysql://app:secret@db:3306/agents' });
+const gnl = createGnl({ storage, agents });
+```
+
+- **The database must exist** and be named in the URL; the store creates its tables (and its indexes,
+  when absent) on first use. Several processes may boot it at once.
+- **Every key and compared value is binary** (VARBINARY / LONGBLOB): prefix ranges in byte order, a
+  compare-and-set byte for byte, `'k'` and `'k '` two keys. The server's collation does not matter. A
+  key longer than its column (3072 bytes for a journal key) is refused, never cut.
+- **Sessions run at READ COMMITTED** with strict SQL mode, set by the store on each connection it
+  opens — also on a pool you pass in (`new MysqlStorage({ pool })`, a `mysql2/promise` pool).
+- **One clock:** `now()` is the server's `NOW(6)`.
+- **Process liveness** (`storage.processLiveness()`, or `mysqlLiveness({ connectionString })`): a
+  named lock (`GET_LOCK`) held by one dedicated session. Lock names are server-wide, so each carries
+  a hash of its database. A crashed process's lock is gone with its session; a frozen one keeps it.
+  How long a host that is cut off (a partition, not a crash) keeps its runs is the server's TCP
+  keepalive — see below.
+- **No triggers.** Every write of this store places or unplaces a run's person/thread columns in its
+  own transaction. Rows written behind the store's back (plain SQL) are outside its contract.
+
+### Required: short TCP keepalives on the server
+
+The server frees a process's lock — and lets another process take its runs over — when it ends that
+process's session. For a crash that is at once (measured ~0.15 s). For a host that is **cut off** the
+server only finds out when TCP keepalive gives up, and MySQL has no per-session setting for it: it is
+the server host's operating system. Measured on MySQL 8.4 and MariaDB 11, a holder container
+disconnected from the network mid-call, 3 rounds each:
+
+| Server keepalive (time / interval / probes) | Lock freed after | Taken over after | Effects |
+|---|---|---|---|
+| 10 s / 5 s / 3 (the setting below) | ~25.6 s | ~26 s | 1 |
+| Linux default, 7200 s / 75 s / 9 | not within 120 s (about 2 h 11 min by the setting) | not within 120 s | 0 |
+
+Until then that host's runs are held: never run twice, but not taken over either. A process that is
+only frozen (SIGSTOP for 80 s, 3x the detection time, 3 rounds) is never taken over: its kernel still
+answers the probes. The client's own keepalive (`mysql2` `enableKeepAlive`, which the liveness session
+sets) does not shorten the server's detection — measured: the default server still held the lock.
+
+Set it on the server host:
+
+```sh
+sysctl -w net.ipv4.tcp_keepalive_time=10 net.ipv4.tcp_keepalive_intvl=5 net.ipv4.tcp_keepalive_probes=3
+# persist: /etc/sysctl.d/90-gnl-keepalive.conf with the same three lines (key = value)
+docker run --sysctl net.ipv4.tcp_keepalive_time=10 --sysctl net.ipv4.tcp_keepalive_intvl=5 --sysctl net.ipv4.tcp_keepalive_probes=3 mysql:8.4
+```
+
+On MariaDB the server's own variables do the same without touching the OS (measured: ~25.6 s):
+`tcp_keepalive_time=10`, `tcp_keepalive_interval=5`, `tcp_keepalive_probes=3` in its config.
+
+**What gnl can check:** the operating system's setting cannot be read by a client, so gnl does not
+pretend to. `storage.durabilityReport()` returns `partitionDetection: { seconds, source }` — `seconds`
+from MariaDB's variables when they are set, `null` otherwise, with a note stating the requirement — and
+the boot warns only when it can read a detection longer than 60 s (MariaDB variables). On a managed
+service (Amazon RDS / Aurora, Google Cloud SQL, Azure Database for MySQL) the host's keepalive is the
+provider's: not measured here — check it with the provider (or with `scripts/mysql-partition-probe.mjs`, which measures it) before
+relying on a takeover time.
 
 ## Testing your own journal (`@gnldev/durable/testing`)
 

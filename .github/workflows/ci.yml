@@ -81,6 +81,31 @@ jobs:
       # one without the check fails here instead of shipping silent.
       - run: pnpm check:option-names
 
+  # The lockfile pins one AI SDK; a user installs the newest one the ranges allow. ai@7.0.132 added two
+  # UI stream options, and the build broke on them only when a lockfile happened to be regenerated
+  # (measured: the release path's own lockfile pulled 7.0.143, a branch's CI failed in 36 s). This job
+  # builds and typechecks against the newest allowed `ai` and its provider packages, so a new SDK
+  # release shows here, as its own red job, before it shows in a release. ~2 min.
+  newest-ai:
+    name: build against the newest allowed ai
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: |
+          if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
+          else pnpm install --no-frozen-lockfile; fi
+      # --no-save: the lockfile moves for this job only, the manifests not at all.
+      - run: pnpm -r up ai @ai-sdk/provider @ai-sdk/provider-utils --no-save
+      - run: pnpm -r build
+      - run: pnpm -r typecheck
+
 
   integration:
     name: real backend (${{ matrix.pg.label }})
@@ -133,6 +158,29 @@ jobs:
         ports: ['5433:5432']
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+      # MysqlStorage (`@gnldev/durable/mysql`) on both servers it supports. A free host port each, read
+      # from `job.services` in the steps below. The health check pings over TCP: the image's init
+      # server listens on no port, so a socket ping would report ready before the real server is up.
+      # Short TCP keepalives, as a deployment must run them: the server frees a cut-off process's lock
+      # when keepalive gives up (~25 s with these; over 2 h with the Linux defaults — measured).
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: gnl
+          MYSQL_DATABASE: gnl
+        ports: ['3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pgnl" --health-interval 5s --health-timeout 5s --health-retries 30
+          --sysctl net.ipv4.tcp_keepalive_time=10 --sysctl net.ipv4.tcp_keepalive_intvl=5 --sysctl net.ipv4.tcp_keepalive_probes=3
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: gnl
+          MARIADB_DATABASE: gnl
+        ports: ['3306']
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 5s --health-timeout 5s --health-retries 30
+          --sysctl net.ipv4.tcp_keepalive_time=10 --sysctl net.ipv4.tcp_keepalive_intvl=5 --sysctl net.ipv4.tcp_keepalive_probes=3
     env:
       GNL_INTEGRATION: '1'
       # integration-real.test.ts reads GNL_PG_URL (audit finding: the old PG_URL name never
@@ -182,8 +230,17 @@ jobs:
       # --maxWorkers=3: the runner's own default on four cores, written down so a larger machine running
       # the same line (check-real-backends.mjs) does not exceed the server's 100 connections — the
       # multi-process tests open several pools per file.
+      #
+      # The MySQL / MariaDB URLs are set per step: `job.services` (the host ports) is not available to
+      # the job's own `env`.
       - run: node scripts/real-backend-tests.mjs --run alone
+        env:
+          GNL_MYSQL_URL: mysql://root:gnl@127.0.0.1:${{ job.services.mysql.ports['3306'] }}/gnl
+          GNL_MARIADB_URL: mysql://root:gnl@127.0.0.1:${{ job.services.mariadb.ports['3306'] }}/gnl
       - run: node scripts/real-backend-tests.mjs --run shared -- --maxWorkers=3 --minWorkers=1
+        env:
+          GNL_MYSQL_URL: mysql://root:gnl@127.0.0.1:${{ job.services.mysql.ports['3306'] }}/gnl
+          GNL_MARIADB_URL: mysql://root:gnl@127.0.0.1:${{ job.services.mariadb.ports['3306'] }}/gnl
 
   upgrade-from-0-9-0:
     name: upgrade from 0.9.0 (known failures, not yet gating)

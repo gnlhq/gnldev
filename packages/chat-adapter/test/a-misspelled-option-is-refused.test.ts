@@ -23,4 +23,19 @@ describe('@gnldev/chat-adapter: a misspelled option is refused', () => {
   it('passes a name close to none on to the AI SDK', () => {
     expect(() => toUIMessageStream(result, { experimental_newThing: true } as any)).not.toThrow();
   });
+
+  // ai@7.0.132 added `onStepEnd` and `onStepFinish` to the UI stream options. They reach the AI SDK
+  // from both wrappers, on any ai 7.x: an older SDK ignores them, a newer one calls them.
+  it.each(['toUIMessageStream', 'toUIMessageStreamResponse'] as const)('%s hands onStepEnd and onStepFinish to the AI SDK', (fn) => {
+    let seen: Record<string, unknown> | undefined;
+    const capturing: any = { toUIMessageStream: (o: Record<string, unknown>) => { seen = o; return new ReadableStream({ start(c) { c.close(); } }); } };
+    const onStepEnd = () => {};
+    const onStepFinish = () => {};
+    const opts = { onStepEnd, onStepFinish, runId: 'r1' } as any;
+    if (fn === 'toUIMessageStream') toUIMessageStream(capturing, opts);
+    else toUIMessageStreamResponse(capturing, opts);
+    expect(seen?.onStepEnd).toBe(onStepEnd);
+    expect(seen?.onStepFinish).toBe(onStepFinish);
+    expect(seen && 'runId' in seen).toBe(false);
+  });
 });

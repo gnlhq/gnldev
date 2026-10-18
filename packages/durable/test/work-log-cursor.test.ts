@@ -8,7 +8,8 @@
 //     their pending jobs never ran and their events were never delivered (in-memory and SQLite);
 //   · `ts` is the PRODUCER's `Date.now()`. A producer 5s behind had its row sorted before the cursor on
 //     SQLite/Postgres/Redis, so it was never seen at all.
-// The same contract runs against every bundled adapter (and a live Postgres under GNL_INTEGRATION=1).
+// The same contract runs against every bundled adapter (and a live Postgres under GNL_INTEGRATION=1, a
+// MySQL / MariaDB server under GNL_MYSQL_URL / GNL_MARIADB_URL).
 import { describe, it, expect, vi, afterEach, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,6 +19,8 @@ import { newDb } from 'pg-mem';
 import { InMemoryStorage } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
+import { MysqlStorage } from '../src/mysql-storage.js';
+import { MYSQL_SERVERS, freshDatabase, mysqlStores } from './real-backends.js';
 import type { WorkStore, Storage } from '../src/index.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
@@ -182,7 +185,26 @@ describe.skipIf(!RUN)('WorkStore.list cursor — live backends', () => {
   const pg = () => { const s = new PostgresStorage({ connectionString: PG_URL }); pools.push(s); return s; };
   contract('postgres (live)', pg);
 
-  for (const [name, make] of [['postgres (live)', pg]] as const) {
+  concurrentProducers('postgres (live)', pg);
+});
+
+for (const { name, url } of MYSQL_SERVERS) {
+  // One database for the contract and the race: every store `open` makes reaches the same one.
+  let db: Promise<string> | undefined;
+  const stores: MysqlStorage[] = [];
+  const open = async () => {
+    const s = new MysqlStorage({ connectionString: await (db ??= freshDatabase(url)) });
+    stores.push(s);
+    return s;
+  };
+  afterAll(async () => { for (const s of stores.splice(0)) await s.close(); });
+  contract(`${name} (real)`, open);
+  describe(`WorkStore.list cursor — ${name} (real, race)`, () => concurrentProducers(`${name} (real)`, open));
+}
+
+/** 8 producers on 4 stores (separate connections) and a reader persisting cursors, on one log. */
+function concurrentProducers(name: string, make: () => Promise<Storage> | Storage): void {
+  {
     it(`${name}: 8 concurrent producers on separate connections vs a reader persisting cursors — nothing is passed over`, async () => {
       const producers = await Promise.all(Array.from({ length: 4 }, () => make()));
       const reader = (await make()).work!;
@@ -213,7 +235,7 @@ describe.skipIf(!RUN)('WorkStore.list cursor — live backends', () => {
       expect(written.filter((id) => !seen.has(id))).toEqual([]);
     }, 60_000);
   }
-});
+}
 
 describe('UPGRADE — a SQLite database written by 0.9 (no `seq` column, rows ordered by the producer clock)', () => {
   // Rows written before sequences are numbered by the first read in the order they were INSERTED
@@ -293,13 +315,14 @@ describe('SIBLING — adoptIntoOrg moves a log into an organization that already
   // Every bundled store. The first cut covered SQLite and pg-mem only; measured then: the in-memory
   // store REPLACED the organization's log with the moved one (60 records gone, 5 behind the cursor),
   // and Redis did not move `wl:` logs at all — the organization's reader never saw the adopted records.
-  const all: Array<[string, () => Storage]> = [
+  const all: Array<[string, () => Storage | Promise<Storage>]> = [
     ['in-memory', () => new InMemoryStorage()],
     ['sqlite', () => new SqliteStorage(':memory:')],
     ['postgres (pg-mem)', () => { const { Pool } = newDb().adapters.createPg(); return new PostgresStorage({ pool: new Pool() }); }],
+    ...mysqlStores(' (real)'),
   ];
   it.each(all)('%s: the moved records land after the organization\'s persisted cursor, and its own records survive', async (_name, make) => {
-    const s = make();
+    const s = await make();
     await append(s.work!, 'evt:t', range('root-', 5));
     await append(s.work!, 'org:acme:evt:t', range('org-', 60));
     const { persisted } = await readFrom(s.work!, 'org:acme:evt:t', undefined);
@@ -311,7 +334,7 @@ describe('SIBLING — adoptIntoOrg moves a log into an organization that already
     expect((await readFrom(s.work!, 'org:acme:evt:t', persisted)).ids.at(-1)).toBe('after');
   });
   it.each(all)('%s: SIBLING — the organization\'s log was erased (its numbers are spent, no record left): the moved records still land after the cursor', async (_name, make) => {
-    const s = make();
+    const s = await make();
     await append(s.work!, 'org:acme:evt:t', range('old-', 60));
     const { persisted } = await readFrom(s.work!, 'org:acme:evt:t', undefined);
     await s.work!.deletePrefix!('org:acme:evt:t');
@@ -320,7 +343,7 @@ describe('SIBLING — adoptIntoOrg moves a log into an organization that already
     expect((await readFrom(s.work!, 'org:acme:evt:t', persisted)).ids).toEqual(range('root-', 5));
   });
   it.each(all)('%s: SIBLING — a log with no organization counterpart moves whole, in its order', async (_name, make) => {
-    const s = make();
+    const s = await make();
     await append(s.work!, 'qjob', range('j-', 70));
     await s.adoptIntoOrg!('acme', { allowUnregistered: true });
     expect((await readFrom(s.work!, 'org:acme:qjob', undefined, 9)).ids).toEqual(range('j-', 70));

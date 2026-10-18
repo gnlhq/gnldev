@@ -72,13 +72,16 @@ function maskSentinelChunks(runId?: string): TransformStream<UIMessageChunk, UIM
   });
 }
 
+// Held to the INSTALLED ai's types by the compiler (`optionNames`): a name the SDK adds fails this
+// build until it is listed here — which is how ai@7.0.132's `onStepEnd`/`onStepFinish` were found. At
+// runtime the list only decides what counts as a misspelling, so an older 7.x is unaffected by it.
 const UI_STREAM_NAMES = optionNames<UIMessageStreamOptions<UIMessage> & { runId?: string }>()([
-  'originalMessages', 'generateMessageId', 'onEnd', 'onFinish', 'messageMetadata', 'sendReasoning', 'sendSources', 'sendFinish',
-  'sendStart', 'onError', 'runId',
+  'originalMessages', 'generateMessageId', 'onStepEnd', 'onStepFinish', 'onEnd', 'onFinish', 'messageMetadata', 'sendReasoning',
+  'sendSources', 'sendFinish', 'sendStart', 'onError', 'runId',
 ]);
 const UI_RESPONSE_NAMES = optionNames<ToUIMessageStreamResponseOptions<UIMessage>>()([
-  'originalMessages', 'generateMessageId', 'onEnd', 'onFinish', 'messageMetadata', 'sendReasoning', 'sendSources', 'sendFinish',
-  'sendStart', 'onError', 'runId', 'consumeSseStream', 'headers', 'status', 'statusText',
+  'originalMessages', 'generateMessageId', 'onStepEnd', 'onStepFinish', 'onEnd', 'onFinish', 'messageMetadata', 'sendReasoning',
+  'sendSources', 'sendFinish', 'sendStart', 'onError', 'runId', 'consumeSseStream', 'headers', 'status', 'statusText',
 ]);
 
 /**

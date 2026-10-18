@@ -17,6 +17,7 @@ import { newDb, DataType } from 'pg-mem';
 import { InMemoryStorage, withOrgStorage, eraseSubject, type Storage, type MemoryStore } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
+import { mysqlStores } from './real-backends.js';
 
 const engines: [string, () => Promise<Storage>][] = [
   ['InMemoryStorage', async () => new InMemoryStorage()],
@@ -37,6 +38,8 @@ if (process.env.GNL_PG_URL) {
     return s as unknown as Storage;
   }]);
 }
+
+for (const [name, make] of mysqlStores(' (real)')) engines.push([`MysqlStorage ${name}`, async () => { const s = await make(); await s.init(); return s as unknown as Storage; }]);
 
 const E = [1, 0, 0];
 async function seed(mem: MemoryStore, id: string, resourceId: string, text: string) {

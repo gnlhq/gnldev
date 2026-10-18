@@ -6,6 +6,7 @@ import { describe, it, expect, afterAll } from 'vitest';
 import { InMemoryStorage, withRootScope, withSubjectJournal, type Storage } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
+import { mysqlStores } from './real-backends.js';
 import { JOURNAL_PORT } from '../src/journal-view.js';
 
 const ends: Array<() => Promise<unknown>> = [];
@@ -23,6 +24,7 @@ if (PG_URL) {
     return s;
   }]);
 }
+for (const [name, make] of mysqlStores(' (real)')) STORES.push([name.toLowerCase(), async () => { const s = await make(); ends.push(() => s.close()); return s; }]);
 const unique = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
 describe.each(STORES)('a view hides a row from every read — %s', (_name, make) => {

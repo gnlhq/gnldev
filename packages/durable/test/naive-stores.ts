@@ -7,8 +7,9 @@ import { InMemoryJournal, JOURNAL_GUARANTEES } from '../src/journal.js';
 const tick = () => new Promise((r) => setTimeout(r, 0));
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
-function wrap(over: (t: any) => Record<string, unknown>, hide: readonly string[] = []): any {
-  const t: any = new InMemoryJournal();
+/** `base` (a correct journal, InMemoryJournal by default) with the methods `over` gives replaced and `hide`'s gone. */
+export function wrap(over: (t: any) => Record<string, unknown>, hide: readonly string[] = [], base: any = new InMemoryJournal()): any {
+  const t: any = base;
   const o = over(t);
   return new Proxy(t, {
     get(target, p) {

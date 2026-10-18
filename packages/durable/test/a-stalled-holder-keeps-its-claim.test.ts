@@ -10,7 +10,8 @@
 // in a queue handler or a workflow step had no liveness bound: only `createGnl`'s executor and
 // `createWorker` bound one.
 //
-// Here no liveness is bound by the test. Postgres runs when GNL_PG_URL is set.
+// Here no liveness is bound by the test. Postgres runs when GNL_PG_URL is set; MySQL / MariaDB when
+// GNL_MYSQL_URL / GNL_MARIADB_URL are.
 import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -23,6 +24,7 @@ import { PostgresStorage } from '../src/postgres-storage.js';
 import { unbindLiveness, installProcessLiveness } from '../src/process-liveness.js';
 import type { DurableCtx } from '../src/journal.js';
 import { createMockModel, finalTextResult } from './mock.js';
+import { mysqlStores } from './real-backends.js';
 
 beforeAll(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
 const ends: Array<() => Promise<unknown> | unknown> = [];
@@ -40,6 +42,7 @@ const STORES: Array<[string, () => Promise<Storage>]> = [
   }],
 ];
 if (PG_URL) STORES.push(['postgres (real)', async () => { const s = new PostgresStorage({ connectionString: PG_URL }); ends.push(() => s.close()); return s; }]);
+for (const [name, make] of mysqlStores(' (real)')) STORES.push([name.toLowerCase(), async () => { const s = await make(); ends.push(() => s.close()); return s; }]);
 
 const TTL = 150;
 const unique = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;

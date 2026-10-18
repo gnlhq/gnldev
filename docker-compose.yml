@@ -5,6 +5,7 @@
 # `pgvector` is a second Postgres with the `vector` extension, for the stores that need it
 # (GNL_PGVECTOR_URL: rag's PostgresVectorStore, the vector write contract). A separate service rather
 # than swapping the image of `postgres`, so the durable suite keeps running on the server it always has.
+# `mysql` and `mariadb` are the servers MysqlStorage supports.
 services:
   postgres:
     image: postgres:15-alpine
@@ -20,3 +21,27 @@ services:
       POSTGRES_DB: gnl
     ports:
       - '55433:5432'
+  # MysqlStorage (`@gnldev/durable/mysql`) on both servers it supports (GNL_MYSQL_URL, GNL_MARIADB_URL),
+  # with the short TCP keepalives a deployment needs (packages/durable/README.md, MySQL and MariaDB).
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: gnl
+      MYSQL_DATABASE: gnl
+    ports:
+      - '55306:3306'
+    sysctls:
+      net.ipv4.tcp_keepalive_time: 10
+      net.ipv4.tcp_keepalive_intvl: 5
+      net.ipv4.tcp_keepalive_probes: 3
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: gnl
+      MARIADB_DATABASE: gnl
+    ports:
+      - '55307:3306'
+    sysctls:
+      net.ipv4.tcp_keepalive_time: 10
+      net.ipv4.tcp_keepalive_intvl: 5
+      net.ipv4.tcp_keepalive_probes: 3
