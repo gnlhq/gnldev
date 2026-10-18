@@ -227,6 +227,34 @@ export class VectorOwnerConflictError extends Error {
 }
 
 /**
+ * A vector query or delete named a metadata filter value the stores cannot compare alike: an array, an
+ * object, a function. Equality on a structured value is not one thing across stores — measured, the
+ * same filter `{ tags: ['a'] }` matched by containment on pgvector and matched nothing on the other six
+ * stores — so it is refused on every store, at the query and at the delete, before anything is read or
+ * removed. A `TypeError`: the caller's filter is the mistake. `detail.key` names the filter key.
+ */
+export class VectorFilterError extends TypeError {
+  readonly code = 'vector_filter_invalid';
+  constructor(message: string, public readonly detail: { key: string }) {
+    super(message);
+    this.name = 'VectorFilterError';
+  }
+}
+
+/**
+ * A vector of another length than the store's: refused where it is written (nothing of the batch is),
+ * and as a query. Measured before: six of seven stores accepted it, and every later query of the shelf
+ * failed. `detail.expected` is the store's length, `detail.got` the one handed in.
+ */
+export class VectorDimensionError extends TypeError {
+  readonly code = 'vector_dimension_mismatch';
+  constructor(message: string, public readonly detail: { expected: number; got: number }) {
+    super(message);
+    this.name = 'VectorDimensionError';
+  }
+}
+
+/**
  * `adoptIntoOrg` would have put a root entry on an id the organization already holds — a thread's owner
  * record, a run, a thread, a working memory, a meta or work-store key. Adoption never replaces what the
  * organization holds (an owner record least of all), so it refuses BEFORE anything moves, the same on

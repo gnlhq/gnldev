@@ -9,7 +9,7 @@
 import type { Journal, JournalEntry, RunSummary, JournalReader, RunStatus, JournalBatch } from './journal.js';
 import { assertJournalGuarantees } from './journal.js';
 import type { RunOrder } from './run-cursor.js';
-import { VectorOwnerConflictError, AdoptionConflictError } from './errors.js';
+import { VectorOwnerConflictError, AdoptionConflictError, VectorFilterError, VectorDimensionError } from './errors.js';
 import { assertOwnerId, isWellFormed, OwnerIdError } from './owned-name.js';
 import { ORG_KEY_PREFIX, isOrganizationKey, parseOrganizationKey, orgSpaceSql, prefixSql } from './organization.js';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -601,9 +601,11 @@ export interface VectorQueryOptions extends VectorPartitionOption, VectorAllPart
    */
   visibleTo?: string;
   /**
-   * Metadata narrowing, before ranking: every key must equal (`===`) the document's metadata value
-   * (`vectorMetadataMatches`). `createRagTool` passes its `filter` here; this storage ignored it, so a
-   * RAG tool with a filter answered from outside it on every `@gnldev/durable` store.
+   * Metadata narrowing, before ranking (`vectorMetadataMatches`). A value is a string, number, boolean
+   * or `null`, and must equal (`===`) the document's value; `undefined` means the document has no such
+   * key. An array, object or function value is refused (`VectorFilterError`, `assertVectorFilter`) —
+   * the same on every store, at a query and at a delete. `createRagTool` passes its `filter` here; this
+   * storage ignored it, so a RAG tool with a filter answered from outside it on every store.
    */
   filter?: Record<string, unknown>;
 }
@@ -670,11 +672,64 @@ export function vectorFilterDocument(filter: Record<string, unknown> | undefined
   return filter && Object.prototype.hasOwnProperty.call(filter, VECTOR_DOCUMENT_KEY) ? vectorDocumentOf(filter) : undefined;
 }
 
+/**
+ * THE VECTOR FILTER RULE. A filter value is a scalar — a string, a number, a boolean or `null` — compared
+ * by `===`, or `undefined`, which means "the record has no such key". An array, an object or a function
+ * is refused (`VectorFilterError`): equality on a structured value is not one thing across stores
+ * (measured: `{ tags: ['a'] }` matched by containment on pgvector and matched nothing on the other six),
+ * so no store may answer it its own way. Asked by `vectorQueryScope` and `vectorDeletePlan`, which every
+ * store runs on entry — the refusal comes before anything is read or removed, from one place.
+ */
+export function assertVectorFilter(filter: Record<string, unknown> | undefined): void {
+  if (!filter) return;
+  for (const [key, v] of Object.entries(filter)) {
+    if (v === null || v === undefined || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') continue;
+    throw new VectorFilterError(
+      `@gnldev/durable: vector filter key '${key}' holds ${Array.isArray(v) ? 'an array' : typeof v === 'object' ? 'an object' : `a ${typeof v}`}; a filter value is a string, ` +
+        'number, boolean, null (each compared by ===) or undefined (the key is absent). Equality on a structured value is not ' +
+        'defined across stores, so it is refused rather than answered differently by each. Filter on a scalar key instead ' +
+        '(store one scalar per tag, e.g. `tag_a: true`).',
+      { key },
+    );
+  }
+}
+
 /** The metadata narrowing of `filter` on a query or a delete: every key equals (`===`), as in @gnldev/rag. */
 export function vectorMetadataMatches(metadata: Record<string, unknown> | undefined, filter: Record<string, unknown> | undefined): boolean {
   if (!filter) return true;
   const m = metadata ?? {};
   return Object.entries(filter).every(([k, v]) => m[k] === v);
+}
+
+/**
+ * THE VECTOR RANKING RULE: most similar first, and equal scores by id (code-unit order), so a query
+ * answers in one order on every store and a replay reads the same documents in the same places. topK is
+ * cut after that order (`topK <= 0` is nothing). Every store that ranks in code ranks through it; a store
+ * that ranks in SQL orders by its distance, then by `id` — the kit holds them to the same answer.
+ */
+export function compareVectorMatches(a: { id: string; score: number }, b: { id: string; score: number }): number {
+  return b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+/** `matches` in the ranking order (`compareVectorMatches`), cut to `topK`. Sorts in place. */
+export function rankVectorMatches<T extends { id: string; score: number }>(matches: T[], topK: number): T[] {
+  return matches.sort(compareVectorMatches).slice(0, Math.max(0, topK));
+}
+
+/**
+ * THE VECTOR LENGTH RULE. A store holds vectors of one length: a vector of another is refused where it
+ * is written, and so is a query of another — `VectorDimensionError`, before anything is written or read.
+ * Measured before: six of seven stores stored it, and every later query of the shelf then failed. The
+ * batch's own consistency is checked by `vectorWriteBatch`; `stored` is the length of what the store
+ * already holds (`undefined` when it holds nothing, so the first write sets it).
+ */
+export function assertVectorDimension(stored: number | undefined, got: number, what: 'write' | 'query'): void {
+  if (stored === undefined || stored === got) return;
+  throw new VectorDimensionError(
+    `@gnldev/durable: a ${got}-dimension vector ${what === 'write' ? 'cannot be written to' : 'cannot query'} a vector store that holds ${stored}-dimension vectors. ` +
+      (what === 'write' ? 'Nothing of the batch was written. ' : '') +
+      'Embed with the model the store was filled with, or use another store (or table) for the other model.',
+    { expected: stored, got },
+  );
 }
 
 /*
@@ -707,7 +762,18 @@ type VectorLabels = { id: string; namespace?: unknown; owner?: unknown; shared?:
  */
 export function vectorWriteBatch<T extends VectorLabels>(items: readonly T[]): T[] {
   const byId = new Map<string, T>();
+  let length: number | undefined;
   for (const it of items) {
+    // One length per batch (the store's own length is its to check, `assertVectorDimension`), and a
+    // vector is a non-empty list of finite numbers: a NaN in it scores NaN against every query.
+    const e = (it as { embedding?: unknown }).embedding;
+    if (e !== undefined) {
+      if (!Array.isArray(e) || e.length === 0 || !e.every((x) => typeof x === 'number' && Number.isFinite(x))) {
+        throw new TypeError(`@gnldev/durable: document '${String(it.id)}': 'embedding' must be a non-empty array of finite numbers`);
+      }
+      assertVectorDimension(length, e.length, 'write');
+      length = e.length;
+    }
     // A NUL is refused too: Postgres text cannot hold one, so the same id stored in memory or SQLite
     // failed there — half-way through a batch, after earlier documents' old chunks were deleted.
     if (typeof it.id !== 'string' || it.id === '' || !isWellFormed(it.id) || it.id.includes('\u0000')) {
@@ -779,8 +845,9 @@ export const SHARED_ONLY = '';
  * documents; so it reads here as what it means in every store: the general shelf, or nothing.
  * @internal — storage adapter plumbing.
  */
-export function vectorQueryScope(opts: ({ namespace?: string; visibleTo?: string } & VectorPartitionOption & VectorAllPartitionsOption) | undefined): { namespace?: string; visibleTo?: string; none: boolean; outsideOrganizations: boolean } {
+export function vectorQueryScope(opts: ({ namespace?: string; visibleTo?: string; filter?: Record<string, unknown> } & VectorPartitionOption & VectorAllPartitionsOption) | undefined): { namespace?: string; visibleTo?: string; none: boolean; outsideOrganizations: boolean } {
   if (opts) assertRootVectorNames(opts);
+  assertVectorFilter(opts?.filter); // the filter rule, on entry, for every store
   // No namespace is the ROOT's partition (ADR-0001), unless the caller holds the code-only grant.
   const out: { namespace?: string; visibleTo?: string; none: boolean; outsideOrganizations: boolean } = {
     none: false, outsideOrganizations: opts?.namespace === undefined && opts?.[VECTOR_ALL_PARTITIONS] !== true,
@@ -810,6 +877,7 @@ export function visibleToSubject(doc: { owner?: string; shared?: boolean }, visi
  */
 export function vectorDeletePlan(where: VectorDeleteWhere): VectorDeleteWhere | null {
   assertRootVectorNames(where);
+  assertVectorFilter(where.filter); // the filter rule, before anything is removed, for every store
   const ids = where.ids?.filter((id) => typeof id === 'string' && isWellFormed(id));
   if (ids !== undefined && ids.length === 0) return null;
   if (where.owner !== undefined && !isWellFormed(where.owner)) return null;

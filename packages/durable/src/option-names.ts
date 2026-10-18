@@ -248,6 +248,7 @@ export const COUNT_RUNS_NAMES = optionNames<NonNullable<Parameters<import('./jou
 export const LIST_RUNS_CHANGED_NAMES = optionNames<NonNullable<Parameters<import('./journal.js').InMemoryJournal['listRunsChangedSince']>[1]>>()(['limit', 'since', 'runIdPrefix']);
 export const JOURNAL_CONFORMANCE_NAMES = optionNames<import('./testing.js').JournalConformanceOptions>()(['describe', 'it', 'timeout', 'exactClaim', 'pageWalk', 'clock']);
 export const STORAGE_CONFORMANCE_NAMES = optionNames<import('./testing.js').StorageConformanceOptions>()(['describe', 'it', 'timeout', 'exactClaim', 'pageWalk', 'clock', 'ports', 'workCas', 'serialisesAppends', 'reopen']);
+export const VECTOR_STORE_CONFORMANCE_NAMES = optionNames<import('./vector-conformance.js').VectorStoreConformanceOptions>()(['describe', 'it', 'timeout', 'exactClaim']);
 
 export const DRAIN_NAMES = optionNames<import('./drain.js').DrainOptions>()(['deadlineMs']);
 export const DRAIN_ON_SIGNAL_NAMES = optionNames<import('./drain.js').DrainOnSignalOptions>()(['deadlineMs', 'signals', 'onDrained']);

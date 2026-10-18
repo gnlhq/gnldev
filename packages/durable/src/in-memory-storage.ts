@@ -17,7 +17,7 @@ import { assertNoRunsInFlight } from './model.js';
 import { ENGINE_META_KEYS, assertOrgRegistered, isPlatformKey, orgPrefix, isOrganizationKey } from './organization.js';
 import { isScopeFact, scopeFactKeys, scopeFactsDroppedByAdoption, staysAtRoot, adoptionConflict } from './adoption.js';
 import type { JournalEntry, RunSummary } from './journal.js';
-import { decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision, vectorInOrganization, vectorDocumentOf, vectorFilterDocument } from './storage.js';
+import { decodeLogCursor, encodeLogCursor, compareLogPosition, workKeyAdoption, workKeyAdoptCollision, matchFilter, visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, orgVectorId, vectorAdoptCollision, vectorInOrganization, vectorDocumentOf, vectorFilterDocument, rankVectorMatches, assertVectorDimension } from './storage.js';
 import type {
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -345,9 +345,15 @@ class InMemoryVectorStore implements VectorStore {
     if (doc !== undefined) return [...(this.byDoc.get(doc) ?? [])].map((id) => this.byId.get(id)!);
     return this.byId.values();
   }
+  /** The length of the vectors held (`assertVectorDimension`); `undefined` when there are none. */
+  private dimension(): number | undefined {
+    for (const it of this.byId.values()) return it.embedding.length;
+    return undefined;
+  }
   async upsert(items: VectorItem[]) {
     const batch = vectorWriteBatch(items);
     // Checked for the whole batch before anything is written, so a refused batch leaves no half.
+    if (batch[0]) assertVectorDimension(this.dimension(), batch[0].embedding.length, 'write');
     for (const it of batch) assertSameVectorOwner(this.byId.get(it.id), it);
     for (const it of batch) this.put(vectorItemCopy(it));
   }
@@ -365,12 +371,11 @@ class InMemoryVectorStore implements VectorStore {
     // ask for 4, get however many of the global top 4 were yours. No error, no leak, just recall that
     // quietly degrades as other organizations upload — invisible unless a test has two of them in it.
     const scope = vectorQueryScope(opts);
+    assertVectorDimension(this.dimension(), embedding.length, 'query');
     if (scope.none) return [];
-    return [...this.candidates(undefined, vectorFilterDocument(opts?.filter))]
+    return rankVectorMatches([...this.candidates(undefined, vectorFilterDocument(opts?.filter))]
       .filter((it) => (scope.namespace === undefined || it.namespace === scope.namespace) && !(scope.outsideOrganizations && vectorInOrganization(it.namespace)) && visibleToSubject(it, scope.visibleTo) && vectorMetadataMatches(it.metadata, opts?.filter))
-      .map((it) => ({ id: it.id, text: it.text, metadata: it.metadata, ...(it.namespace !== undefined ? { namespace: it.namespace } : {}), ...(it.owner !== undefined ? { owner: it.owner } : {}), ...(it.shared ? { shared: true } : {}), score: cosineSimilarity(embedding, it.embedding) }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
+      .map((it) => ({ id: it.id, text: it.text, metadata: it.metadata, ...(it.namespace !== undefined ? { namespace: it.namespace } : {}), ...(it.owner !== undefined ? { owner: it.owner } : {}), ...(it.shared ? { shared: true } : {}), score: cosineSimilarity(embedding, it.embedding) })), topK);
   }
 }
 
