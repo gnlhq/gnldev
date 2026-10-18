@@ -225,6 +225,7 @@ export const LOG_SWEEP_TARGET_NAMES = optionNames<import('./retention.js').LogSw
 export const PROCESSOR_RETRY_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./processor.js').ProcessorRetry>[2]>>()(['maxRetries']);
 export const POSTGRES_STORAGE_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./postgres-storage.js').PostgresStorage>[0]>>()(['connectionString', 'pool']);
 export const MYSQL_STORAGE_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./mysql-storage.js').MysqlStorage>[0]>>()(['connectionString', 'pool']);
+export const MONGO_STORAGE_NAMES = optionNames<ConstructorParameters<typeof import('./mongo-storage.js').MongoStorage>[0]>()(['connectionString', 'database']);
 /** A sub-agent runs as its parent's caller; its config named an owner once, and that name is refused. */
 export const REMOVED_AGENT_TOOL_NAMES = {
   resourceId: "was removed: a sub-agent runs as its parent's caller, so its config cannot name a user. Pass the user to the parent's run.",
@@ -255,6 +256,7 @@ export const DRAIN_NAMES = optionNames<import('./drain.js').DrainOptions>()(['de
 export const DRAIN_ON_SIGNAL_NAMES = optionNames<import('./drain.js').DrainOnSignalOptions>()(['deadlineMs', 'signals', 'onDrained']);
 export const POSTGRES_LIVENESS_NAMES = optionNames<import('./process-liveness.js').PostgresLivenessOptions>()(['connectionString', 'client', 'id', 'heartbeatMs']);
 export const MYSQL_LIVENESS_NAMES = optionNames<import('./mysql-storage.js').MysqlLivenessOptions>()(['connectionString', 'connection', 'id', 'heartbeatMs']);
+export const MONGO_LIVENESS_NAMES = optionNames<import('./mongo-storage.js').MongoLivenessOptions>()(['connectionString', 'database', 'id', 'heartbeatMs']);
 export const DETACHED_RUNS_NAMES = optionNames<import('./detached.js').DetachedRunsOptions>()([
   'journal', 'journalFor', 'resume', 'liveness', 'signal', 'pollMs', 'sweepMs', 'coalesceMs', 'outcomeAskMs', 'onComplete', 'handles',
 ]);

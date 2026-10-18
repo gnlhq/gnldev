@@ -11,7 +11,7 @@
 //    prefix: its neighbour that a wildcard would match survives.
 //
 // Stores: durable InMemory, SQLite, Postgres (pg-mem); with GNL_MYSQL_URL / GNL_MARIADB_URL a MySQL /
-// MariaDB server (real-backends.ts). With GNL_PG_URL also a real Postgres (the
+// MariaDB server, with GNL_MONGO_URL a MongoDB replica set (real-backends.ts). With GNL_PG_URL also a real Postgres (the
 // real-backend gate, `pnpm check:real`, sets it).
 import { describe, it, expect, afterAll, beforeAll, vi } from 'vitest';
 import { newDb } from 'pg-mem';
@@ -29,7 +29,7 @@ import { scheduleWorkflow, pollScheduler, listTriggers, triggerEraser } from '..
 import { workflow, step } from '../../workflow/src/index.js';
 import { AgentMemory } from '../../memory/src/index.js';
 import { createMockModel, finalTextResult } from './mock.js';
-import { mysqlStores } from './real-backends.js';
+import { mysqlStores, mongoStores } from './real-backends.js';
 
 const PG_URL = process.env.GNL_PG_URL;
 
@@ -92,6 +92,21 @@ for (const [name, make] of mysqlStores(' (real)')) {
       rawWork: async () => [
         ...(await rows('SELECT ns, id, payload FROM gnl_work_log')).map((r) => `${r.ns}|${r.id}|${r.payload}`),
         ...(await rows('SELECT `key`, value FROM gnl_work_kv')).map((r) => `${r.key}|${r.value}`),
+      ],
+    };
+  }]);
+}
+
+for (const [name, make] of mongoStores(' (real)')) {
+  BACKENDS.push([name, async () => {
+    const storage = await make();
+    ends.push(() => storage.close());
+    const docs = async (coll: string) => (await storage.db.collection(coll).find({}).toArray()) as Array<Record<string, string>>;
+    return {
+      storage,
+      rawWork: async () => [
+        ...(await docs('gnl_work_log')).map((r) => `${r.ns}|${r.id}|${r.payload}`),
+        ...(await docs('gnl_work_kv')).map((r) => `${r._id}|${r.v}`),
       ],
     };
   }]);

@@ -116,6 +116,25 @@ measures every backend before it is called one.
   cut-off host's runs are taken over after ~26 s with them, and held for over 2 h without (measured).
   `durabilityReport().partitionDetection` reads what a client can (MariaDB's variables) and says when
   it cannot; the boot warns only on what it reads.
+- **`MongoStorage` and `mongoLiveness`** (`@gnldev/durable/mongo`): a MongoDB replica set (one node is
+  enough), `mongodb` as an optional peer dependency. Every port `PostgresStorage` has — run journal with
+  its derived run documents written in the record's transaction, work, memory, vectors (scanned: for
+  thousands of documents, not millions), cache, meta — plus `upgrade()`, erasure, organizations and a
+  process liveness: a connection named for the process, looked up by the others in `$currentOp`. It
+  passes `journalConformance`, `storageConformance` and `vectorStoreConformance` on MongoDB 8.0 and 8.3,
+  in CI. **Refuses a standalone server** (and a sharded cluster's router) at open, before writing
+  anything. **Refuses a liveness that cannot see the other processes' connections**: it looks for its own
+  from a second connection, and registers its user, refusing to run beside another user when either sees
+  only its own (grant `clusterMonitor`; on MongoDB 8.3 a user without it sees no other connection at
+  all). **Requires short TCP keepalives on the server host** (`net.ipv4.tcp_keepalive_time=10`,
+  `_intvl=5`, `_probes=3`): a cut-off host's runs are taken over after 13–14 s with them, ~5.5 min with
+  the Linux defaults (measured); `durabilityReport()` says it cannot read the setting.
+- **`QdrantVectorStore` (`@gnldev/rag`): a vector store on a Qdrant server, over its REST API, with no
+  dependency.** 20 of 20 vector-kit scenarios on a real server; owner, namespace and sharing are part
+  of the point id and checked again after the write, so two processes writing one new id under two
+  owners never left the loser's document (20 of 20 rounds). `apiKey` is sent as a header and never
+  appears in an error. Measured against `PostgresVectorStore` (1,000 128-d inserts, 100 queries at
+  topK 10, median of 5): 655 ms vs 1,667 ms to insert, 85 ms vs 89 ms to query.
 
 ## [0.11.1] — 2026-10-17
 

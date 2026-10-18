@@ -9,7 +9,7 @@ import pg from 'pg';
 import { InMemoryStorage, purgeRun, toJournal, withOrg } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { mysqlStores } from './real-backends.js';
+import { mysqlStores, mongoStores } from './real-backends.js';
 import type { RunSummary } from '../src/journal.js';
 
 // The real-backend CI job sets GNL_PG_URL; a database is created and dropped per store under it.
@@ -35,7 +35,7 @@ const stores: [string, () => Promise<any>][] = [
     created.push(db);
     return new PostgresStorage({ connectionString: PG_ADMIN.replace(/\/[^/]*$/, `/${db}`) });
   }] as [string, () => Promise<any>]] : []),
-  ...mysqlStores(' (real)').map(([name, make]): [string, () => Promise<any>] => [`MysqlStorage ${name}`, make]),
+  ...[...mysqlStores(' (real)'), ...mongoStores(' (real)')].map(([name, make]): [string, () => Promise<any>] => [`MysqlStorage ${name}`, make]),
 ];
 
 /** 23 runs covering every status, every filter field, a child run, an input-only and an outcome-only run. */

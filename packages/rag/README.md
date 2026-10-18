@@ -133,7 +133,29 @@ Read the organization with `serverIdentityOf(ctx)`: the server writes it from th
 request body cannot set it. A call to `gnl.run` from your own code has no sealed organization, so it
 gets no tool here.
 
-Every store (`InMemoryVectorStore`, `GraphRag`, `PostgresVectorStore` and the `@gnldev/durable`
+### Qdrant
+
+`QdrantVectorStore` keeps the documents on a Qdrant server, through its REST API (no extra package):
+
+```ts
+import { QdrantVectorStore } from '@gnldev/rag';
+
+const vectors = new QdrantVectorStore({
+  url: 'https://qdrant.example.internal:6333',
+  apiKey: process.env.QDRANT_API_KEY, // sent as the `api-key` header, never in an error message
+  collection: 'gnl_vectors',          // default; letters, digits, `_` and `-`
+});
+```
+
+The collection is created on the first write, with the length of that write's vectors (or
+`dimension`, when given); a later vector of another length is refused with `VectorDimensionError`.
+Query and delete before the first write return nothing. Owner, namespace and sharing are part of each
+point's id, so the same document id under two owners is two points, and a write that would take over
+another's id fails with `VectorOwnerConflictError`, also when two processes write it at once. Equal
+scores at the top-K cut are read in full and ordered by id, like every other store; a zero query
+vector matches every visible document with score 0.
+
+Every store (`InMemoryVectorStore`, `GraphRag`, `PostgresVectorStore`, `QdrantVectorStore` and the `@gnldev/durable`
 storages) applies the same write rule, before anything is written:
 
 - `owner` must be an id an end user can carry: not empty, at most 200 characters, no control

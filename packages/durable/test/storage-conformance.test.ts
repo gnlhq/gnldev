@@ -1,7 +1,8 @@
 // The storage conformance kit (`@gnldev/durable/testing` storageConformance) on every store this
 // repository ships: the run journal's scenarios through `toJournal`, then each port the store offers.
 // With GNL_PG_URL also a real Postgres, a fresh schema per opened store, dropped at the end; with
-// GNL_MYSQL_URL / GNL_MARIADB_URL a MySQL / MariaDB server, a fresh database per store (real-backends.ts).
+// GNL_MYSQL_URL / GNL_MARIADB_URL a MySQL / MariaDB server, a fresh database per store (real-backends.ts);
+// with GNL_MONGO_URL a MongoDB replica set, the same way.
 import { describe, it, afterAll } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,7 +15,8 @@ import { SqliteStorage } from '../src/sqlite-storage.js';
 import { LibsqlStorage } from '../src/libsql-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { MysqlStorage } from '../src/mysql-storage.js';
-import { MYSQL_SERVERS, freshDatabase, mysqlStores } from './real-backends.js';
+import { MongoStorage } from '../src/mongo-storage.js';
+import { MYSQL_SERVERS, MONGO_URL, freshDatabase, freshMongoDatabase, mysqlStores } from './real-backends.js';
 
 const PG_URL = process.env.GNL_PG_URL;
 const ends: Array<() => Promise<void> | void> = [];
@@ -80,4 +82,14 @@ for (const { name, url } of MYSQL_SERVERS) {
     myUrl.set(s, u);
     return s;
   }, { describe, it, clock: 'shared', timeout: 120_000, reopen: (s) => new MysqlStorage({ connectionString: myUrl.get(s)! }) });
+}
+
+if (MONGO_URL) {
+  const moUrl = new WeakMap<object, string>();
+  storageConformance('MongoDB (real)', () => {
+    const u = freshMongoDatabase();
+    const s = new MongoStorage({ connectionString: u });
+    moUrl.set(s, u);
+    return s;
+  }, { describe, it, clock: 'shared', timeout: 120_000, reopen: (s) => new MongoStorage({ connectionString: moUrl.get(s)! }) });
 }

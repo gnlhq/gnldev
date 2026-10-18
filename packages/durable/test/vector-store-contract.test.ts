@@ -17,7 +17,8 @@ import { InMemoryStorage, withOrgStorage, VECTOR_PARTITION, VECTOR_ALL_PARTITION
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import type { MysqlStorage } from '../src/mysql-storage.js';
-import { mysqlStores } from './real-backends.js';
+import type { MongoStorage } from '../src/mongo-storage.js';
+import { mysqlStores, mongoStores } from './real-backends.js';
 import { InMemoryVectorStore, GraphRag, PostgresVectorStore } from '../../rag/src/index.js';
 
 const E = [1, 0, 0];
@@ -41,7 +42,7 @@ async function realPool(url: string, pgvector = false): Promise<pg.Pool> {
   return pool;
 }
 
-type Durable = InMemoryStorage | SqliteStorage | PostgresStorage | MysqlStorage;
+type Durable = InMemoryStorage | SqliteStorage | PostgresStorage | MysqlStorage | MongoStorage;
 type Store = { name: string; vectors: () => Promise<VectorStore>; storage?: () => Promise<Durable> };
 
 const durable = (name: string, mk: () => Promise<Durable>): Store => ({ name, storage: mk, vectors: async () => (await mk()).vectors! });
@@ -52,7 +53,7 @@ const STORES: Store[] = [
   { name: 'rag InMemoryVectorStore', vectors: async () => new InMemoryVectorStore() as VectorStore },
   { name: 'rag GraphRag', vectors: async () => new GraphRag({ threshold: 0.6 }) as VectorStore },
   ...(PG_URL ? [durable('durable Postgres (real)', async () => new PostgresStorage({ pool: await realPool(PG_URL) }))] : []),
-  ...mysqlStores(' (real)').map(([name, make]) => durable(`durable ${name}`, async () => { const s = await make(); cleanups.push(() => s.close()); return s; })),
+  ...[...mysqlStores(' (real)'), ...mongoStores(' (real)')].map(([name, make]) => durable(`durable ${name}`, async () => { const s = await make(); cleanups.push(() => s.close()); return s; })),
   ...(PGVECTOR_URL ? [{ name: 'rag PostgresVectorStore (real)', vectors: async () => new PostgresVectorStore({ pool: await realPool(PGVECTOR_URL, true), index: 'none' }) as VectorStore }] : []),
 ];
 

@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import pg from 'pg';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { mysqlStores } from './real-backends.js';
+import { mysqlStores, mongoStores } from './real-backends.js';
 import { InMemoryStorage, toJournal, withOrg, ORG_RECORD_PRE, stampFormat, type Storage } from '../src/index.js';
 
 const PG_URL = process.env.GNL_PG_URL;
@@ -40,7 +40,7 @@ if (PG_URL) {
   }]);
 }
 
-for (const [name, make] of mysqlStores(' (real)')) STORES.push([name, async () => { const s = await make(); ends.push(() => s.close()); return s; }]);
+for (const [name, make] of [...mysqlStores(' (real)'), ...mongoStores(' (real)')]) STORES.push([name, async () => { const s = await make(); ends.push(() => s.close()); return s; }]);
 
 describe.each(STORES)('an organization\'s run list on a large store — %s', (name, make) => {
   it('reads a bounded number of the store\'s pages, and answers exactly', async () => {

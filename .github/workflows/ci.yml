@@ -181,6 +181,18 @@ jobs:
         options: >-
           --health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 5s --health-timeout 5s --health-retries 30
           --sysctl net.ipv4.tcp_keepalive_time=10 --sysctl net.ipv4.tcp_keepalive_intvl=5 --sysctl net.ipv4.tcp_keepalive_probes=3
+      # A MongoDB server that is NOT a replica set: what MongoStorage must refuse (GNL_MONGO_STANDALONE_URL).
+      # The replica set it runs on is started in a step below.
+      mongostandalone:
+        image: mongo:8.0
+        ports: ['27017']
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'" --health-interval 5s --health-timeout 5s --health-retries 30
+      # Qdrant, for @gnldev/rag's QdrantVectorStore (the vector kit and its own tests). A free host port,
+      # read from the service in the first step, so a runner that already holds 6333 can run this job.
+      qdrant:
+        image: qdrant/qdrant
+        ports: ['6333']
     env:
       GNL_INTEGRATION: '1'
       # integration-real.test.ts reads GNL_PG_URL (audit finding: the old PG_URL name never
@@ -193,6 +205,7 @@ jobs:
       # it does not have -- the same failure this matrix exists to fix.
       GNL_PG_EXPECT_COLLATION: ${{ matrix.pg.collation }}
     steps:
+      - run: echo "GNL_QDRANT_URL=http://localhost:${{ job.services.qdrant.ports['6333'] }}" >> "$GITHUB_ENV"
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v5
         with:
@@ -214,6 +227,26 @@ jobs:
       # fails with "Failed to resolve entry for package". The typecheck job builds as part of its
       # own flow; this one has to ask for it explicitly.
       - run: pnpm -r build
+      # MongoStorage (`@gnldev/durable/mongo`) runs on a replica set, and a service container cannot be one:
+      # services take no server arguments (`--replSet`). So one node is started here, as a deployment runs
+      # it: access control on (a keyfile made in the container), so the visibility tests meet a user
+      # without clusterMonitor; the short TCP keepalives (a cut-off process's runs are taken over in
+      # 13–14 s with these, ~5.5 min with the Linux defaults — measured); a raised file limit (the
+      # container default of 1024 crashed the server under the kits — measured). The set is initiated
+      # once the real server (not the image's init-time one) is up; its free host port is read back.
+      - name: MongoDB replica set
+        run: |
+          docker run -d --name gnl-mongo -p 127.0.0.1::27017 --ulimit nofile=64000:64000 \
+            --sysctl net.ipv4.tcp_keepalive_time=10 --sysctl net.ipv4.tcp_keepalive_intvl=5 --sysctl net.ipv4.tcp_keepalive_probes=3 \
+            -e MONGO_INITDB_ROOT_USERNAME=root -e MONGO_INITDB_ROOT_PASSWORD=gnl --entrypoint sh mongo:8.0 \
+            -c 'openssl rand -base64 756 > /tmp/keyfile && chmod 400 /tmp/keyfile && chown mongodb /tmp/keyfile && exec docker-entrypoint.sh mongod --replSet rs0 --keyFile /tmp/keyfile --bind_ip_all'
+          ask() { docker exec gnl-mongo mongosh -u root -p gnl --quiet --eval "$1" 2>/dev/null; }
+          for i in $(seq 1 90); do [ "$(ask 'db.adminCommand({getCmdLineOpts:1}).parsed.replication ? 1 : 0')" = "1" ] && break; sleep 2; done
+          ask 'rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27017"}]}).ok'
+          for i in $(seq 1 60); do [ "$(ask 'db.hello().isWritablePrimary')" = "true" ] && break; sleep 2; done
+          [ "$(ask 'db.hello().isWritablePrimary')" = "true" ] || { docker logs gnl-mongo | tail -50; exit 1; }
+          port=$(docker port gnl-mongo 27017/tcp | head -1 | sed 's/.*://')
+          echo "GNL_MONGO_URL=mongodb://root:gnl@127.0.0.1:${port}/gnl?authSource=admin&directConnection=true" >> "$GITHUB_ENV"
       # Run from the root: the root vitest.config include is 'packages/*/test/**', so running from
       # inside a package directory reports "No test files found" (a known monorepo quirk).
       #
@@ -231,16 +264,18 @@ jobs:
       # the same line (check-real-backends.mjs) does not exceed the server's 100 connections — the
       # multi-process tests open several pools per file.
       #
-      # The MySQL / MariaDB URLs are set per step: `job.services` (the host ports) is not available to
-      # the job's own `env`.
+      # The MySQL / MariaDB / standalone MongoDB URLs are set per step: `job.services` (the host ports) is
+      # not available to the job's own `env`. GNL_MONGO_URL comes from the step above.
       - run: node scripts/real-backend-tests.mjs --run alone
         env:
           GNL_MYSQL_URL: mysql://root:gnl@127.0.0.1:${{ job.services.mysql.ports['3306'] }}/gnl
           GNL_MARIADB_URL: mysql://root:gnl@127.0.0.1:${{ job.services.mariadb.ports['3306'] }}/gnl
+          GNL_MONGO_STANDALONE_URL: mongodb://127.0.0.1:${{ job.services.mongostandalone.ports['27017'] }}/gnl
       - run: node scripts/real-backend-tests.mjs --run shared -- --maxWorkers=3 --minWorkers=1
         env:
           GNL_MYSQL_URL: mysql://root:gnl@127.0.0.1:${{ job.services.mysql.ports['3306'] }}/gnl
           GNL_MARIADB_URL: mysql://root:gnl@127.0.0.1:${{ job.services.mariadb.ports['3306'] }}/gnl
+          GNL_MONGO_STANDALONE_URL: mongodb://127.0.0.1:${{ job.services.mongostandalone.ports['27017'] }}/gnl
 
   upgrade-from-0-9-0:
     name: upgrade from 0.9.0 (known failures, not yet gating)

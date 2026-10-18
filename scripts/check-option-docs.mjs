@@ -32,7 +32,7 @@ const BASELINE = new Set([
   'otel/OtlpRetryOptions.retryOn',
   'processors/TokenLimiterOptions.countTokens', 'processors/TokenLimiterOptions.keepSystem',
   'rag/GraphRagOptions.hops', 'rag/GraphRagOptions.decay',
-  'rag/GraphRagOptions.seeds', 'rag/PostgresVectorStoreOptions.dimension', 'scheduler/WorkflowWakerOptions.jitterMs',
+  'rag/GraphRagOptions.seeds', 'scheduler/WorkflowWakerOptions.jitterMs',
   'scheduler/WorkflowWakerOptions.wakeEvented', 'semantic-qualify/QualifyOptions.onProgress',
   'server/OrgOptions.requireRegistration', 'server/OrgOptions.maxInstances',
   'studio/MakeRunnerOptions.toJsonSchema',

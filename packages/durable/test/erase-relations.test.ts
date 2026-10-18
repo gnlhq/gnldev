@@ -21,7 +21,7 @@
 //
 // Stores: InMemory, Sqlite (a file, the older process on a second connection), Postgres on pg-mem.
 // With GNL_PG_URL also a real Postgres, in a database this file creates and drops; with GNL_MYSQL_URL /
-// GNL_MARIADB_URL a MySQL / MariaDB server (real-backends.ts).
+// GNL_MARIADB_URL a MySQL / MariaDB server, with GNL_MONGO_URL a MongoDB replica set (real-backends.ts).
 import { describe, it, expect, afterAll, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -36,7 +36,7 @@ import {
 import { claimRunOwner, user } from '../src/run-identity.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
-import { mysqlStores } from './real-backends.js';
+import { mysqlStores, mongoStores } from './real-backends.js';
 import { serialize } from '../src/serialize.js';
 import { RELATIONS_PENDING_ADVICE } from '../src/upgrade.js';
 import { OLD, oldSqlitePut, oldPgPut } from './older-writer.js';
@@ -142,9 +142,9 @@ const BACKENDS: Array<[string, () => Promise<Backend>]> = [
   ['Postgres (pg-mem)', async () => { const { Pool } = newDb().adapters.createPg(); const pool = new Pool(); return { ...pgBackend(pool, pool), rowValues: false, guarded: false }; }],
 ];
 if (PG_URL) BACKENDS.push(['Postgres (real)', realPgBackend]);
-// MySQL / MariaDB: no older version ever wrote one, so its "older process" writes what this one does
+// MySQL / MariaDB / MongoDB: no older version ever wrote one, so its "older process" writes what this one does
 // (as InMemory's) and the placement checks that need an unplaced row are not asked of it.
-for (const [name, make] of mysqlStores(' (real)')) BACKENDS.push([name, async () => { const storage = await make(); ends.push(() => storage.close()); return { storage, relations: false, oldPut: (k, v) => storage.runs.put(k, v) }; }]);
+for (const [name, make] of [...mysqlStores(' (real)'), ...mongoStores(' (real)')]) BACKENDS.push([name, async () => { const storage = await make(); ends.push(() => storage.close()); return { storage, relations: false, oldPut: (k, v) => storage.runs.put(k, v) }; }]);
 
 const input = (fields: Record<string, unknown>) => stampFormat({ at: 1, ...fields });
 

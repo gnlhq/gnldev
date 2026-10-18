@@ -9,7 +9,7 @@
 //   · `ts` is the PRODUCER's `Date.now()`. A producer 5s behind had its row sorted before the cursor on
 //     SQLite/Postgres/Redis, so it was never seen at all.
 // The same contract runs against every bundled adapter (and a live Postgres under GNL_INTEGRATION=1, a
-// MySQL / MariaDB server under GNL_MYSQL_URL / GNL_MARIADB_URL).
+// MySQL / MariaDB server under GNL_MYSQL_URL / GNL_MARIADB_URL, a MongoDB replica set under GNL_MONGO_URL).
 import { describe, it, expect, vi, afterEach, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -20,7 +20,8 @@ import { InMemoryStorage } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { MysqlStorage } from '../src/mysql-storage.js';
-import { MYSQL_SERVERS, freshDatabase, mysqlStores } from './real-backends.js';
+import { MYSQL_SERVERS, MONGO_URL, freshDatabase, freshMongoDatabase, mysqlStores, mongoStores } from './real-backends.js';
+import { MongoStorage } from '../src/mongo-storage.js';
 import type { WorkStore, Storage } from '../src/index.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
@@ -202,6 +203,20 @@ for (const { name, url } of MYSQL_SERVERS) {
   describe(`WorkStore.list cursor — ${name} (real, race)`, () => concurrentProducers(`${name} (real)`, open));
 }
 
+if (MONGO_URL) {
+  // One database for the contract and the race, as above.
+  let url: string | undefined;
+  const stores: MongoStorage[] = [];
+  const open = async () => {
+    const s = new MongoStorage({ connectionString: (url ??= freshMongoDatabase()) });
+    stores.push(s);
+    return s;
+  };
+  afterAll(async () => { for (const s of stores.splice(0)) await s.close(); });
+  contract('MongoDB (real)', open);
+  describe('WorkStore.list cursor — MongoDB (real, race)', () => concurrentProducers('MongoDB (real)', open));
+}
+
 /** 8 producers on 4 stores (separate connections) and a reader persisting cursors, on one log. */
 function concurrentProducers(name: string, make: () => Promise<Storage> | Storage): void {
   {
@@ -320,6 +335,7 @@ describe('SIBLING — adoptIntoOrg moves a log into an organization that already
     ['sqlite', () => new SqliteStorage(':memory:')],
     ['postgres (pg-mem)', () => { const { Pool } = newDb().adapters.createPg(); return new PostgresStorage({ pool: new Pool() }); }],
     ...mysqlStores(' (real)'),
+    ...mongoStores(' (real)'),
   ];
   it.each(all)('%s: the moved records land after the organization\'s persisted cursor, and its own records survive', async (_name, make) => {
     const s = await make();

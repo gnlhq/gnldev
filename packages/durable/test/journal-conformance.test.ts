@@ -7,7 +7,7 @@
 //
 // Stores: InMemory, Sqlite (a file), Postgres on pg-mem, the custom journal; with GNL_PG_URL also a real
 // Postgres, in one database this file creates (`cpd_conf_…`), a schema per scenario, dropped at the end;
-// with GNL_MYSQL_URL / GNL_MARIADB_URL a MySQL / MariaDB server, a database per scenario. No older version
+// with GNL_MYSQL_URL / GNL_MARIADB_URL a MySQL / MariaDB server, a database per scenario (and a MongoDB replica set with GNL_MONGO_URL). No older version
 // ever wrote a MySQL store, so those subjects have no older writer.
 // A two-minute ceiling per scenario: D4 kills a deletion at every store call, about 7 s on pg-mem alone
 // and past the suite's 30 s default when the full run contends for the machine (measured).
@@ -24,7 +24,7 @@ import { journalConformance, type ConformanceSubject } from '@gnldev/durable/tes
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { oldSqlitePut, oldPgPut } from './older-writer.js';
-import { mysqlStores } from './real-backends.js';
+import { mysqlStores, mongoStores } from './real-backends.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
 const PG_URL = process.env.GNL_PG_URL;
@@ -87,7 +87,7 @@ if (PG_URL) {
   }, { describe, it, clock: 'shared', timeout: 120_000 });
 }
 
-for (const [name, make] of mysqlStores(' (real)')) {
+for (const [name, make] of [...mysqlStores(' (real)'), ...mongoStores(' (real)')]) {
   journalConformance(name, async () => {
     const storage = await make();
     await storage.init();

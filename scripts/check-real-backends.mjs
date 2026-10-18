@@ -42,6 +42,9 @@ const PGVECTOR_URL = 'postgres://postgres:gnl@localhost:55433/gnl';
 // The `mysql` and `mariadb` services (MysqlStorage): root, the compose file's password, their own ports.
 const MYSQL_URL = 'mysql://root:gnl@127.0.0.1:55306/gnl';
 const MARIADB_URL = 'mysql://root:gnl@127.0.0.1:55307/gnl';
+// The `mongo` replica set (initiated below) and the `mongo-standalone` server MongoStorage must refuse.
+const MONGO_URL = 'mongodb://root:gnl@127.0.0.1:55317/gnl?authSource=admin&directConnection=true';
+const MONGO_STANDALONE_URL = 'mongodb://127.0.0.1:55318/gnl';
 
 const run = (cmd, argv, opts = {}) =>
   spawnSync(cmd, argv, { cwd: root, stdio: 'inherit', encoding: 'utf8', ...opts });
@@ -107,6 +110,30 @@ function waitForMysql(service, client, seconds = 120) {
   }
 }
 
+/**
+ * Initiates the `mongo` service's replica set once its real server is up (the image first runs a
+ * throwaway server for its init scripts, started without `--replSet`), and waits for it to be primary.
+ */
+function initiateMongo(seconds = 120) {
+  const deadline = Date.now() + seconds * 1000;
+  const id = () => quiet(bin, [...pre, '-f', 'docker-compose.yml', 'ps', '-q', 'mongo']).stdout?.trim().split('\n')[0];
+  const ask = (c, js) => quiet('docker', ['exec', c, 'mongosh', '-u', 'root', '-p', 'gnl', '--quiet', '--eval', js]).stdout?.trim();
+  for (let initiated = false; ;) {
+    const c = id();
+    if (c) {
+      if (ask(c, 'db.hello().isWritablePrimary') === 'true') return true;
+      if (!initiated && ask(c, 'db.adminCommand({getCmdLineOpts:1}).parsed.replication ? 1 : 0') === '1') {
+        initiated = ask(c, 'try { rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27017"}]}).ok } catch (e) { e.codeName === "AlreadyInitialized" ? 1 : 0 }') === '1';
+      }
+    }
+    if (Date.now() > deadline) {
+      console.error(c ? '  mongo is up but never became a replica set primary' : '  the mongo container was never found');
+      return false;
+    }
+    spawnSync('sleep', ['2']);
+  }
+}
+
 const failures = [];
 const skipped = [];
 
@@ -133,13 +160,17 @@ try {
       throw new Error(`${service} unreachable`);
     }
   }
+  if (!initiateMongo()) {
+    failures.push('mongo never became a replica set primary');
+    throw new Error('mongo unreachable');
+  }
 
   // The env names matter and have been wrong before: the CI job originally exported PG_URL,
   // which the tests never read, so it connected to the built-in defaults and failed on a retry timeout
   // while looking like a real-backend run. These are the names integration-real.test.ts actually reads.
   // GNL_PGVECTOR_URL was missing until the erasure contract round: the real pgvector test listed below
   // was skipped by its own `skipIf` on every run of this gate, and the gate said nothing.
-  const env = { ...process.env, GNL_INTEGRATION: '1', GNL_PG_URL: PG_URL, GNL_PGVECTOR_URL: PGVECTOR_URL, GNL_MYSQL_URL: MYSQL_URL, GNL_MARIADB_URL: MARIADB_URL };
+  const env = { ...process.env, GNL_INTEGRATION: '1', GNL_PG_URL: PG_URL, GNL_PGVECTOR_URL: PGVECTOR_URL, GNL_MYSQL_URL: MYSQL_URL, GNL_MARIADB_URL: MARIADB_URL, GNL_MONGO_URL: MONGO_URL, GNL_MONGO_STANDALONE_URL: MONGO_STANDALONE_URL };
 
   // Every test that needs the server, found by rule (scripts/real-backend-tests.mjs) — the same two
   // runs as the CI integration job. These were named by hand here and in ci.yml, and on 12 Oct 2026
@@ -151,7 +182,7 @@ try {
   // server's 100 connections — the multi-process tests open several pools per file.
   step('real Postgres — the tests that terminate backends, alone', () =>
     run('node', ['scripts/real-backend-tests.mjs', '--run', 'alone'], { env }).status === 0);
-  step('real Postgres + pgvector + MySQL + MariaDB — every other real-backend test', () =>
+  step('real Postgres + pgvector + MySQL + MariaDB + MongoDB — every other real-backend test', () =>
     run('node', ['scripts/real-backend-tests.mjs', '--run', 'shared', '--', '--maxWorkers=3', '--minWorkers=1'], { env }).status === 0);
 
   step('real model provider', () => {
