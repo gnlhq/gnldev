@@ -6,7 +6,8 @@
 // NOTE: this file contains ONLY the INTERFACE + pure helpers (NO storage implementation) → the @gnldev/durable
 // core stays thin; concrete impls (in-memory/sqlite/postgres-storage) implement these ports.
 
-import type { Journal, JournalEntry, RunSummary, JournalReader, RunStatus } from './journal.js';
+import type { Journal, JournalEntry, RunSummary, JournalReader, RunStatus, JournalBatch } from './journal.js';
+import { assertJournalGuarantees } from './journal.js';
 import type { RunOrder } from './run-cursor.js';
 import { VectorOwnerConflictError, AdoptionConflictError } from './errors.js';
 import { assertOwnerId, isWellFormed, OwnerIdError } from './owned-name.js';
@@ -108,6 +109,13 @@ export interface RunJournal {
   readRun(runId: string): Promise<JournalEntry[]>;
   /** Runs — PAGINATED (NO full-table scan). */
   listRuns(q?: ListQuery): Promise<Page<RunSummary>>;
+  // The store's guarantees (journal.ts JOURNAL_GUARANTEES): required, each checked by the conformance kit.
+  putIfMatch(key: string, expected: unknown, value: unknown): Promise<boolean>;
+  applyBatch(batch: JournalBatch): Promise<boolean>;
+  incrBy(key: string, fields: Record<string, number>): Promise<Record<string, number> | void>;
+  getCounters(key: string): Promise<Record<string, number> | undefined>;
+  deletePrefix(prefix: string): Promise<number>;
+  now(): Promise<number>;
 }
 
 // ── 2) MemoryStore = derived/queryable conversation artifacts (NOT replay state) ──
@@ -1342,11 +1350,19 @@ export const JOURNAL_SOURCE = Symbol.for('@gnldev/durable.journalSource');
 
 export function toJournal(source: RunJournal | Storage): Journal & JournalReader {
   const runs: RunJournal = portOf(source, 'runs', 'toJournal');
+  // A store is handed in here: one without a guarantee is refused, naming it (journal.ts JOURNAL_GUARANTEES).
+  assertJournalGuarantees(runs, 'toJournal (storage.runs)');
   const j: Journal & JournalReader = {
     get: (k) => runs.get(k),
     put: (k, v) => runs.put(k, v),
     putIfAbsent: (k, v) => runs.putIfAbsent(k, v),
     listKeys: (p, opts) => runs.listKeys(p, opts),
+    putIfMatch: (k, e, v) => runs.putIfMatch(k, e, v),
+    applyBatch: (b) => runs.applyBatch(b),
+    incrBy: (k, f) => runs.incrBy(k, f),
+    getCounters: (k) => runs.getCounters(k),
+    deletePrefix: (p) => runs.deletePrefix(p),
+    now: () => runs.now(),
     readRun: (runId) => runs.readRun(runId),
     listRuns: async () => (await runs.listRuns({ limit: 1_000_000_000 })).items,
     // P0.3: RunJournal.listRuns is MANDATORY (unlike the optional methods forwarded in the loop below)
@@ -1355,17 +1371,15 @@ export function toJournal(source: RunJournal | Storage): Journal & JournalReader
     // listRuns), so there's nothing extra to do here beyond exposing it under the paged capability name.
     listRunsPaged: (q) => runs.listRuns(q),
   };
-  // Bug: previously the optional Journal methods (deletePrefix/putIfMatch/now/incrBy/getCounters/
-  // listStaleRuns/readRunStats) were NOT forwarded → even if the underlying SqliteStorage/Postgres
-  // provided them, the reader capabilities wrapped by toJournal were SILENTLY DROPPED (studio
-  // organization-deletion, retention/purge, budget incrBy, CAS-based paths were falling back to
-  // 501/fallback). Forward every existing optional method at runtime (leave it alone if absent — old behavior preserved).
+  // The accelerators (journal.ts: optional) a store offers are forwarded when it has them; the
+  // guarantees are bridged above, unconditionally. Dropping one here once made studio's organization
+  // deletion, retention and the CAS paths fall back silently.
   const anyJ = j as unknown as Record<string, unknown>;
   const anyRuns = runs as unknown as Record<string, unknown>;
   // P1.6b: applyBatch/getMany/countRunsByStatus forwarded the SAME way — SqliteRunJournal/PgRunJournal
   // expose them as EXTRA (non-RunJournal-interface) methods; without this they'd be
   // silently dropped here exactly like the other optional methods were before the bug fix above.
-  for (const m of ['deletePrefix', 'putIfMatch', 'now', 'incrBy', 'getCounters', 'listStaleRuns', 'readRunStats', 'applyBatch', 'getMany', 'countRunsByStatus', 'listOwnerRecords', 'countRuns', 'listRunsChangedSince', 'processLiveness', 'readRange']) {
+  for (const m of ['listStaleRuns', 'readRunStats', 'getMany', 'countRunsByStatus', 'listOwnerRecords', 'countRuns', 'listRunsChangedSince', 'processLiveness', 'readRange']) {
     if (typeof anyRuns[m] === 'function') anyJ[m] = (...args: unknown[]) => (anyRuns[m] as (...a: unknown[]) => unknown).call(runs, ...args);
   }
   // The port's markers (an organization view's `ORG_SCOPE` and `ORG_PARENT`) go along too. This bridge
@@ -1464,6 +1478,8 @@ export function journalOf(arg: unknown, call: string): Journal {
   if ((was !== undefined && was !== 'a run journal (storage.runs)') || typeof o.get !== 'function' || typeof o.put !== 'function') {
     throw new TypeError(`${call}: ${was ? `the value passed is ${was}, not a journal` : 'the value passed has no get/put — it is not a journal'}. Pass the storage, or toJournal(storage).`);
   }
+  // A journal handed in here keeps every promise a run store does, or is refused naming what it lacks.
+  assertJournalGuarantees(o, call);
   return arg as unknown as Journal;
 }
 

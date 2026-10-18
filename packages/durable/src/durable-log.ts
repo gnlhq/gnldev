@@ -58,7 +58,7 @@ export interface ListLogOptions {
 export async function listLog<T = unknown>(journal: Journal, ns: string, opts: ListLogOptions = {}): Promise<LogItem<T>[]> {
   refuseUnknownNames('listLog', opts, LIST_LOG_NAMES);
   const prefix = `${ns}:`;
-  let keys = journal.listKeys ? await journal.listKeys(prefix) : [];
+  let keys = await journal.listKeys(prefix);
   if (opts.limit !== undefined && opts.limit >= 0 && keys.length > opts.limit) {
     keys = [...keys].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0)).slice(0, opts.limit);
   }
@@ -75,7 +75,7 @@ export async function listLog<T = unknown>(journal: Journal, ns: string, opts: L
 
 /** How many records exist in a log namespace, without reading any of them. */
 export async function countLog(journal: Journal, ns: string): Promise<number> {
-  return journal.listKeys ? (await journal.listKeys(`${ns}:`)).length : 0;
+  return (await journal.listKeys(`${ns}:`)).length;
 }
 
 /**

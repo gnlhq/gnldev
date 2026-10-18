@@ -246,7 +246,7 @@ export const LIST_OWNER_RECORDS_NAMES = optionNames<NonNullable<Parameters<impor
 export const LIST_STALE_RUNS_NAMES = optionNames<NonNullable<Parameters<import('./journal.js').InMemoryJournal['listStaleRuns']>[1]>>()(['includeSuspended']);
 export const COUNT_RUNS_NAMES = optionNames<NonNullable<Parameters<import('./journal.js').InMemoryJournal['countRuns']>[0]>>()(['runIdPrefix']);
 export const LIST_RUNS_CHANGED_NAMES = optionNames<NonNullable<Parameters<import('./journal.js').InMemoryJournal['listRunsChangedSince']>[1]>>()(['limit', 'since', 'runIdPrefix']);
-export const JOURNAL_CONFORMANCE_NAMES = optionNames<import('./testing.js').JournalConformanceOptions>()(['describe', 'it', 'timeout', 'exactClaim', 'pageWalk']);
+export const JOURNAL_CONFORMANCE_NAMES = optionNames<import('./testing.js').JournalConformanceOptions>()(['describe', 'it', 'timeout', 'exactClaim', 'pageWalk', 'isolatedReads']);
 
 export const DRAIN_NAMES = optionNames<import('./drain.js').DrainOptions>()(['deadlineMs']);
 export const DRAIN_ON_SIGNAL_NAMES = optionNames<import('./drain.js').DrainOnSignalOptions>()(['deadlineMs', 'signals', 'onDrained']);

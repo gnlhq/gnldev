@@ -96,8 +96,9 @@ describe('the write-ahead start marker', () => {
     const settled = await readRunOutcome(journal, 'done');
     expect(settled?.status).toBe('completed');
 
-    // A parallel starter's write-ahead lands late, with an OLDER timestamp — monotonicity holds.
-    await runStarted(journal, 'done', settled!.at - 60_000);
+    // A parallel starter's write-ahead lands late, from an attempt that began before the one that
+    // finished — monotonicity holds. (The time it is written at is the store's; the attempt says which one it is.)
+    await runStarted(journal, 'done', Date.now(), (settled!.attempt ?? settled!.at) - 60_000);
     expect(await statusOf(journal, 'done'), 'the verdict stands').toBe('completed');
   });
 

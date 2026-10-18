@@ -137,8 +137,7 @@ async function priorWork(journal: RawJournal, runId: string, known?: RunOwner): 
   if (o.kind !== 'workflow') return false;
   try {
     if ((await journal.get(`wfrun:${runId}`)) !== undefined) return true;
-    if (typeof journal.listKeys === 'function') return (await journal.listKeys(runRecordPrefix(runId, 'wf'), { limit: 1 })).length > 0;
-    return (await journal.get(runRecordKey(runId, 'wf', '_suspend'))) !== undefined;
+    return (await journal.listKeys(runRecordPrefix(runId, 'wf'), { limit: 1 })).length > 0;
   } catch {
     return false; // a reader that cannot answer is not evidence of prior work: the gate stays on
   }
@@ -2156,9 +2155,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
    * in ONE `wfrun:` prefix scan (see @gnldev/workflow's listWorkflowRuns). Org-scoped via `scope(c)`/
    * `s.journal`: `wfrun:<runId>` keys are NOT runId-prefixed but `withOrg` still prefixes them
    * unconditionally (prefixes EVERY key), so organization isolation holds automatically — see the
-   * `statusKey` JSDoc in workflow.ts. `listKeys` is an optional Journal capability; without it
-   * `listWorkflowRuns` throws a clear error — surfaced as 501 (capability-missing, same pattern as
-   * studio's own listKeys-gated routes) rather than a silent empty list.
+   * `statusKey` JSDoc in workflow.ts.
    */
   app.get('/workflows/runs', async (c) => {
     if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');

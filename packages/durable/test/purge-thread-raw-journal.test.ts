@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { createGnl, purgeThread, InMemoryJournal } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { createMockStreamAgent } from './mock.js';
+import { forwardGuarantees } from './store-guarantees.js';
 
 describe('purgeThread over a raw run journal', () => {
   it('deletes the thread\'s runs (Sqlite storage.runs)', async () => {
@@ -28,7 +29,8 @@ describe('purgeThread over a raw run journal', () => {
   it('refuses a journal that cannot list runs at all, deleting nothing', async () => {
     const j = new InMemoryJournal();
     await j.put('mem:raw-t:messages', [{ role: 'user', content: 'x' }]);
-    const bare: any = { get: j.get.bind(j), put: j.put.bind(j), deletePrefix: j.deletePrefix.bind(j), listKeys: j.listKeys.bind(j) };
+    // Every guarantee of a store, and no way to list runs (`listRuns` is a reader's, not a guarantee).
+    const bare: any = { ...forwardGuarantees(j), get: j.get.bind(j), put: j.put.bind(j) };
     await expect(purgeThread(bare, 'raw-t')).rejects.toThrow(/list/i);
     expect(await j.get('mem:raw-t:messages'), 'a refused delete deleted the messages').toBeDefined();
   });

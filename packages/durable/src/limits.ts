@@ -36,16 +36,12 @@
 //     succeededToolCalls) — written ATOMICALLY via `journal.incrBy` (H8a, engine-internal atomic: SQL
 // UPSERT arithmetic), read via `getCounters`. incrBy is COMMUTATIVE: no matter
 // WHICH ORDER two concurrent deltas are applied in, both are summed WITHOUT LOSS — the "last writer
-//     wins" risk of a struct-put is STRUCTURALLY eliminated. On an adapter without incrBy (e.g. a custom
-// journal) it falls back to get→put (the SAME fallback pattern as budget.ts's `addUsage` —
-// SINGLE-PROCESS safe, the old bound still applies under distributed contention, documented risk).
+//     wins" risk of a struct-put is STRUCTURALLY eliminated.
 // `__gnl_limits_state` (name preserved): ONLY the RESETTABLE/conditional "chain" fields
 //     (lastToolName/lastArgsHash/consecutiveRepeats/subRunIds) — these are NOT additive (RESET to
 //     0/undefined when the chain breaks), don't fit incrBy; so they're written via `journal.putIfMatch`
 //     (H1) with CAS-RETRY (up to 3 attempts: read → apply mutate → `putIfAbsent` if the key is missing /
-//     `putIfMatch(read-value, new-value)` if present; if lost, retry with the FRESH value). On an adapter
-//     without putIfMatch, (again) a get→put fallback — SINGLE-PROCESS safe, the same documented bound
-//     (the SAME spirit as the H1/H8a fallbacks elsewhere in this file).
+//     `putIfMatch(read-value, new-value)` if present; if lost, retry with the FRESH value).
 // SEEDING (`ensureSeeded`): on the run's FIRST encounter with limits (a ONE-TIME full scan via
 //     readRun), the reconstructed counters are now written via `incrBy` INSTEAD OF a put — so that a
 // LIVE increment (incrBy) that happens to interleave with the seeding is NOT LOST (thanks to incrBy's
@@ -500,38 +496,30 @@ function countersKey(runId: string): string {
   return runKeys.proc(runId, LIMITS_COUNTERS_NAME);
 }
 
-/** The minimal surface accepted by checkToolGate/enforceStepLimits/recordToolOutcome: the real
- *  `ctx.journal` (Journal) ALWAYS provides get/put; CAS/counter primitives (H1/H8a) are used IF
- * AVAILABLE (otherwise falls back to fail-open/get→put); readRun comes from JournalReader (optional).
- * ALL fields are kept optional (to STAY COMPATIBLE with the existing `as unknown as JournalReader`
- *  cast at the CALL SITES) — whichever is missing, that path is silently skipped (fail-open). */
-type LimitsStore = Partial<Pick<Journal, 'get' | 'put' | 'putIfAbsent' | 'putIfMatch' | 'incrBy' | 'getCounters'>> &
+/** The surface checkToolGate/enforceStepLimits/recordToolOutcome use: the store's guarantees
+ *  (`ctx.journal`, a Journal — get/put and the CAS/counter primitives H1/H8a); readRun comes from
+ *  JournalReader (optional — without it a limit that needs history is not enforced, said out loud). */
+type LimitsStore = Pick<Journal, 'get' | 'put' | 'putIfAbsent' | 'putIfMatch' | 'incrBy' | 'getCounters'> &
   Partial<JournalReader>;
 
 async function readChain(store: LimitsStore, runId: string): Promise<LimitChain | undefined> {
-  if (typeof store.get !== 'function') return undefined;
   return store.get<LimitChain>(chainKey(runId));
 }
 
 /** H8a unified read: `getCounters` on adapters that support `incrBy`; otherwise a plain-key `get`
  *  (the same one the fallback write path uses). */
 async function readCounters(store: LimitsStore, runId: string): Promise<LimitCounters | undefined> {
-  if (typeof store.getCounters === 'function') {
-    const c = await store.getCounters(countersKey(runId));
-    if (c) {
-      return {
-        modelStepsSeen: c.modelStepsSeen ?? 0,
-        totalTokens: c.totalTokens ?? 0,
-        costUsd: c.costUsd ?? 0,
-        succeededToolCalls: c.succeededToolCalls ?? 0,
-      };
-    }
+  const c = await store.getCounters(countersKey(runId));
+  if (c) {
+    return {
+      modelStepsSeen: c.modelStepsSeen ?? 0,
+      totalTokens: c.totalTokens ?? 0,
+      costUsd: c.costUsd ?? 0,
+      succeededToolCalls: c.succeededToolCalls ?? 0,
+    };
   }
-  if (typeof store.get === 'function') {
-    const c = await store.get<LimitCounters>(countersKey(runId));
-    if (c) return c;
-  }
-  return undefined;
+  // A run an earlier version counted with get→put keeps its counters as a plain record.
+  return store.get<LimitCounters>(countersKey(runId));
 }
 
 /** H8a unified write (delta): ATOMIC at the engine level IF `incrBy` is AVAILABLE (lost-update is
@@ -548,38 +536,7 @@ async function incrCounters(store: LimitsStore, runId: string, delta: Partial<Li
     const { modelStepsSeen: _own, ...spend } = clean;
     if (Object.keys(spend).length) await addToRequest(store, requestRunId, givesBackSeat ? { ...spend, [SEATS]: -1 } : spend);
   }
-  if (typeof store.incrBy === 'function') {
-    try {
-      await store.incrBy(countersKey(runId), clean);
-      return;
-    } catch {
-      // a custom journal whose incrBy cannot do this → the legacy path
-    }
-  }
-  if (typeof store.get !== 'function' || typeof store.put !== 'function') return;
-  warnCasFallback(store, '`incrBy` (or its call failed)');
-  const current = (await store.get<LimitCounters>(countersKey(runId))) ?? emptyCounters();
-  await store.put(countersKey(runId), {
-    modelStepsSeen: current.modelStepsSeen + (clean.modelStepsSeen ?? 0),
-    totalTokens: current.totalTokens + (clean.totalTokens ?? 0),
-    costUsd: current.costUsd + (clean.costUsd ?? 0),
-    succeededToolCalls: current.succeededToolCalls + (clean.succeededToolCalls ?? 0),
-  });
-}
-
-/** (distributed honesty — mirrors journal.ts claim()'s warn-once): the get→put fallbacks below
- *  are SILENT degradations on custom journals that omit a CAS primitive (all first-party adapters
- *  provide them — see the parity matrix in journal.ts). Single-process they are safe; multi-worker
- *  they can lose updates. A degradation this consequential must be SAID once, not discovered in prod. */
-const casFallbackWarned = new WeakSet<object>();
-function warnCasFallback(store: object, missing: string): void {
-  if (casFallbackWarned.has(store)) return;
-  casFallbackWarned.add(store);
-  console.warn(
-    `@gnldev/durable: this journal does not implement ${missing} — limit-state updates fell back to get→put. ` +
-      'Safe in single-process usage; in multi-worker/distributed environments concurrent updates can be ' +
-      'LOST (limits may under-enforce). Implement the primitive (see the Journal interface / parity matrix in journal.ts).',
-  );
+  await store.incrBy(countersKey(runId), clean);
 }
 
 const CHAIN_CAS_ATTEMPTS = 3;
@@ -628,14 +585,13 @@ export async function registerSubRun(journal: unknown, parentRunId: string, chil
 export async function takeToolSeat(journal: unknown, requestRunId: string, limits: RunLimits | undefined): Promise<{ ok: boolean; seat?: ToolSeat }> {
   if (limits?.maxToolCalls == null) return { ok: true };
   const store = journal as LimitsStore;
-  if (typeof store.get !== 'function' || typeof store.put !== 'function') return { ok: true };
   const root = requestRunId;
   // One atomic step on the request's total: the increment says which seat this call got and, in the same
   // step, how many calls have finished — so parallel calls never retry against each other (measured: a
   // bounded compare-and-set retry refused all but 22 of 200 parallel calls with the limit far away), and
   // a finished call, which gives its seat back in the step that counts it (recordToolOutcome), is never
   // seen twice. A seat past the limit is given back at once.
-  if (typeof store.incrBy === 'function' && (await hasRequestTotal(store, root))) {
+  if (await hasRequestTotal(store, root)) {
     const after = await store.incrBy(requestKey(root), { succeededToolCalls: 0, [SEATS]: 1 });
     if (after && typeof after[SEATS] === 'number' && typeof after.succeededToolCalls === 'number') {
       if (after.succeededToolCalls + after[SEATS] <= limits.maxToolCalls) return { ok: true, seat: 'request' };
@@ -655,17 +611,9 @@ export async function takeToolSeat(journal: unknown, requestRunId: string, limit
     const held = current?.held ?? 0;
     if (done + held >= limits.maxToolCalls) return { ok: false };
     const next = { held: held + 1 };
-    if (current === undefined) {
-      if (typeof store.putIfAbsent === 'function') { if (await store.putIfAbsent(key, next)) return { ok: true, seat: 'own-key' }; continue; }
-    } else if (typeof store.putIfMatch === 'function') {
-      // A lost race means another call took a seat: read again — refusing here would refuse a call the
-      // limit admits.
-      if (await store.putIfMatch(key, current, next)) return { ok: true, seat: 'own-key' };
-      continue;
-    }
-    warnCasFallback(store, '`putIfAbsent`/`putIfMatch`');
-    await store.put(key, next);
-    return { ok: true, seat: 'own-key' };
+    // A lost race means another call took a seat: read again — refusing here would refuse a call the
+    // limit admits.
+    if (current === undefined ? await store.putIfAbsent(key, next) : await store.putIfMatch(key, current, next)) return { ok: true, seat: 'own-key' };
   }
 }
 
@@ -674,18 +622,15 @@ export async function takeToolSeat(journal: unknown, requestRunId: string, limit
 export async function releaseToolSeat(journal: unknown, requestRunId: string, seat: ToolSeat): Promise<void> {
   const store = journal as LimitsStore;
   if (seat === 'request') {
-    if (typeof store.incrBy === 'function') await store.incrBy(requestKey(requestRunId), { [SEATS]: -1 });
+    await store.incrBy(requestKey(requestRunId), { [SEATS]: -1 });
     return;
   }
-  if (typeof store.get !== 'function' || typeof store.put !== 'function') return;
   const key = seatsKey(requestRunId);
   for (;;) {
     const current = await store.get<{ held: number }>(key);
     if (!current || current.held <= 0) return;
     const next = { held: current.held - 1 };
-    if (typeof store.putIfMatch === 'function') { if (await store.putIfMatch(key, current, next)) return; continue; }
-    await store.put(key, next);
-    return;
+    if (await store.putIfMatch(key, current, next)) return;
   }
 }
 
@@ -711,7 +656,6 @@ export async function takeConcurrencySlot(
   const cap = limits?.maxConcurrency;
   if (cap == null) return true;
   const store = journal as LimitsStore;
-  if (typeof store.get !== 'function' || typeof store.put !== 'function') return true;
   const key = slotsKey(requestRunId);
   for (let wait = 5; ; wait = Math.min(wait * 2, 100)) {
     if (signal?.aborted) return false;
@@ -720,15 +664,7 @@ export async function takeConcurrencySlot(
     const live = Object.entries(current ?? {}).filter(([h, at]) => h !== holder && now - at < staleMs);
     if (live.length < cap) {
       const next = Object.fromEntries([...live, [holder, now]]);
-      if (current === undefined) {
-        if (typeof store.putIfAbsent === 'function' ? await store.putIfAbsent(key, next) : (await store.put(key, next), true)) return true;
-      } else if (typeof store.putIfMatch === 'function') {
-        if (await store.putIfMatch(key, current, next)) return true;
-      } else {
-        warnCasFallback(store, '`putIfMatch`');
-        await store.put(key, next);
-        return true;
-      }
+      if (current === undefined ? await store.putIfAbsent(key, next) : await store.putIfMatch(key, current, next)) return true;
       continue; // lost a race for the slot — read again at once
     }
     await new Promise((r) => setTimeout(r, wait));
@@ -739,15 +675,12 @@ export async function takeConcurrencySlot(
 export async function releaseConcurrencySlot(journal: unknown, requestRunId: string, limits: RunLimits | undefined, holder: string): Promise<void> {
   if (limits?.maxConcurrency == null) return;
   const store = journal as LimitsStore;
-  if (typeof store.get !== 'function' || typeof store.put !== 'function') return;
   const key = slotsKey(requestRunId);
   for (let attempt = 0; attempt < SEAT_CAS_ATTEMPTS * 3; attempt++) {
     const current = await store.get<Record<string, number>>(key);
     if (!current || !(holder in current)) return;
     const { [holder]: _gone, ...next } = current;
-    if (typeof store.putIfMatch === 'function') { if (await store.putIfMatch(key, current, next)) return; continue; }
-    await store.put(key, next);
-    return;
+    if (await store.putIfMatch(key, current, next)) return;
   }
 }
 
@@ -771,27 +704,12 @@ async function writeChainCas(
   runId: string,
   mutate: (chain: LimitChain) => LimitChain,
 ): Promise<void> {
-  if (typeof store.put !== 'function' || typeof store.get !== 'function') return;
   const key = chainKey(runId);
   for (let attempt = 0; attempt < CHAIN_CAS_ATTEMPTS; attempt++) {
     const current = await store.get<LimitChain>(key);
     const next = mutate(current ?? emptyChain());
-    if (current === undefined) {
-      if (typeof store.putIfAbsent === 'function') {
-        if (await store.putIfAbsent(key, next)) return;
-        continue; // someone created it before us — retry with the fresh value
-      }
-      warnCasFallback(store, '`putIfAbsent`');
-      await store.put(key, next);
-      return;
-    }
-    if (typeof store.putIfMatch === 'function') {
-      if (await store.putIfMatch(key, current, next)) return;
-      continue; // an interleaving write happened — retry with the fresh value
-    }
-    warnCasFallback(store, '`putIfMatch`');
-    await store.put(key, next);
-    return;
+    // Lost: someone created or changed it in between — retry with the fresh value.
+    if (current === undefined ? await store.putIfAbsent(key, next) : await store.putIfMatch(key, current, next)) return;
   }
   // High contention: CHAIN_CAS_ATTEMPTS exhausted → last-resort best-effort get→put (documented bound, see above).
   const current = await store.get<LimitChain>(key);
@@ -911,7 +829,7 @@ async function seedFromHistory(
 /**
  * On the run's FIRST encounter with limits (chain key MISSING), seeds via a ONE-TIME full scan (readRun)
  * (see the FIX note at the top of the file). Seeding is limited to a SINGLE winner via an ATOMIC
- * `putIfAbsent` on the chain key (or a `claim()` get+put fallback if unavailable): ONLY the WINNER adds
+ * `putIfAbsent` on the chain key: ONLY the WINNER adds
  * the counters via `incrCounters` + writes the chain; the LOSER writes nothing (the caller falls through
  * to the normal live-increment path). `true` ⟺ THIS call won (the readRun scan MAY ALREADY INCLUDE this
  * call's own contribution — the winner must NOT apply it AGAIN, to avoid double counting — see the early
@@ -929,22 +847,13 @@ async function seedFromHistory(
 const requestKey = (requestRunId: string): string => runKeys.proc(requestRunId, '__gnl_limits_request');
 
 async function requestTotals(store: LimitsStore, requestRunId: string): Promise<LimitCounters | undefined> {
-  const raw = typeof store.getCounters === 'function'
-    ? await store.getCounters(requestKey(requestRunId))
-    : typeof store.get === 'function' ? await store.get<Record<string, number>>(requestKey(requestRunId)) : undefined;
+  const raw = await store.getCounters(requestKey(requestRunId));
   if (!raw || !raw.created) return undefined;
   return { modelStepsSeen: 0, totalTokens: raw.totalTokens ?? 0, costUsd: raw.costUsd ?? 0, succeededToolCalls: raw.succeededToolCalls ?? 0 };
 }
 
 async function bumpRequest(store: LimitsStore, requestRunId: string, fields: Record<string, number>): Promise<void> {
-  if (typeof store.incrBy === 'function') {
-    try { await store.incrBy(requestKey(requestRunId), fields); return; } catch { /* the legacy path below */ }
-  }
-  if (typeof store.get !== 'function' || typeof store.put !== 'function') return;
-  const cur = (await store.get<Record<string, number>>(requestKey(requestRunId))) ?? {};
-  const next: Record<string, number> = { ...cur };
-  for (const [k, v] of Object.entries(fields)) next[k] = (next[k] ?? 0) + v;
-  await store.put(requestKey(requestRunId), next);
+  await store.incrBy(requestKey(requestRunId), fields);
 }
 
 /** Adds to the request's total — only once it exists: an earlier version's request keeps the walk. */
@@ -990,9 +899,7 @@ async function ensureSeeded(
   if (typeof reader.readRun !== 'function') return false; // fail-open
   const seeded = await seedFromHistory(reader, runId, opts, unpriced);
   const key = chainKey(runId);
-  const won = typeof store.putIfAbsent === 'function'
-    ? await store.putIfAbsent(key, seeded.chain)
-    : await claim(store as Journal, key, seeded.chain);
+  const won = await store.putIfAbsent(key, seeded.chain);
   if (!won) return false; // another call already seeded it — fall through to the normal increment path
   if (requestRunId !== undefined && requestRunId === runId) {
     // The root meets its limits: the request's total starts here, with what the root already spent.

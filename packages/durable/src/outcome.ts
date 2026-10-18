@@ -155,7 +155,7 @@ export async function recordRunOutcome(
     const key = runKeys.outcome(runId);
     // The shared clock when the journal has one: two workers' outcomes are ordered against each
     // other, and local clocks are exactly what cannot do that.
-    const at = journal.now ? await journal.now() : outcome.at;
+    const at = await journal.now();
     const next: RunOutcomeRecord = { ...outcome, at };
     // MONOTONIC, not last-writer-wins. The audit measured the failure: worker A dies on a 401 but its
     // 'failed' put is slow; the lock is already free, worker B resumes the SAME run, succeeds, writes
@@ -201,19 +201,11 @@ export async function recordRunOutcome(
         // back to 'running' even though nothing had run yet — harmless but noisy; and the reverse
         // race (terminal then same-ms running from a parallel starter) hid a real ending.
         if (typeof cur.at === 'number' && cur.at === next.at && next.status === 'running' && cur.status !== 'running') return;
-        if (journal.putIfMatch) {
-          if (await journal.putIfMatch(key, raw, next)) return;
-          continue; // lost the CAS — re-read, the winner may be newer than us
-        }
-        await journal.put(key, next);
-        return;
+        if (await journal.putIfMatch(key, raw, next)) return;
+        continue; // lost the CAS — re-read, the winner may be newer than us
       }
-      if (journal.putIfAbsent) {
-        if (await journal.putIfAbsent(key, next)) return;
-        continue; // someone filled it first — re-read and compare
-      }
-      await journal.put(key, next);
-      return;
+      if (await journal.putIfAbsent(key, next)) return;
+      // someone filled it first — re-read and compare
     }
   } catch {
     // Advisory: the run's own result is already decided. Losing this costs an operator the reason,

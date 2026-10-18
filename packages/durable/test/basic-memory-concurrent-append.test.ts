@@ -71,11 +71,3 @@ for (const [name, make] of journals) {
   });
 }
 
-describe('appendToJournalLog without compare-and-set', () => {
-  it('a journal with only get/put still loses nothing inside one process', async () => {
-    const inner = new InMemoryJournal();
-    const j = slowGet({ get: (k) => inner.get(k), put: (k, v) => inner.put(k, v) });
-    await Promise.all(Array.from({ length: 10 }, (_, i) => appendToJournalLog(j, 'log', [i])));
-    expect(await readJournalLog(j, 'log')).toHaveLength(10);
-  });
-});

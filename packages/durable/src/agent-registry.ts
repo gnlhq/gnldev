@@ -11,6 +11,7 @@
 // (agentVisibleToOrg). withOrg still prefixes it if used through an org view, but the canonical registry
 // lives at the root (platform-admin surface), same as `__audit__`.
 import type { Journal } from './journal.js';
+import { assertJournalGuarantees } from './journal.js';
 import { argsHash } from './hash.js';
 import type { AgentConfig } from './registry.js';
 
@@ -154,11 +155,9 @@ export async function isAgentServable(journal: Journal, name: string): Promise<b
   return rec?.status === 'approved';
 }
 
-/** Lists every agent registry record (requires `listKeys`; throws a clear error otherwise). */
+/** Lists every agent registry record. */
 export async function listAgentRegistry(journal: Journal): Promise<AgentRegistryRecord[]> {
-  if (typeof journal.listKeys !== 'function') {
-    throw new Error('@gnldev/durable: listAgentRegistry requires the journal to implement `listKeys` (see the Journal interface) — cannot enumerate the registry without it.');
-  }
+  assertJournalGuarantees(journal, 'listAgentRegistry');
   const keys = await journal.listKeys(AGENT_REGISTRY_PRE);
   const out: AgentRegistryRecord[] = [];
   for (const k of keys) {

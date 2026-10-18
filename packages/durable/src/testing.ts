@@ -23,7 +23,7 @@ import { leafSuffix } from './run-id-grammar.js';
 import { runRecordKey } from './run-id-grammar.js';
 import assert from 'node:assert/strict';
 import type { Journal, JournalReader, RunSummary, RunStatus, RunListQuery } from './journal.js';
-import { claim, runRecordOf, deriveRunStatus, isOwnerRecordKey, ownerOfRecord, nestedAgentRunId, runKeys } from './journal.js';
+import { claim, missingGuarantees, runRecordOf, deriveRunStatus, isOwnerRecordKey, ownerOfRecord, nestedAgentRunId, runKeys } from './journal.js';
 import { stampFormat } from './format.js';
 import { withOrg, ORG_RECORD_PRE, parseOrganizationKey, orgPrefix } from './organization.js';
 import { RUN_FENCE_PREFIX, runFenceKey } from './erasure-fence.js';
@@ -79,6 +79,12 @@ export interface JournalConformanceOptions {
    * rows, which the keyset cursor needs). Listings are then read in one page.
    */
   pageWalk?: boolean;
+  /**
+   * `false` only for a test double whose other connections see a transaction before it commits (pg-mem
+   * has no isolation between them). A batch is then still checked to apply whole and once; that no
+   * reader sees it half-applied is not. A real store that needs this cannot keep a batch atomic.
+   */
+  isolatedReads?: boolean;
 }
 
 /**
@@ -98,6 +104,7 @@ export function journalConformance(
   refuseUnknownNames('journalConformance', opts, JOURNAL_CONFORMANCE_NAMES);
   const exactClaim = opts.exactClaim !== false;
   const pageWalk = opts.pageWalk !== false;
+  const isolatedReads = opts.isolatedReads !== false;
   const limit = opts.timeout;
   // The limit is the suite's own timer, not only an argument to `it`: `node:test` takes its options
   // before the function and mocha reads `this.timeout()`, so a third argument was dropped in silence there
@@ -119,6 +126,10 @@ export function journalConformance(
 
   opts.describe(`journal conformance — ${name}`, () => {
     // ── The key-value contract ───────────────────────────────────────────────────────────────────
+    scenario('G0 the store provides every guarantee the engine builds on (JOURNAL_GUARANTEES) — none emulated', async ({ journal: j }) => {
+      assert.deepEqual(missingGuarantees(j), [], 'a guarantee no method provides cannot be checked, and the engine refuses the store');
+    });
+
     scenario('K1 get/put: a value reads back as written, an overwrite replaces it, a missing key is undefined', async ({ journal: j }) => {
       const v = { s: 'x', n: 1.5, b: true, nested: { a: [1, 'two', { three: null }] } };
       await j.put('k1:a', v);
@@ -150,7 +161,6 @@ export function journalConformance(
     });
 
     scenario('K3 putIfMatch: a matching record is replaced, a stale or missing one is not touched', async ({ journal: j }) => {
-      if (typeof j.putIfMatch !== 'function') return; // optional: run-lock falls back to get→put
       const stale = { owner: 'A', expires: 1000, token: 'tok-a' };
       const fresh = { owner: 'B', expires: 99_000, token: 'tok-b' };
       await j.put('k3:lock', stale);
@@ -161,6 +171,14 @@ export function journalConformance(
       assert.deepEqual(await j.get('k3:lock'), fresh);
       assert.equal(await j.putIfMatch('k3:missing', stale, fresh), false);
       assert.equal(await j.get('k3:missing'), undefined);
+      // Racing: every worker read the same expired lock and tries to take it over at once.
+      const expired = { owner: 'dead', expires: 1 };
+      await j.put('k3:race', expired);
+      const seen = await j.get('k3:race');
+      const took = await Promise.all(Array.from({ length: 16 }, (_, i) => j.putIfMatch('k3:race', seen, { owner: `w${i}`, expires: 99_000 })));
+      assert.equal(took.filter(Boolean).length, 1, `exactly one compare-and-set wins, got ${took.filter(Boolean).length}`);
+      const kept = await j.get<{ owner: string }>('k3:race');
+      assert.equal(kept?.owner, `w${took.indexOf(true)}`, 'the winner\'s value is the one kept');
     });
 
     scenario('K4 listKeys/deletePrefix: a prefix is literal text — no pattern characters, no case folding, no neighbour', async ({ journal: j }) => {
@@ -185,7 +203,6 @@ export function journalConformance(
     });
 
     scenario('K5 counters: increments are exact under a race, a negative one subtracts, and deletePrefix takes them', async ({ journal: j }) => {
-      if (typeof j.incrBy !== 'function' || typeof j.getCounters !== 'function') return; // optional: budgets fall back to get→put
       const after = await Promise.all(Array.from({ length: 16 }, () => j.incrBy!('k5:org:acme:__usage__', { runs: 1 })));
       assert.deepEqual(await j.getCounters('k5:org:acme:__usage__'), { runs: 16 });
       // A store that hands back the new value hands back each one once (limits take a share by it).
@@ -194,33 +211,74 @@ export function journalConformance(
       assert.deepEqual(await j.getCounters('k5:org:acme:__usage__'), { runs: 10, costUsd: 1.5 });
       await j.incrBy('k5:org:other:__usage__', { runs: 7 });
       await j.put('k5:org:acme:r1:input', { p: 'x' });
-      await j.deletePrefix?.('k5:org:acme:');
+      await j.deletePrefix('k5:org:acme:');
       assert.equal(await j.getCounters('k5:org:acme:__usage__'), undefined, 'a counter is a key: an organization\'s purge takes its usage');
       assert.equal(await j.get('k5:org:acme:r1:input'), undefined);
       assert.deepEqual(await j.getCounters('k5:org:other:__usage__'), { runs: 7 });
     });
 
     scenario('K6 applyBatch and getMany: a claimed batch applies once, all of it or none; getMany keeps order', async ({ journal: j }) => {
-      if (typeof j.applyBatch === 'function') {
+      {
         const batch = { claim: { key: 'k6:claim', value: { at: 1 } }, incrs: [{ key: 'k6:ctr', fields: { runs: 1, tokens: 10 } }], puts: [{ key: 'k6:row', value: { v: 1 } }] };
         assert.equal(await j.applyBatch(batch), true);
         assert.deepEqual(await j.get('k6:row'), { v: 1 });
-        assert.deepEqual(await j.getCounters?.('k6:ctr'), j.getCounters ? { runs: 1, tokens: 10 } : undefined);
+        assert.deepEqual(await j.getCounters('k6:ctr'), { runs: 1, tokens: 10 });
         const second = await j.applyBatch({ ...batch, puts: [{ key: 'k6:row', value: { v: 2 } }] });
         if (exactClaim) {
           assert.equal(second, false);
           assert.deepEqual(await j.get('k6:row'), { v: 1 }, 'a lost claim writes nothing');
-          if (j.getCounters) assert.deepEqual(await j.getCounters('k6:ctr'), { runs: 1, tokens: 10 }, 'a lost claim counts nothing');
+          assert.deepEqual(await j.getCounters('k6:ctr'), { runs: 1, tokens: 10 }, 'a lost claim counts nothing');
         }
         assert.equal(await j.applyBatch({ incrs: [{ key: 'k6:nb', fields: { n: 1 } }] }), true);
         assert.equal(await j.applyBatch({ incrs: [{ key: 'k6:nb', fields: { n: 1 } }] }), true);
-        if (j.getCounters) assert.deepEqual(await j.getCounters('k6:nb'), { n: 2 }, 'a batch with no claim always applies');
+        assert.deepEqual(await j.getCounters('k6:nb'), { n: 2 }, 'a batch with no claim always applies');
+        // Seen whole: a reader racing a batch reads none of it or all of it, never half.
+        if (isolatedReads) {
+          const torn: string[] = [];
+          let done = false;
+          const watch = (async () => {
+            while (!done) {
+              const [c, a2, b2] = await Promise.all([j.get('k6w:claim'), j.get('k6w:a'), j.get('k6w:b')]);
+              const parts = [c !== undefined, a2 !== undefined, b2 !== undefined];
+              if (parts.some(Boolean) && !parts.every(Boolean)) torn.push(parts.map((x) => (x ? 1 : 0)).join(''));
+              await new Promise((r) => setImmediate(r));
+            }
+          })();
+          await new Promise((r) => setImmediate(r));
+          await j.applyBatch({ claim: { key: 'k6w:claim', value: 1 }, puts: [{ key: 'k6w:a', value: 1 }, { key: 'k6w:b', value: 2 }] });
+          done = true;
+          await watch;
+          assert.deepEqual(torn, [], 'a batch was read half-applied');
+        }
+        // Racing claimed batches: one applies, its counters counted once.
+        if (exactClaim) {
+          const applied = await Promise.all(Array.from({ length: 16 }, (_, i) => j.applyBatch({ claim: { key: 'k6r:claim', value: { by: i } }, incrs: [{ key: 'k6r:ctr', fields: { n: 1 } }], puts: [{ key: 'k6r:row', value: { by: i } }] })));
+          assert.equal(applied.filter(Boolean).length, 1, 'exactly one claimed batch applies');
+          assert.deepEqual(await j.getCounters('k6r:ctr'), { n: 1 });
+        }
       }
       if (typeof j.getMany === 'function') {
         await j.put('k6:a', { v: 1 });
         await j.put('k6:c', { v: 3 });
         assert.deepEqual(await j.getMany(['k6:a', 'k6:b', 'k6:c']), [{ v: 1 }, undefined, { v: 3 }]);
       }
+    });
+
+    scenario('K7 now: the store has a clock, it reads as epoch milliseconds, and it does not run backwards', async ({ journal: j }) => {
+      const a1 = await j.now();
+      const a2 = await j.now();
+      assert.ok(Number.isFinite(a1) && a1 > 1_500_000_000_000, `now() is epoch ms, got ${a1}`);
+      assert.ok(a2 >= a1, 'now() does not run backwards between two reads');
+    });
+
+    scenario('K8 change feed: runs come in the order they last changed, not in key order', async ({ journal: j }) => {
+      const reader = j as unknown as JournalReader;
+      if (typeof reader.listRunsChangedSince !== 'function') return; // an accelerator, not a guarantee: the engine reads listRuns instead
+      const pause = () => new Promise((r) => setTimeout(r, 5));
+      for (const id of ['cf-b', 'cf-a', 'cf-c']) { await j.put(`${id}:model:0`, { t: id }); await pause(); }
+      await j.put('cf-b:model:1', { t: 'again' }); // b changes last: the feed reads a, c, b — not the key order a, b, c
+      const got = (await reader.listRunsChangedSince(undefined, { runIdPrefix: 'cf-' })).items.map((r) => r.runId);
+      assert.deepEqual(got, ['cf-a', 'cf-c', 'cf-b'], 'the feed follows change time');
     });
 
     // ── Runs: what makes one, what it reports, its status ────────────────────────────────────────
@@ -330,7 +388,7 @@ export function journalConformance(
         }],
         ['the takeover resolves it', () => j.put('tko:tool:c1', { status: 'succeeded', output: 1 })],
         // (Not on a double that reports a lost claim as won: its adapter then counts the write.)
-        ...(exactClaim ? [['a lost claim changes nothing', async () => { await j.putIfAbsent?.('tko:tool:c1', suspendedRec); }] as [string, () => Promise<unknown>]] : []),
+        ...(exactClaim ? [['a lost claim changes nothing', async () => { await j.putIfAbsent('tko:tool:c1', suspendedRec); }] as [string, () => Promise<unknown>]] : []),
       ];
       const ALL: RunStatus[] = ['completed', 'suspended', 'failed', 'running', 'canceled'];
       const OPEN: RunStatus[] = ['canceled', 'suspended', 'failed', 'running'];

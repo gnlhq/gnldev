@@ -55,10 +55,8 @@ export async function recordIncident(journal: Journal, runId: string, incident: 
   }
 }
 
-/** All incidents of a run, oldest first. Empty if the adapter has no `listKeys` (same optional-capability
- *  fallback as readProcessorReports/audit). */
+/** All incidents of a run, oldest first. */
 export async function readIncidents(journal: Journal, runId: string): Promise<RunIncident[]> {
-  if (typeof journal.listKeys !== 'function') return [];
   const keys = await journal.listKeys(runRecordPrefix(runId, 'incident'));
   const out: RunIncident[] = [];
   for (const key of keys) {

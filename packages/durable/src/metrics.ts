@@ -1,15 +1,14 @@
 // P1.6 materialized metrics layer — Studio's `/metrics` and `/metrics/runs`
 // used to re-read EVERY run's full journal on EVERY request (getRunCost does a `readRun` per run) —
 // O(runs × entries) per page view, which collapses at a few thousand runs. This file adds INCREMENTAL
-// counters written ONCE at run completion, riding the EXISTING optional Journal primitives (incrBy/
-// getCounters/putIfAbsent/put/deletePrefix — see the parity matrix in journal.ts) so every first-party
-// backend (in-memory/sqlite/postgres) gets it for free — NO new dependency, NO time-series DB.
-// Same shape as budget.ts's `__usage__` counter (H8a) and its get→put/warn-once fallback story, just
-// bucketed per-day/per-agent instead of a single running total, plus a per-run "fast row" for the
-// runs table (avoids readRun+getRunCost for every already-finalized run).
+// counters written ONCE at run completion, riding the store's guarantees (applyBatch/incrBy/getCounters/
+// putIfAbsent/deletePrefix — journal.ts JOURNAL_GUARANTEES) — NO new dependency, NO time-series DB.
+// Same shape as budget.ts's `__usage__` counter (H8a), just bucketed per-day/per-agent instead of a
+// single running total, plus a per-run "fast row" for the runs table (avoids readRun+getRunCost for
+// every already-finalized run).
 import { runRecordPrefix } from './run-id-grammar.js';
 import type { Journal, JournalBatch, JournalReader } from './journal.js';
-import { summarizeRun, runKeys, listRunsArray } from './journal.js';
+import { summarizeRun, runKeys, listRunsArray, assertJournalGuarantees } from './journal.js';
 import { getRunCost } from './cost.js';
 import { METRICS_SHARDS, shardSuffix, sumShards } from './counter-shard.js';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -69,8 +68,7 @@ export function metricsAgentDayKey(agentName: string, day: string): string {
  * Returns `undefined` when no shard holds data, exactly as an unsharded miss did.
  */
 export function readCounter(journal: Journal, key: string): Promise<Record<string, number> | undefined> {
-  if (typeof journal.getCounters !== 'function') return Promise.resolve(undefined);
-  return sumShards((k) => journal.getCounters!(k), key, METRICS_SHARDS);
+  return sumShards((k) => journal.getCounters(k), key, METRICS_SHARDS);
 }
 
 /** Fast-path per-run row key: `__metrics__run:<runId>`. */
@@ -187,17 +185,11 @@ export interface MetricsRunRow {
  * hook (registry.ts `run()`, right after the C4 scorers block) and from `backfillMetrics`.
  *
  * CONTRACT: the journal (readRun/getRunCost) is always the source of truth; this is the derived aggregate.
- * P1.6b — TWO write paths, chosen by capability:
- * `applyBatch` (all first-party journals): claim marker + counter increments + fast-row land as ONE
- *    all-or-nothing unit (SQL transaction / in-memory sync block) → NO loss window at all.
- * Sequential fallback (third-party journals without applyBatch): claim FIRST (`putIfAbsent` CAS,
- *    exactly-once under concurrency), then incrBy. A crash between the two loses that ONE run's
- *    contribution (marker-first = UNDERCOUNTS, never overcounts — the safe direction; same accepted
- *    window as budget.ts's `recordRunUsage`). `rebuildMetrics` is the deterministic repair either way.
+ * P1.6b — one write: claim marker + counter increments + fast-row land in ONE `applyBatch`, all or
+ *    nothing (SQL transaction / in-memory sync block) → NO loss window. `rebuildMetrics` is the
+ *    deterministic repair.
  *
  * Returns `false` (no-op) when:
- * the journal doesn't implement `incrBy`/`putIfAbsent` (no atomic primitives → the legacy full-scan
- *    stays the story for this backend; a custom third-party journal without these is unaffected/unbroken),
  * the reader doesn't implement `readRun` (can't compute per-run stats),
  * the run was already recorded (claim lost — idempotent, not an error).
  * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
@@ -208,18 +200,11 @@ export async function recordRunMetrics(
   runId: string,
   opts: { agentName?: string } = {},
 ): Promise<boolean> {
-  const hasBatch = typeof journal.applyBatch === 'function';
-  if (!hasBatch && (typeof journal.incrBy !== 'function' || typeof journal.putIfAbsent !== 'function')) return false;
   if (typeof reader.readRun !== 'function') return false;
 
   // Cheap pre-check on the common already-recorded path (avoids computing stats just to lose the claim).
   // NOT the exactly-once guarantee itself — that stays with the atomic claim below (batch or CAS).
   if ((await journal.get(metricsDoneKey(runId))) !== undefined) return false;
-
-  if (!hasBatch) {
-    const claimed = await journal.putIfAbsent!(metricsDoneKey(runId), { at: Date.now() });
-    if (!claimed) return false; // already recorded (exactly-once) — not an error
-  }
 
   const entries = await reader.readRun(runId);
   const summary = summarizeRun(runId, entries);
@@ -234,7 +219,7 @@ export async function recordRunMetrics(
   const endTs = tsValues.length ? Math.max(...tsValues) : null;
   const durationMs = startTs != null && endTs != null ? Math.max(0, endTs - startTs) : 0;
 
-  const now = (await journal.now?.()) ?? Date.now();
+  const now = await journal.now();
   const day = dayKeyFor(now);
   const bucketField = durationBucketField(durationMs);
 
@@ -272,18 +257,12 @@ export async function recordRunMetrics(
     finalizedAt: now,
   };
 
-  if (hasBatch) {
-    // Atomic path: claim + increments + row are all-or-nothing → no loss window (see the contract note).
-    return journal.applyBatch!({
-      claim: { key: metricsDoneKey(runId), value: { at: Date.now() } },
-      incrs,
-      puts: [{ key: metricsRunKey(runId), value: row }],
-    });
-  }
-
-  for (const i of incrs) await journal.incrBy!(i.key, i.fields);
-  await journal.put(metricsRunKey(runId), row);
-  return true;
+  // Claim + increments + row are all-or-nothing → no loss window (see the contract note).
+  return journal.applyBatch({
+    claim: { key: metricsDoneKey(runId), value: { at: Date.now() } },
+    incrs,
+    puts: [{ key: metricsRunKey(runId), value: row }],
+  });
 }
 
 /**
@@ -314,16 +293,13 @@ export async function recordRunMetrics(
  * same posture as the `.catch(() => {})` at the registry.ts call site).
  *
  * Exactly-once via ITS OWN claim marker (`metricsScoresDoneKey`, distinct from `recordRunMetrics`'s
- * `metricsDoneKey` — see that key's JSDoc for why). Same two write paths as `recordRunMetrics`
- * (applyBatch when available, sequential putIfAbsent+incrBy fallback otherwise) and the same
- * `false`-means-no-op contract (already recorded, or the journal lacks the atomic primitives).
+ * `metricsDoneKey` — see that key's JSDoc for why). The same one `applyBatch` as `recordRunMetrics`,
+ * and the same `false`-means-no-op contract (already recorded).
  *
  * REPAIR PATH (closed in the same round, review finding): `backfillMetrics` restores score counters
  * from the per-run `proc:eval:<name>` memoization records (they ARE the journaled ground truth for
  * scores), and `rebuildMetrics` wipes `METRICS_SCORES_DONE_PRE` alongside the other prefixes — so
  * "rebuild = deterministic repair" holds for score aggregates too, not just the base run counters.
- * Requires `listKeys` for the per-run eval scan; without it, score restoration is skipped (base
- * metrics still rebuild) — documented in backfillMetrics.
  */
 export async function recordRunScores(
   journal: Journal,
@@ -331,18 +307,10 @@ export async function recordRunScores(
   agentName: string | undefined,
   scores: Record<string, number | { score: number }>,
 ): Promise<boolean> {
-  const hasBatch = typeof journal.applyBatch === 'function';
-  if (!hasBatch && (typeof journal.incrBy !== 'function' || typeof journal.putIfAbsent !== 'function')) return false;
-
   // Cheap pre-check — mirrors recordRunMetrics (not the exactly-once guarantee itself, see below).
   if ((await journal.get(metricsScoresDoneKey(runId))) !== undefined) return false;
 
-  if (!hasBatch) {
-    const claimed = await journal.putIfAbsent!(metricsScoresDoneKey(runId), { at: Date.now() });
-    if (!claimed) return false; // already recorded (exactly-once) — not an error
-  }
-
-  const now = (await journal.now?.()) ?? Date.now();
+  const now = await journal.now();
   const day = dayKeyFor(now);
 
   const fields: Record<string, number> = {};
@@ -364,15 +332,10 @@ export async function recordRunScores(
     ...(agentName ? [{ key: metricsAgentDayKey(agentName, day) + sfx, fields }] : []),
   ];
 
-  if (hasBatch) {
-    return journal.applyBatch!({
-      claim: { key: metricsScoresDoneKey(runId), value: { at: Date.now() } },
-      incrs,
-    });
-  }
-
-  for (const i of incrs) await journal.incrBy!(i.key, i.fields);
-  return true;
+  return journal.applyBatch({
+    claim: { key: metricsScoresDoneKey(runId), value: { at: Date.now() } },
+    incrs,
+  });
 }
 
 /**
@@ -401,22 +364,19 @@ export async function backfillMetrics(
     // P2-skor repair (review finding): scorer results are journaled (`<runId>:proc:eval:<name>` — the
     // C4 memoization records, `{v: {score,...}}` shape per durableProcessorStep), so the score counters
     // are RE-DERIVABLE — without this, `rebuildMetrics`' wipe lost score aggregates permanently while
-    // claiming to be "the deterministic repair". Needs listKeys (prefix scan); silently skipped without
-    // it (base metrics still backfill — scores just stay unrestored, same as pre-P2 behavior).
+    // claiming to be "the deterministic repair".
     // Attempted independently of `ok`: the scores claim is SEPARATE (metricsScoresDoneKey), so a run
     // whose base metrics were already recorded but whose score counters were wiped still restores.
-    if (typeof journal.listKeys === 'function') {
-      const evalPrefix = `${runRecordPrefix(r.runId, 'proc')}eval:`;
-      const evalKeys = await journal.listKeys(evalPrefix);
-      if (evalKeys.length) {
-        const scores: Record<string, number | { score: number }> = {};
-        for (const k of evalKeys) {
-          const rec = await journal.get<{ v: { score?: number } }>(k);
-          const name = k.slice(evalPrefix.length);
-          if (rec?.v !== undefined && name) scores[name] = rec.v as { score: number };
-        }
-        if (Object.keys(scores).length && (await recordRunScores(journal, r.runId, r.agent, scores))) scoresRestored++;
+    const evalPrefix = `${runRecordPrefix(r.runId, 'proc')}eval:`;
+    const evalKeys = await journal.listKeys(evalPrefix);
+    if (evalKeys.length) {
+      const scores: Record<string, number | { score: number }> = {};
+      for (const k of evalKeys) {
+        const rec = await journal.get<{ v: { score?: number } }>(k);
+        const name = k.slice(evalPrefix.length);
+        if (rec?.v !== undefined && name) scores[name] = rec.v as { score: number };
       }
+      if (Object.keys(scores).length && (await recordRunScores(journal, r.runId, r.agent, scores))) scoresRestored++;
     }
   }
   return { recorded, skipped, scoresRestored };
@@ -426,7 +386,7 @@ export async function backfillMetrics(
  * Deterministic repair: wipes every materialized-metrics key (counters + run rows + claim markers) and
  * recomputes them from the journal via `backfillMetrics` — the journal is the source of truth (see the
  * trade-off note on `recordRunMetrics`), so this always converges to the exact values regardless of any
- * prior undercount/drift. Requires `deletePrefix` (throws a clear error otherwise — no silent partial rebuild).
+ * prior undercount/drift.
  *
  * ADAPTER CONTRACT: `deletePrefix` wiping a counter written via `incrBy` requires the adapter to treat
  * counter keys as ordinary keys of the prefix space (the deletePrefix contract in journal.ts: ALL keys).
@@ -441,11 +401,7 @@ export async function rebuildMetrics(
   journal: Journal,
   reader: JournalReader,
 ): Promise<{ recorded: number; skipped: number; scoresRestored: number }> {
-  if (typeof journal.deletePrefix !== 'function') {
-    throw new Error(
-      "@gnldev/durable: rebuildMetrics requires the journal to implement `deletePrefix` (see the Journal interface in journal.ts) — without it there is no safe way to wipe the existing aggregate before recomputing it.",
-    );
-  }
+  assertJournalGuarantees(journal, 'rebuildMetrics');
   await journal.deletePrefix(METRICS_COUNTERS_PRE);
   await journal.deletePrefix(METRICS_DONE_PRE);
   await journal.deletePrefix(METRICS_RUN_PRE);
@@ -474,7 +430,6 @@ export async function readMetricsSummary(
   opts: { days?: number } = {},
 ): Promise<{ all: Record<string, number> | undefined; byDay: MetricsDayEntry[] }> {
   refuseUnknownNames('readMetricsSummary', opts, METRICS_SUMMARY_NAMES);
-  if (typeof journal.getCounters !== 'function') return { all: undefined, byDay: [] };
   /**
    * `days: 0` asks for the `all` bucket and nothing else — for a caller that wants the running
    * totals and never looks at the daily series.

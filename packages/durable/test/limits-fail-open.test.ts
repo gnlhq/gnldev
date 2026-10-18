@@ -6,21 +6,15 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { runDurable } from '../src/run.js';
 import { createMockModel, finalTextResult } from './mock.js';
+import { InMemoryJournal } from '../src/journal.js';
 import type { Journal } from '../src/journal.js';
 
 afterEach(() => vi.restoreAllMocks());
 
-/** A minimal, VALID Journal: get/put/putIfAbsent only — deliberately NO `readRun` (that lives on the
- *  optional JournalReader). This is the "I brought my own journal" shape that limits cannot enforce. */
-class NoReaderJournal implements Journal {
-  private m = new Map<string, unknown>();
-  async get<T = unknown>(key: string): Promise<T | undefined> { return this.m.get(key) as T | undefined; }
-  async put(key: string, value: unknown): Promise<void> { this.m.set(key, value); }
-  async putIfAbsent(key: string, value: unknown): Promise<boolean> {
-    if (this.m.has(key)) return false;
-    this.m.set(key, value);
-    return true;
-  }
+/** A complete store with deliberately NO `readRun` (that lives on the optional JournalReader). This is
+ *  the "I brought my own journal" shape that limits cannot enforce. */
+class NoReaderJournal extends InMemoryJournal {
+  override readRun = undefined as never;
 }
 
 const model = () => createMockModel(async () => finalTextResult('done'));

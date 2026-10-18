@@ -114,11 +114,6 @@ describe('recordProcessorReport / readProcessorReports (audit reports — additi
     expect(reports[0]!.findings).toEqual({ hit: 'first' });
   });
 
-  it('returns an empty array for a journal that does not support listKeys (does not throw)', async () => {
-    const bare = { get: async () => undefined, put: async () => {} } as any;
-    expect(await readProcessorReports(bare, 'r3')).toEqual([]);
-  });
-
   it('best-effort: recordProcessorReport SILENTLY swallows a missing/broken ctx.journal (does not throw)', async () => {
     const brokenCtx = { runId: 'r4', journal: {} as any, step: async (_n: string, c: any) => c() };
     await expect(recordProcessorReport(brokenCtx as any, 'x', 'input', { a: 1 })).resolves.toBeUndefined();

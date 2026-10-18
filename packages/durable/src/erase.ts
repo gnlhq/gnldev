@@ -329,9 +329,7 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
   // starting at all (revoke, wait or cancel, erase, check again).
   const home = memoryHome(storage, opts.memory);
   const journal = toJournal(storage.runs);
-  if (typeof journal.deletePrefix !== 'function') throw new Error('@gnldev/durable: eraseSubject needs a journal that can deletePrefix');
   const homeJournal = home ? toJournal(home.runs) : undefined;
-  if (homeJournal && typeof homeJournal.deletePrefix !== 'function') throw new Error('@gnldev/durable: eraseSubject\'s `memory` storage needs a journal that can deletePrefix');
   const work = storage.work;
   if (work && typeof work.deleteIdPrefix !== 'function') {
     throw new Error('@gnldev/durable: eraseSubject was given a work store that cannot delete by id prefix, so this person\'s jobs and events cannot be erased');
@@ -371,7 +369,7 @@ export async function eraseSubject(storage: Storage, resourceId: string, opts: E
   const ownedByRecord = new Set<string>();
   const ownerKeys = runs.listOwnerRecords
     ? await runs.listOwnerRecords(resourceId, { prefix: 'thread:' })
-    : (await runs.listKeys?.('thread:')) ?? [];
+    : await runs.listKeys('thread:');
   for (const k of ownerKeys) if (k.startsWith('thread:') && k.endsWith(':owner')) ownedByRecord.add(k.slice('thread:'.length, -':owner'.length));
   // Outside organizations, a thread under an `org:` id is the root's to erase only when it is CERTAINLY
   // the root's (`reservedThreadVerdict`); an organization's goes with that organization's erasure, and

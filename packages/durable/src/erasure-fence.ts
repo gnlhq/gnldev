@@ -147,7 +147,6 @@ export async function assertNotErased(journal: Journal, runId: string, baseline:
  * organization that was never registered keeps its fences until a sweep through its own view.
  */
 export async function sweepRunFences(journal: Journal, cutoff: number): Promise<number> {
-  if (typeof journal.listKeys !== 'function' || typeof journal.deletePrefix !== 'function') return 0;
   const scopes = [''];
   if (orgScopeOf(journal) === undefined) {
     for (const rec of await journal.listKeys(ORG_RECORD_PRE)) {

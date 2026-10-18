@@ -34,7 +34,7 @@
  */
 import { runRecordPrefix, composeRunId, ownKeysOf, leafSuffix, RUN_KEYED_FAMILIES, type RunKeyedFamily } from './run-id-grammar.js';
 import { randomUUID } from 'node:crypto';
-import { runKeys, nestedAgentRunId, runIdOfKey, executedHere, listRunsWhere, asReaderJournal, deferredTaskRunId, deferredContinuationRunId } from './journal.js';
+import { runKeys, nestedAgentRunId, runIdOfKey, executedHere, listRunsWhere, asReaderJournal, deferredTaskRunId, deferredContinuationRunId, assertJournalGuarantees } from './journal.js';
 import type { Journal, JournalReader, RunSummary } from './journal.js';
 import { MEM_LEAVES, OM_LEAVES, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX, OM_VECTOR_SOURCE } from './memory.js';
 import { threadOwnerKey, threadSeenKey } from './thread-owner.js';
@@ -118,10 +118,9 @@ export function threadIdOfMemKey(key: string): string | undefined {
 
 // ── The journal primitives the executor runs ────────────────────────────────────────────────────
 
-export function requireDelete(journal: Journal): NonNullable<Journal['deletePrefix']> {
-  if (typeof journal.deletePrefix !== 'function') {
-    throw new Error("@gnldev/durable: journal must support 'deletePrefix' for purge (InMemory/Sqlite/Postgres provide it)");
-  }
+/** The deletion every purge runs, from a store that keeps every guarantee — refused, naming what it lacks, otherwise. */
+export function requireDelete(journal: Journal): Journal['deletePrefix'] {
+  assertJournalGuarantees(journal, 'a deletion (purge, sweep, erasure)');
   return journal.deletePrefix.bind(journal);
 }
 
@@ -152,10 +151,8 @@ export const workflowStatusKey = (runId: string) => `wfrun:${runId}`;
 export async function deleteExactKey(journal: Journal, key: string): Promise<number> {
   const del = requireDelete(journal);
   if ((await journal.get(key)) === undefined) return 0;
-  const lk = journal.listKeys;
-  if (typeof lk !== 'function') return del(key);
   const neighbors: Array<[string, unknown]> = [];
-  for (const k of await lk.call(journal, key)) {
+  for (const k of await journal.listKeys(key)) {
     if (k === key) continue;
     neighbors.push([k, await journal.get(k)]);
   }
@@ -179,7 +176,6 @@ export async function deleteExactKey(journal: Journal, key: string): Promise<num
 export async function deleteOwnKeyed(journal: Journal, family: RunKeyedFamily, runId: string): Promise<number> {
   const del = requireDelete(journal);
   const prefix = RUN_KEYED_FAMILIES[family].prefix(runId);
-  if (typeof journal.listKeys !== 'function') return del(prefix);
   const { own, all } = await ownKeysOf(journal as { listKeys(p: string): Promise<string[]> }, family, runId);
   if (own.length === 0) return 0;
   if (own.length === all) return del(prefix);
@@ -217,9 +213,7 @@ export async function deleteOwnKeyed(journal: Journal, family: RunKeyedFamily, r
 export async function purgeOwnNamespace(journal: Journal & Partial<JournalReader>, runId: string): Promise<number> {
   const del = requireDelete(journal);
   const prefix = `${runId}:`;
-  const lk = journal.listKeys;
-  if (typeof lk !== 'function') return del(prefix);
-  const keys = await lk.call(journal, prefix);
+  const keys = await journal.listKeys(prefix);
   const neighbours = new Set<string>();
   for (const k of keys) {
     // runIdOfKey reads the value only for `:input` keys — a point-read on every key here turned a
@@ -247,13 +241,7 @@ export async function purgeOwnNamespace(journal: Journal & Partial<JournalReader
  * whose steps all live behind a suspend, or one built with no steps at all, has written nothing else.
  */
 export async function hasTrace(journal: Journal & Partial<JournalReader>, runId: string): Promise<boolean> {
-  const lk = journal.listKeys;
-  const rr = journal.readRun;
-  if (typeof lk === 'function') {
-    if ((await lk.call(journal, `${runId}:`)).length > 0) return true;
-  } else if (typeof rr === 'function' && (await rr.call(journal, runId)).length > 0) {
-    return true;
-  }
+  if ((await journal.listKeys(`${runId}:`)).length > 0) return true;
   return (await journal.get(workflowStatusKey(runId))) !== undefined;
 }
 
@@ -279,10 +267,7 @@ async function usageToSubtract(journal: Journal & Partial<JournalReader>, runId:
   // H8a fix: usage can live in the legacy USAGE_KEY OR in atomic counters — the old guard, which
   // only looked at legacy, silently skipped the subtraction in the counter-only case (caught by a test).
   const legacy = await journal.get<OrganizationUsage>(USAGE_KEY);
-  const counters =
-    typeof (journal as Journal).getCounters === 'function'
-      ? await (journal as Journal).getCounters!(USAGE_KEY)
-      : undefined;
+  const counters = await (journal as Journal).getCounters(USAGE_KEY);
   if (!legacy && !counters) return undefined; // no counter at all → nothing to subtract
   const cost = await getRunCost(journal as unknown as JournalReader, runId);
   return { cost, ...(legacy ? { legacy } : {}) };
@@ -292,18 +277,8 @@ async function subtractUsage(journal: Journal, pending: PendingUsage | undefined
   const { cost, legacy } = pending;
   // H8a: if incrBy exists, subtract ATOMICALLY with a negative delta (reads are clamped to 0 on
   // the readUsageCounter side); otherwise legacy get→put + clamp (single-process safe).
-  if (typeof journal.incrBy === 'function') {
-    try {
-      await journal.incrBy(USAGE_KEY, { runs: -1, tokens: -cost.totalTokens, costUsd: -cost.costUsd });
-      return;
-    } catch { /* fall back to legacy */ }
-  }
-  if (!legacy) return; // no legacy record → no legacy subtraction either
-  await journal.put(USAGE_KEY, {
-    runs: Math.max(0, legacy.runs - 1),
-    tokens: Math.max(0, legacy.tokens - cost.totalTokens),
-    costUsd: Math.max(0, legacy.costUsd - cost.costUsd),
-  });
+  void legacy; // a legacy record is read back as part of the sum (readUsageCounter); the counter takes the delta
+  await journal.incrBy(USAGE_KEY, { runs: -1, tokens: -cost.totalTokens, costUsd: -cost.costUsd });
 }
 
 /**
@@ -346,10 +321,7 @@ async function purgeThreadNamespace(
 ): Promise<number> {
   const del = requireDelete(journal);
   const scope = `${prefix}${threadId}:`;
-  const lk = journal.listKeys;
-  if (typeof lk !== 'function') return del(scope);
-
-  const keys = await lk.call(journal, scope);
+  const keys = await journal.listKeys(scope);
   const mine: string[] = [];
   let foreign = false;
   for (const k of keys) {
@@ -599,19 +571,16 @@ export async function planRun(journal: Journal & Partial<JournalReader>, runId: 
       }
     }
   }
-  const lk = journal.listKeys;
-  if (typeof lk === 'function') {
-    // Its network steps' runs, from its OWN route records (`<runId>:net:route:<i>`, frozen before step i's
-    // run begins) — not from the prefix `net:<runId>:`, which also starts the network runs of a run whose
-    // id extends this one (`x:5` → `net:x:5:0`).
-    const kids = new Set<string>();
-    const routes = `${runRecordPrefix(runId, 'net')}route:`;
-    for (const k of await lk.call(journal, routes)) {
-      const i = k.slice(routes.length);
-      if (/^\d+$/.test(i)) kids.add(composeRunId('net', runId, Number(i)));
-    }
-    for (const kid of kids) steps.push(...(await planRun(journal, kid, seen)));
+  // Its network steps' runs, from its OWN route records (`<runId>:net:route:<i>`, frozen before step i's
+  // run begins) — not from the prefix `net:<runId>:`, which also starts the network runs of a run whose
+  // id extends this one (`x:5` → `net:x:5:0`).
+  const kids = new Set<string>();
+  const routes = `${runRecordPrefix(runId, 'net')}route:`;
+  for (const k of await journal.listKeys(routes)) {
+    const i = k.slice(routes.length);
+    if (/^\d+$/.test(i)) kids.add(composeRunId('net', runId, Number(i)));
   }
+  for (const kid of kids) steps.push(...(await planRun(journal, kid, seen)));
   steps.push({ kind: 'run', runId, mirrors });
   return steps;
 }
@@ -706,7 +675,6 @@ export const windowClaimPointerKey = (runId: string, toolCallId: string): string
  * (`windowClaimPointerKey`); the claim it points to is read here, so the answer is the claim's own state.
  */
 export async function hasRunningClaim(journal: Journal, runId: string): Promise<boolean> {
-  if (typeof journal.listKeys !== 'function') return false;
   // The run's own claim families, by their exact prefixes (run-id-grammar.ts): its namespace also holds a
   // run whose id extends this one (`x:y` under `x:`), and that run's running call is not this run's.
   const pointers = windowClaimPointerKey(runId, '');
@@ -755,7 +723,7 @@ export async function settleErasedRun(
   // No fence of its own: the deletion it completes has already left its mark (the run's fence, or the
   // organization's purge marker). Written here, after an organization's purge, it landed inside the
   // purged partition — a record the next tenant of the id inherited.
-  if (typeof journal.deletePrefix === 'function') await executePlan({ journal }, await planRun(journal, runId), { fence: false });
+  await executePlan({ journal }, await planRun(journal, runId), { fence: false });
   return true;
 }
 
@@ -858,7 +826,7 @@ export async function executePlan(
         // name the run, and a sweep would otherwise find the record and try to continue a deleted run.
         {
           const root = (orgParentOf(journal) ?? journal) as Journal;
-          if (root.deletePrefix) for (const k of RUN_DEPENDENTS.platformKeys(orgScopeOf(journal), step.runId)) total += await root.deletePrefix(k);
+          for (const k of RUN_DEPENDENTS.platformKeys(orgScopeOf(journal), step.runId)) total += await root.deletePrefix(k);
         }
         // The run's own records LAST: they are how a second attempt finds it (its `:input` lists it on its
         // thread and its person, its keys answer `hasTrace` from its parent). Gone first, a deletion killed
@@ -946,11 +914,9 @@ async function writeOwnershipTrace(journal: Journal, runId: string): Promise<voi
  * silent half-deletion.
  */
 async function purgeTracesTo(journal: Journal, threadId: string): Promise<number> {
-  const lk = journal.listKeys;
-  if (typeof lk !== 'function') return 0;
   let total = 0;
   const pre = ownershipTraceKey('', '').slice(0, -1); // 'resthr:'
-  for (const key of await lk.call(journal, pre)) {
+  for (const key of await journal.listKeys(pre)) {
     const rest = key.slice(pre.length);
     const cut = rest.indexOf(':');
     if (cut < 0 || rest.slice(cut + 1) !== threadId) continue;

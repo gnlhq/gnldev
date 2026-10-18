@@ -54,10 +54,26 @@ describe('sweepRuns (retention TTL)', () => {
       entries.forEach((e, i) => store.set(`${rid}:${e.suspended ? 'tool' : 'model'}:${i}`, e.suspended ? { status: 'suspended', output: {} } : { content: [] }));
     }
     const meta = runs;
+    const counters = new Map<string, Record<string, number>>();
     return {
       store,
       async get(k: string) { return store.get(k); },
       async put(k: string, v: unknown) { store.set(k, v); },
+      // The rest of a store's guarantees (journal.ts JOURNAL_GUARANTEES), over the same map: one process,
+      // no await between a read and its write, so each is atomic.
+      async putIfAbsent(k: string, v: unknown) { if (store.has(k)) return false; store.set(k, v); return true; },
+      async putIfMatch(k: string, e: unknown, v: unknown) { if (!store.has(k) || JSON.stringify(store.get(k)) !== JSON.stringify(e)) return false; store.set(k, v); return true; },
+      async applyBatch(b: { claim?: { key: string; value: unknown }; incrs?: { key: string; fields: Record<string, number> }[]; puts?: { key: string; value: unknown }[] }) {
+        if (b.claim && store.has(b.claim.key)) return false;
+        if (b.claim) store.set(b.claim.key, b.claim.value);
+        for (const i of b.incrs ?? []) { const c = counters.get(i.key) ?? {}; for (const [f, d] of Object.entries(i.fields)) c[f] = (c[f] ?? 0) + d; counters.set(i.key, c); }
+        for (const p of b.puts ?? []) store.set(p.key, p.value);
+        return true;
+      },
+      async incrBy(k: string, fields: Record<string, number>) { const c = counters.get(k) ?? {}; for (const [f, d] of Object.entries(fields)) c[f] = (c[f] ?? 0) + d; counters.set(k, c); return { ...c }; },
+      async getCounters(k: string) { return counters.get(k); },
+      async listKeys(prefix: string) { return [...store.keys()].filter((k) => k.startsWith(prefix)).sort(); },
+      async now() { return Date.now(); },
       async deletePrefix(prefix: string) {
         let d = 0;
         for (const k of [...store.keys()]) if (k.startsWith(prefix)) { store.delete(k); d++; }

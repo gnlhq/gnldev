@@ -107,6 +107,8 @@ class InMemoryRunJournal implements RunJournal {
   listStaleRuns(cutoffTs: number, opts?: { includeSuspended?: boolean }) { return this.journal.listStaleRuns(cutoffTs, opts); }
   readRunStats(runId: string) { return this.journal.readRunStats(runId); }
   deletePrefix(prefix: string) { return this.journal.deletePrefix(prefix); }
+  now() { return this.journal.now(); }
+  getMany<T = unknown>(keys: string[]) { return this.journal.getMany<T>(keys); }
   // Filtered before it is sliced, and paged by run rather than by row number (run-cursor.ts) — the
   // same cursor every other run listing hands out.
   async listRuns(q?: ListQuery): Promise<Page<RunSummary>> {

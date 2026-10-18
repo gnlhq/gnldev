@@ -6,6 +6,7 @@ import { InMemoryJournal, runKeys, USAGE_KEY, recordRunUsage, getOrgUsage, purge
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { runDurable } from '../src/run.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
+import { forwardGuarantees } from './store-guarantees.js';
 
 describe('H8a — atomic counters (incrBy)', () => {
   it.each([
@@ -80,6 +81,7 @@ describe('H8c — replay-cache RAM guardrail (readRunStats)', () => {
     const inner = new InMemoryJournal();
     const stats = { readRun: 0, get: 0 };
     const j: any = {
+      ...forwardGuarantees(inner),
       get: (k: string) => (stats.get++, inner.get(k)),
       put: (k: string, v: unknown) => inner.put(k, v),
       putIfAbsent: (k: string, v: unknown) => inner.putIfAbsent(k, v),
@@ -104,6 +106,7 @@ describe('H8c — replay-cache RAM guardrail (readRunStats)', () => {
     const inner = new InMemoryJournal();
     const stats = { readRun: 0 };
     const j: any = {
+      ...forwardGuarantees(inner),
       get: (k: string) => inner.get(k),
       put: (k: string, v: unknown) => inner.put(k, v),
       putIfAbsent: (k: string, v: unknown) => inner.putIfAbsent(k, v),

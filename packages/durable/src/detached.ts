@@ -308,7 +308,7 @@ export class DetachedRuns {
         return { runId: req.runId, state: 'parked', from: await before() };
       }
       // Its process is gone, it was released by a draining process, or a human's answer arrived.
-      if (await runErasedSince(runJournal, req.runId, undefined)) { await this.opts.journal.deletePrefix?.(key); continue; }
+      if (await runErasedSince(runJournal, req.runId, undefined)) { await this.opts.journal.deletePrefix(key); continue; }
       const rec = mine(await lastSeq());
       this.stats.execWrites++;
       if (await compareAndSet(this.opts.journal, key, cur, rec)) {
@@ -321,7 +321,7 @@ export class DetachedRuns {
 
   /** Takes over every run whose executing process is gone (or that a draining process released). */
   async sweep(): Promise<number> {
-    if (this.sweeping || this.draining || isDraining() || !this.opts.journal.listKeys) return 0;
+    if (this.sweeping || this.draining || isDraining()) return 0;
     // Takes nothing over while it cannot prove its own lock (it would stamp an id the others read as dead).
     if (!(await this.liveness.confirm())) return 0;
     this.sweeping = true;
@@ -340,7 +340,7 @@ export class DetachedRuns {
         if (cur.status === 'running' && (cur.owner === this.liveness.id || (await isAlive(cur.owner)) !== false)) continue;
         // An erased run is not continued: its record goes (the erasure model deletes it too; this covers
         // a record written back by an executor that died before it read the fence).
-        if (await runErasedSince(this.journalOf(cur.scope), cur.runId, undefined)) { await this.opts.journal.deletePrefix?.(key); continue; }
+        if (await runErasedSince(this.journalOf(cur.scope), cur.runId, undefined)) { await this.opts.journal.deletePrefix(key); continue; }
         const rec: ExecRecord = { ...cur, owner: this.liveness.id, status: 'running', at: Date.now(), from: (await lastRunEvent(this.journalOf(cur.scope), cur.runId))?.seq ?? 0 };
         this.stats.execWrites++;
         if (!(await compareAndSet(this.opts.journal, key, cur, rec))) continue;
@@ -469,7 +469,6 @@ export class DetachedRuns {
 
   /** Runs that cannot move on their own: waiting on a human, or held by a live process that has gone quiet. */
   async pending(quietMs = 60_000): Promise<Array<{ runId: string; scope?: string; status: ExecRecord['status']; owner: string; reason: string }>> {
-    if (!this.opts.journal.listKeys) return [];
     const out: Array<{ runId: string; scope?: string; status: ExecRecord['status']; owner: string; reason: string }> = [];
     for (const key of await this.opts.journal.listKeys(EXEC_PREFIX)) {
       const rec = await this.opts.journal.get<ExecRecord>(key);
@@ -570,7 +569,7 @@ export class DetachedRuns {
       // (the engine's refusal says so: nobody is to continue it).
       const cur = await this.opts.journal.get<ExecRecord>(key);
       if (cur && cur.owner === rec.owner && cur.at === rec.at) {
-        if ((e as { code?: unknown })?.code === 'run_erased' || (await readRunOutcome(journal, rec.runId)) === undefined) await this.opts.journal.deletePrefix?.(key);
+        if ((e as { code?: unknown })?.code === 'run_erased' || (await readRunOutcome(journal, rec.runId)) === undefined) await this.opts.journal.deletePrefix(key);
         else await compareAndSet(this.opts.journal, key, cur, {
           ...cur, status: 'parked', reason: `could not be continued: ${errorData(e).message}`, at: Date.now(),
           // Waiting on a call's outcome: the next ask backs off like any other, not every sweep.
@@ -598,7 +597,7 @@ export class DetachedRuns {
     // A launch that began no run (no owner record, no rows) has nothing to log: its events would be the
     // first records of a run nobody began (run-identity.ts). Its execution record goes, as for a run
     // that never began.
-    if ((await runOwnerOf(journal as RawJournal, runId)).state === 'missing') { await this.opts.journal.deletePrefix?.(loc.key); return; }
+    if ((await runOwnerOf(journal as RawJournal, runId)).state === 'missing') { await this.opts.journal.deletePrefix(loc.key); return; }
     // How the run stood: its last event — `rec.from`'s, unless another executor wrote since, and then this
     // execution's first append (`loc.next`) finds its number taken and stops (first writer wins).
     const prior = await lastRunEvent(journal, runId);
@@ -779,8 +778,7 @@ export class DetachedRuns {
       await compareAndSet(this.opts.journal, loc.key, cur, { ...cur, status: 'released', at: Date.now() });
       return;
     }
-    if (this.opts.journal.deletePrefix) await this.opts.journal.deletePrefix(loc.key);
-    else await compareAndSet(this.opts.journal, loc.key, cur, { ...cur, status: 'parked', at: Date.now() });
+    await this.opts.journal.deletePrefix(loc.key);
   }
 
   /** At least once: delivered, then marked. A process that dies between the two delivers again (same id). */
@@ -814,11 +812,9 @@ export class DetachedRuns {
     // The run's own event families, as run-id-grammar.ts spells them: the event log is a listed family
     // (its prefix is the run's alone — the gate refuses `:ev` in a run id), the delivery mark is ONE key
     // and goes by that key — as a prefix it took a run named `<runId>:ev-delivered…` with it (R2-1).
-    if (loc.journal.deletePrefix) {
-      await loc.journal.deletePrefix(runRecordPrefix(loc.runId, 'ev'));
-      await deleteExactKey(loc.journal, runRecordKey(loc.runId, 'ev-delivered'));
-    }
-    if (this.opts.journal.deletePrefix) await this.opts.journal.deletePrefix(loc.key);
+    await loc.journal.deletePrefix(runRecordPrefix(loc.runId, 'ev'));
+    await deleteExactKey(loc.journal, runRecordKey(loc.runId, 'ev-delivered'));
+    await this.opts.journal.deletePrefix(loc.key);
     this.wakeAll(loc);
     return true;
   }
@@ -893,7 +889,6 @@ async function lastExecutionStart(journal: Journal, runId: string): Promise<numb
       after = page[page.length - 1]![0];
     }
   }
-  if (!journal.listKeys) return 0;
   const keys = await journal.listKeys(runEventPrefix(runId));
   for (let end = keys.length; end > 0; end -= 64) {
     const chunk = keys.slice(Math.max(0, end - 64), end);

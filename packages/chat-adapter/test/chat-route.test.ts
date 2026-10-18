@@ -573,27 +573,16 @@ describe('FAZ-2 audit fixes: a turn that is left, refused, or stored minimally',
     await right.text();
   });
 
-  it('a capability-less (get/put only) journal runs a turn and replays it', async () => {
+  it('a capability-less (get/put only) journal is refused when the route is made, naming what it lacks', () => {
     const m = new Map<string, unknown>();
     const plainJournal: any = {
       async get(k: string) { return m.has(k) ? structuredClone(m.get(k)) : undefined; },
       async put(k: string, v: unknown) { m.set(k, structuredClone(v)); },
     };
-    // A hand-written journal cannot say whether other processes reach it: the app says so (here: only this
-    // process — a Map). Without it the registry refuses to guess (LivenessRequiredError).
-    const app = createChatRoute({ journal: plainJournal, liveness: inMemoryLiveness(), agents: { chat: { model: textMock(), maxSteps: 4 } } } as never);
-    const post = () =>
-      app.request('/agents/chat/chat', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ id: 'pl1', messages: [{ id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }] }] }),
-      });
-    const first = await post();
-    expect(first.status).toBe(200); // a journal without putIfAbsent/putIfMatch/listKeys still runs a turn
-    await first.text();
-    const replay = await post();
-    expect(replay.status).toBe(200);
-    await replay.text();
+    // A turn is a run, and a run's promises rest on the store's guarantees: a store without them is
+    // refused before any request, never run on a weaker path (ADR-0009).
+    expect(() => createChatRoute({ journal: plainJournal, liveness: inMemoryLiveness(), agents: { chat: { model: textMock(), maxSteps: 4 } } } as never))
+      .toThrow(/without `putIfAbsent`, `putIfMatch`, `applyBatch`, `incrBy`, `getCounters`, `listKeys`, `deletePrefix`, `now`/);
   });
 });
 

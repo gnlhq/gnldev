@@ -139,11 +139,10 @@ describe('@gnldev/scheduler — createWorkflowWaker', () => {
     // A journal whose ticket keys ALWAYS look absent (worst-case: no CAS protection whatsoever —
     // stronger than merely "no putIfAbsent", since even the get+put fallback's narrow race window
     // wouldn't normally guarantee a double-claim on every run; this forces it deterministically).
-    const noTicketProtection: JournalLike = {
+    const noTicketProtection: JournalLike = Object.assign(Object.create(inner), {
       get: async (k: string) => (k.startsWith('wfwake:') ? undefined : inner.get(k)),
-      put: (k, v) => inner.put(k, v),
-      listKeys: (p: string) => inner.listKeys!(p),
-    };
+      putIfAbsent: async (k: string, v: unknown) => (k.startsWith('wfwake:') ? true : inner.putIfAbsent(k, v)),
+    });
     const results: unknown[] = [];
     const resume = async (runId: string) => {
       const r = await wf.runResumable({}, { runId, journal: inner });

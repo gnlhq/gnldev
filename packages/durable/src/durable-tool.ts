@@ -514,11 +514,6 @@ async function trackResolvedToolCallId<T extends ToolJournalRecord>(ctx: Durable
   // and the second put dropped the first one's id: the resumed request then narrated its own call as
   // work done in an earlier request (a-a-record-lists-every-call-it-answered.test.ts). A record that is
   // no longer there — erased, purged — is not written back: adding an id never creates a record.
-  if (!ctx.journal.putIfMatch) {
-    const updated = { ...record, resolvedToolCallIds: [...(record.resolvedToolCallIds ?? []), toolCallId] } as T;
-    await ctx.journal.put(key, stampFormat(updated)); // single-process fallback — the same documented bound as claim()
-    return updated;
-  }
   let updated: T;
   for (;;) {
     const raw = await ctx.journal.get<T>(key);
@@ -624,8 +619,7 @@ async function consumeExistingRecord(
 async function adoptRecord(journal: DurableCtx['journal'], from: string, to: string): Promise<void> {
   const old = await journal.get<ToolJournalRecord>(from);
   if (old === undefined) return;
-  if (typeof journal.putIfAbsent === 'function') { await journal.putIfAbsent(to, old); return; }
-  if ((await journal.get(to)) === undefined) await journal.put(to, old);
+  await journal.putIfAbsent(to, old);
 }
 
 function nestedApprovalsFor(

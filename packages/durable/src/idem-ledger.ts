@@ -12,6 +12,7 @@
 import { RUN_KEYED_FAMILIES, ownKeysOf } from './run-id-grammar.js';
 import { randomUUID } from 'node:crypto';
 import type { Journal } from './journal.js';
+import { assertJournalGuarantees } from './journal.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { READ_IDEM_LEDGER_NAMES } from './option-names.js';
 
@@ -68,11 +69,7 @@ export async function readIdemLedger(
   opts: { runId?: string } = {},
 ): Promise<IdemConflictRecord[]> {
   refuseUnknownNames('readIdemLedger', opts, READ_IDEM_LEDGER_NAMES);
-  if (typeof journal.listKeys !== 'function') {
-    throw new Error(
-      "@gnldev/durable: readIdemLedger requires the journal to implement `listKeys` — without it the ledger cannot be enumerated (an empty answer would misread as 'no conflicts').",
-    );
-  }
+  assertJournalGuarantees(journal, 'readIdemLedger');
   // One run's: its keys by owner (run-id-grammar.ts) — the prefix alone also lists a run whose id extends it.
   const keys = opts.runId !== undefined
     ? (await ownKeysOf(journal as { listKeys(p: string): Promise<string[]> }, 'idem-conflict', opts.runId)).own

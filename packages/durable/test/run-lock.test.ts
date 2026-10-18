@@ -198,6 +198,7 @@ describe('release TOCTOU (CAS)', () => {
       put: (k: string, v: unknown) => journal.put(k, v),
       putIfAbsent: (k: string, v: unknown) => journal.putIfAbsent(k, v),
       putIfMatch: (k: string, e: unknown, v: unknown) => journal.putIfMatch(k, e, v),
+      now: () => journal.now(),
     };
 
     const lockA = await acquireRunLock(facade, 'r', 'A', 50);
@@ -225,8 +226,8 @@ describe('release TOCTOU (CAS)', () => {
 });
 
 // Faz 0 review findings (Deniz + Rüzgar) — the interleaving where release's CAS loses to its own
-// in-flight renew, and the putIfMatch-less fallback path, are pinned down.
-describe('release CAS retry + fallback', () => {
+// in-flight renew is pinned down.
+describe('release CAS retry', () => {
   it('release retries when it loses the CAS to its OWN in-flight renew — the lock is freed, not left until TTL', async () => {
     const journal = new InMemoryJournal();
     const key = 'r2:lock';
@@ -243,6 +244,7 @@ describe('release CAS retry + fallback', () => {
       put: (k: string, v: unknown) => journal.put(k, v),
       putIfAbsent: (k: string, v: unknown) => journal.putIfAbsent(k, v),
       putIfMatch: (k: string, e: unknown, v: unknown) => journal.putIfMatch(k, e, v),
+      now: () => journal.now(),
     };
     const lock = await acquireRunLock(facade, 'r2', 'A', 5000);
     expect(lock).not.toBeNull();
@@ -257,17 +259,4 @@ describe('release CAS retry + fallback', () => {
     expect(after.expires).toBe(0);
   });
 
-  it('release without putIfMatch keeps the old best-effort put (fallback path pinned)', async () => {
-    const journal = new InMemoryJournal();
-    const facade: any = {
-      get: (k: string) => journal.get(k),
-      put: (k: string, v: unknown) => journal.put(k, v),
-      putIfAbsent: (k: string, v: unknown) => journal.putIfAbsent(k, v),
-      // PutIfMatch deliberately absent — the adapter-without-CAS profile
-    };
-    const lock = await acquireRunLock(facade, 'r3', 'A', 5000);
-    expect(lock).not.toBeNull();
-    await lock!.release();
-    expect((await journal.get<any>('r3:lock')).expires).toBe(0);
-  });
 });

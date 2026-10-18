@@ -42,22 +42,6 @@ function fastRunner(opts: { suspended?: boolean } = {}) {
   return { runner, calls };
 }
 
-/**
- * An OLDER/custom journal that does NOT implement `putIfMatch` (the documented fallback path in
- * `pollScheduler`'s `commit`). `putIfAbsent` is deliberately KEPT — otherwise `claim()` would also
- * drop to its own fallback and the test would no longer be isolated to the CAS branch.
- */
-function noCasJournal(): Journal {
-  const inner = new InMemoryJournal();
-  return {
-    get: (key: string) => inner.get(key),
-    put: (key: string, v: unknown) => inner.put(key, v),
-    putIfAbsent: (key: string, v: unknown) => inner.putIfAbsent(key, v),
-    listKeys: (prefix: string) => inner.listKeys(prefix),
-    // no putIfMatch, no now()
-  } as Journal;
-}
-
 afterEach(() => {
   vi.useRealTimers();
 });
@@ -377,62 +361,3 @@ describe('scheduler: custom lockTtlMs', () => {
   });
 });
 
-// The `if (!journal.putIfMatch)` fallback in `commit` had NO coverage either: every test above runs
-// on InMemoryJournal, which HAS the CAS. Deleting the branch (i.e. assuming `putIfMatch` always
-// exists) left the suite green while it would throw TypeError on the first old/custom adapter.
-// The fallback is a documented QUALITY DROP — an unconditional put, no fencing — not a crash; pin
-// exactly that much: it still fires and still writes correctly, and the lost fencing is visible.
-describe('scheduler: journal without putIfMatch (documented fallback)', () => {
-  it('still fires, advances fireCount and reschedules on the planned grid', async () => {
-    vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const t0 = Date.now();
-    const j = noCasJournal();
-    const r = fastRunner();
-    await scheduleWorkflow(j, { id: 'nc', name: 'wf', every: 60_000 }, t0 - 60_000); // nextRunAt = t0
-
-    const r1 = await pollScheduler(j, r.runner, t0, { owner: 'A' });
-    expect(r1.fired).toBe(1);
-    expect(await j.get<TriggerState>(STATE('nc'))).toEqual({
-      nextRunAt: t0 + 60_000,
-      attempts: 0,
-      fireCount: 1,
-      status: 'pending',
-      of: expect.any(String),
-    });
-
-    const r2 = await pollScheduler(j, r.runner, t0 + 60_000, { owner: 'A' });
-    expect(r2.fired).toBe(1); // the trigger keeps repeating — the write path is not a one-off fluke
-    expect(r.calls).toEqual(['sched:nc:0', 'sched:nc:1']); // per-fire runIds still advance
-    expect((await j.get<TriggerState>(STATE('nc')))!.fireCount).toBe(2);
-  });
-
-  it('WITHOUT the CAS a stale poller`s write does land — the documented loss of fencing', async () => {
-    vi.useFakeTimers({ now: 1_700_000_000_000 });
-    const t0 = Date.now();
-    const j = noCasJournal();
-    const a = gatedRunner();
-    const b = fastRunner();
-    await scheduleWorkflow(j, { id: 'ncf', name: 'wf', every: 60_000 }, t0 - 60_000);
-
-    const p1 = pollScheduler(j, a.runner, t0, { owner: 'A' });
-    await vi.advanceTimersByTimeAsync(0);
-    expect(a.calls).toEqual(['sched:ncf:0']);
-    vi.setSystemTime(t0 + 70_000); // genuine TTL expiry (the heartbeat interval never ticks)
-
-    const r2 = await pollScheduler(j, b.runner, Date.now(), { owner: 'B' });
-    expect(r2.fired).toBe(1); // takeover still works (run-lock has its own fallback)
-    expect((await j.get<TriggerState>(STATE('ncf')))!.nextRunAt).toBe(t0 + 120_000); // B's grid slot
-
-    a.open();
-    await vi.advanceTimersByTimeAsync(0);
-    const r1 = await p1;
-
-    // This is the price of an adapter without putIfMatch, and it is stated in the source comment:
-    // The late poller's unconditional put OVERWRITES B's result — the same slot is counted as fired
-    // twice and nextRunAt is dragged back to a time that has already passed (an immediate re-fire).
-    // An adapter WITH the CAS keeps fired at 1 and nextRunAt at t0+120s (see the fencing tests above).
-    expect(r1.fired).toBe(1);
-    expect(r1.fired + r2.fired).toBe(2);
-    expect((await j.get<TriggerState>(STATE('ncf')))!.nextRunAt).toBe(t0 + 60_000);
-  });
-});

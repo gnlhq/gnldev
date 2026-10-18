@@ -149,12 +149,6 @@ export function createBatch(journal: Journal, cfg: BatchConfig) {
   if (typeof cfg.itemKey !== 'function') {
     throw new Error("@gnldev/durable: batch requires `itemKey` — it is the developer's one critical duty (what makes an item unique in the BUSINESS, not the row number). Refused loudly rather than silently keyless.");
   }
-  // K26: suspend-item'ın onay-dönüşü journal kararlarının OKUNMASINA dayanır (resolveApprovals'ın
-  // listKeys zenginleştirmesi) — listKeys'siz adapter'da karar yazılır ama sonraki run() göremez:
-  // "kaydettim, sonra koşarım" vaadi sessizce yalan olur. Loud red, sessiz-inert değil.
-  if ((cfg.onDuplicate ?? 'suspend-item') === 'suspend-item' && typeof journal.listKeys !== 'function') {
-    throw new Error("@gnldev/durable: batch onDuplicate 'suspend-item' needs journal.listKeys — recorded approvals are read back through it; without listKeys the decision would be written and never seen. Use 'skip'/'fail-batch' or a listKeys-capable journal.");
-  }
   // H10b'nin batch hali: araç yan-etki niyetini beyan etmemişse burada, koşum başlamadan reddedilir
   // (durableTools'un strict kapısı batch yolunda çalışmaz — mini-runner tek aracı sarar).
   const t = cfg.tool as { sideEffect?: boolean; idempotent?: boolean; recover?: unknown };

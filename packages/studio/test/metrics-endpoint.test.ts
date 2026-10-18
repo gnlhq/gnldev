@@ -3,8 +3,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   InMemoryJournal, recordRunMetrics, metricsDayKey, metricsRunKey, METRICS_ALL_KEY,
-  recordRunOutcome, runStarted, runCanceled,
-} from '@gnldev/durable';
+  recordRunOutcome, runStarted, runCanceled, JOURNAL_GUARANTEES } from '@gnldev/durable';
 import { createStudioApi } from '../src/server.js';
 import { call } from './call.js';
 
@@ -59,10 +58,10 @@ describe('GET /metrics', () => {
    *  forces server.ts's legacy listRuns-scan fallback while sharing identical underlying data. */
   function withoutCountRunsByStatus(journal: InMemoryJournal) {
     return {
+      // A store's guarantees, and deliberately no countRunsByStatus (an accelerator, not a guarantee).
+      ...Object.fromEntries(JOURNAL_GUARANTEES.map((m) => [m, (journal as any)[m].bind(journal)])),
       get: journal.get.bind(journal),
       put: journal.put.bind(journal),
-      putIfAbsent: journal.putIfAbsent.bind(journal),
-      getCounters: journal.getCounters.bind(journal),
       listRuns: journal.listRuns.bind(journal),
       readRun: journal.readRun.bind(journal),
     };

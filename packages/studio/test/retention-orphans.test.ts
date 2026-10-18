@@ -16,14 +16,16 @@ import { createStudioApi } from '../src/server.js';
 import { call } from './call.js';
 
 /** A reader with no listKeys at all — a bare custom Journal, which the port allows. */
+/** A read-only reader (no `put`, so no store guarantees) that cannot list keys. */
 function readerWithoutListKeys() {
   const j = new InMemoryJournal() as unknown as Record<string, unknown>;
+  const hidden = new Set(['listKeys', 'put']);
   return new Proxy(j, {
     get(t, k) {
-      if (k === 'listKeys') return undefined;
+      if (hidden.has(k as string)) return undefined;
       return Reflect.get(t, k);
     },
-    has(t, k) { return k === 'listKeys' ? false : Reflect.has(t, k); },
+    has(t, k) { return hidden.has(k as string) ? false : Reflect.has(t, k); },
   }) as never;
 }
 

@@ -13,7 +13,7 @@ import { withMintOf, assertRunIdSafe, runRecordPrefix, runRecordKey, isDerivedRu
 import { argsHash, rawInputFingerprint, type WorkScope, type WorkScopeKind } from './hash.js';
 import { recordIdemConflict } from './idem-ledger.js';
 import { createProcessorCtx, composePrepareStep, composeOnStepFinish, durableProcessorStep, ProcessorRetry, RetryExhaustedByProcessorError, type StepHookFailure } from './processor.js';
-import { loadReplayCache, runKeys, claim } from './journal.js';
+import { loadReplayCache, runKeys, claim, assertJournalGuarantees } from './journal.js';
 // Statically safe: model-router imports only ./journal, and the provider packages it can reach are
 // behind dynamic import(), so this costs the core bundle nothing.
 import { resolveModel, setChainToolShaper } from './model-router.js';
@@ -590,11 +590,8 @@ function composeStopWhen(stopWhen: any, stepHookFailure?: StepHookFailure): any[
  *  (a) writes EVERY decision that comes in via the parameter to the journal with `claim` — idempotent:
  *      `claim` only writes if the key is EMPTY, so the FIRST decision in the journal always wins
  *      (the exactly-once spirit — it NEVER overwrites with a DIFFERENT parameter that arrives later).
- *  (b) if `journal.listKeys` is supported (an optional adapter capability), reads ALL recorded
- *      approvals for this run and MERGES them with the parameter — on conflict, the (FIRST) decision
- *      in the journal wins and is surfaced via `console.warn`. If `listKeys` is UNAVAILABLE (adapter
- *      doesn't support it): only (a) is written, the merge stays LIMITED to the parameter — no WORSE
- *      than today's behavior, it just skips enrichment from the journal (documented fallback).
+ *  (b) reads ALL recorded approvals for this run and MERGES them with the parameter — on conflict,
+ *      the (FIRST) decision in the journal wins and is surfaced via `console.warn`.
  *
  * Read cost: a SINGLE enumeration call via `listKeys` + one `get` per approval record actually FOUND
  * (not for every possible tool/toolCallId — only for approval records that ACTUALLY exist).
@@ -660,8 +657,7 @@ export async function resolveApprovals(
       const raw = await journal.get(key);
       // A spent slot is not a decision — the human's fresh answer takes it over (unchanged).
       if (isSpent(raw)) {
-        if (journal.putIfMatch) await journal.putIfMatch(key, raw, record);
-        else await journal.put(key, record); // single-process fallback, same bound as claim()
+        await journal.putIfMatch(key, raw, record);
         continue;
       }
       // CHANGING ONE'S MIND, while it is still possible to change anything.
@@ -689,13 +685,9 @@ export async function resolveApprovals(
         );
         continue;
       }
-      if (journal.putIfMatch) await journal.putIfMatch(key, raw, record);
-      else await journal.put(key, record);
+      await journal.putIfMatch(key, raw, record);
     }
   }
-
-  // If listKeys is unavailable: enrichment is skipped, the merge stays limited to the parameter (fallback).
-  if (!journal.listKeys) return approvals;
 
   // (b) read all approval records in the journal + merge with the parameter (the journal's FIRST decision wins).
   const prefix = runRecordPrefix(runId, 'approval');
@@ -890,14 +882,10 @@ function serializableLimits(limits: RunLimits): RunLimits {
  * `${runId}:<rest>:tool:`), and capped: a run with thousands of tool records is not worth an
  * unbounded scan to answer a question about a handful of pending approvals.
  *
- * Degrades to "found nothing" without `listKeys` — the same fail-shut direction the escape already
- * had, since an unrecognised id simply falls through to the 409 it would have gotten anyway.
  */
 async function nestedSurfacedToolCallIds(journal: Journal, runId: string, max = 500): Promise<Set<string>> {
   const out = new Set<string>();
-  const lk = journal.listKeys;
-  if (typeof lk !== 'function') return out;
-  const keys = await lk.call(journal, runKeys.tool(runId, ''));
+  const keys = await journal.listKeys(runKeys.tool(runId, ''));
   for (const key of keys.slice(0, max)) {
     const rec = await journal.get<{
       status?: string;
@@ -2374,11 +2362,7 @@ async function claimMemoryAppend(
 
   // STALE pending: the owner likely crashed / threw a transient error → take it over (self-heal).
   const takeover = { status: 'pending' as const, startedAt: Date.now() };
-  if (journal.putIfMatch) {
-    return (await journal.putIfMatch(marker, cur, takeover)) ? takeover : undefined; // CAS lost → someone else just took it over
-  }
-  await journal.put(marker, takeover);
-  return takeover;
+  return (await journal.putIfMatch(marker, cur, takeover)) ? takeover : undefined; // CAS lost → someone else just took it over
 }
 
 /**
@@ -2414,11 +2398,7 @@ async function markMemoryAppendDone(
   marker: string,
   pending: { status: 'pending'; startedAt: number },
 ): Promise<void> {
-  if (journal.putIfMatch) {
-    await journal.putIfMatch(marker, pending, true);
-    return;
-  }
-  await journal.put(marker, true);
+  await journal.putIfMatch(marker, pending, true);
 }
 
 /**
@@ -2790,6 +2770,7 @@ async function normalizeEntryArgs<T extends { model?: unknown }>(args: T): Promi
 
 export async function runDurable(args: RunDurableArgs): Promise<DurableResult> {
   refuseDurableArgNames('runDurable', args);
+  assertJournalGuarantees(args.journal, 'runDurable');
   // Its claims and its hand name this process, called directly too (process-liveness.ts bindOwnLiveness).
   await bindOwnLiveness(args.journal);
   // Held by the process until it settles: a drain waits for it, and `pendingWork` lists it — from this
@@ -3459,6 +3440,7 @@ async function applySchemaCompat(
 const STREAM_LOCK_MAX_HOLD_MS = 60 * 60_000;
 
 export async function streamDurable(args: StreamDurableArgs): Promise<StreamTextResult<any, any, any>> {
+  assertJournalGuarantees(args.journal, 'streamDurable');
   refuseDurableArgNames('streamDurable', args);
   // R4: bu fonksiyon kapsam DIŞINDA kalmıştı — ve tam da korunması gereken kanal burası.
   // chat-adapter ve agui `gnl.stream` üzerinden buraya iniyor, runId doğrudan istemciden geliyor.

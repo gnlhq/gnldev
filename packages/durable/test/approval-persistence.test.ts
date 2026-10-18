@@ -310,45 +310,6 @@ describe('first-class approval: approvals journal persistence', () => {
     expect(blocked.map((b) => b.kind)).toContain('SideEffectRetryBlockedError');
   });
 
-  it('journal WITHOUT listKeys support: enrichment is skipped, behavior is no WORSE than today (fallback)', async () => {
-    // Minimal Journal: has get/put/putIfAbsent, NO listKeys (some adapters may support it).
-    const inner = new InMemoryJournal();
-    const journal: Journal = {
-      get: (k) => inner.get(k),
-      put: (k, v) => inner.put(k, v),
-      putIfAbsent: (k, v) => inner.putIfAbsent(k, v),
-    };
-    const counter = { charges: 0 };
-    const crash = { active: true };
-
-    // Run 1: approved but crashes — the approval IS WRITTEN to the journal (step (a), doesn't require
-    // listKeys) but without listKeys a SUBSEQUENT run can't read it back to enrich.
-    const r1 = await runDurable({
-      runId: 'nolistkeys-1',
-      journal,
-      model: makeModel(),
-      tools: makeTools(counter, crash),
-      approvals: { 'call-1': true },
-      prompt: 'charge 5000',
-    });
-    expect(counter.charges).toBe(0);
-    expect(r1.text).toBe('Done.');
-
-    // Run 2: WITHOUT the approvals parameter — no listKeys → ctx.approvals can't be enriched (fallback) →
-    // the retry is BLOCKED with the OLD behavior (no regression: no retry unless approvals is explicitly given again).
-    crash.active = false;
-    await expect(
-      runDurable({
-        runId: 'nolistkeys-1',
-        journal,
-        model: makeModel(),
-        tools: makeTools(counter, crash),
-        prompt: 'charge 5000',
-      }),
-    ).rejects.toThrow(/side effects|not auto-retried/i);
-    expect(counter.charges).toBe(0); // still hasn't run — the safe side is preserved
-  });
-
   it("parseJournalKey: the approval key (outside model|tool) is INVISIBLE to reader/time-travel", () => {
     const key = runKeys.approval('some-run', 'call-1');
     expect(key).toBe('some-run:approval:call-1');

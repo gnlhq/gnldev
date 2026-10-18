@@ -96,13 +96,7 @@ export async function acquireRunLock(
   // Not held (its process is dead, or — no process to ask — it expired) → take over. If putIfMatch is available it's ATOMIC: change it if the expired record we
   // read is still in place; if another worker acted first, false → null (the loser doesn't run).
   // A new token is written → the old owner's handle cannot release/write (see mkLock: no-op on token mismatch).
-  if (journal.putIfMatch) {
-    return (await journal.putIfMatch(key, cur, rec)) ? mkLock(journal, runId, owner, token) : null;
-  }
-  // Fallback (adapter without putIfMatch): best-effort get→put — sufficient for single-process
-  // resume, split-brain risk in multi-worker is documented (the core-hardening review).
-  await journal.put(key, rec);
-  return mkLock(journal, runId, owner, token);
+  return (await journal.putIfMatch(key, cur, rec)) ? mkLock(journal, runId, owner, token) : null;
 }
 
 function mkLock(journal: Journal, runId: string, owner: string, token: string): RunLock {
@@ -118,15 +112,13 @@ function mkLock(journal: Journal, runId: string, owner: string, token: string): 
     renew: async (ttlMs: number) => {
       const cur = await journal.get<LockRecord>(key);
       if (!cur || cur.token !== token) return false; // stale owner → rejected, record is not renewed
-      const at = journal.now ? await journal.now() : Date.now();
+      const at = await journal.now();
       const next: LockRecord = { owner, expires: at + ttlMs, token, ...procStampFor(journal) };
       // SAME philosophy as the takeover CAS in acquireRunLock: atomic if putIfMatch is available
       // (change it if the record we read is still in place — if a takeover happened in between,
       // returns false, the record is not corrupted). Otherwise falls back to best-effort get→put
       // (sufficient for single-process, the core-hardening review).
-      if (journal.putIfMatch) return journal.putIfMatch(key, cur, next);
-      await journal.put(key, next);
-      return true;
+      return journal.putIfMatch(key, cur, next);
     },
     // The journal has no delete → release by moving expires into the past (the next acquire takes over).
     // Owner-check (fencing): if the current record no longer carries THIS acquisition's token (a
@@ -139,17 +131,12 @@ function mkLock(journal: Journal, runId: string, owner: string, token: string): 
       // get sees a foreign token → silent no-op, correct) vs OUR OWN in-flight renew() landing in
       // between (the next get sees our token with a fresh `expires` → retry against the fresh record,
       // otherwise the lock we mean to free stays live until TTL). Bounded, so a hot takeover race can
-      // never spin. Fallback without putIfMatch keeps the old best-effort behavior (single-process
-      // sufficient, documented risk — the core-hardening review).
+      // never spin.
       try {
         for (let attempt = 0; attempt < 3; attempt++) {
           const cur = await journal.get<LockRecord>(key);
           if (!cur || cur.token !== token) return; // stale owner → rejected, silent no-op
           const dead: LockRecord = { owner, expires: 0, token };
-          if (!journal.putIfMatch) {
-            await journal.put(key, dead);
-            return;
-          }
           if (await journal.putIfMatch(key, cur, dead)) return;
         }
       } catch {

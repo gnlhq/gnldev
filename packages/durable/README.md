@@ -1174,9 +1174,10 @@ journalConformance('my journal', () => ({ journal: new InMemoryJournal() }), { d
   Assertions use `node:assert`, so no test framework is a dependency of this package. `timeout` (ms)
   is enforced by the suite itself, on every runner: a scenario still running then fails and its journal
   is closed. It is also handed to `it` as a third argument (plus a second), for a runner that reads one,
-  so its own default does not end a scenario first. `exactClaim: false` and `pageWalk: false` declare the two limits of the pg-mem test
-  double: it reports a lost `putIfAbsent` as won, and it cannot read a run list's second page. A real
-  store that needs either flag cannot give the guarantee the flag skips.
+  so its own default does not end a scenario first. `exactClaim: false`, `pageWalk: false` and
+  `isolatedReads: false` declare the three limits of the pg-mem test double: it reports a lost
+  `putIfAbsent` as won, it cannot read a run list's second page, and its other connections see a batch
+  before it commits. A real store that needs any of these flags cannot give the guarantee the flag skips.
 - **The scenarios:** the key-value contract (K1–K6: values, the racing claim, `putIfMatch`, literal
   prefixes, exact counters, `applyBatch`/`getMany`); runs (R1–R5: which records name a run, the
   summary, `readRun` in first-write order — not key or clock order, an older writer's rows too —, the status after each write of a scripted history, paging and filters, and a run after one of its records is deleted — its status, counts, person and thread, and whether it is still a run); relations (L1–L2:

@@ -17,7 +17,6 @@ export interface Lease {
   expiresAt: number;
 }
 
-const noCasWarned = new WeakSet<object>();
 
 /**
  * Tries to hold `key` for `ttlMs`. Returns true when this owner may do the work.
@@ -50,19 +49,7 @@ export async function acquireLease(
   if (cur.owner !== owner && cur.expiresAt > now) return false;
 
   // Renewal and takeover are the same operation: replace THIS exact value, or lose.
-  if (typeof journal.putIfMatch === 'function') return journal.putIfMatch(key, cur, next);
-
-  if (!noCasWarned.has(journal)) {
-    noCasWarned.add(journal);
-    console.warn(
-      '@gnldev/durable: this journal does not implement `putIfMatch` — lease renewal/takeover fell back ' +
-        'to a plain write. Safe in single-process usage; with several instances two of them can believe ' +
-        'they hold the same lease at the moment one expires, and the leased work runs twice. Implement ' +
-        '`putIfMatch(key, expected, value)` (all first-party adapters do — see the parity matrix in journal.ts).',
-    );
-  }
-  await journal.put(key, next);
-  return true;
+  return journal.putIfMatch(key, cur, next);
 }
 
 /** Gives the lease up early, so a clean shutdown does not leave the work parked until the TTL. */
@@ -70,8 +57,7 @@ export async function releaseLease(journal: Journal, key: string, owner: string)
   const cur = (await journal.get<Lease>(key).catch(() => undefined)) ?? undefined;
   // Only ever release YOUR OWN. Releasing somebody else's is how two processes end up running.
   if (!cur || cur.owner !== owner) return;
-  if (typeof journal.putIfMatch === 'function') await journal.putIfMatch(key, cur, { owner, expiresAt: 0 });
-  else await journal.put(key, { owner, expiresAt: 0 } satisfies Lease);
+  await journal.putIfMatch(key, cur, { owner, expiresAt: 0 } satisfies Lease);
 }
 
 /** Who holds it, if anyone — for a status endpoint, never for deciding whether to act. */

@@ -129,16 +129,6 @@ describe('metrics.ts — recordRunMetrics', () => {
     expect(await journal.get(metricsRunKey('r1'))).toMatchObject({ status: 'suspended' });
   });
 
-  it('fallback: a journal without incrBy/putIfAbsent returns false and writes nothing', async () => {
-    const putSpy = vi.fn(async () => {});
-    const bare: Journal = { get: async () => undefined, put: putSpy };
-    const reader: JournalReader = { listRuns: async () => [], readRun: async () => [] };
-
-    const ok = await recordRunMetrics(bare, reader, 'r1');
-    expect(ok).toBe(false);
-    expect(putSpy).not.toHaveBeenCalled();
-  });
-
   // P1.6b: money is accumulated as INTEGER micro-USD (costUsdMicros); readMetricsSummary derives the
   // float `costUsd` back — including folding in a legacy float `costUsd` field (pre-P1.6b data).
   it('costUsdMicros is an integer counter; readMetricsSummary derives costUsd back (incl. legacy costUsd fold)', async () => {
@@ -175,6 +165,7 @@ describe('metrics.ts — recordRunMetrics', () => {
       get: (k: string) => real.get(k),
       put: (k: string, v: unknown) => real.put(k, v),
       applyBatch: (b: Parameters<typeof real.applyBatch>[0]) => real.applyBatch(b),
+      now: () => real.now(),
       incrBy: async () => { throw new Error('sequential path must not be used when applyBatch exists'); },
       putIfAbsent: async () => { throw new Error('sequential path must not be used when applyBatch exists'); },
     } as unknown as Journal;
@@ -187,32 +178,6 @@ describe('metrics.ts — recordRunMetrics', () => {
     expect(all?.tokens).toBe(10);
   });
 
-  // P1.6b — the DOCUMENTED sequential-path undercount window (see recordRunMetrics's JSDoc): a journal
-  // WITHOUT applyBatch claims FIRST (putIfAbsent), then incrBy. A crash/throw between the two loses that
-  // run's contribution FOREVER (the claim marker already landed) — but crucially does NOT double-claim
-  // on a retry (no double-count risk either), and does not retry the failed incrBy indefinitely.
-  it('sequential fallback (no applyBatch): a crash AFTER the claim permanently loses the contribution but never double-claims on retry', async () => {
-    const real = new InMemoryJournal();
-    await real.put('r1:model:0', modelUsage(10));
-    let incrByCalls = 0;
-    const stub = {
-      get: (k: string) => real.get(k),
-      put: (k: string, v: unknown) => real.put(k, v),
-      putIfAbsent: (k: string, v: unknown) => real.putIfAbsent(k, v),
-      incrBy: async () => { incrByCalls++; throw new Error('simulated crash after claim'); },
-    } as unknown as Journal;
-    const reader: JournalReader = { listRuns: () => real.listRuns(), readRun: (id: string) => real.readRun(id) };
-
-    await expect(recordRunMetrics(stub, reader, 'r1')).rejects.toThrow('simulated crash after claim');
-    expect(incrByCalls).toBe(1);
-    expect(await real.get(metricsDoneKey('r1'))).toBeDefined(); // claim marker DID land (claim-first)
-
-    // A second call sees the claim already held → false, WITHOUT retrying incrBy (no double-claim, no
-    // repeated attempt either) — the run's contribution stays permanently lost until rebuildMetrics repairs it.
-    const second = await recordRunMetrics(stub, reader, 'r1');
-    expect(second).toBe(false);
-    expect(incrByCalls).toBe(1); // not retried
-  });
 });
 
 describe('metrics.ts — backfillMetrics', () => {
@@ -293,12 +258,6 @@ describe('metrics.ts — org isolation', () => {
 });
 
 describe('metrics.ts — readMetricsSummary', () => {
-  it('returns undefined/empty when the journal has no getCounters', async () => {
-    const bare = { get: async () => undefined, put: async () => {} } as unknown as Journal;
-    const summary = await readMetricsSummary(bare);
-    expect(summary.all).toBeUndefined();
-    expect(summary.byDay).toEqual([]);
-  });
 
   it('returns all-time totals + N day buckets (default 14, clamped 0..90)', async () => {
     const journal = new InMemoryJournal();
