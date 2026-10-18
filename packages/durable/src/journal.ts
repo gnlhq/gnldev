@@ -5,6 +5,7 @@ import type { Guard } from './guard.js';
 import type { RunLimits, ToolSeat } from './limits.js';
 import type { Processor } from './processor.js';
 import { stableStringify } from './hash.js';
+import { copyValue } from './serialize.js';
 import { pageRunsFromArray, compareRunKey, decodeChangeCursor, encodeChangeCursor, type RunOrder } from './run-cursor.js';
 import { isVersionedKey, upgradeFormat } from './format.js';
 import { runRecordKey, RECORD_KEY_RE, REPLAYED_SEGMENT_RE, leafSuffix, composeRunId, RUN_KEYED_FAMILIES } from './run-id-grammar.js';
@@ -1556,38 +1557,45 @@ export class InMemoryJournal implements Journal, JournalReader {
    */
   private mtimes = new Map<string, number>();
 
+  // Every value is copied in and out the way the SQL stores copy one (serialize.ts `copyValue`): the same
+  // answer from every store — a Map, a BigInt, a Date come back as themselves, a function is dropped —
+  // and a caller's mutation never reaches the stored value. (A structured clone answered differently: it
+  // threw on a function the SQL stores drop, so a test here failed where production did not.)
   async get<T = unknown>(key: string): Promise<T | undefined> {
     if (!this.store.has(key)) return undefined;
-    return structuredClone(this.store.get(key)) as T;
+    return copyValue(this.store.get(key)) as T;
   }
 
   async put(key: string, value: unknown): Promise<void> {
+    const copy = copyValue(value);
     if (!this.times.has(key)) this.times.set(key, Date.now());
     this.mtimes.set(key, Date.now());
-    this.store.set(key, structuredClone(value));
+    this.store.set(key, copy);
   }
 
   // no await between has→set → structurally atomic in single-threaded JS.
   async putIfAbsent(key: string, value: unknown): Promise<boolean> {
     if (this.store.has(key)) return false;
+    const copy = copyValue(value);
     this.times.set(key, Date.now());
     this.mtimes.set(key, Date.now());
-    this.store.set(key, structuredClone(value));
+    this.store.set(key, copy);
     return true;
   }
 
-  // H1: conditional replace — comparison via stableStringify (in the same spirit as the SQL
-  // adapters' serialize() string equality); NO await between get→compare→set → structurally atomic.
   /** The store's clock: this process's, the only one that can reach it. */
   async now(): Promise<number> {
     return Date.now();
   }
 
+  // H1: conditional replace — comparison via stableStringify (in the same spirit as the SQL
+  // adapters' serialize() string equality); NO await between get→compare→set → structurally atomic.
   async putIfMatch(key: string, expected: unknown, value: unknown): Promise<boolean> {
     if (!this.store.has(key)) return false;
     if (stableStringify(this.store.get(key)) !== stableStringify(expected)) return false;
+    const copy = copyValue(value);
     this.mtimes.set(key, Date.now());
-    this.store.set(key, structuredClone(value));
+    this.store.set(key, copy);
     return true;
   }
 
@@ -1607,30 +1615,34 @@ export class InMemoryJournal implements Journal, JournalReader {
 
   // P1.6b: atomic batch — no await between the claim check and the writes → structurally atomic in
   // single-threaded JS (the same argument as putIfAbsent/putIfMatch above). Mirrors the SQL-transaction/
-  // semantics of the real adapters: claim exists → NOTHING is applied.
+  // semantics of the real adapters: claim exists → NOTHING is applied. Every value is copied before
+  // anything is written, so one the store cannot hold fails the batch with nothing left behind — as a
+  // transaction rolls back (measured: the claim and the counters stayed, and the run read as counted).
   async applyBatch(batch: JournalBatch): Promise<boolean> {
+    if (batch.claim && this.store.has(batch.claim.key)) return false;
+    const claimed = batch.claim ? copyValue(batch.claim.value) : undefined;
+    const puts = (batch.puts ?? []).map(({ key, value }) => [key, copyValue(value)] as const);
     if (batch.claim) {
-      if (this.store.has(batch.claim.key)) return false;
       this.times.set(batch.claim.key, Date.now());
       this.mtimes.set(batch.claim.key, Date.now());
-      this.store.set(batch.claim.key, structuredClone(batch.claim.value));
+      this.store.set(batch.claim.key, claimed);
     }
     for (const { key, fields } of batch.incrs ?? []) {
       const cur = this.counters.get(key) ?? {};
       for (const [f, d] of Object.entries(fields)) cur[f] = (cur[f] ?? 0) + d;
       this.counters.set(key, cur);
     }
-    for (const { key, value } of batch.puts ?? []) {
+    for (const [key, value] of puts) {
       if (!this.times.has(key)) this.times.set(key, Date.now());
       this.mtimes.set(key, Date.now());
-      this.store.set(key, structuredClone(value));
+      this.store.set(key, value);
     }
     return true;
   }
 
   // P1.6b: batch point-read — order-preserving, undefined for misses (getMany contract).
   async getMany<T = unknown>(keys: string[]): Promise<(T | undefined)[]> {
-    return keys.map((k) => (this.store.has(k) ? (structuredClone(this.store.get(k)) as T) : undefined));
+    return keys.map((k) => (this.store.has(k) ? (copyValue(this.store.get(k)) as T) : undefined));
   }
 
   // P1.6b: push-down status aggregate — derived per call from the same source listRuns uses (no
@@ -1751,7 +1763,7 @@ export class InMemoryJournal implements Journal, JournalReader {
     for (const [key, value] of this.store) {
       const p = parseJournalKey(key);
       if (p && p.runId === runId) {
-        out.push({ key, runId, kind: p.kind, value: structuredClone(value), seq: seq++, ts: this.times.get(key) });
+        out.push({ key, runId, kind: p.kind, value: copyValue(value), seq: seq++, ts: this.times.get(key) });
       }
     }
     return out;

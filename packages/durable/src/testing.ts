@@ -25,6 +25,7 @@ import assert from 'node:assert/strict';
 import type { Journal, JournalReader, RunSummary, RunStatus, RunListQuery } from './journal.js';
 import { claim, missingGuarantees, runRecordOf, deriveRunStatus, isOwnerRecordKey, ownerOfRecord, nestedAgentRunId, runKeys } from './journal.js';
 import { stampFormat } from './format.js';
+import { copyValue } from './serialize.js';
 import { withOrg, ORG_RECORD_PRE, parseOrganizationKey, orgPrefix } from './organization.js';
 import { RUN_FENCE_PREFIX, runFenceKey } from './erasure-fence.js';
 import { threadOwnerKey, threadSeenKey } from './thread-owner.js';
@@ -33,7 +34,8 @@ import { metricsRunKey } from './metrics.js';
 import { purgeThread, purgeRun, purgeResource } from './retention.js';
 import { ThreadRunsInFlightError } from './errors.js';
 import { refuseUnknownNames } from '@gnldev/options';
-import { JOURNAL_CONFORMANCE_NAMES } from './option-names.js';
+import { JOURNAL_CONFORMANCE_NAMES, STORAGE_CONFORMANCE_NAMES } from './option-names.js';
+import { toJournal, type Storage } from './storage.js';
 
 /** The journal under test: the `Journal` port, with the `JournalReader` surface the run scenarios read. */
 export type ConformanceJournal = Journal & Partial<JournalReader>;
@@ -80,11 +82,12 @@ export interface JournalConformanceOptions {
    */
   pageWalk?: boolean;
   /**
-   * `false` only for a test double whose other connections see a transaction before it commits (pg-mem
-   * has no isolation between them). A batch is then still checked to apply whole and once; that no
-   * reader sees it half-applied is not. A real store that needs this cannot keep a batch atomic.
+   * Whose clock `now()` is. `'host'` (the default): only this machine reaches the store (in-memory, a
+   * Sqlite file), so its clock is this machine's — checked against it, within a second. `'shared'`: a
+   * store several machines reach (Postgres) answers its own clock, which every one of them reads; it is
+   * checked to be epoch milliseconds that do not run backwards.
    */
-  isolatedReads?: boolean;
+  clock?: 'host' | 'shared';
 }
 
 /**
@@ -104,7 +107,7 @@ export function journalConformance(
   refuseUnknownNames('journalConformance', opts, JOURNAL_CONFORMANCE_NAMES);
   const exactClaim = opts.exactClaim !== false;
   const pageWalk = opts.pageWalk !== false;
-  const isolatedReads = opts.isolatedReads !== false;
+  const clock = opts.clock ?? 'host';
   const limit = opts.timeout;
   // The limit is the suite's own timer, not only an argument to `it`: `node:test` takes its options
   // before the function and mocha reads `this.timeout()`, so a third argument was dropped in silence there
@@ -143,10 +146,23 @@ export function journalConformance(
       assert.equal(await j.get('k1:missing'), undefined);
     });
 
+    scenario('K1b a value reads back as the store serializes it — the same answer from every store', async ({ journal: j }) => {
+      // One rule for every store, the one the SQL stores have always kept (serialize.ts, superjson):
+      // dates, maps, sets, big integers, byte arrays and errors come back as themselves, an undefined
+      // field is gone, a function is dropped. A store that answered differently would let a test on it
+      // pass where production fails, or the other way round.
+      const v = { d: new Date(0), m: new Map([['k', 1]]), set: new Set([1, 2]), n: 10n, b: new Uint8Array([1, 2]), u: undefined, keep: 1, f: () => 1, arr: [1, undefined, 3] };
+      await j.put('k1b:v', v);
+      assert.deepEqual(await j.get('k1b:v'), copyValue(v));
+      await j.put('k1b:mut', { list: [1] });
+      const read = await j.get<{ list: number[] }>('k1b:mut');
+      read!.list.push(2);
+      assert.deepEqual(await j.get('k1b:mut'), { list: [1] }, 'a reader\'s mutation never reaches the stored value');
+    });
+
     scenario('K2 exactly-once claim: one of many racing claims wins, the rest see it lost, and the winner\'s value stays', async ({ journal: j }) => {
-      assert.equal(typeof j.putIfAbsent, 'function', 'putIfAbsent is what makes a claim atomic; without it `claim()` is get→put, safe in one process only');
-      assert.equal(await j.putIfAbsent!('k2:once', 1), true);
-      const again = await j.putIfAbsent!('k2:once', 2);
+      assert.equal(await j.putIfAbsent('k2:once', 1), true);
+      const again = await j.putIfAbsent('k2:once', 2);
       if (exactClaim) assert.equal(again, false);
       assert.equal(await j.get('k2:once'), 1);
       // Racing: every caller at once, as workers resuming the same step would.
@@ -182,8 +198,6 @@ export function journalConformance(
     });
 
     scenario('K4 listKeys/deletePrefix: a prefix is literal text — no pattern characters, no case folding, no neighbour', async ({ journal: j }) => {
-      assert.equal(typeof j.listKeys, 'function', 'listKeys is how purges, sweeps and the dependents model find keys');
-      assert.equal(typeof j.deletePrefix, 'function', 'deletePrefix is the one deletion the dependents model runs');
       const keys = ['p:a', 'p:a:b', 'p:ab', 'p_a', 'p%a', 'P:a', 'p:\\x', 'q:a', 'r-1:model:0', 'r-10:model:0'];
       for (const k of keys) await j.put(k, { k });
       const sorted = async (p: string) => (await j.listKeys!(p)).sort();
@@ -233,14 +247,18 @@ export function journalConformance(
         assert.equal(await j.applyBatch({ incrs: [{ key: 'k6:nb', fields: { n: 1 } }] }), true);
         assert.deepEqual(await j.getCounters('k6:nb'), { n: 2 }, 'a batch with no claim always applies');
         // Seen whole: a reader racing a batch reads none of it or all of it, never half.
-        if (isolatedReads) {
+        {
           const torn: string[] = [];
           let done = false;
           const watch = (async () => {
             while (!done) {
-              const [c, a2, b2] = await Promise.all([j.get('k6w:claim'), j.get('k6w:a'), j.get('k6w:b')]);
-              const parts = [c !== undefined, a2 !== undefined, b2 !== undefined];
-              if (parts.some(Boolean) && !parts.every(Boolean)) torn.push(parts.map((x) => (x ? 1 : 0)).join(''));
+              // One read after another, not three at once: three reads at once can straddle the commit on
+              // a store several connections reach, and an atomic batch then looks torn. Read in order, a
+              // batch that lands whole can be missed by the earlier reads and seen by the later ones —
+              // never the reverse: once a read sees its key, every later read sees its own.
+              const parts = [await j.get('k6w:claim'), await j.get('k6w:a'), await j.get('k6w:b')].map((x) => x !== undefined);
+              const first = parts.indexOf(true);
+              if (first >= 0 && parts.slice(first).some((x) => !x)) torn.push(parts.map((x) => (x ? 1 : 0)).join(''));
               await new Promise((r) => setImmediate(r));
             }
           })();
@@ -264,11 +282,31 @@ export function journalConformance(
       }
     });
 
-    scenario('K7 now: the store has a clock, it reads as epoch milliseconds, and it does not run backwards', async ({ journal: j }) => {
+    scenario('K6c applyBatch that fails part-way leaves nothing: no claim, no counter, no put', async ({ journal: j }) => {
+      // A value the store cannot serialize fails the batch; what came before it in the batch must not
+      // stay (a claim left behind made the run's metrics count as done while nothing was counted).
+      const unserializable = { get boom(): never { throw new Error('this value cannot be serialized'); } };
+      let threw = false;
+      try {
+        await j.applyBatch({ claim: { key: 'k6c:claim', value: { at: 1 } }, incrs: [{ key: 'k6c:ctr', fields: { n: 1 } }], puts: [{ key: 'k6c:ok', value: { v: 1 } }, { key: 'k6c:bad', value: unserializable }] });
+      } catch { threw = true; }
+      assert.equal(threw, true, 'a batch with a value the store cannot hold fails');
+      assert.equal(await j.get('k6c:claim'), undefined, 'the claim did not stay');
+      assert.equal(await j.getCounters('k6c:ctr'), undefined, 'the counter did not move');
+      assert.equal(await j.get('k6c:ok'), undefined, 'the earlier put did not stay');
+      assert.equal(await j.applyBatch({ claim: { key: 'k6c:claim', value: { at: 2 } }, puts: [{ key: 'k6c:ok', value: { v: 2 } }] }), true, 'the claim is still free');
+    });
+
+    scenario('K7 now: the store has a clock, it reads as epoch milliseconds, and it does not run backwards — and a host clock is this host\'s', async ({ journal: j }) => {
       const a1 = await j.now();
       const a2 = await j.now();
       assert.ok(Number.isFinite(a1) && a1 > 1_500_000_000_000, `now() is epoch ms, got ${a1}`);
       assert.ok(a2 >= a1, 'now() does not run backwards between two reads');
+      if (clock === 'host') {
+        const local = Date.now();
+        const skew = Math.abs((await j.now()) - local);
+        assert.ok(skew < 1_000, `a store only this machine reaches answers this machine's clock: off by ${skew} ms (a store several machines reach declares \`clock: 'shared'\`)`);
+      }
     });
 
     scenario('K8 change feed: runs come in the order they last changed, not in key order', async ({ journal: j }) => {
@@ -374,17 +412,14 @@ export function journalConformance(
         ['both resolved', () => j.put('two:tool:b', { status: 'succeeded', output: 2 })],
         ['running replaced by completed (putIfMatch)', async () => {
           await j.put('pim:outcome', { status: 'running', at: 1 });
-          if (j.putIfMatch) await j.putIfMatch('pim:outcome', { status: 'running', at: 1 }, { status: 'completed', at: 2 });
+          await j.putIfMatch('pim:outcome', { status: 'running', at: 1 }, { status: 'completed', at: 2 });
         }],
-        ['a batch: a suspended claim and a failed outcome', () => (j.applyBatch
-          ? j.applyBatch({ claim: { key: 'bat:tool:c1', value: suspendedRec }, puts: [{ key: 'bat:outcome', value: { status: 'failed', at: 1 } }] })
-          : Promise.all([j.put('bat:tool:c1', suspendedRec), j.put('bat:outcome', { status: 'failed', at: 1 })]))],
-        ['the batch resolves it', () => (j.applyBatch ? j.applyBatch({ puts: [{ key: 'bat:tool:c1', value: { status: 'succeeded', output: 1 } }] }) : j.put('bat:tool:c1', { status: 'succeeded', output: 1 }))],
+        ['a batch: a suspended claim and a failed outcome', () => j.applyBatch({ claim: { key: 'bat:tool:c1', value: suspendedRec }, puts: [{ key: 'bat:outcome', value: { status: 'failed', at: 1 } }] })],
+        ['the batch resolves it', () => j.applyBatch({ puts: [{ key: 'bat:tool:c1', value: { status: 'succeeded', output: 1 } }] })],
         ['a takeover suspends a failed run (putIfMatch)', async () => {
           await j.put('tko:outcome', { status: 'failed', at: 1 });
           await j.put('tko:tool:c1', { status: 'running', startedAt: 1 });
-          if (j.putIfMatch) await j.putIfMatch('tko:tool:c1', { status: 'running', startedAt: 1 }, suspendedRec);
-          else await j.put('tko:tool:c1', suspendedRec);
+          await j.putIfMatch('tko:tool:c1', { status: 'running', startedAt: 1 }, suspendedRec);
         }],
         ['the takeover resolves it', () => j.put('tko:tool:c1', { status: 'succeeded', output: 1 })],
         // (Not on a double that reports a lost claim as won: its adapter then counts the write.)
@@ -872,4 +907,152 @@ async function scope(s: Subject, j: ConformanceJournal, prefix: string): Promise
     await put('lesson:res:ayse2:L1', { text: 'AYSE2-LESSON' });
   });
   return fp;
+}
+
+// ── The storage: every port a Storage hands the engine ───────────────────────────────────────────
+
+/** A port of a `Storage` beyond its run journal, as `storageConformance` names it. */
+export type StoragePort = 'work' | 'vectors' | 'memory' | 'liveness' | 'upgrade';
+
+/** `journalConformance`'s options, and what the storage scenarios may assume of the store. */
+export interface StorageConformanceOptions extends JournalConformanceOptions {
+  /**
+   * The ports this store offers. Each one named is held whole, and fails if the store does not have it;
+   * one left out is not checked, and is not claimed. Default: every port.
+   */
+  ports?: readonly StoragePort[];
+  /**
+   * `false` declares a work store without `putIfMatch`: a job's owner token is then not fenced, and two
+   * workers can both write a job's end. Default `true`: the work store compares and sets atomically.
+   */
+  workCas?: boolean;
+  /** `false` only for a test double whose memory port cannot order two concurrent appends (pg-mem). */
+  serialisesAppends?: boolean;
+  /**
+   * A second handle on the SAME data — what another process would open. With it, a liveness is checked
+   * from that other side too: alive while held, dead once closed.
+   */
+  reopen?: (s: Storage) => Storage | Promise<Storage>;
+}
+
+const STORAGE_PORTS: readonly StoragePort[] = ['work', 'vectors', 'memory', 'liveness', 'upgrade'];
+
+/**
+ * Register the storage conformance scenarios: the run journal's (`journalConformance`, through the same
+ * bridge the engine reads a store by, `toJournal`), then every port the store says it offers. What a new
+ * backend runs before it is called one.
+ *
+ * ```ts
+ * import { describe, it } from 'vitest';
+ * import { storageConformance } from '@gnldev/durable/testing';
+ * storageConformance('my store', () => new MyStorage(), { describe, it, clock: 'shared' });
+ * ```
+ */
+export function storageConformance(
+  name: string,
+  make: () => Storage | Promise<Storage>,
+  opts: StorageConformanceOptions,
+): void {
+  refuseUnknownNames('storageConformance', opts, STORAGE_CONFORMANCE_NAMES);
+  const { ports = STORAGE_PORTS, workCas, serialisesAppends, reopen, ...journalOpts } = opts;
+  const exactClaim = opts.exactClaim !== false;
+  const open = async () => { const s = await make(); await s.init?.(); return s; };
+  journalConformance(name, async () => { const s = await open(); return { journal: toJournal(s), close: () => s.close?.() }; }, journalOpts);
+
+  const limit = opts.timeout;
+  const scenario = (port: StoragePort, title: string, body: (s: Storage) => Promise<void>) => {
+    if (!ports.includes(port)) return;
+    opts.it(title, async () => {
+      const s = await open();
+      try {
+        const offered = port === 'liveness' ? s.processLiveness : port === 'upgrade' ? s.upgrade : s[port];
+        assert.ok(offered, `the store says it offers \`${port}\` and has none (leave it out of \`ports\` if it does not offer it)`);
+        await body(s);
+      } finally { await s.close?.(); }
+    }, ...(limit === undefined ? [] : [limit + 1_000]) as [number?]);
+  };
+
+  opts.describe(`storage conformance — ${name}`, () => {
+    // ── WorkStore: the queue's, the events bus's and the scheduler's log ────────────────────────
+    scenario('work', 'W1 append is idempotent by id, and a log lists every record once, in append order', async (s) => {
+      const a = await s.work!.append('w1', { n: 1 }, 'id-a');
+      assert.equal(await s.work!.append('w1', { n: 99 }, 'id-a'), a, 'the same id is the same record');
+      await s.work!.append('w1', { n: 2 }, 'id-b');
+      await s.work!.append('w1', { n: 3 });
+      assert.deepEqual((await s.work!.list<{ n: number }>('w1')).items.map((r) => r.payload.n), [1, 2, 3]);
+    });
+    scenario('work', 'W2 ackOnce: of many racing acknowledgements exactly one wins', async (s) => {
+      const won = await Promise.all(Array.from({ length: 16 }, () => s.work!.ackOnce('w2:ack')));
+      if (exactClaim) {
+        assert.equal(won.filter(Boolean).length, 1);
+        assert.equal(await s.work!.ackOnce('w2:ack'), false);
+      }
+    });
+    scenario('work', 'W3 putIfMatch on the work store: of many writers holding the same read, exactly one replaces it', async (s) => {
+      if (workCas === false) {
+        assert.equal(s.work!.putIfMatch, undefined, '`workCas: false` declares a work store without putIfMatch; this one has it — drop the flag');
+        return;
+      }
+      assert.equal(typeof s.work!.putIfMatch, 'function', 'a job\'s owner token is fenced by putIfMatch (or declare `workCas: false` and accept the unfenced end)');
+      await s.work!.put('w3:own', { token: 'old' });
+      const read = await s.work!.get('w3:own');
+      const won = await Promise.all(Array.from({ length: 16 }, (_, i) => s.work!.putIfMatch!('w3:own', read, { token: `t${i}` })));
+      assert.equal(won.filter(Boolean).length, 1);
+    });
+
+    // ── VectorStore ─────────────────────────────────────────────────────────────────────────────
+    scenario('vectors', 'V1 a filter narrows by `===` on every value: a scalar matches its equal, an array or object value matches nothing', async (s) => {
+      await s.vectors!.upsert([
+        { id: 'v1', text: 'a', embedding: [1, 0, 0], metadata: { lang: 'tr', tags: ['x'], meta: { k: 1 } } },
+        { id: 'v2', text: 'b', embedding: [0.9, 0.1, 0], metadata: { lang: 'en', tags: ['x'], meta: { k: 1 } } },
+      ]);
+      const ids = async (filter: Record<string, unknown>) => (await s.vectors!.query([1, 0, 0], 10, { filter })).map((m) => m.id).sort();
+      assert.deepEqual(await ids({ lang: 'tr' }), ['v1']);
+      assert.deepEqual(await ids({ lang: 'de' }), []);
+      // The port's rule is `===` (storage.ts vectorMetadataMatches): a store that matched by containment
+      // would answer a retrieval filter differently from every other store.
+      assert.deepEqual(await ids({ tags: ['x'] }), [], 'an array value is compared by ===');
+      assert.deepEqual(await ids({ meta: { k: 1 } }), [], 'an object value is compared by ===');
+    });
+
+    // ── MemoryStore ─────────────────────────────────────────────────────────────────────────────
+    scenario('memory', 'M1 threads: an upsert replaces, a listing filters by person, newest first', async (s) => {
+      await s.memory!.upsertThread({ id: 't1', resourceId: 'u1', createdAt: 100, updatedAt: 100 });
+      await s.memory!.upsertThread({ id: 't2', resourceId: 'u1', createdAt: 300, updatedAt: 300 });
+      await s.memory!.upsertThread({ id: 't3', resourceId: 'u2', createdAt: 200, updatedAt: 200 });
+      assert.deepEqual((await s.memory!.listThreads({ resourceId: 'u1' })).items.map((t) => t.id), ['t2', 't1']);
+    });
+    scenario('memory', 'M2 two writers appending different messages to one thread at once both keep theirs', async (s) => {
+      if (serialisesAppends === false) return;
+      const m = (text: string) => ({ role: 'user' as const, text, ts: 1, message: { role: 'user', content: text } });
+      await s.memory!.upsertThread({ id: 'm2', resourceId: 'u1', createdAt: 1, updatedAt: 1 });
+      await Promise.all([s.memory!.appendMessages('m2', [m('a')] as never), s.memory!.appendMessages('m2', [m('b')] as never)]);
+      assert.deepEqual((await s.memory!.getMessages('m2')).items.map((x: { text?: string }) => x.text).sort(), ['a', 'b']);
+    });
+
+    // ── Process liveness ────────────────────────────────────────────────────────────────────────
+    scenario('liveness', 'P1 liveness: this process is alive while it holds its liveness, and dead to another once it closes', async (s) => {
+      const mine = await s.processLiveness!();
+      assert.equal(await mine.confirm(), true);
+      assert.equal(await mine.isAlive(mine.id), true);
+      if (mine.processOnly || !reopen) return; // one process reaches this store, or no second handle was given
+      const other = await reopen(s);
+      try {
+        const theirs = await other.processLiveness!();
+        assert.equal(await theirs.isAlive(mine.id), true, 'another process sees a held liveness as alive');
+        await mine.close();
+        assert.notEqual(await theirs.isAlive(mine.id), true, 'a closed liveness is not alive to another process');
+      } finally { await other.close?.(); }
+    });
+
+    // ── Upgrade ─────────────────────────────────────────────────────────────────────────────────
+    scenario('upgrade', 'U1 upgrade: a dry run writes nothing, and a second upgrade finds nothing pending', async (s) => {
+      const dry = await s.upgrade!({ dryRun: true });
+      assert.equal(dry.dryRun, true);
+      assert.ok(dry.steps.every((x) => x.ran === false), 'a dry run runs nothing');
+      await s.upgrade!();
+      const second = await s.upgrade!();
+      assert.ok(second.steps.every((x) => x.ran === false), `a second upgrade ran: ${second.steps.filter((x) => x.ran).map((x) => x.name).join(', ')}`);
+    });
+  });
 }

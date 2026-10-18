@@ -66,7 +66,7 @@ it('node:test, for real: a hanging store fails the scenario at `timeout` instead
         return { journal: { get: hang, put: hang, listKeys: async () => [], deletePrefix: async () => 0 }, close: () => clearInterval(socket) };
       }, { describe, it, timeout: 300 });
     `);
-    const r = spawnSync(process.execPath, ['--test', '--test-name-pattern=K1', file], { encoding: 'utf8', timeout: 15_000 });
+    const r = spawnSync(process.execPath, ['--test', '--test-name-pattern=K1 get/put', file], { encoding: 'utf8', timeout: 15_000 });
     const out = `${r.stdout}\n${r.stderr}`;
     expect(r.signal, 'the run ended by itself').toBeNull();
     expect(out).toMatch(/# fail 1/);

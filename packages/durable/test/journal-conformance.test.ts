@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { newDb } from 'pg-mem';
 import pg from 'pg';
-import { InMemoryStorage, toJournal, parseJournalKey, runRecordOf, summarizeRun, pageRunsFromArray } from '@gnldev/durable';
+import { InMemoryStorage, toJournal, parseJournalKey, runRecordOf, summarizeRun, pageRunsFromArray, serialize, deserialize } from '@gnldev/durable';
 import type { Journal, JournalBatch, JournalReader, JournalEntry, RunSummary } from '@gnldev/durable';
 import { journalConformance, type ConformanceSubject } from '@gnldev/durable/testing';
 import { SqliteStorage } from '../src/sqlite-storage.js';
@@ -51,7 +51,7 @@ journalConformance('Postgres (pg-mem)', async () => {
   const storage = new PostgresStorage({ pool });
   await storage.init();
   return { journal: toJournal(storage.runs), writeAsOlderVersion: (key, value) => oldPgPut(pool, key, value) };
-}, { describe, it, exactClaim: false, pageWalk: false, isolatedReads: false, timeout: 120_000 });
+}, { describe, it, exactClaim: false, pageWalk: false, timeout: 120_000 });
 
 if (PG_URL) {
   let db: { admin: pg.Pool; url: string } | undefined;
@@ -81,36 +81,40 @@ if (PG_URL) {
       writeAsOlderVersion: (key, value) => oldPgPut(oldPool, key, value),
       async close() { await oldPool.end(); await pool.end(); },
     };
-  }, { describe, it, timeout: 120_000 });
+  }, { describe, it, clock: 'shared', timeout: 120_000 });
 }
 
 /**
  * A journal as a user writes one against the documented port: a Map of keys, the store's guarantees
  * (journal.ts JOURNAL_GUARANTEES — each atomic because nothing awaits between its read and its write, and
- * the clock of the one process that reaches the map), and the reader built
+ * the clock of the one process that reaches the map), values copied the way every store copies them
+ * (`serialize`/`deserialize`), and the reader built
  * from the public helpers — `parseJournalKey` for a run's entries, `runRecordOf` for the records that make
  * a run, `summarizeRun` for its status, `pageRunsFromArray` for the page.
  */
+/** A copy the way every store makes one: through the store serialization. */
+const copy = <T>(v: T): T => (v === undefined ? v : deserialize<T>(serialize(v)));
+
 class MapJournal implements Journal, JournalReader {
   private readonly m = new Map<string, unknown>();
   private readonly counters = new Map<string, Record<string, number>>();
-  async get<T = unknown>(key: string): Promise<T | undefined> { return this.m.has(key) ? structuredClone(this.m.get(key)) as T : undefined; }
-  async put(key: string, value: unknown): Promise<void> { this.m.set(key, structuredClone(value)); }
+  async get<T = unknown>(key: string): Promise<T | undefined> { return this.m.has(key) ? copy(this.m.get(key)) as T : undefined; }
+  async put(key: string, value: unknown): Promise<void> { this.m.set(key, copy(value)); }
   async putIfAbsent(key: string, value: unknown): Promise<boolean> {
     if (this.m.has(key)) return false;
-    this.m.set(key, structuredClone(value));
+    this.m.set(key, copy(value));
     return true;
   }
   async putIfMatch(key: string, expected: unknown, value: unknown): Promise<boolean> {
     if (!this.m.has(key) || JSON.stringify(this.m.get(key)) !== JSON.stringify(expected)) return false;
-    this.m.set(key, structuredClone(value));
+    this.m.set(key, copy(value));
     return true;
   }
   async applyBatch(batch: JournalBatch): Promise<boolean> {
     if (batch.claim && this.m.has(batch.claim.key)) return false;
     // Every value is copied before anything is written: one that cannot be copied leaves the store as it was.
-    const claim = batch.claim ? structuredClone(batch.claim.value) : undefined;
-    const puts = (batch.puts ?? []).map((p) => [p.key, structuredClone(p.value)] as const);
+    const claim = batch.claim ? copy(batch.claim.value) : undefined;
+    const puts = (batch.puts ?? []).map((p) => [p.key, copy(p.value)] as const);
     if (batch.claim) this.m.set(batch.claim.key, claim);
     for (const { key, fields } of batch.incrs ?? []) this.bump(key, fields);
     for (const [key, value] of puts) this.m.set(key, value);
@@ -146,7 +150,7 @@ class MapJournal implements Journal, JournalReader {
     const out: JournalEntry[] = [];
     for (const [key, value] of this.m) {
       const p = parseJournalKey(key);
-      if (p?.runId === runId) out.push({ key, runId, kind: p.kind, value: structuredClone(value), seq: out.length });
+      if (p?.runId === runId) out.push({ key, runId, kind: p.kind, value: copy(value), seq: out.length });
     }
     return out;
   }
