@@ -11,6 +11,7 @@ import { describe, it, expect, afterAll } from 'vitest';
 import { InMemoryStorage, withOrgStorage, findReservedRootThreads, eraseSubject, threadOwnerKey, toJournal, type Storage } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
+import { mysqlStores } from './real-backends.js';
 import { AgentMemory } from '../../memory/src/index.js';
 
 const ends: Array<() => Promise<unknown>> = [];
@@ -34,6 +35,7 @@ if (PG_URL) {
     return s;
   }]);
 }
+for (const [name, make] of mysqlStores(' (real)')) STORES.push([name.toLowerCase(), async () => { const s = await make(); await s.init(); ends.push(() => s.close()); return s; }]);
 const E = [1, 0, 0];
 const embed = async () => E;
 

@@ -1,6 +1,7 @@
 // The storage conformance kit (`@gnldev/durable/testing` storageConformance) on every store this
 // repository ships: the run journal's scenarios through `toJournal`, then each port the store offers.
-// With GNL_PG_URL also a real Postgres, a fresh schema per opened store, dropped at the end.
+// With GNL_PG_URL also a real Postgres, a fresh schema per opened store, dropped at the end; with
+// GNL_MYSQL_URL / GNL_MARIADB_URL a MySQL / MariaDB server, a fresh database per store (real-backends.ts).
 import { describe, it, afterAll } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,6 +13,8 @@ import { storageConformance } from '@gnldev/durable/testing';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { LibsqlStorage } from '../src/libsql-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
+import { MysqlStorage } from '../src/mysql-storage.js';
+import { MYSQL_SERVERS, freshDatabase, mysqlStores } from './real-backends.js';
 
 const PG_URL = process.env.GNL_PG_URL;
 const ends: Array<() => Promise<void> | void> = [];
@@ -66,4 +69,15 @@ if (PG_URL) {
     await admin.query(`CREATE SCHEMA ${schema}`);
     return openIn(schema);
   }, { describe, it, clock: 'shared', timeout: 120_000, reopen: (s) => openIn(pgSchema.get(s)!) });
+}
+
+mysqlStores();
+const myUrl = new WeakMap<object, string>();
+for (const { name, url } of MYSQL_SERVERS) {
+  storageConformance(`${name} (real)`, async () => {
+    const u = await freshDatabase(url);
+    const s = new MysqlStorage({ connectionString: u });
+    myUrl.set(s, u);
+    return s;
+  }, { describe, it, clock: 'shared', timeout: 120_000, reopen: (s) => new MysqlStorage({ connectionString: myUrl.get(s)! }) });
 }

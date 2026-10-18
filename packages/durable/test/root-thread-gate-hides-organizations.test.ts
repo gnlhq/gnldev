@@ -37,6 +37,7 @@ import { createGnl } from '../src/registry.js';
 import { user } from '../src/run-identity.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
+import { mysqlStores } from './real-backends.js';
 import { serialize } from '../src/serialize.js';
 import { runIdOfKey, parseJournalKey } from '../src/journal.js';
 import { createMockModel, finalTextResult } from './mock.js';
@@ -139,6 +140,8 @@ const BACKENDS: Array<[string, () => Promise<Backend>]> = [
   ['Postgres (pg-mem)', async () => { const { Pool } = newDb().adapters.createPg(); return pgBackend(new Pool()); }],
 ];
 if (PG_URL) BACKENDS.push(['Postgres (real)', realPgBackend]);
+// MySQL / MariaDB: no older version ever wrote one, so its "older process" writes what this one does (as InMemory's).
+for (const [name, make] of mysqlStores(' (real)')) BACKENDS.push([name, async () => { const storage = await make(); ends.push(() => storage.close()); return { storage, oldPut: (k, v) => storage.runs.put(k, v) }; }]);
 
 const input = (fields: Record<string, unknown>) => stampFormat({ at: 1, ...fields });
 const echo = () => createMockModel(async () => finalTextResult('ok'));

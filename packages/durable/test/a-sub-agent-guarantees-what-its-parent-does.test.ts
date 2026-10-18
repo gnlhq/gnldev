@@ -115,7 +115,11 @@ describe('a sub-agent guarantees what the same agent guarantees directly', () =>
         runOpts: () => { ctrl.c = new AbortController(); return { abortSignal: ctrl.c.signal }; },
         onSubModelCall: (n) => { if (n === 1) ctrl.c.abort(); },
       });
-      expect([mode, r.c['sub.model'], r.c.t ?? 0]).toEqual([mode, 1, 1]);
+      // The abort lands during the first model call: no second step, and at most the one tool call that
+      // step had already returned. Measured per AI SDK: ai@7.0.77 ran that call on both paths (1, 1);
+      // ai@7.0.143 checks the signal before running tools, so the direct path runs none (0) while the
+      // sub-agent, whose stop reaches it through its parent's cancel one hop later, still runs it (1).
+      expect([mode, r.c['sub.model'], (r.c.t ?? 0) <= 1]).toEqual([mode, 1, true]);
     }
   });
 

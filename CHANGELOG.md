@@ -58,6 +58,17 @@ measures every backend before it is called one.
   ("has no such key").** One translation now (`filterSql`) for both: no such key.
 - **The pgvector store scored a zero vector NaN**, which broke ranking and `minScore`; it scores 0 now,
   as every other store does.
+- **@gnldev/chat-adapter builds against ai ≥ 7.0.132.** That release added `onStepEnd` and
+  `onStepFinish` to the UI stream options, and the compiler-held list of names `toUIMessageStream` /
+  `toUIMessageStreamResponse` check against stopped matching it: a fresh lockfile failed the build. At
+  runtime nothing changed for a user on any ai 7.x — the two names were already passed on to the AI
+  SDK, not refused (measured, now a test). The lockfile moves to ai 7.0.143 with its provider packages;
+  the peer range stays `^7.0.0`. A CI job now builds and typechecks against the newest allowed `ai`, so
+  the next SDK release that adds a name shows there first. Measured on the way: ai 7.0.143 checks the
+  abort signal before running a step's tool calls, so a run cancelled during a model call now runs none
+  of that step's tool calls on the direct path (7.0.77 ran them), while a sub-agent, stopped through its
+  parent's cancel, may still run the one call its in-flight step returned — the documented bound (no
+  further step, at most the call already returned) holds on both.
 - **A completed run no longer reads 'failed' because an older attempt's failure was written late.**
   Measured with two OS processes on real Postgres: worker A's model call failed, A freed the run, and
   its verdict landed after worker B had run the same run to completion — the run read 'failed',
@@ -95,6 +106,16 @@ measures every backend before it is called one.
   back until it syncs; the kit failed 29 of 34 there) and a remote database (`libsql:`, `http(s):`,
   `ws(s):` — no session a process holds, so a stalled live process would be taken over and its side
   effect run twice; measured 3 of 3).
+- **`MysqlStorage` and `mysqlLiveness`** (`@gnldev/durable/mysql`): MySQL 8.4+ and MariaDB 11+, one
+  store for both, `mysql2` as an optional peer dependency. Every port `PostgresStorage` has — run
+  journal with its derived run table, work, memory, vectors, cache, meta — plus `upgrade()`, erasure,
+  organizations and a process liveness (a named lock on a dedicated session). Keys and compared values
+  are binary, sessions run at READ COMMITTED, `now()` is the server's. It passes `journalConformance`
+  and `storageConformance` on both servers, in CI. **Requires short TCP keepalives on the server**
+  (`net.ipv4.tcp_keepalive_time=10`, `_intvl=5`, `_probes=3`, or MariaDB's `tcp_keepalive_*`): a
+  cut-off host's runs are taken over after ~26 s with them, and held for over 2 h without (measured).
+  `durabilityReport().partitionDetection` reads what a client can (MariaDB's variables) and says when
+  it cannot; the boot warns only on what it reads.
 
 ## [0.11.1] — 2026-10-17
 

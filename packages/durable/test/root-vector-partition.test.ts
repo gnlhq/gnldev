@@ -11,6 +11,7 @@ import pg from 'pg';
 import { InMemoryStorage, withOrgStorage, eraseSubject, purgeResource, toJournal, VECTOR_ALL_PARTITIONS, vectorQueryScope, vectorInOrganization, type Storage, type VectorStore } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
+import { mysqlStores } from './real-backends.js';
 import { InMemoryVectorStore, GraphRag, PostgresVectorStore, createRagTool, ingestDocuments } from '../../rag/src/index.js';
 import { AgentMemory } from '../../memory/src/index.js';
 
@@ -51,6 +52,7 @@ export const WORLDS: World[] = [
   rag('rag InMemoryVectorStore (standalone)', async () => new InMemoryVectorStore() as unknown as VectorStore),
   rag('rag GraphRag (standalone)', async () => new GraphRag({ threshold: 0.6 }) as unknown as VectorStore),
   ...(PG_URL ? [durable('durable Postgres (real)', async () => new PostgresStorage({ pool: await realPool(PG_URL) }) as unknown as Storage)] : []),
+  ...mysqlStores(' (real)').map(([name, make]) => durable(`durable ${name}`, async () => { const s = await make(); cleanups.push(() => s.close()); return s as unknown as Storage; })),
   ...(PGVECTOR_URL ? [rag('rag PostgresVectorStore (real pgvector)', async () => new PostgresVectorStore({ pool: await realPool(PGVECTOR_URL, true), index: 'none' }) as unknown as VectorStore)] : []),
 ];
 
