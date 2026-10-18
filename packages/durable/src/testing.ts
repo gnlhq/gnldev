@@ -36,6 +36,7 @@ import { ThreadRunsInFlightError } from './errors.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { JOURNAL_CONFORMANCE_NAMES, STORAGE_CONFORMANCE_NAMES } from './option-names.js';
 import { toJournal, type Storage } from './storage.js';
+import { vectorStoreConformance } from './vector-conformance.js';
 
 /** The journal under test: the `Journal` port, with the `JournalReader` surface the run scenarios read. */
 export type ConformanceJournal = Journal & Partial<JournalReader>;
@@ -1000,20 +1001,14 @@ export function storageConformance(
       assert.equal(won.filter(Boolean).length, 1);
     });
 
-    // ── VectorStore ─────────────────────────────────────────────────────────────────────────────
-    scenario('vectors', 'V1 a filter narrows by `===` on every value: a scalar matches its equal, an array or object value matches nothing', async (s) => {
-      await s.vectors!.upsert([
-        { id: 'v1', text: 'a', embedding: [1, 0, 0], metadata: { lang: 'tr', tags: ['x'], meta: { k: 1 } } },
-        { id: 'v2', text: 'b', embedding: [0.9, 0.1, 0], metadata: { lang: 'en', tags: ['x'], meta: { k: 1 } } },
-      ]);
-      const ids = async (filter: Record<string, unknown>) => (await s.vectors!.query([1, 0, 0], 10, { filter })).map((m) => m.id).sort();
-      assert.deepEqual(await ids({ lang: 'tr' }), ['v1']);
-      assert.deepEqual(await ids({ lang: 'de' }), []);
-      // The port's rule is `===` (storage.ts vectorMetadataMatches): a store that matched by containment
-      // would answer a retrieval filter differently from every other store.
-      assert.deepEqual(await ids({ tags: ['x'] }), [], 'an array value is compared by ===');
-      assert.deepEqual(await ids({ meta: { k: 1 } }), [], 'an object value is compared by ===');
-    });
+    // ── VectorStore: the vector kit itself (vector-conformance.ts), one copy of its rules ──────────
+    if (ports.includes('vectors')) {
+      vectorStoreConformance(name, async () => {
+        const s = await open();
+        assert.ok(s.vectors, 'the store says it offers `vectors` and has none (leave it out of `ports` if it does not offer it)');
+        return { vectors: s.vectors, close: () => s.close?.() };
+      }, { describe: opts.describe, it: opts.it, exactClaim, ...(limit === undefined ? {} : { timeout: limit + 1_000 }) });
+    }
 
     // ── MemoryStore ─────────────────────────────────────────────────────────────────────────────
     scenario('memory', 'M1 threads: an upsert replaces, a listing filters by person, newest first', async (s) => {
@@ -1056,3 +1051,6 @@ export function storageConformance(
     });
   });
 }
+
+// A vector store on its own (a hosted vector database, or one of @gnldev/rag's): vector-conformance.ts.
+export { vectorStoreConformance, type VectorStoreConformanceOptions, type VectorStoreUnderTest } from './vector-conformance.js';

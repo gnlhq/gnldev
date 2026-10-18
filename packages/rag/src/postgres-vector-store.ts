@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, VECTOR_DOCUMENT_KEY, vectorFilterDocument } from '@gnldev/durable';
+import { vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, VECTOR_DOCUMENT_KEY, vectorFilterDocument, assertVectorDimension } from '@gnldev/durable';
 import type { VectorStore, VectorItem, VectorMatch, QueryOptions, DeleteWhere } from './vector-store.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { POSTGRES_VECTOR_STORE_NAMES, QUERY_NAMES } from './option-names.js';
@@ -110,6 +110,9 @@ export class PostgresVectorStore implements VectorStore {
   async upsert(items: VectorItem[]): Promise<void> {
     if (items.length === 0) return;
     const batch = vectorWriteBatch(items);
+    // The table's length, not the first vector's: a vector of another length is refused here, with
+    // nothing written, rather than by the column after half a batch (`assertVectorDimension`).
+    assertVectorDimension(this.dimension ?? await this.existingDimension(), batch[0]!.embedding.length, 'write');
     await this.ensureReady(batch[0]!.embedding.length);
     // One transaction when the pool can hand out a connection: a batch refused half-way, by a writer
     // that took an id after the check, is rolled back rather than left half-written.
@@ -157,15 +160,17 @@ export class PostgresVectorStore implements VectorStore {
   }
 
   /**
-   * 7.2: opts is backward compatible. namespace + metadata filter (jsonb `@>` containment) + minScore
+   * 7.2: opts is backward compatible. namespace + metadata filter (the port's rule, `filterSql`) + minScore
    * are applied in SQL. NOTE: hybrid keyword blending (`opts.text`/`keywordWeight`) is NOT SUPPORTED
    * in pg (would require a tsvector/BM25 setup) — InMemoryVectorStore has full hybrid; pg here is
    * limited to vector + minScore (keywordWeight is IGNORED even if given). This is a documented, deliberate limit.
    */
   async query(embedding: number[], topK: number, opts?: QueryOptions): Promise<VectorMatch[]> {
     refuseUnknownNames('query', opts, QUERY_NAMES);
-    await this.ensureReady(embedding.length);
     const scope = vectorQueryScope(opts);
+    // Before the table is made: a first query used to create it with the QUERY's length.
+    assertVectorDimension(this.dimension ?? await this.existingDimension(), embedding.length, 'query');
+    await this.ensureReady(embedding.length);
     if (scope.none) return [];
     const params: unknown[] = [toVectorLiteral(embedding)];
     const where: string[] = [];
@@ -174,29 +179,24 @@ export class PostgresVectorStore implements VectorStore {
       where.push(`namespace = $${params.length}`);
     }
     if (scope.outsideOrganizations) where.push(VECTOR_OUTSIDE_ORGANIZATIONS_SQL); // the root's partition (ADR-0001)
-    if (opts?.filter && Object.keys(opts.filter).length > 0) {
-      params.push(JSON.stringify(opts.filter));
-      where.push(`metadata @> $${params.length}::jsonb`);
-      // The same condition again, spelled the way the document index is: `@>` alone cannot use it.
-      const doc = vectorFilterDocument(opts.filter);
-      if (doc !== undefined) { params.push(doc); where.push(`metadata ->> '${VECTOR_DOCUMENT_KEY}' = $${params.length}`); }
-    }
+    if (opts?.filter) where.push(...filterSql(opts.filter, params));
     if (scope.visibleTo !== undefined) {
       params.push(scope.visibleTo);
       where.push(`(shared IS TRUE OR owner = $${params.length})`);
     }
     if (opts?.minScore !== undefined) {
       params.push(opts.minScore);
-      where.push(`1 - (embedding <=> $1::vector) >= $${params.length}`);
+      where.push(`${SCORE_SQL} >= $${params.length}`);
     }
     params.push(topK);
     const limitParam = `$${params.length}`;
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
     const res = await this.pool.query(
-      `SELECT id, text, metadata, namespace, owner, shared, 1 - (embedding <=> $1::vector) AS score
+      // Equal distances by id: the ranking order every store answers in (@gnldev/durable compareVectorMatches).
+      `SELECT id, text, metadata, namespace, owner, shared, ${SCORE_SQL} AS score
          FROM ${this.table}
          ${whereSql}
-         ORDER BY embedding <=> $1::vector
+         ORDER BY embedding <=> $1::vector, id
          LIMIT ${limitParam}`,
       params,
     );
@@ -237,22 +237,7 @@ export class PostgresVectorStore implements VectorStore {
       conds.push(`namespace = $${params.length}`);
     }
     if (w.outsideOrganizations) conds.push(VECTOR_OUTSIDE_ORGANIZATIONS_SQL);
-    if (w.filter && Object.keys(w.filter).length > 0) {
-      // A key whose value is `undefined` means "has no such key" (DeleteWhere.filter); JSON would drop it
-      // and the containment below would then match records that DO carry it.
-      const present = Object.fromEntries(Object.entries(w.filter).filter(([, v]) => v !== undefined));
-      if (Object.keys(present).length > 0) {
-        params.push(JSON.stringify(present));
-        conds.push(`metadata @> $${params.length}::jsonb`);
-        const doc = vectorFilterDocument(present);
-        if (doc !== undefined) { params.push(doc); conds.push(`metadata ->> '${VECTOR_DOCUMENT_KEY}' = $${params.length}`); }
-      }
-      for (const [k, v] of Object.entries(w.filter)) {
-        if (v !== undefined) continue;
-        params.push(k);
-        conds.push(`NOT (COALESCE(metadata, '{}'::jsonb) ? $${params.length})`);
-      }
-    }
+    if (w.filter) conds.push(...filterSql(w.filter, params));
     if (w.owner !== undefined) {
       params.push(w.owner);
       conds.push(`owner = $${params.length}`);
@@ -277,6 +262,37 @@ export class PostgresVectorStore implements VectorStore {
   async close(): Promise<void> {
     if (this.pool.end) await this.pool.end();
   }
+}
+
+/**
+ * A vector's score against `$1`: cosine similarity, and 0 where pgvector's distance is NaN (a zero vector
+ * on either side) — the finite score every other store gives, so ranking and `minScore` still work.
+ */
+const SCORE_SQL = `COALESCE(NULLIF(1 - (embedding <=> $1::vector), 'NaN'::float8), 0)`;
+
+/**
+ * The port's filter rule in SQL, for a query and a delete alike — one translation, so the two cannot read
+ * a filter differently (they did: a query read `{ key: undefined }` as "has metadata", a delete as "has
+ * no such key"). The filter is already checked (`vectorQueryScope` / `vectorDeletePlan`: only scalars and
+ * undefined), so `@>` on scalar values is equality: a stored array or object never contains a scalar
+ * under the same key. A key whose value is `undefined` means "no such key"; JSON would drop it.
+ */
+function filterSql(filter: Record<string, unknown>, params: unknown[]): string[] {
+  const conds: string[] = [];
+  const present = Object.fromEntries(Object.entries(filter).filter(([, v]) => v !== undefined));
+  if (Object.keys(present).length > 0) {
+    params.push(JSON.stringify(present));
+    conds.push(`metadata @> $${params.length}::jsonb`);
+    // The same condition again, spelled the way the document index is: `@>` alone cannot use it.
+    const doc = vectorFilterDocument(present);
+    if (doc !== undefined) { params.push(doc); conds.push(`metadata ->> '${VECTOR_DOCUMENT_KEY}' = $${params.length}`); }
+  }
+  for (const [k, v] of Object.entries(filter)) {
+    if (v !== undefined) continue;
+    params.push(k);
+    conds.push(`NOT (COALESCE(metadata, '{}'::jsonb) ? $${params.length})`);
+  }
+  return conds;
 }
 
 /** number[] → pgvector literal '[0.1,0.2,...]'. */

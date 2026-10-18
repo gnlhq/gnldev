@@ -1,41 +1,17 @@
 import { cosineSimilarity } from 'ai';
-import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, vectorInOrganization, vectorDocumentOf, vectorFilterDocument, type VectorAllPartitionsOption } from '@gnldev/durable';
+import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorMetadataMatches, vectorItemCopy, vectorInOrganization, vectorDocumentOf, vectorFilterDocument, rankVectorMatches, assertVectorDimension } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
 import { INDEX_DOCUMENTS_OPTS_NAMES, QUERY_NAMES } from './option-names.js';
+import type { VectorDoc, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, VectorStore as VectorStorePort } from '@gnldev/durable';
 
-export interface VectorDoc {
-  id: string;
-  text: string;
-  metadata?: Record<string, unknown>;
-  /** 7.2: optional collection/namespace split — isolated data sets within the same store. */
-  namespace?: string;
-  /** The end user this document belongs to. See `QueryOptions.visibleTo`. */
-  owner?: string;
-  /** Visible to every end user of the namespace: the organization's general documents. */
-  shared?: boolean;
-}
-export interface VectorItem extends VectorDoc {
-  embedding: number[];
-}
-export interface VectorMatch extends VectorDoc {
-  score: number;
-}
+// THE PORT IS @gnldev/durable's. These names are its types, so a store written against @gnldev/rag is a
+// durable `VectorStore` and the other way round — one definition, held by one kit
+// (`vectorStoreConformance`). rag adds only what its own query does on top: a score threshold and
+// hybrid keyword blending.
+export type { VectorDoc, VectorItem, VectorMatch };
 
-/** 7.2: query narrowing/blending options (all optional → old behavior if not given). */
-export interface QueryOptions extends VectorAllPartitionsOption {
-  /**
-   * Only items in this namespace (matches item.namespace from upsert). Not given: every item outside
-   * the organizations' namespaces (`org:<id>`) — ADR-0001; `[VECTOR_ALL_PARTITIONS]: true` reaches them too.
-   */
-  namespace?: string;
-  /**
-   * Answer on behalf of this end user: only their own documents (`owner`) and everyone's (`shared`).
-   * An unlabelled document is neither, so a label forgotten at upload reads as "not found" rather
-   * than as "everyone's". `createRagTool` fills it in from the run; omitted means no narrowing.
-   */
-  visibleTo?: string;
-  /** Metadata SHALLOW equality filter: EVERY given key must match item.metadata with the SAME value. */
-  filter?: Record<string, unknown>;
+/** 7.2: query narrowing/blending options (all optional → old behavior if not given). The port's, plus rag's own. */
+export interface QueryOptions extends VectorQueryOptions {
   /** Score threshold: matches whose final score falls BELOW this value are FILTERED OUT (cosine ~0..1). */
   minScore?: number;
   /** Hybrid search: if given, the keyword score (BM25-lite) is blended with the vector score. */
@@ -44,31 +20,12 @@ export interface QueryOptions extends VectorAllPartitionsOption {
   keywordWeight?: number;
 }
 
-/** 7.2: delete condition — id list and/or metadata filter and/or namespace. */
-export interface DeleteWhere extends VectorAllPartitionsOption {
-  ids?: string[];
-  /**
-   * Metadata shallow equality: every key must match. A key whose value is `undefined` matches a record
-   * WITHOUT that key — `ingestDocuments` uses it to leave alone a record that carries another
-   * document's trail. A custom store that serialises the filter must keep that reading (JSON drops
-   * `undefined`, which would widen the delete).
-   */
-  filter?: Record<string, unknown>;
-  namespace?: string;
-  /** Every document of this end user — `owner` is a label, not metadata, so `filter` cannot reach it. */
-  owner?: string;
-  /** Only documents outside every organization (`org:<id>` namespaces) — see @gnldev/durable `VectorDeleteWhere`. */
-  outsideOrganizations?: boolean;
-}
+/** 7.2: delete condition — the port's (`VectorDeleteWhere`). */
+export type DeleteWhere = VectorDeleteWhere;
 
-export interface VectorStore {
-  upsert(items: VectorItem[]): Promise<void>;
+export interface VectorStore extends Omit<VectorStorePort, 'query'> {
   /** 7.2: opts is backward compatible — `query(embedding, topK)` behaves identically to before if not given. */
   query(embedding: number[], topK: number, opts?: QueryOptions): Promise<VectorMatch[]>;
-  /** 7.2 (optional): delete by id/filter/namespace, returns the number deleted. */
-  delete?(where: DeleteWhere): Promise<number>;
-  /** `true` when query and delete without a namespace skip organizations' documents — see @gnldev/durable `VectorStore.rootOutsideOrganizations`. */
-  readonly rootOutsideOrganizations?: boolean;
 }
 
 /** text → embedding function. Wired to the AI SDK `embed` in prod; faked in tests. */
@@ -144,11 +101,18 @@ export class InMemoryVectorStore implements VectorStore {
     return this.byId.values();
   }
 
+  /** The length of the vectors held (`assertVectorDimension`); `undefined` when there are none. */
+  private dimension(): number | undefined {
+    for (const it of this.byId.values()) return it.embedding.length;
+    return undefined;
+  }
+
   async upsert(items: VectorItem[]): Promise<void> {
     // The one write rule every store runs (@gnldev/durable vectorWriteBatch): labels, the owner-id
-    // rule, one id twice in a batch. Then the whole batch is checked against what is stored, so a
-    // refused batch leaves no half.
+    // rule, one id twice in a batch, one vector length. Then the whole batch is checked against what is
+    // stored, so a refused batch leaves no half.
     const batch = vectorWriteBatch(items);
+    if (batch[0]) assertVectorDimension(this.dimension(), batch[0].embedding.length, 'write');
     for (const it of batch) assertSameVectorOwner(this.byId.get(it.id), it);
     for (const it of batch) this.put(vectorItemCopy(it)); // a copy, as the SQL stores keep one
   }
@@ -158,6 +122,7 @@ export class InMemoryVectorStore implements VectorStore {
     const w = opts?.keywordWeight ?? 0;
     const hybrid = w > 0 && !!opts?.text;
     const scope = vectorQueryScope(opts);
+    assertVectorDimension(this.dimension(), embedding.length, 'query');
     if (scope.none) return [];
     const out: VectorMatch[] = [];
     for (const it of this.candidates(undefined, vectorFilterDocument(opts?.filter))) {
@@ -172,7 +137,7 @@ export class InMemoryVectorStore implements VectorStore {
       if (opts?.minScore !== undefined && score < opts.minScore) continue;
       out.push({ id: it.id, text: it.text, metadata: it.metadata, namespace: it.namespace, ...(it.owner !== undefined ? { owner: it.owner } : {}), ...(it.shared ? { shared: true } : {}), score });
     }
-    return out.sort((a, b) => b.score - a.score).slice(0, topK);
+    return rankVectorMatches(out, topK);
   }
 
   async delete(where: DeleteWhere): Promise<number> {

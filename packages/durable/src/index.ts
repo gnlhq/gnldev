@@ -41,7 +41,7 @@ export type { ModelPricing, PricingDoc } from './pricing.js';
 export {
   DivergenceError, RunBusyError, SideEffectRetryBlockedError, RetryLimitExceededError, OutcomeUnknownError,
   SuiteVersionMismatchError, RunThreadMismatchError, RunTargetMismatchError, ThreadRunsInFlightError,
-  RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunNotFoundError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, RunSweptError, BatchPlanMismatchError, AdoptionConflictError,
+  RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunNotFoundError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, VectorFilterError, VectorDimensionError, RunSweptError, BatchPlanMismatchError, AdoptionConflictError,
   CALLER_CONFLICT_CODES, callerConflictCode, callerConflictAnswer, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, FOREIGN_PARTY_DETAIL_FIELDS,
   BLOCKED_ERROR_CODES, blockedErrorCode, upstreamFailure, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES,
   RESERVED_ID_ERROR_CODES, VISIBILITY_ERROR_CODES, runNotFound, REQUEST_ERROR_CODES, ADOPTION_ERROR_CODES, DRAIN_ERROR_CODES, requestRefusal,
@@ -107,7 +107,7 @@ export { streamFinishError } from './run.js';
 // Greenfield storage contracts (ports + Storage + capability + composite).
 // The one reader of a run's limits and of a budget limit, for a door that takes them as its own options.
 export { refuseRunLimitNames, refuseBudgetLimitNames, refuseConfigNames, PROJECT_CONFIG_NAMES } from './option-names.js';
-export { threadRecordOwner, CapabilityError, requireCapability, portOf, storageOf, journalOf, isStorage, composite, toJournal, storageOfWork, matchFilter, visibleToSubject, SHARED_ONLY, vectorWriteBatch, vectorQueryScope, vectorDeletePlan, vectorDeleteMatcher, vectorInOrganization, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorMetadataMatches, OBSERVATION_VECTOR_KEY, VECTOR_DOCUMENT_KEY, vectorDocumentOf, vectorFilterDocument, vectorItemCopy, assertSameVectorOwner, assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, orgVectorId, VECTOR_PARTITION, VECTOR_ALL_PARTITIONS, type VectorAllPartitionsOption, assertRootOutsideOrganizations, ReservedVectorNameError, assertRootVectorNames, type VectorPartitionOption } from './storage.js';
+export { threadRecordOwner, CapabilityError, requireCapability, portOf, storageOf, journalOf, isStorage, composite, toJournal, storageOfWork, matchFilter, visibleToSubject, SHARED_ONLY, vectorWriteBatch, vectorQueryScope, vectorDeletePlan, vectorDeleteMatcher, vectorInOrganization, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorMetadataMatches, assertVectorFilter, compareVectorMatches, rankVectorMatches, assertVectorDimension, OBSERVATION_VECTOR_KEY, VECTOR_DOCUMENT_KEY, vectorDocumentOf, vectorFilterDocument, vectorItemCopy, assertSameVectorOwner, assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, orgVectorId, VECTOR_PARTITION, VECTOR_ALL_PARTITIONS, type VectorAllPartitionsOption, assertRootOutsideOrganizations, ReservedVectorNameError, assertRootVectorNames, type VectorPartitionOption } from './storage.js';
 // ADR-0002: the caller a door hands the engine, the one identity channel to tools and child runs, and
 // the one answer to "does this run exist, and whose is it" (run-identity.ts).
 export {

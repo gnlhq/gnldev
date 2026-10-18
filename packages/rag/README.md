@@ -154,8 +154,14 @@ storages) applies the same write rule, before anything is written:
 `@gnldev/durable` does it for the storage's vector store as part of erasing them. A `delete` with no condition (`{}`, `{ ids: [] }`,
 `{ filter: {} }`) removes nothing.
 
+A `filter` value is a string, number, boolean or `null`, compared by `===`; `undefined` means the
+document has no such key. An array, object or function value is refused with `VectorFilterError` on
+every store — filter on a scalar key instead (`tag_a: true`). Equal scores come back ordered by id, and
+a vector of another length than the store's is refused with `VectorDimensionError`.
+
 Your own `VectorStore` gets the same request as `QueryOptions.visibleTo`. Return only documents with
-`shared: true` or `owner === visibleTo`, and filter **before** taking the top K.
+`shared: true` or `owner === visibleTo`, and filter **before** taking the top K. Run it through
+`vectorStoreConformance` (`@gnldev/durable/testing`) — the scenarios every store here passes.
 
 ## How it works
 Since RAG is a tool, it naturally fits into the durable agent loop: retrieval + rerank are journaled once

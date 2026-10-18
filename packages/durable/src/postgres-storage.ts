@@ -17,7 +17,7 @@ import { keysetRunPage, rangeOrder, runStatusSql, openRunPredicate, decodeChange
 import type { JournalBatch, JournalEntry, RunChange, RunRowChange, RunStatus, RunSummary, ToolJournalRecord } from './journal.js';
 import { withBirth } from './run-identity.js';
 import { serialize, deserialize } from './serialize.js';
-import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, vectorDocumentOf, vectorFilterDocument } from './storage.js';
+import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, vectorDocumentOf, vectorFilterDocument, rankVectorMatches, assertVectorDimension } from './storage.js';
 import type { AdoptIntoOrgResult,
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -2440,11 +2440,17 @@ async function backfillVectorDocuments(q: (sql: string, p?: unknown[]) => Promis
 class PgVectorStore implements VectorStore {
   readonly rootOutsideOrganizations = true;
   constructor(private q: Q, private tx: Tx) {}
+  /** The length of the vectors held (`assertVectorDimension`), from any one row; `undefined` when there are none. */
+  private async dimension(q: Q): Promise<number | undefined> {
+    const row = (await q('SELECT embedding FROM gnl_vectors LIMIT 1', [])).rows[0] as { embedding: string } | undefined;
+    return row ? (JSON.parse(row.embedding) as number[]).length : undefined;
+  }
   async upsert(items: VectorItem[]): Promise<void> {
     const batch = vectorWriteBatch(items);
     // One transaction (where the pool can give one): a batch refused half-way, by a writer that took
     // an id after the check, is rolled back rather than left half-written.
     await this.tx(async (q) => {
+      if (batch[0]) assertVectorDimension(await this.dimension(q), batch[0].embedding.length, 'write');
       const probe = async (id: string) =>
         (await q('SELECT namespace, owner, shared FROM gnl_vectors WHERE id = $1', [id])).rows[0] as { namespace: string | null; owner: string | null; shared: boolean | null } | undefined;
       for (const it of batch) assertSameVectorOwner(await probe(it.id), it);
@@ -2502,6 +2508,7 @@ class PgVectorStore implements VectorStore {
     // `IS NOT DISTINCT FROM` rather than `=`: `= NULL` is never true in SQL, so a query for the
     // un-namespaced partition would match nothing at all.
     const scope = vectorQueryScope(opts);
+    assertVectorDimension(await this.dimension(this.q), embedding.length, 'query');
     if (scope.none) return [];
     const where: string[] = [];
     const params: unknown[] = [];
@@ -2514,10 +2521,9 @@ class PgVectorStore implements VectorStore {
     const doc = vectorFilterDocument(opts?.filter);
     if (doc !== undefined) { params.push(doc); where.push(`(doc = $${params.length} OR doc IS NULL)`); }
     const r = await this.q(`SELECT id, text, embedding, metadata, namespace, owner, shared FROM gnl_vectors${where.length ? ` WHERE ${where.join(' AND ')}` : ''}`, params);
-    return r.rows
+    return rankVectorMatches(r.rows
       .map((x) => ({ id: x.id, text: x.text, metadata: x.metadata ? deserialize<Record<string, unknown>>(x.metadata) : undefined, ...(x.namespace != null ? { namespace: x.namespace as string } : {}), ...(x.owner != null ? { owner: x.owner as string } : {}), ...(x.shared ? { shared: true } : {}), score: cosineSimilarity(embedding, JSON.parse(x.embedding)) }))
-      .filter((m) => vectorMetadataMatches(m.metadata, opts?.filter)) // before ranking, like every narrowing
-      .sort((a, b) => b.score - a.score).slice(0, topK);
+      .filter((m) => vectorMetadataMatches(m.metadata, opts?.filter)), topK); // filtered before ranking, like every narrowing
   }
 }
 

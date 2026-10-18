@@ -18,7 +18,7 @@ import { ENGINE_META_KEYS, assertOrgRegistered, isPlatformKey, orgPrefix, orgSpa
 import type { JournalBatch, JournalEntry, RunChange, RunStatus, RunSummary, ToolJournalRecord } from './journal.js';
 import { withBirth } from './run-identity.js';
 import { serialize, deserialize } from './serialize.js';
-import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, VECTOR_DOCUMENT_KEY, vectorFilterDocument } from './storage.js';
+import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, VECTOR_DOCUMENT_KEY, vectorFilterDocument, rankVectorMatches, assertVectorDimension } from './storage.js';
 import type {
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
@@ -1917,6 +1917,11 @@ class SqliteMemoryStore implements MemoryStore {
 class SqliteVectorStore implements VectorStore {
   readonly rootOutsideOrganizations = true;
   constructor(private db: any) {}
+  /** The length of the vectors held (`assertVectorDimension`), from any one row; `undefined` when there are none. */
+  private dimension(): number | undefined {
+    const row = this.db.prepare('SELECT embedding FROM gnl_vectors LIMIT 1').get() as { embedding: string } | undefined;
+    return row ? (JSON.parse(row.embedding) as number[]).length : undefined;
+  }
   async upsert(items: VectorItem[]): Promise<void> {
     const batch = vectorWriteBatch(items);
     // Check and write in ONE transaction, with no await inside (node:sqlite is synchronous): a refused
@@ -1928,6 +1933,7 @@ class SqliteVectorStore implements VectorStore {
     );
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      if (batch[0]) assertVectorDimension(this.dimension(), batch[0].embedding.length, 'write');
       for (const it of batch) assertSameVectorOwner(probe.get(it.id), it);
       for (const it of batch) stmt.run(it.id, it.text, JSON.stringify(it.embedding), it.metadata ? serialize(it.metadata) : null, it.namespace ?? null, it.owner ?? null, it.shared ? 1 : null, Date.now());
       this.db.exec('COMMIT');
@@ -1964,6 +1970,7 @@ class SqliteVectorStore implements VectorStore {
     // `IS` rather than `=`: SQLite's `=` is never true against NULL, so a query for the un-namespaced
     // partition would silently match nothing at all.
     const scope = vectorQueryScope(opts);
+    assertVectorDimension(this.dimension(), embedding.length, 'query');
     if (scope.none) return [];
     const where: string[] = [];
     const params: unknown[] = [];
@@ -1977,11 +1984,9 @@ class SqliteVectorStore implements VectorStore {
     const rows = this.db
       .prepare(`SELECT id, text, embedding, metadata, namespace, owner, shared FROM gnl_vectors${where.length ? ` WHERE ${where.join(' AND ')}` : ''}`)
       .all(...params) as any[];
-    return rows
+    return rankVectorMatches(rows
       .map((r) => ({ id: r.id, text: r.text, metadata: r.metadata ? deserialize<Record<string, unknown>>(r.metadata) : undefined, ...(r.namespace != null ? { namespace: r.namespace as string } : {}), ...(r.owner != null ? { owner: r.owner as string } : {}), ...(r.shared ? { shared: true } : {}), score: cosineSimilarity(embedding, JSON.parse(r.embedding)) }))
-      .filter((m) => vectorMetadataMatches(m.metadata, opts?.filter)) // before ranking, like every narrowing
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topK);
+      .filter((m) => vectorMetadataMatches(m.metadata, opts?.filter)), topK); // filtered before ranking, like every narrowing
   }
 }
 

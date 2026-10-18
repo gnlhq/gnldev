@@ -8,7 +8,7 @@
 // GraphRAG as a query-time layer is the user's pattern. Since it runs durable inside `createRagTool`,
 // the query RESULT is journaled → the graph isn't retraversed on resume/replay (exactly-once RAG preserved).
 import { cosineSimilarity } from 'ai';
-import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorItemCopy, vectorInOrganization } from '@gnldev/durable';
+import { visibleToSubject, vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorItemCopy, vectorInOrganization, compareVectorMatches, rankVectorMatches, assertVectorDimension } from '@gnldev/durable';
 import { matchesFilter } from './vector-store.js';
 import type { VectorStore, VectorItem, VectorMatch, QueryOptions, DeleteWhere } from './vector-store.js';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -56,6 +56,7 @@ export class GraphRag implements VectorStore {
     // The one write rule every store runs (@gnldev/durable vectorWriteBatch), then the whole batch is
     // checked against what is stored: a refused batch leaves no half.
     const batch = vectorWriteBatch(newItems);
+    if (batch[0]) assertVectorDimension(this.items[0]?.embedding.length, batch[0].embedding.length, 'write');
     for (const it of batch) {
       const at = this.byId.get(it.id);
       assertSameVectorOwner(at === undefined ? undefined : this.items[at], it);
@@ -134,6 +135,7 @@ export class GraphRag implements VectorStore {
   async query(embedding: number[], topK: number, opts?: QueryOptions): Promise<VectorMatch[]> {
     refuseUnknownNames('query', opts, QUERY_NAMES);
     const scope = vectorQueryScope(opts);
+    assertVectorDimension(this.items[0]?.embedding.length, embedding.length, 'query');
     if (this.items.length === 0 || scope.none) return [];
     // Narrow FIRST, then score. Scoring an item this caller may not see and discarding it later would
     // still let it seed the graph walk below and lend its score to a neighbour.
@@ -148,7 +150,7 @@ export class GraphRag implements VectorStore {
     // 1) Direct similarity: everyone visible is scored (in-memory corpus; same cost as InMemoryVectorStore).
     const direct = visible
       .map((it) => ({ id: it.id, score: cosineSimilarity(embedding, it.embedding) }))
-      .sort((a, b) => b.score - a.score);
+      .sort(compareVectorMatches); // the seeds below are the first in the one ranking order
 
     // 2) Graph expansion: walk from the best `seeds` seeds to their neighbors; score = source × decay × edge.
     const best = new Map<string, number>(direct.map((d) => [d.id, d.score])); // id → best known score
@@ -173,10 +175,8 @@ export class GraphRag implements VectorStore {
     }
 
     // 3) Combined ranking → topK.
-    return [...best.entries()]
-      .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)) // deterministic tie-break by id on equal score
-      .slice(0, topK)
-      .map(([id, score]) => {
+    return rankVectorMatches([...best.entries()].map(([id, score]) => ({ id, score })), topK)
+      .map(({ id, score }) => {
         const it = this.items[this.byId.get(id)!]!;
         return { id, text: it.text, metadata: it.metadata, ...(it.owner !== undefined ? { owner: it.owner } : {}), ...(it.shared ? { shared: true } : {}), score };
       });

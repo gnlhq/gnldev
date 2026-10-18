@@ -36,8 +36,28 @@ measures every backend before it is called one.
   `JournalLogContentionError` now points at the conformance kit instead of a journal without
   `putIfMatch`.
 
+- **A vector filter value that is an array, an object or a function is refused** (`VectorFilterError`)
+  on every store, at a query and at a delete, before anything is read or removed. It used to match by
+  containment on the pgvector store and match nothing on the other six, silently. Filter on scalar keys
+  (`tag_a: true`). Strings, numbers, booleans and `null` are compared by `===` as before; `undefined`
+  means "no such key".
+- **Equal vector scores come back ordered by id** on every store, and `topK` cuts in that order, so a
+  replay reads the same documents in the same places. It was insertion order on most stores.
+- **A vector of another length is refused where it is written** (`VectorDimensionError`, nothing of the
+  batch is written), and so is a query of another length. The pgvector store no longer creates its
+  table with the length of a first query.
+- **@gnldev/rag's vector types are @gnldev/durable's** (`VectorDoc`, `VectorItem`, `VectorMatch`,
+  `DeleteWhere` = `VectorDeleteWhere`; `QueryOptions` extends `VectorQueryOptions` with `minScore`,
+  `text`, `keywordWeight`). One port, one definition.
+
 ### Fixed
 
+- **Six of seven vector stores accepted a vector of another length**, after which every query of the
+  store failed. Measured with the vector kit; refused at the write now (above).
+- **The pgvector store read `{ key: undefined }` differently in a query ("has metadata") and a delete
+  ("has no such key").** One translation now (`filterSql`) for both: no such key.
+- **The pgvector store scored a zero vector NaN**, which broke ranking and `minScore`; it scores 0 now,
+  as every other store does.
 - **A completed run no longer reads 'failed' because an older attempt's failure was written late.**
   Measured with two OS processes on real Postgres: worker A's model call failed, A freed the run, and
   its verdict landed after worker B had run the same run to completion — the run read 'failed',
@@ -58,6 +78,15 @@ measures every backend before it is called one.
   trip (K1b), a batch that fails part-way (K6c), the declared clock (K7, `clock: 'host' | 'shared'`).
   Eight stores that each break one guarantee are all caught (the kit caught 4 before).
 - `JOURNAL_GUARANTEES`, `missingGuarantees(store)`, `assertJournalGuarantees(store, where)`.
+- `vectorStoreConformance(name, make, opts)` (`@gnldev/durable/testing`): 20 scenarios a vector store
+  passes on its own — labels, owner conflicts, a refused batch, two owners racing on one id, partitions
+  and the root, visibleTo, delete plan, erasure, the filter rule, filter before ranking, ranking and
+  ties, length, zero vector, copies. `make` returns the store or `{ vectors, close }`. Every vector store
+  here runs it (durable InMemory/SQLite/Postgres, rag InMemory/GraphRag/pgvector), real servers in CI;
+  `storageConformance` runs it for its `vectors` port. Of thirteen stores that each break one rule, each
+  fails the scenario for that rule (the previous kit caught 1 of 10).
+- `assertVectorFilter`, `compareVectorMatches`, `rankVectorMatches`, `assertVectorDimension` — the rules
+  the stores share, for a store written outside this repository.
 - **`LibsqlStorage` (`@gnldev/durable/libsql`): the Sqlite store on the libSQL driver, for a local
   libSQL file.** The first backend added against the conformance kit: 34 of 34 scenarios, liveness
   included; two OS processes racing on one file left one winner in every round of claim,
