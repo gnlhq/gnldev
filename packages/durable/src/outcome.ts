@@ -176,6 +176,15 @@ export async function recordRunOutcome(
         // one, and a suspended one all carry exactly that record. A re-cancel lands here too and
         // returns, which is the idempotence cancel.ts already promises.
         if (opts?.notAfterTerminal && cur.status !== 'running') return;
+        // NEWEST ATTEMPT, not newest write. The time a verdict is written says nothing about which
+        // attempt it belongs to: a worker whose model call failed frees the run and writes 'failed'
+        // afterwards, and that write can be slow — while it was, another worker ran the same run and
+        // completed it, and the late write, dated by the shared clock at the moment it LANDED, read as
+        // the newest news (measured on Postgres: a completed run read 'failed', permanently). The
+        // attempt's start is fixed before it does anything, on the same clock, so an older attempt's
+        // record never replaces a newer attempt's — whenever it arrives. A record without one (written
+        // before the field, or the operator's cancel) is ordered by its `at`.
+        if (next.attempt !== undefined && next.attempt < (cur.attempt ?? cur.at)) return;
         if (typeof cur.at === 'number' && cur.at > next.at) return; // a newer verdict already stands
         // A write-ahead 'running' may never bury a CANCEL. Every other verdict still can when it is
         // strictly newer — a run that finished DESPITE a late cancel really did finish, and calling
@@ -212,15 +221,31 @@ export async function recordRunOutcome(
   }
 }
 
-export const runSucceeded = (journal: Journal, runId: string, at: number): Promise<void> =>
-  recordRunOutcome(journal, runId, { status: 'completed', at });
+/**
+ * The instant an attempt begins, on the clock its verdicts are dated by (the store's, when it has one):
+ * what `runStarted` records and every later verdict of the same attempt carries (`RunOutcomeRecord.attempt`).
+ * Taken before the attempt writes anything, so no slow write can make it later. `undefined` when the
+ * store cannot say — the attempt's verdicts are then ordered by `at`, as before.
+ */
+export async function attemptStart(journal: Journal): Promise<number | undefined> {
+  try {
+    return journal.now ? await journal.now() : Date.now();
+  } catch {
+    return undefined;
+  }
+}
 
-export const runFailed = (journal: Journal, runId: string, err: unknown, at: number): Promise<void> =>
-  recordRunOutcome(journal, runId, { status: 'failed', at, error: messageOf(err) });
+const ofAttempt = (attempt: number | undefined) => (attempt !== undefined ? { attempt } : {});
+
+export const runSucceeded = (journal: Journal, runId: string, at: number, attempt?: number): Promise<void> =>
+  recordRunOutcome(journal, runId, { status: 'completed', at, ...ofAttempt(attempt) });
+
+export const runFailed = (journal: Journal, runId: string, err: unknown, at: number, attempt?: number): Promise<void> =>
+  recordRunOutcome(journal, runId, { status: 'failed', at, error: messageOf(err), ...ofAttempt(attempt) });
 
 /** A fenced-out attempt's failure: only ever fills an ABSENT verdict — the surviving executor's wins. */
-export const runFailedIfUnrecorded = (journal: Journal, runId: string, err: unknown, at: number): Promise<void> =>
-  recordRunOutcome(journal, runId, { status: 'failed', at, error: messageOf(err) }, { fillOnly: true });
+export const runFailedIfUnrecorded = (journal: Journal, runId: string, err: unknown, at: number, attempt?: number): Promise<void> =>
+  recordRunOutcome(journal, runId, { status: 'failed', at, error: messageOf(err), ...ofAttempt(attempt) }, { fillOnly: true });
 
 /**
  * The write-ahead start marker. Recorded at every attempt's entry (a resume is a new attempt), so a
@@ -228,8 +253,8 @@ export const runFailedIfUnrecorded = (journal: Journal, runId: string, err: unkn
  * the absence of any record used to mean. Monotonic like every outcome write: it cannot bury a
  * strictly newer terminal, and a stale attempt's late start cannot resurrect a finished run.
  */
-export const runStarted = (journal: Journal, runId: string, at: number): Promise<void> =>
-  recordRunOutcome(journal, runId, { status: 'running', at });
+export const runStarted = (journal: Journal, runId: string, at: number, attempt?: number): Promise<void> =>
+  recordRunOutcome(journal, runId, { status: 'running', at, ...ofAttempt(attempt) });
 
 /**
  * The operator's ending. Written by `cancelAgentRun` — the durable cancel's single choke point — with

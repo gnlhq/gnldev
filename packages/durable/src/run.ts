@@ -38,7 +38,7 @@ import type { RunLimits } from './limits.js';
 
 import type { LanguageModelV4 } from '@ai-sdk/provider';
 import { systemText, finishReasonText, producedMessages, type InstructionsLike } from './sdk-compat.js';
-import { runFailed, runFailedIfUnrecorded, runStarted, runSucceeded, classifyRunError, isRunFailure, readRunOutcome } from './outcome.js';
+import { attemptStart, runFailed, runFailedIfUnrecorded, runStarted, runSucceeded, classifyRunError, isRunFailure, readRunOutcome } from './outcome.js';
 import { recordedInputProblem, type InputOrigin } from './request-body.js';
 import { recordRunOutput } from './scoring.js';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -2797,6 +2797,9 @@ export async function runDurable(args: RunDurableArgs): Promise<DurableResult> {
   return holdWhile(() => runDurableHeld(args), typeof args.runId === 'string' ? { journal: args.journal, name: args.runId, what: 'the run is executing' } : undefined);
 }
 
+/** What one attempt learns at its admission, read by its failure path: whether it was admitted, and when it began. */
+interface Admission { admitted: boolean; attempt?: number }
+
 async function runDurableHeld(args: RunDurableArgs): Promise<DurableResult> {
   // The failure half of the run's outcome record. The success half is written at the completion choke
   // point inside runDurableInner, where "did it actually finish" is already established (a suspended
@@ -2808,7 +2811,7 @@ async function runDurableHeld(args: RunDurableArgs): Promise<DurableResult> {
   // the run's: recording it wrote `failed` under a run the caller had no right to touch. Measured by
   // the conformance registry: with the owner record unreadable, another user's call rejected with
   // EIO and still stamped the owner's run `failed`. An unreadable owner is not written through.
-  const admission = { admitted: false };
+  const admission: Admission = { admitted: false };
   // What this attempt knows of its run's deletion when it starts (erasure-fence.ts) — compared at every
   // later check, and once more after the attempt's last write (below).
   const erasure = await erasureBaseline(args.journal, parentOf(args));
@@ -2818,11 +2821,11 @@ async function runDurableHeld(args: RunDurableArgs): Promise<DurableResult> {
   } catch (err) {
     if (!admission.admitted) throw err;
     const kind = classifyRunError(err);
-    if (kind === 'failure') await runFailed(args.journal, args.runId, err, Date.now());
+    if (kind === 'failure') await runFailed(args.journal, args.runId, err, Date.now(), admission.attempt);
     // Fenced out MID-FLIGHT: this worker got in and lost to a concurrent executor. Fill-only, so the
     // survivor's verdict — earlier or later — always stands; recording nothing left the run reading
     // 'completed' while it was neither.
-    else if (kind === 'contended') await runFailedIfUnrecorded(args.journal, args.runId, err, Date.now());
+    else if (kind === 'contended') await runFailedIfUnrecorded(args.journal, args.runId, err, Date.now(), admission.attempt);
     if (await settleErasedRun(args.journal, args.runId, erasure, appendsOf(args))) throw err instanceof RunErasedError ? err : new RunErasedError(args.runId);
     throw err;
   }
@@ -2832,7 +2835,7 @@ async function runDurableHeld(args: RunDurableArgs): Promise<DurableResult> {
   return out;
 }
 
-async function runDurableGuarded(args: RunDurableArgs, admission: { admitted: boolean }, erasure: ErasureBaseline): Promise<DurableResult> {
+async function runDurableGuarded(args: RunDurableArgs, admission: Admission, erasure: ErasureBaseline): Promise<DurableResult> {
   // A COMPENSATED (unwound) run refuses to run/resume — replaying memoized successes
   // on top of an already-reverted world would silently "complete" a transaction that was undone.
   await assertNotCompensated(args.journal, args.runId);
@@ -3037,7 +3040,7 @@ export async function admitAgentRun(args: StreamDurableArgs): Promise<void> {
   await admitAgentEntry(journal, runId, args, rest);
 }
 
-async function runDurableInner(args: RunDurableArgs, admission: { admitted: boolean }, erasure: ErasureBaseline): Promise<DurableResult> {
+async function runDurableInner(args: RunDurableArgs, admission: Admission, erasure: ErasureBaseline): Promise<DurableResult> {
   // `workKey`/`workScope` are pulled OUT of `rest` deliberately: `rest` is both the frozen input and
   // the option bag handed to `generateText`, so a declared name left in it would travel to the
   // provider as an unknown request field and land in `:input` twice under two different meanings.
@@ -3059,8 +3062,11 @@ async function runDurableInner(args: RunDurableArgs, admission: { admitted: bool
   // WRITE-AHEAD outcome: this attempt has STARTED. A run SIGKILLed anywhere past this line reads
   // 'running' — never 'completed', which is what the absence of any record used to mean. Sits after
   // the lock (the guarded path acquires before calling here), so a caller that never got in never
-  // touches the live run's record. Best-effort like every outcome write.
-  await runStarted(journal, runId, Date.now());
+  // touches the live run's record. Best-effort like every outcome write. The attempt's start is fixed
+  // first and carried by every verdict it writes (outcome.ts `attemptStart`).
+  const attempt = await attemptStart(journal);
+  admission.attempt = attempt;
+  await runStarted(journal, runId, Date.now(), attempt);
   // AUDIT (approval first-class): BEFORE ctx is set up — claim the parameter's approvals into the
   // journal + merge with the journal's existing approvals (see the resolveApprovals header).
   const resolvedApprovals = await resolveApprovals(journal, runId, approvals, {
@@ -3229,7 +3235,7 @@ async function runDurableInner(args: RunDurableArgs, admission: { admitted: bool
     // Overwrites any 'failed' from an earlier attempt: a run that was fixed and resumed to success is
     // not a failed run. Inside the `interrupts.length === 0` branch, so a suspended run — which returns
     // normally, awaiting a human — is not mislabelled as finished.
-    await runSucceeded(journal, runId, Date.now());
+    await runSucceeded(journal, runId, Date.now(), attempt);
   }
 
   return Object.assign(result, { interrupts, ...(ctx.replayLog?.length ? { replayedToolCalls: ctx.replayLog } : {}) });
@@ -3568,8 +3574,10 @@ async function streamDurableHeld(args: StreamDurableArgs, run: StreamRun): Promi
   const priorOutcome = frozenInput !== undefined ? await readRunOutcome(journal, runId) : undefined;
   const gateResume = priorOutcome?.status !== 'completed' && priorOutcome?.status !== 'canceled';
   // WRITE-AHEAD outcome — the stream twin of runDurableInner's. A stream abandoned mid-flight (the
-  // process died, neither onFinish nor onError ran) reads 'running' instead of 'completed'.
-  await runStarted(journal, runId, Date.now());
+  // process died, neither onFinish nor onError ran) reads 'running' instead of 'completed'. The
+  // attempt's start, carried by every verdict this stream writes (outcome.ts `attemptStart`).
+  const attempt = await attemptStart(journal);
+  await runStarted(journal, runId, Date.now(), attempt);
   // AUDIT (approval first-class): SAME as runDurableInner — BEFORE ctx is set up (see resolveApprovals).
   const resolvedApprovals = await resolveApprovals(journal, runId, approvals, {
     ...(actor ? { actor } : {}),
@@ -3743,7 +3751,7 @@ async function streamDurableHeld(args: StreamDurableArgs, run: StreamRun): Promi
       }
       if (fenceUnread !== undefined) {
         console.warn(`@gnldev/durable: '${runId}' could not read whether it was deleted while it streamed, so its completion was not written (no messages, usage or metrics) and it is recorded failed:`, fenceUnread);
-        try { await runFailed(journal, runId, fenceUnread, Date.now()); } catch { /* the settle below still runs */ }
+        try { await runFailed(journal, runId, fenceUnread, Date.now(), attempt); } catch { /* the settle below still runs */ }
       } else if (!pending && !erased) {
         try {
           let produced: any[] = producedMessages(ev);
@@ -3791,8 +3799,8 @@ async function streamDurableHeld(args: StreamDurableArgs, run: StreamRun): Promi
         // the worst possible lie for a durability engine to tell.
         const endedInError = streamFailed || finishReasonText(ev?.finishReason) === 'error'
           || stepsArr.some((st: any) => finishReasonText(st?.finishReason) === 'error');
-        if (!endedInError) await runSucceeded(journal, runId, Date.now());
-        else await runFailed(journal, runId, new Error(String(ev?.finishReason ?? 'stream error')), Date.now());
+        if (!endedInError) await runSucceeded(journal, runId, Date.now(), attempt);
+        else await runFailed(journal, runId, new Error(String(ev?.finishReason ?? 'stream error')), Date.now(), attempt);
       }
       // (a): the stream has finished (completed OR suspended) → release the run-lock so a resume
       // can proceed. Token-fenced + idempotent: a no-op if the lock was already taken over/released.
@@ -3814,7 +3822,7 @@ async function streamDurableHeld(args: StreamDurableArgs, run: StreamRun): Promi
       const err = (ev as { error?: unknown })?.error ?? ev;
       streamFailed = true; // onFinish still fires after an error — it must not record a success over this
       if (err instanceof RunDrainedError) drained = true;
-      if (isRunFailure(err)) await runFailed(journal, runId, err, Date.now());
+      if (isRunFailure(err)) await runFailed(journal, runId, err, Date.now(), attempt);
       await releaseStreamLock();
       try { await settleErasedRun(journal, runId, erasure, appendsOf({ memory, threadId })); } catch (e) {
         console.warn(`@gnldev/durable: '${runId}' was deleted while it streamed, and what it wrote since could not be deleted again:`, e);

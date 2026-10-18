@@ -518,6 +518,13 @@ export interface RunOutcomeRecord {
    */
   status: 'completed' | 'failed' | 'running' | 'canceled';
   at: number;
+  /**
+   * When the attempt that wrote this record BEGAN, on the same clock as `at` (the store's, when it has
+   * one). A run's outcome is its newest attempt's: a record of an older attempt never replaces one of a
+   * newer attempt, whenever it arrives. Absent on records written before this field, and on the
+   * operator's cancel, which is not an attempt; those are ordered by `at` alone.
+   */
+  attempt?: number;
   error?: string;
 }
 
