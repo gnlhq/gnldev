@@ -17,7 +17,12 @@ Measured on 0.11.1 (raporlar/2026-10-18-db-mod2, -mod3):
 1. **The contract names the guarantees.** The run store requires `putIfAbsent`, `putIfMatch`, `applyBatch`, `incrBy`, `getCounters`, `listKeys`, `deletePrefix`, `now` (a store on one host may declare its host clock). Accelerators stay optional (`getMany`, `readRange`, `listOwnerRecords`, `listRunsChangedSince`).
 2. **A store missing a guarantee is refused where it enters**, naming what is missing — not run on a fallback. The fallback branches for guaranteed methods are removed.
 3. **One exported conformance kit, derived from the contract**, that any backend is pointed at with one `make()`: a scenario group per guarantee including races and partial batches; run, work, vector, memory, liveness and upgrade stores. A missing guarantee fails a scenario; nothing passes vacuously. Every shipped backend runs it in CI, on real Postgres too.
-4. **A verdict from an attempt that no longer holds the run is not written** (the root of the stale-`failed` defect), the same rule as a model step's answer.
+4. **A run's outcome is its newest attempt's verdict** (the root of the stale-`failed` defect). Each
+   attempt fixes its start on the verdict clock before it writes anything, and every verdict it writes
+   carries it; an older attempt's record never replaces a newer attempt's, whenever it arrives. Measured
+   first as "a verdict from an attempt that no longer holds the run is not written", but a run started
+   without a lock has no holder to ask, and the late failure arrived there too; the attempt's start
+   orders both.
 
 ## Alternatives measured
 
@@ -31,6 +36,11 @@ Neither design can make the engine verify atomicity: a non-atomic `putIfMatch` s
 
 - Breaking: a custom store missing one of the guarantees is refused at construction with the missing names (the documented Map example gains them). No shim. Stated in CHANGELOG. No external users today (maturity: R&D).
 - New backends (MySQL/MariaDB, MongoDB, Turso/libSQL) are written against the kit; one is done when it passes it.
+- Values: every store copies a value through the store serialization (`serialize`/`deserialize`) — what
+  the SQL stores always did; the in-memory store used structuredClone and answered differently.
+- Not in this decision, measured and left to a later one: the work store's own compare-and-set (a queue
+  job's owner token is unfenced without it; `workCas: false` declares it), and `@gnldev/workflow`'s
+  standalone journal type, which cannot import this contract.
 
 ## This decision is wrong if
 
