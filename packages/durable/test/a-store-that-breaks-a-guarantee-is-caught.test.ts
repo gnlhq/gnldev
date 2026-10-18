@@ -7,7 +7,7 @@ import { journalConformance } from '../src/testing.js';
 import { missingGuarantees } from '../src/journal.js';
 import { toJournal } from '../src/index.js';
 import { NAIVE_STORES, wrap } from './naive-stores.js';
-import { mysqlStores } from './real-backends.js';
+import { mysqlStores, mongoStores } from './real-backends.js';
 
 /** Runs the kit's scenarios against one store, outside the runner, and returns the titles that failed. */
 async function failedScenarios(make: () => any, close?: (journal: any) => Promise<void>): Promise<string[]> {
@@ -37,10 +37,10 @@ describe('a store that breaks a guarantee is caught', () => {
   }
 });
 
-// The same on a real server: a MySQL / MariaDB journal passes every scenario, and the same journal with
+// The same on a real server: a MySQL / MariaDB / MongoDB journal passes every scenario, and the same journal with
 // one guarantee broken the way N2 / N3 break it (read, wait, write) fails one.
 const tick = () => new Promise((r) => setTimeout(r, 0));
-for (const [name, make] of mysqlStores(' (real)')) {
+for (const [name, make] of [...mysqlStores(' (real)'), ...mongoStores(' (real)')]) {
   describe(`a store that breaks a guarantee is caught — ${name}`, () => {
     const opened = new Map<any, { close(): Promise<void> }>();
     const journalOf = (over: (t: any) => Record<string, unknown>) => async () => {

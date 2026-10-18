@@ -131,7 +131,8 @@ const again = await gnl.follow(s.runId, { after: at }); // continues right after
   reading; the run goes on. `abortSignal` cancels the RUN, durably, wherever it executes
   (`RunCanceledError` for its callers). A second call for a run in flight follows the same execution.
 - **A dead process's runs are taken over; a live one's never are.** Each store has a process liveness
-  — a Postgres session advisory lock, a MySQL named lock, a Sqlite file lock (`SqliteStorage`, `PostgresStorage` and `MysqlStorage` bring
+  — a Postgres session advisory lock, a MySQL named lock, a MongoDB connection named for the process, a Sqlite file lock (`SqliteStorage`,
+  `PostgresStorage`, `MysqlStorage` and `MongoStorage` bring
   their own; the executor, the queue worker, and `durableTool` / `durableModel` / `runDurable` called
   directly bind it on their first call — on Postgres one connection per store per process). A frozen
   process keeps its runs and its calls; a dead one releases them at once. In the process that holds it,
@@ -1158,6 +1159,9 @@ The exactly-once guarantee rests on one precondition: **storage never loses an a
   semi-synchronous replication or a Group Replication / Galera cluster, so an acknowledged commit is on
   a replica before it returns. `storage.runs.durabilityReport()` reads the first; it does not inspect
   replication.
+- **MongoDB:** a replica set (the store refuses anything else); three members for failover. Every
+  transaction commits with `w: "majority"`, so an acknowledged one is on a majority of members.
+  `storage.durabilityReport()` reads the set and its members.
 - **SQLite:** meant for a single node; WAL mode gives sufficient filesystem durability.
 - **Outbound side effects:** the strongest end-to-end defense is using a provider-side **idempotency
   key** on tool calls (see the pattern in `test/idempotency-key.test.ts`) — regardless of the storage
@@ -1236,6 +1240,84 @@ the boot warns only when it can read a detection longer than 60 s (MariaDB varia
 service (Amazon RDS / Aurora, Google Cloud SQL, Azure Database for MySQL) the host's keepalive is the
 provider's: not measured here — check it with the provider (or with `scripts/mysql-partition-probe.mjs`, which measures it) before
 relying on a takeover time.
+
+## MongoDB (`@gnldev/durable/mongo`)
+
+A replica set — one node is enough — with the same ports, guarantees and derived run documents as
+`PostgresStorage`: the run journal, work, memory, vectors, cache and meta, `upgrade()`, erasure,
+organizations, and a process liveness of its own. `mongodb` is an optional peer dependency. Measured on
+MongoDB 8.0 and 8.3.
+
+```ts
+import { MongoStorage } from '@gnldev/durable/mongo';      // npm i mongodb
+
+const storage = new MongoStorage({ connectionString: 'mongodb://app:secret@localhost:27017/agents?replicaSet=rs0' });
+const gnl = createGnl({ storage, agents });
+```
+
+- **A replica set, or nothing.** A claimed batch, a record with its run document, a thread's append and
+  an erasure that cuts into a run are each one multi-document transaction, and a standalone server
+  refuses transactions while it takes single writes. The store and its liveness ask the server first and
+  refuse a standalone (and a sharded cluster's router), before anything is written. For one local node:
+  `mongod --replSet rs0`, then `rs.initiate()` once, and `?directConnection=true` in the URL.
+- **The database must be named** in the URL (or `database`); the store creates its collections and
+  indexes on first use. Several processes may boot it at once.
+- **Transactions are snapshot reads; a conflict runs the write again.** Two writers of one document
+  conflict and the later one runs again from a new snapshot, so a claim has one winner and a record and
+  its run document move together. A thread's append writes the thread's lock document first, so an
+  append and the thread's deletion conflict too (without it, each could keep what the other removed —
+  measured). Keys are string `_id`s in byte order, no collation.
+- **One clock:** `now()` is the server's (`hello.localTime`).
+- **Vectors are scanned.** The community server has no vector index, so every query reads its scope's
+  documents and ranks them in the process: fine for thousands of documents, not for millions. At scale,
+  keep the documents in a vector database (`@gnldev/rag`'s pgvector store, or Qdrant) and the runs here.
+- **Slower than Postgres**: about 3.5x on the same writes (each new record takes a position from a
+  counter document first, and a commit waits for `w: "majority"`); run listings are as fast.
+
+### Required: the liveness must see the other processes' connections
+
+A process's liveness is a connection named for it (`appName`). Another process judges it alive by
+finding that connection in `$currentOp` — and a user that cannot see it reads a live holder as dead and
+runs its call a second time. A user sees other users' connections only with the `inprog` action, the
+**`clusterMonitor`** role:
+
+```js
+db.grantRolesToUser('app', [{ role: 'clusterMonitor', db: 'admin' }])
+```
+
+Without it, MongoDB 8.0 shows a user its own other connections (so every process may run as one user)
+and 8.3 only the connection that asks (so none can). The store does not guess: before the liveness is
+handed out it looks for its own connection from a second connection, and refuses when it cannot see it;
+and it records each user that opens a liveness in `gnl_liveness_users`, refusing a user beside another
+when either of the two sees only its own. `liveness.visibility` and `durabilityReport()` say which it
+is (`'every user'` or `'this user'`).
+
+### Required: short TCP keepalives on the server
+
+The server drops a process's connection — and lets another process take its runs over — when that
+process goes away. For a crash that is at once (measured ~0.15 s). For a host that is **cut off** the
+server only finds out when TCP keepalive gives up, set by the server host's operating system. Measured on
+MongoDB 8.0, a holder container disconnected from the network mid-call:
+
+| Server host keepalive (time / interval / probes) | Connection gone after | Taken over after | Effects |
+|---|---|---|---|
+| 10 s / 5 s / 3 (the setting below), 3 rounds | 13.2–13.6 s | 13.3–14.4 s | 1 |
+| Linux default, 7200 s / 75 s / 9, 1 round | 334 s (mongod lowers the idle time to 300 s on its connections) | 334 s | 1 |
+
+Until then that host's runs are held: never run twice, but not taken over either. A process that is only
+frozen (SIGSTOP for 80 s) is never taken over: its kernel still answers the probes. When the cut-off
+process is connected again its old id stays dead and it comes back under a new one — it never resumes
+under the id the others acted on.
+
+```sh
+sysctl -w net.ipv4.tcp_keepalive_time=10 net.ipv4.tcp_keepalive_intvl=5 net.ipv4.tcp_keepalive_probes=3
+docker run --sysctl net.ipv4.tcp_keepalive_time=10 --sysctl net.ipv4.tcp_keepalive_intvl=5 --sysctl net.ipv4.tcp_keepalive_probes=3 mongo:8.0 --replSet rs0
+```
+
+**What gnl can check:** the setting cannot be read by a client, so `durabilityReport().partitionDetection`
+is `{ seconds: null, source: 'operating system' }` with a note stating the requirement. On a managed
+service (MongoDB Atlas and others) the host is the provider's: not measured here — check it with
+`scripts/mongo-partition-probe.mjs`, which measures it, before relying on a takeover time.
 
 ## Testing your own journal (`@gnldev/durable/testing`)
 

@@ -1,7 +1,8 @@
 // Every vector store in the repository through the vector kit (vector-conformance.ts): durable's three
 // (InMemory, SQLite, Postgres on pg-mem and, with GNL_PG_URL, on a real server; MySQL / MariaDB with
-// GNL_MYSQL_URL / GNL_MARIADB_URL) and @gnldev/rag's three
-// (InMemoryVectorStore, GraphRag and, with GNL_PGVECTOR_URL, the pgvector store). One kit, every store,
+// GNL_MYSQL_URL / GNL_MARIADB_URL; MongoDB with GNL_MONGO_URL) and @gnldev/rag's three
+// (InMemoryVectorStore, GraphRag and, with GNL_PGVECTOR_URL, the pgvector store; with GNL_QDRANT_URL, the
+// Qdrant store). One kit, every store,
 // the same answer — the rules live in storage.ts (`vectorQueryScope`, `vectorDeletePlan`,
 // `vectorWriteBatch`, `rankVectorMatches`), and this is what keeps a store from drifting off them.
 import { describe, it, afterAll } from 'vitest';
@@ -11,11 +12,12 @@ import { InMemoryStorage, type VectorStore } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { vectorStoreConformance, type VectorStoreUnderTest } from '../src/testing.js';
-import { mysqlStores } from './real-backends.js';
-import { InMemoryVectorStore, GraphRag, PostgresVectorStore } from '../../rag/src/index.js';
+import { mysqlStores, mongoStores } from './real-backends.js';
+import { InMemoryVectorStore, GraphRag, PostgresVectorStore, QdrantVectorStore } from '../../rag/src/index.js';
 
 const PG_URL = process.env.GNL_PG_URL;
 const PGVECTOR_URL = process.env.GNL_PGVECTOR_URL;
+const QDRANT_URL = process.env.GNL_QDRANT_URL;
 
 // A real server's stores get a schema of their own, dropped after the scenario, so a scenario never
 // sees another's rows. The `vector` type lives in `public`, created once: made under a per-scenario
@@ -47,7 +49,16 @@ if (PGVECTOR_URL) {
   STORES.push(['rag pgvector (real)', async () => { const { pool, drop } = await schemaPool(PGVECTOR_URL, true); return { vectors: new PostgresVectorStore({ pool, index: 'none' }) as VectorStore, close: drop }; }]);
 }
 
-for (const [name, make] of mysqlStores(' (real)')) STORES.push([`durable ${name}`, async () => { const s = await make(); return { vectors: s.vectors!, close: () => s.close() }; }]);
+for (const [name, make] of [...mysqlStores(' (real)'), ...mongoStores(' (real)')]) STORES.push([`durable ${name}`, async () => { const s = await make(); return { vectors: s.vectors!, close: () => s.close() }; }]);
+if (QDRANT_URL) {
+  // A collection of its own per scenario, dropped after it, so a scenario never sees another's points.
+  let collections = 0;
+  STORES.push(['rag Qdrant (real)', async () => {
+    const collection = `vkit_${process.pid}_${Date.now().toString(36)}_${collections++}`;
+    const drop = async () => { await fetch(`${QDRANT_URL.replace(/\/+$/, '')}/collections/${collection}`, { method: 'DELETE' }); };
+    return { vectors: new QdrantVectorStore({ url: QDRANT_URL, collection }) as VectorStore, close: drop };
+  }]);
+}
 
 // pg-mem cannot isolate two concurrent writers (the same reason journalConformance runs it with
 // `exactClaim: false`); the race is held on every real store, the real Postgres one included.

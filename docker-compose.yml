@@ -5,7 +5,8 @@
 # `pgvector` is a second Postgres with the `vector` extension, for the stores that need it
 # (GNL_PGVECTOR_URL: rag's PostgresVectorStore, the vector write contract). A separate service rather
 # than swapping the image of `postgres`, so the durable suite keeps running on the server it always has.
-# `mysql` and `mariadb` are the servers MysqlStorage supports.
+# `mysql` and `mariadb` are the servers MysqlStorage supports; `mongo` the replica set MongoStorage runs on
+# (scripts/check-real-backends.mjs initiates it) and `mongo-standalone` the server it must refuse.
 services:
   postgres:
     image: postgres:15-alpine
@@ -45,3 +46,24 @@ services:
       net.ipv4.tcp_keepalive_time: 10
       net.ipv4.tcp_keepalive_intvl: 5
       net.ipv4.tcp_keepalive_probes: 3
+  # MongoStorage (`@gnldev/durable/mongo`): a single-node replica set with access control (a keyfile made in
+  # the container), short TCP keepalives and a raised file limit — as packages/durable/README.md says a
+  # deployment runs it. GNL_MONGO_URL; GNL_MONGO_STANDALONE_URL for `mongo-standalone`.
+  mongo:
+    image: mongo:8.0
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: gnl
+    entrypoint: ['sh', '-c', 'openssl rand -base64 756 > /tmp/keyfile && chmod 400 /tmp/keyfile && chown mongodb /tmp/keyfile && exec docker-entrypoint.sh mongod --replSet rs0 --keyFile /tmp/keyfile --bind_ip_all']
+    ports:
+      - '55317:27017'
+    ulimits:
+      nofile: 64000
+    sysctls:
+      net.ipv4.tcp_keepalive_time: 10
+      net.ipv4.tcp_keepalive_intvl: 5
+      net.ipv4.tcp_keepalive_probes: 3
+  mongo-standalone:
+    image: mongo:8.0
+    ports:
+      - '55318:27017'
