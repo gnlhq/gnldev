@@ -58,6 +58,14 @@ measures every backend before it is called one.
   trip (K1b), a batch that fails part-way (K6c), the declared clock (K7, `clock: 'host' | 'shared'`).
   Eight stores that each break one guarantee are all caught (the kit caught 4 before).
 - `JOURNAL_GUARANTEES`, `missingGuarantees(store)`, `assertJournalGuarantees(store, where)`.
+- **`LibsqlStorage` (`@gnldev/durable/libsql`): the Sqlite store on the libSQL driver, for a local
+  libSQL file.** The first backend added against the conformance kit: 34 of 34 scenarios, liveness
+  included; two OS processes racing on one file left one winner in every round of claim,
+  compare-and-set and run-lock takeover, 3 runs of 10. `libsql` is an optional peer dependency.
+  Refused where the store is made, naming why: an embedded replica (`syncUrl` — a write is not read
+  back until it syncs; the kit failed 29 of 34 there) and a remote database (`libsql:`, `http(s):`,
+  `ws(s):` — no session a process holds, so a stalled live process would be taken over and its side
+  effect run twice; measured 3 of 3).
 
 ## [0.11.1] — 2026-10-17
 

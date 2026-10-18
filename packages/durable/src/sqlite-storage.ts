@@ -263,11 +263,21 @@ export class SqliteStorage implements Storage {
     return this.ownLiveness;
   }
 
+  /**
+   * The driver connection for `path`: node:sqlite here. A store on another SQLite-dialect driver with
+   * the same synchronous surface (`exec`, `prepare(...).run/get/all`, `close`) overrides this and
+   * nothing else — the schema, the statements and the guarantees stay this class's (LibsqlStorage).
+   * Called from the constructor, before any field of a subclass is set.
+   */
+  protected openDatabase(path: string): unknown {
+    return new DatabaseSync(path);
+  }
+
   constructor(path = ':memory:') {
     this.dbPath = path;
     // Every statement below (and in every store class) goes through the SQLITE_BUSY retry wrapper —
     // see BusyRetryDatabase. Transient lock contention is absorbed; anything else still throws.
-    this.db = new BusyRetryDatabase(new DatabaseSync(path));
+    this.db = new BusyRetryDatabase(this.openDatabase(path));
     // Busy_timeout MUST be
     // the FIRST pragma, in its OWN try. It used to be the LAST statement of the shared try below —
     // when two processes cold-started the same file simultaneously, the WAL switch raced with

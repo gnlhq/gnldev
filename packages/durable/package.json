@@ -38,6 +38,10 @@
       "types": "./dist/postgres-storage.d.ts",
       "default": "./dist/postgres-storage.js"
     },
+    "./libsql": {
+      "types": "./dist/libsql-storage.d.ts",
+      "default": "./dist/libsql-storage.js"
+    },
     "./mock": {
       "types": "./dist/mock-model.d.ts",
       "default": "./dist/mock-model.js"
@@ -60,11 +64,15 @@
   "peerDependencies": {
     "@gnldev/tool-schema": "workspace:^",
     "ai": "^7.0.0",
+    "libsql": "^0.5.0",
     "pg": "^8.0.0",
     "zod": "^3.25.76 || ^4.1.8"
   },
   "peerDependenciesMeta": {
     "@gnldev/tool-schema": {
+      "optional": true
+    },
+    "libsql": {
       "optional": true
     },
     "pg": {
@@ -77,6 +85,7 @@
     "@gnldev/tool-schema": "workspace:*",
     "@gnldev/workflow": "workspace:*",
     "ai": "^7.0.0",
+    "libsql": "^0.5.29",
     "pg": "^8.0.0",
     "pg-mem": "^3.0.14",
     "zod": "^3.25.0"

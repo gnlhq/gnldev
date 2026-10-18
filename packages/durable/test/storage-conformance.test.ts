@@ -10,6 +10,7 @@ import pg from 'pg';
 import { InMemoryStorage } from '@gnldev/durable';
 import { storageConformance } from '@gnldev/durable/testing';
 import { SqliteStorage } from '../src/sqlite-storage.js';
+import { LibsqlStorage } from '../src/libsql-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 
 const PG_URL = process.env.GNL_PG_URL;
@@ -27,6 +28,16 @@ storageConformance('Sqlite (a file)', () => {
   sqliteFile.set(s, join(dir, 's.db'));
   return s;
 }, { describe, it, timeout: 120_000, reopen: (s) => new SqliteStorage(sqliteFile.get(s)!) });
+
+// The same store on the libSQL driver (a local file — the only libSQL database it opens).
+const libsqlFile = new WeakMap<object, string>();
+storageConformance('libSQL (a file)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gnl-storage-conf-libsql-'));
+  ends.push(() => rmSync(dir, { recursive: true, force: true }));
+  const s = new LibsqlStorage(join(dir, 's.db'));
+  libsqlFile.set(s, join(dir, 's.db'));
+  return s;
+}, { describe, it, timeout: 120_000, reopen: (s) => new LibsqlStorage(libsqlFile.get(s)!) });
 
 // pg-mem is a test double: it reports a lost claim as won, cannot page a run list, lets other
 // connections see a batch before it commits, cannot order two appends, and cannot make a liveness.

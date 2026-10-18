@@ -505,8 +505,27 @@ npx tsx examples/no-double-charge.ts   # no API key needed (mock model) — at-m
 | `resumeRun(runId, opts)` | Resume a suspended run: reads the prompt and the frozen limits back from the journal, so the resumed turn runs under the same bounds as the original — and as its RECORDED owner. Say who is resuming (`caller: STAFF`, or the owner as `user(id)`); with no caller a user's run is refused. NOT an alias for `runDurable` — that name never existed. |
 | `withDurableModel(model, ctx)` / `durableTools(tools, ctx)` | Composable wrappers. |
 | `InMemoryJournal` / `SqliteStorage` (`/sqlite`, journal at `.runs`) | Journal adapters. |
+| `LibsqlStorage` (`/libsql`) | The Sqlite store on the libSQL driver, for a local libSQL file — see below. |
 | `Guard`, `Interrupt`, `Journal`, `DurableResult` | Types. |
 | `resolveModel(spec)` / `registerModelProvider(prefix, factory)` | Turns `'provider/model'` into a model, lazily importing the provider package. Four prefixes ship built in (`openai`, `anthropic`, `google`, `mistral`); a host teaches it more — see below. |
+
+### A libSQL file (`@gnldev/durable/libsql`)
+
+```ts
+import { LibsqlStorage } from '@gnldev/durable/libsql';
+const storage = new LibsqlStorage('runs.db'); // needs `libsql` installed beside @gnldev/durable
+```
+
+The same store as `SqliteStorage` — schema, statements, guarantees, upgrade, liveness — on the libSQL
+driver. It passes the conformance kit as the Sqlite store does, and two processes racing on one file
+leave one winner. It opens a **local file only**, and refuses two other kinds of libSQL database where
+it is made, each because a promise cannot be kept on it:
+
+- an **embedded replica** (`syncUrl`): its reads come from the local copy and its writes go to the
+  remote primary, so a write is not read back until the copy syncs — a call could be claimed twice;
+- a **remote database** (`libsql:`, `http(s):`, `ws(s):`, or an `authToken` given): a remote libSQL server has no session a
+  process holds, so a live process that stalls would be judged dead and its call taken over — a side
+  effect run twice. For a database several hosts share, use `PostgresStorage`.
 
 ### Your own provider (OpenAI-compatible endpoints)
 
