@@ -178,16 +178,8 @@ export async function recordTaintProvenance(journal: Journal, threadId: string, 
         cur?.overflow || merged.length > TAINT_PROVENANCE_MAX_HASHES
           ? { hashes: merged.slice(0, TAINT_PROVENANCE_MAX_HASHES), overflow: true }
           : { hashes: merged };
-      if (cur !== undefined && journal.putIfMatch) {
-        if (await journal.putIfMatch(key, cur, next)) return;
-        continue; // raced with a concurrent tainted run → re-read and re-merge
-      }
-      if (cur === undefined && journal.putIfAbsent) {
-        if (await journal.putIfAbsent(key, next)) return;
-        continue;
-      }
-      await journal.put(key, next);
-      return;
+      // raced with a concurrent tainted run → re-read and re-merge
+      if (cur !== undefined ? await journal.putIfMatch(key, cur, next) : await journal.putIfAbsent(key, next)) return;
     } catch (e) {
       lastErr = e;
     }

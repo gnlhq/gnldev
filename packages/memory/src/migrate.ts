@@ -161,7 +161,7 @@ export async function migrateReservedRootThreads(storage: Storage, opts: Migrate
     await copyThreadOwnership(runs, t.id, to);
     // The old id's state and records go; its runs stay, still naming the id they ran under — a move
     // is not a delete (`purgeThread` would take them).
-    if (typeof runs.deletePrefix === 'function') await purgeThreadState(runs, t.id);
+    await purgeThreadState(runs, t.id);
   }
   return report;
 }

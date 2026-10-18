@@ -142,8 +142,7 @@ export function createWorkflowWaker(opts: WorkflowWakerOptions): WorkflowWaker {
 
         // Cost/politeness optimization ONLY — correctness does NOT depend on this CAS. `runResumable`
         // is idempotent by construction (completed steps replay from the journal), so even if two
-        // waker instances both win this race (e.g. the journal lacks `putIfAbsent` and falls back to
-        // the documented get+put race window), both `resume()` calls are harmless — at most one of
+        // waker instances both win this race, both `resume()` calls are harmless — at most one of
         // them actually advances the run.
         // Per partition: two organizations may each have a run with this id.
         const streakKey = `${orgId ?? ''}\u0000${run.runId}`;

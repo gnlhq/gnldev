@@ -10,11 +10,13 @@ import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
+import { forwardGuarantees } from './store-guarantees.js';
 
 /** Wraps the journal with a counter: counts only `readRun` calls (behavior is delegated as-is — the SAME pattern as journal-growth.test.ts). */
 function countReadRun(inner: InMemoryJournal) {
   let readRunCalls = 0;
   const j = {
+    ...forwardGuarantees(inner),
     get: (k: string) => inner.get(k),
     put: (k: string, v: unknown) => inner.put(k, v),
     putIfAbsent: (k: string, v: unknown) => inner.putIfAbsent(k, v),

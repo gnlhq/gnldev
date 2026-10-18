@@ -545,25 +545,6 @@ describe('FAZ-6 audit fixes', () => {
     // This layer promises to catch duplicates SPREAD OVER TIME; concurrency belongs to the exact-hash and lock layers.
   });
 
-  it("a journal without listKeys: the layer stands down loudly and work runs normally", async () => {
-    const m = new Map<string, unknown>();
-    const journal: any = {
-      async get(k: string) { return m.has(k) ? structuredClone(m.get(k)) : undefined; },
-      async put(k: string, v: unknown) { m.set(k, structuredClone(v)); },
-      async putIfAbsent(k: string, v: unknown) { if (m.has(k)) return false; m.set(k, structuredClone(v)); return true; },
-    };
-    const counter = { n: 0 };
-    const limits = semLimits(fakeEmbed(), 'nl-model');
-    const tools = { createProduct: { sideEffect: true, semanticIdentity: { keys: ['sku'] }, execute: async () => { counter.n++; return { ok: 1 }; } } };
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    try {
-      await runDurable(base(journal, 'nl1', { model: model('createProduct', 'c1', { sku: 'N', note: 'a' })(), tools, threadId: 'th-NL', limits }) as any);
-      await runDurable(base(journal, 'nl2', { model: model('createProduct', 'c2', { sku: 'N', note: 'b' })(), tools, threadId: 'th-NL', limits }) as any);
-      expect(counter.n).toBe(2); // the recall scan is off — work was never blocked
-      expect(warn.mock.calls.some((c) => String(c[0]).includes('listKeys'))).toBe(true);
-    } finally { warn.mockRestore(); }
-  });
-
   it('ttlMs: a semantic record past its window stops being a candidate (aged by the storage clock)', async () => {
     const base2 = new InMemoryJournal();
     const clock = { t: 5_000_000 };

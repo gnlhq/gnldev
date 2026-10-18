@@ -55,11 +55,7 @@ export async function cancelAgentRun(journal: Journal, runId: string, opts: { re
   // A cancel continues a run; it does not begin one. Absent, nothing is written (run-identity.ts).
   await existingRun(journal, runId);
   const record = { at: Date.now(), ...(opts.reason !== undefined ? { reason: opts.reason } : {}) };
-  if (journal.putIfAbsent) {
-    await journal.putIfAbsent(cancelKey(runId), record); // first cancel wins — idempotent
-  } else if ((await journal.get(cancelKey(runId))) === undefined) {
-    await journal.put(cancelKey(runId), record);
-  }
+  await journal.putIfAbsent(cancelKey(runId), record); // first cancel wins — idempotent
   // Read back rather than trusting `record`: on a re-cancel this call LOST the claim, and the outcome
   // must carry the ORIGINAL decision's moment — the same idempotency the flag itself promises. One
   // extra point-read on a rare operator path.

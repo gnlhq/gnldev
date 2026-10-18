@@ -248,9 +248,6 @@ function kindOf(rec: OwnerRecord): RunKind {
   return 'other';
 }
 
-/** Rows a run writes early, read point by point when the journal cannot list (the bounded fallback). */
-const PROBE_KEYS = (runId: string) => [runKeys.model(runId, 0), runRecordKey(runId, 'outcome'), runRecordKey(runId, 'wf', '_input'), runRecordKey(runId, 'net', 'route:0')];
-
 /**
  * Keys the engine writes under a run's id that say nothing about the run having STARTED: the locks
  * taken before a run starts (the run lock, a queue worker's `lease:lock`, the scheduler's
@@ -270,17 +267,12 @@ const PROBE_LIMIT = 16;
  * not be born: its keys would be ambiguous with the longer run's.
  *
  * BOUNDED: one `listKeys(prefix, { limit: PROBE_LIMIT })` — the store stops early — plus the workflow
- * registry row, which lives outside the prefix. A journal without `listKeys` gets a fixed set of point
- * reads instead. Never a full scan of the prefix: this runs on every new run.
+ * registry row, which lives outside the prefix. Never a full scan of the prefix: this runs on every new run.
  */
 async function rowsPresent(journal: Journal, runId: string): Promise<boolean> {
   if ((await journal.get(`wfrun:${runId}`)) !== undefined) return true;
-  if (typeof journal.listKeys === 'function') {
-    const prefix = `${runId}:`;
-    return (await journal.listKeys(prefix, { limit: PROBE_LIMIT })).some((k) => !isBookkeeping(k.slice(prefix.length)));
-  }
-  for (const k of PROBE_KEYS(runId)) if ((await journal.get(k)) !== undefined) return true;
-  return false;
+  const prefix = `${runId}:`;
+  return (await journal.listKeys(prefix, { limit: PROBE_LIMIT })).some((k) => !isBookkeeping(k.slice(prefix.length)));
 }
 
 /** The ONE reading of "does this run exist, and whose is it", for every run kind and every door. */

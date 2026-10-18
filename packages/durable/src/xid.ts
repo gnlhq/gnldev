@@ -105,13 +105,7 @@ export async function writeXid(journal: Journal, plan: XidPlan, runId: string, t
 
 /** Compare-and-set over `expected`; the single-process fallback compares the fields that identify a claim. */
 async function casXid(journal: Journal, key: string, expected: XidRecord, next: XidRecord): Promise<boolean> {
-  if (journal.putIfMatch) return journal.putIfMatch(key, expected, next);
-  // Single-process fallback — the same documented bound as claim().
-  const cur = await journal.get<XidRecord>(key);
-  if (!(cur && cur.inFlight === expected.inFlight && cur.released === expected.released &&
-    cur.first?.runId === expected.first.runId && cur.first?.toolCallId === expected.first.toolCallId && cur.first?.at === expected.first.at)) return false;
-  await journal.put(key, next);
-  return true;
+  return journal.putIfMatch(key, expected, next);
 }
 
 /**

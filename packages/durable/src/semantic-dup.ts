@@ -471,7 +471,6 @@ export async function findSemanticCandidate(journal: Journal, plan: SemPlan, ttl
 }
 
 async function scanCandidates(journal: Journal, plan: SemPlan, ttlMs?: number): Promise<SemVerdict> {
-  if (typeof journal.listKeys !== 'function') return { kind: 'none', noListKeys: true };
   const prefix = `xthr:${plan.threadId}:sem-${plan.toolName}-`;
   const keys = (await journal.listKeys(prefix).catch(() => [] as string[]))
     .filter((k) => k !== semKey(plan.threadId, plan.toolName, plan.argsHash));

@@ -14,11 +14,13 @@ import { stepCountIs } from 'ai';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
+import { forwardGuarantees } from './store-guarantees.js';
 
 /** Wraps the journal with a counter: counts point get / bulk readRun / put calls (behavior is delegated as-is). */
 function countingJournal(inner: InMemoryJournal) {
   const stats = { get: 0, readRun: 0, put: 0 };
   const j = {
+    ...forwardGuarantees(inner),
     get: (k: string) => (stats.get++, inner.get(k)),
     put: (k: string, v: unknown) => (stats.put++, inner.put(k, v)),
     putIfAbsent: (k: string, v: unknown) => inner.putIfAbsent(k, v),

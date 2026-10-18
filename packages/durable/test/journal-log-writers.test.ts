@@ -102,7 +102,7 @@ describe('the number of concurrent writers is not bounded', () => {
 });
 
 describe('a compare that can never succeed is named, with the way through', () => {
-  it('a custom journal whose putIfMatch compares by reference: the error says so and names the single-process way through', async () => {
+  it('a custom journal whose putIfMatch compares by reference: the error says so and names the way through', async () => {
     const store = new Map<string, unknown>();
     const bad: Journal = {
       get: async (k) => (store.has(k) ? structuredClone(store.get(k)) : undefined) as any,
@@ -116,10 +116,11 @@ describe('a compare that can never succeed is named, with the way through', () =
     expect(Date.now() - t0).toBeLessThan(5_000); // fails promptly: nobody else wrote, so retrying cannot help
     expect(err).toBeInstanceOf(JournalLogContentionError);
     expect((err as Error).message).toMatch(/putIfMatch/);
-    expect((err as Error).message).toMatch(/one process/);
-    // The way through it names works: the same store without the compare.
-    await appendToJournalLog({ get: bad.get, put: bad.put }, 'log', [2]);
-    expect(await readJournalLog(bad, 'log')).toEqual([1, 2]);
+    expect((err as Error).message).toMatch(/conformance kit/);
+    // The way through it names works: a putIfMatch that compares the serialized value.
+    const fixed: Journal = { ...bad, putIfMatch: async (k, e, v) => (JSON.stringify(store.get(k)) === JSON.stringify(e) ? (store.set(k, v), true) : false) };
+    await appendToJournalLog(fixed, 'log', [2]);
+    expect(await readJournalLog(fixed, 'log')).toEqual([1, 2]);
   });
 
   it('SIBLING: a 0.9.0 log the store can never compare is still appended to (warned), not refused for good', async () => {

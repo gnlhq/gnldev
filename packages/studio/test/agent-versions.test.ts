@@ -144,27 +144,6 @@ describe('DELETE /managed-agents/:name (PERMANENTLY delete a managed agent recor
     expect(list.agents).toHaveLength(1);
   });
 
-  it('501 if the journal does not support deletePrefix; the record is left undeleted', async () => {
-    // Simulates a host journal without deletePrefix (i.e. not Sqlite/Postgres/InMemory) — put/get/listKeys
-    // exist (agentStoreEnabled is on) but deletePrefix is missing → store.delete is never defined, the endpoint returns 501.
-    const inner = new InMemoryJournal();
-    const reader = {
-      get: inner.get.bind(inner),
-      put: inner.put.bind(inner),
-      listKeys: inner.listKeys.bind(inner),
-      listRuns: inner.listRuns.bind(inner),
-      readRun: inner.readRun.bind(inner),
-    };
-    const app = createStudioApi({ reader: reader as any });
-    await post(app, '/managed-agents', { name: 'a', model: 'm/1' });
-
-    const res = await del(app, '/managed-agents/a');
-    expect(res.status).toBe(501);
-
-    const list = await (await call(app, '/managed-agents')).json();
-    expect(list.agents).toHaveLength(1); // not deleted
-  });
-
   it('prefix-collision safe: deleting "dd" leaves the same-prefix neighbor "dd2" UNTOUCHED', async () => {
     // AGENT_STORE_PRE + name has no trailing separator — 'dd' is an EXACT string prefix of another
     // agent's name ('dd2'). A naive deletePrefix('...:dd') would sweep the neighbor too (see the run

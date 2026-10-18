@@ -38,18 +38,10 @@ import { procStampFor, livenessFor } from './process-liveness.js';
 import { claimXidInFlight, renewXid, releaseXid, type XidHeld, type XidPlan, type XidRecord } from './xid.js';
 import { keepLateReport, type LateWriter } from './call-outcome.js';
 
-/**
- * Compare-and-set: `expected === undefined` means "no record" (first writer wins). A journal without
- * `putIfMatch` gets the single-process fallback — read, compare the stored value, write — the same
- * documented bound as `claim()`.
- */
+/** Compare-and-set: `expected === undefined` means "no record" (first writer wins). */
 export async function compareAndSet(journal: Journal, key: string, expected: unknown, next: unknown): Promise<boolean> {
   if (expected === undefined) return claim(journal, key, next);
-  if (journal.putIfMatch) return journal.putIfMatch(key, expected, next);
-  const cur = await journal.get(key);
-  if (cur === undefined || stableStringify(cur) !== stableStringify(expected)) return false;
-  await journal.put(key, next);
-  return true;
+  return journal.putIfMatch(key, expected, next);
 }
 
 /**

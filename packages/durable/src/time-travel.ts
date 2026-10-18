@@ -231,15 +231,11 @@ export interface ForkResult {
  * `:input` first, because that is the key every fork copies and every `runDurable` writes — it is the
  * cheap answer and the right one in the overwhelming majority of cases. But `forkRun` at `step: 0`
  * copies nothing at all when the source has no frozen input, so `:input` alone can call an occupied
- * namespace free; where the journal can list keys, the whole namespace is asked instead. A journal
- * without `listKeys` keeps the cheap answer, stated rather than silently degraded — every adapter
- * shipped here provides it.
+ * namespace free; so the whole namespace is asked as well.
  */
 async function namespaceTaken(journal: Journal, runId: string): Promise<boolean> {
   if ((await journal.get(runKeys.input(runId))) !== undefined) return true;
-  const lk = journal.listKeys;
-  if (typeof lk !== 'function') return false;
-  return (await lk.call(journal, `${runId}:`)).length > 0;
+  return (await journal.listKeys(`${runId}:`)).length > 0;
 }
 
 /**

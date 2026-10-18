@@ -46,11 +46,10 @@ describe('studio /semantic-guard + suspendedAt', () => {
     expect(sg2.precision).toEqual({ approved: 1, denied: 1, pending: 0, rate: 0.5 });
   });
 
-  it("a journal without listKeys answers honestly, via the unavailable field", async () => {
+  it("a read-only reader (no listKeys) answers honestly, via the unavailable field", async () => {
     const m = new Map<string, unknown>();
     const plain: any = {
       async get(k: string) { return m.get(k); },
-      async put(k: string, v: unknown) { m.set(k, v); },
       async listRuns() { return []; },
       async readRun() { return []; },
     };

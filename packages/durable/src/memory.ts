@@ -309,9 +309,8 @@ export class JournalLogContentionError extends Error {
     super(
       `@gnldev/durable: the append to '${key}' was not written: the journal's putIfMatch refused the value its get had just ` +
       `returned ${attempts} times, while no other writer changed it. putIfMatch must compare the stored value's ` +
-      'serialized form, not object identity (see the parity matrix in journal.ts). Nothing was lost. If only one process ' +
-      'writes this journal, give the memory the journal without its compare — ' +
-      '`new BasicMemory({ get: (k) => journal.get(k), put: (k, v) => journal.put(k, v) })` — and the in-process queue orders the appends.',
+      'serialized form, not object identity (see JOURNAL_GUARANTEES in journal.ts). Nothing was lost. Fix the store\'s putIfMatch ' +
+      'and run it through the store conformance kit (`@gnldev/durable/testing`), which checks exactly this.',
     );
     this.name = 'JournalLogContentionError';
   }
@@ -371,8 +370,6 @@ function decodeLog<T>(stored: unknown): T[] {
  *     while the log stayed as read are counted, and `JOURNAL_LOG_MAX_ATTEMPTS` of those in a row end
  *     in `JournalLogContentionError` (a store whose compare cannot match).
  *
- * A journal without `putIfMatch`/`putIfAbsent` gets the queue alone: safe within one process, not
- * across several. Every first-party journal implements both.
  */
 export async function appendToJournalLog(journal: Journal, key: string, entries: readonly unknown[], batchKey?: string): Promise<void> {
   const part = serialize(entries); // once, outside the retry loop
@@ -387,7 +384,6 @@ export async function appendToJournalLog(journal: Journal, key: string, entries:
  */
 export async function retractFromJournalLog(journal: Journal, key: string, batchKey: string): Promise<number> {
   return queuedOnLog(journal, key, async () => {
-    const cas = typeof journal.putIfMatch === 'function';
     for (let attempt = 0; ; attempt++) {
       const current = await journal.get<unknown>(key);
       if (!isLogValue(current) || !current.batches?.includes(batchKey)) return 0;
@@ -399,8 +395,7 @@ export async function retractFromJournalLog(journal: Journal, key: string, batch
         appendedAt: priorTimes(current).filter((_, i) => keep[i]),
         batches: priorBatches(current).filter((_, i) => keep[i]),
       };
-      if (!cas) { await journal.put(key, next); return removed; }
-      if (await journal.putIfMatch!(key, current, next)) return removed;
+      if (await journal.putIfMatch(key, current, next)) return removed;
       if (attempt + 1 >= JOURNAL_LOG_MAX_ATTEMPTS) throw new JournalLogContentionError(key, attempt + 1);
       await backoff(attempt + 1);
     }
@@ -423,7 +418,6 @@ function queuedOnLog<T>(journal: Journal, key: string, fn: () => Promise<T>): Pr
 const backoff = (lost: number) => new Promise<void>((r) => setTimeout(r, Math.floor(Math.random() * Math.min(1000, 2 ** Math.min(lost, 10)))));
 
 async function casAppend(journal: Journal, key: string, part: string, batch: string | null): Promise<void> {
-  const cas = typeof journal.putIfMatch === 'function' && typeof journal.putIfAbsent === 'function';
   let lost = 0;
   let unchanged = 0;
   let lastLost: number | undefined;
@@ -433,11 +427,10 @@ async function casAppend(journal: Journal, key: string, part: string, batch: str
     // Only a log that names an append carries the field: an unnamed one is stored as it always was.
     const batches = priorBatches(current);
     if (batch !== null || batches.some((b) => b !== null)) next.batches = [...batches, batch];
-    if (!cas) return journal.put(key, next);
     // A 0.9.0 log is the entries themselves, compared through `asStored` — see there.
     const won = current === undefined
-      ? await journal.putIfAbsent!(key, next)
-      : await journal.putIfMatch!(key, Array.isArray(current) ? asStored(current) : current, next);
+      ? await journal.putIfAbsent(key, next)
+      : await journal.putIfMatch(key, Array.isArray(current) ? asStored(current) : current, next);
     if (won) return;
     const seen = sizeOf(current);
     unchanged = seen === lastLost ? unchanged + 1 : 1;

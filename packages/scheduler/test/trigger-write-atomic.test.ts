@@ -7,8 +7,8 @@
 // `failed`), and the identical call on the next boot found "the same spec" and did nothing: the
 // trigger never fired again (4/4 scenarios, in-memory and SQLite).
 //
-// Now: `writeTrigger` is the one writer (atomic `applyBatch` where the journal has it), and a journal
-// without it gets a state that names its definition (`of`), which the same-spec path checks.
+// Now: `writeTrigger` is the one writer, and it writes both halves in one atomic `applyBatch` (a guarantee
+// of every store); the state also names its definition (`of`), which the same-spec path checks.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { InMemoryJournal, toJournal, type Journal } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
@@ -46,8 +46,6 @@ const T0 = Date.UTC(2026, 0, 1);
 const stores = [
   ['in-memory, applyBatch', () => new InMemoryJournal() as Journal, true],
   ['sqlite, applyBatch', () => toJournal(new SqliteStorage(':memory:').runs), true],
-  ['in-memory, no applyBatch', () => new InMemoryJournal() as Journal, false],
-  ['sqlite, no applyBatch', () => toJournal(new SqliteStorage(':memory:').runs), false],
 ] as const;
 
 async function tryCall(f: () => Promise<unknown>): Promise<string> {

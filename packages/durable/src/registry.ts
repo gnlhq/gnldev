@@ -13,7 +13,7 @@ import { delegationTool, runDelegated, type ChildFrame, childOutcome } from './a
 import { assertNoCallerSystemMessage } from './request-body.js';
 import { runNetworkAdmitted as runNetworkCore, type NetworkResult, type NetworkTarget } from './network.js';
 import { acquireRunLock } from './run-lock.js';
-import { claim as journalClaim, runKeys } from './journal.js';
+import { claim as journalClaim, runKeys, assertJournalGuarantees } from './journal.js';
 import { argsHash, derivedRunId, DEPLOYMENT_SCOPE, type WorkScope, type WorkScopeKind } from './hash.js';
 import { RunBusyError, runBusyMessage, RunSweptError, RunInputMismatchError, RunOwnerMismatchError, ThreadOwnerMismatchError } from './errors.js';
 import { admitThreadRun } from './thread-owner.js';
@@ -921,6 +921,7 @@ export function createGnl(config: CreateGnlConfig) {
   // Resolve memory once: explicit `false` → off; if not given, memoryFactory (if any) derives it from the journal.
   const journal: Journal = config.storage ? config.storage.runs : config.journal!;
   if (!journal) throw new Error('createGnl: `storage` or `journal` is required');
+  assertJournalGuarantees(journal, config.storage ? 'createGnl (storage.runs)' : 'createGnl (journal)');
   const memSource: Storage | Journal = config.storage ?? config.journal!;
   // A declaration nothing reads. `effectClass` is the tool's half of the policy matrix — it says what
   // a REPEAT of this tool costs — and the only thing that ever reads it is a profile
@@ -1112,8 +1113,8 @@ export function createGnl(config: CreateGnlConfig) {
       (result as any).scores = scores;
       // P2-skor a SECOND, ADDITIVE metrics pass — recordRunMetrics (run.ts's
       // completion choke points) already ran and cannot see `scores` (computed HERE, after it runs —
-      // see the comment on that call below). Best-effort/non-blocking: a scoring bug or a journal
-      // without incrBy/applyBatch must never fail an otherwise-successful run. Only reached on the
+      // see the comment on that call below). Best-effort/non-blocking: a scoring bug must never fail an
+      // otherwise-successful run. Only reached on the
       // sampled-IN path (shouldSampleScorers above) — see recordRunScores's JSDoc for the resulting bias.
       recordRunScores(journal, runId, name, scores as Record<string, number | { score: number }>).catch(() => {});
     }

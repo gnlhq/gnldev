@@ -16,8 +16,8 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { newDb } from 'pg-mem';
 import pg from 'pg';
-import { InMemoryStorage, toJournal, parseJournalKey, runRecordOf, summarizeRun, pageRunsFromArray } from '@gnldev/durable';
-import type { Journal, JournalReader, JournalEntry, RunSummary } from '@gnldev/durable';
+import { InMemoryStorage, toJournal, parseJournalKey, runRecordOf, summarizeRun, pageRunsFromArray, serialize, deserialize } from '@gnldev/durable';
+import type { Journal, JournalBatch, JournalReader, JournalEntry, RunSummary } from '@gnldev/durable';
 import { journalConformance, type ConformanceSubject } from '@gnldev/durable/testing';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
@@ -81,42 +81,76 @@ if (PG_URL) {
       writeAsOlderVersion: (key, value) => oldPgPut(oldPool, key, value),
       async close() { await oldPool.end(); await pool.end(); },
     };
-  }, { describe, it, timeout: 120_000 });
+  }, { describe, it, clock: 'shared', timeout: 120_000 });
 }
 
 /**
- * A journal as a user writes one against the documented port: a Map of keys, the optional atomic
- * primitives (each atomic because nothing awaits between its read and its write), and the reader built
+ * A journal as a user writes one against the documented port: a Map of keys, the store's guarantees
+ * (journal.ts JOURNAL_GUARANTEES — each atomic because nothing awaits between its read and its write, and
+ * the clock of the one process that reaches the map), values copied the way every store copies them
+ * (`serialize`/`deserialize`), and the reader built
  * from the public helpers — `parseJournalKey` for a run's entries, `runRecordOf` for the records that make
  * a run, `summarizeRun` for its status, `pageRunsFromArray` for the page.
  */
+/** A copy the way every store makes one: through the store serialization. */
+const copy = <T>(v: T): T => (v === undefined ? v : deserialize<T>(serialize(v)));
+
 class MapJournal implements Journal, JournalReader {
   private readonly m = new Map<string, unknown>();
-  async get<T = unknown>(key: string): Promise<T | undefined> { return this.m.has(key) ? structuredClone(this.m.get(key)) as T : undefined; }
-  async put(key: string, value: unknown): Promise<void> { this.m.set(key, structuredClone(value)); }
+  private readonly counters = new Map<string, Record<string, number>>();
+  async get<T = unknown>(key: string): Promise<T | undefined> { return this.m.has(key) ? copy(this.m.get(key)) as T : undefined; }
+  async put(key: string, value: unknown): Promise<void> { this.m.set(key, copy(value)); }
   async putIfAbsent(key: string, value: unknown): Promise<boolean> {
     if (this.m.has(key)) return false;
-    this.m.set(key, structuredClone(value));
+    this.m.set(key, copy(value));
     return true;
   }
   async putIfMatch(key: string, expected: unknown, value: unknown): Promise<boolean> {
     if (!this.m.has(key) || JSON.stringify(this.m.get(key)) !== JSON.stringify(expected)) return false;
-    this.m.set(key, structuredClone(value));
+    this.m.set(key, copy(value));
     return true;
   }
+  async applyBatch(batch: JournalBatch): Promise<boolean> {
+    if (batch.claim && this.m.has(batch.claim.key)) return false;
+    // Every value is copied before anything is written: one that cannot be copied leaves the store as it was.
+    const claim = batch.claim ? copy(batch.claim.value) : undefined;
+    const puts = (batch.puts ?? []).map((p) => [p.key, copy(p.value)] as const);
+    if (batch.claim) this.m.set(batch.claim.key, claim);
+    for (const { key, fields } of batch.incrs ?? []) this.bump(key, fields);
+    for (const [key, value] of puts) this.m.set(key, value);
+    return true;
+  }
+  async incrBy(key: string, fields: Record<string, number>): Promise<Record<string, number>> {
+    return { ...this.bump(key, fields) };
+  }
+  async getCounters(key: string): Promise<Record<string, number> | undefined> {
+    const c = this.counters.get(key);
+    return c ? { ...c } : undefined;
+  }
+  private bump(key: string, fields: Record<string, number>): Record<string, number> {
+    const c = this.counters.get(key) ?? {};
+    for (const [f, d] of Object.entries(fields)) c[f] = (c[f] ?? 0) + d;
+    this.counters.set(key, c);
+    return c;
+  }
+  /** One process reaches this map, so its clock is the store's. */
+  async now(): Promise<number> {
+    return Date.now();
+  }
   async listKeys(prefix: string, opts?: { limit?: number }): Promise<string[]> {
-    return [...this.m.keys()].filter((k) => k.startsWith(prefix)).slice(0, opts?.limit ?? Infinity);
+    return [...this.m.keys(), ...this.counters.keys()].filter((k) => k.startsWith(prefix)).sort().slice(0, opts?.limit ?? Infinity);
   }
   async deletePrefix(prefix: string): Promise<number> {
     let n = 0;
     for (const k of [...this.m.keys()]) if (k.startsWith(prefix)) { this.m.delete(k); n++; }
+    for (const k of [...this.counters.keys()]) if (k.startsWith(prefix)) { this.counters.delete(k); n++; }
     return n;
   }
   async readRun(runId: string): Promise<JournalEntry[]> {
     const out: JournalEntry[] = [];
     for (const [key, value] of this.m) {
       const p = parseJournalKey(key);
-      if (p?.runId === runId) out.push({ key, runId, kind: p.kind, value: structuredClone(value), seq: out.length });
+      if (p?.runId === runId) out.push({ key, runId, kind: p.kind, value: copy(value), seq: out.length });
     }
     return out;
   }

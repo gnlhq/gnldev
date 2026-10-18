@@ -92,25 +92,6 @@ describe('releasing', () => {
   });
 });
 
-describe('an adapter without compare-and-set', () => {
-  it('says so once, loudly, instead of pretending to elect a leader', async () => {
-    // The honest failure: it still works single-process, and with several instances two of them can
-    // believe they hold the same lease at the moment one expires. That has to be said out loud —
-    // a silent degradation here is a doubled bill nobody attributes to anything.
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const j = new InMemoryJournal();
-    (j as any).putIfMatch = undefined;
-
-    await acquireLease(j, KEY, 'A', 60_000, T);
-    await acquireLease(j, KEY, 'A', 60_000, T + 10);           // renewal → the fallback path
-    await acquireLease(j, KEY, 'A', 60_000, T + 20);           // and it does not repeat itself
-
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(String(warn.mock.calls[0][0])).toMatch(/putIfMatch/);
-    expect(String(warn.mock.calls[0][0])).toMatch(/runs twice/);
-  });
-});
-
 describe('reading it', () => {
   it('reports an expired lease as nobody holding it', async () => {
     const j = new InMemoryJournal();

@@ -9,7 +9,7 @@
 // finalize" — an unbounded router loop is structurally impossible.
 import { runRecordKey, runRecordPrefix, composeRunId, minted, withMintOf } from './run-id-grammar.js';
 import { generateText } from 'ai';
-import { claim, frozenGet } from './journal.js';
+import { claim, frozenGet, assertJournalGuarantees } from './journal.js';
 import type { Journal } from './journal.js';
 import type { Interrupt } from './guard.js';
 import { toolDescriptionText } from './types.js';
@@ -399,9 +399,7 @@ export async function getNetworkTrace(
   journal: Journal,
   runId: string,
 ): Promise<{ routes: { i: number | 'final'; decision: RouteDecision }[]; steps: NetworkStep[] }> {
-  if (typeof journal.listKeys !== 'function') {
-    throw new Error('@gnldev/durable network: getNetworkTrace requires a journal that supports `listKeys`');
-  }
+  assertJournalGuarantees(journal, 'getNetworkTrace');
   const prefix = runRecordPrefix(runId, 'net');
   const keys = await journal.listKeys(prefix);
   const routes: { i: number | 'final'; decision: RouteDecision }[] = [];

@@ -1166,6 +1166,14 @@ class SqliteRunJournal implements RunJournal {
     });
   }
   /**
+   * The store's clock. A Sqlite file is reached by the processes of the one machine it lives on, so
+   * that machine's clock is the clock every one of them reads.
+   */
+  async now(): Promise<number> {
+    return Date.now();
+  }
+
+  /**
    * H1: atomic conditional replace (expired run-lock takeover, see journal.ts JSDoc).
    * The STORED FORM is PLAIN serialize() TEXT (no envelope) → the comparison happens directly in SQL:
    * `WHERE key=? AND value=serialize(expected)` — the TOCTOU window is closed inside the engine.

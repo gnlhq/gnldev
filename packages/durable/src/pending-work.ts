@@ -111,7 +111,6 @@ async function openRuns(view: Journal): Promise<RunSummary[]> {
 
 /** Every record of a run's tool calls, by the key it is authoritative under, with the call's id. */
 async function toolRecordsOf(view: Journal, runId: string): Promise<Array<{ key: string; toolCallId?: string; rec: ToolJournalRecord }>> {
-  if (typeof view.listKeys !== 'function') return [];
   const out: Array<{ key: string; toolCallId?: string; rec: ToolJournalRecord }> = [];
   const toolPrefix = runRecordPrefix(runId, 'tool');
   const pointerPrefix = windowClaimPointerKey(runId, '');

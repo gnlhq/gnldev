@@ -57,7 +57,7 @@ async function writeDoc(config: GnlDevConfig, d: typeof Durable, doc: Doc, expec
     putIfMatch?: (k: string, expected: unknown, v: unknown) => Promise<boolean>;
     putIfAbsent?: (k: string, v: unknown) => Promise<boolean>;
   };
-  if (!journal.put) throw new Error("this journal is read-only — `gnl pricing set` needs a writable journal");
+  if (!journal.put || !journal.putIfAbsent || !journal.putIfMatch) throw new Error("this journal is read-only — `gnl pricing set` needs a writable journal");
   // The version has to move, or Studio's optimistic lock silently eats this write: Studio loads v3, the
   // CLI saves (still v3), Studio then saves with ifVersion:3, the check passes because nothing moved, and
   // the CLI's change is gone with no conflict reported. A lock that cannot detect the other writer is
@@ -70,7 +70,7 @@ async function writeDoc(config: GnlDevConfig, d: typeof Durable, doc: Doc, expec
   // compare against, and putIfMatch against `undefined` is not a comparison every adapter can make.
   // putIfAbsent is the create-side CAS, and it loses to whoever created it first — which is the same
   // answer, reported the same way.
-  if (expected === undefined && typeof journal.putIfAbsent === 'function') {
+  if (expected === undefined) {
     const created = await journal.putIfAbsent(d.PRICING_KEY, next);
     if (!created) {
       throw new Error(
@@ -80,17 +80,13 @@ async function writeDoc(config: GnlDevConfig, d: typeof Durable, doc: Doc, expec
     }
     return;
   }
-  if (expected !== undefined && typeof journal.putIfMatch === 'function') {
-    const won = await journal.putIfMatch(d.PRICING_KEY, expected, next);
-    if (!won) {
-      throw new Error(
-        'pricing changed while this command was running (another `gnl pricing` run, or a Studio save). ' +
-        'Nothing was written — re-run the command to apply it on top of the current table.',
-      );
-    }
-    return;
+  const won = await journal.putIfMatch(d.PRICING_KEY, expected, next);
+  if (!won) {
+    throw new Error(
+      'pricing changed while this command was running (another `gnl pricing` run, or a Studio save). ' +
+      'Nothing was written — re-run the command to apply it on top of the current table.',
+    );
   }
-  await journal.put.call(journal, d.PRICING_KEY, next);
 }
 
 /** A price given on the command line. Rejects anything that would silently price at zero. */

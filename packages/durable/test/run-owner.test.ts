@@ -127,16 +127,6 @@ describe('runOwnerOf: the probe is bounded', () => {
     expect(calls).toEqual([]);
   });
 
-  it('a journal that cannot list gets a fixed set of point reads', async () => {
-    const inner = new InMemoryJournal();
-    await inner.put(runKeys.model('r', 0), { x: 1 });
-    let gets = 0;
-    const bare = { get: async (k: string) => { gets++; return inner.get(k); }, put: (k: string, v: unknown) => inner.put(k, v) };
-    expect(await runOwnerOf(bare as never, 'r')).toMatchObject({ state: 'owned' });
-    gets = 0;
-    expect(await runOwnerOf(bare as never, 'nothing')).toEqual({ state: 'missing' });
-    expect(gets).toBeLessThanOrEqual(6);
-  });
 });
 
 describe('decideRunAccess: the one rule', () => {

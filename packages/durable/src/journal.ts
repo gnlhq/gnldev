@@ -5,6 +5,7 @@ import type { Guard } from './guard.js';
 import type { RunLimits, ToolSeat } from './limits.js';
 import type { Processor } from './processor.js';
 import { stableStringify } from './hash.js';
+import { copyValue } from './serialize.js';
 import { pageRunsFromArray, compareRunKey, decodeChangeCursor, encodeChangeCursor, type RunOrder } from './run-cursor.js';
 import { isVersionedKey, upgradeFormat } from './format.js';
 import { runRecordKey, RECORD_KEY_RE, REPLAYED_SEGMENT_RE, leafSuffix, composeRunId, RUN_KEYED_FAMILIES } from './run-id-grammar.js';
@@ -152,16 +153,18 @@ export interface Journal {
   get<T = unknown>(key: string): Promise<T | undefined>;
   put(key: string, value: unknown): Promise<void>;
   /**
-   * M4 (optional): atomic insert-only. Writes and returns `true` WHEN the key is ABSENT, or returns
-   * `false` without touching anything if it exists. Provides exactly-once under concurrency via CAS. If undefined, `claim()` falls back to get+put.
+   * M4 (a guarantee, JOURNAL_GUARANTEES): atomic insert-only. Writes and returns `true` WHEN the key is
+   * ABSENT, or returns `false` without touching anything if it exists. Provides exactly-once under
+   * concurrency via CAS.
    */
-  putIfAbsent?(key: string, value: unknown): Promise<boolean>;
+  putIfAbsent(key: string, value: unknown): Promise<boolean>;
   /**
-   * Phase 12 (optional): return keys starting with a prefix (queue/events/cache enumeration).
+   * Phase 12 (a guarantee): return keys starting with a prefix, in byte order (purges, sweeps and the
+   * dependents model find a run's keys with it).
    * `limit` makes it a bounded PROBE: at most that many keys, WHICH ones unspecified (no ordering is
    * promised with a limit). An adapter that ignores it stays correct, only unbounded.
    */
-  listKeys?(prefix: string, opts?: { limit?: number }): Promise<string[]>;
+  listKeys(prefix: string, opts?: { limit?: number }): Promise<string[]>;
   /**
    * (optional) The records under `prefix`, in byte order of their keys, after the key `after` (before it,
    * with `desc`), at most `limit` — ONE read of an index range, not a listing of the whole prefix. What a
@@ -181,52 +184,50 @@ export interface Journal {
    */
   listOwnerRecords?(resourceId: string, opts?: { prefix?: string }): Promise<string[]>;
   /**
-   * Retention/GDPR (optional): PERMANENTLY deletes ALL keys starting with a prefix, returns the
+   * Retention/GDPR (a guarantee): PERMANENTLY deletes ALL keys starting with a prefix, returns the
    * number deleted. The single exception to the journal's append-only philosophy — only for lawful
    * deletion (PII purge) and retention sweeps; never used in the normal flow. A run whose records it
    * takes only some of (`<run>:tool:x`, `<run>:outcome`) then reads what its remaining records say —
    * status, counts, person and thread — and a run left with none is no run (conformance R5).
    */
-  deletePrefix?(prefix: string): Promise<number>;
+  deletePrefix(prefix: string): Promise<number>;
   /**
-   * H1 (optional): atomic CONDITIONAL replace (CAS-on-existing). If the key's CURRENT value is
+   * H1 (a guarantee): atomic CONDITIONAL replace (CAS-on-existing). If the key's CURRENT value is
    * SERIALIZED-equal to `expected`, writes `value` and returns `true`; otherwise (different/changed/
    * deleted) returns `false` WITHOUT touching anything. Usage: expired run-lock TAKEOVER — even if two
    * workers read the same expired record, only ONE can replace it (split-brain becomes impossible, see run-lock.ts).
    * The comparison is over the serialized form; a false-negative (mismatch) is the SAFE side: the
-   * takeover just doesn't happen this attempt, the next attempt reads the fresh record. If undefined,
-   * acquireRunLock falls back to the old best-effort get→put behavior (documented risk, the core-hardening review).
+   * takeover just doesn't happen this attempt, the next attempt reads the fresh record.
    */
-  putIfMatch?(key: string, expected: unknown, value: unknown): Promise<boolean>;
+  putIfMatch(key: string, expected: unknown, value: unknown): Promise<boolean>;
   /**
-   * H2 (optional): the storage's OWN clock (epoch ms) — makes lock TTL decisions independent of
-   * worker wall-clock skew (Postgres `now()`).
-   * If undefined, Date.now is used (no difference on single-machine setups).
+   * H2 (a guarantee): the storage's OWN clock (epoch ms) — makes lock TTL decisions and the order of
+   * two workers' verdicts independent of worker wall-clock skew (Postgres `now()`). A store only one
+   * machine reaches (in-memory, a Sqlite file) returns that machine's clock.
    */
-  now?(): Promise<number>;
+  now(): Promise<number>;
   /**
-   * H8a (optional): field-based ATOMIC counter increment — `value = value + delta` inside the engine
+   * H8a (a guarantee): field-based ATOMIC counter increment — `value = value + delta` inside the engine
    * (SQL UPSERT arithmetic). Kills two ailments of get→put at once: the
    * lost-update race (two workers read the same value and add, one gets overwritten) and the hot-row
-   * read-modify-write cost. Negative delta = decrement. budget.ts uses this when supported.
+   * read-modify-write cost. Negative delta = decrement.
    * Resolves to the new value of each field it was given — what this increment made it, so a caller can
-   * take a share of a limit in one step (limits.ts takeToolSeat). The built-in adapters return it; a
-   * custom one that resolves to nothing keeps working, and callers that need the value fall back.
+   * take a share of a limit in one step (limits.ts takeToolSeat). The built-in adapters return it; one
+   * that resolves to nothing is still correct, and a caller that needs the value takes the slower path.
    */
-  incrBy?(key: string, fields: Record<string, number>): Promise<Record<string, number> | void>;
+  incrBy(key: string, fields: Record<string, number>): Promise<Record<string, number> | void>;
   /** H8a: read counter fields written via incrBy (undefined if absent). */
-  getCounters?(key: string): Promise<Record<string, number> | undefined>;
+  getCounters(key: string): Promise<Record<string, number> | undefined>;
   /**
-   * P1.6b (optional): ATOMIC batch — claim (putIfAbsent semantics) + counter increments + plain puts as
+   * P1.6b (a guarantee): ATOMIC batch — claim (putIfAbsent semantics) + counter increments + plain puts as
    * ONE all-or-nothing unit (a SQL transaction). If `claim` is given and its key EXISTS, the
    * WHOLE batch is a no-op and `false` is returned; otherwise everything applies and `true` is returned.
    * Motivation (metrics.ts recordRunMetrics): with the sequential claim→incrBy path, a crash between the
    * two loses one run's counter contribution forever (documented undercount window). applyBatch closes
    * that window definitively — either the claim marker AND the increments AND the rows all land, or none
-   * do. Adapters that can't provide atomicity must NOT implement this (callers fall back to the
-   * sequential path rather than getting fake atomicity).
+   * do. A store that cannot make it atomic cannot keep these promises: the conformance kit checks it.
    */
-  applyBatch?(batch: JournalBatch): Promise<boolean>;
+  applyBatch(batch: JournalBatch): Promise<boolean>;
   /**
    * P1.6b (optional): batch point-read — values for `keys`, ORDER-PRESERVING, `undefined` for misses
    * (SQL `WHERE key IN`). Kills the N-roundtrip pattern of reading N keys in a loop
@@ -239,6 +240,35 @@ export interface Journal {
    * (gnl_runs.updated_at). If `includeSuspended` is not given, suspended runs are NOT RETURNED (the safe side).
    */
   listStaleRuns?(cutoffTs: number, opts?: { includeSuspended?: boolean }): Promise<string[]>;
+}
+
+/**
+ * The guarantees a journal store gives — each one a promise the engine keeps on top of it, none of them
+ * derivable from the others: an atomic claim (exactly-once), a compare-and-set (a lock or an attempt
+ * taken over once), an atomic batch and exact counters (a limit's seat, a run's metrics counted once),
+ * prefix listing and deletion (erasure that reaches every record), and the store's own clock (a
+ * takeover judged the same on every machine). A store without one of them cannot keep those promises,
+ * so it is refused where it is handed in (`assertJournalGuarantees`), naming what is missing — never
+ * run with a weaker fallback.
+ */
+export const JOURNAL_GUARANTEES = ['putIfAbsent', 'putIfMatch', 'applyBatch', 'incrBy', 'getCounters', 'listKeys', 'deletePrefix', 'now'] as const;
+export type JournalGuarantee = (typeof JOURNAL_GUARANTEES)[number];
+
+/** The guarantees `store` does not provide (by method presence; what each method promises is the conformance kit's to check). */
+export function missingGuarantees(store: object): JournalGuarantee[] {
+  return JOURNAL_GUARANTEES.filter((m) => typeof (store as Record<string, unknown>)[m] !== 'function');
+}
+
+/** Refuses a store that lacks a guarantee (see `JOURNAL_GUARANTEES`). `where` names the entry point for the message. */
+export function assertJournalGuarantees(store: object, where: string): void {
+  const missing = missingGuarantees(store);
+  if (missing.length) {
+    throw new TypeError(
+      `@gnldev/durable: ${where} was handed a store without ${missing.map((m) => `\`${m}\``).join(', ')} — ` +
+        'each is a guarantee the engine builds a promise on (exactly-once, a lock taken once, exact counters, complete erasure, one clock), ' +
+        'and none can be emulated safely. Implement them, and run the store through `storeConformance` from @gnldev/durable/testing.',
+    );
+  }
 }
 
 /**
@@ -518,35 +548,20 @@ export interface RunOutcomeRecord {
    */
   status: 'completed' | 'failed' | 'running' | 'canceled';
   at: number;
+  /**
+   * When the attempt that wrote this record BEGAN, on the same clock as `at` (the store's, when it has
+   * one). A run's outcome is its newest attempt's: a record of an older attempt never replaces one of a
+   * newer attempt, whenever it arrives. Absent on records written before this field, and on the
+   * operator's cancel, which is not an attempt; those are ordered by `at` alone.
+   */
+  attempt?: number;
   error?: string;
 }
 
-// AUDIT (silent fallback → vocal): custom journals that don't offer `putIfAbsent` fall back to
-// get→put — this is SAFE in a single process but exactly-once is NOT ATOMICALLY guaranteed under
-// multiple workers (two concurrent `claim` calls can both see `get` as undefined at the same time and
-// both `put`). This used to be SILENT — a user writing a custom journal would not notice this risk.
-// Warn explicitly ONCE PER journal object (WeakSet — doesn't prevent GC) via `console.warn`; DOES NOT
-// THROW (doesn't BREAK existing single-process custom adapter users, only makes it visible).
-const claimFallbackWarned = new WeakSet<Journal>();
 
-/**
- * Atomic claim: use `putIfAbsent` if available (CAS), otherwise get+put fallback (single-process safe).
- * Returns `true` if this call created the key.
- */
+/** Atomic claim: `putIfAbsent`, a guarantee every journal gives (JOURNAL_GUARANTEES). `true` if this call created the key. */
 export async function claim(journal: Journal, key: string, value: unknown): Promise<boolean> {
-  if (journal.putIfAbsent) return journal.putIfAbsent(key, value);
-  if (!claimFallbackWarned.has(journal)) {
-    claimFallbackWarned.add(journal);
-    console.warn(
-      '@gnldev/durable: this journal does not implement `putIfAbsent` — atomic claim fell back to get→put. ' +
-        'This is safe in single-process usage; in multi-worker/distributed environments exactly-once is ' +
-        'NOT guaranteed ATOMICALLY (double-claim is possible in the contention window). Implementing ' +
-        '`putIfAbsent(key, value)` is recommended (see the Journal interface in journal.ts).',
-    );
-  }
-  if ((await journal.get(key)) !== undefined) return false;
-  await journal.put(key, value);
-  return true;
+  return journal.putIfAbsent(key, value);
 }
 
 /**
@@ -1542,24 +1557,35 @@ export class InMemoryJournal implements Journal, JournalReader {
    */
   private mtimes = new Map<string, number>();
 
+  // Every value is copied in and out the way the SQL stores copy one (serialize.ts `copyValue`): the same
+  // answer from every store — a Map, a BigInt, a Date come back as themselves, a function is dropped —
+  // and a caller's mutation never reaches the stored value. (A structured clone answered differently: it
+  // threw on a function the SQL stores drop, so a test here failed where production did not.)
   async get<T = unknown>(key: string): Promise<T | undefined> {
     if (!this.store.has(key)) return undefined;
-    return structuredClone(this.store.get(key)) as T;
+    return copyValue(this.store.get(key)) as T;
   }
 
   async put(key: string, value: unknown): Promise<void> {
+    const copy = copyValue(value);
     if (!this.times.has(key)) this.times.set(key, Date.now());
     this.mtimes.set(key, Date.now());
-    this.store.set(key, structuredClone(value));
+    this.store.set(key, copy);
   }
 
   // no await between has→set → structurally atomic in single-threaded JS.
   async putIfAbsent(key: string, value: unknown): Promise<boolean> {
     if (this.store.has(key)) return false;
+    const copy = copyValue(value);
     this.times.set(key, Date.now());
     this.mtimes.set(key, Date.now());
-    this.store.set(key, structuredClone(value));
+    this.store.set(key, copy);
     return true;
+  }
+
+  /** The store's clock: this process's, the only one that can reach it. */
+  async now(): Promise<number> {
+    return Date.now();
   }
 
   // H1: conditional replace — comparison via stableStringify (in the same spirit as the SQL
@@ -1567,8 +1593,9 @@ export class InMemoryJournal implements Journal, JournalReader {
   async putIfMatch(key: string, expected: unknown, value: unknown): Promise<boolean> {
     if (!this.store.has(key)) return false;
     if (stableStringify(this.store.get(key)) !== stableStringify(expected)) return false;
+    const copy = copyValue(value);
     this.mtimes.set(key, Date.now());
-    this.store.set(key, structuredClone(value));
+    this.store.set(key, copy);
     return true;
   }
 
@@ -1588,30 +1615,34 @@ export class InMemoryJournal implements Journal, JournalReader {
 
   // P1.6b: atomic batch — no await between the claim check and the writes → structurally atomic in
   // single-threaded JS (the same argument as putIfAbsent/putIfMatch above). Mirrors the SQL-transaction/
-  // semantics of the real adapters: claim exists → NOTHING is applied.
+  // semantics of the real adapters: claim exists → NOTHING is applied. Every value is copied before
+  // anything is written, so one the store cannot hold fails the batch with nothing left behind — as a
+  // transaction rolls back (measured: the claim and the counters stayed, and the run read as counted).
   async applyBatch(batch: JournalBatch): Promise<boolean> {
+    if (batch.claim && this.store.has(batch.claim.key)) return false;
+    const claimed = batch.claim ? copyValue(batch.claim.value) : undefined;
+    const puts = (batch.puts ?? []).map(({ key, value }) => [key, copyValue(value)] as const);
     if (batch.claim) {
-      if (this.store.has(batch.claim.key)) return false;
       this.times.set(batch.claim.key, Date.now());
       this.mtimes.set(batch.claim.key, Date.now());
-      this.store.set(batch.claim.key, structuredClone(batch.claim.value));
+      this.store.set(batch.claim.key, claimed);
     }
     for (const { key, fields } of batch.incrs ?? []) {
       const cur = this.counters.get(key) ?? {};
       for (const [f, d] of Object.entries(fields)) cur[f] = (cur[f] ?? 0) + d;
       this.counters.set(key, cur);
     }
-    for (const { key, value } of batch.puts ?? []) {
+    for (const [key, value] of puts) {
       if (!this.times.has(key)) this.times.set(key, Date.now());
       this.mtimes.set(key, Date.now());
-      this.store.set(key, structuredClone(value));
+      this.store.set(key, value);
     }
     return true;
   }
 
   // P1.6b: batch point-read — order-preserving, undefined for misses (getMany contract).
   async getMany<T = unknown>(keys: string[]): Promise<(T | undefined)[]> {
-    return keys.map((k) => (this.store.has(k) ? (structuredClone(this.store.get(k)) as T) : undefined));
+    return keys.map((k) => (this.store.has(k) ? (copyValue(this.store.get(k)) as T) : undefined));
   }
 
   // P1.6b: push-down status aggregate — derived per call from the same source listRuns uses (no
@@ -1732,7 +1763,7 @@ export class InMemoryJournal implements Journal, JournalReader {
     for (const [key, value] of this.store) {
       const p = parseJournalKey(key);
       if (p && p.runId === runId) {
-        out.push({ key, runId, kind: p.kind, value: structuredClone(value), seq: seq++, ts: this.times.get(key) });
+        out.push({ key, runId, kind: p.kind, value: copyValue(value), seq: seq++, ts: this.times.get(key) });
       }
     }
     return out;

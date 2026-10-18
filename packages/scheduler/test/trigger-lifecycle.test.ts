@@ -198,7 +198,7 @@ describe.each(stores)('pauseTrigger / resumeTrigger — %s', (_l, mk) => {
   });
 });
 
-describe('a crash during pause / remove (journal without applyBatch)', () => {
+describe('a crash during pause / remove', () => {
   /** A journal whose next state write throws — the process stops before the transition lands. */
   function crashing() {
     const base = new InMemoryJournal() as Journal;
@@ -207,8 +207,7 @@ describe('a crash during pause / remove (journal without applyBatch)', () => {
     const boom = () => { ctl.armed = false; throw new Error('crash'); };
     j.put = async (k, v) => { if (ctl.armed && k.startsWith('sched:state:')) boom(); return base.put(k, v); };
     j.putIfMatch = async (k, e, v) => { if (ctl.armed && k.startsWith('sched:state:')) boom(); return base.putIfMatch!(k, e, v); };
-    for (const m of ['get', 'putIfAbsent', 'listKeys', 'deletePrefix'] as const) (j as any)[m] = (base as any)[m].bind(base);
-    (j as any).applyBatch = undefined;
+    for (const m of ['get', 'putIfAbsent', 'listKeys', 'deletePrefix', 'applyBatch', 'incrBy', 'getCounters', 'now'] as const) (j as any)[m] = (base as any)[m].bind(base);
     return { j, ctl };
   }
 

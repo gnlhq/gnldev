@@ -188,25 +188,15 @@ async function writeTrigger(journal: Journal, id: string, def: TriggerDef, state
  * pause, a resume, a removal. Only the state changes, so one write is the whole unit — a CAS against
  * the state the caller read (`expected`). Returns `null` when somebody else wrote the state in between
  * (another poller's fire, an operator's pause): the caller re-reads and decides again, it never
- * overwrites a transition it did not see. A journal without `putIfMatch` gets a plain put — the same
- * documented fallback as the fire lock.
+ * overwrites a transition it did not see.
  */
 async function writeTrigger(journal: Journal, id: string, def: TriggerDef, state: TriggerState, expected: TriggerState): Promise<TriggerState | null>;
 async function writeTrigger(journal: Journal, id: string, def: TriggerDef, state: TriggerState, expected?: TriggerState): Promise<TriggerState | null> {
   const stamped: TriggerState = { ...state, of: definitionFingerprint(def) };
   if (expected !== undefined) {
-    if (!journal.putIfMatch) {
-      await journal.put(STATE(id), stamped);
-      return stamped;
-    }
     return (await journal.putIfMatch(STATE(id), expected, stamped)) ? stamped : null;
   }
-  if (journal.applyBatch) {
-    await journal.applyBatch({ puts: [{ key: DEF(id), value: def }, { key: STATE(id), value: stamped }] });
-  } else {
-    await journal.put(DEF(id), def);
-    await journal.put(STATE(id), stamped);
-  }
+  await journal.applyBatch({ puts: [{ key: DEF(id), value: def }, { key: STATE(id), value: stamped }] });
   return stamped;
 }
 const FAIL = (id: string) => `sched:fail:${id}`;
@@ -392,14 +382,8 @@ function backoff(attempts: number): number {
  * So the journal is asked what it already knows: the highest `<n>` that ever appeared under this
  * trigger's own key prefix, plus one. Every fire leaves something there — the run's entries, and the
  * fire lock even when the run itself was swept — so the answer is a floor, not a guess.
- *
- * WITHOUT `listKeys` there is no honest answer and it returns 0, which is the historical behaviour of
- * a fresh trigger. That is stated rather than hidden: `pollScheduler` already REQUIRES `listKeys`, so
- * a journal that lacks it cannot run this scheduler at all, and this path is reachable only by a host
- * that schedules through one journal and polls through another.
  */
 async function fireCountAfterLoss(journal: Journal, id: string): Promise<number> {
-  if (!journal.listKeys) return 0;
   const prefix = `sched:${id}:`;
   let highest = -1;
   try {
@@ -509,7 +493,7 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
     const current = await journal.get<TriggerState>(STATE(id));
     if (current !== undefined && !stateBelongsTo(current, stored)) {
       // HALF-WRITTEN: the definition was replaced and the process stopped before its state landed
-      // (only reachable on a journal without `applyBatch` — see writeTrigger). The state still
+      // (reachable for a trigger an earlier version wrote in two puts — see writeTrigger). The state still
       // describes the previous definition, so it is replaced like a lost one; the counter keeps
       // climbing past every run id either definition used.
       const state = await writeTrigger(journal, id, stored, {
@@ -598,7 +582,6 @@ export async function pollScheduler(
 ): Promise<PollResult> {
   refuseUnknownNames('pollScheduler', opts, POLL_SCHEDULER_OPTS_NAMES);
   journal = rootJournal(journal, 'pollScheduler');
-  if (!journal.listKeys) throw new Error('@gnldev/scheduler: journal.listKeys is required (trigger enumeration)');
   const owner = opts.owner ?? `sched-${Math.random().toString(36).slice(2, 8)}`;
   const retryMs = opts.retryMs ?? 30_000;
   const lockTtlMs = opts.lockTtlMs ?? 60_000;
@@ -621,7 +604,7 @@ export async function pollScheduler(
       const orphanProblem = definitionProblem(def);
       if (orphanProblem !== undefined) {
         const failed: TriggerState = { nextRunAt: 0, attempts: 0, fireCount: await fireCountAfterLoss(journal, id), status: 'failed', of: definitionFingerprint(def) };
-        const won = journal.putIfAbsent ? await journal.putIfAbsent(STATE(id), failed) : (await journal.put(STATE(id), failed), true);
+        const won = await journal.putIfAbsent(STATE(id), failed);
         if (won) {
           await journal.put(FAIL(id), { error: invalidDefinitionError(orphanProblem), at: now });
           console.warn(`[scheduler] trigger ${id} has an invalid definition and no state (${orphanProblem}) — marked failed, not fired.`);
@@ -718,8 +701,6 @@ export async function pollScheduler(
     // own result), our record no longer matches and this write is REJECTED — a late poller can no
     // longer roll fireCount/nextRunAt back or resurrect `attempts`. The write of the poller that
     // genuinely holds the lock always matches, so a correct poller is never blocked.
-    // A journal WITHOUT putIfMatch falls back to an unconditional put (old behavior, documented risk
-    // — the same fallback as run-lock.ts / claim()).
     // Every state the poller writes names the definition it was computed from (see writeTrigger), so
     // a state the poller has touched once is never mistaken for a half-written one.
     //
@@ -952,7 +933,6 @@ export interface TriggerInfo {
  */
 export async function listTriggers(journal: Journal): Promise<TriggerInfo[]> {
   journal = rootJournal(journal, 'listTriggers');
-  if (!journal.listKeys) throw new Error('@gnldev/scheduler: listTriggers requires journal.listKeys (trigger enumeration)');
   const defKeys = await journal.listKeys('sched:def:');
   const out: TriggerInfo[] = [];
   for (const dkey of defKeys) {
@@ -1246,10 +1226,7 @@ export function triggerEraser(journal: Journal): SubjectEraser {
   journal = rootJournal(journal, 'triggerEraser');
   // One body for a person and an organization: what differs is the owner's prefix (`ownedPrefix`).
   const eraseOwned = async (owner: { resourceId?: string; orgId?: string }): Promise<number> => {
-    const del = journal.deletePrefix;
-    if (typeof del !== 'function') {
-      throw new Error("@gnldev/scheduler: the journal cannot deletePrefix, so this person's triggers cannot be erased");
-    }
+    const del = journal.deletePrefix.bind(journal);
     const prefix = ownedPrefix(owner);
     let n = 0;
     for (const fam of ['sched:def:', 'sched:state:', 'sched:fail:', 'sched:budget-skip:', 'sched:busy-skip:', 'sched:']) {

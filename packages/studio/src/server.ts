@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { runRecordKey, runRecordPrefix, runIdFamilyOf, runIdentity, UNKNOWN } from '@gnldev/durable';
+import { runRecordKey, runRecordPrefix, runIdFamilyOf, runIdentity, UNKNOWN, JOURNAL_GUARANTEES, missingGuarantees } from '@gnldev/durable';
 import { randomUUID } from 'node:crypto';
 import { toFetchHandler, type FetchHandler } from './handler.js';
 import { Hono, type Context } from 'hono';
@@ -934,6 +934,19 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // The host may hand back `storage.runs` (a RunJournal → Page) rather than a bridged reader — the
   // README's quickstart does exactly that. Every listRuns consumer below expects the array contract.
   const rawReader = asReaderJournal(rawReaderIn as object) as typeof rawReaderIn;
+  // A reader that can write is a store, and a store keeps every guarantee or none of Studio's writes are
+  // safe (a fork, a regression replay, an approval are run writes like any other): one that writes
+  // without them is refused here, naming what it lacks. A read-only reader (no `put`) stays welcome.
+  {
+    const r = rawReader as unknown as Record<string, unknown>;
+    const missing = typeof r.put === 'function' ? missingGuarantees(rawReader as object) : [];
+    if (missing.length) {
+      throw new TypeError(
+        `@gnldev/studio: the reader can write but has no ${missing.map((m) => `\`${m}\``).join(', ')} — Studio's writes are run writes, ` +
+          'and each of these is a guarantee they rest on. Hand Studio the store (`storage.runs`), or a reader without `put` for a read-only Studio.',
+      );
+    }
+  }
   const app = new Hono();
 
   // Opt-in auth: an AuthProvider (free roleAuth / paid @gnldev/auth-ee) or the backward-compatible {read,write}.
@@ -1279,17 +1292,14 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     // The writable surface is only bridged if the raw reader supports it (so writable detection stays intact).
     ...(typeof (rawReader as any).get === 'function' ? { get: (k: string) => (scopedNow() as any).get(k) } : {}),
     ...(typeof (rawReader as any).put === 'function' ? { put: (k: string, v: unknown) => (scopedNow() as any).put(k, v) } : {}),
-    ...(typeof (rawReader as any).putIfAbsent === 'function' ? { putIfAbsent: (k: string, v: unknown) => (scopedNow() as any).putIfAbsent(k, v) } : {}),
     // The birth (run-identity.ts `withBirth`) the scoped view offers: a managed workflow is born through it.
     ...(typeof (rawReader as any).put === 'function' ? { beginRun: (id: string, ctx?: unknown) => (scopedNow() as any).beginRun?.(id, ctx) } : {}),
-    ...(typeof (rawReader as any).listKeys === 'function' ? { listKeys: (p: string) => (scopedNow() as any).listKeys(p) } : {}),
-    // deletePrefix is bridged too (purge/retention call it via `rw`); since ALS is never set up on the
-    // write path (see the middleware), scopedNow() always falls through to the raw journal — behavior unchanged.
-    ...(typeof (rawReader as any).deletePrefix === 'function' ? { deletePrefix: (p: string) => (scopedNow() as any).deletePrefix(p) } : {}),
-    // P1.6 getCounters bridged the same way — GET /metrics reads the materialized
-    // per-org metrics counters (readMetricsSummary) through this SAME org-scoped accessor, so the
-    // isolation guarantee (withOrg prefixing) automatically covers it, same as every other bridge here.
-    ...(typeof (rawReader as any).getCounters === 'function' ? { getCounters: (k: string) => (scopedNow() as any).getCounters(k) } : {}),
+    // Every guarantee the store gives, through the same scoped accessor (withOrg prefixes each key, so the
+    // isolation covers them as it covers get/put). Hand-picked before, this bridge forwarded four of the
+    // eight: a replay or a fork through Studio wrote by read-then-put and its metrics were never counted
+    // (measured on Postgres: a direct replay counted, the same replay through Studio did not).
+    ...Object.fromEntries(JOURNAL_GUARANTEES.filter((m) => typeof (rawReader as any)[m] === 'function')
+      .map((m) => [m, (...a: unknown[]) => (scopedNow() as any)[m](...a)])),
     // P1.6b: getMany bridged the SAME way — withOrg mirrors it 1:1 with the underlying journal (every
     // key inside is prefixed, just like get/put), so a plain delegation is safe here too.
     ...(typeof (rawReader as any).getMany === 'function' ? { getMany: (ks: string[]) => (scopedNow() as any).getMany(ks) } : {}),
@@ -1477,7 +1487,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
 
   const WF_STORE_PRE = '__studio_wf__';
   const wfStoreSource: StudioScopedOption<StudioWorkflowStore> | undefined = _wfStoreOpt ?? (
-    writable && rw.listKeys && rw.get && rw.put
+    writable
       ? {
         async list () {
           const keys = await rw.listKeys!(WF_STORE_PRE).catch(() => [] as string[]);
@@ -1691,21 +1701,21 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // `adoptIntoOrg` arrived) in the storage adapters. One source, since it decides whether an
   // organization resolves at all.
   const ORG_PRE = ORG_RECORD_PRE;
-  const agentStoreEnabled = writable && typeof rw.listKeys === 'function';
+  const agentStoreEnabled = writable;
   type AgentStore = {
     list(): Promise<ManagedAgentRecord[]>;
     get(name: string): Promise<ManagedAgentRecord | undefined>;
     put(rec: ManagedAgentRecord): Promise<void>;
-    /** Present if the journal supports deletePrefix — PERMANENTLY deletes the agent record (with ALL its
-     *  versions) (as OPPOSED TO the workflow store's tombstone/`put(key,null)` pattern — a real delete).
-     * Otherwise the field is absent entirely (the caller must return 501, see DELETE /managed-agents/:name). */
-    delete?(name: string): Promise<void>;
+    /** PERMANENTLY deletes the agent record (with ALL its versions) (as OPPOSED TO the workflow store's
+     *  tombstone/`put(key,null)` pattern — a real delete). */
+    delete(name: string): Promise<void>;
   };
-  /** Agent version store (list/get/put[/delete]) over the given journal. Requires listKeys+get+put. */
-  function makeAgentStore(j: Partial<Journal>): AgentStore | undefined {
-    if (!agentStoreEnabled || typeof j.listKeys !== 'function' || typeof j.get !== 'function' || typeof j.put !== 'function') return undefined;
+  /** Agent version store (list/get/put/delete) over the given journal — a writable store, so it has them all. */
+  function makeAgentStore(store: Partial<Journal>): AgentStore | undefined {
+    if (!agentStoreEnabled) return undefined;
+    const j = store as Journal;
     const lk = j.listKeys.bind(j); const g = j.get.bind(j); const p = j.put.bind(j);
-    const dp = typeof j.deletePrefix === 'function' ? j.deletePrefix.bind(j) : undefined;
+    const dp = j.deletePrefix.bind(j);
     return {
       async list() {
         const keys = await lk(AGENT_STORE_PRE).catch(() => [] as string[]);
@@ -1718,24 +1728,20 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       },
       get: async (name) => ((await g(AGENT_STORE_PRE + name).catch(() => undefined)) ?? undefined) as ManagedAgentRecord | undefined,
       put: async (rec) => { await p(AGENT_STORE_PRE + rec.name, rec); },
-      ...(dp
-        ? {
-          async delete(name: string) {
-            const key = AGENT_STORE_PRE + name;
-            // deletePrefix is RANGE-based (key >= prefix && key < prefix+'￿') — in our key format
-            // (`AGENT_STORE_PRE + name`, with NO trailing separator) `name` can be an EXACT string
-            // prefix of another agent's name (e.g. deleting 'dd' also catches 'dd2' in the range —
-            // see run purge using a `${runId}:` separator against the same class of bug, retention.ts).
-            // First read the colliding sibling keys, write them back after the sweep — only the
-            // EXACTLY matching record is permanently deleted.
-            const hits = await lk(key).catch(() => [] as string[]);
-            const siblings = hits.filter((k) => k !== key);
-            const preserved = await Promise.all(siblings.map(async (k) => [k, await g(k).catch(() => null)] as const));
-            await dp(key);
-            for (const [k, v] of preserved) if (v != null) await p(k, v as ManagedAgentRecord);
-          },
-        }
-        : {}),
+      async delete(name: string) {
+        const key = AGENT_STORE_PRE + name;
+        // deletePrefix is RANGE-based (key >= prefix && key < prefix+'￿') — in our key format
+        // (`AGENT_STORE_PRE + name`, with NO trailing separator) `name` can be an EXACT string
+        // prefix of another agent's name (e.g. deleting 'dd' also catches 'dd2' in the range —
+        // see run purge using a `${runId}:` separator against the same class of bug, retention.ts).
+        // First read the colliding sibling keys, write them back after the sweep — only the
+        // EXACTLY matching record is permanently deleted.
+        const hits = await lk(key).catch(() => [] as string[]);
+        const siblings = hits.filter((k) => k !== key);
+        const preserved = await Promise.all(siblings.map(async (k) => [k, await g(k).catch(() => null)] as const));
+        await dp(key);
+        for (const [k, v] of preserved) if (v != null) await p(k, v as ManagedAgentRecord);
+      },
     };
   }
   /**
@@ -1858,12 +1864,12 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       // Scheduler (@gnldev/scheduler trigger introspection): the journal is READ-ONLY (see GET /scheduler/triggers),
       // it needs neither a separate opts.scheduler surface nor a running instance — writable + listKeys
       // is enough (same auto-detection pattern as audit/organizations; returns an empty list if the host doesn't use @gnldev/scheduler).
-      scheduler: writable && typeof rw.listKeys === 'function',
+      scheduler: writable,
       knowledge: !!vectors && reach('vectors'),
       workflowManage: !!wfStoreSource && reach('workflowStore'),
       // Governance: approval queue (needs resume), audit + organizations (need a writable journal + listKeys).
       approvals: !!resume,
-      audit: writable && typeof rw.listKeys === 'function',
+      audit: writable,
       // Agent approval registry (governance): review/approve/block code-defined agents recorded by
       // @gnldev/server's boot-time recording (see GET/POST /agents/registry* below) — SAME auto-detection
       // pattern as audit/scheduler, no separate host option needed.
@@ -1873,31 +1879,31 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       // `Agents.tsx` carried a `!me.data?.orgId` clause beside the flag, and `useAgentRegistry` grew an
       // `enabled` argument after being burned — a background poll on a 403 logs the user out.
       //
-      // `writable && typeof rw.listKeys === 'function'` is decided once at construction; who is asking
+      // `writable` is decided once at construction; who is asking
       // is decided per request. A capability that mixes the two has to be corrected at every call site,
       // and the third consumer is the one that forgets. Not covered by `scopeRefused`: this is
       // platform-admin gating, not an unscopeable host object — the boolean was wrong, not unexplained.
-      agentRegistry: writable && typeof rw.listKeys === 'function' && unscoped,
+      agentRegistry: writable && unscoped,
       // Compliance reports: findings produced in this run by the pii/moderation/prompt-injection
       // processors (`${runId}:procreport:...`) — the SAME auto-detection pattern as audit/scheduler: writable +
       // listKeys is enough, no separate host option is NEEDED (returns an empty list if the host doesn't use a processor).
-      processors: writable && typeof rw.listKeys === 'function',
+      processors: writable,
       // The organizations surface is shown ONLY when multi-org is on (paid/opt-in). Hidden on free.
-      organizations: multiOrganizationEnabled && writable && typeof rw.listKeys === 'function',
+      organizations: multiOrganizationEnabled && writable,
       // Budget management lives in the org panel → also depends on multi-org.
       budgetManage: multiOrganizationEnabled && writable,
       // Create/delete org (multi-org + writable + listKeys). Delete additionally needs deletePrefix (checked at the endpoint).
-      orgManage: multiOrganizationEnabled && writable && typeof rw.listKeys === 'function',
+      orgManage: multiOrganizationEnabled && writable,
       // User management (paid): on if the host gave a userStore.
       userManage: !!opts.users,
       agentVersions: agentStoreEnabled,
       evalGate: !!(opts.evalGate && datasets),
-      purge: writable && typeof (rw as Partial<Journal>).deletePrefix === 'function',
+      purge: writable,
       // W5: replay-based regression ("re-run" + decision-point diff). replayRun needs a writable
       // journal since it writes a new run; diffing two EXISTING runs (GET) doesn't depend on that.
       regression: writable,
       policy: writable,
-      retention: !!opts.retention && writable && typeof (rw as Partial<Journal>).deletePrefix === 'function',
+      retention: !!opts.retention && writable,
       // OTEL export button: on if the host gave opts.otelExport (RBAC is again enforced server-side
       // via allow(c,'write') — this is only button visibility, same pattern as queueManage/cacheManage).
       otelExport: !!opts.otelExport,
@@ -1909,7 +1915,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       // D3-A: durable workflow-run cancel (POST /workflows/runs/:id/cancel) — mirrors @gnldev/server's
       // P0.4 /workflows/runs/:id/cancel (reimplemented inline, see the route's own JSDoc for why).
       // Same capability gate as the suspended-runs registry itself (GET /workflows/runs) needs.
-      workflowRunCancel: writable && typeof rw.listKeys === 'function',
+      workflowRunCancel: writable,
       // Auth: if a provider exists the UI requires login; provider.capabilities() unlocks premium surfaces.
       authRequired: !!authProvider,
       ...(authProvider?.capabilities?.() ?? {}),
@@ -2064,7 +2070,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // records that scoreRun memoizes — the read surface for exactly-once scores.
   app.get('/runs/:id/scores', async (c) => {
     if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
-    if (!writable || typeof rw.listKeys !== 'function') return c.json({ scores: {} });
+    if (!writable) return c.json({ scores: {} });
     const id = decodeURIComponent(c.req.param('id'));
     const prefix = `${runRecordPrefix(id, 'proc')}eval:`;
     const keys = await rw.listKeys!(prefix).catch(() => [] as string[]);
@@ -2078,21 +2084,21 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
 
   // Compliance reports: findings the pii-redactor/prompt-injection/moderation processors produced in
   // this run (`readProcessorReports` — @gnldev/durable, reads the `${runId}:procreport:...` prefix).
-  // Empty list if the host doesn't use a processor / writable+listKeys is missing (SAME fallback as scores).
+  // Empty list if the host doesn't use a processor, or Studio is read-only (SAME as scores).
   app.get('/runs/:id/processors', async (c) => {
     if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
-    if (!writable || typeof rw.listKeys !== 'function') return c.json({ reports: [] });
+    if (!writable) return c.json({ reports: [] });
     const id = decodeURIComponent(c.req.param('id'));
     const reports = await readProcessorReports(rw as any, id).catch(() => []);
     return c.json({ reports });
   });
 
   // The run's guard incidents (duplicate guard / loop detection /
-  // maxToolCalls — warn/reflect/block/suspend) as queryable telemetry. Same optional-capability
-  // fallback as /processors: no listKeys → empty list (never an error).
+  // maxToolCalls — warn/reflect/block/suspend) as queryable telemetry. Same as /processors: a read-only
+  // Studio answers an empty list (never an error).
   app.get('/runs/:id/incidents', async (c) => {
     if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
-    if (!writable || typeof rw.listKeys !== 'function') return c.json({ incidents: [] });
+    if (!writable) return c.json({ incidents: [] });
     const id = decodeURIComponent(c.req.param('id'));
     const incidents = await readIncidents(rw as any, id).catch(() => []);
     return c.json({ incidents });
@@ -2102,7 +2108,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // the UI draws the dynamic tree (router → agent → result) from this. Nested run detail at /runs/net:<id>:<i>.
   app.get('/runs/:id/network', async (c) => {
     if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
-    if (!writable || typeof rw.listKeys !== 'function') return c.json({ routes: [], steps: [] });
+    if (!writable) return c.json({ routes: [], steps: [] });
     const id = decodeURIComponent(c.req.param('id'));
     // rw is Partial<Journal>; writable + listKeys was checked → the surface getNetworkTrace uses is complete.
     return c.json(await getNetworkTrace(rw as any, id).catch(() => ({ routes: [], steps: [] })));
@@ -2211,8 +2217,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     // repeat the human waved through lands in the same bucket, so this ranks suspects, not verdicts.
     const byDeclaration = new Map<string, { toolName: string; keys: string[]; suspend: number; approved: number; denied: number }>();
     const semSuspends: { runId: string; toolCallId: string; declKey?: string }[] = [];
-    if (!writable || typeof kj.listKeys !== 'function') {
-      return c.json({ totals, byTool, byOrigin, scan, judge, precision, byDeclaration: [], recent, unavailable: 'journal has no listKeys — incidents cannot be enumerated' });
+    if (!writable) {
+      return c.json({ totals, byTool, byOrigin, scan, judge, precision, byDeclaration: [], recent, unavailable: 'the reader is read-only (no put, so no listKeys guarantee) — incidents cannot be enumerated' });
     }
     // Cap: this aggregates on every 10s UI poll — unbounded N+1 over a retention-sized journal grows
     // linearly forever. The most RECENT slice carries the calibration signal; the cap is reported.
@@ -2439,7 +2445,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   app.get('/audit', async (c) => {
     if (!(await allowP(c.req.raw, 'audit:read'))) return deny(c.req.raw, 'read');
     const rootRw = rawReader as Partial<Journal> & JournalReader;
-    if (!writable || typeof rootRw.listKeys !== 'function') return c.json({ items: [] });
+    if (!writable) return c.json({ items: [] });
     const limit = Math.max(1, Math.min(1000, Number(c.req.query('limit') ?? 200)));
     const action = c.req.query('action');
     const q = c.req.query('q')?.toLowerCase();
@@ -2488,7 +2494,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // A SINGLE notification to opts.alerts.webhook on budget overrun (first-write-wins __alert__ marker).
   const listOrganizations = async (c: Context) => {
     if (!(await allowP(c.req.raw, 'money:read'))) return deny(c.req.raw, 'read');
-    if (!writable || typeof rw.listKeys !== 'function') return c.json({ organizations: [] });
+    if (!writable) return c.json({ organizations: [] });
     // The scan always happens on the ROOT journal (org: prefixes aren't visible in the org-scoped view);
     // an identity-bound org sees ONLY itself — the global list is open only to unbound (operator) identities.
     const rootRw = rawReader as Partial<Journal> & JournalReader;
@@ -2535,7 +2541,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
           source = 'materialized';
         }
       }
-      // No materialized data yet (older data / a journal without getCounters) — fall back to the
+      // No materialized data yet (older data, or a read-only reader) — fall back to the
       // legacy per-run scan so behavior is IDENTICAL to before this fix. NOTE: `view.countRunsByStatus`
       // is intentionally NOT used here — withOrg deliberately does not bridge it (an org-scoped
       // aggregate would otherwise leak every organization's counts, see organization.ts) — run COUNT
@@ -3090,7 +3096,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
         });
       }
     }
-    // Legacy full scan (no materialized counters yet — pre-P1.6 data, or a journal without incrBy/getCounters).
+    // Legacy full scan (no materialized counters yet — pre-P1.6 data, or a read-only reader without getCounters).
     const runs = await reader.listRuns();
     const byStatus: Record<string, number> = {};
     let costUsd = 0, tokens = 0;
@@ -3102,7 +3108,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // Per-run metric rows (Observability: time-series + latency percentiles + a rich table).
   // P1.6: for a finalized run, the `__metrics__run:<runId>` row (written once at completion — see
   // registry.ts's post-run hook / metrics.ts recordRunMetrics) is read directly — no readRun/getRunCost.
-  // Only runs WITHOUT that row (in-flight, or older than this feature / a journal without incrBy) fall
+  // Only runs WITHOUT that row (in-flight, or older than this feature) fall
   // back to the readRun+getRunCost scan. Response shape is UNCHANGED (same field names as before).
   app.get('/metrics/runs', async (c) => {
     if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
@@ -4086,7 +4092,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   app.get('/agents/registry', async (c) => {
     if (!(await allowP(c.req.raw, 'catalog:read'))) return deny(c.req.raw, 'read');
     { const denied = requirePlatformAdmin(c, 'an org-bound identity cannot view the agent registry (operator required)'); if (denied) return denied; }
-    if (!writable || typeof rw.listKeys !== 'function') return c.json([]);
+    if (!writable) return c.json([]);
     try {
       return c.json(await listAgentRegistry(rawReader as unknown as Journal));
     } catch (e: any) {
@@ -5232,7 +5238,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    */
   app.get('/scheduler/triggers', async (c) => {
     if (!(await allowP(c.req.raw, 'catalog:read'))) return deny(c.req.raw, 'read');
-    if (!writable || typeof rw.listKeys !== 'function' || typeof rw.get !== 'function') return c.json([]);
+    if (!writable || typeof rw.get !== 'function') return c.json([]);
     const triggers = await listTriggers(rw as unknown as Journal);
     if (await allowP(c.req.raw, 'payloads:read')) return c.json(triggers);
     return c.json(triggers.map(({ input: _input, lastError, ...rest }) => ({
@@ -5345,7 +5351,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // counterpart of the agent fork (forkRun) — "what-if" analysis that can't be copied without a journal.
   app.post('/workflows/:name/runs/:id/fork', async (c) => {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
-    if (!writable || typeof rw.listKeys !== 'function') return c.json({ error: 'fork requires a writable journal (listKeys)' }, 501);
+    if (!writable) return c.json({ error: 'fork requires a writable journal (listKeys)' }, 501);
     const name = decodeURIComponent(c.req.param('name'));
     const src = decodeURIComponent(c.req.param('id'));
     const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
@@ -5648,7 +5654,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    */
   app.post('/workflows/runs/:id/cancel', async (c) => {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
-    if (!writable || typeof rw.listKeys !== 'function' || typeof rw.get !== 'function' || typeof rw.put !== 'function') {
+    if (!writable || typeof rw.get !== 'function' || typeof rw.put !== 'function') {
       return c.json({ error: 'workflow cancel requires a writable journal (listKeys+get+put)' }, 501);
     }
     const runId = decodeURIComponent(c.req.param('id'));
@@ -5852,7 +5858,6 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const name = decodeURIComponent(c.req.param('name'));
     const existing = await store.get(name);
     if (!existing) return c.json({ error: `agent '${name}' not found` }, 404);
-    if (!store.delete) return c.json({ error: 'agent deletion requires journal deletePrefix support (Sqlite/Postgres/InMemory provide it)' }, 501);
     await store.delete(name);
     await audit(c, 'agent.delete', name, { versions: existing.versions.length, hadActive: existing.active != null });
     return c.json({ ok: true, name });
@@ -5860,7 +5865,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
 
   // Delete a SINGLE VERSION. The ACTIVE (prod) version cannot be deleted → promote another version first
   // (409). Since the active version is never deleted, the active pointer always stays valid. If the last
-  // version is deleted too, the agent record is removed entirely (same as whole-agent delete — needs store.delete; only in that case).
+  // version is deleted too, the agent record is removed entirely (same as whole-agent delete).
   app.delete('/managed-agents/:name/versions/:version', async (c) => {
     if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
     const store = agentStoreFor(c);
@@ -5877,7 +5882,6 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     }
     rec.versions = rec.versions.filter((v) => v.version !== version);
     if (rec.versions.length === 0) {
-      if (!store.delete) return c.json({ error: 'deleting the last version requires journal deletePrefix support' }, 501);
       await store.delete(name);
     } else {
       await store.put(rec);

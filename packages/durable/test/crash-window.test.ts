@@ -83,16 +83,17 @@ describe('H7 crash window (stale running) — safe default', () => {
     // has run, the ledger is still 'running'. The subsequent resume must BLOCK the unmarked tool.
     const inner = new InMemoryJournal();
     let dying = false;
-    const journal: any = {
-      get: (k: string) => inner.get(k),
-      putIfAbsent: (k: string, v: unknown) => inner.putIfAbsent(k, v),
-      listKeys: (p: string) => inner.listKeys(p),
-      put: async (k: string, v: any) => {
-        if (v?.status === 'succeeded' && !dying) dying = true; // moment of death: didn't make it to the succeeded write
-        if (dying) throw new Error('CRASH: process died');
-        return inner.put(k, v);
+    // The same store with every guarantee; the process dies at the write that would record 'succeeded',
+    // whichever write that is (a plain put or the attempt's compare-and-set).
+    const dies = (v: any) => { if (v?.status === 'succeeded' && !dying) dying = true; if (dying) throw new Error('CRASH: process died'); };
+    const journal: any = new Proxy(inner, {
+      get(t, k) {
+        if (k === 'put') return async (key: string, v: any) => { dies(v); return inner.put(key, v); };
+        if (k === 'putIfMatch') return async (key: string, e: unknown, v: any) => { dies(v); return inner.putIfMatch(key, e, v); };
+        const v = Reflect.get(t, k, t);
+        return typeof v === 'function' ? v.bind(t) : v;
       },
-    };
+    });
     let charges = 0;
     const mk = () => durableTool(
       { execute: async () => { charges++; return { charged: 20 }; } },

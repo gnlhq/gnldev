@@ -31,7 +31,7 @@ export const USAGE_KEY = '__usage__';
  */
 async function readUsageCounter(view: Partial<Journal>): Promise<OrganizationUsage | undefined> {
   const legacy = typeof view.get === 'function' ? await view.get<OrganizationUsage>(USAGE_KEY) : undefined;
-  const ctr = typeof view.getCounters === 'function' ? await view.getCounters(USAGE_KEY) : undefined;
+  const ctr = await (view as Pick<Journal, 'getCounters'>).getCounters(USAGE_KEY); // a guarantee of every journal (JOURNAL_GUARANTEES)
   if (!legacy && !ctr) return undefined;
   const sum = (a?: number, b?: number) => Math.max(0, (a ?? 0) + (b ?? 0));
   return {
@@ -41,46 +41,11 @@ async function readUsageCounter(view: Partial<Journal>): Promise<OrganizationUsa
   };
 }
 
-/**
- * H8a combined counter WRITE (delta): if `incrBy` exists it's ENGINE-INTERNAL ATOMIC (lost updates are
- * impossible, no hot-row read-modify-write); otherwise/on failure it falls back to legacy get→put
- * (single-process safe).
- */
-async function addUsage(journal: Partial<Journal>, delta: OrganizationUsage): Promise<void> {
-  if (typeof journal.incrBy === 'function') {
-    try {
-      await journal.incrBy(USAGE_KEY, { runs: delta.runs, tokens: delta.tokens, costUsd: delta.costUsd });
-      return;
-    } catch {
-      // a custom journal whose incrBy cannot do this (no float arithmetic, a read-only view) → legacy path
-    }
-  }
-  if (typeof journal.get !== 'function' || typeof journal.put !== 'function') return;
-  // (silent under-enforcement): this non-atomic get→put loses concurrent increments under
-  // multi-worker contention (two workers read the same total, both write back → one increment lost, in the
-  // budget-UNDER-count direction). Say so ONCE (same pattern as limits.ts's warnCasFallback / journal.ts's
-  // claimFallbackWarned) so the degradation is visible instead of discovered when a cap silently overruns.
-  warnUsageCasFallback(journal);
-  const current = (await journal.get<OrganizationUsage>(USAGE_KEY)) ?? { runs: 0, tokens: 0, costUsd: 0 };
-  await journal.put(USAGE_KEY, {
-    runs: Math.max(0, current.runs + delta.runs),
-    tokens: Math.max(0, current.tokens + delta.tokens),
-    costUsd: Math.max(0, current.costUsd + delta.costUsd),
-  });
+/** H8a combined counter WRITE (delta): `incrBy`, ENGINE-INTERNAL ATOMIC (lost updates are impossible, no hot-row read-modify-write). */
+async function addUsage(journal: Pick<Journal, 'incrBy'>, delta: OrganizationUsage): Promise<void> {
+  await journal.incrBy(USAGE_KEY, { runs: delta.runs, tokens: delta.tokens, costUsd: delta.costUsd });
 }
 
-// Warn ONCE per store when `addUsage` falls back to the non-atomic get→put path (no `incrBy`).
-const usageCasFallbackWarned = new WeakSet<object>();
-function warnUsageCasFallback(journal: object): void {
-  if (usageCasFallbackWarned.has(journal)) return;
-  usageCasFallbackWarned.add(journal);
-  console.warn(
-    '@gnldev/durable: this journal does not implement `incrBy` — the org usage counter fell back to get→put. ' +
-      'Safe in single-process usage; in multi-worker/distributed environments concurrent completions can LOSE ' +
-      'increments (usage UNDER-counts → the budget can silently OVER-run). Implement `incrBy` (all first-party ' +
-      'adapters do — see the parity matrix in journal.ts).',
-  );
-}
 
 /**
  * The idempotency marker that flags a run as having been added to the counter. Written with the

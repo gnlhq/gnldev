@@ -371,7 +371,6 @@ export async function recordProcessorReport(
  * "optional capability" fallback pattern as the audit/scores read APIs.
  */
 export async function readProcessorReports(journal: Journal, runId: string): Promise<ProcessorReport[]> {
-  if (typeof journal.listKeys !== 'function') return [];
   const prefix = runRecordPrefix(runId, 'procreport');
   const keys = await journal.listKeys(prefix);
   const out: ProcessorReport[] = [];

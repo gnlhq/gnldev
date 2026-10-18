@@ -3,7 +3,7 @@
 // Requires the `deletePrefix` port (InMemory/Sqlite/Postgres adapters provide it); otherwise
 // throws a clear error.
 import { runRecordKey } from './run-id-grammar.js';
-import { runKeys, summarizeRun, runIdOfKey, listRunsWhere } from './journal.js';
+import { runKeys, summarizeRun, runIdOfKey, listRunsWhere, assertJournalGuarantees } from './journal.js';
 import { identityOnlyInput } from './run.js';
 import { workKeyHash } from './hash.js';
 import { memKey, readJournalLogDated, semanticLogKey, SEMANTIC_LOG_PREFIX } from './memory.js';
@@ -39,10 +39,8 @@ import { orgPurgedKey, sweepRunFences } from './erasure-fence.js';
 export { ownershipTraceKey, orgPurgedKey };
 
 
-function requireListKeys(journal: Journal): NonNullable<Journal['listKeys']> {
-  if (typeof journal.listKeys !== 'function') {
-    throw new Error("@gnldev/durable: journal must support 'listKeys' for sweep (InMemory/Sqlite/Postgres provide it)");
-  }
+function requireListKeys(journal: Journal): Journal['listKeys'] {
+  assertJournalGuarantees(journal, 'a sweep');
   return journal.listKeys.bind(journal);
 }
 
@@ -92,10 +90,8 @@ async function threadIsTheirs(journal: Journal, threadId: string, resourceId: st
   const o = await threadOwnerOf(journal, memory, threadId);
   if (o.owner) return o.owner === resourceId;
   if (o.exists) return false;
-  const lk = journal.listKeys;
-  if (typeof lk !== 'function') return true;
   const pre = ownershipTraceKey('', '').slice(0, -1); // 'resthr:'
-  for (const k of await lk.call(journal, pre)) {
+  for (const k of await journal.listKeys(pre)) {
     const rest = k.slice(pre.length);
     const cut = rest.indexOf(':');
     if (cut > 0 && rest.slice(cut + 1) === threadId && rest.slice(0, cut) !== escOwnerPart(resourceId)) return false;
@@ -182,17 +178,15 @@ async function purgePersonFamilies(journal: Journal, resourceId: string): Promis
   const xidPre = `${xidFamily}${resourceId}:`;
   const lessonPre = `${lessonFamily}${resourceId}:`;
   const statsPre = `${statsFamily}${resourceId}:`;
-  const lk = journal.listKeys;
-  if (typeof lk !== 'function') return (await del(xidPre)) + (await del(lessonPre)) + (await del(statsPre));
   const own: string[] = [];
   const suggIds = new Set<string>();
   let foreign = false;
-  for (const k of await lk.call(journal, xidPre)) {
+  for (const k of await journal.listKeys(xidPre)) {
     const rest = k.slice(xidPre.length);
     if (xidShape(rest, await journal.get(k)) === 'own') own.push(k); else foreign = true;
   }
   for (const [pre, isStats] of [[lessonPre, false], [statsPre, true]] as const) {
-    for (const k of await lk.call(journal, pre)) {
+    for (const k of await journal.listKeys(pre)) {
       const rest = k.slice(pre.length);
       if (rest.includes(':')) { foreign = true; continue; }
       own.push(k);
@@ -319,22 +313,18 @@ export async function purgeResource(
   // retention sweep that ran first has already taken the only link — and the erasure request would
   // walk an empty list past `xthr:<threadId>:` records built from this person's own arguments.
   // `purgeRun` leaves `resthr:<resourceId>:<threadId>` behind precisely for this moment.
-  const lk = journal.listKeys;
-  if (typeof lk === 'function') {
-    const tracePrefix = `${ownershipTraceKey(resourceId, '')}`;
-    // NO `.catch(() => [])` HERE, deliberately. An empty list and a failed read produce the same
-    // value, and this is an ERASURE path: swallowing the error means purgeResource returns a count,
-    // the caller tells the person their data is gone, and a record carrying their own arguments is
-    // still on disk. Measured: with listKeys throwing, the thread kept `pay: iban-tr55` and the
-    // function reported success. A throw is the only honest outcome — the request must be retried,
-    // not quietly half-finished. (`typeof lk === 'function'` above still covers the journal that
-    // never had listKeys: a missing capability is a known limit, a failing call is not.)
-    for (const k of await lk.call(journal, tracePrefix)) {
-      const t = k.slice(tracePrefix.length);
-      // A threadId may itself contain ':' ('tenant:7:chat'), so this takes the WHOLE remainder
-      // rather than splitting — the prefix already ends at the resourceId boundary.
-      if (t && (await threadIsTheirs(journal, t, resourceId, opts.memory))) owned.add(t);
-    }
+  const tracePrefix = `${ownershipTraceKey(resourceId, '')}`;
+  // NO `.catch(() => [])` HERE, deliberately. An empty list and a failed read produce the same
+  // value, and this is an ERASURE path: swallowing the error means purgeResource returns a count,
+  // the caller tells the person their data is gone, and a record carrying their own arguments is
+  // still on disk. Measured: with listKeys throwing, the thread kept `pay: iban-tr55` and the
+  // function reported success. A throw is the only honest outcome — the request must be retried,
+  // not quietly half-finished.
+  for (const k of await journal.listKeys(tracePrefix)) {
+    const t = k.slice(tracePrefix.length);
+    // A threadId may itself contain ':' ('tenant:7:chat'), so this takes the WHOLE remainder
+    // rather than splitting — the prefix already ends at the resourceId boundary.
+    if (t && (await threadIsTheirs(journal, t, resourceId, opts.memory))) owned.add(t);
   }
   // Their threads, each deleted as a thread is (model.ts): its runs — theirs, and any other run on it —
   // its journal state, its owner record last. Not refused for a run in flight: an erasure takes what is
@@ -484,7 +474,6 @@ function organizationTarget(storage: Storage, who: string): DeleteTarget {
   }
   const journal = toJournal(storage.runs);
   const missing: string[] = [];
-  if (typeof journal.deletePrefix !== 'function') missing.push('its journal cannot `deletePrefix`');
   if (storage.memory && typeof storage.memory.deletePartition !== 'function') missing.push('its memory store cannot `deletePartition`');
   if (storage.vectors && typeof storage.vectors.delete !== 'function') missing.push('its vector store cannot `delete`');
   if (storage.work && (typeof storage.work.deletePrefix !== 'function' || typeof storage.work.deleteIdPrefix !== 'function')) missing.push('its work store cannot `deletePrefix` and `deleteIdPrefix`');

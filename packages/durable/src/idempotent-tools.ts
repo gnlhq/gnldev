@@ -16,7 +16,7 @@
 // crash-recovery / approval gating still require `runDurable`. This layer gives you "the same argument
 // never runs twice", not full durability.
 import { durableTool } from './durable-tool.js';
-import { runKeys, type Journal } from './journal.js';
+import { runKeys, assertJournalGuarantees, type Journal } from './journal.js';
 import { identityOf, runIdentity, toolContextFor, UNKNOWN, type Caller } from './run-identity.js';
 import { argsHash } from './hash.js';
 import type { AnyTool, ToolSet } from './types.js';
@@ -133,14 +133,7 @@ export async function releaseFailedClaim(
   //
   // putIfMatch closes it because the compare and the write are one operation. If the record moved on
   // while we were deciding, our write loses and we say so instead of destroying the winner's record.
-  if (typeof journal.putIfMatch !== 'function') {
-    throw new Error(
-      '@gnldev/durable: releaseFailedClaim needs a journal with putIfMatch — without a compare-and-set ' +
-      'the release cannot tell a still-failed claim from one that succeeded a moment ago, and removing ' +
-      'the latter runs the side effect twice. (InMemoryJournal, SqliteStorage and PostgresStorage all ' +
-      'have it.)',
-    );
-  }
+  assertJournalGuarantees(journal, 'releaseFailedClaim');
   const hash = argsHash(opts.key ? opts.key(opts.toolName, opts.args) : opts.args);
   const claimKey = opts.threadId !== undefined
     ? runKeys.toolThread(opts.threadId, opts.toolName, hash)
@@ -155,14 +148,10 @@ export async function releaseFailedClaim(
     // looking, while the run stays blocked.
     //
     // The key that was looked for is printed, because seeing `xrun:args-charge-<hash>` is what tells
-    // them which of the three it was. Sibling claims for the same tool are listed when the journal can
-    // list keys: "this tool has claims, none with these arguments" is a different problem from "this
+    // them which of the three it was. Sibling claims for the same tool are listed: "this tool has claims, none with these arguments" is a different problem from "this
     // tool has none", and only one of them is about the arguments.
-    let siblings: string[] = [];
-    if (typeof journal.listKeys === 'function') {
-      siblings = (await journal.listKeys(`xrun:args-${opts.toolName}-`).catch(() => [] as string[]))
-        .filter((k) => k !== claimKey).slice(0, 5);
-    }
+    const siblings = (await journal.listKeys(`xrun:args-${opts.toolName}-`).catch(() => [] as string[]))
+      .filter((k) => k !== claimKey).slice(0, 5);
     console.warn(
       `@gnldev/durable: releaseFailedClaim found no claim at '${claimKey}' — nothing was released. ` +
       (siblings.length

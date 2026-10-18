@@ -4,7 +4,7 @@
 // registry meant ~20k reads just to show a handful of suspended rows on every poll. `limit` omitted still
 // returns the legacy flat array, unchanged (older callers, e.g. packages/server, never send `limit`).
 import { describe, it, expect, vi } from 'vitest';
-import { InMemoryJournal } from '@gnldev/durable';
+import { InMemoryJournal, JOURNAL_GUARANTEES } from '@gnldev/durable';
 import { createStudioApi } from '../src/server.js';
 import { call } from './call.js';
 
@@ -90,6 +90,8 @@ describe('GET /workflows/runs pagination (API-03)', () => {
     const journal = new InMemoryJournal();
     await seedWfRuns(journal, 20);
     const bare = {
+      // A store's guarantees, and deliberately no getMany (an accelerator, not a guarantee).
+      ...Object.fromEntries(JOURNAL_GUARANTEES.map((m) => [m, (journal as any)[m].bind(journal)])),
       listRuns: journal.listRuns.bind(journal),
       readRun: journal.readRun.bind(journal),
       listKeys: journal.listKeys.bind(journal),
@@ -140,6 +142,7 @@ describe('GET /workflows/runs pagination (API-03)', () => {
     const journal = new InMemoryJournal();
     await journal.put('wfrun:run-x', { runId: 'run-x', status: 'suspended', updatedAt: 1 });
     const bare = {
+      ...Object.fromEntries(JOURNAL_GUARANTEES.map((m) => [m, (journal as any)[m].bind(journal)])),
       listKeys: journal.listKeys.bind(journal),
       get: async (k: string) => { if (k.endsWith(':input')) throw new Error('boom'); return journal.get(k); },
       put: journal.put.bind(journal),

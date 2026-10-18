@@ -89,25 +89,11 @@ export const runEventKey = (runId: string, seq: number): string => `${runEventPr
 /** Appends event `seq` — false when it is already there (another executor wrote it: this one lost the run). */
 export async function appendRunEvent(journal: Journal, runId: string, ev: RunEvent): Promise<boolean> {
   const key = runEventKey(runId, ev.seq);
-  if (journal.putIfAbsent) return journal.putIfAbsent(key, ev);
-  if ((await journal.get(key)) !== undefined) return false;
-  await journal.put(key, ev);
-  return true;
+  return journal.putIfAbsent(key, ev);
 }
 
 /** The events after `after`, in order (two statements: the key range, then the values). */
 export async function readRunEvents(journal: Journal, runId: string, after = 0, limit = 1_000): Promise<RunEvent[]> {
-  // A journal that cannot list (get/put only) is read by key: the numbers are dense — each append claims
-  // the next one — so the events after `after` are `after+1`, `after+2`, … until the first that is not there.
-  if (!journal.listKeys) {
-    const out: RunEvent[] = [];
-    for (let seq = after + 1; out.length < limit; seq++) {
-      const ev = await journal.get<RunEvent>(runEventKey(runId, seq));
-      if (ev === undefined) break;
-      out.push(ev);
-    }
-    return out;
-  }
   const from = runEventKey(runId, after);
   // One index range from the cursor (Journal.readRange): measured, a follower of a 30 s answer listed
   // 54 243 keys per run through the whole-prefix listing below, and 0 this way.
@@ -121,15 +107,6 @@ export async function readRunEvents(journal: Journal, runId: string, after = 0, 
 /** The last event written (undefined for a run with none). */
 export async function lastRunEvent(journal: Journal, runId: string): Promise<RunEvent | undefined> {
   if (journal.readRange) return (await journal.readRange<RunEvent>(runEventPrefix(runId), { limit: 1, desc: true }))[0]?.[1];
-  if (!journal.listKeys) {
-    // Dense numbers (see readRunEvents): find the last one by doubling, then halving.
-    if ((await journal.get(runEventKey(runId, 1))) === undefined) return undefined;
-    let lo = 1;
-    let hi = 2;
-    while ((await journal.get(runEventKey(runId, hi))) !== undefined) { lo = hi; hi *= 2; }
-    while (hi - lo > 1) { const mid = Math.floor((lo + hi) / 2); if ((await journal.get(runEventKey(runId, mid))) !== undefined) lo = mid; else hi = mid; }
-    return journal.get<RunEvent>(runEventKey(runId, lo));
-  }
   const keys = await journal.listKeys(runEventPrefix(runId));
   const last = keys[keys.length - 1];
   return last === undefined ? undefined : journal.get<RunEvent>(last);

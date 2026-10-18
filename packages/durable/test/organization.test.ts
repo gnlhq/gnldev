@@ -98,12 +98,9 @@ describe('withOrg: optional capability bridges (no capability loss)', () => {
     expect(await globex.get('k')).toBe('other'); // the other organization is UNAFFECTED
   });
 
-  it('if the underlying journal does not offer putIfMatch, the org view does not either (no false atomicity promise)', () => {
-    const bare: Journal = { get: async () => undefined, put: async () => {} };
-    const view = withOrg(bare, 'acme');
-    expect(view.putIfMatch).toBeUndefined();
-    expect(view.incrBy).toBeUndefined();
-    expect(view.now).toBeUndefined();
+  it('a store without the guarantees is refused, naming them — never given a view that promises less', () => {
+    const bare = { get: async () => undefined, put: async () => {} } as unknown as Journal;
+    expect(() => withOrg(bare, 'acme')).toThrow(/withOrg was handed a store without `putIfAbsent`, `putIfMatch`, `applyBatch`, `incrBy`, `getCounters`, `listKeys`, `deletePrefix`, `now`/);
   });
 
   it('run-lock: of two workers racing to take over an expired lock in the org view, ONLY ONE succeeds (CAS)', async () => {
@@ -136,8 +133,9 @@ describe('withOrg: optional capability bridges (no capability loss)', () => {
   });
 
   it('now() is delegated as-is (no prefix — time is global)', async () => {
-    const bare: Journal = { get: async () => undefined, put: async () => {}, now: async () => 42_000 };
-    const view = withOrg(bare, 'acme');
+    const inner = new InMemoryJournal();
+    inner.now = async () => 42_000;
+    const view = withOrg(inner, 'acme');
     expect(await view.now!()).toBe(42_000);
   });
 
@@ -231,8 +229,9 @@ describe('P0.3: listRunsPaged (InMemoryJournal direct + withOrg bridge)', () => 
   });
 
   it('withOrg: if the underlying journal has no listRunsPaged, the org view does not either', () => {
-    const bare: Journal = { get: async () => undefined, put: async () => {} };
-    const view = withOrg(bare, 'acme');
+    const inner = new InMemoryJournal();
+    (inner as { listRunsPaged?: unknown }).listRunsPaged = undefined;
+    const view = withOrg(inner, 'acme');
     expect(view.listRunsPaged).toBeUndefined();
   });
 });

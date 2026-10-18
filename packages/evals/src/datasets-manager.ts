@@ -6,7 +6,7 @@
 //   ds:def:<dsId>:v<N>      → the Nth version of the dataset definition ({ dataset, at, hash })
 //   ds:def:<dsId>:latest    → { version: N }
 //   ds:exp:<dsId>:<expId>   → experiment record ({ result, at, label, datasetVersion })
-import { claim, stableStringify } from '@gnldev/durable';
+import { claim, stableStringify, assertJournalGuarantees } from '@gnldev/durable';
 import type { Journal } from '@gnldev/durable';
 import type { Scorer } from './scorer.js';
 import { evalDataset } from './dataset.js';
@@ -60,17 +60,10 @@ export interface RunExperimentOptions {
   now?: number;
 }
 
-/**
- * Journal-based dataset/experiment manager. Requires a journal that supports `listKeys`
- * (the InMemory/SQLite/Postgres adapters provide it).
- */
+/** Journal-based dataset/experiment manager. */
 export function createDatasetsManager(journal: Journal) {
-  const requireListKeys = () => {
-    if (typeof journal.listKeys !== 'function') {
-      throw new Error("@gnldev/evals DatasetsManager: journal does not support 'listKeys'");
-    }
-    return journal.listKeys.bind(journal);
-  };
+  assertJournalGuarantees(journal, 'createDatasetsManager');
+  const requireListKeys = () => journal.listKeys.bind(journal);
 
   /** Save a versioned dataset: if the content is UNCHANGED, no new version is opened (hash comparison). */
   async function saveDataset(dataset: Dataset, now: number = Date.now()): Promise<DatasetVersion> {

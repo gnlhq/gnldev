@@ -7,6 +7,58 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+**A store states its guarantees, and is measured against them** (ADR-0009). Every promise a run
+keeps — once, owned, erased, truthfully reported — rests on a few store operations being atomic.
+They are now the store contract, a store without one is refused where it enters, and one kit
+measures every backend before it is called one.
+
+### Breaking
+
+- **A store must provide every guarantee: `putIfAbsent`, `putIfMatch`, `applyBatch`, `incrBy`,
+  `getCounters`, `listKeys`, `deletePrefix`, `now`** (`JOURNAL_GUARANTEES`). A store missing one is
+  refused, naming what it lacks, by `createGnl`, `runDurable`, `streamDurable`, `toJournal`, `withOrg`,
+  every scheduler entry, every purge and sweep, `createSuggestions` (and a `suggestions` config),
+  `releaseFailedClaim`, `listAgentRegistry`, `readIdemLedger`, `getNetworkTrace`, `rebuildMetrics`,
+  `createDatasetsManager`, and `createStudioApi` for a reader that can write (a read-only reader
+  without `put` is still welcome). Before, each was "used if present", with a weaker fallback when not:
+  measured, on a store with none of them, 20 workers taking over one expired run lock all won, in 10
+  of 10 rounds. The bundled stores have them all; a store of your own runs `storageConformance`.
+- **A store on one machine answers `now()` with that machine's clock**: `InMemoryJournal` and
+  `SqliteStorage` gained one. A store several machines reach answers its own (Postgres `now()`).
+- **The in-memory journal copies values the way the SQL stores do** (`serialize`/`deserialize`): a
+  `Map`, a `BigInt`, a `Date` read back as themselves, as they always did on Sqlite and Postgres, and a
+  function is dropped where it used to throw.
+- **Removed fallbacks:** a journal without `listKeys` no longer gets point-read probes, a deletion no
+  longer deletes by bare prefix (that path took a neighbour run whose id extends this one), and the
+  warn-once messages about missing primitives are gone with the paths they warned about.
+  `JournalLogContentionError` now points at the conformance kit instead of a journal without
+  `putIfMatch`.
+
+### Fixed
+
+- **A completed run no longer reads 'failed' because an older attempt's failure was written late.**
+  Measured with two OS processes on real Postgres: worker A's model call failed, A freed the run, and
+  its verdict landed after worker B had run the same run to completion — the run read 'failed',
+  permanently, 3 of 3. The verdict was dated by the store's clock when it was written. Each verdict
+  now carries the start of the attempt that wrote it (`RunOutcomeRecord.attempt`), and an older
+  attempt's never replaces a newer one's; also while the newer attempt is still running, and on the
+  stream path.
+- **A replay or fork through Studio keeps the store's guarantees.** Studio's reader forwarded four of
+  eight by hand: a regression replay wrote by read-then-put and was never counted in the metrics.
+- **The in-memory journal's `applyBatch` is all or nothing:** a value it could not copy used to fail
+  the batch after its claim and counters were written.
+
+### Added
+
+- `storageConformance(name, make, opts)` (`@gnldev/durable/testing`): the run journal's scenarios
+  through `toJournal`, then every port a store says it offers — work, vectors, memory, liveness,
+  upgrade (`ports`, `workCas`, `serialisesAppends`, `reopen`). New journal scenarios: a value's round
+  trip (K1b), a batch that fails part-way (K6c), the declared clock (K7, `clock: 'host' | 'shared'`).
+  Eight stores that each break one guarantee are all caught (the kit caught 4 before).
+- `JOURNAL_GUARANTEES`, `missingGuarantees(store)`, `assertJournalGuarantees(store, where)`.
+
 ## [0.11.1] — 2026-10-17
 
 **A schedule's fire, a queued job and a batch item belong to the owner they were made for, and a model

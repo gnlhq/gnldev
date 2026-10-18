@@ -1,11 +1,10 @@
 // Multi-organization support: partition the journal by organization. All keys are written/read with the
-// `org:<orgId>:` prefix → runs, memory, queue, cache — EVERYTHING is isolated per organization. ALL of
-// the journal's optional capabilities (putIfAbsent/listKeys/deletePrefix/putIfMatch/now/incrBy/
-// getCounters/listStaleRuns) and JournalReader's (readRun/listRuns/readRunStats) — if the underlying
-// journal supports them — are bridged → exactly-once/atomic-CAS/atomic-counter guarantees are also
-// PRESERVED in the organization view (the same Journal interface). A highly requested feature that has no
+// `org:<orgId>:` prefix → runs, memory, queue, cache — EVERYTHING is isolated per organization. Every
+// guarantee of the store (journal.ts JOURNAL_GUARANTEES) is bridged, and the accelerators and
+// JournalReader's methods (readRun/listRuns/readRunStats/listStaleRuns…) when the store has them →
+// exactly-once/atomic-CAS/atomic-counter guarantees are PRESERVED in the organization view. A highly requested feature that has no
 // counterpart in most agent frameworks.
-import { listRunsArray } from './journal.js';
+import { listRunsArray, assertJournalGuarantees } from './journal.js';
 import { hidingView } from './journal-view.js';
 import { decodeRunCursor, encodeRunCursor, encodeChangeCursor, type ChangePosition } from './run-cursor.js';
 import type { Journal, JournalBatch, JournalReader, JournalEntry, RunChange, RunSummary } from './journal.js';
@@ -72,8 +71,7 @@ export const ADOPTABLE_RESERVED_PREFIXES: readonly string[] = [
 export const ORG_RECORD_PRE = '__org__:';
 
 /** Every organization registered in a store (an `__org__:<id>` record that is not a tombstone). */
-export async function registeredOrganizations(read: { listKeys?(prefix: string): Promise<string[]>; get<T = unknown>(key: string): Promise<T | undefined> }): Promise<string[]> {
-  if (typeof read.listKeys !== 'function') return [];
+export async function registeredOrganizations(read: { listKeys(prefix: string): Promise<string[]>; get<T = unknown>(key: string): Promise<T | undefined> }): Promise<string[]> {
   const out: string[] = [];
   for (const key of await read.listKeys(ORG_RECORD_PRE)) {
     if ((await read.get(key)) != null) out.push(key.slice(ORG_RECORD_PRE.length));
@@ -356,9 +354,25 @@ export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<J
     );
   }
   const prefix = orgPrefix(orgId);
+  // The organization's view keeps every guarantee of the store it scopes (each key prefixed), so an
+  // organization's run is as exactly-once, as lockable and as erasable as a root one.
+  assertJournalGuarantees(journal, 'withOrg');
   const out: Journal & Partial<JournalReader> = {
     get: <T = unknown>(key: string) => journal.get<T>(prefix + key),
     put: (key: string, value: unknown) => journal.put(prefix + key, value),
+    putIfAbsent: (key, value) => journal.putIfAbsent(prefix + key, value),
+    listKeys: async (p, opts) => (await journal.listKeys(prefix + p, opts)).map((k) => k.slice(prefix.length)),
+    deletePrefix: (p) => journal.deletePrefix(prefix + p), // an organization can only delete its own scope
+    putIfMatch: (key, expected, value) => journal.putIfMatch(prefix + key, expected, value),
+    now: () => journal.now(), // time is not an organization's: no prefix
+    incrBy: (key, fields) => journal.incrBy(prefix + key, fields),
+    getCounters: (key) => journal.getCounters(prefix + key),
+    // Every key inside the batch is prefixed the way put()/incrBy() prefix their own.
+    applyBatch: (batch: JournalBatch) => journal.applyBatch({
+      ...(batch.claim ? { claim: { key: prefix + batch.claim.key, value: batch.claim.value } } : {}),
+      ...(batch.incrs ? { incrs: batch.incrs.map((i) => ({ key: prefix + i.key, fields: i.fields })) } : {}),
+      ...(batch.puts ? { puts: batch.puts.map((p) => ({ key: prefix + p.key, value: p.value })) } : {}),
+    }),
   };
   // Enumerable, deliberately — and this used to be `enumerable: false` on the reasoning that a marker
   // for in-process code "must not appear in a spread, a JSON round-trip, or a key listing". Two of
@@ -376,12 +390,6 @@ export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<J
   // Same enumerability, same reason: a wrapper built by spreading this object must keep both markers or
   // it silently becomes a journal that cannot answer where its global documents live.
   Object.defineProperty(out, ORG_PARENT, { value: journal, enumerable: true, configurable: true });
-  if (journal.putIfAbsent) {
-    out.putIfAbsent = (key, value) => journal.putIfAbsent!(prefix + key, value);
-  }
-  if (journal.listKeys) {
-    out.listKeys = async (p, opts) => (await journal.listKeys!(prefix + p, opts)).map((k) => k.slice(prefix.length));
-  }
   if (journal.readRange) {
     out.readRange = async <T>(p: string, opts: { after?: string; limit: number; desc?: boolean }) =>
       (await journal.readRange!<T>(prefix + p, { ...opts, ...(opts.after !== undefined ? { after: prefix + opts.after } : {}) })).map(([k, v]) => [k.slice(prefix.length), v] as [string, T]);
@@ -391,36 +399,6 @@ export function withOrg(scopedFrom: Journal, orgId: string): Journal & Partial<J
   if (journal.listOwnerRecords) {
     out.listOwnerRecords = async (rid, opts) =>
       (await journal.listOwnerRecords!(rid, { prefix: prefix + (opts?.prefix ?? '') })).map((k) => k.slice(prefix.length));
-  }
-  if (journal.deletePrefix) {
-    out.deletePrefix = (p) => journal.deletePrefix!(prefix + p); // an organization can only delete its own scope
-  }
-  // H1 (atomic conditional replace): the prefixed key, expected/value are delegated as-is — run-lock.ts's
-  // expired-lock takeover CAS also stays atomic in the org view (if not bridged it would fall back to
-  // best-effort get→put, creating a split-brain risk in a multi-organization deployment).
-  if (journal.putIfMatch) {
-    out.putIfMatch = (key, expected, value) => journal.putIfMatch!(prefix + key, expected, value);
-  }
-  // H2 (storage clock): NO prefix — time isn't organization-specific, delegated as-is.
-  if (journal.now) {
-    out.now = () => journal.now!();
-  }
-  // H8a (atomic counter): the key is prefixed → budget.ts:incrBy/getOrgUsage also use an
-  // engine-internal atomic increment in the org view (would fall back to legacy get→put if not bridged).
-  if (journal.incrBy) {
-    out.incrBy = (key, fields) => journal.incrBy!(prefix + key, fields);
-  }
-  if (journal.getCounters) {
-    out.getCounters = (key) => journal.getCounters!(prefix + key);
-  }
-  // P1.6b: atomic batch — every key inside `batch` (claim/incrs/puts) is prefixed the SAME way put()/
-  // incrBy() prefix their own single key, so the org isolation guarantee carries over unchanged.
-  if (journal.applyBatch) {
-    out.applyBatch = (batch: JournalBatch) => journal.applyBatch!({
-      ...(batch.claim ? { claim: { key: prefix + batch.claim.key, value: batch.claim.value } } : {}),
-      ...(batch.incrs ? { incrs: batch.incrs.map((i) => ({ key: prefix + i.key, fields: i.fields })) } : {}),
-      ...(batch.puts ? { puts: batch.puts.map((p) => ({ key: prefix + p.key, value: p.value })) } : {}),
-    });
   }
   // P1.6b: batch point-read — keys prefixed the same way get() prefixes a single key; order preserved (contract).
   if (journal.getMany) {

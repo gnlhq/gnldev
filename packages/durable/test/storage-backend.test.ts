@@ -164,13 +164,12 @@ describe('composite + capability', () => {
     expect(await j.get('org:acme:x')).toBeUndefined();
   });
 
-  it('toJournal: does NOT forward an optional method the underlying RunJournal does not provide (old behavior)', () => {
+  it('toJournal: a RunJournal without a guarantee is refused, naming it — not bridged into a store that promises less', () => {
     const bare = {
       get: async () => undefined, put: async () => {}, putIfAbsent: async () => true,
       listKeys: async () => [], readRun: async () => [], listRuns: async () => ({ items: [], total: 0 }),
-    } as any; // NO deletePrefix
-    const j = toJournal(bare);
-    expect(j.deletePrefix).toBeUndefined();
+    } as any; // NO deletePrefix, putIfMatch, applyBatch, incrBy, getCounters, now
+    expect(() => toJournal(bare)).toThrow(/toJournal \(storage\.runs\) was handed a store without `putIfMatch`, `applyBatch`, `incrBy`, `getCounters`, `deletePrefix`, `now`/);
   });
 
   // P0.3 (AUDIT-R2): toJournal's listRunsPaged bridge — a straight delegation to the

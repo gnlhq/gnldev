@@ -117,12 +117,6 @@ describe('metrics.ts — recordRunScores', () => {
     expect(summary.all?.['score:relevancy:avg']).toBeCloseTo(0.4, 10); // 0.4/1
   });
 
-  it('fallback: a journal without incrBy/putIfAbsent returns false and writes nothing', async () => {
-    const bare: Journal = { get: async () => undefined, put: async () => {} };
-    const ok = await recordRunScores(bare, 'r1', undefined, { s: { score: 0.5 } });
-    expect(ok).toBe(false);
-  });
-
   // applyBatch path: same "must not touch incrBy/putIfAbsent" style stub as metrics.test.ts's atomicity test.
   it('atomicity: recordRunScores uses applyBatch exclusively when available (never touches incrBy/putIfAbsent)', async () => {
     const real = new InMemoryJournal();
@@ -130,6 +124,7 @@ describe('metrics.ts — recordRunScores', () => {
       get: (k: string) => real.get(k),
       put: (k: string, v: unknown) => real.put(k, v),
       applyBatch: (b: Parameters<typeof real.applyBatch>[0]) => real.applyBatch(b),
+      now: () => real.now(),
       incrBy: async () => { throw new Error('sequential path must not be used when applyBatch exists'); },
       putIfAbsent: async () => { throw new Error('sequential path must not be used when applyBatch exists'); },
     } as unknown as Journal;
@@ -141,27 +136,6 @@ describe('metrics.ts — recordRunScores', () => {
     expect(all?.['score:s:gte75']).toBe(1);
   });
 
-  // Sequential fallback (no applyBatch): a journal that implements incrBy/putIfAbsent but not applyBatch —
-  // same claim-first ordering contract as recordRunMetrics's sequential path.
-  it('sequential fallback (no applyBatch): claims then increments, and never double-claims on retry', async () => {
-    const real = new InMemoryJournal();
-    let incrByCalls = 0;
-    const stub = {
-      get: (k: string) => real.get(k),
-      put: (k: string, v: unknown) => real.put(k, v),
-      putIfAbsent: (k: string, v: unknown) => real.putIfAbsent(k, v),
-      incrBy: async (k: string, fields: Record<string, number>) => { incrByCalls++; return real.incrBy(k, fields); },
-    } as unknown as Journal;
-
-    const ok = await recordRunScores(stub, 'r1', undefined, { s: { score: 0.5 } });
-    expect(ok).toBe(true);
-    expect(incrByCalls).toBe(2); // no agentName → 2 incrs entries (all + day), one incrBy call each
-    const all = await readCounter(real, METRICS_ALL_KEY);
-    expect(all?.['score:s:count']).toBe(1);
-
-    const second = await recordRunScores(stub, 'r1', undefined, { s: { score: 0.5 } });
-    expect(second).toBe(false); // already claimed — no-op, no double-claim
-  });
 });
 
 describe('metrics.ts — score counters survive rebuildMetrics (P2-skor repair path, review finding)', () => {
@@ -196,25 +170,6 @@ describe('metrics.ts — score counters survive rebuildMetrics (P2-skor repair p
     expect(again?.['score:quality:count']).toBe(1);
   });
 
-  it('backfillMetrics without listKeys support skips score restoration (base metrics still land)', async () => {
-    const journal = new InMemoryJournal();
-    await journal.put(runKeys.model('r-nl', 0), { content: [] });
-    await journal.put(`r-nl:proc:eval:quality`, { v: { score: 0.5 } });
-    // Strip listKeys: structural journal without the prefix-scan capability.
-    const stripped: any = {
-      get: journal.get.bind(journal), put: journal.put.bind(journal),
-      putIfAbsent: journal.putIfAbsent.bind(journal), incrBy: journal.incrBy.bind(journal),
-      getCounters: journal.getCounters.bind(journal), applyBatch: journal.applyBatch.bind(journal),
-      listRuns: journal.listRuns.bind(journal), readRun: journal.readRun.bind(journal),
-    };
-    const { backfillMetrics } = await import('../src/metrics.js');
-    const res = await backfillMetrics(stripped, stripped);
-    expect(res.recorded).toBe(1); // base metrics landed
-    expect(res.scoresRestored).toBe(0); // scores skipped — no listKeys, documented behavior
-    const all = await readCounter(journal, METRICS_ALL_KEY);
-    expect(all?.runs).toBe(1);
-    expect(all?.['score:quality:sumMilli']).toBeUndefined();
-  });
 });
 
 describe('metrics.ts — recordRunScores integration with registry.ts C4 scoring (sampling bias)', () => {

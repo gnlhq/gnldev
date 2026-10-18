@@ -184,25 +184,7 @@ describe('args idempotency — different arguments get SEPARATE keys (no false-p
   });
 });
 
-describe('journal.ts claim() — silent fallback made loud', () => {
-  it('journal without putIfAbsent → console.warn ONCE PER journal in the get→put fallback path', async () => {
-    const store = new Map<string, unknown>();
-    const journal: any = {
-      get: async (k: string) => store.get(k),
-      put: async (k: string, v: unknown) => { store.set(k, v); },
-      // putIfAbsent DELIBERATELY UNDEFINED — triggers the fallback path.
-    };
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    try {
-      expect(await claim(journal, 'k1', { v: 1 })).toBe(true);
-      expect(await claim(journal, 'k1', { v: 2 })).toBe(false); // key already taken → false, NO second warning
-      expect(await claim(journal, 'k2', { v: 3 })).toBe(true); // different key, SAME journal object
-      expect(warnSpy).toHaveBeenCalledTimes(1); // ONCE per journal object
-      expect(warnSpy.mock.calls[0]?.[0]).toMatch(/putIfAbsent/);
-    } finally {
-      warnSpy.mockRestore();
-    }
-  });
+describe('journal.ts claim() — a store with putIfAbsent says nothing', () => {
 
   it('InMemoryJournal (HAS putIfAbsent) never warns', async () => {
     const journal = new InMemoryJournal();

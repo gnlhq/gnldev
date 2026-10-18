@@ -1150,6 +1150,12 @@ The exactly-once guarantee rests on one precondition: **storage never loses an a
 
 ## Testing your own journal (`@gnldev/durable/testing`)
 
+A store is refused where it enters unless it has every guarantee the engine builds on —
+`putIfAbsent`, `putIfMatch`, `applyBatch`, `incrBy`, `getCounters`, `listKeys`, `deletePrefix`, `now`
+(`JOURNAL_GUARANTEES`; `missingGuarantees(store)` names what yours lacks). That a method is there says
+nothing about whether it is atomic: a `putIfMatch` that reads, waits and writes lets every racing worker
+win. The scenarios below are how a store shows it keeps them (ADR-0009).
+
 A journal is more than its method signatures. Exactly-once needs a `putIfAbsent` that lets one of many
 racing callers win. A purge needs a prefix that is literal text, not a SQL pattern. Erasure needs a
 person's runs found even when an older writer never placed them. A thread delete must take what the
@@ -1176,16 +1182,21 @@ journalConformance('my journal', () => ({ journal: new InMemoryJournal() }), { d
   is closed. It is also handed to `it` as a third argument (plus a second), for a runner that reads one,
   so its own default does not end a scenario first. `exactClaim: false` and `pageWalk: false` declare the two limits of the pg-mem test
   double: it reports a lost `putIfAbsent` as won, and it cannot read a run list's second page. A real
-  store that needs either flag cannot give the guarantee the flag skips.
+  store that needs either flag cannot give the guarantee the flag skips. `clock: 'shared'` declares a
+  store several machines reach (its `now()` is its own); the default `'host'` checks `now()` against
+  this machine's clock.
 - **The scenarios:** the key-value contract (K1–K6: values, the racing claim, `putIfMatch`, literal
   prefixes, exact counters, `applyBatch`/`getMany`); runs (R1–R5: which records name a run, the
   summary, `readRun` in first-write order — not key or clock order, an older writer's rows too —, the status after each write of a scripted history, paging and filters, and a run after one of its records is deleted — its status, counts, person and thread, and whether it is still a run); relations (L1–L2:
   a person's and a thread's runs, owner records, rows from older writers); and the dependents model
   (D1–D7: thread delete, organization isolation, refusal while a run is in flight, a delete killed at
-  every step and then retried, run purge, erasure, cross-run claims that outlive a delete). Optional
-  methods such as `putIfMatch`, `incrBy`, `applyBatch` and `listOwnerRecords` are checked when the
+  every step and then retried, run purge, erasure, cross-run claims that outlive a delete). The
+  guarantees are checked under a race each (G0, K2, K3, K5, K6), a batch that fails part-way must leave
+  nothing (K6c), a value must read back as the store serialization makes it (K1b: `serialize` /
+  `deserialize`, the same answer from every store), and `now()` must be the clock it declares (K7).
+  Accelerators such as `getMany`, `listOwnerRecords` and `listRunsChangedSince` are checked when the
   journal has them.
-- **What a journal must have:** the `Journal` port with `putIfAbsent`, `listKeys` and `deletePrefix`, plus
+- **What a journal must have:** the `Journal` port with every guarantee (`JOURNAL_GUARANTEES`), plus
   `readRun` and `listRunsPaged` from `JournalReader`. `readRun` returns a run's records in the order
   they were first written (an overwrite keeps its place) — a position the store keeps, not a clock. A
   journal without a paged listing gives
@@ -1196,6 +1207,29 @@ journalConformance('my journal', () => ({ journal: new InMemoryJournal() }), { d
   The outcome record can be the only one, as with a run canceled before it started. A run with no
   record left is no run, whatever other keys its prefix still holds. Its status is
   `summarizeRun(runId, entries, outcomeRecord)`, and `pageRunsFromArray` pages the result.
+
+A whole backend — a `Storage` with its run journal and its other ports — runs `storageConformance`:
+the journal scenarios above through `toJournal` (the bridge the engine reads a store by), then each
+port it says it offers: the work store (W1–W3: idempotent append, one acknowledgement of many, a
+compare-and-set under a race), the vector store (V1: a filter compares by `===`), the memory store
+(M1–M2), the process liveness (P1: alive while held, dead to another process once closed) and the
+upgrade (U1: a dry run writes nothing, a second run finds nothing pending).
+
+```ts
+import { describe, it } from 'vitest';
+import { InMemoryStorage } from '@gnldev/durable';
+import { storageConformance } from '@gnldev/durable/testing';
+
+// Your storage goes here; InMemoryStorage stands in for it (one process reaches it: no liveness port).
+storageConformance('my store', () => new InMemoryStorage(), { describe, it, ports: ['work', 'vectors', 'memory', 'upgrade'] });
+```
+
+- **`ports`** names the ports the store offers (default: `work`, `vectors`, `memory`, `liveness`,
+  `upgrade`). A named port the store lacks fails; one left out is not checked and not claimed.
+- **`workCas: false`** declares a work store without `putIfMatch` — a job's owner token is then not
+  fenced. **`serialisesAppends: false`** is pg-mem's: it cannot order two appends to one thread.
+- **`reopen(s)`** opens a second handle on the same data, as another process would; with it the
+  liveness is checked from that other side too.
 - **Not covered:** scenarios that need a memory store, a vector store or the agent engine. These stay in
   the packages that own them: `AgentMemory` thread deletes, `eraseSubject` over a whole `Storage`,
   and `adoptIntoOrg`.

@@ -385,9 +385,7 @@ export async function judgeGrayPair(
   // survivor is whichever landed last. Replacing CONDITIONALLY on the exact record that was read
   // keeps the agreement the claim path provides — the loser re-reads and serves the winner's answer.
   if (staleStamp) {
-    const replaced = typeof journal.putIfMatch === 'function'
-      ? await journal.putIfMatch(key, cached, rec).catch(() => true)
-      : await journal.put(key, rec).then(() => true).catch(() => true); // no CAS on this journal: documented fallback
+    const replaced = await journal.putIfMatch(key, cached, rec).catch(() => true);
     if (!replaced) {
       const winner = await journal.get<SemJudgeRecord>(key).catch(() => undefined);
       if (winner && winner.v === 1) return { kind: 'verdict', verdict: winner.verdict, cached: true, latencyMs };

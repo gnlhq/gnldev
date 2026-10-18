@@ -37,7 +37,7 @@
 import { runRecordKey } from './run-id-grammar.js';
 import { generateText } from 'ai';
 import { randomUUID } from 'node:crypto';
-import { claim as journalClaim } from './journal.js';
+import { claim as journalClaim, assertJournalGuarantees } from './journal.js';
 import { resolveModel } from './model-router.js';
 import { argsHash } from './hash.js';
 import { cosine, decodeVec, encodeVec, embedCached } from './semantic-dup.js';
@@ -144,6 +144,9 @@ export const normalizeRule = (v: string): string => v.trim().normalize('NFKC').t
 
 export function validateSuggestionsConfig(cfg: SuggestionsConfig, journal: Journal): void {
   refuseSuggestionsNames(cfg);
+  // Lesson injection, proposal merge and promotion clustering enumerate records and write them by
+  // compare-and-set: a store without its guarantees is refused here, at configuration, naming them.
+  assertJournalGuarantees(journal, 'suggestions');
   if (typeof cfg.generate !== 'boolean' || typeof cfg.apply !== 'boolean') {
     throw new Error('@gnldev/durable: suggestions requires BOTH switches — `generate` and `apply` — as explicit booleans (the two-switch contract).');
   }
@@ -170,12 +173,6 @@ export function validateSuggestionsConfig(cfg: SuggestionsConfig, journal: Journ
     if (t?.ratio !== undefined && !(t.ratio > 0 && t.ratio <= 1)) {
       throw new Error('@gnldev/durable: suggestions.promotion.threshold.ratio must be in (0, 1].');
     }
-  }
-  // ALL three switches that need listKeys gate on it — guarding generate/promotion while letting
-  // apply stay silently inert (readLessons would return [] forever, no lesson ever injected, no
-  // error ever raised) would turn this throw into a false "it validated, so it works" assurance.
-  if ((cfg.generate || cfg.apply || cfg.promotion) && typeof journal.listKeys !== 'function') {
-    throw new Error('@gnldev/durable: suggestions.generate/apply/promotion all need journal.listKeys — lesson injection, proposal merge and promotion clustering enumerate records; without listKeys the switch would be silently absent.');
   }
 }
 
@@ -242,19 +239,19 @@ export interface SuggestionsApi {
    *  (when the promotion block exists) runs one on-approval promotion scan. */
   decide(id: string, opts: { approve: boolean; by?: string }): Promise<{ status: 'approved' | 'rejected'; alreadyDecided: boolean }>;
   /** Approved lessons visible to a resource (personal + org), newest first. `injected` = how many
-   *  runs this lesson was frozen into (from the `suggstats:<lessonKey>` counter; absent without incrBy). */
+   *  runs this lesson was frozen into (from the `suggstats:<lessonKey>` counter). */
   lessons(resourceId?: string): Promise<Array<LessonRecord & { key: string; injected?: number }>>;
 }
 
 export function createSuggestions(journal: Journal, cfg: SuggestionsConfig): SuggestionsApi {
   refuseSuggestionsNames(cfg);
+  assertJournalGuarantees(journal, 'createSuggestions');
   const embedCfg = cfg.embed && cfg.embedModelId ? { embed: cfg.embed, embedModelId: cfg.embedModelId } : undefined;
   const minSim = cfg.minSimilarity ?? DEFAULT_MERGE_SIMILARITY;
   const maxInject = cfg.maxInject ?? DEFAULT_MAX_INJECT;
-  const nowOf = async () => (journal.now ? await journal.now() : Date.now());
+  const nowOf = () => journal.now();
 
   async function readLessons(resourceId?: string): Promise<Array<LessonRecord & { key: string; injected?: number }>> {
-    if (typeof journal.listKeys !== 'function') return [];
     const keys: string[] = [];
     if (resourceId) keys.push(...(await journal.listKeys(`lesson:res:${resourceId}:`).catch(() => [] as string[])));
     keys.push(...(await journal.listKeys('lesson:org:').catch(() => [] as string[])));
@@ -265,7 +262,7 @@ export function createSuggestions(journal: Journal, cfg: SuggestionsConfig): Sug
       // The injection counter's key carries the full LESSON KEY (`suggstats:lesson:res:...`) — the
       // one identity prepareInjection has in hand at freeze time. Surfaced here so the counter has a
       // reader (a written-only counter is dead weight); best-effort like its writer.
-      const counters = journal.getCounters ? await journal.getCounters(`suggstats:${k}`).catch(() => undefined) : undefined;
+      const counters = await journal.getCounters(`suggstats:${k}`).catch(() => undefined);
       out.push({ ...rec, key: k, ...(counters?.injected !== undefined ? { injected: counters.injected } : {}) });
     }
     return out.sort((a, b) => b.at - a.at);
@@ -295,7 +292,7 @@ export function createSuggestions(journal: Journal, cfg: SuggestionsConfig): Sug
     if (!won) {
       const winner = await journal.get<{ ids: string[]; text: string }>(key);
       if (winner !== undefined) return winner; // K4: the loser holds itself to the winner's freeze
-    } else if (journal.incrBy && value.ids.length) {
+    } else if (value.ids.length) {
       for (const id of value.ids) await journal.incrBy(`suggstats:${id}`, { injected: 1 }).catch(() => {});
     }
     return value;
@@ -356,13 +353,11 @@ export function createSuggestions(journal: Journal, cfg: SuggestionsConfig): Sug
       // Merge scan: an existing similar suggestion (this resource, pending/approved) absorbs the
       // evidence — the same lesson twice must be ONE rule with two evidences, not two rules.
       const existing: Array<SuggestionRecord & { key: string }> = [];
-      if (typeof journal.listKeys === 'function') {
-        for (const k of await journal.listKeys('sugg:').catch(() => [] as string[])) {
-          if (k.split(':').length !== 2) continue; // decision side-keys (sugg:<id>:decision) are not records
-          const rec = await journal.get<SuggestionRecord>(k);
-          if (rec && rec.v === 1 && rec.scope === 'personal' && rec.resourceId === input.resourceId && rec.status !== 'rejected') {
-            existing.push({ ...rec, key: k });
-          }
+      for (const k of await journal.listKeys('sugg:').catch(() => [] as string[])) {
+        if (k.split(':').length !== 2) continue; // decision side-keys (sugg:<id>:decision) are not records
+        const rec = await journal.get<SuggestionRecord>(k);
+        if (rec && rec.v === 1 && rec.scope === 'personal' && rec.resourceId === input.resourceId && rec.status !== 'rejected') {
+          existing.push({ ...rec, key: k });
         }
       }
       const matchIdx = await similarityMatch(parsed.rule, existing);
@@ -375,19 +370,13 @@ export function createSuggestions(journal: Journal, cfg: SuggestionsConfig): Sug
           at,
           ...(influencedBy.has(target.id) || shadowed ? { tainted: true } : {}),
         };
-        // CAS append (3 attempts) — two concurrent merges must not eat each other's evidence. On a
-        // journal without putIfMatch this degrades to read+put (documented best-effort).
+        // CAS append (3 attempts) — two concurrent merges must not eat each other's evidence.
         for (let attempt = 0; attempt < 3; attempt++) {
           const cur = await journal.get<SuggestionRecord>(target.key);
           if (!cur) break;
           if (cur.evidence.some((e) => e.runId === input.runId)) break; // this run already testified
           const next = { ...cur, evidence: [...cur.evidence, entry] };
-          if (typeof journal.putIfMatch === 'function') {
-            if (await journal.putIfMatch(target.key, cur, next)) break;
-          } else {
-            await journal.put(target.key, next);
-            break;
-          }
+          if (await journal.putIfMatch(target.key, cur, next)) break;
         }
         await journal.put(memoKey, { suggId: target.id, merged: true });
         return { id: target.id, merged: true };
@@ -422,7 +411,6 @@ export function createSuggestions(journal: Journal, cfg: SuggestionsConfig): Sug
   }
 
   async function list(filter?: { status?: SuggestionRecord['status']; scope?: SuggestionRecord['scope']; resourceId?: string }): Promise<Array<SuggestionRecord & { quality: EvidenceQuality }>> {
-    if (typeof journal.listKeys !== 'function') return [];
     const out: Array<SuggestionRecord & { quality: EvidenceQuality }> = [];
     for (const k of await journal.listKeys('sugg:').catch(() => [] as string[])) {
       if (k.split(':').length !== 2) continue;
@@ -471,13 +459,7 @@ export function createSuggestions(journal: Journal, cfg: SuggestionsConfig): Sug
       if (!rec || rec.v !== 1) return;
       if (rec.status === status) break; // flip already landed (this call or an earlier repair)
       const next: SuggestionRecord = { ...rec, status, decidedAt: rec.decidedAt ?? decision.at, ...(decision.by && !rec.decidedBy ? { decidedBy: decision.by } : {}) };
-      if (typeof journal.putIfMatch === 'function') {
-        if (await journal.putIfMatch(key, rec, next)) { rec = next; break; }
-      } else {
-        await journal.put(key, next);
-        rec = next;
-        break;
-      }
+      if (await journal.putIfMatch(key, rec, next)) { rec = next; break; }
     }
     if (!decision.approve || !rec) return;
     // Lesson birth — deterministic keys, so re-running is a no-op when the record already exists.
@@ -507,7 +489,6 @@ export function createSuggestions(journal: Journal, cfg: SuggestionsConfig): Sug
   /** 'on-approval': one scan at each personal approval. Similar approved lessons across DISTINCT
    *  resources ≥ N → an org-scope suggestion is born (pending — promotion never applies by itself). */
   async function promotionScan(approved: SuggestionRecord, at: number): Promise<void> {
-    if (typeof journal.listKeys !== 'function') return;
     const all: Array<LessonRecord & { key: string }> = [];
     for (const k of await journal.listKeys('lesson:res:').catch(() => [] as string[])) {
       const rec = await journal.get<LessonRecord>(k);

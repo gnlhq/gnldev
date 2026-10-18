@@ -167,10 +167,11 @@ describe('AUDIT-4: a stale failure cannot bury a later success', () => {
     const afterSuccess = await readRunOutcome(journal, runId);
     expect(afterSuccess?.status).toBe('completed');
 
-    // …and worker A's much older 'failed' put finally lands (GC pause, contended DB). Plain
-    // last-writer-wins let it stamp a succeeded run failed, permanently — measured in the audit.
+    // …and worker A's 'failed' put, from an attempt that began earlier, finally lands (GC pause,
+    // contended DB). Plain last-writer-wins let it stamp a succeeded run failed, permanently — measured
+    // in the audit. (an-older-attempts-verdict-does-not-replace-a-newer-one.test.ts drives it through the engine.)
     const { runFailed } = await import('../src/outcome.js');
-    await runFailed(journal, runId, new Error('401 invalid api key'), afterSuccess!.at - 60_000);
+    await runFailed(journal, runId, new Error('401 invalid api key'), Date.now(), (afterSuccess!.attempt ?? afterSuccess!.at) - 60_000);
 
     const final = await readRunOutcome(journal, runId);
     expect(final?.status, 'the stale verdict must lose').toBe('completed');

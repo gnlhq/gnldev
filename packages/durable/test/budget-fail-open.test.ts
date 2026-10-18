@@ -2,22 +2,15 @@
 // when it can't list runs, so isBudgetExceeded is always false — a configured budget silently never fires.
 // Mirror of C4: checkBudget now emits a LOUD one-time warn (once per store) naming the disabled cap.
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { checkBudget, budgetsEnforceable, recordRunUsage } from '../src/budget.js';
-import { InMemoryJournal, runKeys } from '../src/journal.js';
-import type { Journal } from '../src/journal.js';
+import { checkBudget, budgetsEnforceable } from '../src/budget.js';
+import { InMemoryJournal } from '../src/journal.js';
 
 afterEach(() => vi.restoreAllMocks());
 
-/** get/put only — deliberately NO `listRuns` (usage cannot be computed). */
-class NoListRunsJournal implements Journal {
-  private m = new Map<string, unknown>();
-  async get<T = unknown>(key: string): Promise<T | undefined> { return this.m.get(key) as T | undefined; }
-  async put(key: string, value: unknown): Promise<void> { this.m.set(key, value); }
-  async putIfAbsent(key: string, value: unknown): Promise<boolean> {
-    if (this.m.has(key)) return false;
-    this.m.set(key, value);
-    return true;
-  }
+/** A store with every guarantee, and deliberately NO `listRuns` (usage cannot be computed). */
+class NoListRunsJournal extends InMemoryJournal {
+  override listRuns = undefined as never;
+  override listRunsPaged = undefined as never;
 }
 
 const unenforceableWarns = (spy: ReturnType<typeof vi.spyOn>) =>
@@ -49,38 +42,5 @@ describe('C5 — budget on a journal without listRuns', () => {
     await checkBudget(j, 'acme', { usdLimit: 1 });
     await checkBudget(j, 'acme', { usdLimit: 1 });
     expect(unenforceableWarns(warn)).toHaveLength(1);
-  });
-});
-
-/** InMemoryJournal with `incrBy`/`getCounters` hidden → addUsage takes the non-atomic get→put fallback. */
-function noIncrByJournal(inner: InMemoryJournal): any {
-  return new Proxy(inner, {
-    get(target, prop, receiver) {
-      if (prop === 'incrBy' || prop === 'getCounters') return undefined;
-      const v = Reflect.get(target, prop, receiver);
-      return typeof v === 'function' ? v.bind(target) : v;
-    },
-    has(target, prop) {
-      if (prop === 'incrBy' || prop === 'getCounters') return false;
-      return Reflect.has(target, prop);
-    },
-  });
-}
-
-const casFallbackWarns = (spy: ReturnType<typeof vi.spyOn>) =>
-  spy.mock.calls.filter((c) => String(c[0]).includes('does not implement `incrBy`'));
-
-describe('E3 — usage counter get→put fallback (no incrBy)', () => {
-  it('recordRunUsage WARNS once when the journal lacks incrBy (non-atomic under-count risk)', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const inner = new InMemoryJournal();
-    await inner.put(runKeys.model('r1', 0), { usage: { inputTokens: 30, outputTokens: 10, totalTokens: 40 }, response: { modelId: 'mock' } });
-    await inner.put(runKeys.model('r2', 0), { usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 }, response: { modelId: 'mock' } });
-    const j = noIncrByJournal(inner);
-
-    await recordRunUsage(j, 'r1');
-    await recordRunUsage(j, 'r2');
-    expect(casFallbackWarns(warn)).toHaveLength(1); // loud, once per store
-    expect(String(casFallbackWarns(warn)[0][0])).toContain('UNDER-count');
   });
 });
