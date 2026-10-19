@@ -42,7 +42,6 @@ export async function startNode(store: Store, envExtra: Record<string, string> =
   const exited = new Promise<number | null>((r) => child.once('exit', (code) => r(code)));
   for (let i = 0; i < 300 && !existsSync(ready); i++) await sleep(50);
   if (!existsSync(ready)) throw new Error(`node did not start: ${err}`);
-  await sleep(20);
   // The app process itself — tsx runs it as a CHILD of the spawned wrapper, so signals go to this pid.
   const [port, pid] = readFileSync(ready, 'utf8').split(' ').map(Number) as [number, number];
   const kill = (sig: NodeJS.Signals) => { try { process.kill(pid, sig); } catch { /* gone */ } };

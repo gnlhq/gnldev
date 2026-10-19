@@ -7,7 +7,8 @@
 //         DN_WORDS, DN_GAP_MS, DN_BASELINE=1 (no process liveness: today's claim-by-age), DN_SWEEP_MS,
 //         DN_IDEMPOTENT=1 (the tool declares a repeat harmless: the crash ladder may run it again)
 import { createServer } from 'node:http';
-import { appendFileSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, existsSync } from 'node:fs';
+import { writeReady } from './write-ready.js';
 import { tool } from 'ai';
 import { z } from 'zod';
 import { armFixtureWatchdog } from './watchdog.js';
@@ -189,5 +190,5 @@ process.on('SIGTERM', async () => {
 });
 
 server.listen(0, '127.0.0.1', () => {
-  writeFileSync(readyFile, `${(server.address() as any).port} ${process.pid}`);
+  writeReady(readyFile, `${(server.address() as any).port} ${process.pid}`);
 });
