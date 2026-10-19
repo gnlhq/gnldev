@@ -98,6 +98,14 @@ measures every backend before it is called one.
 
 ### Fixed
 
+- **An answer sent right after its question is no longer dropped** (`gnl.run`, `gnl.stream`, every
+  door). A run that stops on a question answers its caller as soon as the question is in its log; its
+  execution record is given back a moment later. An answer that arrived in between joined the ending
+  execution and was told the question again: the approved call did not run, and nothing said why.
+  Measured: 5 of 1,000 approvals on Postgres under load (it failed the upgrade test U4 in CI); with the
+  give-back held 50 ms, 5 of 5, by the same process and by another. Now an answer waits for the ended
+  execution to give the run back, then continues it: 0 of 1,000, each payment once. A process frozen
+  between the two is refused as `RunBusyError` after 5 s — retried, never dropped.
 - **A closed MongoDB liveness could still read alive to another process** (`mongoLiveness`). The server
   drops a closed connection from `$currentOp` a moment after the client closes it: with 12 processes
   closing at once, 252 of 1,200 closed livenesses still read alive right after `close()` (0 of 1,200 on

@@ -26,6 +26,7 @@
 // `.killed` (the one self-kill happened).
 import { createServer } from 'node:http';
 import { appendFileSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { writeReady } from './write-ready.js';
 import { tool } from 'ai';
 import { z } from 'zod';
 import { armFixtureWatchdog } from './watchdog.js';
@@ -240,5 +241,5 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(0, '127.0.0.1', () => {
-  writeFileSync(readyFile, `${(server.address() as any).port} ${process.pid}`);
+  writeReady(readyFile, `${(server.address() as any).port} ${process.pid}`);
 });
