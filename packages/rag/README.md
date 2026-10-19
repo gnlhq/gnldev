@@ -155,7 +155,31 @@ another's id fails with `VectorOwnerConflictError`, also when two processes writ
 scores at the top-K cut are read in full and ordered by id, like every other store; a zero query
 vector matches every visible document with score 0.
 
-Every store (`InMemoryVectorStore`, `GraphRag`, `PostgresVectorStore`, `QdrantVectorStore` and the `@gnldev/durable`
+### Chroma
+
+`ChromaVectorStore` keeps the documents on a Chroma server (1.x), through its REST API (no extra package):
+
+```ts
+import { ChromaVectorStore } from '@gnldev/rag';
+
+const vectors = new ChromaVectorStore({
+  url: 'http://chroma.example.internal:8000',
+  apiKey: process.env.CHROMA_TOKEN, // sent as the `x-chroma-token` header, never in an error message
+  collection: 'gnl_vectors',        // default; letters, digits, `_` and `-` (so are `tenant` and `database`)
+});
+```
+
+It keeps the same rules as the Qdrant store: the collection (cosine) is created on the first write with
+that write's vector length or `dimension`; owner, namespace and sharing are part of each record's id;
+a zero vector scores 0. A document's metadata may hold any JSON value — it is stored whole beside the
+scalar fields filters read.
+
+Chroma's search is approximate (HNSW), and among copies of one vector it does not reach them all. When
+equal scores fall at the top-K cut, the store reads the tie whole and orders it by id like every other
+store: copies of one vector (a text ingested twice) are read by a digest of the vector; a tie between
+different vectors is found one vector at a time. Away from a tie, the answer is Chroma's.
+
+Every store (`InMemoryVectorStore`, `GraphRag`, `PostgresVectorStore`, `QdrantVectorStore`, `ChromaVectorStore` and the `@gnldev/durable`
 storages) applies the same write rule, before anything is written:
 
 - `owner` must be an id an end user can carry: not empty, at most 200 characters, no control
