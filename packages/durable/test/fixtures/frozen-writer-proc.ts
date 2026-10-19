@@ -2,7 +2,7 @@
 // It opens the store as every gnl process does, writes a run, then opens a write transaction the way the
 // store's own writes do (`BEGIN IMMEDIATE` … `COMMIT`, synchronous) and stops right inside it: the state a
 // process is in when SIGSTOP lands between its BEGIN and its COMMIT. Writes `<db>.frozen-ready` then.
-import { writeFileSync } from 'node:fs';
+import { writeReady } from './write-ready.js';
 import { createRequire } from 'node:module';
 import { SqliteStorage } from '../../src/sqlite-storage.js';
 import { runKeys } from '../../src/journal.js';
@@ -15,5 +15,5 @@ const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { Data
 const raw = new DatabaseSync(db);
 raw.exec('BEGIN IMMEDIATE');
 raw.prepare('INSERT INTO gnl_meta(k, v) VALUES (?, ?)').run('frozen-mid-write', '1');
-writeFileSync(`${db}.frozen-ready`, String(process.pid));
+writeReady(`${db}.frozen-ready`, String(process.pid));
 setInterval(() => {}, 1_000);

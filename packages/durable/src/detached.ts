@@ -30,7 +30,7 @@ import { randomUUID } from 'node:crypto';
 import { claim, runKeys, type Journal } from './journal.js';
 import { compareAndSet } from './attempt.js';
 import { interruptsFromSteps } from './agent-stream.js';
-import { LIMIT_ERROR_CODES, BLOCKED_ERROR_CODES } from './errors.js';
+import { LIMIT_ERROR_CODES, BLOCKED_ERROR_CODES, RunBusyError } from './errors.js';
 import { limitBreachFromSteps, blockedFromSteps } from './run.js';
 import { RUN_EVENT_VERSION, DELTA_KINDS, encodePart, errorData } from './event-codec.js';
 import { readRunOutcome } from './outcome.js';
@@ -195,7 +195,15 @@ interface Local {
   end?: LaunchEnd;
   /** The call this execution stopped on with its outcome unknown (`waiting-outcome`). */
   awaits?: { key: string; toolCallId?: string };
+  /** Its ending is decided (and about to be, or already, in the log): nothing more of it is to be followed. */
+  ending?: boolean;
 }
+
+/**
+ * How long an answer waits for an ended execution to give its run back (its record parked) before it is
+ * refused as busy. The park is one write after the ending; this bounds a process frozen between the two.
+ */
+const ENDING_SETTLE_MS = 5_000;
 
 /** How often (at most) an executor reads its run's erasure fence before an append. */
 const FENCE_EVERY_MS = 250;
@@ -268,7 +276,12 @@ export class DetachedRuns {
     await req.admit?.();
     const key = execKey(req.scope, req.runId);
     const loc = this.local.get(key);
-    if (loc) return { runId: req.runId, state: 'attached', from: loc.firstSeq - 1 };
+    // AN ANSWER NEVER JOINS AN EXECUTION THAT HAS ENDED. The caller is told the question as soon as the
+    // ending is in the log; the record is parked a moment later. An answer arriving in between, attached,
+    // read that ending again — the question, asked again, and the answer dropped (seen in the upgrade test
+    // U4; 5 of 1,000 rounds on Postgres under load). It waits for the execution to end, then continues it.
+    if (loc && !(req.resumeIntent && loc.ending)) return { runId: req.runId, state: 'attached', from: loc.firstSeq - 1 };
+    if (loc) await loc.done;
     const inFlight = this.starting.get(key);
     if (inFlight) return inFlight.then((r) => ({ ...r, state: 'attached' as StartState }));
     const p = this.startOnce(key, req).finally(() => this.starting.delete(key));
@@ -303,7 +316,14 @@ export class DetachedRuns {
         continue;
       }
       if (cur.status === 'running') {
-        if (cur.owner === this.liveness.id || (await this.alive(cur.owner)) !== false) return { runId: req.runId, state: 'attached', from: cur.from ?? 0 };
+        if (cur.owner === this.liveness.id || (await this.alive(cur.owner)) !== false) {
+          // An answer and an execution (here or in another process) whose ending is already in the log:
+          // the same moment as above, seen through the store. Wait for its record to move, then read again.
+          if (!req.resumeIntent || !(await endedSince(runJournal, req.runId, cur.from ?? 0))) return { runId: req.runId, state: 'attached', from: cur.from ?? 0 };
+          await this.recordMoves(key, cur, req.runId);
+          round--;
+          continue;
+        }
       } else if (cur.status === 'parked' && !req.resumeIntent) {
         return { runId: req.runId, state: 'parked', from: await before() };
       }
@@ -317,6 +337,22 @@ export class DetachedRuns {
       }
     }
     return { runId: req.runId, state: 'attached', from: 0 };
+  }
+
+  /**
+   * Waits until the execution record of `key` is no longer `cur` (an ended execution parks it, or its
+   * process is gone and it is taken over). Refused as busy past ENDING_SETTLE_MS: an answer is never
+   * dropped silently — the caller retries it.
+   */
+  private async recordMoves(key: string, cur: ExecRecord, runId: string): Promise<void> {
+    const until = Date.now() + ENDING_SETTLE_MS;
+    for (let wait = 5; Date.now() < until; wait = Math.min(wait * 2, 100)) {
+      await new Promise((r) => setTimeout(r, wait));
+      const now = await this.opts.journal.get<ExecRecord>(key);
+      if (now?.status !== cur.status || now?.owner !== cur.owner || now?.at !== cur.at) return;
+      if (now.owner !== this.liveness.id && (await this.alive(now.owner)) === false) return;
+    }
+    throw new RunBusyError(`@gnldev/durable: run '${runId}' ended its last execution and has not given the run back yet — retry the answer shortly`);
   }
 
   /** Takes over every run whose executing process is gone (or that a draining process released). */
@@ -718,6 +754,7 @@ export class DetachedRuns {
       const o = await readRunOutcome(journal, runId);
       if (o?.status === 'failed') ended = 'failed';
     }
+    loc.ending = true;
     if (ended !== 'released') await this.emit(loc, 'status', { state: ended, ...end }, step);
     await this.finish(loc, rec, ended);
   }
@@ -879,6 +916,12 @@ function scopeOfKey(key: string): string | undefined {
  * Where a run's last execution starts in its log (the `seq` before its `running` status) — what a reader
  * of a run that is over, or that waits on a human, reads from: that execution's events and its ending.
  */
+/** Whether the execution that started after `from` has written its ending (or its question) to the log. */
+async function endedSince(journal: Journal, runId: string, from: number): Promise<boolean> {
+  const last = await lastRunEvent(journal, runId);
+  return last !== undefined && last.seq > from && endsFollow(last, true);
+}
+
 async function lastExecutionStart(journal: Journal, runId: string): Promise<number> {
   if (journal.readRange) {
     // Backwards from the end, a page at a time (one index range each).
