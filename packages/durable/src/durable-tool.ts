@@ -21,7 +21,7 @@ import { judgeGrayPair } from './semantic-judge.js';
 import { xidPlanOf, readXid, xidWhen, amountsDifferOf, completeOwnXid, writeXid, type XidPlan, type XidHeld } from './xid.js';
 import { Attempt, AttemptLost, compareAndSet, isUnstartedRelease, type DupMarker, type TerminalWriter } from './attempt.js';
 import { claimTtlFor, claimTimeLeft, claimIsLive, journalNow, newHoldId } from './liveness.js';
-import { procStampFor, bindOwnLiveness, isDraining, RunDrainedError } from './process-liveness.js';
+import { procStampFor, bindOwnLiveness, isDraining, RunDrainedError, livenessFor } from './process-liveness.js';
 import type { SemPlan } from './semantic-dup.js';
 import type { RunLimits, ToolSeat } from './limits.js';
 import { createProcessorCtx } from './processor.js';
@@ -867,6 +867,18 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       const readRecord = (raw: unknown): ToolJournalRecord | undefined => isUnstartedRelease(raw) ? undefined : upgradeFormat(raw as ToolJournalRecord, key);
       const busy = (): unknown => blockedOrThrow(ctx, toolCallId, toolName,
         new RunBusyError(`'${toolName}' (${key}) is being executed by another executor`));
+      // A BODY THAT LOST ITS CALL ANSWERS WITH THE CALL'S RECORD. When its success could not be the call's
+      // record (Attempt.succeed: the call was taken over while the body ran — a stall past the TTL, a
+      // liveness session cut), its caller gets what a fresh call gets: the record that answers the call, or
+      // busy while another attempt holds it. It was handed the body's own output: measured on Postgres
+      // (session-cut S1b), that caller saw one result while the journal and every later reader saw
+      // another — one call, two answers. The body's result is still kept, as the late report it is.
+      // Nothing in the record (erased with its run): nothing contradicts the body's own output.
+      const answerLost = async (own: unknown): Promise<unknown> => {
+        const now = readRecord(await ctx.journal.get<ToolJournalRecord>(key));
+        if (isAnswer(now)) return consumeExistingRecord(ctx, key, now, toolCallId);
+        return now === undefined ? own : busy();
+      };
       // A LIVE 'running' record is another attempt in this call's body — busy ('call' mode), or waited
       // out until it answers or goes stale ('args' mode: a same-step twin is a dedup candidate, not an
       // error). Answered: `{ answered }`; otherwise the record as it then stands.
@@ -2225,6 +2237,13 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         const tSignal = AbortSignal.timeout(timeoutMs);
         execOpts.abortSignal = execOpts.abortSignal ? AbortSignal.any([execOpts.abortSignal, tSignal]) : tSignal;
       }
+      // THE PROCESS'S SESSION, AS A SIGNAL. A process whose liveness session is gone and not back within
+      // half its reconnect grace may soon be read as dead by the others, and this call taken over: the body
+      // is told to stop (process-liveness.ts `sessionSignal`). A body that honours it ends its attempt like
+      // any failed one; one that does not keeps running — its effect may then happen twice, and the
+      // provider's idempotencyKey is what folds the two.
+      const sSignal = livenessFor(ctx.journal)?.sessionSignal?.();
+      if (sSignal) execOpts.abortSignal = execOpts.abortSignal ? AbortSignal.any([execOpts.abortSignal, sSignal]) : sSignal;
       // SAME-STEP DUPLICATE RACE — claimed HERE, after every gate that can stop this call.
       //
       // The duplicate marker was read at the top (for the policy decision) and written only after a
@@ -2392,11 +2411,12 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // fired the effect a second time (measured: a second charge on every store). It throws instead;
         // the body has not started, so the claim is given back and a retry asks lookup again.
         if (found?.exists) {
-          await attempt.succeed({
+          const written = await attempt.succeed({
             status: 'succeeded', output: found.output, argsHash: hash, toolName,
             ...(typeof tool.compensate === 'function' ? { input } : {}),
           });
-          return found.output; // the effect already exists downstream — journaled, never re-fired
+          // the effect already exists downstream — journaled, never re-fired
+          return written ? found.output : answerLost(found.output);
         }
       }
       let output: unknown;
@@ -2435,7 +2455,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         }
         // The effect happened: recorded over this attempt's claim, or — when the call was taken over
         // while the body ran (a stall past the TTL, the lease's residual) — as the fact it is (Attempt.succeed).
-        await attempt.succeed({
+        const written = await attempt.succeed({
           status: 'succeeded', output, argsHash: hash, toolName,
           // A compensate-bearing tool's success stores the RAW args — the unwind needs them.
           ...(typeof tool.compensate === 'function' ? { input } : {}),
@@ -2443,7 +2463,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         });
         // NOTE: taint for `untrusted` tools is now marked at INVOCATION (see above), not here —
         // marking after execute lost the same-step parallel race against a side-effect tool's taint read.
-        return output;
+        return written ? output : answerLost(output);
       };
       // The failure path, for an attempt that ended in an error: journaled as one failed attempt, the
       // claimed duplicate slot given back. Returns the error to throw.

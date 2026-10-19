@@ -32,7 +32,7 @@ import { cosineSimilarity } from 'ai';
 import { refuseUnknownNames } from '@gnldev/options';
 import { leafSuffix, runRecordKey } from './run-id-grammar.js';
 import { closeExecutorFor } from './executors.js';
-import { unbindLiveness, livenessIdOf, LivenessUnavailableError, type ProcessLiveness } from './process-liveness.js';
+import { unbindLiveness, livenessIdOf, LivenessUnavailableError, reconnectGraceOf, sessionSignals, proofWithin, HEARTBEAT_MS, type ProcessLiveness } from './process-liveness.js';
 import { ROOT_EXEC_RECORDS, isScopeFact, scopeFactKeys, scopeFactsDroppedByAdoption, staysAtRoot, onAdoptionCollision, adoptionConflict } from './adoption.js';
 import { prefixUpperBound, ENGINE_META_KEYS, assertOrgRegistered, isPlatformKey, orgPrefix, ORG_KEY_PREFIX } from './organization.js';
 import {
@@ -1550,8 +1550,10 @@ export interface MongoLivenessOptions {
   database?: string;
   /** A name for this process — the prefix of its liveness id (see `postgresLiveness`). */
   id?: string;
-  /** How often this process proves its own connection (and how stale a proof `confirm()` accepts). Default 5 s. */
+  /** How often this process proves its own connection (and how stale a proof `confirm()` accepts); a proof not answered within one more is a lost connection. Default 1 s. */
   heartbeatMs?: number;
+  /** How long a holder's connection must be gone before it reads as dead, and a live process has to open it again (see `postgresLiveness`). Default 5 s, at least 4 × `heartbeatMs`. */
+  reconnectGraceMs?: number;
 }
 
 /** A process liveness on MongoDB, and which connections it can see. */
@@ -1582,15 +1584,16 @@ const appNameMax = 100;
  * connection, and refuses when it cannot see it; and it registers its user in `gnl_liveness_users`,
  * refusing to run beside another user when either of the two sees only its own.
  *
- * The connection is this process's only for as long as it is the same connection: when the driver
- * closes it (a network error, a failover, a pool clear) the id is dead for good — others may already
- * have acted on it — and the process comes back under a new id and connection, as `postgresLiveness`
- * does. `confirm()` is false until then.
+ * When the driver closes the connection (a network error, a failover, a pool clear) the process is not
+ * gone: it opens a connection under the SAME name again, and the others read it as dead only once no
+ * connection of that name has been seen for `reconnectGraceMs` (see `postgresLiveness`). `confirm()` is
+ * false until it is back.
  */
 export async function mongoLiveness(opts: MongoLivenessOptions): Promise<MongoProcessLiveness> {
   refuseUnknownNames('mongoLiveness', opts, MONGO_LIVENESS_NAMES);
-  const heartbeatMs = opts.heartbeatMs ?? 5_000;
+  const heartbeatMs = opts.heartbeatMs ?? HEARTBEAT_MS;
   if (!(heartbeatMs > 0 && heartbeatMs <= 60_000)) throw new Error(`@gnldev/durable: mongoLiveness heartbeatMs must be between 1 and 60000 ms; got ${heartbeatMs}`);
+  const reconnectGraceMs = reconnectGraceOf('mongoLiveness', opts.reconnectGraceMs, heartbeatMs);
   if (!opts?.connectionString) throw new Error('@gnldev/durable: mongoLiveness needs a connectionString');
   if (opts.id !== undefined && opts.id.length > appNameMax - 40) throw new Error(`@gnldev/durable: mongoLiveness id must be at most ${appNameMax - 40} characters (it names the connection); got ${opts.id.length}`);
   const url = opts.connectionString;
@@ -1617,15 +1620,16 @@ export async function mongoLiveness(opts: MongoLivenessOptions): Promise<MongoPr
       throw e;
     }
   };
-  held = await open(livenessIdOf(opts.id));
-  // The id and visibility last held: kept while a lost connection is replaced (`confirm()` is false meanwhile).
-  let id = held.id;
+  const id = livenessIdOf(opts.id);
+  held = await open(id);
+  // The visibility last held: kept while a lost connection is replaced (`confirm()` is false meanwhile).
   let visibility = held.visibility;
   let healthy = true;
   let closed = false;
   let provenAt = performance.now();
   let reopening: Promise<void> | undefined;
-  /** The connection is gone: its id is dead for good; the process comes back under a new id and connection. */
+  const signals = sessionSignals(reconnectGraceMs);
+  /** The connection is gone, the process is not: it opens one under the SAME name again (see postgresLiveness). */
   function lost(): void {
     healthy = false;
     const was = held;
@@ -1633,15 +1637,15 @@ export async function mongoLiveness(opts: MongoLivenessOptions): Promise<MongoPr
     void was?.client.close().catch(() => undefined);
     if (closed || reopening) return;
     reopening = (async () => {
-      for (let wait = 100; !closed; wait = Math.min(wait * 2, 5_000)) {
+      for (let wait = 50; !closed; wait = Math.min(wait * 2, 1_000)) {
         try {
-          const next = await open(livenessIdOf(opts.id));
+          const next = await open(id);
           if (closed) { await next.client.close().catch(() => undefined); return; }
           held = next;
-          id = next.id;
           visibility = next.visibility;
           provenAt = performance.now();
           healthy = true;
+          signals.proven();
           return;
         } catch {
           await new Promise((r) => setTimeout(r, wait).unref?.());
@@ -1654,20 +1658,22 @@ export async function mongoLiveness(opts: MongoLivenessOptions): Promise<MongoPr
     if (!healthy || !h || h.broken) throw new LivenessUnavailableError();
     return h;
   };
-  const holdsOwn = async (): Promise<boolean> => {
+  let proving: Promise<boolean> | undefined;
+  /** One proof at a time, answered within a heartbeat or the connection is lost (`proofWithin`). */
+  const holdsOwn = (): Promise<boolean> => proving ??= (async () => {
     const h = held;
     if (!healthy || !h || h.broken) return false;
-    try {
-      await h.client.db('admin').command({ ping: 1 });
-      if (h.broken || held !== h) return false;
-      provenAt = performance.now();
-      return true;
-    } catch { if (held === h) lost(); return false; }
-  };
+    const ok = await proofWithin(h.client.db('admin').command({ ping: 1 }).then(() => true), heartbeatMs);
+    if (h.broken || held !== h) return false;
+    if (ok) { provenAt = performance.now(); signals.proven(); } else lost();
+    return ok;
+  })().finally(() => { proving = undefined; });
   const beat = setInterval(() => { void holdsOwn(); }, heartbeatMs);
   beat.unref?.();
   return {
-    get id() { return id; },
+    id,
+    reconnectGraceMs,
+    sessionSignal: signals.signal,
     get visibility() { return visibility; },
     async isAlive(other) {
       const h = current();
@@ -1688,13 +1694,37 @@ export async function mongoLiveness(opts: MongoLivenessOptions): Promise<MongoPr
       if (closed) return;
       closed = true;
       clearInterval(beat);
+      signals.close();
       healthy = false;
       const h = held;
       held = undefined;
-      if (h) await h.client.close().catch(() => undefined);
+      // A connection lost silently never answers the goodbye: a heartbeat at most, then on.
+      if (h) await proofWithin(h.client.close().then(() => true), heartbeatMs);
+      await goneFromServer(url, id, visibility === 'every user');
     },
   };
 }
+
+/**
+ * Returns once the server holds no connection named `appName`, as another connection sees it. The server
+ * drops a closed connection from `$currentOp` a moment after the client closes it: measured with 12
+ * processes closing at once, a closed liveness still read alive right after its close in 252 of 1,200
+ * closes (raporlar/2026-10-19-mongo-close). Gives up when the server cannot be asked (it then holds no
+ * connection anyone can see) or after `CLOSE_SETTLE_MS` (the others then read it alive a while longer:
+ * a later takeover, never a second holder).
+ */
+async function goneFromServer(url: string, appName: string, allUsers: boolean): Promise<void> {
+  const probe = new (driver().MongoClient)(url, { maxPoolSize: 1, serverSelectionTimeoutMS: 2_000 });
+  try {
+    const until = performance.now() + CLOSE_SETTLE_MS;
+    while ((await connectionsNamed(probe, appName, allUsers)) > 0 && performance.now() < until) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  } catch { /* the server cannot be asked */ } finally {
+    await probe.close().catch(() => undefined);
+  }
+}
+const CLOSE_SETTLE_MS = 10_000;
 
 /** How many connections named `appName` the server holds, as `client` can see them. */
 async function connectionsNamed(client: Any, appName: string, allUsers: boolean): Promise<number> {

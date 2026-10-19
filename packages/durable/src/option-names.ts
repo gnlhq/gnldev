@@ -254,9 +254,9 @@ export const VECTOR_STORE_CONFORMANCE_NAMES = optionNames<import('./vector-confo
 
 export const DRAIN_NAMES = optionNames<import('./drain.js').DrainOptions>()(['deadlineMs']);
 export const DRAIN_ON_SIGNAL_NAMES = optionNames<import('./drain.js').DrainOnSignalOptions>()(['deadlineMs', 'signals', 'onDrained']);
-export const POSTGRES_LIVENESS_NAMES = optionNames<import('./process-liveness.js').PostgresLivenessOptions>()(['connectionString', 'client', 'id', 'heartbeatMs']);
-export const MYSQL_LIVENESS_NAMES = optionNames<import('./mysql-storage.js').MysqlLivenessOptions>()(['connectionString', 'connection', 'id', 'heartbeatMs']);
-export const MONGO_LIVENESS_NAMES = optionNames<import('./mongo-storage.js').MongoLivenessOptions>()(['connectionString', 'database', 'id', 'heartbeatMs']);
+export const POSTGRES_LIVENESS_NAMES = optionNames<import('./process-liveness.js').PostgresLivenessOptions>()(['connectionString', 'client', 'id', 'heartbeatMs', 'reconnectGraceMs']);
+export const MYSQL_LIVENESS_NAMES = optionNames<import('./mysql-storage.js').MysqlLivenessOptions>()(['connectionString', 'connection', 'id', 'heartbeatMs', 'reconnectGraceMs']);
+export const MONGO_LIVENESS_NAMES = optionNames<import('./mongo-storage.js').MongoLivenessOptions>()(['connectionString', 'database', 'id', 'heartbeatMs', 'reconnectGraceMs']);
 export const DETACHED_RUNS_NAMES = optionNames<import('./detached.js').DetachedRunsOptions>()([
   'journal', 'journalFor', 'resume', 'liveness', 'signal', 'pollMs', 'sweepMs', 'coalesceMs', 'outcomeAskMs', 'onComplete', 'handles',
 ]);
