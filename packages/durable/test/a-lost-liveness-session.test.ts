@@ -2,13 +2,14 @@
 // ended) answers its callers with a retryable refusal, never an internal error, and is serving again
 // once it holds a lock of its own anew.
 //
-// The liveness is one session holding one advisory lock (process-liveness.ts). When that session ends,
-// the others read this process as dead from that moment — and may take over what it held. Two rules
-// follow. (1) Unknown is never "dead": this process cannot judge another one while it cannot ask, so a
-// question about another holder is refused (`LivenessUnavailableError`, 503 with Retry-After at every
-// door), not answered `false` (a takeover beside a live holder) nor thrown as a raw driver error (a 500).
-// (2) Its old id is dead for good — the others may already have acted on it — so it comes back under a
-// NEW id and a new lock, and what was stamped with the old one is no longer its own.
+// The liveness is one session holding one advisory lock (process-liveness.ts). When that session ends the
+// process has not: (1) unknown is never "dead" — this process cannot judge another one while it cannot
+// ask, so a question about another holder is refused (`LivenessUnavailableError`, 503 with Retry-After at
+// every door), not answered `false` (a takeover beside a live holder) nor thrown as a raw driver error (a
+// 500); (2) it takes its lock back under the SAME id, and the others read it as dead only once that lock
+// has been gone for `reconnectGraceMs` — so what it holds is not taken over beside it (a-cut-session-keeps-
+// its-call.test.ts). It used to come back under a new id, the old one dead at once: a call whose body was
+// running was run a second time (raporlar/2026-10-18-session-cut).
 // Postgres runs when GNL_PG_URL is set.
 import { describe, it, expect, afterAll, afterEach } from 'vitest';
 import pg from 'pg';
@@ -36,7 +37,7 @@ async function outcomeOf(call: () => Promise<any>): Promise<{ kind: 'ok' | 'refu
 }
 
 describe.skipIf(!PG_URL)('a process whose liveness session is cut', () => {
-  it('refuses with 503 while it cannot ask, takes nothing over beside a live holder, and serves again under a new id', async () => {
+  it('refuses with 503 while it cannot ask, takes nothing over beside a live holder, and serves again under its own id', async () => {
     const admin = new pg.Client({ connectionString: PG_URL });
     await admin.connect();
     ends.push(() => admin.end());
@@ -81,8 +82,8 @@ describe.skipIf(!PG_URL)('a process whose liveness session is cut', () => {
       expect(o.kind, `a door answers 503 or serves — never a 500 (${o.error})`).not.toBe('internal');
       if (o.kind === 'refused') expect(o.status).toBe(503);
     }
-    // A run is executed by one process at a time: one started here under the dead id is B's to take
-    // over at once (its sweep reads the id as dead) — beside this one.
+    // A run is executed by one process at a time: one started here while the session was gone is never
+    // executed by both.
     await sleep(1_500);
     expect({ a: slowA.calls, b: slowB.calls }, 'n1 executed by one process').not.toEqual({ a: 1, b: 1 });
     expect(slowA.calls + slowB.calls).toBeLessThanOrEqual(1);
@@ -90,7 +91,7 @@ describe.skipIf(!PG_URL)('a process whose liveness session is cut', () => {
     // B's live run was never executed here beside B.
     expect(attach.kind === 'ok' ? attach.text : '', 'attached to B, not re-run').not.toMatch(/a1/);
 
-    // Back under a new id, with a lock of its own: a new run is served.
+    // Back under the same id, with its lock again: a new run is served.
     let served: Awaited<ReturnType<typeof outcomeOf>> | undefined;
     for (let i = 0; i < 60; i++) {
       served = await outcomeOf(() => gnlA.stream('a', { runId: `n2-${i}`, prompt: 'go', caller: STAFF } as any));
@@ -100,7 +101,7 @@ describe.skipIf(!PG_URL)('a process whose liveness session is cut', () => {
     }
     expect(served!.kind, `serving again (${served!.error})`).toBe('ok');
     expect(served!.text).toBe('a1 a2 ');
-    expect(livA.id, 'a new id: the old one is dead for good').not.toBe(oldId);
+    expect(livA.id, 'the same id: one process lifetime').toBe(oldId);
     const relocked = await admin.query(`SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND ((classid::bigint << 32) | objid::bigint) = $1::bigint AND granted`, [procLockKey(livA.id)]);
     expect(relocked.rows.length).toBe(1);
 

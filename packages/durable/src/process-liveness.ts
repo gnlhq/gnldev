@@ -16,7 +16,8 @@
 //     Another process asks `pg_locks` whether it is granted. A frozen process's kernel still answers
 //     TCP keepalives, so its session — and its lock — stay. NOT through a transaction-mode pooler
 //     (pgbouncer `pool_mode=transaction`): a session lock there belongs to whichever client the server
-//     connection is lent to next. Give this connection a direct (or session-mode) URL.
+//     connection is lent to next. Such a connection is refused at open (`refuseSharedBackend`); give
+//     this connection a direct (or session-mode) URL.
 //   · Sqlite: one exclusive transaction per process on its own lock file (POSIX advisory lock).
 //     Another process tries `BEGIN EXCLUSIVE` with no busy wait: SQLITE_BUSY means alive. The lock is
 //     released by the kernel when the process exits, however it exits. One host by nature.
@@ -38,11 +39,26 @@ import { POSTGRES_LIVENESS_NAMES } from './option-names.js';
 
 export interface ProcessLiveness {
   /**
-   * This process's id: written into every holder stamp it writes (`proc`). It can change — a Postgres
-   * session that was cut comes back under a NEW id (the old one is dead for good: the others may have
-   * acted on it) — so a stamp is this process's own only while it names the CURRENT id.
+   * This process's id: written into every holder stamp it writes (`proc`). It names ONE process lifetime
+   * and does not change while the process lives: a session that was cut comes back under the same id
+   * (see `reconnectGraceMs`). A stamp is this process's own while it names this id.
    */
   readonly id: string;
+  /**
+   * How long another process must find this store's lock of a holder gone — at two looks at least this
+   * far apart — before it reads that holder as dead (`judgeAlive`). A live process whose session was cut
+   * (a terminated backend, a restart, a failover) takes its lock back under the same id within it, so
+   * nothing it holds is taken over beside it. Unset or 0: gone is dead at once — for a lock no live
+   * process can lose (a Sqlite file lock, held by the kernel for the life of the process).
+   */
+  readonly reconnectGraceMs?: number;
+  /**
+   * Aborted when this process has been without its session for half its `reconnectGraceMs`: from about
+   * then another process may read it as dead and take over what it holds, so a tool body it started is
+   * told to stop (durable-tool passes it to `execute` as part of `abortSignal`). A fresh, unaborted signal
+   * once the session is back. Absent: the lock cannot be lost while the process lives.
+   */
+  sessionSignal?(): AbortSignal;
   /**
    * True for the in-memory liveness: it knows only this process's own ids, so it is never installed for the
    * process — a claim's stamp is then judged as before (by its age), not as "mine, so alive".
@@ -151,11 +167,25 @@ export async function bindOwnLiveness(journal: unknown): Promise<void> {
   if (isProcessLocal(journal)) return;
   const store = storeOf(journal);
   if (!store || bound.has(store) || unbindable.has(store)) return;
+  const refused = poolerRefused.get(store);
+  if (refused) {
+    if (installed) { bindLiveness(journal, installed); return; }
+    throw refused;
+  }
   const own = (store as { processLiveness?: () => ProcessLiveness | Promise<ProcessLiveness> }).processLiveness;
   if (typeof own !== 'function' && !installed) return;
   try {
     await storeLiveness(journal, typeof own === 'function' ? { own: () => own.call(store) } : {});
   } catch (err) {
+    // A store reached through a transaction-mode pooler is NOT one that merely lacks a liveness: judging its
+    // claims by their age would run a frozen holder's effect beside it — measured, through PgBouncer in
+    // transaction mode: the body ran twice. A liveness this process installed for the database answers
+    // instead; without one the call is refused before its body, every time, naming the fix.
+    if (err instanceof TransactionPoolerError) {
+      if (installed) { bindLiveness(journal, installed); return; }
+      poolerRefused.set(store, err);
+      throw err;
+    }
     // A store that cannot make its liveness (a pool that does not say where it connects, a session that
     // could not be opened) keeps its claims judged by their age, as before — said once, not failed: the
     // call itself does not need it, and an executor or worker given a liveness binds one later.
@@ -166,6 +196,8 @@ export async function bindOwnLiveness(journal: unknown): Promise<void> {
 
 /** Stores whose own liveness could not be made, asked once (see `bindOwnLiveness`). */
 const unbindable = new WeakSet<object>();
+/** Stores reached through a transaction-mode pooler, with the refusal every direct call on them gets. */
+const poolerRefused = new WeakMap<object, TransactionPoolerError>();
 
 /** The liveness that answers for `journal`'s store in this process: its own, else the installed one. */
 export function livenessFor(journal: unknown): ProcessLiveness | undefined {
@@ -193,7 +225,83 @@ export async function holderAlive(proc: unknown, journal: unknown): Promise<bool
   const l = livenessFor(journal);
   if (!l || typeof proc !== 'string') return undefined;
   if (proc === l.id) return true;
-  return l.isAlive(proc);
+  return judgeAlive(l, proc);
+}
+
+/**
+ * GONE IS NOT YET DEAD — the one rule that reads another process as dead, asked by every reader of a
+ * holder (`holderAlive`, an executor's owner check). A store's lock of a process goes away when its
+ * SESSION ends, and a session ends under a live process too: a terminated backend, a database restart, a
+ * failover, a pooler closing it. Read as dead at once, the process's call was taken over while its body
+ * still ran: measured on Postgres (2026-10-18, raporlar/2026-10-18-session-cut), a cut liveness session
+ * mid-body gave 2 effects in 5 of 5 rounds — and 1 with no cut. A live process takes its lock back under
+ * the same id (`reconnectGraceMs`), so a holder is dead only when its lock is found gone at looks that
+ * span the grace, none of them more than one and a half graces after the one before. A dead process is
+ * taken over that much later; the first look of a judgment waits out the rest of the grace, within the
+ * call that asked. STATED LIMIT: looks cannot see a holder that came back and was cut again between them.
+ */
+export async function judgeAlive(l: ProcessLiveness, id: string): Promise<boolean | undefined> {
+  const grace = l.reconnectGraceMs ?? 0;
+  for (;;) {
+    const alive = await l.isAlive(id);
+    if (alive !== false || !(grace > 0)) { if (alive !== false) absences.get(l)?.delete(id); return alive; }
+    const now = performance.now();
+    let seen = absences.get(l);
+    if (!seen) absences.set(l, (seen = new Map()));
+    const was = seen.get(id);
+    // Looks further apart than the grace (and the slack a timer is late by) do not make one absence: the
+    // holder may have been back in between — start over.
+    const run = was && now - was.last <= grace * 1.5 ? { first: was.first, last: now } : { first: now, last: now };
+    seen.set(id, run);
+    if (run.last - run.first >= grace) return false;
+    await new Promise((r) => setTimeout(r, run.first + grace - now));
+  }
+}
+/** Per liveness, the holders found gone: when first in this run of looks, and when last. */
+const absences = new WeakMap<ProcessLiveness, Map<string, { first: number; last: number }>>();
+
+/**
+ * The default `reconnectGraceMs` of the Postgres, MySQL and MongoDB livenesses: how long a live process
+ * has to take its lock back after its session ends before the others read it as dead.
+ */
+export const RECONNECT_GRACE_MS = 5_000;
+
+/**
+ * `reconnectGraceMs` as given to a liveness factory: a finite number of ms, at least its `heartbeatMs`. A
+ * session that ends silently is noticed by its process only at the next heartbeat; a shorter grace (0
+ * among them) reads a live process as dead before it can know, and its call runs beside it.
+ */
+export function reconnectGraceOf(factory: string, given: number | undefined, heartbeatMs: number): number {
+  const g = given ?? Math.max(RECONNECT_GRACE_MS, heartbeatMs);
+  if (!(Number.isFinite(g) && g >= heartbeatMs)) throw new Error(`@gnldev/durable: ${factory} reconnectGraceMs must be at least heartbeatMs (${heartbeatMs} ms); got ${given}`);
+  return g;
+}
+
+/**
+ * The signal side of a session that can be lost (`ProcessLiveness.sessionSignal`), one per liveness:
+ * `lost()` when the session ends, `back()` when it is held again. Half the grace after a loss that has
+ * not been repaired the current signal is aborted (with `LivenessUnavailableError`) and the next one starts.
+ */
+export function sessionSignals(graceMs: number): { signal(): AbortSignal; lost(): void; back(): void; close(): void } {
+  let ctl = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const fire = () => {
+    timer = undefined;
+    const was = ctl;
+    ctl = new AbortController();
+    was.abort(new LivenessUnavailableError());
+  };
+  return {
+    signal: () => ctl.signal,
+    lost() {
+      if (timer) return;
+      if (!(graceMs > 0)) { fire(); return; }
+      timer = setTimeout(fire, graceMs / 2);
+      timer.unref?.();
+    },
+    back() { if (timer) { clearTimeout(timer); timer = undefined; } },
+    close() { if (timer) { clearTimeout(timer); timer = undefined; } },
+  };
 }
 
 // ── The work in hand: one set, two faces ────────────────────────────────────────────────────────────
@@ -215,8 +323,11 @@ export async function holderAlive(proc: unknown, journal: unknown): Promise<bool
 // A shadow names a run (a job's run, a fire's run), never its content; the erasure model deletes it with
 // the run it names (model.ts RUN_DEPENDENTS), an organization's purge with its scope, a person's job
 // erasure with the jobs. One left by a process that died is read as dead, and the first process to hold
-// work in that store afterwards reclaims it — by the rule that judged it dead (a liveness id is never
-// reused, so a dead holder's shadow cannot become a live one's).
+// work in that store afterwards reclaims it — by the rule that judged it dead (`judgeAlive`: its lock gone
+// for the reconnect grace; a liveness id names one process lifetime, so no LATER process can come back
+// under it). STATED LIMIT: a live process kept off its database for longer than the grace is read as dead,
+// and its shadow may be reclaimed while it still holds the work; its tool bodies were told to stop by then
+// (`sessionSignal`).
 
 /** What a held unit names: the run it executes (`name`), in the store `journal` belongs to. */
 export interface HandFace {
@@ -669,6 +780,78 @@ export function procLockKey(id: string): string {
   return (h.readBigUInt64BE(0) & 0x7fffffffffffffffn).toString();
 }
 
+/**
+ * A Postgres connection that cannot hold a process lock: it goes through a transaction-mode pooler
+ * (`refuseSharedBackend`). Refused where a liveness is opened on it, and a call that would have used it is
+ * refused too rather than judging claims by their age (`bindOwnLiveness`).
+ */
+export class TransactionPoolerError extends Error {
+  constructor() {
+    super(
+      '@gnldev/durable: this Postgres connection goes through a transaction-mode pooler (PgBouncer `pool_mode=transaction`, '
+      + 'a managed "-pooler" endpoint, port 6543 on some hosts), so it cannot hold a process lock: the lock lands on a server '
+      + 'connection that is lent to other clients, a dead process keeps reading alive and two processes can hold one lock. '
+      + 'Give the liveness a direct or session-mode URL — `postgresLiveness({ connectionString: <direct URL> })` passed as '
+      + '`liveness` to createGnl / createWorker, or installed with installProcessLiveness — or build the PostgresStorage '
+      + 'from the direct URL.',
+    );
+    this.name = 'TransactionPoolerError';
+  }
+}
+
+/**
+ * THE LOCK HOLDS ONLY ON A REAL SESSION. A session-level advisory lock belongs to the server backend that
+ * ran the statement, and it is this process's lock only if every statement this client sends lands on that
+ * same backend, and no other client's does. Behind a transaction-mode pooler neither holds: measured on a
+ * managed pooler (2026-10-18), a SIGKILLed holder read alive 60 s later, and a second client re-took the
+ * first one's lock on the same backend 10 of 10 times — while nothing said so.
+ *
+ * So the session is checked once, before it is used: a SECOND client tries the same lock (it can only
+ * succeed, or report the holder's backend pid, if both clients share a backend), then the holder asks
+ * again from its own client whether the lock is still granted to the backend it is on now (it is not when
+ * its statements wander to another backend). On a direct or session-mode connection none of the three can
+ * happen. Measured: refused 10 of 10 on a managed pooler and 20 of 20 on an idle PgBouncer in transaction
+ * mode; opened 5 of 5 on a direct managed endpoint and 5 of 5 on a local server.
+ */
+/**
+ * Rounds of the check above. One round can miss on a BUSY pooler — the probe lands on another backend and
+ * the holder's next statement happens to land on its own: measured on PgBouncer in transaction mode under
+ * twelve busy clients, 33 of 200 opens missed with one round, 1 of 200 with three, 0 of 200 with five. A
+ * pooler is caught in its first round almost always (an idle one: 20 of 20), so the rounds cost a real
+ * session ten short statements at open, once. What a miss leaves is caught by the heartbeat, which asks
+ * the same question (`pid = pg_backend_pid()`) every `heartbeatMs`.
+ */
+const SHARED_BACKEND_ROUNDS = 5;
+async function refuseSharedBackend(holder: any, config: Record<string, unknown>, key: string, holderPid: unknown): Promise<void> {
+  const { Client } = createRequire(import.meta.url)('pg') as { Client: new (c: any) => any };
+  const probe = new Client(config);
+  let shared = false;
+  try {
+    await probe.connect();
+    for (let round = 0; round < SHARED_BACKEND_ROUNDS && !shared; round++) {
+      // One statement, so the try and its release run on one backend whatever sits in between.
+      const p = (await probe.query(
+        'SELECT pg_backend_pid() AS pid, CASE WHEN pg_try_advisory_lock($1::bigint) THEN pg_advisory_unlock($1::bigint) ELSE false END AS took',
+        [key],
+      )).rows[0];
+      const own = (await holder.query(
+        `SELECT pg_backend_pid() AS pid, EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1
+           AND ((classid::bigint << 32) | objid::bigint) = $1::bigint AND pid = pg_backend_pid() AND granted) AS held`,
+        [key],
+      )).rows[0];
+      shared = p?.took === true || p?.pid === holderPid || own?.pid !== holderPid || own?.held !== true;
+    }
+  } finally {
+    await probe.end().catch(() => undefined);
+  }
+  if (shared) {
+    // Best effort: the lock may sit on a backend this client no longer reaches. Its id was never used — no
+    // stamp names it — so a lock left behind reads one unused id alive, and nothing else.
+    await holder.query('SELECT pg_advisory_unlock($1::bigint)', [key]).catch(() => undefined);
+    throw new TransactionPoolerError();
+  }
+}
+
 /** What a liveness session takes from a pool's options: where to connect, never how many. */
 const PG_CONNECTION_FIELDS = new Set(['connectionString', 'host', 'port', 'user', 'password', 'database', 'ssl', 'options', 'application_name']);
 
@@ -688,6 +871,13 @@ export interface PostgresLivenessOptions {
   id?: string;
   /** How often this process proves its own session (and how stale a proof `confirm()` accepts). Default 5 s. */
   heartbeatMs?: number;
+  /**
+   * How long another process waits, after this database's lock of a holder is gone, before it reads that
+   * holder as dead — and how long a live process has to take its lock back after its session ends (a
+   * terminated backend, a restart, a failover). Default 5 s. A killed process is
+   * taken over this much later. 0: gone is dead at once — a cut session's call then runs a second time.
+   */
+  reconnectGraceMs?: number;
 }
 
 /** Signals delivered over the liveness session (LISTEN/NOTIFY), see `PgProcessSession.listen`. */
@@ -715,6 +905,7 @@ export async function postgresLiveness(opts: PostgresLivenessOptions): Promise<P
   if (!(heartbeatMs > 0 && heartbeatMs <= SERVER_KEEPALIVE_MS / 3)) {
     throw new Error(`@gnldev/durable: postgresLiveness heartbeatMs must be between 1 and ${Math.floor(SERVER_KEEPALIVE_MS / 3)} ms (the server drops a silent session in ~${SERVER_KEEPALIVE_MS / 1000} s); got ${heartbeatMs}`);
   }
+  const reconnectGraceMs = reconnectGraceOf('postgresLiveness', opts.reconnectGraceMs, heartbeatMs);
   const fields = opts.client ? Object.fromEntries(Object.entries(opts.client).filter(([k]) => PG_CONNECTION_FIELDS.has(k))) : {};
   const config = { ...fields, ...(opts.connectionString ? { connectionString: opts.connectionString } : {}), keepAlive: true, keepAliveInitialDelayMillis: 5_000 };
   let statements = 0;
@@ -735,11 +926,13 @@ export async function postgresLiveness(opts: PostgresLivenessOptions): Promise<P
       await c.query('SET tcp_keepalives_interval = 5');
       await c.query('SET tcp_keepalives_count = 3');
       const key = procLockKey(sid);
-      const got = await c.query('SELECT pg_try_advisory_lock($1::bigint) AS ok', [key]);
+      const got = await c.query('SELECT pg_try_advisory_lock($1::bigint) AS ok, pg_backend_pid() AS pid', [key]);
       statements += 4;
       if (got.rows[0]?.ok !== true) {
         throw new Error(`@gnldev/durable: the process lock for id '${sid}' is already held by another session — two processes share one liveness id.`);
       }
+      await refuseSharedBackend(c, config, key, got.rows[0].pid);
+      statements += 2;
       for (const ch of listeners.keys()) { await c.query(`LISTEN ${c.escapeIdentifier(ch)}`); statements++; }
       return { client: c, key };
     } catch (e) {
@@ -747,35 +940,48 @@ export async function postgresLiveness(opts: PostgresLivenessOptions): Promise<P
       throw e;
     }
   };
-  let id = livenessIdOf(opts.id);
+  const id = livenessIdOf(opts.id);
   session = await open(id);
   let healthy = true;
   let closed = false;
   let provenAt = performance.now();
   let reopening: Promise<void> | undefined;
+  let saidPooler = false;
+  const signals = sessionSignals(reconnectGraceMs);
   /**
-   * THE SESSION IS GONE: from this moment the others read `id` as dead and may take over what it held,
-   * so it is never this process's again. It comes back under a new id, with a new lock — the in-process
-   * equivalent of a restart — retrying until it holds one (or the liveness is closed).
+   * THE SESSION IS GONE — the process is not. It takes its lock back under the SAME id, retrying until it
+   * holds it (or the liveness is closed): the others read a holder as dead only once its lock has been
+   * gone for `reconnectGraceMs` (`judgeAlive`), so a session that is back within it keeps everything the
+   * process holds. It used to come back under a NEW id, and the old one read dead at once: a call whose
+   * body was running was taken over beside it — 2 effects in 5 of 5 rounds (raporlar/2026-10-18-session-
+   * cut). Until it is back, `confirm()` is false (nothing new starts) and a question about another process
+   * is refused; past half the grace, the bodies it started are told to stop (`sessionSignal`).
    */
   function lost(): void {
     healthy = false;
     const was = session;
     session = undefined;
     void was?.client.end().catch(() => undefined);
+    signals.lost();
     if (closed || reopening) return;
     reopening = (async () => {
-      for (let wait = 100; !closed; wait = Math.min(wait * 2, 5_000)) {
-        const next = livenessIdOf(opts.id);
+      // The first try at once: a terminated backend's lock is free the moment it is gone.
+      for (let wait = 50; !closed; wait = Math.min(wait * 2, 1_000)) {
         try {
-          const s2 = await open(next);
+          const s2 = await open(id);
           if (closed) { await s2.client.end().catch(() => undefined); return; }
           session = s2;
-          id = next;
           provenAt = performance.now();
           healthy = true;
+          signals.back();
           return;
-        } catch {
+        } catch (e) {
+          // A session that turned out to be a pooler's (its statements wandered off the lock's backend) is
+          // refused again on every attempt: say why, once, rather than answer 503 with no reason.
+          if (e instanceof TransactionPoolerError && !saidPooler) {
+            saidPooler = true;
+            console.error(e.message);
+          }
           await new Promise((r) => setTimeout(r, wait).unref?.());
         }
       }
@@ -810,7 +1016,9 @@ export async function postgresLiveness(opts: PostgresLivenessOptions): Promise<P
   const beat = setInterval(() => { void holdsOwn(); }, heartbeatMs);
   beat.unref?.();
   return {
-    get id() { return id; },
+    id,
+    reconnectGraceMs,
+    sessionSignal: signals.signal,
     get statements() { return statements; },
     async isAlive(other) {
       if (other === id) return healthy;
@@ -839,6 +1047,7 @@ export async function postgresLiveness(opts: PostgresLivenessOptions): Promise<P
       if (closed) return;
       closed = true;
       clearInterval(beat);
+      signals.close();
       healthy = false;
       const cur = session;
       session = undefined;

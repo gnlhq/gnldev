@@ -36,7 +36,7 @@ import { RUN_EVENT_VERSION, DELTA_KINDS, encodePart, errorData } from './event-c
 import { readRunOutcome } from './outcome.js';
 import { agentRunCanceled, cancelAgentRun } from './cancel.js';
 import {
-  beginDrain, bindLiveness, isDraining, isProcessLocal, livenessFor, inMemoryLiveness, LivenessUnavailableError,
+  beginDrain, bindLiveness, isDraining, isProcessLocal, livenessFor, inMemoryLiveness, LivenessUnavailableError, judgeAlive,
   within, settledExceptOwn, outsideHeld, type ProcessLiveness,
 } from './process-liveness.js';
 import { appendRunEvent, endsFollow, lastRunEvent, readRunEvents, runEventPrefix, type RunEvent, type RunState } from './run-events.js';
@@ -248,7 +248,7 @@ export class DetachedRuns {
 
   /** Whether the process holding a record is alive — asked of THIS executor's liveness (the store's). */
   private alive(owner: string): Promise<boolean | undefined> {
-    return owner === this.liveness.id ? Promise.resolve(true) : this.liveness.isAlive(owner);
+    return owner === this.liveness.id ? Promise.resolve(true) : judgeAlive(this.liveness, owner);
   }
 
   private journalOf(scope: string | undefined): Journal {
