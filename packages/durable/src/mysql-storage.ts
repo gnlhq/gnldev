@@ -28,7 +28,7 @@ import { cosineSimilarity } from 'ai';
 import { refuseUnknownNames } from '@gnldev/options';
 import { leafSuffix, runRecordKey } from './run-id-grammar.js';
 import { closeExecutorFor } from './executors.js';
-import { unbindLiveness, livenessIdOf, LivenessUnavailableError, type ProcessLiveness } from './process-liveness.js';
+import { unbindLiveness, livenessIdOf, LivenessUnavailableError, reconnectGraceOf, sessionSignals, proofWithin, HEARTBEAT_MS, type ProcessLiveness } from './process-liveness.js';
 import { ROOT_EXEC_RECORDS, isScopeFact, scopeFactKeys, scopeFactsDroppedByAdoption, staysAtRoot, onAdoptionCollision, adoptionConflict } from './adoption.js';
 import { prefixUpperBound, ENGINE_META_KEYS, assertOrgRegistered, isPlatformKey, orgPrefix, orgSpaceSql, prefixSql } from './organization.js';
 import {
@@ -1453,8 +1453,10 @@ export interface MysqlLivenessOptions {
   connection?: Record<string, unknown>;
   /** A name for this process — the prefix of its liveness id (see `postgresLiveness`). */
   id?: string;
-  /** How often this process proves its own lock (and how stale a proof `confirm()` accepts). Default 5 s. */
+  /** How often this process proves its own lock (and how stale a proof `confirm()` accepts); a proof not answered within one more is a lost session. Default 1 s. */
   heartbeatMs?: number;
+  /** How long a holder's lock must be gone before it reads as dead, and a live process has to take it back (see `postgresLiveness`). Default 5 s, at least 4 × `heartbeatMs`. */
+  reconnectGraceMs?: number;
 }
 
 /** The connection fields a liveness session takes from a pool's config: where to connect, never how many. */
@@ -1473,8 +1475,9 @@ const MY_CONNECTION_FIELDS = new Set(['host', 'port', 'user', 'password', 'datab
  */
 export async function mysqlLiveness(opts: MysqlLivenessOptions): Promise<ProcessLiveness> {
   refuseUnknownNames('mysqlLiveness', opts, MYSQL_LIVENESS_NAMES);
-  const heartbeatMs = opts.heartbeatMs ?? 5_000;
+  const heartbeatMs = opts.heartbeatMs ?? HEARTBEAT_MS;
   if (!(heartbeatMs > 0 && heartbeatMs <= 60_000)) throw new Error(`@gnldev/durable: mysqlLiveness heartbeatMs must be between 1 and 60000 ms; got ${heartbeatMs}`);
+  const reconnectGraceMs = reconnectGraceOf('mysqlLiveness', opts.reconnectGraceMs, heartbeatMs);
   if (!opts.connectionString && !opts.connection) throw new Error('@gnldev/durable: mysqlLiveness needs a connectionString or a connection config');
   const fields = opts.connection ? Object.fromEntries(Object.entries(opts.connection).filter(([k]) => MY_CONNECTION_FIELDS.has(k))) : {};
   const config = { ...fields, ...(opts.connectionString ? { uri: opts.connectionString } : {}), ...CONNECTION_DEFAULTS, enableKeepAlive: true, keepAliveInitialDelay: 5_000 };
@@ -1495,30 +1498,31 @@ export async function mysqlLiveness(opts: MysqlLivenessOptions): Promise<Process
       throw e;
     }
   };
-  let id = livenessIdOf(opts.id);
+  const id = livenessIdOf(opts.id);
   session = await open(id);
   const db = session.db;
   let healthy = true;
   let closed = false;
   let provenAt = performance.now();
   let reopening: Promise<void> | undefined;
-  /** The session is gone: `id` is dead for good; the process comes back under a new id and lock (see postgresLiveness). */
+  const signals = sessionSignals(reconnectGraceMs);
+  /** The session is gone, the process is not: it takes its lock back under the SAME id (see postgresLiveness). */
   function lost(): void {
     healthy = false;
     const was = session;
     session = undefined;
-    void was?.c.end?.().catch(() => undefined);
+    // Destroyed, not ended: a session lost silently never answers the goodbye `end()` waits for.
+    was?.c.destroy?.();
     if (closed || reopening) return;
     reopening = (async () => {
-      for (let wait = 100; !closed; wait = Math.min(wait * 2, 5_000)) {
-        const next = livenessIdOf(opts.id);
+      for (let wait = 50; !closed; wait = Math.min(wait * 2, 1_000)) {
         try {
-          const s2 = await open(next);
+          const s2 = await open(id);
           if (closed) { await s2.c.end?.().catch(() => undefined); return; }
           session = s2;
-          id = next;
           provenAt = performance.now();
           healthy = true;
+          signals.proven();
           return;
         } catch {
           await new Promise((r) => setTimeout(r, wait).unref?.());
@@ -1531,19 +1535,22 @@ export async function mysqlLiveness(opts: MysqlLivenessOptions): Promise<Process
     if (!healthy || !cur) throw new LivenessUnavailableError();
     try { return await run(cur.c, sql, p); } catch { if (session === cur) lost(); throw new LivenessUnavailableError(); }
   };
-  const holdsOwn = async (): Promise<boolean> => {
-    if (!healthy || !session) return false;
-    try {
-      const held = Number((await q('SELECT IS_USED_LOCK($1) = CONNECTION_ID() AS ok', [session.name])).rows[0]?.ok) === 1;
-      if (held) provenAt = performance.now();
-      else lost();
-      return held;
-    } catch { return false; }
-  };
+  let proving: Promise<boolean> | undefined;
+  /** One proof at a time, answered within a heartbeat or the session is lost (`proofWithin`). */
+  const holdsOwn = (): Promise<boolean> => proving ??= (async () => {
+    const cur = session;
+    if (!healthy || !cur) return false;
+    const held = await proofWithin((async () => Number((await q('SELECT IS_USED_LOCK($1) = CONNECTION_ID() AS ok', [cur.name])).rows[0]?.ok) === 1)(), heartbeatMs);
+    if (session !== cur) return false;
+    if (held) { provenAt = performance.now(); signals.proven(); } else lost();
+    return held;
+  })().finally(() => { proving = undefined; });
   const beat = setInterval(() => { void holdsOwn(); }, heartbeatMs);
   beat.unref?.();
   return {
-    get id() { return id; },
+    id,
+    reconnectGraceMs,
+    sessionSignal: signals.signal,
     async isAlive(other) {
       if (other === id) return healthy;
       return (await q('SELECT IS_USED_LOCK($1) AS c', [lockName('p', db, other)])).rows[0]?.c != null;
@@ -1557,11 +1564,16 @@ export async function mysqlLiveness(opts: MysqlLivenessOptions): Promise<Process
       if (closed) return;
       closed = true;
       clearInterval(beat);
+      signals.close();
       healthy = false;
       const cur = session;
       session = undefined;
       // Given back before the session ends, so no reader can meet it held by a session on its way out.
-      if (cur) { await run(cur.c, 'SELECT RELEASE_LOCK($1)', [cur.name]).catch(() => undefined); await cur.c.end?.().catch(() => undefined); }
+      // A session lost silently answers neither, so both together wait a heartbeat at most, then it is destroyed.
+      if (cur) {
+        const ended = await proofWithin((async () => { await run(cur.c, 'SELECT RELEASE_LOCK($1)', [cur.name]); await cur.c.end?.(); return true; })(), heartbeatMs);
+        if (!ended) cur.c.destroy?.();
+      }
     },
   };
 }

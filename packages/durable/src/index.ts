@@ -273,7 +273,7 @@ export { followedRun, type FollowedRun, type RunEnding } from './followed-run.js
 export { appendRunEvent, readRunEvents, lastRunEvent, endsFollow, runEventKey, type RunEvent, type RunState } from './run-events.js';
 export {
   installProcessLiveness, processLiveness, storeLiveness, livenessFor, unbindLiveness, inMemoryLiveness, sqliteLiveness, postgresLiveness, beginDrain, isDraining, endDrain,
-  holdWhile, settledExceptOwn, handNamePrefix, type HandFace, RunDrainedError, LivenessUnavailableError, procLockKey, isProcessLocal, type ProcessLiveness, type PgProcessSession, type PostgresLivenessOptions,
+  holdWhile, settledExceptOwn, handNamePrefix, type HandFace, RunDrainedError, LivenessUnavailableError, TransactionPoolerError, procLockKey, isProcessLocal, type ProcessLiveness, type PgProcessSession, type PostgresLivenessOptions,
 } from './process-liveness.js';
 // The run-id grammar: every family written under a run id, every family of id the engine composes, and
 // the one admission gate (run-id-grammar.ts). The packages on this one spell run keys through it.

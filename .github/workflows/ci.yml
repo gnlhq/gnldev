@@ -193,6 +193,22 @@ jobs:
       qdrant:
         image: qdrant/qdrant
         ports: ['6333']
+      # PgBouncer in TRANSACTION mode in front of the job's Postgres, for the pooler tests
+      # (GNL_PG_TXPOOL_URL): a liveness there must be refused at open, and a call through it must not be
+      # judged by its age (a-transaction-pooler-is-refused-at-open, a-frozen-process-keeps-its-direct-
+      # claim). Measured locally with this image: 7 of 7. Pinned by digest; `*` passes every database name.
+      pgbouncer:
+        image: edoburu/pgbouncer@sha256:9c78945868a6a142c7fc40ccd843bbe5a606df163c7ffce4de70e0d628d696a2
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          POOL_MODE: transaction
+          AUTH_TYPE: scram-sha-256
+          LISTEN_PORT: '6432'
+          MAX_CLIENT_CONN: '200'
+        ports: ['6432']
     env:
       GNL_INTEGRATION: '1'
       # integration-real.test.ts reads GNL_PG_URL (audit finding: the old PG_URL name never
@@ -264,18 +280,20 @@ jobs:
       # the same line (check-real-backends.mjs) does not exceed the server's 100 connections — the
       # multi-process tests open several pools per file.
       #
-      # The MySQL / MariaDB / standalone MongoDB URLs are set per step: `job.services` (the host ports) is
-      # not available to the job's own `env`. GNL_MONGO_URL comes from the step above.
+      # The MySQL / MariaDB / standalone MongoDB / PgBouncer URLs are set per step: `job.services` (the host
+      # ports) is not available to the job's own `env`. GNL_MONGO_URL comes from the step above.
       - run: node scripts/real-backend-tests.mjs --run alone
         env:
           GNL_MYSQL_URL: mysql://root:gnl@127.0.0.1:${{ job.services.mysql.ports['3306'] }}/gnl
           GNL_MARIADB_URL: mysql://root:gnl@127.0.0.1:${{ job.services.mariadb.ports['3306'] }}/gnl
           GNL_MONGO_STANDALONE_URL: mongodb://127.0.0.1:${{ job.services.mongostandalone.ports['27017'] }}/gnl
+          GNL_PG_TXPOOL_URL: postgresql://postgres:postgres@127.0.0.1:${{ job.services.pgbouncer.ports['6432'] }}/postgres
       - run: node scripts/real-backend-tests.mjs --run shared -- --maxWorkers=3 --minWorkers=1
         env:
           GNL_MYSQL_URL: mysql://root:gnl@127.0.0.1:${{ job.services.mysql.ports['3306'] }}/gnl
           GNL_MARIADB_URL: mysql://root:gnl@127.0.0.1:${{ job.services.mariadb.ports['3306'] }}/gnl
           GNL_MONGO_STANDALONE_URL: mongodb://127.0.0.1:${{ job.services.mongostandalone.ports['27017'] }}/gnl
+          GNL_PG_TXPOOL_URL: postgresql://postgres:postgres@127.0.0.1:${{ job.services.pgbouncer.ports['6432'] }}/postgres
 
   upgrade-from-0-9-0:
     name: upgrade from 0.9.0 (known failures, not yet gating)

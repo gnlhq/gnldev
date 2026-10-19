@@ -15,16 +15,24 @@ on it (~25 s).
 
 ## Why
 
-From the moment its session ended, the other processes read this one as dead, and may already have
-taken over the runs and calls it held. Until it holds a lock again it can tell neither that a run is
-still its own, nor whether another process is alive. Starting the run anyway would let two processes
-execute it at once; answering "dead" for another process would let this one take a run over beside a
-live holder. So it refuses, and asks for a retry.
+Until it holds its lock again this process can tell neither that a run is still its own, nor whether
+another process is alive. Starting the run anyway could let two processes execute it at once; answering
+"dead" for another process would let this one take a run over beside a live holder. So it refuses, and
+asks for a retry.
 
-It comes back by itself: it opens a new session under a **new** process id (the old id stays dead —
-others may have acted on it) and serves again, usually within a fraction of a second. What it was
-executing under the old id is no longer its own: a tool body it had not started does not start, and
-another process continues the run.
+It comes back by itself: it opens a new session and takes its lock back under the **same** process id,
+usually within a fraction of a second. The other processes read it as dead only once its lock has been
+gone for `reconnectGraceMs` (5 s by default), so when it is back within that, nothing it held was taken
+over. When it is not — a partition, a long failover — the others take it for dead and may take over the
+runs and calls it held. Half a grace after the process last proved its session — also when the session
+ended without the process being told, which it then notices within two heartbeats — the tool bodies it
+is running get an aborted `abortSignal` with this error as the reason.
+
+A body that was **already running keeps running** unless it honours that signal: its effect can then
+happen twice — once here, once in the process that took the call over. The defence is the provider's
+idempotency key (`idempotencyKey`, passed to every side-effect tool): the provider folds the two into
+one. Whichever finishes second does not change the call's record; its caller gets that record (or busy
+while the other attempt still holds it), and its own result is kept as a late report.
 
 ## What to do
 
@@ -32,4 +40,6 @@ another process continues the run.
 
 **If you see it often**, look at what ends the sessions: database restarts or failovers, a pooler in
 transaction mode between the process and the database (a liveness session must be direct or
-session-mode — see `postgresLiveness`), or network timeouts on long-idle connections.
+session-mode — see `postgresLiveness`; one is refused at open with `TransactionPoolerError`, and one that
+is found out later, when the heartbeat sees its statements leave the lock's backend, logs that error and
+answers this code until it is given a direct URL), or network timeouts on long-idle connections.

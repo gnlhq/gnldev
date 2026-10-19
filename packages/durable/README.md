@@ -141,6 +141,13 @@ const again = await gnl.follow(s.runId, { after: at }); // continues right after
   (`claimTtlMs`) — a holder frozen past it there is taken over. The executor refuses such a store
   (`LivenessRequiredError`): pass `createGnl({ liveness: await postgresLiveness({ connectionString }) })`,
   or `inMemoryLiveness()` for a store only this process reaches.
+- **A Postgres liveness needs a real session.** Behind a transaction-mode pooler (PgBouncer
+  `pool_mode=transaction`, a managed "-pooler" endpoint) a session lock lands on a server connection lent
+  to other clients, so the liveness is refused when it is opened (`TransactionPoolerError`), and a direct
+  call on such a store is refused before its body unless a liveness is installed. The store may stay on
+  the pooler; give the liveness the direct URL:
+  `createGnl({ storage: new PostgresStorage({ connectionString: POOLED_URL }), liveness: await postgresLiveness({ connectionString: DIRECT_URL }) })`
+  (or `installProcessLiveness(…)` for direct calls).
 - **Tuning the executor** (`createGnl({ detached: { … } })`, or `new DetachedRuns({ … })` used
   directly): `sweepMs` — how often it looks for runs whose process is gone (default 1 s; `0` runs no
   sweeper in this process); `pollMs` — how often a reader on another process reads the store (200 ms);
@@ -148,8 +155,13 @@ const again = await gnl.follow(s.runId, { after: at }); // continues right after
   before a call in doubt is put to its tool again (2 s, doubling); `onComplete` — a notice per run that
   completed or failed, at least once, with an `id` stable across deliveries. Used directly, `journal`
   is where the execution records live and `journalFor(scope)` the journal a scope's runs are in.
-  `postgresLiveness({ heartbeatMs })` is how often a process proves its own session (5 s; at most a
-  third of the server's keepalive window, refused above it). An `id` given to a liveness (a pm2 slot, a
+  `heartbeatMs` (1 s, on `postgresLiveness`, `mysqlLiveness` and `mongoLiveness`) is how often a process
+  proves its own session; a proof not answered within one more heartbeat is a lost session (Postgres: at
+  most a third of the server's keepalive window, refused above it). `reconnectGraceMs` (5 s) is how long
+  a process's lock must be gone before the others read it as dead — and the time a live process has to
+  take its lock back after its session ends; a crashed process is taken over that much later. It is at
+  least 4 × `heartbeatMs` (refused below it, `0` too): proofs come at most two heartbeats apart, and the
+  bodies are told to stop half a grace after the last one. An `id` given to a liveness (a pm2 slot, a
   hostname) is a prefix: every process gets an id of its own (`<id>:<uuid>`), so one restarted in the
   slot of a crashed one takes that one's work over instead of reading it as its own.
 - **The event log.** A run's events (`<runId>:ev:<seq>`) are what every reader reads, scoped and
@@ -1166,12 +1178,24 @@ The exactly-once guarantee rests on one precondition: **storage never loses an a
 - **Outbound side effects:** the strongest end-to-end defense is using a provider-side **idempotency
   key** on tool calls (see the pattern in `test/idempotency-key.test.ts`) — regardless of the storage
   layer, the external system rejects the duplicate.
-- **Network partitions.** A process cut off from its store is taken for dead once its session is gone
-  (Postgres: after its keepalive, ~25 s), and another process may run the call again while the first,
-  if it wakes, finishes its own. Measured with real processes on Postgres: where the provider accepts
-  the call's key, every effect applied once; where it does not, 2 on a single partition, and at most
-  the retry ceiling on partitions in a row (`maxRetries`, 3 by default). A process that is only frozen,
-  its session alive, is never taken over.
+- **When a process's session ends.** A process is alive to the others through its liveness session
+  (the Postgres advisory lock, the MySQL named lock, the MongoDB connection). That session can end while
+  the process lives: the database restarts or fails over, an operator terminates the backend
+  (`pg_terminate_backend`), a pooler closes it, or the network is cut long enough for the server to give
+  up on it (Postgres: its keepalive, ~25 s). The process takes its lock back under the same id, and the
+  others read it as dead only once its lock has been gone for `reconnectGraceMs` (5 s) — so a session
+  that is back within it keeps everything the process holds (measured on Postgres, a cut mid-body: 2
+  effects in 5 of 5 rounds before, 1 after). A session gone for longer — a partition, a long failover —
+  and the process is taken for dead: another process may run the call again. Half a grace after the
+  process last proved its session — whether or not it heard of the loss: a session can end on the server
+  with the client told nothing (a dropped NAT entry, a failover that moves an address) — the process's
+  tool bodies get an aborted `abortSignal` (reason: `LivenessUnavailableError`); a body
+  that honours it stops, one that ignores it finishes its own effect. Measured with real processes on
+  Postgres: where the provider accepts the call's key, every effect applied once; where it does not, 2
+  on a single partition, and at most the retry ceiling on partitions in a row (`maxRetries`, 3 by
+  default). A process that is only frozen, its session alive, is never taken over. The caller of a body
+  that finished after its call was taken over gets the call's record (or busy while the other attempt
+  holds it), never its own diverging result; that result is kept as a late report.
 - **Shutdown time.** Give the process manager more time than the drain's 25 s (pm2
   `kill_timeout: 30000`; Kubernetes `terminationGracePeriodSeconds: 30`).
 
