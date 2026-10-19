@@ -1,6 +1,4 @@
 import { createHash } from 'node:crypto';
-import http from 'node:http';
-import https from 'node:https';
 import {
   vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, vectorDeleteMatcher, vectorQueryScope, vectorInOrganization,
   vectorItemCopy, rankVectorMatches, assertVectorDimension,
@@ -9,6 +7,7 @@ import { refuseUnknownNames } from '@gnldev/options';
 import type { VectorStore, VectorItem, VectorMatch, QueryOptions, DeleteWhere } from './vector-store.js';
 import { keywordScore } from './vector-store.js';
 import { QDRANT_VECTOR_STORE_NAMES, QUERY_NAMES } from './option-names.js';
+import { restCall, CONFLICT, type RestCall } from './rest-call.js';
 
 export interface QdrantVectorStoreOptions {
   /** Qdrant's REST endpoint: `http://localhost:6333`, or `https://…` for a TLS endpoint (Qdrant Cloud). */
@@ -68,16 +67,14 @@ const PAGE = 256;
  *   last match ties others, every match at that score is read and the port's ranking cuts topK.
  * - A zero query vector has no direction for cosine: its matches score 0 and are read by scrolling.
  *
- * NOT `fetch`, and measured why: the global `fetch` (undici) on a kept-alive connection waited ~40 ms on
- * every response that carried a payload (43 ms against 1.1 ms through `node:http`, the same query, the
- * same server; `curl` 1.5 ms) — 100 queries took 4.4 s instead of 77 ms.
+ * Calls go through `restCall` (`node:http`, not `fetch`: measured there).
  */
 export class QdrantVectorStore implements VectorStore {
   readonly rootOutsideOrganizations = true;
   private readonly collection: string;
   private dimension?: number;
   private ready?: Promise<void>;
-  private readonly call: Call;
+  private readonly call: RestCall;
 
   constructor(opts: QdrantVectorStoreOptions) {
     refuseUnknownNames('QdrantVectorStore', opts, QDRANT_VECTOR_STORE_NAMES);
@@ -89,7 +86,9 @@ export class QdrantVectorStore implements VectorStore {
       throw new TypeError('@gnldev/rag: a Qdrant collection name holds letters, digits, `_` and `-` only');
     }
     this.dimension = opts.dimension;
-    this.call = httpCall(opts.url, opts.apiKey);
+    this.call = restCall(opts.url, {
+      name: 'Qdrant', headers: opts.apiKey ? { 'api-key': opts.apiKey } : {}, result: (j) => j?.result, detail: (j) => j?.status,
+    });
   }
 
   /**
@@ -272,38 +271,4 @@ function toMatch(p: QdrantPayload, score: number): VectorMatch {
     id: p.gnl_id, text: p.text, metadata: p.metadata, namespace: p.namespace,
     ...(p.owner !== undefined ? { owner: p.owner } : {}), ...(p.shared ? { shared: true } : {}), score,
   };
-}
-
-const CONFLICT = Symbol('conflict');
-type Call = (method: string, path: string, body?: unknown, missingIsUndefined?: boolean, conflictIsSymbol?: boolean) => Promise<unknown>;
-
-/** One REST call; the result is Qdrant's `result`. The API key goes in a header and never into a message. */
-function httpCall(url: string, apiKey?: string): Call {
-  const base = new URL(url);
-  const lib = base.protocol === 'https:' ? https : http;
-  const agent = new lib.Agent({ keepAlive: true });
-  const prefix = base.pathname.replace(/\/+$/, '');
-  return (method, path, body, missingIsUndefined = false, conflictIsSymbol = false) => new Promise((resolve, reject) => {
-    const data = body === undefined ? undefined : JSON.stringify(body);
-    const req = lib.request({
-      protocol: base.protocol, hostname: base.hostname, port: base.port, path: `${prefix}${path}`, method, agent,
-      headers: { 'content-type': 'application/json', ...(data ? { 'content-length': Buffer.byteLength(data) } : {}), ...(apiKey ? { 'api-key': apiKey } : {}) },
-    }, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (c: Buffer) => chunks.push(c));
-      res.on('end', () => {
-        const status = res.statusCode ?? 0;
-        if (missingIsUndefined && status === 404) return resolve(undefined);
-        if (conflictIsSymbol && status === 409) return resolve(CONFLICT);
-        let j: { result?: unknown; status?: unknown } = {};
-        try { j = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { /* not JSON: reported below by status */ }
-        if (status < 200 || status >= 300) {
-          return reject(Object.assign(new Error(`@gnldev/rag: Qdrant ${method} ${path.split('?')[0]} answered ${status} ${JSON.stringify(j?.status ?? '').slice(0, 200)}`), { status }));
-        }
-        resolve(j.result);
-      });
-    });
-    req.on('error', (e) => reject(new Error(`@gnldev/rag: Qdrant ${method} ${path.split('?')[0]} failed: ${e.message}`)));
-    req.end(data);
-  });
 }

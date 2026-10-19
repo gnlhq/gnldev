@@ -7,6 +7,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`ChromaVectorStore` (`@gnldev/rag`): a vector store on a Chroma server (1.x), over its REST API,
+  with no dependency.** 20 of 20 vector-kit scenarios on a real server (1.0); owner, namespace and
+  sharing are part of the record id and checked again after the write, as in the Qdrant store. A
+  filter on a missing key reads a stored key list, because Chroma's `$ne` also matches a record without
+  the key. Equal scores past Chroma's own cut are read until the tie is whole (300 equal scores, topK 5:
+  the five smallest ids). `apiKey` is sent as `x-chroma-token` and never appears in an error. Measured
+  against `QdrantVectorStore` (1,000 128-d inserts, 100 queries at topK 10, median of 5): 454 ms vs
+  529 ms to insert, 460 ms vs 64 ms to query — Chroma's metadata-filtered search costs the difference
+  (the same 100 queries without the root's partition filter: 190 ms), and that filter is what keeps an
+  organization's documents out of the root's answers. Not measured: Chroma Cloud, token auth on a server.
+
 ## [0.12.0] — 2026-10-19
 
 **A store states its guarantees, and is measured against them** (ADR-0009). Every promise a run

@@ -3,7 +3,7 @@
 //
 // A file needs one when it, or a local module it imports, reads one of the variables a real server is
 // handed through: GNL_PG_URL, GNL_PG_ADMIN_URL, GNL_PGVECTOR_URL, GNL_MYSQL_URL, GNL_MARIADB_URL, GNL_MONGO_URL,
-// GNL_MONGO_STANDALONE_URL, GNL_QDRANT_URL or GNL_PG_TXPOOL_URL (a transaction-mode pooler). Without the
+// GNL_MONGO_STANDALONE_URL, GNL_QDRANT_URL, GNL_CHROMA_URL or GNL_PG_TXPOOL_URL (a transaction-mode pooler). Without the
 // server such a file skips itself, so the default run stays green whether or not it was ever run. The CI job and
 // scripts/check-real-backends.mjs used to name these files by hand; measured on 12 Oct 2026, 50 of them
 // were named nowhere and ran only on a developer's machine — the new queue liveness and SIGTERM tests
@@ -28,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
-const SERVER_VARIABLE = /process\.env(?:\.|\[['"])GNL_(PG_URL|PG_ADMIN_URL|PGVECTOR_URL|MYSQL_URL|MARIADB_URL|MONGO_URL|MONGO_STANDALONE_URL|QDRANT_URL|PG_TXPOOL_URL)\b/;
+const SERVER_VARIABLE = /process\.env(?:\.|\[['"])GNL_(PG_URL|PG_ADMIN_URL|PGVECTOR_URL|MYSQL_URL|MARIADB_URL|MONGO_URL|MONGO_STANDALONE_URL|QDRANT_URL|CHROMA_URL|PG_TXPOOL_URL)\b/;
 const TERMINATES_BACKENDS = /\bpg_terminate_backend\b/;
 const LOCAL_IMPORT = /(?:from\s+|import\s*\(\s*|import\s+)['"](\.{1,2}\/[^'"]+)['"]/g;
 const TEST_FILE = /\.test\.tsx?$/;
