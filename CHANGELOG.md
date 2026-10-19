@@ -7,12 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.12.0] — 2026-10-19
 
 **A store states its guarantees, and is measured against them** (ADR-0009). Every promise a run
 keeps — once, owned, erased, truthfully reported — rests on a few store operations being atomic.
 They are now the store contract, a store without one is refused where it enters, and one kit
-measures every backend before it is called one.
+measures every backend before it is called one. New stores measured by it: MySQL/MariaDB, MongoDB,
+libSQL, and Qdrant for vectors. Upgrading from 0.11 needs no store step on Postgres or SQLite; a
+custom store must provide the guarantees listed under Breaking, and a crashed process's work is
+taken over after `reconnectGraceMs` (5 s) instead of at once.
 
 ### Breaking
 
