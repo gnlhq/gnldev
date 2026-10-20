@@ -1,0 +1,52 @@
+name: mongo kernel probe
+
+# Probe only, never merged: which way MongoDB 8.x starts and keeps working on the runner's kernel
+# (SERVER-121912: mongod 8.x refuses kernels 6.19–7.0.13). Six runners, so some land on the new image.
+on:
+  pull_request:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04, ubuntu-26.04]
+        copy: [1, 2, 3]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: probe
+        run: |
+          set +e
+          echo "RUNNER label=${{ matrix.os }} kernel=$(uname -r) image=${ImageVersion:-?}"
+          try() { # name image env...
+            name=$1; image=$2; shift 2
+            docker rm -f probe-m >/dev/null 2>&1 || true
+            docker run -d --name probe-m "$@" "$image" >/dev/null
+            up=no
+            for i in $(seq 1 40); do
+              [ "$(docker exec probe-m mongosh --quiet --eval 'db.runCommand({ping:1}).ok' 2>/dev/null)" = "1" ] && { up=yes; break; }
+              [ "$(docker inspect -f '{{.State.Running}}' probe-m)" = "true" ] || break
+              sleep 1
+            done
+            load=skip
+            if [ $up = yes ]; then
+              # Allocation-heavy work: a latent allocator fault shows as a crash or an error here.
+              out=$(docker exec probe-m mongosh --quiet --eval '
+                const c = db.getSiblingDB("p").c;
+                for (let r = 0; r < 20; r++) {
+                  const b = []; for (let i = 0; i < 5000; i++) b.push({r, i, s: "x".repeat(200 + (i % 800))});
+                  c.insertMany(b); c.find({r}).sort({i:-1}).limit(2000).toArray(); c.deleteMany({r: {$lt: r - 2}});
+                }
+                print(c.countDocuments({}))' 2>&1 | tail -1)
+              alive=$(docker inspect -f '{{.State.Running}}' probe-m)
+              load="count=$out alive=$alive"
+            fi
+            reason=$(docker logs probe-m 2>&1 | grep -o -m1 -E 'cannot start[^"]{0,80}|Segmentation fault|Invalid access|tcmalloc[^"]{0,60}' || true)
+            echo "RESULT label=${{ matrix.os }} kernel=$(uname -r) image=${ImageVersion:-?} variant=$name mongo=$image up=$up load=[$load] reason=[$reason]"
+          }
+          for img in mongo:8.0 mongo:8.3; do
+            try none $img
+            try rseq0 $img -e GLIBC_TUNABLES=glibc.pthread.rseq=0
+            try rseq1 $img -e GLIBC_TUNABLES=glibc.pthread.rseq=1
+            try rseq0-noshstk $img -e GLIBC_TUNABLES=glibc.pthread.rseq=0:glibc.cpu.hwcaps=-SHSTK
+          done
