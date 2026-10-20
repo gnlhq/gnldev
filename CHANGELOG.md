@@ -7,7 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.13.0] — 2026-10-20
+
+**Two more vector stores, measured like the rest.** `ChromaVectorStore` and `WeaviateVectorStore`
+(`@gnldev/rag`) keep documents on a Chroma or Weaviate server, with no extra package, and pass the same
+vector kit as every other store. Both servers' searches are approximate and miss some copies of one
+vector, so a tie at the top-K cut is read whole and ordered by id, as everywhere else. Upgrading from
+0.12 needs no step.
 
 ### Added
 
@@ -40,6 +46,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and Qdrant stores (1,000 128-d inserts, 100 queries at topK 10, median of 5): 465 / 472 / 511 ms to
   insert, 207 / 536 / 54 ms to query. Not measured: Weaviate Cloud, API-key auth on a server, a
   multi-node cluster.
+
+### Fixed
+
+- **MongoDB 8.x on Linux 6.19 to 7.0.13** (`@gnldev/durable` README, MongoDB): `mongod` refuses to start
+  there (MongoDB's SERVER-121912; fixed in the kernel from 7.0.14). The README now says how to start it —
+  `GLIBC_TUNABLES=glibc.pthread.rseq=1` on the container, as the repository's `docker-compose.yml` and CI
+  do — and what was measured: on a 7.0.0 kernel, mongo:8.0 and 8.3 started with it and refused without
+  it; this package's MongoDB tests passed on 8.0. No code change.
 
 ## [0.12.0] — 2026-10-19
 
