@@ -9,6 +9,7 @@ import type { VectorStore, VectorItem, VectorMatch, QueryOptions, DeleteWhere } 
 import { keywordScore } from './vector-store.js';
 import { CHROMA_VECTOR_STORE_NAMES, QUERY_NAMES } from './option-names.js';
 import { restCall, CONFLICT, type RestCall } from './rest-call.js';
+import { tieWhole, vectorDigest, TIE_EPSILON } from './tie-whole.js';
 
 export interface ChromaVectorStoreOptions {
   /** Chroma's server address: `http://localhost:8000`, or `https://…` for a TLS endpoint. */
@@ -52,14 +53,10 @@ interface Hit { id: string; text: string; meta: ChromaMeta; score: number; embed
 function recordId(it: { id: string; namespace?: string; owner?: string; shared?: boolean }): string {
   return createHash('sha256').update(JSON.stringify([it.namespace ?? null, it.owner ?? null, it.shared === true, it.id])).digest('hex');
 }
-/** A digest of a vector's values: equal vectors, equal digests. */
-const vectorDigest = (v: number[]) => createHash('sha256').update(new Float64Array(v)).digest('hex').slice(0, 32);
 /** A metadata key as a field name: letters, digits and `_` only, and injective. */
 const metaKey = (k: string) => k.replace(/[^A-Za-z0-9]/g, (c) => `_${c.codePointAt(0)!.toString(16)}_`);
 /** A page size for reads. */
 const PAGE = 256;
-/** Distinct vectors a tie is read by digest for; past it, the partition is read. */
-const TIE_VECTORS = 8;
 /** Chroma refuses an empty `where`; one clause is itself; more are an `$and`. */
 const allOf = (clauses: unknown[]) => (clauses.length === 0 ? undefined : clauses.length === 1 ? clauses[0] : { $and: clauses });
 
@@ -85,7 +82,8 @@ const allOf = (clauses: unknown[]) => (clauses.length === 0 ? undefined : clause
  *   better). So when the one past the cut ties the last one, the tie is read whole and scored here, and
  *   the port's ranking (equal scores by id) cuts topK. A tie between copies of one vector — the usual
  *   one, a text ingested twice — is read by the vectors' digests (`gnl_vh`), within the same `where`
- *   (`tieWhole`). Away from a tie the answer is Chroma's, approximate as any HNSW index is.
+ *   (`tieWhole`, shared with the Weaviate store). Away from a tie the answer is Chroma's, approximate as
+ *   any HNSW index is.
  */
 export class ChromaVectorStore implements VectorStore {
   readonly rootOutsideOrganizations = true;
@@ -207,36 +205,22 @@ export class ChromaVectorStore implements VectorStore {
     let hits = await this.search(c.id, embedding, allOf(where), limit + 1);
     const last = hits[limit - 1];
     const next = hits[limit];
-    if (!hybrid && last && next && next.score >= last.score - 1e-6) hits = await this.tieWhole(c.id, embedding, where, hits, last.score);
+    if (!hybrid && last && next && next.score >= last.score - TIE_EPSILON) {
+      hits = await tieWhole(hits, last.score, {
+        score: (h) => h.score,
+        digest: (h) => h.meta.gnl_vh,
+        bestOutside: async (digests) => (await this.search(c.id, embedding, allOf([...where, { gnl_vh: { $nin: digests } }]), 1))[0],
+        scored: (digests) => this.scored(c.id, embedding, allOf(digests ? [...where, { gnl_vh: { $in: digests } }] : where)),
+      });
+    }
     let out = hits.map((h) => toMatch(h, hybrid ? (1 - w) * h.score + w * keywordScore(opts!.text!, h.text) : h.score));
     if (opts?.minScore !== undefined) out = out.filter((m) => m.score >= opts.minScore!);
     return rankVectorMatches(out, topK);
   }
 
-  /**
-   * `hits` with the tie at `score` read whole and scored here. The tie's vectors are found one digest at a
-   * time — Chroma is asked for the best record outside the digests found so far, and while it ties too,
-   * its digest joins — then their copies are read by digest. Past `TIE_VECTORS` distinct vectors, the
-   * partition the query may see is read instead.
-   */
-  private async tieWhole(id: string, embedding: number[], where: unknown[], hits: Hit[], score: number): Promise<Hit[]> {
-    const ties = (h: Hit) => h.score >= score - 1e-6;
-    const digests = [...new Set(hits.filter(ties).map((h) => h.meta.gnl_vh))];
-    for (;;) {
-      if (digests.length > TIE_VECTORS) return this.scored(id, embedding, allOf(where), score);
-      const outside = await this.search(id, embedding, allOf([...where, { gnl_vh: { $nin: digests } }]), 1);
-      if (!outside[0] || !ties(outside[0])) break;
-      digests.push(outside[0].meta.gnl_vh);
-    }
-    // What scored above the tie is Chroma's answer, as away from a tie.
-    return [...hits.filter((h) => h.score > score + 1e-6), ...await this.scored(id, embedding, allOf([...where, { gnl_vh: { $in: digests } }]), score)];
-  }
-
-  /** The records `where` selects, scored here against `embedding`, those at `score` or above. */
-  private async scored(id: string, embedding: number[], where: unknown, score: number): Promise<Hit[]> {
-    return (await this.readAll(id, where, true))
-      .map((h) => ({ ...h, score: cosineSimilarity(embedding, h.embedding!) }))
-      .filter((h) => h.score >= score - 1e-6);
+  /** The records `where` selects, scored here against `embedding`. */
+  private async scored(id: string, embedding: number[], where: unknown): Promise<Hit[]> {
+    return (await this.readAll(id, where, true)).map((h) => ({ ...h, score: cosineSimilarity(embedding, h.embedding!) }));
   }
 
   private async search(id: string, vector: number[], where: unknown, n: number): Promise<Hit[]> {

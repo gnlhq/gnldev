@@ -7,7 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.13.0] — 2026-10-20
+
+**Two more vector stores, measured like the rest.** `ChromaVectorStore` and `WeaviateVectorStore`
+(`@gnldev/rag`) keep documents on a Chroma or Weaviate server, with no extra package, and pass the same
+vector kit as every other store. Both servers' searches are approximate and miss some copies of one
+vector, so a tie at the top-K cut is read whole and ordered by id, as everywhere else. Upgrading from
+0.12 needs no step.
 
 ### Added
 
@@ -24,6 +30,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   535 ms to insert, 592 ms vs 66 ms to query — Chroma's metadata-filtered search costs most of the
   difference (the same 100 queries without the root's partition filter: 190 ms), and that filter is what
   keeps an organization's documents out of the root's answers; the vector digest costs 4–8%. Not measured: Chroma Cloud, token auth on a server.
+
+- **`WeaviateVectorStore` (`@gnldev/rag`): a vector store on a Weaviate server (1.x), over its REST and
+  GraphQL API, with no dependency.** 20 of 20 vector-kit scenarios on a real server (1.40). Weaviate's
+  exact match trims whitespace (`"a"`, `" a"` and `"a "` were one value), so every label a filter
+  compares — id, namespace, owner, each metadata value — is stored as its JSON spelling, and two that
+  differ only by a space stay two. Owner, namespace and sharing are part of the object id and checked
+  again after the write, as in the Qdrant and Chroma stores. Its search does not reach every copy of one
+  vector either (3,000 copies, a limit of 4,000: 2,974–2,989 came back over two collections), so a tie
+  at the top-K cut is read whole and ordered by id; the Chroma store's tie reading moves to one shared
+  helper that both use. Reads page by object id, past Weaviate's 10,000-result offset limit. Right after
+  a collection is made, Weaviate's GraphQL may not know it yet (seen on CI): that answer is asked again
+  for up to ~2.75 s. A batch write Weaviate refuses in part fails the call; the objects it accepted stay
+  written. `apiKey` is sent as a bearer token and never appears in an error. Measured against the Chroma
+  and Qdrant stores (1,000 128-d inserts, 100 queries at topK 10, median of 5): 465 / 472 / 511 ms to
+  insert, 207 / 536 / 54 ms to query. Not measured: Weaviate Cloud, API-key auth on a server, a
+  multi-node cluster.
+
+### Fixed
+
+- **MongoDB 8.x on Linux 6.19 to 7.0.13** (`@gnldev/durable` README, MongoDB): `mongod` refuses to start
+  there (MongoDB's SERVER-121912; fixed in the kernel from 7.0.14). The README now says how to start it —
+  `GLIBC_TUNABLES=glibc.pthread.rseq=1` on the container, as the repository's `docker-compose.yml` and CI
+  do — and what was measured: on a 7.0.0 kernel, mongo:8.0 and 8.3 started with it and refused without
+  it; this package's MongoDB tests passed on 8.0. No code change.
 
 ## [0.12.0] — 2026-10-19
 
