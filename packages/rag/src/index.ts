@@ -8,6 +8,8 @@ export { QdrantVectorStore } from './qdrant-vector-store.js';
 export type { QdrantVectorStoreOptions } from './qdrant-vector-store.js';
 export { ChromaVectorStore } from './chroma-vector-store.js';
 export type { ChromaVectorStoreOptions } from './chroma-vector-store.js';
+export { WeaviateVectorStore } from './weaviate-vector-store.js';
+export type { WeaviateVectorStoreOptions } from './weaviate-vector-store.js';
 export { createRagTool } from './rag-tool.js';
 export { llmReranker } from './rerank.js';
 export type { Reranker } from './rerank.js';
