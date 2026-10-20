@@ -179,7 +179,34 @@ equal scores fall at the top-K cut, the store reads the tie whole and orders it 
 store: copies of one vector (a text ingested twice) are read by a digest of the vector; a tie between
 different vectors is found one vector at a time. Away from a tie, the answer is Chroma's.
 
-Every store (`InMemoryVectorStore`, `GraphRag`, `PostgresVectorStore`, `QdrantVectorStore`, `ChromaVectorStore` and the `@gnldev/durable`
+### Weaviate
+
+`WeaviateVectorStore` keeps the documents on a Weaviate server (1.x), through its REST and GraphQL API
+(no extra package):
+
+```ts
+import { WeaviateVectorStore } from '@gnldev/rag';
+
+const vectors = new WeaviateVectorStore({
+  url: 'https://weaviate.example.internal:8080',
+  apiKey: process.env.WEAVIATE_API_KEY, // sent as `Authorization: Bearer …`, never in an error message
+  collection: 'GnlVectors',             // default; a capital letter, then letters, digits and `_`
+});
+```
+
+It keeps the same rules as the Qdrant and Chroma stores: the collection (cosine, no vectorizer: the
+store sends its own vectors) is created on the first write with that write's vector length or
+`dimension`; owner, namespace and sharing are part of each object's id; a zero vector scores 0; a
+document's metadata may hold any JSON value. Weaviate's exact match trims whitespace, so the store
+keeps every label it filters on as its JSON spelling: `"a"` and `" a"` stay two ids, two namespaces,
+two owners. Its search is approximate (HNSW) and does not reach every copy of one vector either, so a
+tie at the top-K cut is read whole and ordered by id, as in the Chroma store.
+
+A collection made by hand needs this store's properties; let the store make it. Weaviate's batch write
+is not one transaction: when it refuses an object, the call fails and the objects it accepted stay
+written.
+
+Every store (`InMemoryVectorStore`, `GraphRag`, `PostgresVectorStore`, `QdrantVectorStore`, `ChromaVectorStore`, `WeaviateVectorStore` and the `@gnldev/durable`
 storages) applies the same write rule, before anything is written:
 
 - `owner` must be an id an end user can carry: not empty, at most 200 characters, no control

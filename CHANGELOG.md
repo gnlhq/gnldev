@@ -25,6 +25,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   difference (the same 100 queries without the root's partition filter: 190 ms), and that filter is what
   keeps an organization's documents out of the root's answers; the vector digest costs 4–8%. Not measured: Chroma Cloud, token auth on a server.
 
+- **`WeaviateVectorStore` (`@gnldev/rag`): a vector store on a Weaviate server (1.x), over its REST and
+  GraphQL API, with no dependency.** 20 of 20 vector-kit scenarios on a real server (1.40). Weaviate's
+  exact match trims whitespace (`"a"`, `" a"` and `"a "` were one value), so every label a filter
+  compares — id, namespace, owner, each metadata value — is stored as its JSON spelling, and two that
+  differ only by a space stay two. Owner, namespace and sharing are part of the object id and checked
+  again after the write, as in the Qdrant and Chroma stores. Its search does not reach every copy of one
+  vector either (3,000 copies, a limit of 4,000: 2,974–2,989 came back over two collections), so a tie
+  at the top-K cut is read whole and ordered by id; the Chroma store's tie reading moves to one shared
+  helper that both use. Reads page by object id, past Weaviate's 10,000-result offset limit. Right after
+  a collection is made, Weaviate's GraphQL may not know it yet (seen on CI): that answer is asked again
+  for up to ~2.75 s. A batch write Weaviate refuses in part fails the call; the objects it accepted stay
+  written. `apiKey` is sent as a bearer token and never appears in an error. Measured against the Chroma
+  and Qdrant stores (1,000 128-d inserts, 100 queries at topK 10, median of 5): 465 / 472 / 511 ms to
+  insert, 207 / 536 / 54 ms to query. Not measured: Weaviate Cloud, API-key auth on a server, a
+  multi-node cluster.
+
 ## [0.12.0] — 2026-10-19
 
 **A store states its guarantees, and is measured against them** (ADR-0009). Every promise a run
