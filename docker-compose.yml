@@ -48,12 +48,14 @@ services:
       net.ipv4.tcp_keepalive_probes: 3
   # MongoStorage (`@gnldev/durable/mongo`): a single-node replica set with access control (a keyfile made in
   # the container), short TCP keepalives and a raised file limit — as packages/durable/README.md says a
-  # deployment runs it. GNL_MONGO_URL; GNL_MONGO_STANDALONE_URL for `mongo-standalone`.
+  # deployment runs it. GNL_MONGO_URL; GNL_MONGO_STANDALONE_URL for `mongo-standalone`. GLIBC_TUNABLES:
+  # MongoDB 8.x does not start on Linux 6.19–7.0.13 otherwise (packages/durable/README.md, MongoDB).
   mongo:
     image: mongo:8.0
     environment:
       MONGO_INITDB_ROOT_USERNAME: root
       MONGO_INITDB_ROOT_PASSWORD: gnl
+      GLIBC_TUNABLES: glibc.pthread.rseq=1
     entrypoint: ['sh', '-c', 'openssl rand -base64 756 > /tmp/keyfile && chmod 400 /tmp/keyfile && chown mongodb /tmp/keyfile && exec docker-entrypoint.sh mongod --replSet rs0 --keyFile /tmp/keyfile --bind_ip_all']
     ports:
       - '55317:27017'
@@ -65,5 +67,7 @@ services:
       net.ipv4.tcp_keepalive_probes: 3
   mongo-standalone:
     image: mongo:8.0
+    environment:
+      GLIBC_TUNABLES: glibc.pthread.rseq=1
     ports:
       - '55318:27017'
