@@ -35,9 +35,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const status = async (s: Storage, runId: string) => (await readRunOutcome(s.runs as never, runId))?.status;
 const unauthorized = () => Object.assign(new Error('401 Unauthorized'), { name: 'AI_APICallError', statusCode: 401, isRetryable: false });
 
-/** Worker A's view of the store: once A has failed, its outcome write waits until `release` opens (a slow write, a stall). */
+/** Worker A's view of the store: once A has failed, its outcome write waits until `release` opens (a slow write, a stall).
+ *  `failed` opens when A's model call has thrown: B starts only after it, so A is the older attempt even on a slow machine. */
 function slowAfterFailure(journal: object, release: Promise<void>) {
-  const state = { failed: false };
+  const failed = gate();
+  const state = { failed: false, fail: () => { state.failed = true; failed.open(); }, hasFailed: failed.p };
   const view = new Proxy(journal, {
     get(t: any, k) {
       const v = Reflect.get(t, k, t);
@@ -57,7 +59,8 @@ describe.each(STORES)('an older attempt\'s verdict does not replace a newer one,
     const runId = `v1-${unique()}`;
     const bDone = gate();
     const a = slowAfterFailure(s.runs, bDone.p);
-    const aRun = runDurable({ runId, journal: a.view, model: createMockModel(async () => { a.state.failed = true; throw unauthorized(); }), prompt: 'x', maxRetries: 0 } as never).catch((e: Error) => e);
+    const aRun = runDurable({ runId, journal: a.view, model: createMockModel(async () => { a.state.fail(); throw unauthorized(); }), prompt: 'x', maxRetries: 0 } as never).catch((e: Error) => e);
+    await a.state.hasFailed;
     await sleep(200);
     await runDurable({ runId, journal: s.runs, model: createMockModel(async () => finalTextResult('ok')), prompt: 'x' } as never);
     expect(await status(s, runId)).toBe('completed');
@@ -71,10 +74,12 @@ describe.each(STORES)('an older attempt\'s verdict does not replace a newer one,
     const runId = `v2-${unique()}`;
     const aWrites = gate(); const bMayFinish = gate();
     const a = slowAfterFailure(s.runs, aWrites.p);
-    const aRun = runDurable({ runId, journal: a.view, model: createMockModel(async () => { a.state.failed = true; throw unauthorized(); }), prompt: 'x', maxRetries: 0 } as never).catch((e: Error) => e);
+    const aRun = runDurable({ runId, journal: a.view, model: createMockModel(async () => { a.state.fail(); throw unauthorized(); }), prompt: 'x', maxRetries: 0 } as never).catch((e: Error) => e);
+    await a.state.hasFailed;
     await sleep(200);
-    const bRun = runDurable({ runId, journal: s.runs, model: createMockModel(async () => { await bMayFinish.p; return finalTextResult('ok'); }), prompt: 'x' } as never);
-    await sleep(200);
+    const bAsked = gate();
+    const bRun = runDurable({ runId, journal: s.runs, model: createMockModel(async () => { bAsked.open(); await bMayFinish.p; return finalTextResult('ok'); }), prompt: 'x' } as never);
+    await bAsked.p;
     expect(await status(s, runId)).toBe('running');
     aWrites.open();
     await aRun;
@@ -89,8 +94,9 @@ describe.each(STORES)('an older attempt\'s verdict does not replace a newer one,
     const runId = `v3-${unique()}`;
     const bDone = gate();
     const a = slowAfterFailure(s.runs, bDone.p);
-    const aStream = await streamDurable({ runId, journal: a.view, model: createMockModel(async () => { a.state.failed = true; throw unauthorized(); }), prompt: 'x', maxRetries: 0 } as never);
+    const aStream = await streamDurable({ runId, journal: a.view, model: createMockModel(async () => { a.state.fail(); throw unauthorized(); }), prompt: 'x', maxRetries: 0 } as never);
     const aRead = (async () => { try { for await (const _ of aStream.fullStream) { /* drain */ } } catch { /* the failure */ } })();
+    await a.state.hasFailed;
     await sleep(200);
     await runDurable({ runId, journal: s.runs, model: createMockModel(async () => finalTextResult('ok')), prompt: 'x' } as never);
     bDone.open();

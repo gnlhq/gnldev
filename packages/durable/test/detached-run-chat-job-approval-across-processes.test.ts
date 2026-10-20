@@ -66,12 +66,13 @@ describe.each(kinds)('S1–S3 on %s', (kind) => {
     const t0 = performance.now();
     const started = await (await post(a, '/start', { runId: 'job' })).json();
     const answeredIn = performance.now() - t0;
+    const effectsAtAnswer = effectCount(s); // the 3 s tool has not finished when the caller is answered
     const evs = await readEvents(await fetch(b.url('/events?runId=job')));
     await sleep(200);
     const statuses = evs.filter((e) => e.kind === 'status').map((e) => e.data.state + (e.data.tool ? `:${e.data.tool}` : ''));
     const hooks = linesOf(`${s.effects}.hooks`);
     console.log(`[S2 ${kind}] started=${started.state} answeredIn=${answeredIn.toFixed(0)}ms statuses=${JSON.stringify(statuses)} hooks=${JSON.stringify(hooks)} effects=${effectCount(s)}`);
-    expect(answeredIn).toBeLessThan(1_000);
+    expect(effectsAtAnswer).toBe(0);
     expect(statuses).toContain('tool:effect');
     expect(finalState(evs)).toBe('completed');
     expect(hooks).toHaveLength(1);
