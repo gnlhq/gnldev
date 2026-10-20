@@ -5,6 +5,7 @@ import { optionNames } from '@gnldev/options';
 
 export const INDEX_DOCUMENTS_OPTS_NAMES = optionNames<NonNullable<Parameters<typeof import('./vector-store.js').indexDocuments>[3]>>()(['concurrency']);
 export const QDRANT_VECTOR_STORE_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./qdrant-vector-store.js').QdrantVectorStore>[0]>>()(['url', 'apiKey', 'collection', 'dimension']);
+export const CHROMA_VECTOR_STORE_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./chroma-vector-store.js').ChromaVectorStore>[0]>>()(['url', 'apiKey', 'tenant', 'database', 'collection', 'dimension']);
 export const POSTGRES_VECTOR_STORE_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./postgres-vector-store.js').PostgresVectorStore>[0]>>()(['connectionString', 'pool', 'table', 'dimension', 'index']);
 export const LLM_RERANKER_NAMES = optionNames<NonNullable<Parameters<typeof import('./rerank.js').llmReranker>[0]>>()(['model']);
 export const CHUNK_TEXT_OPTS_NAMES = optionNames<NonNullable<Parameters<typeof import('./chunk.js').chunkText>[1]>>()(['size', 'overlap', 'strategy']);

@@ -195,6 +195,11 @@ jobs:
       qdrant:
         image: qdrant/qdrant
         ports: ['6333']
+      # Chroma 1.0, for @gnldev/rag's ChromaVectorStore (the vector kit and its own tests), on a free host
+      # port like Qdrant's. Pinned by digest: the image measured locally (raporlar/2026-10-19-chroma).
+      chroma:
+        image: chromadb/chroma@sha256:1e0b73a187a28757c572acba508c46f48c9e8b0acaf5c20e6d95cdedce1acdf6
+        ports: ['8000']
       # PgBouncer in TRANSACTION mode in front of the job's Postgres, for the pooler tests
       # (GNL_PG_TXPOOL_URL): a liveness there must be refused at open, and a call through it must not be
       # judged by its age (a-transaction-pooler-is-refused-at-open, a-frozen-process-keeps-its-direct-
@@ -224,6 +229,7 @@ jobs:
       GNL_PG_EXPECT_COLLATION: ${{ matrix.pg.collation }}
     steps:
       - run: echo "GNL_QDRANT_URL=http://localhost:${{ job.services.qdrant.ports['6333'] }}" >> "$GITHUB_ENV"
+      - run: echo "GNL_CHROMA_URL=http://localhost:${{ job.services.chroma.ports['8000'] }}" >> "$GITHUB_ENV"
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v5
         with:
