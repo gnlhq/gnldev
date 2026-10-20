@@ -1297,6 +1297,15 @@ const gnl = createGnl({ storage, agents });
   keep the documents in a vector database (`@gnldev/rag`'s pgvector store, or Qdrant) and the runs here.
 - **Slower than Postgres**: about 3.5x on the same writes (each new record takes a position from a
   counter document first, and a commit waits for `w: "majority"`); run listings are as fast.
+- **On Linux 6.19 to 7.0.13, MongoDB 8.x does not start** unless glibc keeps rseq: `mongod` exits with
+  "MongoDB cannot start: Linux kernel versions 6.19 and newer has a known incompatibility" (MongoDB's
+  SERVER-121912; fixed in the kernel from 7.0.14, no MongoDB release fixes it). Start it with
+  `GLIBC_TUNABLES=glibc.pthread.rseq=1`: the allocator then keeps per-thread caches instead of per-CPU
+  ones, and MongoDB starts. The official `mongo` image sets `rseq=0` for per-CPU caches, so set it on
+  the container (`-e GLIBC_TUNABLES=glibc.pthread.rseq=1`, as the repository's `docker-compose.yml` and
+  CI do). Measured on a 7.0.0 kernel: without it, or with `rseq=0`, mongo:8.0 and 8.3 refused; with it,
+  both started and held under an insert/sort/delete load, and this package's MongoDB tests passed on 8.0
+  (`serverStatus().tcmalloc.usingPerCPUCaches` is `false`).
 
 ### Required: the liveness must see the other processes' connections
 

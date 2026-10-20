@@ -182,10 +182,12 @@ jobs:
           --health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 5s --health-timeout 5s --health-retries 30
           --sysctl net.ipv4.tcp_keepalive_time=10 --sysctl net.ipv4.tcp_keepalive_intvl=5 --sysctl net.ipv4.tcp_keepalive_probes=3
       # A MongoDB server that is NOT a replica set: what MongoStorage must refuse (GNL_MONGO_STANDALONE_URL).
-      # The replica set it runs on is started in a step below.
+      # The replica set it runs on is started in a step below. GLIBC_TUNABLES: see that step.
       mongostandalone:
         image: mongo:8.0
         ports: ['27017']
+        env:
+          GLIBC_TUNABLES: glibc.pthread.rseq=1
         options: >-
           --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'" --health-interval 5s --health-timeout 5s --health-retries 30
       # Qdrant, for @gnldev/rag's QdrantVectorStore (the vector kit and its own tests). A free host port,
@@ -250,11 +252,17 @@ jobs:
       # 13–14 s with these, ~5.5 min with the Linux defaults — measured); a raised file limit (the
       # container default of 1024 crashed the server under the kits — measured). The set is initiated
       # once the real server (not the image's init-time one) is up; its free host port is read back.
+      # GLIBC_TUNABLES=glibc.pthread.rseq=1: MongoDB 8.x refuses to start on Linux 6.19–7.0.13 when its
+      # allocator keeps per-CPU caches (SERVER-121912), and the runners moved to 7.0.0 from 18 Oct 2026.
+      # With glibc holding rseq the allocator keeps per-thread caches, the path MongoDB starts on there.
+      # Measured on 7.0.0 runners, mongo:8.0 and 8.3: no variable and rseq=0 refused, rseq=1 started and
+      # held under load; on 6.17 all three started.
       - name: MongoDB replica set
         run: |
           docker run -d --name gnl-mongo -p 127.0.0.1::27017 --ulimit nofile=64000:64000 \
             --sysctl net.ipv4.tcp_keepalive_time=10 --sysctl net.ipv4.tcp_keepalive_intvl=5 --sysctl net.ipv4.tcp_keepalive_probes=3 \
-            -e MONGO_INITDB_ROOT_USERNAME=root -e MONGO_INITDB_ROOT_PASSWORD=gnl --entrypoint sh mongo:8.0 \
+            -e MONGO_INITDB_ROOT_USERNAME=root -e MONGO_INITDB_ROOT_PASSWORD=gnl -e GLIBC_TUNABLES=glibc.pthread.rseq=1 \
+            --entrypoint sh mongo:8.0 \
             -c 'openssl rand -base64 756 > /tmp/keyfile && chmod 400 /tmp/keyfile && chown mongodb /tmp/keyfile && exec docker-entrypoint.sh mongod --replSet rs0 --keyFile /tmp/keyfile --bind_ip_all'
           ask() { docker exec gnl-mongo mongosh -u root -p gnl --quiet --eval "$1" 2>/dev/null; }
           for i in $(seq 1 90); do [ "$(ask 'db.adminCommand({getCmdLineOpts:1}).parsed.replication ? 1 : 0')" = "1" ] && break; sleep 2; done
