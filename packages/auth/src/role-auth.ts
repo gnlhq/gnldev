@@ -25,7 +25,8 @@ import { safeEqual } from './safe-equal.js';
 import { grantsAllow, isReadPermission } from './permission.js';
 import { PLATFORM_ADMIN_ROLE, subjectIdProblem } from './scope.js';
 import { refuseUnknownNames, optionNames } from '@gnldev/options';
-import { verifyJwt, MIN_SUBJECT_SECRET_BYTES, MAX_SUBJECT_TTL_SEC, MAX_REVOCABLE_SUBJECT_TTL_SEC } from './jwt.js';
+import { verifyJwt, b64uDecode, MIN_SUBJECT_SECRET_BYTES, MAX_SUBJECT_TTL_SEC, MAX_REVOCABLE_SUBJECT_TTL_SEC } from './jwt.js';
+import { jwksSource, type JwksSourceOptions } from './jwks.js';
 
 /** The reserved role naming the application credential class (see `CLIENT_WRITES`). */
 export const CLIENT_ROLE = 'client';
@@ -95,8 +96,15 @@ function isWrite(ctx: AuthContext): boolean {
 export interface EndUserTokens {
   /** HS256 secret the application signs with. */
   secret?: string;
-  /** Or a public key (PEM or base64url SPKI; RS256/Ed25519), when the application signs asymmetrically. */
+  /** Or a public key (PEM or base64url SPKI; RS256/ES256/Ed25519), when the application signs asymmetrically. */
   publicKey?: string;
+  /**
+   * Or the identity provider's JWKS — its address (`https://<tenant>.auth0.com/.well-known/jwks.json`),
+   * or the address with cache rules (`JwksSourceOptions`). The key a token names (`kid`) is fetched,
+   * cached, and fetched again when the provider rotates (see `jwksSource`). For a provider that signs
+   * your users' tokens: Auth0, Clerk, Supabase signing keys, WorkOS, Firebase, Okta.
+   */
+  jwks?: string | JwksSourceOptions;
   /** Expected `iss`; unchecked if unset. */
   issuer?: string;
   /** Expected `aud`; unchecked if unset. */
@@ -213,7 +221,7 @@ export interface RoleAuthConfig {
 }
 const ROLE_AUTH_NAMES = optionNames<RoleAuthConfig>()(['superAdmin', 'admin', 'client', 'viewer', 'endUsers']);
 const CRED_NAMES = optionNames<Cred>()(['token', 'user', 'pass', 'orgId', 'platformAdmin']);
-const END_USER_TOKEN_NAMES = optionNames<EndUserTokens>()(['secret', 'publicKey', 'issuer', 'audience', 'orgId', 'maxTtlSec', 'isRevoked']);
+const END_USER_TOKEN_NAMES = optionNames<EndUserTokens>()(['secret', 'publicKey', 'jwks', 'issuer', 'audience', 'orgId', 'maxTtlSec', 'isRevoked']);
 
 function roleAuthProvider(cfg: RoleAuthConfig): AuthProvider | undefined {
   const superAdmin = credValues(cfg.superAdmin);
@@ -221,9 +229,15 @@ function roleAuthProvider(cfg: RoleAuthConfig): AuthProvider | undefined {
   const client = credValues(cfg.client);
   const viewer = credValues(cfg.viewer);
   const endUsers = cfg.endUsers;
-  if (endUsers && endUsers.secret == null && endUsers.publicKey == null) {
-    throw new Error('@gnldev/auth: `endUsers` needs `secret` or `publicKey` — without one, no token can be verified.');
+  const keySources = endUsers ? [endUsers.secret, endUsers.publicKey, endUsers.jwks].filter((k) => k != null).length : 0;
+  if (endUsers && keySources === 0) {
+    throw new Error('@gnldev/auth: `endUsers` needs `secret`, `publicKey` or `jwks` — without one, no token can be verified.');
   }
+  if (keySources > 1) {
+    throw new Error('@gnldev/auth: `endUsers` takes one of `secret`, `publicKey` and `jwks` — with two, which one a token was checked against would depend on the order they are tried.');
+  }
+  const jwks = endUsers?.jwks == null ? undefined
+    : jwksSource(typeof endUsers.jwks === 'string' ? { url: endUsers.jwks } : endUsers.jwks, '@gnldev/auth endUsers', 'endUsers.jwks.maxStaleMs');
   if (endUsers?.secret != null && Buffer.byteLength(endUsers.secret, 'utf8') < MIN_SUBJECT_SECRET_BYTES) {
     throw new Error(`@gnldev/auth: \`endUsers.secret\` must be at least ${MIN_SUBJECT_SECRET_BYTES} bytes — a short HMAC key lets whoever guesses it sign any user.`);
   }
@@ -239,7 +253,7 @@ function roleAuthProvider(cfg: RoleAuthConfig): AuthProvider | undefined {
   }
 
   // What verifyJwt reads of the rule: `orgId` and `isRevoked` are this provider's, asked below.
-  const { orgId: _orgId, isRevoked: _isRevoked, ...jwtRule } = endUsers ?? {};
+  const { orgId: _orgId, isRevoked: _isRevoked, jwks: _jwks, ...jwtRule } = endUsers ?? {};
   /** The one user a verified token names, or null. Nothing but `sub` is taken from it. */
   const endUserOf = async (req: Request): Promise<Principal | null> => {
     if (!endUsers) return null;
@@ -248,8 +262,21 @@ function roleAuthProvider(cfg: RoleAuthConfig): AuthProvider | undefined {
     if (!token || token.split('.').length !== 3) return null;
     const now = Date.now();
     let claims: Record<string, unknown> | undefined;
+    // With a JWKS, the key the token names; the algorithm still comes from that key, not the header.
+    let rule = jwtRule;
+    if (jwks) {
+      let pem: string | undefined;
+      try {
+        const kid = (JSON.parse(b64uDecode(token.split('.')[0]!).toString('utf8')) as { kid?: unknown }).kid;
+        pem = await jwks.pemFor(typeof kid === 'string' ? kid : undefined);
+      } catch {
+        return null; // no key set to be had (endpoint down past the stale bound): nobody, not an error page
+      }
+      if (!pem) return null;
+      rule = { ...jwtRule, publicKey: pem };
+    }
     // `maxTtlSec` (default 1 hour) is enforced by verifyJwt: a token whose exp is further out is refused.
-    const verified = verifyJwt(token, { ...jwtRule, maxTtlSec, onClaims: (c) => { claims = c; } }, now);
+    const verified = verifyJwt(token, { ...rule, maxTtlSec, onClaims: (c) => { claims = c; } }, now);
     if (!verified?.id || !claims) return null;
     if (badSubject(verified.id)) return null;
     if (endUsers.isRevoked) {

@@ -37,6 +37,8 @@ export type GnlCred = {
 export type GnlEndUsers = {
   secret?: string;
   publicKey?: string;
+  /** The identity provider's JWKS address, or the address with cache rules — see @gnldev/auth `EndUserTokens.jwks`. */
+  jwks?: string | { url: string; ttlMs?: number; maxStaleMs?: number; refetchMs?: number; fetch?: typeof fetch; now?: () => number };
   issuer?: string;
   audience?: string;
   orgId?: string;

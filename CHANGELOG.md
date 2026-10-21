@@ -32,6 +32,59 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`@gnldev/channels`: agents on Slack (`slackChannel`).** A new package, Apache-2.0. A Slack message
+  comes in through the signed Events API webhook (a request without Slack's signature, or older than
+  five minutes, is 401) and becomes a queue job in the store named by Slack's event id, so Slack
+  redelivering it finds the same job; the job runs the agent under a `workKey` from the same id, so a
+  retried job lands on the same run and its tools do not run twice. The reply is a recorded tool call
+  carrying its idempotency key in Slack's message metadata: a post whose connection was cut is settled
+  by reading the thread (found: posted; not found: posted now) — measured both ways, one post each.
+  Each person's conversation is their own GNL thread and run, in the organization their workspace maps
+  to; an unlisted workspace is acknowledged and never run. No Redis. A run that stops for an approval posts Approve /
+  Deny buttons for each call; only the requester (or someone `approvers` allows) may answer, a button's
+  value is signed so a changed one decides nothing (401), one decision per call (a double click or
+  Approve after Deny is the first decision), and the run's answer after the decision is posted once.
+  Not yet: a shared-thread mode, Telegram.
+
+- **An eval gate for CI: `gnl eval` and thresholds (`@gnldev/evals`, `@gnldev/cli`).** A suite is a
+  `*.eval.ts` file exporting `defineEval({ dataset, run, scorers, thresholds })`; `gnl eval` runs every
+  suite under `./evals`, prints each scorer's mean against its threshold and exits 1 on a shortfall
+  (`--json` for a step that reads the report). A threshold is a least mean, or `{ every }` per case. A
+  suite also fails when a case does not finish — its 0 used to be averaged in, so a lenient mean could
+  pass over a crash — and when a threshold names a scorer the suite lacks, so a typo cannot leave a gate
+  open. Every invocation runs its cases again (a memo keyed by case and scorers would replay results
+  the changed code never produced); `--resume <id>` continues one that was cut off. In a test,
+  `assertEvalThresholds` throws an `EvalThresholdError` that lists each shortfall.
+
+- **An end user's token from an identity provider (`endUsers.jwks`, `@gnldev/auth`).** `roleAuth` takes
+  the provider's JWKS address instead of a key, so a token Auth0, Clerk, Supabase or Firebase issued is
+  verified as is: the key the token names is fetched, cached for 10 minutes, and fetched again on
+  rotation — a key id not in the cache asks again at once, at most every 30 seconds (before, a rotated-in
+  key was refused until the TTL ran out). An outage serves the last good keys for `maxStaleMs` (1 hour),
+  then fails closed. ES256 (P-256) joins RS256 and Ed25519: Supabase's signing keys, the default for its
+  new projects, were refused. The JWKS cache moves from `@gnldev/auth-ee`'s Auth0 provider into
+  `@gnldev/auth` as `jwksSource`, and the Auth0 provider now uses it: every auth-ee test passes
+  unchanged except the one that recorded the rotated-in refusal as a known limit, now rewritten to the
+  new rule. Measured with tokens shaped like each provider's against a test-served JWKS, not the live
+  services.
+
+- **`ElasticsearchVectorStore` and `OpenSearchVectorStore` (`@gnldev/rag`): vector stores on
+  Elasticsearch 9.x and OpenSearch 3.x, over the REST API, with no dependency.** 20 of 20 vector-kit
+  scenarios on each (Elasticsearch 9.4, OpenSearch 3.9). Both servers refuse a zero vector in a cosine
+  field, so the index searches normalized vectors by inner product and scores are computed from the
+  vectors as written (the default quantized Elasticsearch index had moved a score of 1 to 2.0000067). A
+  write is searchable only after a refresh (0 of 10 found at once), and the owner check reads back what
+  was written, so every write and delete refreshes. A second process making the same index was told
+  "already exists" before its shards were up and its first search answered 503 (20 of 20 races, both
+  servers, and a cluster health wait for `yellow` did not help): the store reads the index's own shard
+  count until its primaries are active. Equal scores came back in the server's own order, so a tie at
+  the cut is read whole and ordered by id, as in the Chroma and Weaviate stores. A metadata value is
+  filtered by a digest of its JSON, so a value longer than a keyword term (40,000 characters) still
+  filters exactly. Measured beside the other REST stores (1,000 128-d inserts, 100 queries at topK 10,
+  median of 5) insert / query: Elasticsearch 649 / 545 ms, OpenSearch 669 / 360, Weaviate 503 / 209,
+  Chroma 524 / 680, Qdrant 541 / 56. Not measured: Elastic Cloud, Amazon OpenSearch Service, a
+  multi-node cluster, an API key or basic auth on a server.
+
 - **The REST API is tested inside Express 5, Fastify 5 and Koa 3**, booted on a socket and bound as
   `@gnldev/server`'s README says: the agent list, a run, a stream, and the app's own routes and body
   parser beside it. Each wrong binding the README warns about is held to the failure it describes, and two

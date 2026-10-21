@@ -4,6 +4,12 @@ import https from 'node:https';
 /** Answered for a 409 when the caller asked for it: "someone made it first", not a failure. */
 export const CONFLICT = Symbol('conflict');
 
+/** A body of newline-delimited JSON lines, sent as written (`application/x-ndjson`). */
+export class NdJson {
+  readonly text: string;
+  constructor(lines: unknown[]) { this.text = lines.map((l) => JSON.stringify(l)).join('\n') + '\n'; }
+}
+
 export type RestCall = (method: string, path: string, body?: unknown, missingIsUndefined?: boolean, conflictIsSymbol?: boolean) => Promise<unknown>;
 
 export interface RestService {
@@ -39,11 +45,13 @@ export function restCall(url: string, service: RestService): RestCall {
   const agent = new lib.Agent({ keepAlive: true });
   const prefix = base.pathname.replace(/\/+$/, '');
   return (method, path, body, missingIsUndefined = false, conflictIsSymbol = false) => new Promise((resolve, reject) => {
-    const data = body === undefined ? undefined : JSON.stringify(body);
+    // A body already written out is sent as it is — newline-delimited JSON, Elasticsearch's `_bulk`.
+    const data = body === undefined ? undefined : body instanceof NdJson ? body.text : JSON.stringify(body);
+    const type = body instanceof NdJson ? 'application/x-ndjson' : 'application/json';
     const where = `${service.name} ${method} ${path.split('?')[0]}`;
     const req = lib.request({
       protocol: base.protocol, hostname: base.hostname, port: base.port, path: `${prefix}${path}`, method, agent,
-      headers: { 'content-type': 'application/json', ...(data ? { 'content-length': Buffer.byteLength(data) } : {}), ...service.headers },
+      headers: { 'content-type': type, ...(data ? { 'content-length': Buffer.byteLength(data) } : {}), ...service.headers },
     }, (res) => {
       const chunks: Buffer[] = [];
       res.on('error', (e) => reject(new Error(`@gnldev/rag: ${where} failed: ${e.message}`)));
