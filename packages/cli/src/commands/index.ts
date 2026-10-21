@@ -17,6 +17,7 @@ import { rmCommand } from './rm.js';
 import { adoptOrgCommand } from './adopt-org.js';
 import { upgradeCommand } from './upgrade.js';
 import { pendingCommand } from './pending.js';
+import { evalCommand } from './eval.js';
 
 export type { Command, CommandCtx, CommandGroup } from './types.js';
 
@@ -28,6 +29,7 @@ export const commandList: Command[] = [
   runsCommand,
   runCommand,
   inspectCommand,
+  evalCommand,
   doctorCommand,
   forkCommand,
   resumeCommand,

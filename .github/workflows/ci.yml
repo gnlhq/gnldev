@@ -211,6 +211,28 @@ jobs:
           PERSISTENCE_DATA_PATH: /var/lib/weaviate
           CLUSTER_HOSTNAME: node1
         ports: ['8080']
+      # Elasticsearch 9.4 and OpenSearch 3.9, for @gnldev/rag's ElasticsearchVectorStore and
+      # OpenSearchVectorStore (the vector kit and their own tests): one node, security off, a small heap.
+      # Pinned by digest: the images measured locally (raporlar/2026-10-21-search).
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch@sha256:754c3d8ca6f74acba58eb0610b8479a13c36df09ac1a4e0f2667dc167d377b84
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: 'false'
+          ES_JAVA_OPTS: -Xms512m -Xmx512m
+        ports: ['9200']
+        options: >-
+          --health-cmd "curl -fs http://localhost:9200/_cluster/health || exit 1" --health-interval 5s --health-timeout 5s --health-retries 40
+      opensearch:
+        image: opensearchproject/opensearch@sha256:adfa61f85025d06b4aeb562e7e74fde7e31c437039c93c3862c17e9acebd6c7c
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: 'true'
+          DISABLE_INSTALL_DEMO_CONFIG: 'true'
+          OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+        ports: ['9200']
+        options: >-
+          --health-cmd "curl -fs http://localhost:9200/_cluster/health || exit 1" --health-interval 5s --health-timeout 5s --health-retries 40
       # PgBouncer in TRANSACTION mode in front of the job's Postgres, for the pooler tests
       # (GNL_PG_TXPOOL_URL): a liveness there must be refused at open, and a call through it must not be
       # judged by its age (a-transaction-pooler-is-refused-at-open, a-frozen-process-keeps-its-direct-
@@ -242,6 +264,8 @@ jobs:
       - run: echo "GNL_QDRANT_URL=http://localhost:${{ job.services.qdrant.ports['6333'] }}" >> "$GITHUB_ENV"
       - run: echo "GNL_CHROMA_URL=http://localhost:${{ job.services.chroma.ports['8000'] }}" >> "$GITHUB_ENV"
       - run: echo "GNL_WEAVIATE_URL=http://localhost:${{ job.services.weaviate.ports['8080'] }}" >> "$GITHUB_ENV"
+      - run: echo "GNL_ELASTICSEARCH_URL=http://localhost:${{ job.services.elasticsearch.ports['9200'] }}" >> "$GITHUB_ENV"
+      - run: echo "GNL_OPENSEARCH_URL=http://localhost:${{ job.services.opensearch.ports['9200'] }}" >> "$GITHUB_ENV"
       - uses: actions/checkout@v5
       - uses: pnpm/action-setup@v5
         with:

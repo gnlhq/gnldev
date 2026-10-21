@@ -206,9 +206,39 @@ A collection made by hand needs this store's properties; let the store make it. 
 is not one transaction: when it refuses an object, the call fails and the objects it accepted stay
 written.
 
+### Elasticsearch and OpenSearch
+
+`ElasticsearchVectorStore` (Elasticsearch 9.x) and `OpenSearchVectorStore` (OpenSearch 3.x) keep the
+documents in an index on that server, through its REST API (no extra package):
+
+```ts
+import { ElasticsearchVectorStore, OpenSearchVectorStore } from '@gnldev/rag';
+
+const es = new ElasticsearchVectorStore({
+  url: 'https://es.example.internal:9200',
+  apiKey: process.env.ES_API_KEY,     // sent as `Authorization: ApiKey …`, never in an error message
+  index: 'gnl_vectors',               // default; lowercase letters, digits, `_` and `-`
+});
+const os = new OpenSearchVectorStore({
+  url: 'https://opensearch.example.internal:9200',
+  auth: { username: 'gnl', password: process.env.OPENSEARCH_PASSWORD! }, // HTTP basic, never in an error message
+});
+```
+
+They keep the same rules as the other server stores: the index is created on the first write with that
+write's vector length (or `dimension`), with fields of its own and `dynamic: strict`, and an index this
+store did not make is refused by name rather than written into; owner, namespace and sharing are part of
+each document's id; equal scores at the cut are read in full and ordered by id; a zero vector is kept
+and scores 0. Scores are computed from the vectors as written — the index only finds the candidates
+(cosine refuses a zero vector on both servers, so the index searches normalized vectors by inner
+product). Every write and delete asks the server to refresh, so what was written is searchable when the
+call returns; that costs a refresh per call (1,000 inserts in batches of 100: about 0.65 s). Labels
+compare exactly — case and whitespace are kept — and a metadata value of any length filters exactly.
+
 ### A call to a vector server has a deadline
 
-`QdrantVectorStore`, `ChromaVectorStore` and `WeaviateVectorStore` give each call to their server
+`QdrantVectorStore`, `ChromaVectorStore`, `WeaviateVectorStore`, `ElasticsearchVectorStore` and
+`OpenSearchVectorStore` give each call to their server
 `timeoutMs` (default 30 000 ms), from sending it to the answer's last byte — a server that takes the
 connection and never answers, or answers a byte at a time, fails the call with `… timed out after
 30000 ms` instead of holding it. A write cut this way may still have landed on the server; an upsert
@@ -220,7 +250,8 @@ import { QdrantVectorStore } from '@gnldev/rag';
 const vectors = new QdrantVectorStore({ url: 'http://qdrant.example.internal:6333', timeoutMs: 10_000 });
 ```
 
-Every store (`InMemoryVectorStore`, `GraphRag`, `PostgresVectorStore`, `QdrantVectorStore`, `ChromaVectorStore`, `WeaviateVectorStore` and the `@gnldev/durable`
+Every store (`InMemoryVectorStore`, `GraphRag`, `PostgresVectorStore`, `QdrantVectorStore`, `ChromaVectorStore`, `WeaviateVectorStore`,
+`ElasticsearchVectorStore`, `OpenSearchVectorStore` and the `@gnldev/durable`
 storages) applies the same write rule, before anything is written:
 
 - `owner` must be an id an end user can carry: not empty, at most 200 characters, no control
