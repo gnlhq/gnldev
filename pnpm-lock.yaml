@@ -420,6 +420,9 @@ importers:
       '@gnldev/durable':
         specifier: workspace:^
         version: link:../durable
+      '@gnldev/evals':
+        specifier: workspace:^
+        version: link:../evals
       '@gnldev/memory':
         specifier: workspace:^
         version: link:../memory
