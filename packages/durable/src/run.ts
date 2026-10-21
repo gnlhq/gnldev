@@ -38,6 +38,7 @@ import type { RunLimits } from './limits.js';
 
 import type { LanguageModelV4 } from '@ai-sdk/provider';
 import { systemText, finishReasonText, producedMessages, type InstructionsLike } from './sdk-compat.js';
+import { importOptionalPeer } from './optional-peer.js';
 import { attemptStart, runFailed, runFailedIfUnrecorded, runStarted, runSucceeded, classifyRunError, isRunFailure, readRunOutcome } from './outcome.js';
 import { recordedInputProblem, type InputOrigin } from './request-body.js';
 import { recordRunOutput } from './scoring.js';
@@ -3393,7 +3394,7 @@ async function applySchemaCompat(
   model: unknown,
   tools: Record<string, any>,
 ): Promise<Record<string, any>> {
-  const { applyToolCompat, chainToolCompat, defaultRules } = await import('@gnldev/tool-schema');
+  const { applyToolCompat, chainToolCompat, defaultRules } = await importOptionalPeer<typeof import('@gnldev/tool-schema')>('@gnldev/tool-schema');
   const rules = schemaCompat === true ? defaultRules : schemaCompat;
   // One object owns both halves on the chain path: what each candidate is sent, and the validators
   // that read an invited null back through the record of what it was sent.

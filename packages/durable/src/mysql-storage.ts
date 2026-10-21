@@ -23,7 +23,7 @@
 //    decides from the record, as on Postgres. A row written by plain SQL is outside the contract here, as
 //    there (Postgres' CE-4 bound).
 import { createHash } from 'node:crypto';
-import { createRequire } from 'node:module';
+import { requireOptionalPeer } from './optional-peer.js';
 import { cosineSimilarity } from 'ai';
 import { refuseUnknownNames } from '@gnldev/options';
 import { leafSuffix, runRecordKey } from './run-id-grammar.js';
@@ -78,7 +78,7 @@ interface Driver {
   createPool(o: Record<string, unknown>): MysqlPool;
   createConnection(o: Record<string, unknown>): Promise<MysqlConnection>;
 }
-const driver = (): Driver => createRequire(import.meta.url)('mysql2/promise') as Driver;
+const driver = (): Driver => requireOptionalPeer<Driver>('mysql2/promise');
 
 /** A statement's answer in one shape: the rows of a read, the affected (matched) rows of a write. */
 type QueryResult = { rows: any[]; rowCount: number };

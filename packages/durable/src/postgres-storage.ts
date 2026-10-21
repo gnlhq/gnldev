@@ -10,7 +10,7 @@ import { ROOT_EXEC_RECORDS } from './adoption.js';
 import { prefixUpperBound } from './organization.js';
 import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition, markWorkOf } from './storage.js';
 import { memoryPartitionOf, memoryPartitionSql, type MemoryPartitionOption } from './storage.js';
-import { createRequire } from 'node:module';
+import { requireOptionalPeer } from './optional-peer.js';
 import { cosineSimilarity } from 'ai';
 import { runIdOfKey, parseJournalKey, outcomeStatusOf, runRelationsOf, relationsOfInput, ownerColumnOf, ownerOfRecord, OWNER_RECORD_LIKE, RunRowChanges, runStatusOf, runStatusCaseSql, storedOutcomeOf, runRecordOf, runsCutBy, compareKeys } from './journal.js';
 import { keysetRunPage, rangeOrder, runStatusSql, openRunPredicate, decodeChangeCursor, encodeChangeCursor, type RunRelationRead } from './run-cursor.js';
@@ -414,7 +414,7 @@ export class PostgresStorage implements Storage {
     refuseUnknownNames('PostgresStorage', opts, POSTGRES_STORAGE_NAMES);
     if (opts.pool) this._pool = opts.pool;
     else {
-      const { Pool } = createRequire(import.meta.url)('pg') as { Pool: new (c: any) => Pool };
+      const { Pool } = requireOptionalPeer<{ Pool: new (c: any) => Pool }>('pg');
       this._pool = new Pool(opts.connectionString ? { connectionString: opts.connectionString } : {});
     }
     // `pg` emits 'error' on IDLE clients — a server restart, a failover, a scale-to-zero, a PgBouncer
@@ -559,7 +559,7 @@ export class PostgresStorage implements Storage {
       const locked = await this._pool.query('SELECT pg_advisory_lock(47110001)').then(() => true, () => false);
       return locked ? async () => { await this._pool.query('SELECT pg_advisory_unlock(47110001)').catch(() => {}); } : undefined;
     }
-    const { Client } = createRequire(import.meta.url)('pg') as { Client: new (c: any) => any };
+    const { Client } = requireOptionalPeer<{ Client: new (c: any) => any }>('pg');
     const c = new Client({ ...options });
     c.on('error', () => undefined); // a dropped lock connection ends the transaction, which releases the lock
     try {

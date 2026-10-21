@@ -282,3 +282,4 @@ export {
   isComposedRunId, composerMark, admitRunId, REPLAYED_SEGMENT_RE,
   type RunRecordFamily, type ListedRunRecordFamily, type RunIdFamily, type RunKeyedFamily,
 } from './run-id-grammar.js';
+export { requireOptionalPeer, importOptionalPeer } from './optional-peer.js';

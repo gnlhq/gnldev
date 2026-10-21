@@ -11,6 +11,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`@gnldev/durable` builds inside a Next.js app** (and any bundler that resolves what it reads). An App
+  Router route that imported `@gnldev/durable` and ran on memory failed `next build` (Next.js 16.4,
+  Turbopack): "Module not found: Can't resolve 'pg'" (twice) and "'@gnldev/tool-schema'" — optional
+  drivers the app never used and never installed, loaded by a literal `require`/`import` the bundler
+  resolved at build time. Every optional peer (`pg`, `mysql2`, `mongodb`, `libsql`, `@gnldev/tool-schema`,
+  and `pg` in `@gnldev/rag`'s pgvector store) is now loaded through `requireOptionalPeer` /
+  `importOptionalPeer`, by Node at run time. Measured after, with no `next.config` entry: the agent list, a
+  run and a `/stream` answer on memory, and on Postgres (the driver found in the app's node_modules). A
+  source scan keeps a new literal load out.
+
 - **A vector server that does not answer no longer holds a call forever** (`QdrantVectorStore`,
   `ChromaVectorStore`, `WeaviateVectorStore`, `@gnldev/rag`). A server that took the connection and
   never answered held a query indefinitely — measured, all three still waiting after 20 s. Each call now
@@ -19,6 +29,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   after 30000 ms` (measured after: 30.0–30.1 s). A write cut this way may still have landed; an upsert
   writes by a derived id, so the same upsert again is safe. A `timeoutMs` that is not a number above 0
   is refused at construction.
+
+### Added
+
+- **The REST API is tested inside Express 5, Fastify 5 and Koa 3**, booted on a socket and bound as
+  `@gnldev/server`'s README says: the agent list, a run, a stream, and the app's own routes and body
+  parser beside it. Each wrong binding the README warns about is held to the failure it describes, and two
+  descriptions were out of date: a Fastify route binding now answers 500 `body_consumed_upstream` (it
+  said 400), and on Koa 3 a two-parameter koa-connect middleware gets a plain 404 (Koa 2 also logged
+  `ERR_HTTP_HEADERS_SENT`). The README gains a Next.js section: one catch-all route, measured on
+  Next.js 16.4.
 
 ## [0.13.0] — 2026-10-20
 

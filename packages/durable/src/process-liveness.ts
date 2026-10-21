@@ -32,6 +32,7 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRequire } from 'node:module';
+import { requireOptionalPeer } from './optional-peer.js';
 import { mkdirSync, rmSync, existsSync, realpathSync, statSync, openSync, closeSync } from 'node:fs';
 import { join, resolve as resolvePath, dirname, basename } from 'node:path';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -839,7 +840,7 @@ export class TransactionPoolerError extends Error {
  */
 const SHARED_BACKEND_ROUNDS = 5;
 async function refuseSharedBackend(holder: any, config: Record<string, unknown>, key: string, holderPid: unknown): Promise<void> {
-  const { Client } = createRequire(import.meta.url)('pg') as { Client: new (c: any) => any };
+  const { Client } = requireOptionalPeer<{ Client: new (c: any) => any }>('pg');
   const probe = new Client(config);
   let shared = false;
   try {
@@ -914,7 +915,7 @@ export interface PgProcessSession extends ProcessLiveness {
  */
 export async function postgresLiveness(opts: PostgresLivenessOptions): Promise<PgProcessSession> {
   refuseUnknownNames('postgresLiveness', opts, POSTGRES_LIVENESS_NAMES);
-  const { Client } = createRequire(import.meta.url)('pg') as { Client: new (c: any) => any };
+  const { Client } = requireOptionalPeer<{ Client: new (c: any) => any }>('pg');
   const heartbeatMs = opts.heartbeatMs ?? HEARTBEAT_MS;
   // `confirm()` accepts a self-proof this old. Past a third of the server's keepalive window, a process
   // could act on a proof older than the moment its session was dropped and its runs handed over.
