@@ -32,6 +32,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **An eval gate for CI: `gnl eval` and thresholds (`@gnldev/evals`, `@gnldev/cli`).** A suite is a
+  `*.eval.ts` file exporting `defineEval({ dataset, run, scorers, thresholds })`; `gnl eval` runs every
+  suite under `./evals`, prints each scorer's mean against its threshold and exits 1 on a shortfall
+  (`--json` for a step that reads the report). A threshold is a least mean, or `{ every }` per case. A
+  suite also fails when a case does not finish — its 0 used to be averaged in, so a lenient mean could
+  pass over a crash — and when a threshold names a scorer the suite lacks, so a typo cannot leave a gate
+  open. Every invocation runs its cases again (a memo keyed by case and scorers would replay results
+  the changed code never produced); `--resume <id>` continues one that was cut off. In a test,
+  `assertEvalThresholds` throws an `EvalThresholdError` that lists each shortfall.
+
 - **The REST API is tested inside Express 5, Fastify 5 and Koa 3**, booted on a socket and bound as
   `@gnldev/server`'s README says: the agent list, a run, a stream, and the app's own routes and body
   parser beside it. Each wrong binding the README warns about is held to the failure it describes, and two
