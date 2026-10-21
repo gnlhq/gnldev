@@ -14,6 +14,7 @@ export { makeGate, principalOf, permissionContext, type Gate, type GateOptions }
 export { fromReadWrite, normalizeAuth, bindsIdentity, carriesIdentity, type ReadWriteAuth } from './adapter.js';
 export { safeEqual } from './safe-equal.js';
 // One JWT verifier for the free `endUsers` class and every @gnldev/auth-ee SSO provider.
+export { jwksSource, DEFAULT_JWKS_TTL_MS, DEFAULT_JWKS_MAX_STALE_MS, DEFAULT_JWKS_REFETCH_MS, type Jwk, type JwksSource, type JwksSourceOptions } from './jwks.js';
 export { verifyJwt, jwtFromRequest, b64uDecode, declaredKind, signSubjectToken, MIN_SUBJECT_SECRET_BYTES, MAX_SUBJECT_TTL_SEC, MAX_REVOCABLE_SUBJECT_TTL_SEC, type JwtVerifyOptions } from './jwt.js';
 export { isCrossSiteStateChange, crossSiteRefusedMessage, isHostAllowed, hostnameOf, parseAllowedHosts } from './same-site.js';
 // The providerless protections for a standalone door (chat, AG-UI, MCP over HTTP), for a request with no identity.

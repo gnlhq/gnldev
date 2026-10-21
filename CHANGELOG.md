@@ -32,6 +32,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **An end user's token from an identity provider (`endUsers.jwks`, `@gnldev/auth`).** `roleAuth` takes
+  the provider's JWKS address instead of a key, so a token Auth0, Clerk, Supabase or Firebase issued is
+  verified as is: the key the token names is fetched, cached for 10 minutes, and fetched again on
+  rotation — a key id not in the cache asks again at once, at most every 30 seconds (before, a rotated-in
+  key was refused until the TTL ran out). An outage serves the last good keys for `maxStaleMs` (1 hour),
+  then fails closed. ES256 (P-256) joins RS256 and Ed25519: Supabase's signing keys, the default for its
+  new projects, were refused. The JWKS cache moves from `@gnldev/auth-ee`'s Auth0 provider into
+  `@gnldev/auth` as `jwksSource`, and the Auth0 provider now uses it: every auth-ee test passes
+  unchanged except the one that recorded the rotated-in refusal as a known limit, now rewritten to the
+  new rule. Measured with tokens shaped like each provider's against a test-served JWKS, not the live
+  services.
+
 - **The REST API is tested inside Express 5, Fastify 5 and Koa 3**, booted on a socket and bound as
   `@gnldev/server`'s README says: the agent list, a run, a stream, and the app's own routes and body
   parser beside it. Each wrong binding the README warns about is held to the failure it describes, and two
