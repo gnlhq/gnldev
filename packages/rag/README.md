@@ -206,6 +206,20 @@ A collection made by hand needs this store's properties; let the store make it. 
 is not one transaction: when it refuses an object, the call fails and the objects it accepted stay
 written.
 
+### A call to a vector server has a deadline
+
+`QdrantVectorStore`, `ChromaVectorStore` and `WeaviateVectorStore` give each call to their server
+`timeoutMs` (default 30 000 ms), from sending it to the answer's last byte — a server that takes the
+connection and never answers, or answers a byte at a time, fails the call with `… timed out after
+30000 ms` instead of holding it. A write cut this way may still have landed on the server; an upsert
+writes by a derived id, so the same upsert again is safe.
+
+```ts
+import { QdrantVectorStore } from '@gnldev/rag';
+
+const vectors = new QdrantVectorStore({ url: 'http://qdrant.example.internal:6333', timeoutMs: 10_000 });
+```
+
 Every store (`InMemoryVectorStore`, `GraphRag`, `PostgresVectorStore`, `QdrantVectorStore`, `ChromaVectorStore`, `WeaviateVectorStore` and the `@gnldev/durable`
 storages) applies the same write rule, before anything is written:
 

@@ -20,6 +20,8 @@ export interface WeaviateVectorStoreOptions {
   collection?: string;
   /** Vector length the collection is created with; otherwise the first vector's. An existing collection's length wins. */
   dimension?: number;
+  /** How long one call to the server may take, from sending it to the answer's last byte (default 30 000 ms). Past it the call fails; a write may still have landed, and the same upsert again is safe. */
+  timeoutMs?: number;
 }
 
 /**
@@ -125,7 +127,7 @@ export class WeaviateVectorStore implements VectorStore {
     }
     this.dimension = opts.dimension;
     this.call = restCall(opts.url, {
-      name: 'Weaviate', headers: opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {}, result: (j) => j,
+      name: 'Weaviate', timeoutMs: opts.timeoutMs, headers: opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {}, result: (j) => j,
       detail: (j) => j?.error?.[0]?.message ?? j?.message,
     });
   }

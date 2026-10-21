@@ -18,6 +18,8 @@ export interface QdrantVectorStoreOptions {
   collection?: string;
   /** Vector length the collection is created with; otherwise the first vector's. An existing collection's length wins. */
   dimension?: number;
+  /** How long one call to the server may take, from sending it to the answer's last byte (default 30 000 ms). Past it the call fails; a write may still have landed, and the same upsert again is safe. */
+  timeoutMs?: number;
 }
 
 /** A point as this store writes it: the document's id and labels are in the payload; the point id is derived (`pointId`). */
@@ -87,7 +89,7 @@ export class QdrantVectorStore implements VectorStore {
     }
     this.dimension = opts.dimension;
     this.call = restCall(opts.url, {
-      name: 'Qdrant', headers: opts.apiKey ? { 'api-key': opts.apiKey } : {}, result: (j) => j?.result, detail: (j) => j?.status,
+      name: 'Qdrant', timeoutMs: opts.timeoutMs, headers: opts.apiKey ? { 'api-key': opts.apiKey } : {}, result: (j) => j?.result, detail: (j) => j?.status,
     });
   }
 
