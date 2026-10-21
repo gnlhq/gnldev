@@ -48,6 +48,36 @@ const r = await evalDataset({
   (`llmJudge({ name: 'polite', ... })`, `faithfulness({ model, name })`) or rename any scorer with a spread:
   `{ ...contains('x'), name: 'has-x' }`.
 
+## In CI: thresholds and `gnl eval`
+
+A suite can say what it must reach. `defineEval` names the suite; `gnl eval` (from `@gnldev/cli`) runs
+every `*.eval.ts` under `./evals` and exits 1 when one falls short:
+
+```ts
+// evals/support-agent.eval.ts
+import { defineEval, faithfulness, contains } from '@gnldev/evals';
+import { openai } from '@ai-sdk/openai';
+declare function answer(input: string): Promise<{ output: string; context: string[] }>; // your agent
+
+export default defineEval({
+  dataset: { id: 'support', cases: [{ id: 'refund', input: 'How do I get a refund?' }] },
+  run: (input) => answer(input),
+  scorers: [faithfulness({ model: openai('gpt-4o-mini') }), contains('refund')],
+  thresholds: { faithfulness: 0.8, contains: { every: 1 } }, // a mean, or every case
+  concurrency: 4,
+});
+```
+
+```bash
+npx gnl eval            # ✓ / ✗ per suite, each scorer's mean and its threshold; exit 1 on a shortfall
+```
+
+A number is the least mean; `{ every }` is the least score of each case; `{ mean, every }` both. A suite
+also fails when a case does not finish (its 0 is not averaged into a pass), and when a threshold names a
+scorer the suite does not have — a misspelled name would otherwise never close the gate. In a test
+instead of the CLI, `assertEvalThresholds(result, thresholds)` throws an `EvalThresholdError` that lists
+each shortfall; `checkEvalThresholds` returns `{ pass, failures }`.
+
 ## How it works
 Since scores are written to the journal, the eval suite is idempotent; long suites continue after a crash,
 and the same input produces the same score. A memo is replayed only for what it was computed on: a score
