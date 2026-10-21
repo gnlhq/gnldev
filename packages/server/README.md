@@ -37,23 +37,53 @@ createServer(toNodeHandler(api)).listen(3000);                        // node:ht
 nestApp.use('/api', toNodeHandler(api));                              // Nest (Express or Fastify)
 ```
 
-Two rules, both measured on live servers rather than reasoned about:
+Three rules, all measured on live servers rather than reasoned about — and held there by a test that
+boots Express 5, Fastify 5 and Koa 3 on a socket (`a-node-framework-serves-the-api.test.ts`):
 
 **Bind at the middleware layer, not as a route.** On Fastify the difference is the whole story:
 middleware runs before body parsing, a route runs after it. `fastify.all('/api/*', …)` looks correct,
-passes every GET, and answers 400 to a perfectly good POST — because Fastify's built-in JSON parser
-has already drained the stream.
+passes every GET, and refuses a perfectly good POST — Fastify's built-in JSON parser has already
+drained the stream, and the bridge answers 500 `body_consumed_upstream`.
 
 **On Koa, declare the third parameter.** `koa-connect` switches on `fn.length`: a middleware with
 fewer than three parameters is assumed not to terminate the response, so it calls `next()` straight
-after and Koa writes its own 404 over what was already sent — measured, `ERR_HTTP_HEADERS_SENT` and
-404 on every route. Naming `next` without calling it selects the branch that waits, which is what a
-handler that owns the response needs.
+after and Koa sends its own 404 first — measured, 404 on every route (Koa 3.2; Koa 2 also logged
+`ERR_HTTP_HEADERS_SENT`). Naming `next` without calling it selects the branch that waits, which is what a
+handler that owns the response needs. `koa-connect` takes no path, so bound as above the API answers
+every request, 404 included: to keep routes of your own, put it behind a check on `ctx.path` that calls
+`next()` for anything outside the API's prefix (and strips the prefix from `ctx.req.url`), as the test does.
 
 **Mount before whatever parses request bodies.** A parser that runs first reads the stream to the end
 and hands the result to the framework, not to us. Get it wrong and the bridge says so
 (`body_consumed_upstream`) instead of blaming your request. Your own routes keep the parser: it still
 runs for everything mounted after.
+
+## Next.js (App Router)
+
+No bridge: a route handler takes a `Request` and returns a `Response`, which is what the API is. One
+catch-all route hands it every request under its folder, with that folder's prefix cut, since the API's
+routes start at `/agents`:
+
+```ts
+// app/api/[...path]/route.ts
+import { createRestApi } from '@gnldev/server';
+import { PostgresStorage } from '@gnldev/durable/postgres';
+
+const api = createRestApi({ storage: new PostgresStorage({ connectionString: process.env.DATABASE_URL }), agents: {} });
+
+function handle(req: Request): Response | Promise<Response> {
+  const url = new URL(req.url);
+  url.pathname = url.pathname.replace(/^\/api(?=\/|$)/, '') || '/';
+  return api.fetch(new Request(url, req));
+}
+export { handle as GET, handle as POST, handle as PUT, handle as PATCH, handle as DELETE, handle as OPTIONS };
+```
+
+Measured on Next.js 16.4 with `next build` and `next start`, no `next.config` entry: the agent list, a
+run, and a `/stream` read as server-sent events, on memory and on Postgres (raporlar/2026-10-21-frameworks).
+That is the Node runtime, a route handler's default; the Edge runtime was not tried, and the stores need
+Node (a process liveness, a driver). As everywhere, production refuses to start
+without `auth` (or a deliberate `allowOpenAccess: true`).
 
 ## Endpoints (per agent)
 | Method | Path | Description |

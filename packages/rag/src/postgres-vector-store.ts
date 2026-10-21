@@ -1,5 +1,4 @@
-import { createRequire } from 'node:module';
-import { vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, VECTOR_DOCUMENT_KEY, vectorFilterDocument, assertVectorDimension } from '@gnldev/durable';
+import { vectorWriteBatch, assertSameVectorOwner, vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, VECTOR_DOCUMENT_KEY, vectorFilterDocument, assertVectorDimension, requireOptionalPeer } from '@gnldev/durable';
 import type { VectorStore, VectorItem, VectorMatch, QueryOptions, DeleteWhere } from './vector-store.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { POSTGRES_VECTOR_STORE_NAMES, QUERY_NAMES } from './option-names.js';
@@ -50,7 +49,7 @@ export class PostgresVectorStore implements VectorStore {
     if (opts.pool) {
       this.pool = opts.pool;
     } else {
-      const { Pool } = createRequire(import.meta.url)('pg') as { Pool: new (config: any) => any };
+      const { Pool } = requireOptionalPeer<{ Pool: new (config: any) => any }>('pg');
       this.pool = new Pool(opts.connectionString ? { connectionString: opts.connectionString } : {});
     }
   }

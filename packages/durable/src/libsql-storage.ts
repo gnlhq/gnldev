@@ -16,7 +16,7 @@
 //   once).
 //
 // `libsql` is an optional peer dependency: a node:sqlite user installs no native binary for it.
-import { createRequire } from 'node:module';
+import { requireOptionalPeer } from './optional-peer.js';
 import { refuseUnknownNames, optionNames } from '@gnldev/options';
 import { SqliteStorage } from './sqlite-storage.js';
 
@@ -43,7 +43,7 @@ const REMOTE_REFUSED = (what: string) =>
 /** The libSQL driver, loaded when a store is made: it is an optional peer dependency. */
 function libsqlDriver(): new (path: string) => unknown {
   try {
-    return createRequire(import.meta.url)('libsql') as new (path: string) => unknown;
+    return requireOptionalPeer<new (path: string) => unknown>('libsql');
   } catch (e) {
     throw new Error("@gnldev/durable: LibsqlStorage needs the `libsql` package — install it beside @gnldev/durable (`npm i libsql`).", { cause: e });
   }

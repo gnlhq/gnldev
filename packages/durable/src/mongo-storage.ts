@@ -27,7 +27,7 @@
 //    connection outlives it (the server's TCP keepalive).
 //  - Vectors are scanned (the community server has no vector index): every query reads its scope's
 //    documents and ranks them here. Fine for thousands of documents; use a vector database at scale.
-import { createRequire } from 'node:module';
+import { requireOptionalPeer } from './optional-peer.js';
 import { cosineSimilarity } from 'ai';
 import { refuseUnknownNames } from '@gnldev/options';
 import { leafSuffix, runRecordKey } from './run-id-grammar.js';
@@ -69,7 +69,7 @@ interface Driver {
   MongoClient: new (url: string, opts?: Record<string, unknown>) => Any;
   Double: new (n: number) => unknown;
 }
-const driver = (): Driver => createRequire(import.meta.url)('mongodb') as Driver;
+const driver = (): Driver => requireOptionalPeer<Driver>('mongodb');
 
 /** A database of the `mongodb` driver (`MongoClient.db()`), as far as a companion store needs it. */
 export interface MongoDatabase {

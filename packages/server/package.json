@@ -5,7 +5,7 @@
   "engines": {
     "node": ">=22.13.0"
   },
-  "description": "Auto-REST + OpenAPI for @gnldev/durable agents: createGnl registry \u2192 HTTP router (run/resume/runs + openapi.json).",
+  "description": "Auto-REST + OpenAPI for @gnldev/durable agents: createGnl registry → HTTP router (run/resume/runs + openapi.json).",
   "keywords": [
     "ai",
     "agent",
@@ -54,11 +54,20 @@
     "@gnldev/durable": "workspace:^"
   },
   "devDependencies": {
+    "@fastify/middie": "^9.3.6",
     "@gnldev/durable": "workspace:*",
+    "@types/express": "^5.0.6",
+    "@types/koa": "^3.0.3",
+    "@types/koa-bodyparser": "^4.3.13",
     "ai": "^7.0.0",
+    "express": "^5.2.1",
+    "fastify": "^5.12.7",
+    "koa": "^3.2.1",
+    "koa-bodyparser": "^4.4.1",
+    "koa-connect": "^2.1.1",
     "zod": "^3.25.0"
   },
-  "author": "Karaca Y\u0131lmaz (https://gnl.dev)",
+  "author": "Karaca Yılmaz (https://gnl.dev)",
   "homepage": "https://gnl.dev",
   "bugs": {
     "url": "https://github.com/gnlhq/gnldev/issues"
