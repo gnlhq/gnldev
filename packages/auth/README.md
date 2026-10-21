@@ -145,6 +145,45 @@ for. A per-user logout time (`iat < loggedOutAt(sub)`) needs `iat` in the token:
 and `subjectTokenEndpoint` set it, but a token minted elsewhere may not — deny by `jti`, or refuse
 tokens with no `iat` in `isRevoked`.
 
+### A token your identity provider signed
+
+If Auth0, Clerk, Supabase or Firebase signs your users in, GNL can take the token they issue as is:
+give `endUsers` the provider's JWKS address instead of a key. The key a token names (`kid`) is fetched,
+cached for 10 minutes (`ttlMs`), and fetched again when the provider rotates (a key id not in the cache
+asks again, at most every 30 seconds: `refetchMs`). If the provider's endpoint is down, the last keys fetched keep working for an
+hour (`maxStaleMs`), and then nobody is let in until it answers. The algorithm comes from the key, never
+from the token: RS256, ES256 (P-256) and Ed25519.
+
+```ts
+import { roleAuth } from '@gnldev/auth';
+
+export const auth = roleAuth({
+  endUsers: {
+    orgId: 'acme',
+    // Auth0 — pin the issuer and your API's audience:
+    jwks: 'https://acme.eu.auth0.com/.well-known/jwks.json',
+    issuer: 'https://acme.eu.auth0.com/',
+    audience: 'https://api.acme.example',
+  },
+});
+```
+
+| Provider | `jwks` | Also set |
+|---|---|---|
+| Auth0 | `https://<tenant>/.well-known/jwks.json` | `issuer` `https://<tenant>/`, `audience` your API |
+| Clerk | `https://<frontend-api>/.well-known/jwks.json` | `issuer` your Frontend API URL |
+| Supabase (signing keys) | `https://<project-ref>.supabase.co/auth/v1/.well-known/jwks.json` | `audience` `authenticated` |
+| Supabase (legacy JWT secret) | — use `secret: <the project's JWT secret>` instead | `audience` `authenticated` |
+| Firebase | `https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com` | `issuer` `https://securetoken.google.com/<project>`, `audience` `<project>` |
+
+The rules above stay: only `sub` is read, the holder is a `subject` of `orgId`, and a token may live at
+most an hour unless you pass `isRevoked`. Auth0's API tokens last 24 hours by default — shorten the API's
+token lifetime to an hour, or give `isRevoked` and `maxTtlSec: 86400`. Clerk's session tokens last a
+minute and Supabase's and Firebase's an hour, so those need nothing.
+
+Measured with tokens shaped like each provider's (claims, `kid`, algorithm) against a JWKS endpoint the
+test serves — not against the providers' live services.
+
 ### Refreshing an end user's token
 
 GNL keeps no session, so refresh belongs to your app, whose session already knows whether the user is
