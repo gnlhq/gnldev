@@ -7,6 +7,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **A vector server that does not answer no longer holds a call forever** (`QdrantVectorStore`,
+  `ChromaVectorStore`, `WeaviateVectorStore`, `@gnldev/rag`). A server that took the connection and
+  never answered held a query indefinitely — measured, all three still waiting after 20 s. Each call now
+  has a deadline, `timeoutMs` (default 30 000 ms, as the A2A tool's), from sending it to the answer's
+  last byte, so a server that answers a byte at a time is cut too; the call fails with `… timed out
+  after 30000 ms` (measured after: 30.0–30.1 s). A write cut this way may still have landed; an upsert
+  writes by a derived id, so the same upsert again is safe. A `timeoutMs` that is not a number above 0
+  is refused at construction.
+
 ## [0.13.0] — 2026-10-20
 
 **Two more vector stores, measured like the rest.** `ChromaVectorStore` and `WeaviateVectorStore`

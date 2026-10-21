@@ -15,7 +15,12 @@ export interface RestService {
   result: (body: any) => unknown;
   /** What of a failed answer's body goes into the message, at most 200 characters. */
   detail: (body: any) => unknown;
+  /** How long one call may take, from sending it to the answer's last byte (default 30 000 ms). */
+  timeoutMs?: number;
 }
+
+/** The default `timeoutMs`, the same as the A2A tool's. */
+export const DEFAULT_TIMEOUT_MS = 30_000;
 
 /**
  * One JSON call over REST with `node:http`/`node:https`, a kept-alive connection, no dependency.
@@ -25,6 +30,10 @@ export interface RestService {
  * the same server; `curl` 1.5 ms) — 100 queries took 4.4 s instead of 77 ms.
  */
 export function restCall(url: string, service: RestService): RestCall {
+  const timeoutMs = service.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError(`@gnldev/rag: ${service.name} \`timeoutMs\` is a number of milliseconds above 0`);
+  }
   const base = new URL(url);
   const lib = base.protocol === 'https:' ? https : http;
   const agent = new lib.Agent({ keepAlive: true });
@@ -37,6 +46,7 @@ export function restCall(url: string, service: RestService): RestCall {
       headers: { 'content-type': 'application/json', ...(data ? { 'content-length': Buffer.byteLength(data) } : {}), ...service.headers },
     }, (res) => {
       const chunks: Buffer[] = [];
+      res.on('error', (e) => reject(new Error(`@gnldev/rag: ${where} failed: ${e.message}`)));
       res.on('data', (c: Buffer) => chunks.push(c));
       res.on('end', () => {
         const status = res.statusCode ?? 0;
@@ -50,6 +60,14 @@ export function restCall(url: string, service: RestService): RestCall {
         resolve(service.result(j));
       });
     });
+    // A deadline for the whole call, not an idle timer: a server that answers a byte at a time is cut
+    // too. A write cut here may still land on the server; the stores' writes are upserts by a derived
+    // id, so the same call again is safe.
+    const timer = setTimeout(() => {
+      reject(Object.assign(new Error(`@gnldev/rag: ${where} timed out after ${timeoutMs} ms`), { timedOut: true }));
+      req.destroy();
+    }, timeoutMs);
+    req.on('close', () => clearTimeout(timer));
     req.on('error', (e) => reject(new Error(`@gnldev/rag: ${where} failed: ${e.message}`)));
     req.end(data);
   });

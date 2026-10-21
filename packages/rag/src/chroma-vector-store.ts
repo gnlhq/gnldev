@@ -24,6 +24,8 @@ export interface ChromaVectorStoreOptions {
   collection?: string;
   /** Vector length the collection is created with; otherwise the first vector's. An existing collection's length wins. */
   dimension?: number;
+  /** How long one call to the server may take, from sending it to the answer's last byte (default 30 000 ms). Past it the call fails; a write may still have landed, and the same upsert again is safe. */
+  timeoutMs?: number;
 }
 
 /** A record's metadata as this store writes it: the document's id and labels; the record id is derived (`recordId`). */
@@ -108,7 +110,7 @@ export class ChromaVectorStore implements VectorStore {
     this.base = `/api/v2/tenants/${tenant}/databases/${database}/collections`;
     this.dimension = opts.dimension;
     this.call = restCall(opts.url, {
-      name: 'Chroma', headers: opts.apiKey ? { 'x-chroma-token': opts.apiKey } : {}, result: (j) => j, detail: (j) => j?.message ?? j?.error,
+      name: 'Chroma', timeoutMs: opts.timeoutMs, headers: opts.apiKey ? { 'x-chroma-token': opts.apiKey } : {}, result: (j) => j, detail: (j) => j?.message ?? j?.error,
     });
   }
 
