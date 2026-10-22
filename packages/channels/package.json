@@ -1,0 +1,60 @@
+{
+  "name": "@gnldev/channels",
+  "version": "0.13.0",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "description": "Agents on Slack and Telegram: a signed webhook in, a durable job per message (a platform retry is the same job), the agent run once, the reply sent once \u2014 no Redis, the store is the queue.",
+  "keywords": [
+    "ai",
+    "agent",
+    "llm",
+    "typescript",
+    "slack",
+    "telegram",
+    "chatbot",
+    "durable",
+    "exactly-once"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@gnldev/durable": "workspace:^",
+    "@gnldev/options": "workspace:^",
+    "@gnldev/queue": "workspace:^"
+  },
+  "devDependencies": {
+    "ai": "^7.0.132"
+  },
+  "author": "Karaca Y\u0131lmaz (https://gnl.dev)",
+  "homepage": "https://gnl.dev",
+  "bugs": {
+    "url": "https://github.com/gnlhq/gnldev/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gnlhq/gnldev.git",
+    "directory": "packages/channels"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

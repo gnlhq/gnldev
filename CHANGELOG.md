@@ -32,6 +32,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`@gnldev/channels`: agents on Slack (`slackChannel`).** A new package, Apache-2.0. A Slack message
+  comes in through the signed Events API webhook (a request without Slack's signature, or older than
+  five minutes, is 401) and becomes a queue job in the store named by Slack's event id, so Slack
+  redelivering it finds the same job; the job runs the agent under a `workKey` from the same id, so a
+  retried job lands on the same run and its tools do not run twice. The reply is a recorded tool call
+  carrying its idempotency key in Slack's message metadata: a post whose connection was cut is settled
+  by reading the thread (found: posted; not found: posted now) — measured both ways, one post each.
+  Each person's conversation is their own GNL thread and run, in the organization their workspace maps
+  to; an unlisted workspace is acknowledged and never run. No Redis. Not yet: approving from Slack,
+  posting the answer that follows an approval, Telegram.
+
 - **An eval gate for CI: `gnl eval` and thresholds (`@gnldev/evals`, `@gnldev/cli`).** A suite is a
   `*.eval.ts` file exporting `defineEval({ dataset, run, scorers, thresholds })`; `gnl eval` runs every
   suite under `./evals`, prints each scorer's mean against its threshold and exits 1 on a shortfall
