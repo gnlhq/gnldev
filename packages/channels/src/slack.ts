@@ -1,8 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import {
-  createGnl, scopeConfigToOrg, sealRequestContext, sealFieldsOf, user, withIdempotency, refuseConfigNames,
-  type CreateGnlConfig, type Storage, type Interrupt,
-} from '@gnldev/durable';
+import { refuseConfigNames, type CreateGnlConfig } from '@gnldev/durable';
+import { channelRuntime, runFor, postOnce, type ReplyTool } from './core.js';
 import { enqueue, createWorker, type JobCtx, type Worker, type QueueWorkerOptions } from '@gnldev/queue';
 import { refuseUnknownNames, optionNames } from '@gnldev/options';
 
@@ -127,23 +125,10 @@ export function slackChannel(config: CreateGnlConfig, opts: SlackChannelOptions)
   for (const k of ['signingSecret', 'botToken', 'agent'] as const) {
     if (typeof opts[k] !== 'string' || opts[k] === '') throw new TypeError(`@gnldev/channels: slackChannel needs \`${k}\``);
   }
-  if (!config.agents?.[opts.agent]) throw new TypeError(`@gnldev/channels: slackChannel's agent '${opts.agent}' is not in the config's \`agents\``);
-  const storage = (config as { storage?: Storage }).storage;
-  if (!storage?.work) throw new TypeError('@gnldev/channels: slackChannel needs a config with `storage` — its messages are queue jobs in the store');
-  const store: Storage = storage;
-  const work = storage.work;
+  const rt = channelRuntime('slackChannel', config, opts.agent);
   const now = opts.now ?? Date.now;
   const doFetch = opts.fetch ?? fetch;
   const api = (opts.apiUrl ?? 'https://slack.com/api').replace(/\/+$/, '');
-
-  // One instance per organization, over that organization's partition — as every door does.
-  const gnls = new Map<string, ReturnType<typeof createGnl>>();
-  const gnlFor = (org: string | undefined) => {
-    const key = org ?? '';
-    let g = gnls.get(key);
-    if (!g) gnls.set(key, (g = createGnl(org ? scopeConfigToOrg(config, org).config : config)));
-    return g;
-  };
 
   async function slack(method: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
     const res = await doFetch(`${api}/${method}`, {
@@ -162,7 +147,7 @@ export function slackChannel(config: CreateGnlConfig, opts: SlackChannelOptions)
    * for it — there: it was posted, record it; not there: it never was, post it. A post is never sent
    * twice, and a lost connection does not lose the reply.
    */
-  const replyTool = (channel: string, thread: string) => ({
+  const replyTool = (channel: string, thread: string): ReplyTool => ({
     description: 'post the reply to Slack',
     execute: async (args: { text: string; blocks?: unknown[] }, options: Record<string, unknown>) => {
       const key = (options as { idempotencyKey?: string }).idempotencyKey ?? '';
@@ -182,14 +167,6 @@ export function slackChannel(config: CreateGnlConfig, opts: SlackChannelOptions)
 
   const mac = (d: Decision) => createHmac('sha256', opts.signingSecret).update(JSON.stringify(['gnl-slack-decision', d.teamId, d.eventId, d.channel, d.user, d.ts, d.threadTs ?? null, d.toolCallId, d.toolName])).digest('base64url');
 
-  /** Posts once, under `key`: a recorded tool call in this job's journal (see `replyTool`). */
-  async function postOnce(ctx: JobCtx, channel: string, thread: string, key: string, message: { text: string; blocks?: unknown[] }): Promise<void> {
-    const { reply } = withIdempotency({ reply: replyTool(channel, thread) } as never, {
-      journal: ctx.journal, window: 'run', runId: ctx.runId, key: () => key, caller: ctx.caller,
-    });
-    await (reply as { execute: (a: unknown, o: unknown) => Promise<unknown> }).execute(message, { toolCallId: key, messages: [] });
-  }
-
   /**
    * Runs (or continues) the message's run and posts what came of it: the answer, or — when it stopped for
    * an approval — one message per stop with an Approve and a Deny button for each call. The run is named
@@ -198,20 +175,19 @@ export function slackChannel(config: CreateGnlConfig, opts: SlackChannelOptions)
   async function runAndAnswer(m: SlackJob | Decision, ctx: JobCtx, approvals?: Record<string, boolean>, prompt?: string): Promise<unknown> {
     const workspace = opts.workspaces[m.teamId];
     if (!workspace) return { ignored: 'workspace no longer listed' };
-    const org = workspace.orgId;
-    const caller = user(`slack:${m.teamId}:${m.user}`, org);
     const thread = m.threadTs ?? m.ts;
-    const result = await gnlFor(org).run(opts.agent, {
+    const result = await runFor(rt, opts.agent, {
       workKey: `slack:${m.teamId}:${m.eventId}`,
-      ...(prompt !== undefined ? { prompt } : {}),
       threadId: `slack:${m.teamId}:${m.channel}:${thread}:${m.user}`,
-      caller,
-      context: sealRequestContext({}, sealFieldsOf(caller, org)),
+      subject: `slack:${m.teamId}:${m.user}`,
+      ...(workspace.orgId ? { org: workspace.orgId } : {}),
+      ...(prompt !== undefined ? { prompt } : {}),
       ...(approvals ? { approvals } : {}),
-    }) as { runId: string; text?: string; interrupts?: Interrupt[] };
-    const asks = result.interrupts ?? [];
+    });
+    const asks = result.interrupts;
+    const tool = replyTool(m.channel, thread);
     if (asks.length === 0) {
-      await postOnce(ctx, m.channel, thread, `slack-reply:${result.runId}`, { text: result.text?.trim() || '(no answer)' });
+      await postOnce(ctx, tool, `slack-reply:${result.runId}`, { text: result.text?.trim() || '(no answer)' });
       return { runId: result.runId };
     }
     const studio = opts.studioUrl ? ` (or in Studio: ${opts.studioUrl.replace(/\/+$/, '')}/runs/${result.runId})` : '';
@@ -225,7 +201,7 @@ export function slackChannel(config: CreateGnlConfig, opts: SlackChannelOptions)
         { type: 'button', style: 'danger', text: { type: 'plain_text', text: 'Deny' }, action_id: DENY, value },
       ] });
     }
-    await postOnce(ctx, m.channel, thread, `slack-ask:${result.runId}:${asks.map((a) => a.toolCallId).join(',')}`, { text: `This needs an approval before I go on${studio}.`, blocks });
+    await postOnce(ctx, tool, `slack-ask:${result.runId}:${asks.map((a) => a.toolCallId).join(',')}`, { text: `This needs an approval before I go on${studio}.`, blocks });
     return { runId: result.runId, waiting: asks.map((a) => a.toolCallId) };
   }
 
@@ -251,7 +227,7 @@ export function slackChannel(config: CreateGnlConfig, opts: SlackChannelOptions)
     const allowed = by === d.user || (opts.approvers ? await opts.approvers({ teamId: d.teamId, userId: by, requesterId: d.user, toolName: d.toolName }) : false);
     if (!allowed) return Response.json({ response_type: 'ephemeral', replace_original: false, text: `Only <@${d.user}>${opts.approvers ? ' or an approver' : ''} can answer this.` });
     const job: DecisionJob = { ...d, approve: action.action_id === APPROVE, by };
-    await enqueue(work, SLACK_DECISION_JOB, job, {
+    await enqueue(rt.work, SLACK_DECISION_JOB, job, {
       id: `slack:${d.teamId}:decide:${d.eventId}:${d.toolCallId}`,
       resourceId: `slack:${d.teamId}:${d.user}`,
       ...(workspace.orgId ? { orgId: workspace.orgId } : {}),
@@ -260,7 +236,7 @@ export function slackChannel(config: CreateGnlConfig, opts: SlackChannelOptions)
   }
 
   let worker: Worker | undefined;
-  const ensureWorker = () => (worker ??= createWorker(store, { [SLACK_JOB]: runMessage as never, [SLACK_DECISION_JOB]: runDecision as never }, opts.workerOptions));
+  const ensureWorker = () => (worker ??= createWorker(rt.storage, { [SLACK_JOB]: runMessage as never, [SLACK_DECISION_JOB]: runDecision as never }, opts.workerOptions));
   if (opts.worker !== false) ensureWorker().start();
 
   return {
@@ -284,7 +260,7 @@ export function slackChannel(config: CreateGnlConfig, opts: SlackChannelOptions)
         teamId: body.team_id, eventId: body.event_id, channel: e.channel, user: e.user, text: askedText(e.text), ts: e.ts,
         ...(e.thread_ts ? { threadTs: e.thread_ts } : {}),
       };
-      await enqueue(work, SLACK_JOB, job, {
+      await enqueue(rt.work, SLACK_JOB, job, {
         id: `slack:${body.team_id}:${body.event_id}`,
         resourceId: `slack:${body.team_id}:${e.user}`,
         ...(workspace.orgId ? { orgId: workspace.orgId } : {}),

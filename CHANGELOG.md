@@ -44,7 +44,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Deny buttons for each call; only the requester (or someone `approvers` allows) may answer, a button's
   value is signed so a changed one decides nothing (401), one decision per call (a double click or
   Approve after Deny is the first decision), and the run's answer after the decision is posted once.
-  Not yet: a shared-thread mode, Telegram.
+  `telegramChannel`: the same for a Telegram bot — the webhook's
+  secret token checked (401 without it), a job per `update_id`, each person's own thread, the chats
+  served chosen by `chats` — with one difference, stated: a bot cannot read a chat's history, so a reply
+  whose connection was cut is left in doubt, never resent (at most once; measured both ways). Slack and
+  Telegram share one core (`core.ts`). Not yet: a shared-thread mode, Telegram approval buttons.
 
 - **An eval gate for CI: `gnl eval` and thresholds (`@gnldev/evals`, `@gnldev/cli`).** A suite is a
   `*.eval.ts` file exporting `defineEval({ dataset, run, scorers, thresholds })`; `gnl eval` runs every

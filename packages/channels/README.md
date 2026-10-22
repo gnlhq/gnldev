@@ -1,6 +1,6 @@
 # @gnldev/channels
 
-Agents on chat platforms. Slack today; Telegram next.
+Agents on chat platforms: Slack and Telegram.
 
 A message comes in through the platform's signed webhook and becomes a durable job in your store; the
 job runs the agent once and posts the reply once. A platform that redelivers a message — Slack does,
@@ -71,7 +71,44 @@ channels the bot is mentioned in (the reply is looked up there after a lost conn
     same decision, the first.
   - Buttons need **Interactivity** on in the Slack app, with the same request URL as the events.
 
-Not yet: a thread shared by everyone in it, Telegram.
+Not yet: a thread shared by everyone in it.
+
+## Telegram
+
+```ts
+import { telegramChannel } from '@gnldev/channels';
+import { SqliteStorage } from '@gnldev/durable/sqlite';
+import type { CreateGnlConfig } from '@gnldev/durable';
+
+declare const agents: CreateGnlConfig['agents'];
+
+const telegram = telegramChannel({ storage: new SqliteStorage('runs.db'), agents }, {
+  botToken: process.env.TELEGRAM_BOT_TOKEN!,        // <id>:<secret> from @BotFather, never in an error message
+  secretToken: process.env.TELEGRAM_WEBHOOK_SECRET!, // the secret_token you pass to setWebhook
+  agent: 'support',
+  // Who is served, and in which organization: a bot is reachable by anyone who finds it.
+  chats: (chat) => (chat.id === -1001234567890 ? { orgId: 'acme' } : undefined),
+  studioUrl: 'https://studio.acme.example',
+});
+
+export const handleTelegram = (req: Request) => telegram.handle(req);
+```
+
+Point the bot at it once: `setWebhook` with `url` = your mount and `secret_token` = `secretToken`.
+
+The promises are Slack's, with one difference:
+
+- **Only Telegram is heard:** an update without the webhook's secret token is 401.
+- **Only the chats `chats` serves are run**, in the organization it names; any other chat is acknowledged
+  and dropped.
+- **A message is run once:** a job named by Telegram's `update_id`, which Telegram keeps on redelivering
+  until it gets a 2xx.
+- **Each person's conversation is their own:** the chat (and forum topic) and the person.
+- **The reply is sent at most once — the difference.** A bot cannot read a chat's history, so a reply
+  whose connection was cut cannot be looked up: it is left in doubt and not sent again, where Slack's is
+  found or sent. Measured both ways: cut after Telegram took it, one message; cut before, none.
+- **A run waiting for an approval** says so with the run to open in Studio; Telegram buttons are not there
+  yet. `worker`, `workerOptions`, `apiUrl` and `fetch` work as Slack's.
 
 ## License
 
