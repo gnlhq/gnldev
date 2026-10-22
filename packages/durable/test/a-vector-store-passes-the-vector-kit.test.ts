@@ -2,7 +2,8 @@
 // (InMemory, SQLite, Postgres on pg-mem and, with GNL_PG_URL, on a real server; MySQL / MariaDB with
 // GNL_MYSQL_URL / GNL_MARIADB_URL; MongoDB with GNL_MONGO_URL) and @gnldev/rag's three
 // (InMemoryVectorStore, GraphRag and, with GNL_PGVECTOR_URL, the pgvector store; with GNL_QDRANT_URL, the
-// Qdrant store; with GNL_CHROMA_URL, the Chroma store; with GNL_WEAVIATE_URL, the Weaviate store). One kit, every store,
+// Qdrant store; with GNL_CHROMA_URL, the Chroma store; with GNL_WEAVIATE_URL, the Weaviate store; with GNL_ELASTICSEARCH_URL /
+// GNL_OPENSEARCH_URL, the Elasticsearch / OpenSearch store). One kit, every store,
 // the same answer — the rules live in storage.ts (`vectorQueryScope`, `vectorDeletePlan`,
 // `vectorWriteBatch`, `rankVectorMatches`), and this is what keeps a store from drifting off them.
 import { describe, it, afterAll } from 'vitest';
@@ -13,13 +14,15 @@ import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { vectorStoreConformance, type VectorStoreUnderTest } from '../src/testing.js';
 import { mysqlStores, mongoStores } from './real-backends.js';
-import { InMemoryVectorStore, GraphRag, PostgresVectorStore, QdrantVectorStore, ChromaVectorStore, WeaviateVectorStore } from '../../rag/src/index.js';
+import { InMemoryVectorStore, GraphRag, PostgresVectorStore, QdrantVectorStore, ChromaVectorStore, WeaviateVectorStore, ElasticsearchVectorStore, OpenSearchVectorStore } from '../../rag/src/index.js';
 
 const PG_URL = process.env.GNL_PG_URL;
 const PGVECTOR_URL = process.env.GNL_PGVECTOR_URL;
 const QDRANT_URL = process.env.GNL_QDRANT_URL;
 const CHROMA_URL = process.env.GNL_CHROMA_URL;
 const WEAVIATE_URL = process.env.GNL_WEAVIATE_URL;
+const ELASTICSEARCH_URL = process.env.GNL_ELASTICSEARCH_URL;
+const OPENSEARCH_URL = process.env.GNL_OPENSEARCH_URL;
 
 // A real server's stores get a schema of their own, dropped after the scenario, so a scenario never
 // sees another's rows. The `vector` type lives in `public`, created once: made under a per-scenario
@@ -75,6 +78,18 @@ if (WEAVIATE_URL) {
     const collection = `Vkit_${process.pid}_${Date.now().toString(36)}_${collections++}`;
     const drop = async () => { await fetch(`${WEAVIATE_URL.replace(/\/+$/, '')}/v1/schema/${collection}`, { method: 'DELETE' }); };
     return { vectors: new WeaviateVectorStore({ url: WEAVIATE_URL, collection }) as VectorStore, close: drop };
+  }]);
+}
+for (const [label, url, make] of [
+  ['Elasticsearch', ELASTICSEARCH_URL, (u: string, index: string) => new ElasticsearchVectorStore({ url: u, index })],
+  ['OpenSearch', OPENSEARCH_URL, (u: string, index: string) => new OpenSearchVectorStore({ url: u, index })],
+] as const) {
+  if (!url) continue;
+  let indexes = 0;
+  STORES.push([`rag ${label} (real)`, async () => {
+    const index = `vkit_${process.pid}_${Date.now().toString(36)}_${indexes++}`;
+    const drop = async () => { await fetch(`${url.replace(/\/+$/, '')}/${index}`, { method: 'DELETE' }); };
+    return { vectors: make(url, index) as VectorStore, close: drop };
   }]);
 }
 

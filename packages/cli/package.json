@@ -62,6 +62,7 @@
   "peerDependencies": {
     "@gnldev/auth": "workspace:^",
     "@gnldev/durable": "workspace:^",
+    "@gnldev/evals": "workspace:^",
     "@gnldev/memory": "workspace:^",
     "@gnldev/server": "workspace:^",
     "@gnldev/studio": "workspace:^",
@@ -75,13 +76,16 @@
     "@gnldev/durable": {
       "optional": true
     },
+    "@gnldev/evals": {
+      "optional": true
+    },
+    "@gnldev/memory": {
+      "optional": true
+    },
     "@gnldev/server": {
       "optional": true
     },
     "@gnldev/studio": {
-      "optional": true
-    },
-    "@gnldev/memory": {
       "optional": true
     },
     "@hono/node-server": {
@@ -94,6 +98,7 @@
   "devDependencies": {
     "@gnldev/auth": "workspace:^",
     "@gnldev/durable": "workspace:^",
+    "@gnldev/evals": "workspace:^",
     "@gnldev/memory": "workspace:^",
     "@gnldev/server": "workspace:^",
     "@gnldev/studio": "workspace:^",

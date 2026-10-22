@@ -104,6 +104,17 @@ order-9  step 1/3
   pending (awaiting result): charge[c]
 ```
 
+### `gnl eval` — an eval gate for CI
+
+`gnl eval [files or dirs…] [--journal .gnl/evals.db] [--resume <id>] [--json]` runs every `*.eval.ts`
+under `./evals` (or the paths given), prints each scorer's mean against its threshold, and exits 1 when a
+suite falls short, a case does not finish, or a threshold names a scorer the suite does not have. It needs
+no `gnl.config.ts`; a suite is a file whose default export is `defineEval` from `@gnldev/evals` (see its
+README). Each invocation runs every case again — results are kept by case and scorers, not by the code
+that produced them, so replaying an earlier run would hide the change a CI run asks about. `--resume <id>`
+continues an invocation that was cut off; the id is printed when it starts. `--json` prints the report
+for a step that reads it.
+
 ## Operate (mutating)
 | Command | What |
 |---|---|

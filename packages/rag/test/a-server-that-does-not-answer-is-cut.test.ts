@@ -1,4 +1,4 @@
-// The REST stores (Qdrant, Chroma, Weaviate) call their server through one transport (rest-call.ts).
+// The REST stores (Qdrant, Chroma, Weaviate, Elasticsearch, OpenSearch) call their server through one transport (rest-call.ts).
 // Before it had a deadline, a server that took the connection and never answered held a query forever:
 // measured, all three still waiting after 20 s (raporlar/2026-10-21-rest-timeout). Now one call may take
 // `timeoutMs` (default 30 s), from sending it to the answer's last byte.
@@ -8,12 +8,15 @@ import type { AddressInfo } from 'node:net';
 import { QdrantVectorStore } from '../src/qdrant-vector-store.js';
 import { ChromaVectorStore } from '../src/chroma-vector-store.js';
 import { WeaviateVectorStore } from '../src/weaviate-vector-store.js';
+import { ElasticsearchVectorStore, OpenSearchVectorStore } from '../src/search-vector-store.js';
 
 type Make = (url: string, extra?: { apiKey?: string; timeoutMs?: number }) => { query: (v: number[], k: number) => Promise<unknown[]> };
 const STORES: Array<[string, Make]> = [
   ['Qdrant', (url, extra) => new QdrantVectorStore({ url, ...extra })],
   ['Chroma', (url, extra) => new ChromaVectorStore({ url, ...extra })],
   ['Weaviate', (url, extra) => new WeaviateVectorStore({ url, ...extra })],
+  ['Elasticsearch', (url, extra) => new ElasticsearchVectorStore({ url, ...extra })],
+  ['OpenSearch', (url, { apiKey, ...extra } = {}) => new OpenSearchVectorStore({ url, ...extra, ...(apiKey ? { auth: { username: 'u', password: apiKey } } : {}) })],
 ];
 
 const servers: http.Server[] = [];
