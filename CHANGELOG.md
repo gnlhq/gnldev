@@ -32,6 +32,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **An end user's token from an identity provider (`endUsers.jwks`, `@gnldev/auth`).** `roleAuth` takes
+  the provider's JWKS address instead of a key, so a token Auth0, Clerk, Supabase or Firebase issued is
+  verified as is: the key the token names is fetched, cached for 10 minutes, and fetched again on
+  rotation — a key id not in the cache asks again at once, at most every 30 seconds (before, a rotated-in
+  key was refused until the TTL ran out). An outage serves the last good keys for `maxStaleMs` (1 hour),
+  then fails closed. ES256 (P-256) joins RS256 and Ed25519: Supabase's signing keys, the default for its
+  new projects, were refused. The JWKS cache moves from `@gnldev/auth-ee`'s Auth0 provider into
+  `@gnldev/auth` as `jwksSource`, and the Auth0 provider now uses it: every auth-ee test passes
+  unchanged except the one that recorded the rotated-in refusal as a known limit, now rewritten to the
+  new rule. Measured with tokens shaped like each provider's against a test-served JWKS, not the live
+  services.
+
 - **`ElasticsearchVectorStore` and `OpenSearchVectorStore` (`@gnldev/rag`): vector stores on
   Elasticsearch 9.x and OpenSearch 3.x, over the REST API, with no dependency.** 20 of 20 vector-kit
   scenarios on each (Elasticsearch 9.4, OpenSearch 3.9). Both servers refuse a zero vector in a cosine

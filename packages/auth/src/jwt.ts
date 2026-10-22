@@ -22,8 +22,9 @@ export interface JwtVerifyOptions {
   /** Shared secret for HS256 verification. If `secret` is given, only HS256 is accepted. */
   secret?: string;
   /**
-   * Public key for RS256/Ed25519 verification: PEM (`-----BEGIN...`) or, following the license.ts
-   * pattern, base64url DER (spki). The expected `alg` is auto-selected from the key type (rsa→RS256, ed25519→EdDSA).
+   * Public key for RS256/ES256/Ed25519 verification: PEM (`-----BEGIN...`) or, following the license.ts
+   * pattern, base64url DER (spki). The expected `alg` is auto-selected from the key type (rsa→RS256,
+   * ec P-256→ES256, ed25519→EdDSA).
    */
   publicKey?: string;
   /** Expected issuer (`iss` claim); unchecked if unset. */
@@ -130,6 +131,11 @@ export function verifyJwt(token: string, opts: JwtVerifyOptions, now: number): P
       } else if (key.asymmetricKeyType === 'rsa') {
         if (header.alg !== 'RS256') return null;
         verified = verifySignature('sha256', signingInput, key, sig);
+      } else if (key.asymmetricKeyType === 'ec' && key.asymmetricKeyDetails?.namedCurve === 'prime256v1') {
+        // ES256 (RFC 7518 §3.4): the signature is r‖s, 64 bytes, not DER — Supabase's signing keys,
+        // the default for its new projects, sign this way (measured: refused before this branch).
+        if (header.alg !== 'ES256') return null;
+        verified = verifySignature('sha256', signingInput, { key, dsaEncoding: 'ieee-p1363' }, sig);
       } else {
         return null; // unsupported key type
       }
