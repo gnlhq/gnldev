@@ -10,6 +10,8 @@ export { ChromaVectorStore } from './chroma-vector-store.js';
 export type { ChromaVectorStoreOptions } from './chroma-vector-store.js';
 export { WeaviateVectorStore } from './weaviate-vector-store.js';
 export type { WeaviateVectorStoreOptions } from './weaviate-vector-store.js';
+export { ElasticsearchVectorStore, OpenSearchVectorStore } from './search-vector-store.js';
+export type { ElasticsearchVectorStoreOptions, OpenSearchVectorStoreOptions } from './search-vector-store.js';
 export { createRagTool } from './rag-tool.js';
 export { llmReranker } from './rerank.js';
 export type { Reranker } from './rerank.js';
