@@ -105,6 +105,15 @@ type PrefixShape = {
 };
 
 /**
+ * The shape, once the boot has settled it. A statement shaped by it is built only after this resolves:
+ * read before the boot, `collate` is still '' and the guards unknown, and on an en_US.utf8 database a
+ * prefix range without `COLLATE "C"` matches nothing — a fresh process's first `listKeys`, owner lookup
+ * or `deletePrefix` answered "none" with no error (an erasure that came first in a process left the
+ * person's thread behind). The stores take this, not the shape, so no method can read it unsettled.
+ */
+type Settled = () => Promise<PrefixShape>;
+
+/**
  * An owner record REWRITTEN by a writer that leaves `owner` as it was — an older process, whose
  * statement sets the value and knows nothing of the column — goes back to "not placed" (NULL), so
  * every lookup reads it and decides from the record. Without it the column kept the previous person:
@@ -361,7 +370,7 @@ function incrSql(rows: number): string {
 }
 
 export class PostgresStorage implements Storage {
-  /** Filled in by ensureReady's probe; shared BY REFERENCE with PgRunJournal (see PrefixShape). */
+  /** Filled in by ensureReady's probe; the stores read it through `settled` (see Settled). */
   private prefixShape: PrefixShape = { collate: '' };
   /** Filled by ensureReady's budget probe; used to explain a connection refusal. */
   private connectionBudget?: { poolMax: number; serverMax: number };
@@ -524,7 +533,8 @@ export class PostgresStorage implements Storage {
         client.release?.(destroy);
       }
     };
-    this.runs = new PgRunJournal(q, tx, this.prefixShape);
+    const settled: Settled = () => this.ensureReady().then(() => this.prefixShape);
+    this.runs = new PgRunJournal(q, tx, settled);
     // The run journal answers for its store's liveness too (see SqliteStorage).
     Object.defineProperty(this.runs, 'processLiveness', { value: () => this.processLiveness(), enumerable: false, configurable: true });
     // A1 — DOWNGRADE THE PORT, do not throw. `connect` is a synchronous check, so there is no reason
@@ -540,7 +550,7 @@ export class PostgresStorage implements Storage {
       this.memory = new PgMemoryStore(q, tx, () => this.advisoryLocks);
     }
     this.vectors = new PgVectorStore(q, tx);
-    this.work = new PgWorkStore(q, tx, this.prefixShape);
+    this.work = new PgWorkStore(q, tx, settled);
     markWorkOf(this);
     this.cache = new PgCacheStore(q);
     this.meta = new PgMetaStore(q);
@@ -1025,14 +1035,12 @@ export class PostgresStorage implements Storage {
   }
 
   /**
-   * A step that reads through the adapter, run on a booted one. Some of the adapter's SQL is shaped by
-   * what the boot settles — the collation its key ranges need (`COLLATE "C"` on a linguistic database),
-   * whether the relation guards hold — and a statement built before the boot is built without it: on an
-   * en_US.utf8 database the first `listKeys('__org__:')` of an unbooted instance matched nothing, so the
-   * `thread-records` step saw no organization and called every scope complete (measured on a store
-   * 19b94c3f wrote: acme's threads were marked only by a second `gnl upgrade`). Before this step existed
-   * the CLI booted the store first; a store whose `run-status` step is pending refuses to boot, so each
-   * step boots it once the steps before it have run.
+   * A step that reads through the adapter, run on a booted one. Before this step existed the CLI booted
+   * the store first; a store whose `run-status` step is pending refuses to boot, so each step boots it
+   * once the steps before it have run. (This wrapper was also where an unbooted instance's first
+   * `listKeys('__org__:')` matching nothing on en_US.utf8 was first seen — the `thread-records` step then
+   * called every scope complete. The adapter itself now builds such statements only after the boot:
+   * see Settled.)
    */
   private booted(step: UpgradeStep): UpgradeStep {
     const plan = step.plan;
@@ -1327,7 +1335,7 @@ function pgRunSummary(x: any): RunSummary {
 }
 
 class PgRunJournal implements RunJournal {
-  constructor(private q: Q, private tx: Tx, private shape: PrefixShape) { withBirth(this as never); /* the birth a package without this one reaches through it (run-identity.ts) */ }
+  constructor(private q: Q, private tx: Tx, private settled: Settled) { withBirth(this as never); /* the birth a package without this one reaches through it (run-identity.ts) */ }
   async get<T = unknown>(key: string): Promise<T | undefined> {
     const r = await this.q('SELECT value FROM gnl_run_journal WHERE key = $1', [key]);
     return r.rows[0] ? deserialize<T>(r.rows[0].value) : undefined;
@@ -1638,11 +1646,12 @@ class PgRunJournal implements RunJournal {
    * — and trusts the columns from the first answer that it is gone. Settled processes ask nothing.
    */
   private async relationsTrusted(): Promise<boolean> {
-    if (this.shape.relationGuard) return true;
-    if (!this.shape.guardsInstalled) return false;
+    const shape = await this.settled();
+    if (shape.relationGuard) return true;
+    if (!shape.guardsInstalled) return false;
     const r = await this.q(`SELECT 1 AS x FROM gnl_meta WHERE k = $1`, [RELATIONS_VERIFY_KEY]);
-    if (r.rows.length === 0) this.shape.relationGuard = true;
-    return this.shape.relationGuard === true;
+    if (r.rows.length === 0) shape.relationGuard = true;
+    return shape.relationGuard === true;
   }
 
   /**
@@ -1650,7 +1659,8 @@ class PgRunJournal implements RunJournal {
    * half over the owner-record index, each record decided from its value.
    */
   async listOwnerRecords(resourceId: string, opts?: { prefix?: string }): Promise<string[]> {
-    const c = this.shape.collate;
+    const shape = await this.settled();
+    const c = shape.collate;
     if (!(await this.relationsTrusted())) {
       // Nothing keeps the column true here (no OWNER_UNPLACE): every owner record, decided from itself.
       const all = pgRange('key', c, opts?.prefix ?? '', 1);
@@ -1670,14 +1680,16 @@ class PgRunJournal implements RunJournal {
 
   /** See RelationPlacer and `verify-relations`. Nothing to verify where the columns are never trusted (no guards). */
   async requestRelationsVerify(): Promise<void> {
-    if (!this.shape.guardsInstalled) return;
+    const shape = await this.settled();
+    if (!shape.guardsInstalled) return;
     await this.q(`INSERT INTO gnl_meta (k, v) VALUES ($1, $2) ON CONFLICT (k) DO NOTHING`, [RELATIONS_VERIFY_KEY, String(Date.now())]);
-    this.shape.relationGuard = false;
+    shape.relationGuard = false;
   }
 
   /** See the sqlite twin. */
   async relationsPending(): Promise<boolean> {
-    if (this.shape.guardsInstalled) {
+    const shape = await this.settled();
+    if (shape.guardsInstalled) {
       // Placements to verify.
       const v = await this.q(`SELECT 1 AS x FROM gnl_meta WHERE k = $1`, [RELATIONS_VERIFY_KEY]);
       if (v.rows.length) return true;
@@ -1694,7 +1706,8 @@ class PgRunJournal implements RunJournal {
 
   /** Owner records not placed yet, after `after` in key order, one page. */
   private async unplacedOwners(after: string): Promise<Array<{ key: string; value: string }>> {
-    const c = this.shape.collate;
+    const shape = await this.settled();
+    const c = shape.collate;
     return (await this.q(
       `SELECT key, value FROM gnl_run_journal WHERE owner IS NULL AND key LIKE '${OWNER_RECORD_LIKE}' AND key${c} > $1 ORDER BY key${c} LIMIT $2`,
       [after, PLACE_PAGE],
@@ -1712,12 +1725,13 @@ class PgRunJournal implements RunJournal {
    * @internal — `storage.upgrade({ only: ['relations'] })` runs it.
    */
   async placeRelations(): Promise<{ runs: number; owners: number; analyzed: boolean }> {
+    const shape = await this.settled();
     let runs = 0;
     let owners = 0;
     // Placements made while nothing guarded them (RELATIONS_VERIFY_KEY): cleared, a page at a time, and
     // placed again below from the records. A run placed by a live writer meanwhile may be cleared too —
     // unplaced is always correct, and it is placed again by this pass or the next.
-    const verify = this.shape.guardsInstalled === true
+    const verify = shape.guardsInstalled === true
       && (await this.q(`SELECT 1 AS x FROM gnl_meta WHERE k = $1`, [RELATIONS_VERIFY_KEY])).rows.length > 0;
     if (verify) {
       while (Number((await this.q(`UPDATE gnl_runs SET resource_id = NULL, thread_id = NULL WHERE run_id IN
@@ -1753,7 +1767,7 @@ class PgRunJournal implements RunJournal {
       const last = page[page.length - 1]!;
       after = { at: Number(last.created_at), runId: last.run_id };
     }
-    const c = this.shape.collate;
+    const c = shape.collate;
     for (let after = '';;) {
       const { got, last, placed } = await againOnConflict(() => this.tx(async (q) => {
         const rows = (await q(
@@ -1785,7 +1799,7 @@ class PgRunJournal implements RunJournal {
     // without ANALYZE (pg-mem) says so in the report; nothing about the answers depends on it.
     if (verify) {
       await this.q(`DELETE FROM gnl_meta WHERE k = $1`, [RELATIONS_VERIFY_KEY]);
-      this.shape.relationGuard = true;
+      shape.relationGuard = true;
     }
     const analyzed = runs + owners === 0 ? false
       : await this.q('ANALYZE gnl_runs').then(() => this.q('ANALYZE gnl_run_journal')).then(() => true, () => false);
@@ -1793,8 +1807,9 @@ class PgRunJournal implements RunJournal {
   }
 
   async readRange<T = unknown>(prefix: string, opts: { after?: string; limit: number; desc?: boolean }): Promise<Array<[string, T]>> {
+    const shape = await this.settled();
     // Byte order under COLLATE "C", for the reason listKeys gives below.
-    const c = this.shape.collate;
+    const c = shape.collate;
     const rg = pgRange('key', c, prefix, 1);
     const params: unknown[] = [...rg.params];
     let after = '';
@@ -1805,6 +1820,7 @@ class PgRunJournal implements RunJournal {
   }
 
   async listKeys(prefix: string, opts?: { limit?: number }): Promise<string[]> {
+    const shape = await this.settled();
     // COLLATE "C" is load-bearing, not a micro-optimisation. Under a linguistic collation (en_US.utf8,
     // the default of nearly every managed Postgres) string comparison is NOT byte order: U+FFFF is a
     // noncharacter and collates as if absent, so `key < prefix || U+FFFF` reduces to `key < prefix` and
@@ -1815,7 +1831,7 @@ class PgRunJournal implements RunJournal {
     // unaffected: its default collation IS byte order. The gnl_*_cprefix indexes below are declared
     // with the same collation so these stay index-backed range scans rather than seq scans.
     // Same upper bound as the SQLite approach: prefixUpperBound(prefix).
-    const c = this.shape.collate;
+    const c = shape.collate;
     const rg = pgRange('key', c, prefix, 1);
     // `key` tie-breaker: Postgres does not guarantee order for equal ORDER BY keys, and entries written
     // in the same millisecond (parallel tool calls) could otherwise come back in a different order on
@@ -1844,7 +1860,8 @@ class PgRunJournal implements RunJournal {
    * organization's) to find the few that matter cost about half as much again (measured on 300 000 rows).
    */
   async deletePrefix(prefix: string): Promise<number> {
-    const c = this.shape.collate;
+    const shape = await this.settled();
+    const c = shape.collate;
     const cut = runsCutBy(prefix);
     const jr = pgRange('key', c, prefix, 1);
     // The records that name a cut-into run: an entry by its row's run id, an `:input` or an outcome record by its key.
@@ -1905,6 +1922,7 @@ class PgRunJournal implements RunJournal {
    * comment for the full rationale.
    */
   async listRuns(q?: ListQuery): Promise<Page<RunSummary>> {
+    const shape = await this.settled();
     // The column the summaries read, so a filtered page cannot disagree with a full scan.
     const statusCond = runStatusSql(q);
     const toSummary = pgRunSummary;
@@ -1947,7 +1965,7 @@ class PgRunJournal implements RunJournal {
           [...params, take, skip],
         );
       return r.rows.map((x: any) => ({ summary: toSummary(x), at: Number(x.created_at) }));
-    }, (n) => `$${n}`, trusted, (prefix, from) => pgRange('r.run_id', this.shape.collate, prefix, from)); // the columns, only where both guards keep them true
+    }, (n) => `$${n}`, trusted, (prefix, from) => pgRange('r.run_id', shape.collate, prefix, from)); // the columns, only where both guards keep them true
   }
 
   /**
@@ -2027,7 +2045,8 @@ class PgRunJournal implements RunJournal {
    * range `listRuns({ runIdPrefix })` reads, so the count and the listing agree byte for byte.
    */
   async countRuns(q?: { runIdPrefix?: string }): Promise<number> {
-    const rg = q?.runIdPrefix ? pgRange('run_id', this.shape.collate, q.runIdPrefix, 1) : undefined;
+    const shape = await this.settled();
+    const rg = q?.runIdPrefix ? pgRange('run_id', shape.collate, q.runIdPrefix, 1) : undefined;
     const r = await this.q(`SELECT COUNT(*) AS n FROM gnl_runs${rg ? ` WHERE ${rg.where}` : ''}`, rg?.params ?? []);
     return Number(r.rows[0]?.n ?? 0);
   }
@@ -2042,6 +2061,7 @@ class PgRunJournal implements RunJournal {
    * and nothing else.
    */
   async listRunsChangedSince(cursor?: string, opts?: { limit?: number; since?: number; runIdPrefix?: string }): Promise<{ items: RunChange[]; nextCursor?: string }> {
+    const shape = await this.settled();
     const pos = decodeChangeCursor(cursor);
     const limit = opts?.limit ?? 200;
     const conds: string[] = [];
@@ -2054,7 +2074,7 @@ class PgRunJournal implements RunJournal {
       params.push(opts.since);
     }
     if (opts?.runIdPrefix) {
-      const rg = pgRange('r.run_id', this.shape.collate, opts.runIdPrefix, params.length + 1);
+      const rg = pgRange('r.run_id', shape.collate, opts.runIdPrefix, params.length + 1);
       conds.push(rg.where);
       params.push(...rg.params);
     }
@@ -2585,10 +2605,10 @@ const NUMBER_NEW_SQL = `WITH cand AS (
   WHERE w.ctid = cand.t AND w.ns = $1 AND w.seq = 0`;
 
 class PgWorkStore implements WorkStore {
-  /** `shape` is shared BY REFERENCE with the journal (see PrefixShape): the prefix comparison below
-   *  needs the same collation clause the probe settled on, or a range scan can miss rows on a
-   *  non-C collation — the exact failure the journal's deletePrefix already guards against. */
-  constructor(private q: Q, private tx: Tx, private shape: PrefixShape) {}
+  /** `settled` is the journal's (see Settled): the prefix comparison below needs the same collation
+   *  clause the probe settled on, or a range scan can miss rows on a non-C collation — the exact
+   *  failure the journal's deletePrefix already guards against. */
+  constructor(private q: Q, private tx: Tx, private settled: Settled) {}
   /** `false` once the engine has refused `NUMBER_NEW_SQL` (pg-mem: no data-modifying CTE, no window functions). */
   private cteDml = true;
   /** `true` once the database's default isolation has refused the numbering statement (40001): see `numberNew`. */
@@ -2694,7 +2714,8 @@ class PgWorkStore implements WorkStore {
   }
   /** FAZ-9: both families, one prefix (see the sqlite note). */
   async deletePrefix(prefix: string): Promise<number> {
-    const c = this.shape.collate;
+    const shape = await this.settled();
+    const c = shape.collate;
     const lr = pgRange('ns', c, prefix, 1);
     const l = await this.q(`DELETE FROM gnl_work_log WHERE ${lr.where}`, lr.params);
     const kr = pgRange('key', c, prefix, 1);
@@ -2705,7 +2726,8 @@ class PgWorkStore implements WorkStore {
    *  A byte range under the probed collation, like `deletePrefix`: literal (no LIKE, so `%`, `_` and
    *  `\` in an id are characters, not wildcards) and exact on a linguistic collation. One statement. */
   async deleteIdPrefix(idPrefix: string): Promise<number> {
-    const r = pgRange('id', this.shape.collate, idPrefix, 1);
+    const shape = await this.settled();
+    const r = pgRange('id', shape.collate, idPrefix, 1);
     return Number((await this.q(`DELETE FROM gnl_work_log WHERE ${r.where}`, r.params)).rowCount ?? 0);
   }
 }

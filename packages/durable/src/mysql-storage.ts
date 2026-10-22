@@ -276,6 +276,13 @@ export interface MysqlStorageOptions {
 
 /** What `MysqlStorage` shares with its ports: the database name (lock namespaces), settled at boot. */
 type Shared = { db: string };
+/**
+ * `Shared` once the boot has settled it. A lock name is built only after this resolves: built before the
+ * boot (as a transaction's argument, before the transaction waits for it), `db` was still '' and a fresh
+ * process's first append to a thread took another lock than every later append to it — the two were not
+ * serialized. The memory store takes this, not `Shared`, so it cannot read the name unsettled.
+ */
+type Settled = () => Promise<Shared>;
 
 export class MysqlStorage implements Storage {
   readonly name = 'mysql';
@@ -345,7 +352,7 @@ export class MysqlStorage implements Storage {
     };
     this.runs = new MyRunJournal(q, tx);
     Object.defineProperty(this.runs, 'processLiveness', { value: () => this.processLiveness(), enumerable: false, configurable: true });
-    this.memory = new MyMemoryStore(q, tx, this.shared);
+    this.memory = new MyMemoryStore(q, tx, () => this.ensureReady().then(() => this.shared));
     this.vectors = new MyVectorStore(q, tx);
     this.work = new MyWorkStore(q, tx);
     markWorkOf(this);
@@ -1102,9 +1109,10 @@ function lockWaitAdvice(e: unknown, threadId: string, rows: number): unknown {
 }
 
 class MyMemoryStore implements MemoryStore {
-  constructor(private q: Q, private tx: Tx, private shared: Shared) {}
-  private lock(threadId: string): TxOptions {
-    return { lock: { name: lockName('t', this.shared.db, threadId), timeoutS: THREAD_LOCK_WAIT_S, what: `thread '${threadId}'` } };
+  constructor(private q: Q, private tx: Tx, private settled: Settled) {}
+  private async lock(threadId: string): Promise<TxOptions> {
+    const { db } = await this.settled();
+    return { lock: { name: lockName('t', db, threadId), timeoutS: THREAD_LOCK_WAIT_S, what: `thread '${threadId}'` } };
   }
   async upsertThread(rec: ThreadRecord): Promise<void> {
     await this.q(
@@ -1140,7 +1148,7 @@ class MyMemoryStore implements MemoryStore {
       if (legacy !== undefined) await q('DELETE FROM gnl_working_memory WHERE scope_id = $1', [legacy]);
       await q('DELETE FROM gnl_observations WHERE thread_id = $1', [id]);
       await q('DELETE FROM gnl_message_batches WHERE thread_id = $1', [id]);
-    }, this.lock(id));
+    }, await this.lock(id));
   }
   /** One transaction under the thread's lock: the batch's marker claimed first, then its rows (see PgMemoryStore.appendMessagesOnce). */
   async appendMessagesOnce(threadId: string, rows: MessageAppend[], batchKey: string): Promise<boolean> {
@@ -1154,7 +1162,7 @@ class MyMemoryStore implements MemoryStore {
       for (const r of rows) await this.insertMessage(q, threadId, r, r.seq ?? next++);
       await q('UPDATE gnl_message_batches SET seq_from = $1, seq_to = $2 WHERE thread_id = $3 AND batch_key = $4', [from, next, threadId, batchKey]);
       return true;
-    }, this.lock(threadId)).catch((e: unknown) => { throw lockWaitAdvice(e, threadId, rows.length); });
+    }, await this.lock(threadId)).catch((e: unknown) => { throw lockWaitAdvice(e, threadId, rows.length); });
   }
   /** One transaction under the thread's lock, for every append, explicit positions too (see PgMemoryStore.appendMessages). */
   async appendMessages(threadId: string, rows: MessageAppend[]): Promise<void> {
@@ -1164,7 +1172,7 @@ class MyMemoryStore implements MemoryStore {
       let next = 0;
       if (assign) next = Number((await q('SELECT COALESCE(MAX(seq), -1) + 1 AS n FROM gnl_messages WHERE thread_id = $1', [threadId])).rows[0].n);
       for (const r of rows) await this.insertMessage(q, threadId, r, r.seq ?? next++);
-    }, this.lock(threadId)).catch((e: unknown) => { throw lockWaitAdvice(e, threadId, rows.length); });
+    }, await this.lock(threadId)).catch((e: unknown) => { throw lockWaitAdvice(e, threadId, rows.length); });
   }
   /**
    * One message row. A caller-supplied position that is already written is the documented idempotent
@@ -1198,7 +1206,7 @@ class MyMemoryStore implements MemoryStore {
       if (!b) return 0;
       await q('DELETE FROM gnl_message_batches WHERE thread_id = $1 AND batch_key = $2', [threadId, batchKey]);
       return (await q('DELETE FROM gnl_messages WHERE thread_id = $1 AND seq >= $2 AND seq < $3', [threadId, Number(b.seq_from), Number(b.seq_to)])).rowCount;
-    }, this.lock(threadId));
+    }, await this.lock(threadId));
   }
   async deletePartition(partition: string): Promise<number> {
     assertOrganizationPartition(partition);

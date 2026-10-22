@@ -7,7 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.14.0] — 2026-10-22
+## [0.14.0] — 2026-10-23
 
 **Agents where people talk, measured like everything else.** A new package, `@gnldev/channels`, runs an
 agent on Slack and Telegram: a message is a durable job named by the platform's id for it (a redelivery
@@ -29,6 +29,21 @@ and Koa, and `@gnldev/durable` building inside Next.js.
 
 
 ### Fixed
+
+- **A Postgres store's first call answers as a booted one** (`@gnldev/durable`). The boot settles the
+  collation key ranges need (`COLLATE "C"` on a linguistic database) and whether the relation guards
+  hold, and some statements were built from it before the boot had run. On an en_US.utf8 database — the
+  default of nearly every managed Postgres — a prefix range without `COLLATE "C"` matches nothing, with no
+  error: a fresh process's first `listKeys`, `readRange`, owner lookup, run listing by id prefix or
+  `deletePrefix` answered "none". An `eraseSubject` that was the first thing a process did erased the
+  person's runs and owner records and left their thread's messages (measured: 1 in about 10 runs of a
+  two-process erasure test). The journal and the work store now read what the boot settles only once it
+  has run; a fresh store's first call of each of these now answers as a booted store's.
+
+- **A MySQL store's first append to a thread takes the thread's lock** (`@gnldev/durable`). The lock is
+  named from the database, which the boot reads; the name was built before the boot, so a fresh process's
+  first append locked another name than every later append to that thread, and was not serialized with
+  another process's. It is now built after the boot.
 
 - **`WeaviateVectorStore` waits for a new collection's shards** (`@gnldev/rag`). A collection another
   process had just made was in the schema before its index existed: public CI answered a query "tried to
