@@ -28,3 +28,7 @@ export type { TrajectoryScorerOptions, TrajectoryWeights, TrajectorySample } fro
 // P1.3 4 free, deterministic, model-free text scorers (no llm-judge cost).
 export { contentSimilarity, keywordCoverage, textualDifference, answerSimilarity } from './text-scorers.js';
 export type { KeywordCoverageOptions } from './text-scorers.js';
+export { checkEvalThresholds, assertEvalThresholds, EvalThresholdError } from './thresholds.js';
+export type { EvalThreshold, EvalThresholdFailure } from './thresholds.js';
+export { defineEval } from './define-eval.js';
+export type { EvalSpec } from './define-eval.js';

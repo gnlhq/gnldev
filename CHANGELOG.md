@@ -32,6 +32,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **An eval gate for CI: `gnl eval` and thresholds (`@gnldev/evals`, `@gnldev/cli`).** A suite is a
+  `*.eval.ts` file exporting `defineEval({ dataset, run, scorers, thresholds })`; `gnl eval` runs every
+  suite under `./evals`, prints each scorer's mean against its threshold and exits 1 on a shortfall
+  (`--json` for a step that reads the report). A threshold is a least mean, or `{ every }` per case. A
+  suite also fails when a case does not finish — its 0 used to be averaged in, so a lenient mean could
+  pass over a crash — and when a threshold names a scorer the suite lacks, so a typo cannot leave a gate
+  open. Every invocation runs its cases again (a memo keyed by case and scorers would replay results
+  the changed code never produced); `--resume <id>` continues one that was cut off. In a test,
+  `assertEvalThresholds` throws an `EvalThresholdError` that lists each shortfall.
+
 - **An end user's token from an identity provider (`endUsers.jwks`, `@gnldev/auth`).** `roleAuth` takes
   the provider's JWKS address instead of a key, so a token Auth0, Clerk, Supabase or Firebase issued is
   verified as is: the key the token names is fetched, cached for 10 minutes, and fetched again on
