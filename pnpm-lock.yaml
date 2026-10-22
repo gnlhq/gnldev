@@ -383,6 +383,22 @@ importers:
         specifier: workspace:*
         version: link:../durable
 
+  packages/channels:
+    dependencies:
+      '@gnldev/durable':
+        specifier: workspace:^
+        version: link:../durable
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
+      '@gnldev/queue':
+        specifier: workspace:^
+        version: link:../queue
+    devDependencies:
+      ai:
+        specifier: ^7.0.132
+        version: 7.0.143(zod@4.6.5)
+
   packages/chat-adapter:
     dependencies:
       '@gnldev/auth':
@@ -420,6 +436,9 @@ importers:
       '@gnldev/durable':
         specifier: workspace:^
         version: link:../durable
+      '@gnldev/evals':
+        specifier: workspace:^
+        version: link:../evals
       '@gnldev/memory':
         specifier: workspace:^
         version: link:../memory
@@ -4769,6 +4788,13 @@ snapshots:
       '@vercel/oidc': 3.2.0
       zod: 3.25.76
 
+  '@ai-sdk/gateway@4.0.116(zod@4.6.5)':
+    dependencies:
+      '@ai-sdk/provider': 4.0.29
+      '@ai-sdk/provider-utils': 5.0.62(zod@4.6.5)
+      '@vercel/oidc': 3.2.0
+      zod: 4.6.5
+
   '@ai-sdk/gateway@4.0.92(zod@3.25.76)':
     dependencies:
       '@ai-sdk/provider': 4.0.18
@@ -4821,6 +4847,15 @@ snapshots:
       eventsource-parser: 3.1.1
       undici: 7.30.0
       zod: 3.25.76
+
+  '@ai-sdk/provider-utils@5.0.62(zod@4.6.5)':
+    dependencies:
+      '@ai-sdk/provider': 4.0.29
+      '@standard-schema/spec': 1.1.0
+      '@workflow/serde': 4.1.0
+      eventsource-parser: 3.1.1
+      undici: 7.30.0
+      zod: 4.6.5
 
   '@ai-sdk/provider@4.0.18':
     dependencies:
@@ -6181,6 +6216,13 @@ snapshots:
       '@ai-sdk/provider': 4.0.29
       '@ai-sdk/provider-utils': 5.0.62(zod@3.25.76)
       zod: 3.25.76
+
+  ai@7.0.143(zod@4.6.5):
+    dependencies:
+      '@ai-sdk/gateway': 4.0.116(zod@4.6.5)
+      '@ai-sdk/provider': 4.0.29
+      '@ai-sdk/provider-utils': 5.0.62(zod@4.6.5)
+      zod: 4.6.5
 
   ajv-formats@3.0.1(ajv@8.20.0):
     optionalDependencies:
