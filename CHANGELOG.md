@@ -11,6 +11,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`WeaviateVectorStore` waits for a new collection's shards** (`@gnldev/rag`). A collection another
+  process had just made was in the schema before its index existed: public CI answered a query "tried to
+  browse non-existing index" right after the second maker was told the collection already existed (the
+  same race as Elasticsearch's 503, measured there 20 of 20). The store now reads the collection's shard
+  status once, when it first meets the collection, until every shard is READY (50 ms steps, 30 s at most)
+  — both as its maker and as the second one.
+
 - **`@gnldev/durable` builds inside a Next.js app** (and any bundler that resolves what it reads). An App
   Router route that imported `@gnldev/durable` and ran on memory failed `next build` (Next.js 16.4,
   Turbopack): "Module not found: Can't resolve 'pg'" (twice) and "'@gnldev/tool-schema'" — optional

@@ -50,6 +50,7 @@ describe('WeaviateVectorStore — without a server', () => {
     let graphql = 0;
     const server = http.createServer((req, res) => {
       res.writeHead(200, { 'content-type': 'application/json' });
+      if (req.method === 'GET' && req.url!.endsWith('/shards')) return res.end(JSON.stringify([{ name: 's1', status: 'READY' }]));
       if (req.method === 'GET') return res.end(JSON.stringify({ class: 'GnlVectors', description: '@gnldev/rag vectors, gnl_dim=2' }));
       graphql++;
       if (graphql <= refusals) return res.end(JSON.stringify({ errors: [{ message: message('GnlVectors') }] }));
@@ -61,6 +62,32 @@ describe('WeaviateVectorStore — without a server', () => {
     await new Promise<void>((r) => server.close(() => r()));
     return { out, graphql };
   }
+
+  it('a collection whose index does not exist yet is waited for: its shards are read until READY, then it is queried', async () => {
+    // Public CI (gnldev#34): a second maker queried a collection that was in the schema before its index
+    // existed — "tried to browse non-existing index". The store reads the shards' status first.
+    const seen: string[] = [];
+    let shardReads = 0;
+    const server = http.createServer((req, res) => {
+      seen.push(`${req.method} ${req.url}`);
+      if (req.url!.endsWith('/shards')) {
+        shardReads++;
+        res.writeHead(shardReads === 1 ? 404 : 200, { 'content-type': 'application/json' });
+        if (shardReads === 1) return res.end(JSON.stringify({ error: [{ message: 'non-existing index' }] }));
+        return res.end(JSON.stringify([{ name: 's1', status: shardReads < 3 ? 'INDEXING' : 'READY' }]));
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      if (req.method === 'GET') return res.end(JSON.stringify({ class: 'GnlVectors', description: '@gnldev/rag vectors, gnl_dim=2' }));
+      res.end(JSON.stringify({ data: { Get: { GnlVectors: [] } } }));
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+    const store = new WeaviateVectorStore({ url: `http://127.0.0.1:${(server.address() as AddressInfo).port}` });
+    expect(await store.query([1, 0], 1)).toEqual([]);
+    expect(await store.query([1, 0], 1)).toEqual([]);
+    await new Promise<void>((r) => server.close(() => r()));
+    expect(shardReads).toBe(3); // until READY, and once per store
+    expect(seen.findIndex((l) => l.startsWith('POST /v1/graphql'))).toBeGreaterThan(seen.lastIndexOf('GET /v1/schema/GnlVectors/shards'));
+  });
 
   it('a collection GraphQL does not know yet is asked again: the answer comes once it does', async () => {
     expect(await lagging(3)).toEqual({ out: ['x'], graphql: 4 });
