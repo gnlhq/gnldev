@@ -40,8 +40,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   carrying its idempotency key in Slack's message metadata: a post whose connection was cut is settled
   by reading the thread (found: posted; not found: posted now) — measured both ways, one post each.
   Each person's conversation is their own GNL thread and run, in the organization their workspace maps
-  to; an unlisted workspace is acknowledged and never run. No Redis. Not yet: approving from Slack,
-  posting the answer that follows an approval, Telegram.
+  to; an unlisted workspace is acknowledged and never run. No Redis. A run that stops for an approval posts Approve /
+  Deny buttons for each call; only the requester (or someone `approvers` allows) may answer, a button's
+  value is signed so a changed one decides nothing (401), one decision per call (a double click or
+  Approve after Deny is the first decision), and the run's answer after the decision is posted once.
+  Not yet: a shared-thread mode, Telegram.
 
 - **An eval gate for CI: `gnl eval` and thresholds (`@gnldev/evals`, `@gnldev/cli`).** A suite is a
   `*.eval.ts` file exporting `defineEval({ dataset, run, scorers, thresholds })`; `gnl eval` runs every

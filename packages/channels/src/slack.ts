@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import {
   createGnl, scopeConfigToOrg, sealRequestContext, sealFieldsOf, user, withIdempotency, refuseConfigNames,
-  type CreateGnlConfig, type Storage,
+  type CreateGnlConfig, type Storage, type Interrupt,
 } from '@gnldev/durable';
 import { enqueue, createWorker, type JobCtx, type Worker, type QueueWorkerOptions } from '@gnldev/queue';
 import { refuseUnknownNames, optionNames } from '@gnldev/options';
@@ -24,8 +24,14 @@ export interface SlackChannelOptions {
    * not write cannot put a stranger's workspace into one of your organizations.
    */
   workspaces: Record<string, SlackWorkspace>;
-  /** Where a run waiting for an approval can be opened (`<studioUrl>/runs/<runId>`); without it the reply names the run id. */
+  /** Where a run waiting for an approval can also be opened (`<studioUrl>/runs/<runId>`). */
   studioUrl?: string;
+  /**
+   * Who may answer an approval button. Default: only the person whose message started the run. Return
+   * true to let someone else decide — a team lead, an on-call channel's members. Asked with the Slack ids
+   * of the workspace, the person who clicked and the person who asked.
+   */
+  approvers?: (who: { teamId: string; userId: string; requesterId: string; toolName: string }) => boolean | Promise<boolean>;
   /** Start a queue worker in this process (default true). `false` when workers run elsewhere — then call `worker()` there. */
   worker?: boolean;
   /** The worker's options (retries, delays, concurrency) — `@gnldev/queue`'s `QueueWorkerOptions`. */
@@ -38,7 +44,11 @@ export interface SlackChannelOptions {
   now?: () => number;
 }
 
-const SLACK_CHANNEL_NAMES = optionNames<SlackChannelOptions>()(['signingSecret', 'botToken', 'agent', 'workspaces', 'studioUrl', 'worker', 'workerOptions', 'apiUrl', 'fetch', 'now']);
+const SLACK_CHANNEL_NAMES = optionNames<SlackChannelOptions>()(['signingSecret', 'botToken', 'agent', 'workspaces', 'studioUrl', 'approvers', 'worker', 'workerOptions', 'apiUrl', 'fetch', 'now']);
+/** The queue job type an approval button's click becomes. */
+export const SLACK_DECISION_JOB = 'gnl-slack-decision';
+const APPROVE = 'gnl_approve';
+const DENY = 'gnl_deny';
 /** The metadata event type a reply carries, with its idempotency key: how a cut-off post is found again. */
 export const SLACK_REPLY_EVENT = 'gnl_reply';
 /** A request older (or newer) than this is refused: Slack's own replay bound. */
@@ -71,6 +81,19 @@ export function verifySlackSignature(rawBody: string, headers: Headers, signingS
   const given = Buffer.from(sig);
   return given.length === expected.length && timingSafeEqual(given, expected);
 }
+
+/** What an approval button carries back: the run's message, the call, and a MAC over both, so a value nobody signed decides nothing. */
+interface Decision {
+  teamId: string;
+  eventId: string;
+  channel: string;
+  user: string;
+  ts: string;
+  threadTs?: string;
+  toolCallId: string;
+  toolName: string;
+}
+interface DecisionJob extends Decision { approve: boolean; by: string }
 
 /** What a Slack message's text asks, without the mention of the bot that opens it. */
 const askedText = (text: string) => text.replace(/^\s*<@[A-Z0-9]+>\s*/, '').trim();
@@ -107,6 +130,8 @@ export function slackChannel(config: CreateGnlConfig, opts: SlackChannelOptions)
   if (!config.agents?.[opts.agent]) throw new TypeError(`@gnldev/channels: slackChannel's agent '${opts.agent}' is not in the config's \`agents\``);
   const storage = (config as { storage?: Storage }).storage;
   if (!storage?.work) throw new TypeError('@gnldev/channels: slackChannel needs a config with `storage` — its messages are queue jobs in the store');
+  const store: Storage = storage;
+  const work = storage.work;
   const now = opts.now ?? Date.now;
   const doFetch = opts.fetch ?? fetch;
   const api = (opts.apiUrl ?? 'https://slack.com/api').replace(/\/+$/, '');
@@ -139,10 +164,10 @@ export function slackChannel(config: CreateGnlConfig, opts: SlackChannelOptions)
    */
   const replyTool = (channel: string, thread: string) => ({
     description: 'post the reply to Slack',
-    execute: async (args: { text: string }, options: { gnl?: { idempotencyKey?: string } } & Record<string, unknown>) => {
+    execute: async (args: { text: string; blocks?: unknown[] }, options: Record<string, unknown>) => {
       const key = (options as { idempotencyKey?: string }).idempotencyKey ?? '';
       const out = await slack('chat.postMessage', {
-        channel, thread_ts: thread, text: args.text,
+        channel, thread_ts: thread, text: args.text, ...(args.blocks ? { blocks: args.blocks } : {}),
         metadata: { event_type: SLACK_REPLY_EVENT, event_payload: { key } },
       });
       return { ts: out.ts };
@@ -155,40 +180,95 @@ export function slackChannel(config: CreateGnlConfig, opts: SlackChannelOptions)
     },
   });
 
-  async function runMessage(payload: SlackJob, ctx: JobCtx): Promise<unknown> {
-    const workspace = opts.workspaces[payload.teamId];
+  const mac = (d: Decision) => createHmac('sha256', opts.signingSecret).update(JSON.stringify(['gnl-slack-decision', d.teamId, d.eventId, d.channel, d.user, d.ts, d.threadTs ?? null, d.toolCallId, d.toolName])).digest('base64url');
+
+  /** Posts once, under `key`: a recorded tool call in this job's journal (see `replyTool`). */
+  async function postOnce(ctx: JobCtx, channel: string, thread: string, key: string, message: { text: string; blocks?: unknown[] }): Promise<void> {
+    const { reply } = withIdempotency({ reply: replyTool(channel, thread) } as never, {
+      journal: ctx.journal, window: 'run', runId: ctx.runId, key: () => key, caller: ctx.caller,
+    });
+    await (reply as { execute: (a: unknown, o: unknown) => Promise<unknown> }).execute(message, { toolCallId: key, messages: [] });
+  }
+
+  /**
+   * Runs (or continues) the message's run and posts what came of it: the answer, or — when it stopped for
+   * an approval — one message per stop with an Approve and a Deny button for each call. The run is named
+   * by the message's event id, so a decision continues the same run.
+   */
+  async function runAndAnswer(m: SlackJob | Decision, ctx: JobCtx, approvals?: Record<string, boolean>, prompt?: string): Promise<unknown> {
+    const workspace = opts.workspaces[m.teamId];
     if (!workspace) return { ignored: 'workspace no longer listed' };
     const org = workspace.orgId;
-    const subject = `slack:${payload.teamId}:${payload.user}`;
-    const caller = user(subject, org);
-    const thread = payload.threadTs ?? payload.ts;
+    const caller = user(`slack:${m.teamId}:${m.user}`, org);
+    const thread = m.threadTs ?? m.ts;
     const result = await gnlFor(org).run(opts.agent, {
-      workKey: `slack:${payload.teamId}:${payload.eventId}`,
-      prompt: payload.text,
-      threadId: `slack:${payload.teamId}:${payload.channel}:${thread}:${payload.user}`,
+      workKey: `slack:${m.teamId}:${m.eventId}`,
+      ...(prompt !== undefined ? { prompt } : {}),
+      threadId: `slack:${m.teamId}:${m.channel}:${thread}:${m.user}`,
       caller,
       context: sealRequestContext({}, sealFieldsOf(caller, org)),
-    }) as { runId: string; text?: string; status?: string; interrupts?: unknown[] };
-    const waiting = (result.interrupts?.length ?? 0) > 0 || result.status === 'suspended';
-    const text = waiting
-      ? `This needs an approval before I go on — ${opts.studioUrl ? `${opts.studioUrl.replace(/\/+$/, '')}/runs/${result.runId}` : `run ${result.runId}`}`
-      : result.text?.trim() || '(no answer)';
-    // The post, once: a tool call recorded in this job's journal under the run's id.
-    const { reply } = withIdempotency({ reply: replyTool(payload.channel, thread) } as never, {
-      journal: ctx.journal, window: 'run', runId: ctx.runId, key: () => `slack-reply:${result.runId}`, caller: ctx.caller,
+      ...(approvals ? { approvals } : {}),
+    }) as { runId: string; text?: string; interrupts?: Interrupt[] };
+    const asks = result.interrupts ?? [];
+    if (asks.length === 0) {
+      await postOnce(ctx, m.channel, thread, `slack-reply:${result.runId}`, { text: result.text?.trim() || '(no answer)' });
+      return { runId: result.runId };
+    }
+    const studio = opts.studioUrl ? ` (or in Studio: ${opts.studioUrl.replace(/\/+$/, '')}/runs/${result.runId})` : '';
+    const blocks: unknown[] = [{ type: 'section', text: { type: 'mrkdwn', text: `This needs an approval before I go on${studio}.` } }];
+    for (const a of asks) {
+      const d: Decision = { teamId: m.teamId, eventId: m.eventId, channel: m.channel, user: m.user, ts: m.ts, ...(m.threadTs ? { threadTs: m.threadTs } : {}), toolCallId: a.toolCallId, toolName: a.toolName };
+      const value = JSON.stringify({ d, mac: mac(d) });
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*${a.toolName}* ${'`'}${JSON.stringify(a.args ?? {}).slice(0, 300)}${'`'}${a.reason ? `\n${a.reason}` : ''}` } });
+      blocks.push({ type: 'actions', elements: [
+        { type: 'button', style: 'primary', text: { type: 'plain_text', text: 'Approve' }, action_id: APPROVE, value },
+        { type: 'button', style: 'danger', text: { type: 'plain_text', text: 'Deny' }, action_id: DENY, value },
+      ] });
+    }
+    await postOnce(ctx, m.channel, thread, `slack-ask:${result.runId}:${asks.map((a) => a.toolCallId).join(',')}`, { text: `This needs an approval before I go on${studio}.`, blocks });
+    return { runId: result.runId, waiting: asks.map((a) => a.toolCallId) };
+  }
+
+  const runMessage = (payload: SlackJob, ctx: JobCtx) => runAndAnswer(payload, ctx, undefined, payload.text);
+  const runDecision = (payload: DecisionJob, ctx: JobCtx) => runAndAnswer(payload, ctx, { [payload.toolCallId]: payload.approve });
+
+  /** A click on an approval button: checked, then queued once per call — the first decision on a call is the one. */
+  async function decide(raw: string): Promise<Response> {
+    let p: { type?: string; team?: { id?: string }; user?: { id?: string }; actions?: Array<{ action_id?: string; value?: string }> };
+    try { p = JSON.parse(new URLSearchParams(raw).get('payload') ?? ''); } catch { return new Response('not a payload', { status: 400 }); }
+    const action = p.actions?.[0];
+    if (p.type !== 'block_actions' || !action || (action.action_id !== APPROVE && action.action_id !== DENY)) return new Response(null, { status: 200 });
+    let d: Decision;
+    try {
+      const v = JSON.parse(action.value ?? '') as { d: Decision; mac: string };
+      const want = Buffer.from(mac(v.d)), got = Buffer.from(String(v.mac));
+      if (got.length !== want.length || !timingSafeEqual(got, want)) return new Response('invalid decision', { status: 401 });
+      d = v.d;
+    } catch { return new Response('invalid decision', { status: 401 }); }
+    const by = p.user?.id;
+    const workspace = opts.workspaces[d.teamId];
+    if (!by || !workspace || p.team?.id !== d.teamId) return new Response(null, { status: 200 });
+    const allowed = by === d.user || (opts.approvers ? await opts.approvers({ teamId: d.teamId, userId: by, requesterId: d.user, toolName: d.toolName }) : false);
+    if (!allowed) return Response.json({ response_type: 'ephemeral', replace_original: false, text: `Only <@${d.user}>${opts.approvers ? ' or an approver' : ''} can answer this.` });
+    const job: DecisionJob = { ...d, approve: action.action_id === APPROVE, by };
+    await enqueue(work, SLACK_DECISION_JOB, job, {
+      id: `slack:${d.teamId}:decide:${d.eventId}:${d.toolCallId}`,
+      resourceId: `slack:${d.teamId}:${d.user}`,
+      ...(workspace.orgId ? { orgId: workspace.orgId } : {}),
     });
-    await (reply as { execute: (a: unknown, o: unknown) => Promise<unknown> }).execute({ text }, { toolCallId: `slack-reply:${result.runId}`, messages: [] });
-    return { runId: result.runId, waiting };
+    return new Response(null, { status: 200 });
   }
 
   let worker: Worker | undefined;
-  const ensureWorker = () => (worker ??= createWorker(storage, { [SLACK_JOB]: runMessage as never }, opts.workerOptions));
+  const ensureWorker = () => (worker ??= createWorker(store, { [SLACK_JOB]: runMessage as never, [SLACK_DECISION_JOB]: runDecision as never }, opts.workerOptions));
   if (opts.worker !== false) ensureWorker().start();
 
   return {
     async handle(req: Request): Promise<Response> {
       const raw = await req.text();
       if (!verifySlackSignature(raw, req.headers, opts.signingSecret, now())) return new Response('invalid signature', { status: 401 });
+      // A button click arrives form-encoded (Interactivity), an event as JSON (Event Subscriptions).
+      if ((req.headers.get('content-type') ?? '').startsWith('application/x-www-form-urlencoded')) return decide(raw);
       let body: { type?: string; challenge?: string; team_id?: string; event_id?: string; event?: Record<string, unknown> };
       try { body = JSON.parse(raw); } catch { return new Response('not JSON', { status: 400 }); }
       if (body.type === 'url_verification') return Response.json({ challenge: body.challenge });
@@ -204,7 +284,7 @@ export function slackChannel(config: CreateGnlConfig, opts: SlackChannelOptions)
         teamId: body.team_id, eventId: body.event_id, channel: e.channel, user: e.user, text: askedText(e.text), ts: e.ts,
         ...(e.thread_ts ? { threadTs: e.thread_ts } : {}),
       };
-      await enqueue(storage.work!, SLACK_JOB, job, {
+      await enqueue(work, SLACK_JOB, job, {
         id: `slack:${body.team_id}:${body.event_id}`,
         resourceId: `slack:${body.team_id}:${e.user}`,
         ...(workspace.orgId ? { orgId: workspace.orgId } : {}),

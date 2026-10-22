@@ -152,7 +152,7 @@ describe('a Slack message is answered once', () => {
     await ch.handle(request(event()));
     await ch.worker().drain();
     expect(slack.posts).toHaveLength(1);
-    expect(slack.posts[0]!.text).toMatch(/^This needs an approval before I go on — https:\/\/studio\.example\/runs\/run1_[0-9a-f]+$/);
+    expect(slack.posts[0]!.text).toMatch(/^This needs an approval before I go on \(or in Studio: https:\/\/studio\.example\/runs\/run1_[0-9a-f]+\)\.$/);
   });
 
   it('two people in one Slack thread each talk to the agent in their own GNL thread', async () => {

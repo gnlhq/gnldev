@@ -34,7 +34,8 @@ export const handleSlack = (req: Request) => slack.handle(req);
 ```
 
 Set up the Slack app: **Event Subscriptions** on, the request URL your mount (Slack checks it with a
-challenge the channel answers), bot events `app_mention` and `message.im`; **OAuth scopes**
+challenge the channel answers), bot events `app_mention` and `message.im`; **Interactivity** on, the same
+URL (approval buttons); **OAuth scopes**
 `app_mentions:read`, `chat:write`, `im:history`, and `channels:history` / `groups:history` for the
 channels the bot is mentioned in (the reply is looked up there after a lost connection — below).
 
@@ -59,12 +60,18 @@ channels the bot is mentioned in (the reply is looked up there after a lost conn
   freezes once the response is sent. With `worker: false` the worker runs elsewhere: call
   `slack.worker().start()` in that process (`workerOptions` takes `@gnldev/queue`'s worker options).
   `apiUrl`, `fetch` and `now` exist for tests: Slack's Web API address, the fetch used, the clock.
-- **A run waiting for an approval says so** in the thread, once, with the run to open in Studio
-  (`studioUrl`). It goes on when it is approved there, but its answer is then in Studio only: the
-  channel does not yet post an answer that comes after an approval.
+- **A run waiting for an approval asks in the thread.** One message per stop, with the tool, its input
+  and an **Approve** / **Deny** button for each call (and the run in Studio, with `studioUrl`). A click
+  continues the same run; its answer is posted once, like any reply.
+  - Only the person who asked may answer, unless `approvers` says yes for someone else (asked with the
+    workspace, the clicker, the requester and the tool). Anyone else is told so, and nothing happens.
+  - A button's value is signed with your signing secret: a value changed after it was posted — another
+    call, another requester, another workspace — is 401 and decides nothing.
+  - One decision per call: a double click, Slack sending a click again, or Approve after Deny is the
+    same decision, the first.
+  - Buttons need **Interactivity** on in the Slack app, with the same request URL as the events.
 
-Not yet: approving from Slack itself (buttons) and posting the answer that follows an approval, a
-thread shared by everyone in it, Telegram.
+Not yet: a thread shared by everyone in it, Telegram.
 
 ## License
 
