@@ -7,7 +7,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.14.0] — 2026-10-22
+
+**Agents where people talk, measured like everything else.** A new package, `@gnldev/channels`, runs an
+agent on Slack and Telegram: a message is a durable job named by the platform's id for it (a redelivery
+is the same job), the agent runs once, and the reply is posted once on Slack — at most once on Telegram,
+which cannot read a chat back — with approval buttons the person who asked answers. Beside it: vector
+stores on Elasticsearch and OpenSearch, end-user tokens straight from Auth0, Clerk, Supabase or Firebase
+(`endUsers.jwks`, ES256), an eval gate for CI (`gnl eval`), the REST API tested inside Express, Fastify
+and Koa, and `@gnldev/durable` building inside Next.js.
+
+### Upgrading from 0.13
+
+- **A vector server call has a deadline**: `QdrantVectorStore`, `ChromaVectorStore`, `WeaviateVectorStore`,
+  `ElasticsearchVectorStore` and `OpenSearchVectorStore` fail a call after `timeoutMs` (30 s by default).
+  A store that answers slower on purpose needs a larger `timeoutMs`.
+- **`endUsers` takes one key source**: `secret`, `publicKey` or `jwks`. A config that named both `secret`
+  and `publicKey` (the secret was used, the key ignored) is now refused at startup — keep the one your
+  tokens are signed with.
+- No store step. Next.js needs no `serverExternalPackages` entry for `@gnldev/durable` any more.
+
 
 ### Fixed
 
