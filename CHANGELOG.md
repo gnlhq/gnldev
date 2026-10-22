@@ -52,10 +52,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   value is signed so a changed one decides nothing (401), one decision per call (a double click or
   Approve after Deny is the first decision), and the run's answer after the decision is posted once.
   `telegramChannel`: the same for a Telegram bot — the webhook's
-  secret token checked (401 without it), a job per `update_id`, each person's own thread, the chats
+  secret token checked (401 without it), a job per message, each person's own thread, the chats
   served chosen by `chats` — with one difference, stated: a bot cannot read a chat's history, so a reply
-  whose connection was cut is left in doubt, never resent (at most once; measured both ways). Slack and
-  Telegram share one core (`core.ts`). Not yet: a shared-thread mode, Telegram approval buttons.
+  whose connection was cut is left in doubt, never resent (at most once; measured both ways). Telegram approval buttons
+  (inline keyboard): a press is checked against the author of the message the buttons reply to, which
+  Telegram sends with the press — no record kept elsewhere — one decision per call, and a call id too
+  long for the 64-byte button data is approved in Studio. A Telegram message is named by its chat and
+  message id (it was the `update_id`), so a press can find its run. Slack and Telegram share one core
+  (`core.ts`). Not yet: a shared-thread mode, `approvers` on Telegram.
 
 - **An eval gate for CI: `gnl eval` and thresholds (`@gnldev/evals`, `@gnldev/cli`).** A suite is a
   `*.eval.ts` file exporting `defineEval({ dataset, run, scorers, thresholds })`; `gnl eval` runs every

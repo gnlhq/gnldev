@@ -40,7 +40,7 @@ afterEach(async () => { for (const c of channels.splice(0)) await c.close(); });
 
 const update = (id: number, msg: Record<string, unknown> = {}, secret = SECRET) => new Request('http://app/telegram', {
   method: 'POST', headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': secret },
-  body: JSON.stringify({ update_id: id, message: { message_id: 10, from: { id: 5, is_bot: false }, chat: { id: 77, type: 'group' }, text: 'refund window?', ...msg } }),
+  body: JSON.stringify({ update_id: id, message: { message_id: id * 10, from: { id: 5, is_bot: false }, chat: { id: 77, type: 'group' }, text: 'refund window?', ...msg } }),
 });
 
 describe('a Telegram message is answered at most once', () => {

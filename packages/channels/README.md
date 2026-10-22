@@ -101,14 +101,19 @@ The promises are Slack's, with one difference:
 - **Only Telegram is heard:** an update without the webhook's secret token is 401.
 - **Only the chats `chats` serves are run**, in the organization it names; any other chat is acknowledged
   and dropped.
-- **A message is run once:** a job named by Telegram's `update_id`, which Telegram keeps on redelivering
-  until it gets a 2xx.
+- **A message is run once:** a job named by the chat and the message's id, which Telegram keeps on
+  redelivering until it gets a 2xx.
 - **Each person's conversation is their own:** the chat (and forum topic) and the person.
 - **The reply is sent at most once — the difference.** A bot cannot read a chat's history, so a reply
   whose connection was cut cannot be looked up: it is left in doubt and not sent again, where Slack's is
   found or sent. Measured both ways: cut after Telegram took it, one message; cut before, none.
-- **A run waiting for an approval** says so with the run to open in Studio; Telegram buttons are not there
-  yet. `worker`, `workerOptions`, `apiUrl` and `fetch` work as Slack's.
+- **A run waiting for an approval asks** in a reply to the person's message: the tool, its input and an
+  **Approve** / **Deny** button for each call. Only the person who asked may answer — their identity is
+  the author of the message the buttons reply to, which Telegram sends with every press inside the webhook
+  it authenticated; anyone else gets an alert and nothing happens. One decision per call (a double press,
+  or Approve after Deny, is the first). A call whose id does not fit Telegram's 64-byte button data (a
+  sub-agent's long addressed id) gets no button and is approved in Studio (`studioUrl`). There is no
+  `approvers` option on Telegram yet. `worker`, `workerOptions`, `apiUrl` and `fetch` work as Slack's.
 
 ## License
 
