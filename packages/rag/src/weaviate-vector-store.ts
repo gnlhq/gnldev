@@ -114,6 +114,7 @@ export class WeaviateVectorStore implements VectorStore {
   private readonly name: string;
   private dimension?: number;
   private ready?: Promise<void>;
+  private active?: Promise<void>;
   private readonly call: RestCall;
 
   constructor(opts: WeaviateVectorStoreOptions) {
@@ -136,8 +137,32 @@ export class WeaviateVectorStore implements VectorStore {
   private async existing(): Promise<number | null | undefined> {
     const c = await this.call('GET', `/v1/schema/${this.name}`, undefined, true) as { description?: string } | undefined;
     if (!c) return undefined;
+    await this.whenActive();
     const m = /gnl_dim=(\d+)/.exec(c.description ?? '');
     return m ? Number(m[1]) : null;
+  }
+
+  /**
+   * Waits, once, until every shard of the collection is READY. A collection another process has just
+   * made is in the schema before its index exists: public CI (gnldev#34, Postgres C) answered a query
+   * "explorer: list class: search: tried to browse non-existing index" right after the second maker was
+   * told it already existed — Elasticsearch's 503 on a second maker, here. The shards' status is read
+   * every 50 ms (404 while there is no index yet) for at most 30 s.
+   */
+  private whenActive(): Promise<void> {
+    if (!this.active) {
+      const waiting = (async () => {
+        for (const until = Date.now() + 30_000; ;) {
+          const shards = await this.call('GET', `/v1/schema/${this.name}/shards`, undefined, true) as Array<{ status?: string }> | undefined;
+          if (Array.isArray(shards) && shards.length > 0 && shards.every((x) => x.status === 'READY')) return;
+          if (Date.now() > until) throw new Error(`@gnldev/rag: Weaviate collection ${this.name}'s shards did not become READY within 30 s`);
+          await new Promise((r) => setTimeout(r, 50));
+        }
+      })();
+      this.active = waiting;
+      waiting.catch(() => { if (this.active === waiting) this.active = undefined; });
+    }
+    return this.active;
   }
 
   /** The collection, made with `dim` if there is none. Two processes making it at once: the loser reads the winner's. */
@@ -158,6 +183,7 @@ export class WeaviateVectorStore implements VectorStore {
             ],
           });
           this.dimension = want;
+          await this.whenActive(); // made here: its index too may not exist yet
         } catch (e) {
           // 422 "already exists": another process made it first, and its length wins.
           const theirs = (e as { status?: number }).status === 422 ? await this.existing() : undefined;

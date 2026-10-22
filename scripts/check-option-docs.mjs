@@ -17,7 +17,6 @@ import { join } from 'node:path';
 
 /** Documented nowhere when this gate was written. Shrinks only. See the header. */
 const BASELINE = new Set([
-  'auth-ee/Auth0SsoOptions.jwks',
   'cli/ScaffoldOptions.hostMode',
   'deploy/NodeAdapterOptions.onListen', 'deploy/BundleOptions.esTarget',
   'deploy/TargetOptions.exportName', 'durable/ToolCallingModelOptions.doneText',
