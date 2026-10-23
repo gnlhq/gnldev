@@ -1,5 +1,7 @@
 # @gnldev/channels
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 Agents on chat platforms: Slack and Telegram.
 
 A message comes in through the platform's signed webhook and becomes a durable job in your store; the

@@ -1,5 +1,7 @@
 # @gnldev/options
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 One rule for every options object GNL reads: a name it does not take is refused, with the option it is
 closest to.
 

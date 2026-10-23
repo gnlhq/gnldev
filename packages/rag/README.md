@@ -1,5 +1,7 @@
 # @gnldev/rag
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 **Vector store + RAG tool** for AI SDK agents. Used as a tool inside `runDurable`, it's automatically
 **replayable** (thanks to durableTool the retrieval is journaled: on resume it comes back from the record
 instead of running again).

@@ -1,5 +1,7 @@
 # @gnldev/agui
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 **AG-UI protocol adapter**: converts the GNL agent stream (the `{event, data}` schema of `@gnldev/durable`'s `agentStreamEvents`) into [AG-UI](https://github.com/ag-ui-protocol/ag-ui) (CopilotKit's open agent↔UI event protocol) event sequences. **Zero `@ag-ui/*` dependency** — event types are hand-defined (AG-UI is an open SSE/JSON protocol, no SDK required).
 
 **Two ways to run it:**

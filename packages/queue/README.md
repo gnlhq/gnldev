@@ -1,5 +1,7 @@
 # @gnldev/queue
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 **Durable background-task queue + worker** on top of the journal. Each job runs as a durable run → if the process crashes mid-job it resumes from the journal, and a side effect already recorded as done is not run again ([at-most-once](../durable/README.md#what-never-charged-twice-actually-means)). `acquireRunLock` keeps two workers off the same job at once: a worker whose process is frozen (a GC pause, a VM migration, `SIGSTOP`) keeps its job however long, and a worker whose process died loses it at once. The process is asked through the storage's process liveness (`SqliteStorage`/`PostgresStorage` answer for themselves); without one, the lease's TTL decides.
 
 > Install: `pnpm add @gnldev/queue` — or use it from a [repo clone](https://github.com/gnlhq/gnldev): `pnpm install && pnpm -r build`.

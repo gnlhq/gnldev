@@ -5,7 +5,7 @@
   "engines": {
     "node": ">=22.13.0"
   },
-  "description": "Call-scoped exactly-once effect + deterministic-replay durability layer for Vercel AI SDK agents. Drop-in: generateText -> runDurable.",
+  "description": "The durable core of GNL, a full agent framework for TypeScript: call-scoped exactly-once effect + deterministic replay for Vercel AI SDK agents. Drop-in: generateText -> runDurable.",
   "keywords": [
     "ai",
     "agent",

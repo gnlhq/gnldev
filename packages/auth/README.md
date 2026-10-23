@@ -1,5 +1,7 @@
 # @gnldev/auth
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 The auth contract the rest of the framework speaks, plus a role-based default you can use as-is.
 
 Auth is **opt-in**: leave it out and the REST API and Studio stay open (fine for local work). Wire a

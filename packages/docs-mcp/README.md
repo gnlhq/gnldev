@@ -1,5 +1,7 @@
 # @gnldev/docs-mcp
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 **Stdio server that serves GNL docs to AI assistants over MCP (Model Context Protocol).** Any MCP-compatible CLI or editor starts this server as a child process and can query GNL's features (install/API/example) with the `gnl_docs_overview` / `gnl_docs_feature` / `gnl_docs_search` tools.
 
 Hand-written JSON-RPC 2.0 — **`@modelcontextprotocol/sdk` is NOT USED** (zero new dependencies: only `node:readline`/`node:process`). Content is first tried via a live fetch of `/llms.txt` + `/llms-full.txt` through `GNL_DOCS_URL` (default `https://gnl.dev`); if the network is unavailable/unreachable, it falls back to the static content embedded in the package (`src/content.ts`) — this package works on its own even if the site is down.

@@ -1,5 +1,7 @@
 # @gnldev/client
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 A typed client for talking to agents exposed by `@gnldev/server` — plain HTTP and SSE streaming,
 with React hooks on top.
 

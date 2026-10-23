@@ -1,5 +1,7 @@
 # @gnldev/mcp
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 **MCP client + server.** Client: adapts external MCP tools to AI SDK tools → inside `runDurable` they become **journaled and replayable**: a call already recorded as done is not made again on resume ([at-most-once for the effect](../durable/README.md#what-never-charged-twice-actually-means)). Server: exposes your own tools as MCP (`callTool` deduped against the journal, keyed by the CALLER the transport authenticated — see [Who the caller is](#who-the-caller-is-and-why-it-is-not-the-request)).
 
 > Install: `pnpm add @gnldev/mcp` — or use it from a [repo clone](https://github.com/gnlhq/gnldev): `pnpm install && pnpm -r build`.

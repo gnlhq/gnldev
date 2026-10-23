@@ -1,5 +1,7 @@
 # @gnldev/cache
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 **Cross-run content-hash cache** on top of a storage's **`cache` port** (`CacheStore`), not the run
 journal. The key is run-independent (`<namespace>:<argsHash(key)>`) → a result computed in one run is
 **reused in other runs**. (Within-run reuse is already journal replay; this closes the across-run gap.)

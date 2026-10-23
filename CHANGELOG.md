@@ -7,6 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **The README says what GNL is: a full agent framework, durable from the core.** It opened with "a thin
+  correctness layer on top of the Vercel AI SDK", and its "Honest positioning" section with "not a
+  full-featured agent-framework alternative" — written when the core was all there was. The README (English
+  and Turkish) now leads with the framework and the two ways in: all of it, or only the core in an agent you
+  already have. Every published package's README says it is part of GNL and works on its own; the
+  `@gnldev/durable` description calls it the framework's durable core. The out-of-scope list no longer names
+  auth or a deployer, which ship (`@gnldev/auth`, `gnl deploy`). No code changed.
+
 ## [0.14.0] — 2026-10-23
 
 **Agents where people talk, measured like everything else.** A new package, `@gnldev/channels`, runs an

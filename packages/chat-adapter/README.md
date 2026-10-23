@@ -1,5 +1,7 @@
 # @gnldev/chat-adapter
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 Compatibility with the Vercel AI SDK's UI layer: run a durable agent on the server, render it with
 `useChat` on the client.
 

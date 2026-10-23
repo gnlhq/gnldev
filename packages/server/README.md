@@ -1,5 +1,7 @@
 # @gnldev/server
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 Exposes the `createGnl` registry as **auto-REST + OpenAPI + SSE**. Every endpoint bottoms out in `runDurable` → the journal, replay and the [at-most-once side-effect guarantee](../durable/README.md#what-never-charged-twice-actually-means) are inherited for free. (The durable counterpart to the common auto-REST pattern.)
 
 > Install: `pnpm add @gnldev/server` — or use it from a [repo clone](https://github.com/gnlhq/gnldev): `pnpm install && pnpm -r build`.

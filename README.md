@@ -2,10 +2,20 @@
 
 **English** · [Türkçe](./README.tr.md)
 
-**A thin correctness layer on top of the Vercel AI SDK — durable execution without standing up a server.**
-It doesn't touch the AI SDK's agentic loop (`generateText`/`streamText` + `tools`) at all; it adds two
-wrappers and a journal on top: **a side-effecting tool call is never silently fired twice.** That's the
-precise meaning of **"exactly-once effect"** here — call-scoped dedup with a safe default, whose exact name is
+**GNL is a full agent framework for TypeScript, durable from the core.** Runtime, HTTP server, Studio,
+workflows, RAG, memory, evals, auth, channels — use all of it. Or take only the core into the agent you
+already have: a side-effecting tool call is never fired twice, and a crashed run picks up where it
+stopped. The more of it you use, the more it does for you.
+
+- **The whole framework:** register agents with `createGnl`, serve them with `createRestApi` (REST +
+  OpenAPI + SSE), watch and approve them in Studio, and add [the packages below](#packages) as you need
+  them — each one carries the core's guarantees.
+- **Only the core:** swap `generateText` for `runDurable` in an agent you already have, as below. Nothing
+  else changes: same model, same tools, your database.
+
+Built on the Vercel AI SDK, it doesn't touch the AI SDK's agentic loop (`generateText`/`streamText` +
+`tools`): **a side-effecting tool call is never silently fired twice.** That's the precise meaning of
+**"exactly-once effect"** here — call-scoped dedup with a safe default, whose exact name is
 [**at-most-once for side effects**](./packages/durable/README.md#what-never-charged-twice-actually-means): the guarantee
 is carried all the way to the provider itself via `recover()`/`idempotencyKey`, and when the outcome is
 genuinely unknown (e.g. after a crash), the system **blocks and asks for approval** instead of silently
@@ -245,17 +255,19 @@ serve({ fetch: createRestApi(config).fetch, port: Number(process.env.PORT ?? 300
 processes.
 
 ## Honest positioning
-Not "a full-featured agent-framework alternative" — a **durability/correctness layer for the AI SDK**: a solid core
-(`@gnldev/durable`) plus satellite packages of varying maturity that inherit its guarantees. It covers most of
-what a typical full-featured agent framework's core provides (memory/workflow/rag/mcp/processors/eval…), but builds it on top of
+A **full agent framework whose every part is built on one durable core** (`@gnldev/durable`): the
+packages around it — server, Studio, memory, workflows, RAG, MCP, processors, evals, auth, channels —
+inherit its guarantees, and their maturity varies (each README says what it measured). Use all of it, or
+take only the core into an agent you already have. What sets it apart is the foundation:
 **call-scoped exactly-once effect + deterministic replay**. "Exactly-once" here isn't an absolute physical
 guarantee — it means **call-scoped dedup with a safe default**: the same `toolCallId` never runs again, a
 call whose outcome is unknown is tracked all the way to the provider via `recover()`/`idempotencyKey`, and
 if it's still unknown the system **blocks and asks for approval instead of silently retrying** (the sentinel that
 keeps a re-planned call from slipping past is in `packages/durable/test/blocked-sentinel.test.ts`;
 the recover ladder is in `packages/durable/test/crash-window.test.ts`) — which is exactly what an
-opaque step-snapshot durable agent doesn't give you. Full-featured agent frameworks are broader/more mature (voice/deployer/editor/auth — deliberately out of scope for us), but
-none of their features ship with these guarantees. Our edge is **correctness**; it's decisive for
+opaque step-snapshot durable agent doesn't give you. Older agent frameworks are broader in places and more
+mature (voice and a visual editor are deliberately out of scope for us), but none of their features ship
+with these guarantees. Our edge is **correctness**; it's decisive for
 payment/financial and transactional or long-running/distributed workloads.
 
 ---
