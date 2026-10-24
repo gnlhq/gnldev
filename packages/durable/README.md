@@ -1,6 +1,8 @@
 # @gnldev/durable
 
-**Call-scoped exactly-once effect + deterministic-replay durability for [Vercel AI SDK](https://sdk.vercel.ai) agents.**
+**The durable core of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript** — call-scoped exactly-once
+effect + deterministic replay for [Vercel AI SDK](https://sdk.vercel.ai) agents. Use it inside the agent you already have,
+or with the rest of the framework.
 
 Wraps the AI SDK's agent loop (`generateText`/`streamText`) **without changing it**. After a crash/restart a
 completed tool call is **never executed a second time**, and the agent **makes the same decisions**

@@ -1,5 +1,7 @@
 # @gnldev/scheduler
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 Cron, interval and one-shot triggers for durable workflows. Several workers can poll the same
 schedule: a run-lock picks one winner per fire and every write to the trigger's state is CAS-fenced,
 so a slot is never double-advanced or rolled back — see [the lock section](#lock-ttl-and-what-once-covers)

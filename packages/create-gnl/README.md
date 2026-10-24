@@ -1,5 +1,7 @@
 # create-gnl
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 `npm create gnl <project-name>` — scaffolds a durable agent project. A thin door: it forwards to
 `@gnldev/cli`'s `init` command (single source), which is also what `gnl init` runs inside an existing
 project. Template files live in `packages/cli/templates/minimal` (plus the `_e2e` add-on `--e2e`

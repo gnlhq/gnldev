@@ -1,5 +1,7 @@
 # @gnldev/processors
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 **Input/output processors** for `@gnldev/durable` agents: PII masking, moderation, tool filtering, safety.
 Built-ins inherit durability — input processors run before `persistInput` (masking is journaled → doesn't
 run again on resume).

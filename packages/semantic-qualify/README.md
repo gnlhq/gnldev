@@ -1,5 +1,7 @@
 # @gnldev/semantic-qualify
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 The exam a judge closure must sit before `@gnldev/durable` will run it.
 
 ## Why this exists

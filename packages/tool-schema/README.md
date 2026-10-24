@@ -1,5 +1,7 @@
 # @gnldev/tool-schema
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 Tool schemas that one provider accepts and another rejects, smoothed over.
 
 The same JSON Schema does not travel cleanly between OpenAI, Gemini and Anthropic: one rejects

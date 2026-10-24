@@ -2,9 +2,21 @@
 
 [English](./README.md) · **Türkçe**
 
-**Vercel AI SDK üstüne ince bir "correctness katmanı" — server kurmadan durable execution.** AI SDK'nın
-agentic loop'unu (`generateText`/`streamText` + `tools`) değiştirmeden, iki sarmalayıcı + bir journal ile
-ekler: **yan etkili bir tool çağrısı ASLA sessizce iki kere olmaz.** Bunun kesin anlamı **"exactly-once
+**GNL, TypeScript için tam bir agent framework'ü; temelinden dayanıklı.** Çalışma zamanı, HTTP sunucusu,
+Studio, iş akışları, RAG, bellek, değerlendirme, yetkilendirme, kanallar — hepsini kullan. Ya da sadece
+çekirdeği mevcut agent'ına tak: yan etkili bir araç çağrısı asla iki kez çalışmaz, çöken bir koşu kaldığı
+yerden devam eder. Ne kadarını kullanırsan, o kadar çok iş senin yerine yapılır.
+
+- **Framework'ün tamamı:** ajanları `createGnl` ile kaydet, `createRestApi` ile sun (REST + OpenAPI +
+  SSE), Studio'da izle ve onayla, [aşağıdaki paketleri](#paketler) ihtiyaç oldukça ekle — her biri
+  çekirdeğin garantilerini taşır.
+- **Sadece çekirdek:** mevcut agent'ında `generateText` yerine `runDurable` kullan, aşağıdaki gibi.
+  Başka bir şey değişmez: aynı model, aynı araçlar, senin veritabanın.
+
+Birinden ötekine adım adım: [Çekirdekten tam framework'e](./docs/CORE-TO-FRAMEWORK.tr.md).
+
+Vercel AI SDK üstüne kurulu; AI SDK'nın agentic loop'unu (`generateText`/`streamText` + `tools`)
+değiştirmez: **yan etkili bir tool çağrısı ASLA sessizce iki kere olmaz.** Bunun kesin anlamı **"exactly-once
 effect"**tir — çağrı-bazlı dedup + güvenli-varsayılan; garantinin tam adı
 [**yan etkiler için at-most-once**](./packages/durable/README.md#what-never-charged-twice-actually-means):
 `recover()`/`idempotencyKey` ile garanti sağlayıcının
@@ -240,15 +252,17 @@ biçimdedir.
 **Journal uyarısı:** serverless/edge runtime'larda `node:sqlite` çalışmaz → ağ-tabanlı journal kullanın (`@gnldev/durable/postgres`; GNL'de D1 deposu yok). `SqliteStorage` yalnız uzun-ömürlü Node süreçleri içindir.
 
 ## Dürüst konumlandırma
-"Tam-donanımlı bir agent framework alternatifi" değil; **AI SDK için durability/correctness katmanı**: sağlam bir çekirdek (`@gnldev/durable`) +
-onun garantilerini miras alan değişken olgunlukta uydu paketler. Tipik tam-donanımlı bir agent framework'ün temel yeteneklerinin çoğunu kapsar
-(memory/workflow/rag/mcp/processors/eval…) ama bunu **çağrı-bazında exactly-once effect + deterministic replay**
-üstüne kurar. "Exactly-once" burada mutlak bir fiziksel garanti değil — **çağrı-bazlı dedup + güvenli-varsayılan**
+**Her parçası tek bir dayanıklı çekirdek (`@gnldev/durable`) üstüne kurulu tam bir agent framework'ü**:
+etrafındaki paketler — sunucu, Studio, bellek, iş akışları, RAG, MCP, işlemciler, değerlendirme,
+yetkilendirme, kanallar — onun garantilerini miras alır; olgunlukları farklıdır (her README ne ölçtüğünü
+söyler). Hepsini kullan ya da sadece çekirdeği mevcut agent'ına tak. Farkı temelinde:
+**çağrı-bazında exactly-once effect + deterministic replay**. "Exactly-once" burada mutlak bir fiziksel garanti değil — **çağrı-bazlı dedup + güvenli-varsayılan**
 demektir: aynı `toolCallId` bir daha çalışmaz, sonucu belirsiz kalan çağrı `recover()`/`idempotencyKey` ile
 sağlayıcıya kadar takip edilir, hâlâ belirsizse sistem **sessizce tekrar etmek yerine bloklanıp onay ister**
 (yeniden planlanmış bir çağrının sızmasını engelleyen sentinel `packages/durable/test/blocked-sentinel.test.ts`'te,
-recover merdiveni `packages/durable/test/crash-window.test.ts`'te) — opak step-snapshot'lı bir durable agent'ın vermediği budur. Bu tür framework'ler
-daha geniş/olgun (voice/deployer/editor/auth — bizde bilinçli pas) ama hiçbir özelliği bu garantilerle gelmiyor.
+recover merdiveni `packages/durable/test/crash-window.test.ts`'te) — opak step-snapshot'lı bir durable agent'ın vermediği budur. Daha eski agent
+framework'leri bazı yerlerde daha geniş ve daha olgun (ses ve görsel editör bizde bilinçli olarak kapsam dışı),
+ama hiçbir özelliği bu garantilerle gelmiyor.
 Bizim kozumuz **correctness**; ödeme/finans/transaksiyonel ve uzun-koşan/dağıtık iş yüklerinde belirleyici.
 
 ---
