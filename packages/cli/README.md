@@ -1,5 +1,7 @@
 # @gnldev/cli
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 The `gnl` developer CLI. Three groups of commands, all wired straight to `@gnldev/durable`'s own exports
 (`reconstructState`/`forkRun`/`resumeRun`/`sweepRuns`/`purgeRun`/`getRunCost`, plus the journal's own
 `listRuns`/`readRun`) —

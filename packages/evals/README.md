@@ -1,5 +1,7 @@
 # @gnldev/evals
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 **Scorers + LLM judge** for `@gnldev/durable` runs. `scoreRun` reads from the journal trace → deterministic &
 replayable scores (memoized if the journal is writable → same score on resume). `evalDataset` runs a
 resumable suite (picks up where it left off if interrupted).

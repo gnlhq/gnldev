@@ -1,5 +1,7 @@
 # @gnldev/a2a
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 **Agent-to-agent, both ways.** Serve your GNL agents to any [Agent2Agent (A2A)](https://a2a-protocol.org)
 client with `createA2AServer` (`@gnldev/a2a/server`), and call a remote agent — another GNL server or any
 A2A agent — as an AI SDK tool with `createA2ATool`.

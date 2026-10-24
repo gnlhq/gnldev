@@ -1,5 +1,7 @@
 # @gnldev/memory
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 Rich semantic-recall memory for `@gnldev/durable` — **journaled and replayable**; a write already recorded is replayed rather than applied again ([at-most-once for side effects](../durable/README.md#what-never-charged-twice-actually-means)). One class: `AgentMemory`.
 
 ```ts

@@ -1,5 +1,7 @@
 # @gnldev/studio
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 Durable run **inspector + Playground**. Run history from the journal: timeline, time-travel, reconstructed
 state, cost, an OTEL-like trace waterfall, fork, approval (resume). **Playground** (when `gnl` is given):
 pick an agent from the browser → prompt → **streaming** response → interrupt approval → that run's trace.

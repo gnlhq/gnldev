@@ -1,5 +1,7 @@
 # @gnldev/events
 
+> Part of [GNL](https://github.com/gnlhq/gnldev), a full agent framework for TypeScript — works with the rest of it, or on its own.
+
 A **durable event/notification bus** on top of the journal. `emit` writes to an append-only log; each
 consumer processes events with its own ack marker: **exactly-once marking + at-least-once delivery**. The
 marker is written **after** the handler succeeds — if the handler throws or the process dies, the event
