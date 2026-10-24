@@ -6,7 +6,7 @@ import * as DialogPrimitive from '@radix-ui/react-dialog';
 import {
   Activity, Boxes, Workflow, Network, Plug, Inbox, ScrollText, Building2, Shield,
   FlaskConical, Gauge, Wrench, Moon, Sun, Languages, MessageSquare, BookOpen, ListChecks, Library, LogOut, Users as UsersIcon,
-  AlertTriangle, Database, Clock, Menu, Search, Scale, DollarSign, MailWarning } from 'lucide-react';
+  AlertTriangle, Database, Clock, Menu, Search, Scale, DollarSign, MailWarning, PiggyBank } from 'lucide-react';
 import { useCapabilities, useMe, api, ApiError, isCredentialError, shouldForceReauth, type Capabilities } from './api';
 import { Spinner, ViewSkeleton, Btn, ErrorBox, Badge, cn } from './components';
 import { CommandPalette, type CommandItem } from './ui';
@@ -50,6 +50,7 @@ const Evals = lazy(() => named(import('./views/Evals'), 'Evals'));
 const Jobs = lazy(() => named(import('./views/Jobs'), 'Jobs'));
 const DeadEvents = lazy(() => named(import('./views/DeadEvents'), 'DeadEvents'));
 const Cache = lazy(() => named(import('./views/Cache'), 'Cache'));
+const Optimizer = lazy(() => named(import('./views/Optimizer'), 'Optimizer'));
 const Scheduler = lazy(() => named(import('./views/Scheduler'), 'Scheduler'));
 const Knowledge = lazy(() => named(import('./views/Knowledge'), 'Knowledge'));
 const Networks = lazy(() => named(import('./views/Networks'), 'Networks'));
@@ -108,6 +109,7 @@ const NAV: NavItem[] = [
   // on anything to do with the `/events` SSE stream — same word, unrelated surface.
   { to: '/dead-events', labelKey: 'deadEvents', icon: MailWarning, cap: 'deadEvents', group: 'operate' },
   { to: '/cache', labelKey: 'cache', icon: Database, cap: 'cache', group: 'operate' },
+  { to: '/optimizer', labelKey: 'optimizer', icon: PiggyBank, cap: 'optimizer', group: 'operate' },
   { to: '/scheduler', labelKey: 'scheduler', icon: Clock, cap: 'scheduler', group: 'operate' },
   // Governance: approvals inbox / audit log / organizations (enabled via server capability flags).
   { to: '/approvals', labelKey: 'approvals', icon: Inbox, cap: 'approvals', group: 'governance' },
@@ -465,6 +467,7 @@ function AppShell({ onLogout }: { onLogout?: () => void }) {
               <Route path="/jobs" element={<Jobs />} />
               <Route path="/dead-events" element={<DeadEvents />} />
               <Route path="/cache" element={<Cache />} />
+              <Route path="/optimizer" element={<Optimizer />} />
               <Route path="/scheduler" element={<Scheduler />} />
               <Route path="/knowledge" element={<Knowledge />} />
               <Route path="/networks" element={<Networks />} />

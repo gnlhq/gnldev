@@ -25,8 +25,13 @@
 export interface FlatUsage {
   inputTokens: number;
   outputTokens: number;
-  /** Cached input tokens, when the provider reports them. */
+  /** Cached input tokens READ (a cache hit), when the provider reports them. */
   cachedTokens: number;
+  /**
+   * Input tokens WRITTEN to the provider's cache, when it reports them (AI SDK 7:
+   * `inputTokens.cacheWrite`). Part of `inputTokens`, like `cachedTokens`; billed at the write rate.
+   */
+  cacheWriteTokens: number;
   totalTokens: number;
 }
 
@@ -51,8 +56,9 @@ export function flattenUsage(usage: unknown): FlatUsage {
   const inputTokens = (nested ? u.inputTokens?.total : u?.inputTokens) ?? 0;
   const outputTokens = (nested ? u.outputTokens?.total : u?.outputTokens) ?? 0;
   const cachedTokens = (nested ? u.inputTokens?.cacheRead : u?.cachedInputTokens ?? u?.cachedTokens) ?? 0;
+  const cacheWriteTokens = (nested ? u.inputTokens?.cacheWrite : u?.cacheWriteTokens) ?? 0;
   const totalTokens = u?.totalTokens ?? inputTokens + outputTokens;
-  return { inputTokens, outputTokens, cachedTokens, totalTokens };
+  return { inputTokens, outputTokens, cachedTokens, cacheWriteTokens, totalTokens };
 }
 
 /**
