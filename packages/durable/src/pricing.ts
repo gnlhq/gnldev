@@ -6,6 +6,11 @@ export interface ModelPricing {
   inputPer1M: number;
   outputPer1M: number;
   cachedInputPer1M?: number;
+  /**
+   * Cache WRITE rate. Without it a written token is billed at `inputPer1M`. Anthropic: 1.25x input for
+   * the 5-minute TTL (the rows below), 2x for 1 hour; OpenAI GPT-5.6+: 1.25x (30 min), 2.5x (12 h).
+   */
+  cacheWritePer1M?: number;
 }
 
 /**
@@ -26,8 +31,9 @@ export interface ModelPricing {
  * `claude-opus-4` covers Opus 4 and 4.1 at $15/$75, and 4.5 through 4.8 each say $5/$25 themselves.
  * pricing.test.ts pins that resolution so a new row cannot quietly capture a neighbour.
  *
- * `cachedInputPer1M` is the cache READ (hit) rate. Cache WRITES cost more than base input on Anthropic
- * (1.25x for 5m, 2x for 1h) and are not modelled here — an accepted under-count, not an oversight.
+ * `cachedInputPer1M` is the cache READ (hit) rate; `cacheWritePer1M` the cache WRITE rate. The Anthropic
+ * rows name the 5-minute write rate (1.25x input); a 1-hour write costs 2x, which a row cannot tell from
+ * the usage — override the row for an agent that caches for an hour.
  *
  * These are list prices: they ignore batch (-50%), data-residency (1.1x) and negotiated discounts, and
  * they go stale when a vendor changes them. For billing, override with `getRunCost({ pricing })` or the
@@ -35,18 +41,18 @@ export interface ModelPricing {
  */
 export const DEFAULT_PRICING: Record<string, ModelPricing> = {
   // ── Anthropic ────────────────────────────────────────────────────────────────
-  'claude-opus-4': { inputPer1M: 15, outputPer1M: 75, cachedInputPer1M: 1.5 }, // Opus 4 and 4.1
-  'claude-opus-4-5': { inputPer1M: 5, outputPer1M: 25, cachedInputPer1M: 0.5 },
-  'claude-opus-4-6': { inputPer1M: 5, outputPer1M: 25, cachedInputPer1M: 0.5 },
-  'claude-opus-4-7': { inputPer1M: 5, outputPer1M: 25, cachedInputPer1M: 0.5 },
-  'claude-opus-4-8': { inputPer1M: 5, outputPer1M: 25, cachedInputPer1M: 0.5 },
-  'claude-opus-5': { inputPer1M: 5, outputPer1M: 25, cachedInputPer1M: 0.5 },
-  'claude-sonnet-4': { inputPer1M: 3, outputPer1M: 15, cachedInputPer1M: 0.3 }, // Sonnet 4, 4.5, 4.6
-  'claude-sonnet-5': { inputPer1M: 2, outputPer1M: 10, cachedInputPer1M: 0.2 },
-  'claude-haiku-3-5': { inputPer1M: 0.8, outputPer1M: 4, cachedInputPer1M: 0.08 },
-  'claude-haiku-4': { inputPer1M: 1, outputPer1M: 5, cachedInputPer1M: 0.1 }, // Haiku 4.5
-  'claude-fable-5': { inputPer1M: 10, outputPer1M: 50, cachedInputPer1M: 1 },
-  'claude-mythos-5': { inputPer1M: 10, outputPer1M: 50, cachedInputPer1M: 1 },
+  'claude-opus-4': { inputPer1M: 15, outputPer1M: 75, cachedInputPer1M: 1.5, cacheWritePer1M: 18.75 }, // Opus 4 and 4.1
+  'claude-opus-4-5': { inputPer1M: 5, outputPer1M: 25, cachedInputPer1M: 0.5, cacheWritePer1M: 6.25 },
+  'claude-opus-4-6': { inputPer1M: 5, outputPer1M: 25, cachedInputPer1M: 0.5, cacheWritePer1M: 6.25 },
+  'claude-opus-4-7': { inputPer1M: 5, outputPer1M: 25, cachedInputPer1M: 0.5, cacheWritePer1M: 6.25 },
+  'claude-opus-4-8': { inputPer1M: 5, outputPer1M: 25, cachedInputPer1M: 0.5, cacheWritePer1M: 6.25 },
+  'claude-opus-5': { inputPer1M: 5, outputPer1M: 25, cachedInputPer1M: 0.5, cacheWritePer1M: 6.25 },
+  'claude-sonnet-4': { inputPer1M: 3, outputPer1M: 15, cachedInputPer1M: 0.3, cacheWritePer1M: 3.75 }, // Sonnet 4, 4.5, 4.6
+  'claude-sonnet-5': { inputPer1M: 2, outputPer1M: 10, cachedInputPer1M: 0.2, cacheWritePer1M: 2.5 },
+  'claude-haiku-3-5': { inputPer1M: 0.8, outputPer1M: 4, cachedInputPer1M: 0.08, cacheWritePer1M: 1 },
+  'claude-haiku-4': { inputPer1M: 1, outputPer1M: 5, cachedInputPer1M: 0.1, cacheWritePer1M: 1.25 }, // Haiku 4.5
+  'claude-fable-5': { inputPer1M: 10, outputPer1M: 50, cachedInputPer1M: 1, cacheWritePer1M: 12.5 },
+  'claude-mythos-5': { inputPer1M: 10, outputPer1M: 50, cachedInputPer1M: 1, cacheWritePer1M: 12.5 },
   // ── OpenAI ───────────────────────────────────────────────────────────────────
   'gpt-4o': { inputPer1M: 2.5, outputPer1M: 10, cachedInputPer1M: 1.25 },
   'gpt-4o-mini': { inputPer1M: 0.15, outputPer1M: 0.6, cachedInputPer1M: 0.075 },
@@ -138,8 +144,9 @@ function isUsablePrice(row: unknown): row is ModelPricing {
     if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return false;
   }
   // Optional, but if present it is multiplied too, so the same rule applies.
-  const cached = r.cachedInputPer1M;
-  if (cached !== undefined && (typeof cached !== 'number' || !Number.isFinite(cached) || cached < 0)) return false;
+  for (const opt of [r.cachedInputPer1M, r.cacheWritePer1M]) {
+    if (opt !== undefined && (typeof opt !== 'number' || !Number.isFinite(opt) || opt < 0)) return false;
+  }
   return true;
 }
 
@@ -195,11 +202,13 @@ export function costOf(usage: any, pricing: ModelPricing): number {
   // gnl's own normalised field — not the SDK's. Reading the SDK object directly is what made the
   // cache discount dead code on every version: no AI SDK release has ever had `usage.cachedTokens`.
   const cached = usage?.cachedTokens ?? 0;
-  const input = Math.max(0, (usage?.inputTokens ?? 0) - cached);
+  const written = usage?.cacheWriteTokens ?? 0;
+  const input = Math.max(0, (usage?.inputTokens ?? 0) - cached - written);
   const output = usage?.outputTokens ?? 0;
   return (
     (input / 1e6) * pricing.inputPer1M +
     (cached / 1e6) * (pricing.cachedInputPer1M ?? pricing.inputPer1M) +
+    (written / 1e6) * (pricing.cacheWritePer1M ?? pricing.inputPer1M) +
     (output / 1e6) * pricing.outputPer1M
   );
 }
