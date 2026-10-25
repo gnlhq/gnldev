@@ -7,7 +7,51 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.15.0] — 2026-10-25
+
+**What an agent costs, measured on its own runs — and lowered only where a replay shows it does the same
+work.** A new package, `@gnldev/optimizer`, reads where an agent's money went from what the provider
+billed, offers two levers (prompt-cache marks and leaving old tool output out of the context), and
+replays recorded runs with a cheaper model — every tool answered from the recording, none executed — to
+show whether the cheaper setting does the same work. It recommends and changes nothing; Studio shows it
+as an Optimizer tab. Measured on a paid key: a cache key took a third off four runs sharing their
+instructions, and GNL's computed cost equalled the cost worked out from the provider's own usage.
+
+### Upgrading from 0.14
+
+- **Anthropic runs that write to the prompt cache cost slightly more in GNL's numbers** — the amount
+  the provider bills: cache writes were priced as plain input and are now priced at the write rate.
+  A spend limit set close to a run's cost may trip a little earlier. `RunCost` gains `cacheWriteTokens`.
+- No store step.
+
+
+### Added
+
+- **`@gnldev/optimizer`** — lower what agents cost without lowering what they do, measured on their own
+  conversations. `diagnoseAgent` reads where an agent's money went from what the provider billed (the
+  opening re-sent on later steps and what a cache would save after one write per run; the same
+  instructions re-sent by runs that start within 5 minutes of one another; old tool output, both
+  estimated). `replayCounterfactual` plays a recorded run again with another model, system prompt or
+  context policy, answering every tool call from the recording and never executing a tool; a call the
+  recording never made stops it as a divergence. Two levers: `withCacheBreakpoints` (Anthropic cache
+  marks within the limit of 4, an OpenAI `promptCacheKey`) and `maskOldToolOutputs` (old tool output
+  left out of a step's context, kept in the journal). `DEFAULT_SUITE` — 26 scenarios of tool-using work
+  with expectations a program checks, no judge — with `runSuite` and `compareOnSuite`; a model that
+  could not be asked is reported as an error, not as a quality failure. `replayAgent` sums an agent's
+  latest runs replayed under one candidate; each replay is kept (no conversation text) and
+  `renderReport` writes a Markdown report with a recommendation. It recommends and changes nothing.
+  Studio shows an **Optimizer** tab when given `studioOptimizer(...)`: diagnosis, replay, history and the
+  report, all read through the caller's organization.
+
+### Fixed
+
+- **A cache write is billed as a write** (`@gnldev/durable`). The AI SDK reports tokens written to a
+  provider's prompt cache in `usage.inputTokens.cacheWrite`; flattening dropped them, so they were billed
+  as plain input — Anthropic bills them at 1.25x (5-minute TTL) or 2x (1 hour), OpenAI's GPT-5.6+ at 1.25x
+  or 2.5x. A price row may now name `cacheWritePer1M`; the Anthropic rows carry their 5-minute rate.
+  `getRunCost`, its per-step funnel and the spend limits read it, and `RunCost` reports
+  `cacheWriteTokens`. A row without a write rate prices exactly as before. Runs on Anthropic models
+  that write to the cache now cost slightly more in GNL's numbers — the amount the provider bills.
 
 ### Changed
 

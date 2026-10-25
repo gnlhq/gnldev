@@ -88,7 +88,7 @@ export const ACTIONS = [
   'agent.approve', 'agent.block', 'agent.delete', 'agent.gate',
   'agent.promote', 'agent.run', 'agent.version', 'agent.version-delete',
   'approve', 'cache.invalidate', 'deny', 'event.release', 'fork',
-  'job.retry', 'org.budget', 'org.create', 'org.delete',
+  'job.retry', 'optimizer.replay', 'org.budget', 'org.create', 'org.delete',
   'policy.update', 'pricing.update', 'retention.sweep', 'run.cancel',
   'run.compensate', 'run.otel-export', 'run.purge', 'run.regression',
   'thread.delete', 'thread.rename', 'thread.truncate', 'tool.exec',
