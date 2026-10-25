@@ -9,6 +9,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`@gnldev/optimizer`** — lower what agents cost without lowering what they do, measured on their own
+  conversations. `diagnoseAgent` reads where an agent's money went from what the provider billed (the
+  opening re-sent on later steps and what a cache would save after one write per run; the same
+  instructions re-sent by runs that start within 5 minutes of one another; old tool output, both
+  estimated). `replayCounterfactual` plays a recorded run again with another model, system prompt or
+  context policy, answering every tool call from the recording and never executing a tool; a call the
+  recording never made stops it as a divergence. Two levers: `withCacheBreakpoints` (Anthropic cache
+  marks within the limit of 4, an OpenAI `promptCacheKey`) and `maskOldToolOutputs` (old tool output
+  left out of a step's context, kept in the journal). `DEFAULT_SUITE` — 26 scenarios of tool-using work
+  with expectations a program checks, no judge — with `runSuite` and `compareOnSuite`; a model that
+  could not be asked is reported as an error, not as a quality failure. `replayAgent` sums an agent's
+  latest runs replayed under one candidate; each replay is kept (no conversation text) and
+  `renderReport` writes a Markdown report with a recommendation. It recommends and changes nothing.
+  Studio shows an **Optimizer** tab when given `studioOptimizer(...)`: diagnosis, replay, history and the
+  report, all read through the caller's organization.
+
+### Fixed
+
+- **A cache write is billed as a write** (`@gnldev/durable`). The AI SDK reports tokens written to a
+  provider's prompt cache in `usage.inputTokens.cacheWrite`; flattening dropped them, so they were billed
+  as plain input — Anthropic bills them at 1.25x (5-minute TTL) or 2x (1 hour), OpenAI's GPT-5.6+ at 1.25x
+  or 2.5x. A price row may now name `cacheWritePer1M`; the Anthropic rows carry their 5-minute rate.
+  `getRunCost`, its per-step funnel and the spend limits read it, and `RunCost` reports
+  `cacheWriteTokens`. A row without a write rate prices exactly as before. Runs on Anthropic models
+  that write to the cache now cost slightly more in GNL's numbers — the amount the provider bills.
+
 ### Changed
 
 - **The README says what GNL is: a full agent framework, durable from the core.** It opened with "a thin

@@ -12,6 +12,8 @@ export interface RunCost {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  /** Input tokens written to the provider's cache (billed at the row's `cacheWritePer1M`). */
+  cacheWriteTokens: number;
   totalTokens: number;
   modelCalls: number;
   toolCalls: number;
@@ -33,6 +35,7 @@ export interface ModelStepUsage {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  cacheWriteTokens: number;
   totalTokens: number;
   costUsd: number;
   modelId: string;
@@ -82,7 +85,8 @@ export function usageAndCostFromModelValue(value: unknown, opts: RunCostOptions 
   const { usage } = facts;
   // Through the compat layer, not field-by-field: this is the one funnel every token/cost read
   // passes, so reading the raw object here is what silently disabled every spend ceiling.
-  const { inputTokens: inp, outputTokens: outp, cachedTokens: cached, totalTokens: total } = flattenUsage(usage);
+  const flat = flattenUsage(usage);
+  const { inputTokens: inp, outputTokens: outp, cachedTokens: cached, cacheWriteTokens: written, totalTokens: total } = flat;
   // Measured against a live provider: a generate record's `response` carries
   // ["id","modelId","timestamp","headers","body"] while a stream record's carries ONLY ["headers"], so
   // every streamDurable step used to price as 'unknown' — priceFor returned nothing, costUsd was 0 and
@@ -92,13 +96,13 @@ export function usageAndCostFromModelValue(value: unknown, opts: RunCostOptions 
   const pricing = priceFor(modelId, table);
   // costOf reads FLAT fields, so it must be handed the flattened object — a nested usage would
   // price every step at zero.
-  const costUsd = pricing ? costOf({ inputTokens: inp, outputTokens: outp, cachedTokens: cached }, pricing) : 0;
+  const costUsd = pricing ? costOf(flat, pricing) : 0;
   // Reported, not warned about. This funnel also serves plain cost REPORTING, where an unpriced
   // model is unremarkable -- every mock model in a test suite is unpriced and always will be. The
   // warning belongs where the silence is actually dangerous: at a configured maxCostUsd ceiling
   // (see limits.ts). Warning here instead meant an ordinary durable run printed to stderr, which
   // is how test/suspend-cross-process.test.ts caught it.
-  return { inputTokens: inp, outputTokens: outp, cachedTokens: cached, totalTokens: total, costUsd, modelId, priced: !!pricing };
+  return { inputTokens: inp, outputTokens: outp, cachedTokens: cached, cacheWriteTokens: written, totalTokens: total, costUsd, modelId, priced: !!pricing };
 }
 
 export async function getRunCost(
@@ -116,7 +120,7 @@ export async function getRunCost(
   const resolved: RunCostOptions = opts.pricing ? opts : { ...opts, pricing: await effectivePricingTable(reader as never) };
   const entries = await reader.readRun(runId);
   const out: RunCost = {
-    runId, inputTokens: 0, outputTokens: 0, cachedTokens: 0, totalTokens: 0,
+    runId, inputTokens: 0, outputTokens: 0, cachedTokens: 0, cacheWriteTokens: 0, totalTokens: 0,
     modelCalls: 0, toolCalls: 0, costUsd: 0, byModel: {},
   };
   for (const e of entries) {
@@ -130,6 +134,7 @@ export async function getRunCost(
     out.inputTokens += u.inputTokens;
     out.outputTokens += u.outputTokens;
     out.cachedTokens += u.cachedTokens;
+    out.cacheWriteTokens += u.cacheWriteTokens;
     out.totalTokens += u.totalTokens;
     out.costUsd += u.costUsd;
     const bm = out.byModel[u.modelId] ?? { calls: 0, tokens: 0, costUsd: 0 };
