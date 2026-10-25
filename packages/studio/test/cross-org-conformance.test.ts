@@ -94,6 +94,11 @@ const VERDICTS: Record<string, { verdict: Verdict; why: string }> = {
   'POST /runs/:id/compensate': { verdict: 'org-scoped', why: 'unwinds a run' },
   'POST /runs/:id/score': { verdict: 'org-scoped', why: 'writes onto a run' },
   'POST /runs/:id/otel-export': { verdict: 'org-scoped', why: 'exports a run' },
+  'GET /optimizer': { verdict: 'global', why: 'the host optimizer catalog: agent and model names from code, not journal data' },
+  'GET /optimizer/diagnosis': { verdict: 'org-scoped', why: "reads an agent's runs through the caller's scoped reader" },
+  'POST /optimizer/replay': { verdict: 'org-scoped', why: "replays an agent's runs read through the caller's scoped reader" },
+  'GET /optimizer/history': { verdict: 'org-scoped', why: "the agent's kept replays, read through the caller's scoped reader" },
+  'GET /optimizer/report': { verdict: 'org-scoped', why: "a report built from the caller's scoped reader" },
   'GET /metrics': { verdict: 'org-scoped', why: 'aggregates the org-scoped journal' },
   'GET /metrics/runs': { verdict: 'org-scoped', why: 'aggregates the org-scoped journal' },
   'GET /audit': { verdict: 'org-scoped', why: 'the audit log is per organization' },
@@ -271,6 +276,12 @@ async function seeded() {
   // run `GET /runs/:id/regression/:otherId` needs.
   await seedOrg(journal, 'acme', 'r-acme-2', MARKER, 2);
   await seedOrg(journal, 'globex', 'r-globex', 'GLOBEX-OWN', 1);
+  // One run per organization for the optimizer's agent, carrying the organization's own text: the
+  // optimizer stand-in answers with what the reader it is handed can see.
+  for (const [org, text] of [['acme', MARKER], ['globex', 'GLOBEX-OWN']] as const) {
+    await journal.put(`org:${org}:r-opt:input`, { _v: 1, prompt: text, at: 1, agent: 'support' });
+    await journal.put(`org:${org}:r-opt:model:0`, { content: [{ type: 'text', text }], finishReason: 'stop', usage: { inputTokens: { total: 5 }, outputTokens: { total: 7 } } });
+  }
   // A run left SUSPENDED on a tool call, which is what `GET /approvals` reconstructs.
   await suspendRun(journal, 'acme', 'r-acme', MARKER);
   // The SAME shape under globex, so the control is "two different pending queues" rather than "one
@@ -404,6 +415,12 @@ function hostObjects(optIn: boolean) {
  * the route in the uncontrolled pile for a reason that has nothing to do with organizations. Fourteen
  * routes were sitting there purely because the fixture had not enabled the feature.
  */
+/** What the optimizer stand-in answers: the inputs of the agent's runs the handed reader can see. */
+async function optimizerSeen(journal: any, agent: string) {
+  const page = await journal.listRunsPaged({ agent, limit: 100 });
+  return { runs: await Promise.all(page.items.map(async (r: any) => (await journal.get(`${r.runId}:input`))?.prompt)) };
+}
+
 async function makeApi(optIn = false) {
   const journal = await seeded();
   const mem = (j: { get: (k: string) => Promise<unknown>; put: (k: string, v: unknown) => Promise<void> }) => ({
@@ -432,6 +449,13 @@ async function makeApi(optIn = false) {
     resume: async (_id: string, _a: unknown, ctx?: { orgId?: string }) => rec('resume', ctx, {}),
     compensate: async (_id: string, _o?: unknown, ctx?: { orgId?: string }) => rec('compensate', ctx, { ok: true }),
     otelExport: async (runId: string) => ({ ok: true, target: runId }),
+    optimizer: {
+      catalog: () => ({ agents: ['support'], models: ['openai/gpt-4o-mini'] }),
+      diagnose: async (j: any, agent: string) => optimizerSeen(j, agent),
+      replay: async (j: any, req: { agent: string }) => optimizerSeen(j, req.agent),
+      history: async (j: any, agent: string) => optimizerSeen(j, agent),
+      report: async (j: any, agent: string) => ({ markdown: JSON.stringify(await optimizerSeen(j, agent)) }),
+    },
     // `chat` is a FUNCTION, not an object with `.send` — the route calls `chat(message, {runId}, ctx)`.
     // An earlier fixture used `{ send }`, which produced "chat is not a function" and left the route
     // looking uncontrollable when it was simply never reached.
@@ -518,6 +542,10 @@ const QUERY: Record<string, string> = {
   // This host has no `userErasure`: without the flag the delete is refused (409) for owner and stranger
   // alike, for a reason that has nothing to do with organizations.
   'DELETE /users/:id': '?keepData=true',
+  // The agent to diagnose; it must be one the host optimizer offers.
+  'GET /optimizer/diagnosis': '?agent=support',
+  'GET /optimizer/history': '?agent=support',
+  'GET /optimizer/report': '?agent=support',
 };
 
 async function drive(api: (r: Request) => Promise<Response>, route: { method: string; path: string }, who: Record<string, string>) {
@@ -543,6 +571,8 @@ async function drive(api: (r: Request) => Promise<Response>, route: { method: st
       // `POST /dead-events/release` addresses a record by the TRIPLE (topic, consumer, id) — `id`
       // alone is already above, and without the other two the route 400s before reaching the host.
       topic: 'orders.created', consumer: 'acme-consumer',
+      // `POST /optimizer/replay` names the agent (and the model, above) it replays; both must be offered.
+      agent: 'support',
       // Running a managed workflow BEGINS a run: `r-acme` is an agent run of acme's, and a workflow may
       // not write under another target's id (refused at its birth — the target rule). Its own id.
       ...(/^\/workflows\/:name\/run(-stream)?$/.test(route.path) ? { runId: 'wf-run-acme' } : {}),
@@ -655,6 +685,7 @@ describe('the ownership control — acme must SEE what globex must not', () => {
     'GET /runs/:id/incidents', 'GET /runs/:id/network', 'GET /runs/:id/processors',
     'GET /scheduler/triggers', 'GET /runs/:id/memory-context',
     'POST /runs/:id/otel-export', 'GET /runs/:id/regression/:otherId', 'POST /runs/:id/resume',
+    'GET /optimizer/diagnosis', 'POST /optimizer/replay', 'GET /optimizer/history', 'GET /optimizer/report',
     'POST /runs/:id/score', 'GET /runs/:id/scores', 'GET /runs/:id/state', 'GET /runs/:id/trace',
     'POST /users',
     'GET /threads', 'GET /threads/:id/messages', 'GET /threads/:id/working-memory',

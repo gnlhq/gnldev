@@ -5,6 +5,32 @@ import { config } from './config';
 import { authHeader, getToken } from './auth';
 
 // ── Types (structurally compatible with server.ts responses) ────────────────
+/** GET /optimizer — the agents and candidate models the host's optimizer offers. */
+export interface OptimizerCatalog { agents: string[]; models: string[] }
+/** GET /optimizer/diagnosis — @gnldev/optimizer AgentDiagnosis (the fields the view reads). */
+export interface OptimizerDiagnosis {
+  agent: string; runs: number; modelSteps: number; costUsd: number;
+  inputTokens: number; outputTokens: number; cachedTokens: number; cacheWriteTokens: number;
+  byModel: Record<string, { steps: number; costUsd: number }>;
+  repeatedPrefix: { tokens: number; uncachedTokens: number; cacheableUncachedTokens: number; share: number; medianOpening: number };
+  sharedInstructions: { estimatedTokens: number; cacheableUncachedTokens: number; runs: number; share: number };
+  oldToolOutput: { estimatedTokens: number; share: number; keepLast: number };
+  findings: Array<{ lever: 'cache' | 'mask-old-tool-output'; tokens: number; estimatedSavingUsd?: number; needsReplay: boolean; why: string }>;
+  notes: string[];
+}
+/** GET /optimizer/history — a kept replay (@gnldev/optimizer ExperimentRecord, the fields the view reads). */
+export interface OptimizerExperiment {
+  at: number; agent: string; model: string; limit: number; keepLast?: number;
+  summary: { replayed: number; diverged: number; divergenceRate: number | null; missedCallRuns: number; costRatio: number | null; recordedTokens: number; candidateTokens: number; priced: boolean };
+  errors: Array<{ runId: string; error: string }>;
+}
+/** POST /optimizer/replay — @gnldev/optimizer ReplayAgentResult (the fields the view reads). */
+export interface OptimizerReplay {
+  agent: string;
+  runs: Array<{ runId: string; divergence?: { at: number; call: { toolName: string } }; missed: unknown[]; reordered: boolean; recorded: { costUsd: number; inputTokens: number; outputTokens: number }; candidate: { costUsd: number; inputTokens: number; outputTokens: number } }>;
+  errors: Array<{ runId: string; error: string }>;
+  summary: { replayed: number; diverged: number; divergenceRate: number | null; missedCallRuns: number; reorderedRuns: number; recordedCostUsd: number; candidateCostUsd: number; costRatio: number | null; recordedTokens: number; candidateTokens: number; priced: boolean };
+}
 export interface Capabilities {
   // NOTE: `chat` = the host's optional POST /chat (non-streaming, embedder/programmatic) endpoint. It is
   // DELIBERATELY not surfaced in Studio UI — interactive chat is covered by Playground (streaming,
@@ -39,6 +65,8 @@ export interface Capabilities {
   eventsManage?: boolean;
   /** Cache view (@gnldev/cache hit/miss ratio + size — on if the host passed the `cache` option). */
   cache?: boolean;
+  /** Optimizer view (@gnldev/optimizer `studioOptimizer` — on if the host passed the `optimizer` option). */
+  optimizer?: boolean;
   /** Manual invalidate button in the Cache view (on if the host implements cache.invalidate). */
   cacheManage?: boolean;
   /** Scheduler view (@gnldev/scheduler trigger introspection) — on when the journal is writable + listKeys,
@@ -713,6 +741,11 @@ export const api = {
   releaseDeadEvent: (topic: string, consumer: string, id: string) =>
     post<{ ok: boolean }>('/dead-events/release', { topic, consumer, id }),
   cacheStats: () => get<CacheStats>('/cache/stats'),
+  optimizerCatalog: () => get<OptimizerCatalog>('/optimizer'),
+  optimizerDiagnosis: (agent: string) => get<OptimizerDiagnosis>(`/optimizer/diagnosis?agent=${encodeURIComponent(agent)}`),
+  optimizerReplay: (body: { agent: string; model: string; limit?: number; keepLast?: number }) => post<OptimizerReplay>('/optimizer/replay', body),
+  optimizerHistory: (agent: string) => get<{ items: OptimizerExperiment[] }>(`/optimizer/history?agent=${encodeURIComponent(agent)}`),
+  optimizerReport: (agent: string) => get<{ markdown: string }>(`/optimizer/report?agent=${encodeURIComponent(agent)}`),
   /** If key is given, only that key is deleted; if not given, (best-effort) all keys known to the host
    *  are deleted (only call when caps.cacheManage is on). */
   invalidateCache: (key?: unknown) => post<{ ok: boolean; deleted: number }>('/cache/invalidate', { key }),
@@ -1060,6 +1093,11 @@ export const useDeadEvents = (topic: string | null, consumer: string | null) => 
   });
 };
 export const useCacheStats = () => usePolled('cache', ['cache-stats'], api.cacheStats, 5000);
+export const useOptimizerCatalog = (enabled: boolean) => useQuery({ queryKey: ['optimizer-catalog'], queryFn: api.optimizerCatalog, enabled });
+export const useOptimizerHistory = (agent: string | undefined) =>
+  useQuery({ queryKey: ['optimizer-history', agent], queryFn: () => api.optimizerHistory(agent!), enabled: !!agent });
+export const useOptimizerDiagnosis = (agent: string | undefined) =>
+  useQuery({ queryKey: ['optimizer-diagnosis', agent], queryFn: () => api.optimizerDiagnosis(agent!), enabled: !!agent });
 export const useSchedulerTriggers = () => usePolled('scheduler', ['scheduler-triggers'], api.schedulerTriggers, 5000);
 // Governance: approvals inbox refreshes every 5s, organization counters every 10s; audit is keyed by filters.
 export const useApprovals = () => usePolled('approvals', ['approvals'], api.approvals, 5000);

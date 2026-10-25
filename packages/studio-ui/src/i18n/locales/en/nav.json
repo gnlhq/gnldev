@@ -27,5 +27,6 @@
   "pendingApprovalsBadge_one": "{{count}} pending approval",
   "pendingApprovalsBadge_other": "{{count}} pending approvals",
   "failedJobsBadge_one": "{{count}} failed job",
-  "failedJobsBadge_other": "{{count}} failed jobs"
+  "failedJobsBadge_other": "{{count}} failed jobs",
+  "optimizer": "Optimizer"
 }

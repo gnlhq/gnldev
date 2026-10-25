@@ -910,6 +910,27 @@ export interface StudioApiOptions {
    * the route returns 501 and the button (capabilities.otelExport) is hidden.
    */
   otelExport?: (runId: string) => Promise<{ ok: boolean; target?: string; error?: string }>;
+  /**
+   * Cost optimizer (host-provided; `studioOptimizer` from @gnldev/optimizer builds it). Studio never
+   * reads the journal for it and never holds a model: it hands the host THIS request's reader — scoped
+   * to the caller's organization, as every other route reads — and relays the answer. Not given: the
+   * routes answer 501 and the tab (capabilities.optimizer) is hidden.
+   */
+  optimizer?: StudioOptimizer;
+}
+
+/** What Studio's optimizer tab calls — see StudioApiOptions.optimizer. */
+export interface StudioOptimizer {
+  /** The agents to offer, and the candidate model specs a replay may use. */
+  catalog(): { agents: string[]; models: string[] } | Promise<{ agents: string[]; models: string[] }>;
+  /** Where an agent's money went, read from `journal`. */
+  diagnose(journal: JournalReader, agent: string): Promise<unknown>;
+  /** The agent's latest runs in `journal`, replayed with `model` — no tool executes; the outcome is kept in `journal`. */
+  replay(journal: JournalReader, request: { agent: string; model: string; limit?: number; keepLast?: number }): Promise<unknown>;
+  /** The agent's kept replays in `journal`. */
+  history(journal: JournalReader, agent: string): Promise<unknown>;
+  /** A Markdown report for the agent from `journal`. It recommends; it changes nothing. */
+  report(journal: JournalReader, agent: string): Promise<{ markdown: string }>;
 }
 
 /** createStudioApp additionally takes the admin HTML's API base (apiBase). */
@@ -1611,7 +1632,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     | 'run.purge' | 'run.regression' | 'run.compensate' | 'run.cancel' | 'retention.sweep' | 'policy.update' | 'pricing.update'
     | 'org.budget' | 'org.create' | 'org.delete'
     | 'user.create' | 'user.delete' | 'user.revoke' | 'user.update'
-    | 'job.retry' | 'event.release' | 'cache.invalidate' | 'run.otel-export' | 'workflow.cancel'
+    | 'job.retry' | 'event.release' | 'cache.invalidate' | 'run.otel-export' | 'optimizer.replay' | 'workflow.cancel'
     | 'agent.approve' | 'agent.block';
   /**
    * Actor attribution — priority: an authenticated principal.id (e.g. a basic-auth user) > the
@@ -1907,6 +1928,9 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       // OTEL export button: on if the host gave opts.otelExport (RBAC is again enforced server-side
       // via allow(c,'write') — this is only button visibility, same pattern as queueManage/cacheManage).
       otelExport: !!opts.otelExport,
+      // Cost optimizer tab: on if the host gave opts.optimizer. Every call is handed this request's
+      // org-scoped reader, so an organization's admin diagnoses and replays only its own runs.
+      optimizer: !!opts.optimizer,
       // D3-A: durable run cancel (POST /runs/:id/cancel) — writes cancelAgentRun's cross-worker flag.
       // Studio has no in-process AbortController registry (unlike @gnldev/server's P0.3 in-flight abort),
       // so this is the durable-flag path ONLY: a canceled run stops at its NEXT fresh model step,
@@ -3695,6 +3719,62 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (!(await runVisible(id))) return c.json({ error: `run '${id}' not found` }, 404);
     const result = await opts.otelExport(id);
     await audit(c, 'run.otel-export', id, result);
+    return c.json(result);
+  });
+
+  // Cost optimizer (host-provided, see StudioApiOptions.optimizer). Reads go through `reader`, this
+  // request's org-scoped view; a replay calls a model (it costs money), so it takes 'write' and is audited.
+  const OPTIMIZER_OFF = { error: 'the optimizer is not enabled (the host must provide optimizer)' };
+  const MAX_REPLAY_RUNS = 50;
+  app.get('/optimizer', async (c) => {
+    if (!(await allowP(c.req.raw, 'catalog:read'))) return deny(c.req.raw, 'read');
+    if (!opts.optimizer) return c.json(OPTIMIZER_OFF, 501);
+    return c.json(await opts.optimizer.catalog());
+  });
+  app.get('/optimizer/diagnosis', async (c) => {
+    if (!(await allowP(c.req.raw, 'money:read'))) return deny(c.req.raw, 'read');
+    if (!opts.optimizer) return c.json(OPTIMIZER_OFF, 501);
+    const agent = await optimizerAgent(c);
+    if (typeof agent !== 'string') return agent;
+    return c.json(await opts.optimizer.diagnose(reader, agent));
+  });
+  /** The `agent` query parameter, checked against what the host offers; a Response when it is not usable. */
+  async function optimizerAgent(c: Context): Promise<string | Response> {
+    const agent = c.req.query('agent');
+    if (!agent) return c.json({ error: 'agent is required' }, 400);
+    const { agents } = await opts.optimizer!.catalog();
+    if (!agents.includes(agent)) return c.json({ error: `agent '${agent}' is not offered by the optimizer` }, 404);
+    return agent;
+  }
+  app.get('/optimizer/history', async (c) => {
+    if (!(await allowP(c.req.raw, 'money:read'))) return deny(c.req.raw, 'read');
+    if (!opts.optimizer) return c.json(OPTIMIZER_OFF, 501);
+    const agent = await optimizerAgent(c);
+    if (typeof agent !== 'string') return agent;
+    return c.json({ items: await opts.optimizer.history(reader, agent) });
+  });
+  app.get('/optimizer/report', async (c) => {
+    if (!(await allowP(c.req.raw, 'money:read'))) return deny(c.req.raw, 'read');
+    if (!opts.optimizer) return c.json(OPTIMIZER_OFF, 501);
+    const agent = await optimizerAgent(c);
+    if (typeof agent !== 'string') return agent;
+    return c.json(await opts.optimizer.report(reader, agent));
+  });
+  app.post('/optimizer/replay', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.optimizer) return c.json(OPTIMIZER_OFF, 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as { agent?: unknown; model?: unknown; limit?: unknown; keepLast?: unknown };
+    const { agents, models } = await opts.optimizer.catalog();
+    if (typeof body.agent !== 'string' || !agents.includes(body.agent)) return c.json({ error: 'agent must be one the optimizer offers' }, 400);
+    if (typeof body.model !== 'string' || !models.includes(body.model)) return c.json({ error: 'model must be one the optimizer offers' }, 400);
+    const limit = body.limit === undefined ? 10 : Number(body.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_REPLAY_RUNS) return c.json({ error: `limit must be an integer from 1 to ${MAX_REPLAY_RUNS}` }, 400);
+    const keepLast = body.keepLast === undefined ? undefined : Number(body.keepLast);
+    if (keepLast !== undefined && (!Number.isInteger(keepLast) || keepLast < 0)) return c.json({ error: 'keepLast must be a non-negative integer' }, 400);
+    const request = { agent: body.agent, model: body.model, limit, ...(keepLast !== undefined ? { keepLast } : {}) };
+    const result = await opts.optimizer.replay(reader, request);
+    await audit(c, 'optimizer.replay', body.agent, request);
     return c.json(result);
   });
 

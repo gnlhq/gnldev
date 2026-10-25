@@ -78,6 +78,9 @@ describe('managed workflow and agent stores are adopted, not left behind', () =>
   it.each([
     ['__studio_wf__wf1', 'managed workflow definitions'],
     ['__studio_agent__:bot', 'managed agent versions'],
+    // @gnldev/optimizer keeps each replay's outcome through the journal it is handed — through Studio,
+    // the caller's org-scoped view — so a paid deployment holds them under `org:<id>:`.
+    ['__optimizer__:exp:support:000000000000001-abc', 'optimizer replay history'],
   ])('%s (%s) is organization data, not platform state', (key) => {
     expect(isPlatformKey(key),
       'studio writes this key under `org:<id>:` on a paid deployment — measured through its own routes — '
