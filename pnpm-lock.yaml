@@ -610,6 +610,28 @@ importers:
         specifier: ^3.25.0
         version: 3.25.76
 
+  packages/optimizer:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
+    devDependencies:
+      '@gnldev/auth':
+        specifier: workspace:*
+        version: link:../auth
+      '@gnldev/durable':
+        specifier: workspace:*
+        version: link:../durable
+      '@gnldev/studio':
+        specifier: workspace:*
+        version: link:../studio
+      ai:
+        specifier: ^7.0.0
+        version: 7.0.143(zod@3.25.76)
+      zod:
+        specifier: ^3.25.0
+        version: 3.25.76
+
   packages/options: {}
 
   packages/otel:
