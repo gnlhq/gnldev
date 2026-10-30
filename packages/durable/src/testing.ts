@@ -822,7 +822,7 @@ interface ScopeFootprints {
  *                       its sub-agent; r-a2 (suspended on an approval); r-a3 (written by an older version)
  *                       the thread's state (mem:, xthr:, om:, sem:), its owner record and mark
  *   ayse, thread t-a:x: r-ax — a thread whose id EXTENDS t-a
- *   ayse, no thread:    r-a5 and its sub-agent; her lesson and cross-channel id records
+ *   ayse, no thread:    r-a5 and its sub-agent; her lesson, cross-channel id and suggestion records
  *   bob, thread t-b:    r-a10 — a run whose id EXTENDS r-a1 — and r-b1 (older version)
  *   ayse2:              r-z — a person whose id extends ayse's
  */
@@ -846,6 +846,10 @@ async function scope(s: Subject, j: ConformanceJournal, prefix: string): Promise
   const input = (f: Record<string, unknown>) => stampFormat({ at: 1, ...f });
   const child = (parent: string) => nestedAgentRunId(parent, 'c-agent_w');
   const subAgentCall = { status: 'succeeded', output: { text: 'child done' } };
+  const suggestion = (resourceId: string) => ({
+    v: 1, id: `s-${resourceId}`, type: 'memory-lesson', scope: 'personal', resourceId, status: 'pending',
+    rule: `${resourceId.toUpperCase()}-RULE`, mechanism: 'm', evidence: [{ runId: 'r-z', resourceId, at: 1 }], at: 1,
+  });
 
   // Thread t-a, and everything on it.
   await owning([[fp.thread, 't-a'], [fp.person, 'ayse']], async () => {
@@ -892,6 +896,9 @@ async function scope(s: Subject, j: ConformanceJournal, prefix: string): Promise
   await owning([[fp.person, 'ayse']], async () => {
     await put('lesson:res:ayse:L1', { text: 'AYSE-LESSON' });
     await put('xid:res:ayse:pay:0123456789abcdef', { toolName: 'pay' });
+    // A suggestion is keyed by id, not by person: only the owner it names says it is hers.
+    await put('sugg:s-ayse', suggestion('ayse'));
+    await put('sugg:s-ayse:decision', { approve: false, at: 1 });
   });
   // Other people: bob (a run whose id extends r-a1, and an older version's run), ayse2.
   await owning([[fp.thread, 't-b'], [fp.person, 'bob']], async () => {
@@ -906,6 +913,7 @@ async function scope(s: Subject, j: ConformanceJournal, prefix: string): Promise
     await put('r-z:input', input({ resourceId: 'ayse2' }));
     await put('r-z:model:0', { text: 'AYSE2' });
     await put('lesson:res:ayse2:L1', { text: 'AYSE2-LESSON' });
+    await put('sugg:s-ayse2', suggestion('ayse2'));
   });
   return fp;
 }
