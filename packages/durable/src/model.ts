@@ -423,6 +423,14 @@ export const RUN_DEPENDENTS = {
 export const PERSON_FAMILIES = ['xid:res:', 'lesson:res:', 'suggstats:lesson:res:'] as const;
 
 /**
+ * What follows `<family><resourceId>:` in the two lesson families is ONE suggestion id, which never holds
+ * a ':' (a uuid). The prefix alone is not a person boundary — ids may contain ':', and `alice:evil`'s
+ * lessons sit under `alice`'s prefix — so a rest with a ':' is a longer id's. Erasure and every read of
+ * a person's lessons decide "is this key theirs" with this one rule.
+ */
+export const isOwnLessonRest = (rest: string): boolean => !rest.includes(':');
+
+/**
  * Everything a PERSON owns: their threads (by owner record — the one owner source — and by the memory's
  * listing), each deleted as a thread is; their runs on no thread of theirs (`listRunsWhere({ resourceId })`);
  * the families their id names; their working memory; their documents (`owner`); their owned jobs and
@@ -432,6 +440,7 @@ export const PERSON_DEPENDENTS = {
   threads: 'owner records (listOwnerRecords) + MemoryStore.listThreads({ resourceId })',
   runs: 'listRunsWhere({ resourceId })',
   families: PERSON_FAMILIES,
+  suggestions: 'sugg:<id> records owned (scope personal, resourceId) + their evidence on org records (eraseSuggestionsOf)',
   workingMemory: 'workingMemoryScope.resource + legacyWorkingMemoryScope.resource',
   vectors: 'delete({ owner })',
   work: 'deleteIdPrefix(ownedPrefix(owner))',

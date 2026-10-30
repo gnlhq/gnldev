@@ -7,6 +7,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.15.1] — 2026-10-30
+
+**What is remembered about a person stays with that person, goes when they are erased, and is seen by
+the model that saved it.** Three defects in 0.15.0, each fixed at its rule: a person's lessons are read
+by the same boundary erasure draws, erasing a person takes their suggestions, and working memory with a
+`template` shows the saved values. Upgrading from 0.15.0 needs no store step and no code change.
+
+### Fixed
+
+- **A person's lessons stop at the person.** `lesson:res:<id>:` is not a boundary when ids may contain
+  ':' — `suggestions.lessons('alice')` returned `alice:evil`'s lessons too, and the next run of alice's
+  carried them in its system prompt. Erasure already drew the line; the lesson listing and the
+  injection now read the same rule.
+- **Erasing a person takes their suggestions.** `sugg:<id>` records are keyed by id, so `purgeResource`
+  / `eraseSubject` left a person's pending and rejected suggestions (rule text, evidence naming their
+  runs) behind. They are now matched on the owner the record stores and erased; on org-scope
+  promotions the person's evidence entries are removed, and a promotion nobody supports any more goes.
+  The storage conformance kit checks it on every adapter.
+- **Working memory with a `template` shows what was saved.** With a template set, the system message
+  carried the template text in place of the saved values, so the model never saw what it had stored
+  (and a `readOnly` reader saw nothing). The saved values are now always shown, with the template after
+  them as the shape to keep them in.
+
 ## [0.15.0] — 2026-10-25
 
 **What an agent costs, measured on its own runs — and lowered only where a replay shows it does the same

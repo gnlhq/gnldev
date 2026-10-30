@@ -25,7 +25,7 @@ import { LOG_SWEEP_TARGET_NAMES, PURGE_ORGANIZATION_NAMES, PURGE_RESOURCE_NAMES,
 // What a run, a thread and a person own, and the one executor that deletes by it (model.ts). The
 // journal primitives (exact and neighbour-safe deletes, the thread-key readers) live there with it.
 import {
-  requireDelete, deleteExactKey, escOwnerPart, ownershipTraceKey, planRun, planThread, planOrganization, executePlan, PERSON_FAMILIES,
+  requireDelete, deleteExactKey, escOwnerPart, ownershipTraceKey, planRun, planThread, planOrganization, executePlan, PERSON_FAMILIES, isOwnLessonRest,
   MEM_PREFIX, XTHR_PREFIX, threadIdOfMemKey, threadIdOfXthrKey, threadIdOfSemKey,
 } from './model.js';
 import type { DeleteTarget } from './model.js';
@@ -35,6 +35,7 @@ import { orgStorageScopeOf } from './org-storage.js';
 import type { SubjectEraser } from './erase.js';
 import type { MemoryStore } from './storage.js';
 import { ThreadRunsInFlightError } from './errors.js';
+import { eraseSuggestionsOf } from './suggestions.js';
 import { orgPurgedKey, sweepRunFences } from './erasure-fence.js';
 export { ownershipTraceKey, orgPurgedKey };
 
@@ -139,8 +140,8 @@ async function purgeRunPlan(journal: Journal & Partial<JournalReader>, runId: st
  * süpürür — `xid:res:<rid>:` (kanallar-arası iş kimlikleri: düz-metin kimlik + tutar + ilk-koşum
  * referansı) ve `lesson:res:<rid>:` (HERMES kişisel dersleri). Denetçi K27-EK: bu yüzey, xid
  * ailesinin doğduğu diff'te 'yorumda reçete' olarak kalmıştı — çağrılabilir hali budur.
- * `sugg:` kayıtları resource-önekli DEĞİL (id-anahtarlı) — kişinin önerileri suggestions API'siyle
- * listelenip tek tek silinir; buradaki dönüş sayısına dahil değildir (belgeli sınır).
+ * `sugg:` records are keyed by id, not by person: `purgeResource` erases them by the owner the record
+ * names (`eraseSuggestionsOf`, suggestions.ts).
  */
 /**
  * BATCH ailesinin silme yüzeyi (denetçi bloker — K27/EK-2): `batch:<batchId>:` tek süpürmede plan
@@ -188,7 +189,7 @@ async function purgePersonFamilies(journal: Journal, resourceId: string): Promis
   for (const [pre, isStats] of [[lessonPre, false], [statsPre, true]] as const) {
     for (const k of await journal.listKeys(pre)) {
       const rest = k.slice(pre.length);
-      if (rest.includes(':')) { foreign = true; continue; }
+      if (!isOwnLessonRest(rest)) { foreign = true; continue; }
       own.push(k);
       if (!isStats) suggIds.add(rest);
     }
@@ -278,7 +279,7 @@ export async function purgeResource(
   // counter's key itself names the person, so it must die with them (GDPR brief audit, K27 EK-3).
   // deletePrefix sweeps counter rows since P1.6, so this reaches HINCRBY-backed adapters too.
   let total =
-    (await purgePersonFamilies(journal, resourceId));
+    (await purgePersonFamilies(journal, resourceId)) + (await eraseSuggestionsOf(journal, resourceId));
 
   // Their own documents in the knowledge base (shared ones are nobody's to erase with one person).
   // Before the early return below, which a journal without paged listing takes.
