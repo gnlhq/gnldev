@@ -59,6 +59,8 @@ export const ADOPTABLE_RESERVED_PREFIXES: readonly string[] = [
   // @gnldev/optimizer's replay history: written through the journal it is handed, which through Studio
   // is the caller's org-scoped view — per-organization by construction, like the two above.
   '__optimizer__:',
+  // Studio's Lab experiments: written through the same org-scoped reader as the optimizer's history.
+  '__lab__:',
   // The fences of runs deleted in the root (erasure-fence.ts): adopted with the runs' scope, so a
   // deleted run id stays refused where its work now runs.
   '__run_erased__:',

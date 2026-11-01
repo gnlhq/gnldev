@@ -230,6 +230,10 @@ jobs:
           DISABLE_SECURITY_PLUGIN: 'true'
           DISABLE_INSTALL_DEMO_CONFIG: 'true'
           OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+          # Past its disk watermark OpenSearch blocks index creation for the whole cluster ("cluster
+          # create-index blocked") — measured on a runner (PR #48, run 41337139135: every vector-kit test
+          # 403). A one-node test server's disk is the runner's, not ours to guard.
+          cluster.routing.allocation.disk.threshold_enabled: 'false'
         ports: ['9200']
         options: >-
           --health-cmd "curl -fs http://localhost:9200/_cluster/health || exit 1" --health-interval 5s --health-timeout 5s --health-retries 40

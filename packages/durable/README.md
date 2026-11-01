@@ -1015,7 +1015,7 @@ a deletion that silently did nothing would be the worst possible failure here.
 
 | Call | Deletes | Reach for it when |
 |---|---|---|
-| `eraseSubject(storage, resourceId, { orgId?, erasers?, memory? })` | a PERSON, from every store the storage holds: runs, their own threads (not other people's they wrote into) with messages, observations and observational-memory records and vectors, their working memory (0.7 and 0.6 keys), cross-channel ids, lesson counters, documents, owned jobs and events — plus what the `erasers` reach, and a memory kept in another storage (`memory`) | an erasure request arrives |
+| `eraseSubject(storage, resourceId, { orgId?, erasers?, memory? })` | a PERSON, from every store the storage holds: runs, their own threads (not other people's they wrote into) with messages, observations and observational-memory records and vectors, their working memory (0.7 and 0.6 keys), cross-channel ids, lesson counters, records kept about them (`personRecordKey`), documents, owned jobs and events — plus what the `erasers` reach, and a memory kept in another storage (`memory`) | an erasure request arrives |
 | `purgeRun(journal, runId)` | one run and its nested sub-agent/workflow children | a single run must go |
 | `purgeThread(journal, threadId, { memory?, vectors?, allowInFlight? })` | a THREAD, with its runs: every run on it (and their sub-agents), `mem:`, `om:` (observational memory's counters and memoized summaries), `sem:`, the whole `xthr:` family (dedup window, semantic records, tombstones, judge verdicts), the ownership traces naming it and its owner record (last) — plus, given them, the memory store's half (`memory`) and its observation vectors (`vectors`). Refuses while a run on it is in flight (`ThreadRunsInFlightError`) | a conversation must go (`AgentMemory.deleteThread` calls it with its own store) |
 | `purgeResource(journal, resourceId, { vectors?, memory? })` | the JOURNAL's share of a person (and, given the vector store, their documents). It does not reach the memory store or the work log | building your own erasure; for a request, use `eraseSubject` |
@@ -1024,6 +1024,12 @@ a deletion that silently did nothing would be the worst possible failure here.
 | `sweepRuns(journal, { olderThanMs })` | runs whose LAST activity is older than the threshold | scheduled retention |
 | `sweepThreads(journal, { olderThanMs })` | threads the memory port knows, by age | scheduled retention |
 | `sweepLog(journal, ns, opts)` | durable-log entries in one namespace | a log namespace grows without bound |
+
+A package that keeps a record ABOUT a person — a copy of their conversation, say — keeps it under
+`personRecordKey(resourceId, rest)` (`kept:res:<length>.<id>:<rest>`), and `eraseSubject` and
+`purgeResource` erase it with nothing to wire. The id's length is in the key, so erasing `bob` never
+reaches `bob:evil`'s records; in an organization it is that organization's `bob`. The Lab keeps a turn
+copied as a scenario there.
 
 ### Erasing a person
 

@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import {
   Activity, Boxes, Workflow, Network, Plug, Inbox, ScrollText, Building2, Shield,
-  FlaskConical, Gauge, Wrench, Moon, Sun, Languages, MessageSquare, BookOpen, ListChecks, Library, LogOut, Users as UsersIcon,
+  FlaskConical, Microscope, Gauge, Wrench, Moon, Sun, Languages, MessageSquare, BookOpen, ListChecks, Library, LogOut, Users as UsersIcon,
   AlertTriangle, Database, Clock, Menu, Search, Scale, DollarSign, MailWarning, PiggyBank } from 'lucide-react';
 import { useCapabilities, useMe, api, ApiError, isCredentialError, shouldForceReauth, type Capabilities } from './api';
 import { Spinner, ViewSkeleton, Btn, ErrorBox, Badge, cn } from './components';
@@ -51,6 +51,7 @@ const Jobs = lazy(() => named(import('./views/Jobs'), 'Jobs'));
 const DeadEvents = lazy(() => named(import('./views/DeadEvents'), 'DeadEvents'));
 const Cache = lazy(() => named(import('./views/Cache'), 'Cache'));
 const Optimizer = lazy(() => named(import('./views/Optimizer'), 'Optimizer'));
+const Lab = lazy(() => named(import('./views/Lab'), 'Lab'));
 const Scheduler = lazy(() => named(import('./views/Scheduler'), 'Scheduler'));
 const Knowledge = lazy(() => named(import('./views/Knowledge'), 'Knowledge'));
 const Networks = lazy(() => named(import('./views/Networks'), 'Networks'));
@@ -102,6 +103,7 @@ const NAV: NavItem[] = [
   { to: '/workflows', labelKey: 'workflows', icon: Workflow, cap: 'workflows', group: 'build' },
   { to: '/knowledge', labelKey: 'knowledge', icon: Library, cap: 'knowledge', group: 'build' },
   { to: '/evals', labelKey: 'evals', icon: FlaskConical, group: 'build' },
+  { to: '/lab', labelKey: 'lab', icon: Microscope, cap: 'lab', group: 'build' },
   { to: '/mcp', labelKey: 'mcp', icon: Plug, cap: 'mcp', group: 'build' },
   // Operate: live health of already-running infra, not authoring (D1-2/D1-5).
   { to: '/jobs', labelKey: 'jobs', icon: ListChecks, cap: 'queue', group: 'operate' },
@@ -468,6 +470,7 @@ function AppShell({ onLogout }: { onLogout?: () => void }) {
               <Route path="/dead-events" element={<DeadEvents />} />
               <Route path="/cache" element={<Cache />} />
               <Route path="/optimizer" element={<Optimizer />} />
+              <Route path="/lab" element={<Lab />} />
               <Route path="/scheduler" element={<Scheduler />} />
               <Route path="/knowledge" element={<Knowledge />} />
               <Route path="/networks" element={<Networks />} />

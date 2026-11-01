@@ -5,11 +5,11 @@ import { useTranslation } from 'react-i18next';
 import { motion } from 'framer-motion';
 import { ReactFlow, Background, Controls, MiniMap, type Node, type Edge } from '@xyflow/react';
 import dagre from '@dagrejs/dagre';
-import { GitFork, Check, X, Play, Pause, ChevronLeft, ChevronRight, SkipBack, SkipForward, Columns2, FlaskConical, Trash2, Undo2, UploadCloud, Wrench, Ban, Activity, Copy } from 'lucide-react';
+import { GitFork, Check, X, Play, Pause, ChevronLeft, ChevronRight, SkipBack, SkipForward, Columns2, FlaskConical, Trash2, Undo2, UploadCloud, Wrench, Ban, Activity, Copy, Microscope } from 'lucide-react';
 import {
   useRunsPaged, useRun, useRunState, useDiff, useTrace, useRunNetwork, useCapabilities, useLiveRuns, useRunScores, useThreads,
   useProcessorReports, useRunIncidents, useMetrics, useMetricsRuns, type MetricsRun,
-  api, errMessage, ApiError, type Capabilities, type RunSummary, type RegressionReport, type RegressionDiffEntry, type RunCost, type NetworkTrace,
+  api, errMessage, ApiError, useLabCatalog, type Capabilities, type RunSummary, type RunCost, type NetworkTrace,
   type ProcessorReport, type JournalEntry, type RunIncident,
 } from '../api';
 import { Btn, StatusBadge, StatStrip, Spinner, Empty, EmptyState, ErrorBox, JsonBlock, Tabs, Badge, cn, useStatusLabel } from '../components';
@@ -21,8 +21,8 @@ import { ThreadDetail } from './inspector-thread';
 import { currentLocale } from '../i18n/locale';
 import { readLocal, writeLocal, removeLocal } from '../storage';
 
-type TabId = 'conversation' | 'trace' | 'network' | 'forks' | 'regression' | 'processors' | 'cost' | 'incidents';
-const ALL_TAB_IDS: readonly TabId[] = ['conversation', 'trace', 'network', 'forks', 'regression', 'processors', 'cost', 'incidents'];
+type TabId = 'conversation' | 'trace' | 'network' | 'forks' | 'processors' | 'cost' | 'incidents';
+const ALL_TAB_IDS: readonly TabId[] = ['conversation', 'trace', 'network', 'forks', 'processors', 'cost', 'incidents'];
 
 // ── fork lineage tree: TWO runId conventions, because forkRun mints two ────────────
 //
@@ -570,6 +570,10 @@ function RunDetail({ runId, status, caps, allRuns, allRunsLoading, metricsById, 
 }) {
   const { t } = useTranslation('inspector');
   const qc = useQueryClient();
+  const navigate = useNavigate();
+  // The Lab replays a run with its agent's own definition: a run of an agent it was not given (a scheduler
+  // or workflow run, an agent left out of the host's lab) has nothing to replay, so it is not offered.
+  const labCatalog = useLabCatalog(!!caps?.lab);
   const [purgeOpen, setPurgeOpen] = useState(false);
   const [unwindOpen, setUnwindOpen] = useState(false);
   const [cancelOpen, setCancelOpen] = useState(false);
@@ -623,6 +627,7 @@ function RunDetail({ runId, status, caps, allRuns, allRunsLoading, metricsById, 
   const metric = metricsById.get(runId);
   const runRow = allRuns.find((r) => r.runId === runId);
   const runAgent = runRow?.agent;
+  const labOffers = !!caps?.lab && status === 'completed' && !!runAgent && !!labCatalog.data?.agents.includes(runAgent);
   // Same row, same trip: `listRuns` reads workKey out of the run's `:input` alongside `agent`, so the
   // header's label costs nothing the agent name did not already cost.
   const runWorkKey = runRow?.workKey;
@@ -649,12 +654,11 @@ function RunDetail({ runId, status, caps, allRuns, allRunsLoading, metricsById, 
     ...(cost ? [{ id: 'cost' as const, label: t('tabCost') }] : []),
     { id: 'network' as const, label: t('tabNetwork') },
     { id: 'forks' as const, label: family.length > 1 ? t('tabForksCount', { count: family.length - 1 }) : t('tabForks') },
-    ...(caps?.regression ? [{ id: 'regression' as const, label: t('tabRegression') }] : []),
     ...(caps?.processors ? [{ id: 'processors' as const, label: 'Processor' }] : []),
     // Guard incidents (duplicate guard / loop detection): the tab appears ONLY when the run has
     // any — an always-present empty tab would be noise (same conditional pattern as Cost).
     ...(incidents.data?.incidents?.length ? [{ id: 'incidents' as const, label: t('tabIncidents', { count: incidents.data.incidents.length }) }] : []),
-  ], [cost, family.length, caps?.regression, caps?.processors, incidents.data, t]);
+  ], [cost, family.length, caps?.processors, incidents.data, t]);
   // Sanity-check `tab` against the full TabId union — NOT against `tabDefs` above: several entries in
   // tabDefs are conditional on data that's still LOADING on first render for a freshly-selected run
   // (cost, incidents.data), so validating against it would bounce a perfectly valid persisted/
@@ -714,6 +718,14 @@ function RunDetail({ runId, status, caps, allRuns, allRunsLoading, metricsById, 
         </div>
         <div className="flex items-center gap-1.5">
           {caps?.otelExport && <OtelExportButton runId={runId} />}
+          {/* One way into the Lab: the run opens in Improve, its thread's turns above it — the thread is sent
+              from here, so the Lab asks nothing to find it. Only a completed run of an agent the Lab offers
+              has calls to play again. */}
+          {labOffers && (
+            <Btn variant="outline" size="xs" title={t('labButtonTitle')} onClick={() => navigate(`/lab?runId=${encodeURIComponent(runId)}${runRow?.threadId ? `&threadId=${encodeURIComponent(runRow.threadId)}` : ''}`)}>
+              <Microscope size={13} /> {t('labButton')}
+            </Btn>
+          )}
           {/* D3-A: durable cancel (irreversible → confirm dialog, same treatment as Unwind): only when
               the host journal is writable (caps.runCancel — studio has no in-process abort here). */}
           {caps?.runCancel && (
@@ -811,15 +823,6 @@ function RunDetail({ runId, status, caps, allRuns, allRunsLoading, metricsById, 
         {tab === 'cost' && cost && <CostSummary cost={cost} />}
         {tab === 'network' && <NetworkView runId={runId} />}
         {tab === 'forks' && <ForkView runId={runId} allRuns={allRuns} onSelectRun={onSelectRun} />}
-        {/* Kept mounted (not conditionally rendered): a regression run is a REAL paid model call —
-            switching to another tab must not lose the report/inputs (FLOW-01). Hidden via CSS instead
-            of unmounting; RegressionView makes no request on mount, so this costs nothing until the
-            user clicks "Re-run"/"Diff". Only this tab needs this treatment. */}
-        {caps?.regression && (
-          <div className={cn(tab !== 'regression' && 'hidden')}>
-            <RegressionView runId={runId} />
-          </div>
-        )}
         {tab === 'processors' && <ProcessorsView runId={runId} />}
         {tab === 'incidents' && <IncidentsView incidents={incidents.data?.incidents ?? []} />}
       </div>
@@ -1752,125 +1755,6 @@ function DiffPair({ a, b }: { a: string; b: string }) {
   );
 }
 
-// ── W5: Regression — re-run a recorded run with a new model/system (replayRun) or compare it
-// against an existing run (without re-running); both paths return the SAME decision-point diff (durable
-// diffRuns) → the result display is consolidated into a single DecisionList component.
-// D6-4: 'changed' used to map to 'brand' (lime) — recolored to 'info' (kept distinct from 'warning',
-// already used for 'added', and from 'destructive', already used for 'missing', so all four decision
-// outcomes stay visually distinguishable without spending the brand accent on a status label).
-const STATUS_TONE: Record<RegressionDiffEntry['status'], 'muted' | 'info' | 'destructive' | 'warning'> = {
-  same: 'muted', changed: 'info', missing: 'destructive', added: 'warning',
-};
-
-/** Shows the detail of a single decision point (model: text+tool-calls · tool: status/argsHash/output). */
-function DecisionDetail({ entry }: { entry: RegressionDiffEntry }) {
-  const { t } = useTranslation('inspector');
-  const d = entry.detail;
-  if (!d) return null;
-  if (d.note) return <div className="text-xs text-muted-foreground">{d.note}</div>;
-  if (entry.kind === 'model') {
-    return (
-      <div className="grid grid-cols-2 gap-2">
-        <div className="min-w-0 space-y-1">
-          <div className="microlabel text-muted-foreground">{t('baseLabel')}</div>
-          {d.textA !== undefined && <div className="whitespace-pre-wrap break-words rounded-sm bg-muted/40 p-1.5 font-mono text-[11px]">{d.textA || <span className="text-muted-foreground">{t('noText')}</span>}</div>}
-          {d.toolCallsA && d.toolCallsA.length > 0 && (
-            <div className="flex flex-wrap gap-1">{d.toolCallsA.map((tc, i) => <Badge key={i} tone="model">{tc.toolName}·{tc.argsHash.slice(0, 8)}</Badge>)}</div>
-          )}
-        </div>
-        <div className="min-w-0 space-y-1">
-          <div className="microlabel text-muted-foreground">{t('newLabel')}</div>
-          {/* D6-4: was bg-brand/5 — recolored to info to match STATUS_TONE.changed below. */}
-          {d.textB !== undefined && <div className="whitespace-pre-wrap break-words rounded-sm bg-info/5 p-1.5 font-mono text-[11px]">{d.textB || <span className="text-muted-foreground">{t('noText')}</span>}</div>}
-          {d.toolCallsB && d.toolCallsB.length > 0 && (
-            <div className="flex flex-wrap gap-1">{d.toolCallsB.map((tc, i) => <Badge key={i} tone="model">{tc.toolName}·{tc.argsHash.slice(0, 8)}</Badge>)}</div>
-          )}
-        </div>
-        {d.textA !== undefined && d.textB !== undefined && d.textA !== d.textB && (
-          <div className="col-span-2 min-w-0">
-            <div className="microlabel mb-1 text-muted-foreground">{t('lineDiffLabel')}</div>
-            <TextDiff a={d.textA} b={d.textB} />
-          </div>
-        )}
-      </div>
-    );
-  }
-  // tool
-  return (
-    <div className="grid grid-cols-2 gap-2 font-mono text-[11px]">
-      <div className="min-w-0 space-y-1">
-        <div className="microlabel text-muted-foreground">{t('baseLabel')}</div>
-        {d.statusA !== undefined && <div>{t('statusWord')} <span className="text-foreground">{d.statusA}</span></div>}
-        {d.argsHashA !== undefined && <div>argsHash: {d.argsHashA.slice(0, 12)}</div>}
-        {d.outputA !== undefined && <JsonBlock value={d.outputA} max={300} />}
-      </div>
-      <div className="min-w-0 space-y-1">
-        <div className="microlabel text-muted-foreground">{t('newLabel')}</div>
-        {d.statusB !== undefined && <div>{t('statusWord')} <span className="text-foreground">{d.statusB}</span></div>}
-        {d.argsHashB !== undefined && <div>argsHash: {d.argsHashB.slice(0, 12)}</div>}
-        {d.outputB !== undefined && <JsonBlock value={d.outputB} max={300} />}
-      </div>
-    </div>
-  );
-}
-
-/** Decision-point list + divergentAt summary — POST (re-run) and GET (existing run diff) share the SAME schema. */
-function DecisionList({ report }: { report: RegressionReport }) {
-  const { t } = useTranslation('inspector');
-  const STATUS_LABEL: Record<RegressionDiffEntry['status'], string> = {
-    same: t('statusSame'), changed: t('statusChanged'), missing: t('statusMissing'), added: t('statusAdded'),
-  };
-  const { diff } = report;
-  return (
-    <div className="space-y-3">
-      <Reveal>
-        <div className="flex flex-wrap items-center gap-3 rounded-md border border-border p-2.5 text-xs">
-          <span className="microlabel text-muted-foreground">{t('resultLabel')}</span>
-          <span className="font-mono">{report.baseRunId} <span className="text-muted-foreground">↔</span> {report.newRunId}</span>
-          <span className="ml-auto flex gap-1.5">
-            <Badge tone="muted">{t('summarySame', { count: diff.summary.same })}</Badge>
-            <Badge tone="info">{t('summaryChanged', { count: diff.summary.changed })}</Badge>
-            {diff.summary.missing > 0 && <Badge tone="destructive">{t('summaryMissing', { count: diff.summary.missing })}</Badge>}
-            {diff.summary.added > 0 && <Badge tone="warning">{t('summaryAdded', { count: diff.summary.added })}</Badge>}
-          </span>
-        </div>
-      </Reveal>
-      <Reveal delay={0.05}>
-        {diff.divergentAt === undefined ? (
-          <div className="rounded-md border border-success/40 bg-success/5 p-2.5 text-xs text-success">{t('allDecisionsSame')}</div>
-        ) : (
-          // D6-4: was border/bg/text-brand — recolored to info, matching STATUS_TONE.changed above.
-          <div className="rounded-md border border-info/40 bg-info/5 p-2.5 text-xs text-info">{t('firstDivergence', { index: diff.divergentAt, kind: diff.steps[diff.divergentAt]?.kind })}</div>
-        )}
-      </Reveal>
-      {diff.steps.length === 0 ? (
-        <Empty>{t('noDecisionPointsEmpty')}</Empty>
-      ) : (
-        <Stagger className="space-y-2">
-          {diff.steps.map((s, i) => (
-            <StaggerItem
-              key={i}
-              className={cn(
-                'rounded-md border p-2.5',
-                i === diff.divergentAt ? 'border-info/60' : 'border-border',
-                s.status === 'same' && 'opacity-70',
-              )}
-            >
-              <div className="mb-1.5 flex items-center gap-2 font-mono text-xs">
-                <span className="text-muted-foreground">#{i}</span>
-                <Badge tone={s.kind === 'model' ? 'model' : 'success'}>{s.kind}</Badge>
-                <span className="text-muted-foreground">{t('stepLabel', { step: s.step })}</span>
-                <Badge tone={STATUS_TONE[s.status]}>{STATUS_LABEL[s.status]}</Badge>
-              </div>
-              <DecisionDetail entry={s} />
-            </StaggerItem>
-          ))}
-        </Stagger>
-      )}
-    </div>
-  );
-}
-
 // ── Processor (audit/compliance) tab: findings left behind by pii-redactor/prompt-injection/moderation
 // processors in this run (@gnldev/durable readProcessorReports — GET /runs/:id/processors).
 // BROWSER VERIFICATION: this view's actual visual layout must be manually verified (within this task's
@@ -1961,111 +1845,6 @@ function IncidentsView({ incidents }: { incidents: RunIncident[] }) {
         </StaggerItem>
       ))}
     </Stagger>
-  );
-}
-
-function RegressionView({ runId }: { runId: string }) {
-  const { t } = useTranslation('inspector');
-  const [model, setModel] = useState('');
-  const [system, setSystem] = useState('');
-  const [memoryOff, setMemoryOff] = useState(false);
-  const [otherRunId, setOtherRunId] = useState('');
-  const [running, setRunning] = useState(false);
-  const [report, setReport] = useState<RegressionReport | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const runAgain = async () => {
-    setRunning(true); setError(null);
-    try {
-      const r = await api.runRegression(runId, { model: model.trim(), ...(system.trim() ? { system: system.trim() } : {}), ...(memoryOff ? { memoryOff: true } : {}) });
-      setReport(r);
-    } catch (e) {
-      setError(String((e as Error)?.message ?? e));
-    } finally {
-      setRunning(false);
-    }
-  };
-
-  const diffExisting = async () => {
-    setRunning(true); setError(null);
-    try {
-      const r = await api.regressionDiff(runId, otherRunId.trim());
-      setReport(r);
-    } catch (e) {
-      setError(String((e as Error)?.message ?? e));
-    } finally {
-      setRunning(false);
-    }
-  };
-
-  return (
-    <div className="space-y-4">
-      <div className="rounded-md border border-border p-3">
-        {/* D6-4: section-heading icon, not the actual action — the real "Re-run" Btn below stays
-            variant="primary" (brand); this icon no longer needs its own brand tint. */}
-        <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-foreground">
-          <FlaskConical size={13} className="text-foreground" /> {t('rerun')}
-        </div>
-        <p className="mb-2 text-xs text-muted-foreground">
-          {t('rerunDescription')}
-        </p>
-        <div className="flex flex-wrap items-end gap-2">
-          <label className="flex-1 min-w-[220px] space-y-1">
-            <span className="microlabel text-muted-foreground">{t('modelOverrideLabel')}</span>
-            <input
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder={t('modelOverridePlaceholder')}
-              className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none"
-            />
-          </label>
-          <label className="flex-1 min-w-[220px] space-y-1">
-            <span className="microlabel text-muted-foreground">{t('systemOverrideLabel')}</span>
-            <input
-              value={system}
-              onChange={(e) => setSystem(e.target.value)}
-              placeholder={t('systemOverridePlaceholder')}
-              className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs outline-none"
-            />
-          </label>
-          <Btn variant="primary" size="sm" disabled={running || !model.trim()} onClick={runAgain} arrow>
-            {running ? t('running') : t('rerun')}
-          </Btn>
-        </div>
-        {/* Counterfactual memory-off replay: strips what the ':memctx' provenance PROVES was injected
-            (recall/window/observations) and re-asks — turning "it probably read it from memory" into
-            an experiment. The frozen system string (working memory, if any) is not edited; say so. */}
-        <label className="mt-2 flex items-start gap-2 text-xs text-muted-foreground">
-          <input type="checkbox" checked={memoryOff} onChange={(e) => setMemoryOff(e.target.checked)} className="mt-0.5 accent-primary" />
-          <span>
-            <span className="font-medium text-foreground">{t('memoryOffLabel')}</span>
-            <span className="block text-[11px]">{t('memoryOffNote')}</span>
-          </span>
-        </label>
-      </div>
-
-      <div className="rounded-md border border-border p-3">
-        <div className="mb-2 text-xs font-medium text-foreground">{t('orCompareExisting')}</div>
-        <div className="flex items-end gap-2">
-          <label className="flex-1 space-y-1">
-            <span className="microlabel text-muted-foreground">{t('otherRunIdLabel')}</span>
-            <input
-              value={otherRunId}
-              onChange={(e) => setOtherRunId(e.target.value)}
-              placeholder={t('otherRunIdPlaceholder')}
-              className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none"
-            />
-          </label>
-          <Btn variant="outline" size="sm" disabled={running || !otherRunId.trim()} onClick={diffExisting}>
-            <Columns2 size={13} /> {t('diffButton')}
-          </Btn>
-        </div>
-      </div>
-
-      {error && <ErrorBox error={error} />}
-      {running && <Spinner label={t('runningOrDiffing')} />}
-      {report && <DecisionList report={report} />}
-    </div>
   );
 }
 

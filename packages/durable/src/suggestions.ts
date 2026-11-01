@@ -44,6 +44,7 @@ import { cosine, decodeVec, encodeVec, embedCached } from './semantic-dup.js';
 import type { Journal } from './journal.js';
 import type { ModelInput } from './types.js';
 import { refuseSuggestionsNames } from './option-names.js';
+import { deleteExactKey, isOwnLessonRest } from './model.js';
 
 export interface SuggestionsConfig {
   /** May the system PROPOSE lessons after completed runs? Requires `model` and journal listKeys. */
@@ -243,6 +244,40 @@ export interface SuggestionsApi {
   lessons(resourceId?: string): Promise<Array<LessonRecord & { key: string; injected?: number }>>;
 }
 
+/**
+ * A person's footprint in the suggestion records, for erasure (`purgeResource`).
+ *
+ * `sugg:<id>` is keyed by id, not by person, so no person prefix reaches it — measured before this:
+ * after erasing `alice`, her pending suggestion (rule text, evidence naming her runs and threads) was
+ * still listable. A record is matched on the owner it stores, exactly, so `alice` never takes
+ * `alice:evil`'s. Her personal record goes whole, with its decision side-key. On any other record
+ * (org-scope promotions cite the people behind them) her evidence entries are cut out by CAS, and a
+ * record left with no evidence goes: a promotion nobody supports any more is nobody's to keep.
+ * Returns the rows deleted or rewritten. A journal without `listKeys` has nothing to enumerate: 0.
+ */
+export async function eraseSuggestionsOf(journal: Journal, resourceId: string): Promise<number> {
+  if (typeof journal.listKeys !== 'function') return 0;
+  let total = 0;
+  for (const k of await journal.listKeys('sugg:')) {
+    if (k.split(':').length !== 2) continue; // decision side-keys (sugg:<id>:decision) follow their record
+    // CAS retry: a concurrent merge may add evidence between the read and the write.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const rec = await journal.get<SuggestionRecord>(k);
+      if (!rec || rec.v !== 1) break;
+      const theirs = rec.scope === 'personal' && rec.resourceId === resourceId;
+      const kept = rec.evidence.filter((e) => e.resourceId !== resourceId);
+      if (!theirs && kept.length === rec.evidence.length) break;
+      if (theirs || kept.length === 0) {
+        total += (await deleteExactKey(journal, `${k}:decision`)) + (await deleteExactKey(journal, k));
+        break;
+      }
+      if (await journal.putIfMatch(k, rec, { ...rec, evidence: kept })) { total += 1; break; }
+      if (attempt === 4) throw new Error(`@gnldev/durable: eraseSuggestionsOf('${resourceId}') — ${k} kept changing; the erasure is retried, not reported done`);
+    }
+  }
+  return total;
+}
+
 export function createSuggestions(journal: Journal, cfg: SuggestionsConfig): SuggestionsApi {
   refuseSuggestionsNames(cfg);
   assertJournalGuarantees(journal, 'createSuggestions');
@@ -253,7 +288,11 @@ export function createSuggestions(journal: Journal, cfg: SuggestionsConfig): Sug
 
   async function readLessons(resourceId?: string): Promise<Array<LessonRecord & { key: string; injected?: number }>> {
     const keys: string[] = [];
-    if (resourceId) keys.push(...(await journal.listKeys(`lesson:res:${resourceId}:`).catch(() => [] as string[])));
+    if (resourceId) {
+      // The prefix is not this person's boundary: `alice:evil`'s lessons sit under `lesson:res:alice:` too.
+      const pre = `lesson:res:${resourceId}:`;
+      keys.push(...(await journal.listKeys(pre).catch(() => [] as string[])).filter((k) => isOwnLessonRest(k.slice(pre.length))));
+    }
     keys.push(...(await journal.listKeys('lesson:org:').catch(() => [] as string[])));
     const out: Array<LessonRecord & { key: string; injected?: number }> = [];
     for (const k of keys) {

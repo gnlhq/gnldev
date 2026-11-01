@@ -1,10 +1,258 @@
 // Typed API client (@gnldev/studio JSON endpoints) + react-query hooks + SSE helpers.
 import { useEffect } from 'react';
-import { useInfiniteQuery, useQuery, useQueryClient, type InfiniteData, type QueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useInfiniteQuery, useQuery, useQueryClient, type InfiniteData, type QueryClient } from '@tanstack/react-query';
 import { config } from './config';
 import { authHeader, getToken } from './auth';
 
 // ── Types (structurally compatible with server.ts responses) ────────────────
+/** A long lab call, as it goes: `done` of `total`, the failures so far and the last reason. */
+export interface LabProgress {
+  done: number; total: number; failed: number; lastError?: string; concurrency?: number;
+  /** Present while it waits because the provider refused a request (429). */
+  throttled?: { waitMs: number; attempt: number; maxWaits: number; error: string };
+  /** Jobs started and not finished. */
+  running?: number;
+  /** A request a running job sent is being sent again (the provider client's own retry). */
+  retrying?: { reason: string; attempt: number; waitMs: number };
+}
+/** A tool as a capsule offers it (@gnldev/lab LabCapsuleTool). `recordedOnly`: the run called it, the agent's config does not define it. */
+export interface LabCapsuleTool { name: string; description: string; parameters?: unknown; recordedOnly?: true }
+/** What a run's memory layout lets the lab say (@gnldev/lab LabLayout). */
+export type LabLayout =
+  | { status: 'none' }
+  | { status: 'present'; layout: string; memoryMessages: number; notes: string[] }
+  | { status: 'absent'; reason: string; detail: string };
+/** GET /lab/capsule — what a run's capsule starts from; calls no model (@gnldev/lab LabCapsuleBase). */
+export interface LabCapsuleBase {
+  runId: string; agent: string;
+  /** The recorded system prompt without the working memory, when the layout places one in it. */
+  system: string;
+  workingMemory?: { status: 'exact' | 'moved' | 'rewritten'; text: string } | { status: 'unbounded' | 'lost' };
+  tools: LabCapsuleTool[]; earlierMessages: number; memoryMessages: number | null; lastMessage: string;
+  /** Absent from a server older than the layout. */
+  layout?: LabLayout;
+  parts?: LabPart[];
+  recordedCalls: Array<{ toolName: string; args: unknown }>; tokensPerPlay: number;
+}
+/** What a right answer does (@gnldev/experiment Expectation) — a program checks it, no judge model. */
+export interface LabExpectation {
+  calls?: Array<{ toolName: string; args?: Record<string, unknown> }>;
+  forbidden?: string[];
+  answerIncludes?: Array<string | string[]>;
+}
+/** A call in a capsule play and where its result came from. */
+export interface LabTracedCall { toolName: string; args: unknown; source: 'recorded' | 'answer' | 'override' | 'none' }
+/** POST /lab/capsule — the run's copy played again (@gnldev/lab LabCapsule, the fields the view reads). */
+export interface LabCapsule {
+  runId: string; agent: string; model: string; trials: number; failed: number;
+  recorded: { calls: Array<{ toolName: string; args: unknown }>; text: string };
+  paths: Array<{ calls: LabTracedCall[]; text: string; count: number; sameAsRecorded: boolean; passed?: number; failures?: string[] }>;
+  sameAsRecorded: { value: number; low: number | null; high: number | null; n: number };
+  pending: Array<{ toolName: string; args: unknown }>;
+  inputTokens: number; outputTokens: number; costUsd: number; priced: boolean;
+  /** With `expect`: the plays that did what it asks; a play stopped at an unanswered call is undetermined. NaN arrives as null. */
+  expected?: {
+    passRate: { value: number | null; low: number | null; high: number | null; n: number }; undetermined: number;
+    /** Over every play that ran: an undetermined play counted a failure (`low`) and a pass (`high`). Absent from an older server. */
+    bounds?: { low: LabInterval; high: LabInterval };
+  };
+  notes?: string[];
+  /** The run played as it was, as many times, beside a change (absent when nothing changed, or from an older server). */
+  unchanged?: { trials: number; failed: number; sameAsRecorded: LabInterval; paths: LabCapsule['paths']; expected?: NonNullable<LabCapsule['expected']> };
+  /** The change's rate minus the unchanged run's, 95% — with `expect` at its worst for the change. An interval holding 0 does not tell it from chance. */
+  difference?: { of: 'expected' | 'sameAsRecorded'; interval: LabInterval };
+}
+export interface LabCapsuleBody {
+  runId: string; model: string; trials: number; system?: string; tools?: LabCapsuleTool[]; history?: boolean; memory?: boolean;
+  expect?: LabExpectation;
+  answers?: Array<{ toolName: string; args: unknown; output: unknown }>;
+  /** Results put in place of the recorded ones. */
+  overrides?: Array<{ toolName: string; args: unknown; output: unknown }>;
+}
+/** A rate or a difference with its interval. NaN arrives as null. */
+export interface LabInterval { value: number | null; low: number | null; high: number | null; n: number }
+/** A turn's input by source, in characters (@gnldev/lab TurnComposition). */
+export interface LabTurnComposition { unit: 'characters'; total: number; labelled: boolean; bySource: Partial<Record<'system' | 'wm' | 'om' | 'recall' | 'recent' | 'turn' | 'unlabelled', number>> }
+/** What diagnosing a turn would take (@gnldev/lab DiagnosisPlan). */
+export interface LabDiagnosisPlan {
+  arms: number; comparisons: number; alpha: number; targetDifference: number; power: number; trials: number; plannedTrials: number;
+  detectableDifference: number;
+  /** The share of undetermined plays the plan assumes, and the smallest true difference seen at its worst with it. Absent from an older server. */
+  undetermined?: number; worstCaseDetectableDifference?: number;
+  eliminationPlays: number; verificationPlays: number; jointPlays: number; totalPlays: number; tokens: number;
+  estimatedCostUsd?: number; underpowered: boolean;
+}
+/** One turn of a thread plan (@gnldev/lab ThreadTurn, the fields the view reads). */
+export interface LabThreadTurn {
+  turn: number; runId: string; agent?: string; status: string;
+  class: 'infrastructure' | 'failed' | 'suspended' | 'completed' | 'running' | 'canceled';
+  classReason?: string; error?: { name?: string; code?: string; status?: number; message?: string };
+  modelSteps: number; firstStepInputTokens?: number; layout: LabLayout; composition?: LabTurnComposition;
+  expected?: { pass: boolean; failures: string[] };
+  diagnosable: boolean; whyNot?: string;
+  experiments?: {
+    suspects: Array<LabPart & { intervention: string }>;
+    absences: Array<{ id: string; kind: 'window' | 'trimmed'; turns: number[]; at: number; preview: string }>;
+    untestable: LabUntestable[];
+    grouped: boolean; tokensPerPlay: number; plan: LabDiagnosisPlan;
+  };
+}
+/** GET /lab/thread-plan — a thread's turns, a page at a time; calls no model. */
+export interface LabThreadPlan { threadId: string; model: string; total: number; offset: number; turns: LabThreadTurn[]; nextOffset?: number }
+/** One arm of a diagnosis: a change, played n times, beside the turn unchanged. */
+export interface LabArm {
+  id: string; intervention: string; label: string; targets: string[];
+  passed: number; judged: number; undetermined: number; failed: number;
+  rate: LabInterval;
+  /** The rate with every undetermined play counted wrong (`low`) and right (`high`). */
+  bounds?: { low: LabInterval; high: LabInterval };
+  /** The difference the verdict reads: this arm at its worst against the unchanged turn at its best. */
+  difference?: LabInterval;
+  /** The same difference over the judged plays only. */
+  observedDifference?: LabInterval;
+  pending?: Array<{ toolName: string; args: unknown }>;
+  /** Too many plays could not be judged: the arm decides nothing. */
+  untested?: { share: number };
+  paths: Array<{ calls: LabTracedCall[]; count: number; passed: number }>;
+}
+/** The verdict, by the rules written before any play. */
+export type LabVerdict =
+  | { kind: 'chance'; sentence: string; baseline: LabInterval }
+  | { kind: 'cause'; sentence: string; arm: string; also: string[] }
+  | { kind: 'indistinct'; sentence: string; arms: [string, string]; also: string[] }
+  | { kind: 'joint'; sentence: string; arms: [string, string] }
+  /** `uncorrected`: parts elimination blamed that were only left out — their content may still be wrong. */
+  | { kind: 'not-found'; sentence: string; uncorrected?: string[] }
+  /** No change was tested: elimination did not finish and nothing else was played, or every arm stopped too often at unanswered calls. */
+  | { kind: 'untested'; sentence: string; untested: string[] }
+  | { kind: 'undecided'; sentence: string };
+/** POST /lab/thread — a turn diagnosed (@gnldev/lab LabThreadDiagnosis, the fields the view reads). */
+export interface LabThreadDiagnosis {
+  runId: string; agent: string; model: string; threadId?: string; turn?: number; expect: LabExpectation;
+  layout: LabLayout; composition: LabTurnComposition;
+  elimination: { grouped: boolean; parts: LabPart[]; shares: Array<{ part: string; share: number; blame: number; noise: number | null }>; plays: number; failed: number; undetermined: number; error?: string; /** Not run: the guess was borne out. */ skipped?: true };
+  arms: LabArm[]; joint?: LabArm; comparisons: number; z: number; verdict: LabVerdict;
+  /** The corrections the model proposed for the most blamed parts, each played as an arm `correct:<part>`. */
+  suggestions?: Array<{ part: string; text: string }>;
+  /** The parts the model named first, what it said they should have said, and whether the plays bore it out. */
+  guess?: { parts: Array<{ part: string; correction?: string }>; verified: boolean; z: number; arms: LabArm[]; verdict: LabVerdict };
+  untestable: LabUntestable[]; plan: LabDiagnosisPlan;
+  plays: number; failed: number; inputTokens: number; outputTokens: number; costUsd: number; priced: boolean; notes: string[];
+}
+/** What the Lab sends to diagnose a turn. */
+export interface LabThreadBody {
+  runId: string; model: string; expect: LabExpectation; trials?: number; workingMemory?: string;
+  overrides?: Array<{ toolName: string; args: unknown; output: unknown }>;
+  answers?: Array<{ toolName: string; args: unknown; output: unknown }>;
+  /** What a part should have said, by part id — each an arm. Stays in this page and the request; never kept. */
+  corrections?: Record<string, string>;
+  /** The model also proposes corrections of the most blamed parts. */
+  suggest?: boolean;
+  /** The model first names the parts most likely to blame; only those are played first. */
+  guess?: boolean;
+}
+/** GET /lab/experiments — a lab experiment kept for the organization's admins. */
+export interface LabExperiment {
+  v: 1; id: string; at: number; actor: string; kind: 'explain' | 'capsule' | 'thread' | 'best-form'; target: string;
+  request: { model?: string; trials?: number; system?: string; tools?: LabCapsuleTool[]; history?: boolean; memory?: boolean; expect?: LabExpectation; answers?: number; overrides?: number; workingMemory?: string; scenarios?: string[] };
+  result: unknown;
+}
+/** A run's turn kept as a scenario of its agent (@gnldev/lab SavedScenario, the fields the view reads). */
+export interface LabSavedScenario {
+  v: 1; id: string; agent: string; title: string; at: number; by: string;
+  /** Present when it copies a person's conversation: erasing them erases it. */
+  owner?: string;
+  from: { runId: string; threadId?: string } | { playground: true };
+  expect: LabExpectation;
+  results: Array<{ toolName: string; args: unknown; output: unknown }>;
+  answers: Array<{ toolName: string; args: unknown; output: unknown }>;
+}
+/** What the Lab sends to keep a turn as a scenario. */
+export interface LabSaveScenarioBody {
+  runId: string; title: string; expect: LabExpectation; system?: string;
+  answers?: Array<{ toolName: string; args: unknown; output: unknown }>;
+  overrides?: Array<{ toolName: string; args: unknown; output: unknown }>;
+}
+/** POST /lab/saved-scenarios/run — each kept scenario played against the agent as it is now. */
+export interface LabScenarioRuns {
+  agent: string; model: string; allPassed: number; inputTokens: number; outputTokens: number; costUsd: number; priced: boolean;
+  scenarios: Array<{ id: string; title: string; passed: number; failed: number; undetermined: number; errored: number; passRate: LabInterval; failures: string[]; pending: Array<{ toolName: string; args: unknown }> }>;
+}
+/** A conversation message as the playground sends it (an AI SDK ModelMessage). */
+export interface LabMessage { role: 'user' | 'assistant' | 'tool'; content: unknown }
+/** An agent written on the playground: its prompt, its tools and what each returns. */
+export interface LabPlaygroundAgent {
+  system: string;
+  tools: Array<{ name: string; description: string; parameters: unknown; answers?: Array<{ args: unknown; output: unknown }>; otherwise?: { output: unknown } }>;
+}
+/** GET /lab/playground/base — an agent the lab offers, as the playground starts from it. */
+export interface LabPlaygroundBase { agent: string; system: string; systemFixed: boolean; tools: Array<{ name: string; description: string; parameters: unknown }> }
+/** A tool call in a playground play and where its answer came from. */
+export interface LabPlaygroundCall { toolName: string; args: unknown; source: 'answer' | 'otherwise' | 'none'; output?: unknown }
+/** POST /lab/playground/play — the agent's next answer. */
+export interface LabPlay { text: string; calls: LabPlaygroundCall[]; stopped?: { toolName: string; args: unknown }; messages: LabMessage[]; inputTokens: number; outputTokens: number; costUsd: number; priced: boolean }
+/** How the plays of one definition went. */
+export interface LabPlaygroundMeasure {
+  passed: number; failed: number; undetermined: number; errored: number; passRate: LabInterval;
+  paths: Array<{ calls: LabTracedCall[]; text: string; count: number; passed: number; failures?: string[] }>;
+  pending: Array<{ toolName: string; args: unknown }>;
+}
+/** POST /lab/playground/measure — the definition's plays, and A's beside them. */
+export interface LabMeasure { model: string; measure: LabPlaygroundMeasure; compared?: LabPlaygroundMeasure; difference?: LabInterval; inputTokens: number; outputTokens: number; costUsd: number; priced: boolean }
+/** GET /lab — the agents and models the host's lab offers. */
+export interface LabCatalog { agents: string[]; models: string[] }
+/** A part of a run the lab proposes (@gnldev/lab LabPart). */
+export interface LabPart {
+  id: string;
+  kind: 'system' | 'wm' | 'om' | 'recall' | 'recent' | 'turn' | 'tool';
+  /** 'unknown': a memory run whose layout does not say where this part came from. Absent from an older server. */
+  source?: 'layout' | 'unknown';
+  preview: string;
+}
+/** GET /lab/plan — what an explanation would take; calls no model (@gnldev/lab LabPlan). */
+export interface LabPlan { runId: string; agent: string; parts: LabPart[]; layout?: LabLayout; trials: number; replays: number; tokensPerReplay: number; /** What the replays are expected to take in all; absent from an older server. */ estimatedTokens?: number; estimatedCostUsd?: number }
+/** POST /lab/explain — each part's share (@gnldev/lab LabExplanation, the fields the view reads). NaN arrives as null. */
+export interface LabExplanation {
+  runId: string; agent: string; model: string; parts: string[]; partsDetail: LabPart[];
+  recordedCalls: Array<{ toolName: string }>;
+  representative: { value: number; low: number | null; high: number | null; n: number; ok: boolean };
+  dependsOnParts: boolean;
+  shares: Array<{ part: string; share: number; noise: number | null }>;
+  replays: number; failed: number; inputTokens: number; outputTokens: number; costUsd: number; priced: boolean;
+}
+/** GET /lab/scenarios — a scenario a new agent's forms can be tried on. */
+export interface LabScenario { id: string; category: string; prompt: string }
+/** GET /lab/form-plan — the components of an agent's prompt and the runs trying every form takes. */
+export interface LabFormPlan { agent: string; components: LabPart[]; scenarios: number; trials: number; forms: number; runs: number; /** The tools the chosen scenarios offer — each can be taken away. */ tools: string[] }
+/** A tool a new agent's forms may offer, written on the page: its definition and what it returns whatever it is asked. */
+export interface LabFormTool { name: string; description: string; parameters: Record<string, unknown>; output: unknown }
+/** The tools a best-form search takes away or adds, beside the prompt's sections. */
+export interface LabFormTools { withoutTools?: string[]; addTools?: LabFormTool[] }
+/** A candidate a diagnosis cannot test: in words, and as codes the page says in its reader's language. */
+export interface LabUntestable { candidate: string; reason: string; kind?: 'memory' | 'earlier-turns' | 'working-memory' | 'processor-rows'; layoutReason?: string; wmStatus?: string; rows?: number }
+/** GET /lab/prune-plan — the sections one can try removing, the agent's tools to answer, what the check takes. */
+export interface LabPrunePlan { runId: string; agent: string; sections: LabPart[]; tools: Array<{ name: string; description: string; parameters: unknown }>; arms: number; runs: number; estimatedTokens: number; estimatedCostUsd?: number }
+export interface LabPruneBody { runId: string; model: string; remove: string; control?: string; prompts: string[]; otherwise?: Record<string, unknown>; trials: number }
+/** One arm of a prune check: its distance from the full prompt's behaviour, over the prompts and per prompt. */
+export interface LabPruneArm { distance: number; perPrompt: Array<{ prompt: string; distance: number }> }
+/** POST /lab/prune — would removing the section change what the agent does, beside the noise. */
+export interface LabPrune {
+  agent: string; model: string; noise: number; removed: LabPruneArm; control?: LabPruneArm; harmless: boolean; controlSeparates?: boolean;
+  runs: number; failed: number; inputTokens: number; outputTokens: number; costUsd: number; priced: boolean;
+  unanswered: Array<{ toolName: string; args: unknown; count: number }>;
+}
+/** GET /lab/words-plan — the run's last message cut into words, and what explaining one decision takes. */
+export interface LabWordsPlan { runId: string; agent: string; words: string[]; tools: string[]; tool?: string; method: 'logprobs' | 'sampled'; samples: number; subsets: number; calls: number; estimatedTokens: number; estimatedCostUsd?: number }
+/** POST /lab/words — each word's share of the chance the next call is `tool`; `sd` when the value was sampled. */
+export interface LabWords {
+  agent: string; model: string; tool: string; method: 'logprobs' | 'sampled'; samples?: number;
+  shares: Array<{ word: string; share: number; sd?: number }>; full: number; none: number; calls: number;
+  inputTokens: number; outputTokens: number; costUsd: number; priced: boolean;
+}
+/** A form of the agent (@gnldev/lab Form). NaN arrives as null. */
+export interface LabForm { components: string[]; passRate: { value: number | null; low: number | null; high: number | null; n: number }; costUsd: number; priced: boolean; tokens: number; errored: number }
+/** POST /lab/best-form — every form, the cheapest that passes as well as the best, each component's share. */
+export interface LabBestForm { agent: string; model: string; forms: LabForm[]; shares: Record<string, number>; /** Absent when no form passed a single scenario run. */ best?: LabForm; target: number; componentsDetail: LabPart[]; scenarios: string[] }
 /** GET /optimizer — the agents and candidate models the host's optimizer offers. */
 export interface OptimizerCatalog { agents: string[]; models: string[] }
 /** GET /optimizer/diagnosis — @gnldev/optimizer AgentDiagnosis (the fields the view reads). */
@@ -67,6 +315,8 @@ export interface Capabilities {
   cache?: boolean;
   /** Optimizer view (@gnldev/optimizer `studioOptimizer` — on if the host passed the `optimizer` option). */
   optimizer?: boolean;
+  /** Lab view (@gnldev/lab `studioLab` — on if the host passed the `lab` option). */
+  lab?: boolean;
   /** Manual invalidate button in the Cache view (on if the host implements cache.invalidate). */
   cacheManage?: boolean;
   /** Scheduler view (@gnldev/scheduler trigger introspection) — on when the journal is writable + listKeys,
@@ -78,8 +328,6 @@ export interface Capabilities {
   plan?: string; licenseExp?: number;
   // Governance surfaces: approvals inbox / audit log / organization counters (server opt-in flags).
   approvals?: boolean; organizations?: boolean; org?: boolean; agentVersions?: boolean; policy?: boolean; evalGate?: boolean; purge?: boolean; retention?: boolean;
-  /** W5: replay-based regression ("rerun" + decision-point diff) — requires a writable journal. */
-  regression?: boolean;
   /** Organization budgets living in the journal can be edited from the UI (writable journal). */
   budgetManage?: boolean;
   /** Create/delete organizations (writable + listKeys). */
@@ -386,7 +634,28 @@ export interface MemoryContextRecord {
    * a warning. Absent when the dedupe did not fire.
    */
   incomingDedupedByShape?: true;
+  /** Where each part of the frozen input came from — read it through `MemoryContextResponse.layout`, never here. */
+  layout?: unknown;
+  systemSpans?: unknown;
 }
+/** A span `[start, end)` over the frozen `:input.messages`. */
+export type MemoryLayoutSpan = [number, number];
+/** @gnldev/durable MemoryLayout, the fields the Inspector reads. */
+export interface MemoryLayout {
+  v: 1; n: number;
+  status: 'exact' | 'changed' | 'counts-mismatch' | 'boundary-lost' | 'no-messages' | 'unresolved';
+  observations?: MemoryLayoutSpan; recall?: MemoryLayoutSpan; recent?: MemoryLayoutSpan; incoming?: MemoryLayoutSpan;
+  rewritten?: number[]; foreign?: number[]; ambiguous?: number[]; droppedByChain?: number; incomingAlreadyInThread?: number;
+}
+/** @gnldev/durable MemoryLayoutReading — the server's reading of a run's layout against its frozen input. */
+export type MemoryLayoutReading =
+  | { status: 'absent'; reason: 'no-record' | 'no-layout' | 'unknown-version' | 'malformed' | 'input-mismatch' | 'unresolved' }
+  | { status: 'present'; layout: MemoryLayout; systemSpans?: { workingMemory?: { span?: MemoryLayoutSpan; start?: number; chars: number; status: 'exact' | 'moved' | 'rewritten' | 'unbounded' | 'lost' } } };
+/**
+ * GET /runs/:id/memory-context. `context` is the record as stored — of any shape: a reader checks every
+ * field it uses. `layout` is absent from a server older than the layout.
+ */
+export interface MemoryContextResponse { context: unknown; layout?: MemoryLayoutReading }
 export interface AgentMeta { name: string; model: string; system?: string; hasTools: boolean; maxSteps?: number; tools?: ToolMeta[]; orgs?: string[]; }
 // ── Agent approval registry (governance — structurally compatible with @gnldev/durable's agent-registry.ts) ──
 export type AgentApprovalStatus = 'pending' | 'approved' | 'changed' | 'blocked';
@@ -556,21 +825,6 @@ export interface PricingResponse {
   /** False on a read-only journal — the screen shows the table but cannot save. */
   editable: boolean;
 }
-// ── W5: regression (structurally compatible with @gnldev/durable regression.ts — DiffDetail/DiffEntry/RunDiff) ──
-export interface RegressionDiffDetail {
-  textA?: string; textB?: string;
-  toolCallsA?: { toolName: string; argsHash: string }[]; toolCallsB?: { toolName: string; argsHash: string }[];
-  toolName?: string; argsHashA?: string; argsHashB?: string; statusA?: string; statusB?: string;
-  outputA?: unknown; outputB?: unknown; note?: string;
-}
-export interface RegressionDiffEntry { step: number; kind: 'model' | 'tool'; status: 'same' | 'changed' | 'missing' | 'added'; detail?: RegressionDiffDetail; }
-export interface RegressionRunDiff {
-  steps: RegressionDiffEntry[];
-  divergentAt?: number;
-  summary: { same: number; changed: number; missing: number; added: number };
-}
-export interface RegressionReport { ok?: boolean; baseRunId: string; newRunId: string; diff: RegressionRunDiff; score?: unknown; }
-
 // ── fetch helpers ─────────────────────────────────────────────────────────
 /**
  * API-07: shared HTTP-error-body reader (this used to be `http()`-only logic; the SSE helpers
@@ -618,6 +872,42 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
 }
 const get = <T>(p: string) => http<T>(p);
 const post = <T>(p: string, body: unknown) => http<T>(p, { method: 'POST', body: JSON.stringify(body) });
+
+/**
+ * A lab call that spends, asked as a stream: `progress` events while it runs, then one `done` (the result)
+ * or `error` (the reason — a provider's 429 included). Aborting `signal` closes the stream, and the server
+ * starts no further replay.
+ */
+async function labStream<T>(path: string, body: unknown, onProgress: (p: LabProgress) => void, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(config.apiBase + path, {
+    method: 'POST', headers: { 'content-type': 'application/json', accept: 'text/event-stream', ...authHeader() }, body: JSON.stringify(body), signal,
+  });
+  if (!res.ok) throw new Error(await errorMessageFromResponse(res));
+  if (!res.body) throw new Error(`${res.status} ${res.statusText}`);
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const chunks = buf.split('\n\n');
+    buf = chunks.pop() ?? '';
+    for (const chunk of chunks) {
+      let event = 'message', data = '';
+      for (const line of chunk.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) data += line.slice(5).trim();
+      }
+      if (!data) continue;
+      const parsed = JSON.parse(data);
+      if (event === 'progress') onProgress(parsed as LabProgress);
+      else if (event === 'done') return parsed as T;
+      else if (event === 'error') throw new Error((parsed as { error: string }).error);
+    }
+  }
+  throw new Error('the lab stream ended without a result');
+}
 const del = <T>(p: string) => http<T>(p, { method: 'DELETE' });
 const patch = <T>(p: string, body: unknown) => http<T>(p, { method: 'PATCH', body: JSON.stringify(body) });
 
@@ -644,7 +934,7 @@ export const api = {
   modelProviders: () => get<{ providers: string[]; models: string[] }>('/model-providers'),
   runs: () => get<RunSummary[]>('/runs'),
   /** Memory provenance for a turn ('null' = not recorded: old run, memory off, read-only journal). */
-  memoryContext: (id: string) => get<{ context: MemoryContextRecord | null }>(`/runs/${encodeURIComponent(id)}/memory-context`),
+  memoryContext: (id: string) => get<MemoryContextResponse>(`/runs/${encodeURIComponent(id)}/memory-context`),
   // API-09: optional server-side filters — SAME parameter names as @gnldev/server's GET /runs (status/agent
   // are pushed down to the engine; q is a runId substring). Filtering is done on the server so `total`
   // (shown in the search placeholder) always describes the same set as `items`.
@@ -741,6 +1031,37 @@ export const api = {
   releaseDeadEvent: (topic: string, consumer: string, id: string) =>
     post<{ ok: boolean }>('/dead-events/release', { topic, consumer, id }),
   cacheStats: () => get<CacheStats>('/cache/stats'),
+  labCatalog: () => get<LabCatalog>('/lab'),
+  labPlan: (runId: string, model: string, trials: number) => get<LabPlan>(`/lab/plan?runId=${encodeURIComponent(runId)}&model=${encodeURIComponent(model)}&trials=${trials}`),
+  labExplain: (body: { runId: string; model: string; trials: number }, onProgress: (p: LabProgress) => void, signal?: AbortSignal) => labStream<LabExplanation>('/lab/explain', body, onProgress, signal),
+  labExperiments: (kind: LabExperiment['kind'], target: string) => get<{ items: LabExperiment[] }>(`/lab/experiments?kind=${kind}&target=${encodeURIComponent(target)}`),
+  labCapsuleBase: (runId: string) => get<LabCapsuleBase>(`/lab/capsule?runId=${encodeURIComponent(runId)}`),
+  labCapsule: (body: LabCapsuleBody, onProgress: (p: LabProgress) => void, signal?: AbortSignal) => labStream<LabCapsule>('/lab/capsule', body, onProgress, signal),
+  labThreadPlan: (q: { threadId: string; model: string; trials?: number; offset?: number; workingMemory?: boolean; overrides?: string[]; corrections?: string[]; suggest?: boolean; guess?: boolean }) =>
+    get<LabThreadPlan>(`/lab/thread-plan?threadId=${encodeURIComponent(q.threadId)}&model=${encodeURIComponent(q.model)}${q.trials !== undefined ? `&trials=${q.trials}` : ''}${q.offset ? `&offset=${q.offset}` : ''}${q.workingMemory ? '&wm=1' : ''}${q.overrides?.length ? `&overrides=${q.overrides.map(encodeURIComponent).join(',')}` : ''}${q.corrections?.length ? `&corrections=${q.corrections.map(encodeURIComponent).join(',')}` : ''}${q.suggest ? '&suggest=1' : ''}${q.guess ? '&guess=1' : ''}`),
+  labThread: (body: LabThreadBody, onProgress: (p: LabProgress) => void, signal?: AbortSignal) => labStream<LabThreadDiagnosis>('/lab/thread', body, onProgress, signal),
+  labPrunePlan: (q: { runId: string; model: string; prompts: number; trials: number; control: boolean }) =>
+    get<LabPrunePlan>(`/lab/prune-plan?runId=${encodeURIComponent(q.runId)}&model=${encodeURIComponent(q.model)}&prompts=${q.prompts}&trials=${q.trials}${q.control ? '&control=1' : ''}`),
+  labPrune: (body: LabPruneBody, onProgress: (p: LabProgress) => void, signal?: AbortSignal) => labStream<LabPrune>('/lab/prune', body, onProgress, signal),
+  labWordsPlan: (q: { runId: string; model: string; samples: number; words?: string[] }) =>
+    get<LabWordsPlan>(`/lab/words-plan?runId=${encodeURIComponent(q.runId)}&model=${encodeURIComponent(q.model)}&samples=${q.samples}${q.words?.length ? `&words=${encodeURIComponent(JSON.stringify(q.words))}` : ''}`),
+  labWords: (body: { runId: string; model: string; tool: string; words: string[]; samples: number }, onProgress: (p: LabProgress) => void, signal?: AbortSignal) => labStream<LabWords>('/lab/words', body, onProgress, signal),
+  labScenarios: (agent: string) => get<{ items: LabScenario[] }>(`/lab/scenarios?agent=${encodeURIComponent(agent)}`),
+  labPlaygroundBase: (agent: string) => get<LabPlaygroundBase>(`/lab/playground/base?agent=${encodeURIComponent(agent)}`),
+  labPlay: (body: { agent: LabPlaygroundAgent; model: string; messages: LabMessage[] }) => post<LabPlay>('/lab/playground/play', body),
+  labMeasure: (body: { agent: LabPlaygroundAgent; model: string; messages: LabMessage[]; expect: LabExpectation; trials: number; compareTo?: LabPlaygroundAgent }, onProgress: (p: LabProgress) => void, signal?: AbortSignal) =>
+    labStream<LabMeasure>('/lab/playground/measure', body, onProgress, signal),
+  labSavePlaygroundScenario: (body: { agent: string; title: string; definition: LabPlaygroundAgent; messages: LabMessage[]; expect: LabExpectation }) => post<LabSavedScenario>('/lab/playground/scenario', body),
+  labRunPlaygroundScenarios: (body: { agent: string; definition: LabPlaygroundAgent; model: string; trials: number; ids?: string[] }, onProgress: (p: LabProgress) => void, signal?: AbortSignal) =>
+    labStream<LabScenarioRuns>('/lab/playground/scenarios/run', body, onProgress, signal),
+  labSavedScenarios: (agent: string) => get<{ items: LabSavedScenario[] }>(`/lab/saved-scenarios?agent=${encodeURIComponent(agent)}`),
+  labSaveScenario: (body: LabSaveScenarioBody) => post<LabSavedScenario>('/lab/saved-scenarios', body),
+  labUpdateScenario: (agent: string, id: string, edit: { title?: string; expect?: LabExpectation; results?: LabSavedScenario['results']; answers?: LabSavedScenario['answers'] }) =>
+    patch<LabSavedScenario>(`/lab/saved-scenarios/${encodeURIComponent(agent)}/${encodeURIComponent(id)}`, edit),
+  labDeleteScenario: (agent: string, id: string) => del<{ deleted: string }>(`/lab/saved-scenarios/${encodeURIComponent(agent)}/${encodeURIComponent(id)}`),
+  labRunScenarios: (body: { agent: string; model: string; trials: number; ids?: string[] }, onProgress: (p: LabProgress) => void, signal?: AbortSignal) => labStream<LabScenarioRuns>('/lab/saved-scenarios/run', body, onProgress, signal),
+  labFormPlan: (agent: string, trials: number, scenarios: string[], tools: LabFormTools = {}) => get<LabFormPlan>(`/lab/form-plan?agent=${encodeURIComponent(agent)}&trials=${trials}&scenarios=${scenarios.map(encodeURIComponent).join(',')}${tools.withoutTools?.length ? `&withoutTools=${tools.withoutTools.map(encodeURIComponent).join(',')}` : ''}${tools.addTools?.length ? `&addTools=${encodeURIComponent(JSON.stringify(tools.addTools))}` : ''}`),
+  labBestForm: (body: { agent: string; model: string; trials: number; scenarios: string[] } & LabFormTools, onProgress: (p: LabProgress) => void, signal?: AbortSignal) => labStream<LabBestForm>('/lab/best-form', body, onProgress, signal),
   optimizerCatalog: () => get<OptimizerCatalog>('/optimizer'),
   optimizerDiagnosis: (agent: string) => get<OptimizerDiagnosis>(`/optimizer/diagnosis?agent=${encodeURIComponent(agent)}`),
   optimizerReplay: (body: { agent: string; model: string; limit?: number; keepLast?: number }) => post<OptimizerReplay>('/optimizer/replay', body),
@@ -836,12 +1157,6 @@ export const api = {
   /** Deletes a single VERSION. The active (prod) version cannot be deleted (409); once the last version is gone the agent disappears entirely. */
   deleteAgentVersion: (name: string, version: number) =>
     del<{ ok: boolean; name: string; version: number; active: number | null; remaining: number }>(`/managed-agents/${encodeURIComponent(name)}/versions/${version}`),
-  // W5 regression: rerun a recorded run with a new model/system (replayRun) → returns the decision-point diff.
-  runRegression: (id: string, body: { model: string; system?: string; memoryOff?: boolean }) =>
-    post<RegressionReport>(`/runs/${encodeURIComponent(id)}/regression`, body),
-  // Diff two EXISTING runs (without rerunning) at the decision-point level.
-  regressionDiff: (id: string, otherId: string) =>
-    get<RegressionReport>(`/runs/${encodeURIComponent(id)}/regression/${encodeURIComponent(otherId)}`),
   // OTEL export: exports the run trace to the APM the host configured (Langfuse/Honeycomb/Datadog/Collector)
   // (only call when caps.otelExport is on — the server returns 501 if the host didn't pass otelExport).
   otelExport: (id: string) => post<{ ok: boolean; target?: string; error?: string }>(`/runs/${encodeURIComponent(id)}/otel-export`, {}),
@@ -1093,6 +1408,27 @@ export const useDeadEvents = (topic: string | null, consumer: string | null) => 
   });
 };
 export const useCacheStats = () => usePolled('cache', ['cache-stats'], api.cacheStats, 5000);
+export const useLabCatalog = (enabled: boolean) => useQuery({ queryKey: ['lab-catalog'], queryFn: api.labCatalog, enabled });
+export const useLabPlan = (runId: string | undefined, model: string | undefined, trials: number) =>
+  useQuery({ queryKey: ['lab-plan', runId, model, trials], queryFn: () => api.labPlan(runId!, model!, trials), enabled: !!runId && !!model });
+export const useLabExperiments = (kind: LabExperiment['kind'], target: string | undefined) =>
+  useQuery({ queryKey: ['lab-experiments', kind, target], queryFn: () => api.labExperiments(kind, target!), enabled: !!target });
+export const useLabCapsuleBase = (runId: string | undefined) =>
+  useQuery({ queryKey: ['lab-capsule-base', runId], queryFn: () => api.labCapsuleBase(runId!), enabled: !!runId });
+export const useLabThreadPlan = (q: { threadId: string | undefined; model: string | undefined; trials?: number; offset?: number; workingMemory?: boolean; overrides?: string[]; corrections?: string[]; suggest?: boolean; guess?: boolean }) =>
+  useQuery({ queryKey: ['lab-thread-plan', q.threadId, q.model, q.trials, q.offset, q.workingMemory, q.overrides?.join(','), q.corrections?.join(','), q.suggest, q.guess], queryFn: () => api.labThreadPlan({ ...q, threadId: q.threadId!, model: q.model! }), enabled: !!q.threadId && !!q.model,
+    // n and the hypotheses change the plan's numbers, not its turns: the page keeps showing them while it is asked again.
+    placeholderData: keepPreviousData });
+export const useLabSavedScenarios = (agent: string | undefined) =>
+  useQuery({ queryKey: ['lab-saved-scenarios', agent], queryFn: () => api.labSavedScenarios(agent!), enabled: !!agent });
+export const useLabScenarios = (agent: string | undefined) =>
+  useQuery({ queryKey: ['lab-scenarios', agent], queryFn: () => api.labScenarios(agent!), enabled: !!agent });
+export const useLabFormPlan = (agent: string | undefined, trials: number, scenarios: string[], tools: LabFormTools = {}) =>
+  useQuery({ queryKey: ['lab-form-plan', agent, trials, scenarios, tools], queryFn: () => api.labFormPlan(agent!, trials, scenarios, tools), enabled: !!agent && scenarios.length > 0, placeholderData: keepPreviousData });
+export const useLabPrunePlan = (q: { runId: string | undefined; model: string; prompts: number; trials: number; control: boolean }) =>
+  useQuery({ queryKey: ['lab-prune-plan', q.runId, q.model, q.prompts, q.trials, q.control], queryFn: () => api.labPrunePlan({ ...q, runId: q.runId! }), enabled: !!q.runId && !!q.model, placeholderData: keepPreviousData });
+export const useLabWordsPlan = (q: { runId: string | undefined; model: string; samples: number; words?: string[] }) =>
+  useQuery({ queryKey: ['lab-words-plan', q.runId, q.model, q.samples, q.words], queryFn: () => api.labWordsPlan({ ...q, runId: q.runId! }), enabled: !!q.runId && !!q.model, placeholderData: keepPreviousData });
 export const useOptimizerCatalog = (enabled: boolean) => useQuery({ queryKey: ['optimizer-catalog'], queryFn: api.optimizerCatalog, enabled });
 export const useOptimizerHistory = (agent: string | undefined) =>
   useQuery({ queryKey: ['optimizer-history', agent], queryFn: () => api.optimizerHistory(agent!), enabled: !!agent });

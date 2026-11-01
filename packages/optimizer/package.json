@@ -1,6 +1,6 @@
 {
   "name": "@gnldev/optimizer",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=22.13.0"
@@ -61,6 +61,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@gnldev/experiment": "workspace:^",
     "@gnldev/options": "workspace:^"
   }
 }

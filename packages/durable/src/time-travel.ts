@@ -374,6 +374,12 @@ export async function forkRun(
 
   const input = await journal.get(runKeys.input(srcRunId));
   if (input !== undefined) await journal.put(runKeys.input(dst), input);
+  // The fork's input IS the source's, so the source's account of where that input came from is too.
+  // Not copied, the fork's resume wrote a fresh `:memctx` from TODAY's thread against the copied
+  // input — measured: recentCount 6, incomingCount 0, for a 3-message input. After `:input`, so a
+  // crash in between leaves the fork as it was before this copy existed (a fresh, self-flagged record).
+  const memctx = input !== undefined ? await journal.get(runKeys.memoryContext(srcRunId)) : undefined;
+  if (memctx !== undefined) await journal.put(runKeys.memoryContext(dst), memctx);
 
   return { newRunId: dst, copiedModel, copiedTool };
 }

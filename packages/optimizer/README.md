@@ -12,7 +12,8 @@ of them your agent pays for, gives you the lever for each, and proves a change k
 before you make it.
 
 ```ts
-import { diagnoseAgent, replayCounterfactual, maskOldToolOutputs, withCacheBreakpoints } from '@gnldev/optimizer';
+import { diagnoseAgent, maskOldToolOutputs, withCacheBreakpoints } from '@gnldev/optimizer';
+import { replayCounterfactual } from '@gnldev/experiment';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
 import type { AgentConfig } from '@gnldev/durable';
 import { openai } from '@ai-sdk/openai';
@@ -40,12 +41,12 @@ const agent: AgentConfig = {
 | | What | Calls a model? | Changes quality? |
 |---|---|---|---|
 | `diagnoseAgent` | Cost, tokens, cache reads and writes per agent; the opening re-sent on later steps and what a cache would save after one write per run; the same instructions re-sent by runs that start within 5 minutes of one another (estimated); tool output older than `keepLast` steps (estimated) | no | — |
-| `replayCounterfactual` | A recorded run played again with another model, system prompt or context policy. Every tool call is answered from the recording; a call the recording never made stops the replay as a **divergence**. Reports both sides' cost, calls, missed calls, reordering | the candidate | it measures it |
+| `replayCounterfactual` (from `@gnldev/experiment`, installed with this package) | A recorded run played again with another model, system prompt or context policy. Every tool call is answered from the recording; a call the recording never made stops the replay as a **divergence**. Reports both sides' cost, calls, missed calls, reordering | the candidate | it measures it |
 | `withCacheBreakpoints` / `cacheBreakpoints` | Anthropic: cache marks on the system message and the last message (within its limit of 4). OpenAI: your `promptCacheKey`. Other providers: untouched | — | no — the provider is sent the same tokens |
 | `maskOldToolOutputs` | Tool output older than `keepLast` steps is replaced, for that step only, by a one-line note. The journal keeps the full output | — | possibly — replay it first |
 | `replayAgent` | An agent's latest runs replayed under one candidate, summed up: divergence rate, skipped calls, reordering, cost ratio (none made up when a model is unpriced) | the candidate | it measures it |
 | `saveExperiment`, `listExperiments`, `renderReport` | Each replay kept (run ids, calls and numbers — no conversation text) and a Markdown report: where the money goes, findings, replays tried, and a recommendation | — | — |
-| `DEFAULT_SUITE`, `runSuite`, `compareOnSuite` | 26 scenarios a tool-using agent does (refunds, lookups, multi-step work, plain conversation, tricky arguments), each with fake tools and an expectation a program checks — no judge model | the models compared | it measures it |
+| `compareOnSuite` | Two models on the same scenarios — `@gnldev/experiment`'s `DEFAULT_SUITE` by default: 26 a tool-using agent does (refunds, lookups, multi-step work, plain conversation, tricky arguments), each with fake tools and an expectation a program checks, no judge model. What the candidate costs as a share of the baseline, and the scenarios it does worse on | the models compared | it measures it |
 
 ## In Studio
 
@@ -80,6 +81,8 @@ const studio = createStudioApp({
   cacheable; the diagnosis says so in a note instead.
 - `maskOldToolOutputs({ keepLast, minChars })` — leave out tool output older than `keepLast` steps
   (default 2), but keep any result shorter than `minChars` characters (default 200) whatever its age.
+  As a `prepareStep` it masks the conversation rebuilt from the step's `initialMessages` and
+  `responseMessages`, so a note always names the real distance.
 
 ## Guarantees it keeps
 

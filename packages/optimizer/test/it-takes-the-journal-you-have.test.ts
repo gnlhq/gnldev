@@ -8,7 +8,8 @@ import { z } from 'zod';
 import { runDurable, gnlTool } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
 import { createMockModel } from '../../durable/test/mock.js';
-import { diagnoseAgent, replayCounterfactual } from '../src/index.js';
+import { replayCounterfactual } from '@gnldev/experiment';
+import { diagnoseAgent } from '../src/index.js';
 
 function planned(modelId: string) {
   let step = 0;

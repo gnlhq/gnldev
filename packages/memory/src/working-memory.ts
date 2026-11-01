@@ -8,7 +8,7 @@ import { WORKING_MEMORY_NAMES } from './option-names.js';
 export interface WorkingMemoryConfig {
   /** Structured WM schema (zod). Also determines the updateWorkingMemory input. */
   schema?: z.ZodTypeAny;
-  /** Alternative: a free-form template (markdown/json). */
+  /** A free-form template (markdown/json): the shape to keep working memory in, shown after the saved values. */
   template?: string;
   scope?: 'thread' | 'resource';
   /** true → WM is injected into the system message but the update tool is NOT REGISTERED. */
@@ -36,12 +36,15 @@ export function createWorkingMemoryTool(opts: {
   };
 }
 
-/** Dump the current WM + schema/template into the system message (a `<working_memory>` tag, the common pattern). */
+/** Dump the current WM into the system message (a `<working_memory>` tag, the common pattern), followed by the
+ *  template and schema fields as the shape to keep it in. The saved values are always shown: a template guides
+ *  the shape, it never stands in for what was saved. */
 export function renderWorkingMemorySystem(current: Record<string, unknown>, cfg: WorkingMemoryConfig): string {
   refuseUnknownNames('workingMemory', cfg, WORKING_MEMORY_NAMES);
-  const body = cfg.template ?? JSON.stringify(current, null, 2);
+  const body = JSON.stringify(current, null, 2);
+  const shapeGuide = cfg.template ? `\nTemplate (keep working memory in this shape):\n${cfg.template}` : '';
   const shape = cfg.schema && (cfg.schema as any).shape ? Object.keys((cfg.schema as any).shape) : [];
   const fields = shape.length ? `\nFields: ${shape.join(', ')}` : '';
   const tail = cfg.readOnly ? '' : "\nUpdate persistent information via 'updateWorkingMemory' (null=delete).";
-  return `# Working Memory\n<working_memory>\n${body}\n</working_memory>${fields}${tail}`;
+  return `# Working Memory\n<working_memory>\n${body}\n</working_memory>${shapeGuide}${fields}${tail}`;
 }
