@@ -601,10 +601,13 @@ yeniden koşması bununla kırpar), `chainAppended` ise bunların kaçının zin
 processor'ı olmayan her koşu böyledir.
 
 **Kontrfaktüel yeniden koşma (çıkarım değil, kanıt).** "Model bunu recall parçasından okumuştur" bir
-çıkarımdır — Studio'nun Regression sekmesi bunu deneye çevirir: *hafızasız yeniden koş*, provenance
-kaydının enjekte edildiğini kanıtladığı kısmı çıkarıp aynı turu aynı modelle yeniden sorar ve iki
-cevabı diff'ler. Provenance kaydı olmayan turda neyi kırpacağını tahmin etmek yerine çalışmayı
-reddeder.
+çıkarımdır — Studio Lab'ın kapsülü bunu deneye çevirir: *bellek* kapalıyken run'ın kendi bellek
+düzeninin (layout) belleğe ait olduğunu kanıtladığı kısmı — gözlemleri, recall ve son pencere
+satırlarını, sistem istemindeki çalışma belleğini — çıkarır, aynı turu her tool çağrısını kayıttan
+cevaplayarak yeniden oynatır ve çağrıların ne sıklıkla aynı çıktığını gösterir (doğru cevabın ne
+yaptığı verildiyse, bunu ne sıklıkla yaptığını da). Bir input processor'ın eklediği satır kalır.
+Düzen bilgisi olmayan turda sayılardan tahmin etmek yerine, sebebini söyleyerek çalışmayı reddeder. Kodda: `@gnldev/lab`'den `runCapsule({ memory: false })`,
+yeni ve gerçek bir run için `@gnldev/durable`'dan `replayRun({ stripMemoryContext: true })`.
 
 ### 7.4 RAG — doküman arşivinden cevap
 
@@ -829,7 +832,7 @@ koşu.** Bu tercih birinci listeyi kazandırıyor, ikincisine mal oluyor.
 | **Model fallback kalıcı** | Gerçekte kazanan model journal'a yazılır; resume zarı yeniden atmaz, ona yapışır |
 | **Dinamik ajan ağı kararları donar** | Bir kez verilen yönlendirme kararı kaydedilir, replay aynı yolu izler |
 | **Resumable evals** | Test paketi baştan başlamaz, durduğu yerden devam eder |
-| **Yönetişim yüzeyi** | Studio 20 görünümle gelir: onay kuyruğu, politika, bütçe, denetim, ölü-mektup, regresyon karşılaştırma |
+| **Yönetişim yüzeyi** | Studio 20 görünümle gelir: onay kuyruğu, politika, bütçe, denetim, ölü-mektup, Lab (run'ı açıkla, kapsülde değiştir) |
 | **Edge-native** | İnce çekirdek + opsiyonel bağımlılıklar; Workers sınıfı bir bundle'a sığacak kadar küçük |
 
 **Maliyeti — eksiklikten değil, bilinçli olarak**
@@ -1211,6 +1214,6 @@ Aynı veri üzerinde iki farklı soru vardır:
 deneyimi, karşılığında o depoyu işletme yükü sende (ya da yönetilen bir hizmete ödeme). GNL'in bahsi ters yönde: **kritik olan analitik
 değil, KAYIT** — kayıt (journal) sende ve eksiksizse, analitiği istediğin araca sonradan bile
 dökebilirsin; kaydı eksik tutup panosu güzel olanın geri dönüş şansı yoktur. Studio bu yüzden
-salt izleme panosu değil, **operasyon/yönetişim** panosudur (time-travel, onay kuyruğu, regresyon
-karşılaştırma, kiracı/bütçe — bunlar adanmış izleme araçlarında yoktur); filo analitiği + alerting
+salt izleme panosu değil, **operasyon/yönetişim** panosudur (time-travel, onay kuyruğu, Lab
+kapsülü, kiracı/bütçe — bunlar adanmış izleme araçlarında yoktur); filo analitiği + alerting
 ise bilinçli olarak dışarıya, fişin ucundaki uzmana bırakılır.

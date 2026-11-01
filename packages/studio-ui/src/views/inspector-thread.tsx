@@ -5,10 +5,11 @@
 // panel, because "what did memory inject into this turn, and why" is the question no competing tool
 // answers (trace-side tools see only the finished prompt).
 import { useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft, ChevronDown, ChevronRight, BrainCircuit, Ghost } from 'lucide-react';
-import { useMemoryContext, useThreadMessages, type Capabilities, type MetricsRun, type RunSummary } from '../api';
-import { StatusBadge, Empty, cn } from '../components';
+import { useMemoryContext, useThreadMessages, type Capabilities, type MemoryContextRecord, type MemoryContextResponse, type MetricsRun, type RecalledMessageRef, type RunSummary } from '../api';
+import { StatusBadge, Empty, Btn, cn } from '../components';
 
 /** Role tone for provenance refs — the SAME mapping the Inspector's chat bubbles use. */
 const REF_ROLE_TONE: Record<string, string> = { user: 'text-info', assistant: 'text-success', tool: 'text-warning', system: 'text-muted-foreground' };
@@ -35,11 +36,64 @@ function fmtDur(ms: number | null | undefined): string {
   return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
 }
 
+const LOSS_REASONS = ['messages-dropped', 'boundary-lost', 'turn-dropped'] as const;
+const isObj = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x);
+const num = (x: unknown): number | undefined => (typeof x === 'number' && Number.isFinite(x) ? x : undefined);
+const refsOf = (x: unknown): RecalledMessageRef[] =>
+  Array.isArray(x)
+    ? x.filter(isObj).map((r) => ({ threadId: String(r.threadId ?? ''), seq: num(r.seq) ?? -1, role: String(r.role ?? ''), preview: typeof r.preview === 'string' ? r.preview : '', ...(num(r.score) !== undefined ? { score: num(r.score) } : {}) }))
+    : [];
+
+/**
+ * The memory record as this panel reads it. It is the journal's own record, of whatever shape a
+ * release once wrote or a store returns — every field is checked before use, and a record that is not
+ * an object at all is `null` (shown as unreadable, never thrown on).
+ */
+export function readMemoryRecord(raw: unknown): (Omit<MemoryContextRecord, 'recentCount' | 'incomingCount' | 'v' | 'threadId'> & { recentCount?: number }) | null {
+  if (!isObj(raw)) return null;
+  const loss = LOSS_REASONS.find((r) => r === raw.incomingUnrecoverable);
+  return {
+    recalled: refsOf(raw.recalled),
+    ...(num(raw.recentCount) !== undefined ? { recentCount: num(raw.recentCount) } : {}),
+    ...(Array.isArray(raw.recent) ? { recent: refsOf(raw.recent) } : {}),
+    ...(num(raw.observationCount) !== undefined ? { observationCount: num(raw.observationCount) } : {}),
+    ...(num(raw.workingMemoryChars) !== undefined ? { workingMemoryChars: num(raw.workingMemoryChars) } : {}),
+    echoTrimmed: num(raw.echoTrimmed) ?? 0,
+    ...(loss ? { incomingUnrecoverable: loss } : {}),
+    ...(raw.incomingDedupedByShape === true ? { incomingDedupedByShape: true as const } : {}),
+  };
+}
+
+/**
+ * What the layout says, in the panel's three numbers: rows memory GAVE (what it returned), rows of
+ * memory's that were SENT to the model, and what the input processors changed between the two. From the
+ * server's reading (durable readRunMemoryLayout), never from the counts: `absent` says why there is none.
+ */
+export function layoutSummary(reading: MemoryContextResponse['layout'] | unknown):
+  | { kind: 'absent'; reason: string }
+  | { kind: 'undiagnosable'; status: string }
+  | { kind: 'present'; gave: number; sent: number; dropped: number; foreign: number; rewritten: number; ambiguous: number } {
+  if (!isObj(reading) || reading.status !== 'present' || !isObj(reading.layout)) {
+    return { kind: 'absent', reason: isObj(reading) && typeof reading.reason === 'string' ? reading.reason : 'no-layout' };
+  }
+  const L = reading.layout;
+  if (L.status !== 'exact' && L.status !== 'changed') return { kind: 'undiagnosable', status: String(L.status) };
+  const n = num(L.n) ?? 0;
+  const incoming = Array.isArray(L.incoming) ? num(L.incoming[0]) : undefined;
+  const histEnd = incoming ?? n;
+  const len = (x: unknown) => (Array.isArray(x) ? x.length : 0);
+  const foreign = len(L.foreign), dropped = num(L.droppedByChain) ?? 0;
+  const sent = Math.max(0, histEnd - foreign);
+  return { kind: 'present', gave: sent + dropped, sent, dropped, foreign, rewritten: len(L.rewritten), ambiguous: len(L.ambiguous) };
+}
+
 /**
  * Per-turn memory provenance: served lazily (only when the turn's Memory row is expanded).
  * Rows use the journal vocabulary as mono eyebrows (RECALL / RECENT / WM / OM / TRIM) — these are
  * SDK terms, deliberately untranslated (the surrounding sentences are). An honest empty state for
- * runs without a record — never an error.
+ * runs without a record — never an error. The LAYOUT line first: what memory gave, what reached the
+ * model, and what an input processor changed — or, without a layout, that this turn cannot be
+ * diagnosed by position and the counts are memory's own pre-processor report.
  */
 export function MemoryContextPanel({ runId, threadId, threadMessages }: {
   runId: string;
@@ -55,10 +109,31 @@ export function MemoryContextPanel({ runId, threadId, threadMessages }: {
   const fill = (r: { threadId: string; seq: number; preview: string }): string =>
     r.preview || (threadId && r.threadId === threadId && threadMessages?.[r.seq] ? refPreviewOf(threadMessages[r.seq]) : '');
   if (q.isLoading) return <div className="px-3 py-2 text-[11px] text-muted-foreground">{t('memLoading')}</div>;
-  const ctx = q.data?.context ?? null;
-  if (!ctx) return <div className="px-3 py-2 text-[11px] text-muted-foreground">{t('memNoProvenance')}</div>;
+  const raw = q.data?.context ?? null;
+  if (raw === null || raw === undefined) return <div className="px-3 py-2 text-[11px] text-muted-foreground">{t('memNoProvenance')}</div>;
+  const ctx = readMemoryRecord(raw);
+  if (!ctx) return <div role="status" className="px-3 py-2 text-[11px] text-muted-foreground">{t('memUnreadable')} {t('memNoLayout')} <span className="font-mono">malformed</span></div>;
+  const lay = layoutSummary(q.data?.layout);
   return (
     <div className="space-y-1.5 px-3 py-2">
+      {lay.kind === 'present' ? (
+        <div className="flex items-baseline gap-2 text-[11px]">
+          <span className="microlabel shrink-0 text-muted-foreground">layout</span>
+          <span className="text-foreground">
+            {t('memLayoutLine', { gave: lay.gave, sent: lay.sent })}
+            {lay.dropped > 0 && <> · {t('memLayoutDropped', { count: lay.dropped })}</>}
+            {lay.foreign > 0 && <> · {t('memLayoutForeign', { count: lay.foreign })}</>}
+            {lay.rewritten > 0 && <> · {t('memLayoutRewritten', { count: lay.rewritten })}</>}
+            {lay.ambiguous > 0 && <> · {t('memLayoutAmbiguous', { count: lay.ambiguous })}</>}
+          </span>
+        </div>
+      ) : (
+        <div data-testid="mem-no-layout" className="rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[11px] text-muted-foreground">
+          {lay.kind === 'undiagnosable' ? t('memLayoutUndiagnosable', { status: lay.status })
+            : lay.reason === 'unresolved' ? t('memLayoutUnresolved')
+            : <>{t('memNoLayout')} <span className="font-mono">{lay.reason}</span></>}
+        </div>
+      )}
       {ctx.recalled.map((r) => (
         <div key={`${r.threadId}:${r.seq}`} className="flex items-baseline gap-2 text-[11px]">
           <span className="microlabel shrink-0 text-info">recall</span>
@@ -73,7 +148,7 @@ export function MemoryContextPanel({ runId, threadId, threadMessages }: {
       ))}
       <div className="flex items-baseline gap-2 text-[11px]">
         <span className="microlabel shrink-0 text-muted-foreground">recent</span>
-        <span className="text-muted-foreground">{t('memRecentCount', { count: ctx.recentCount })}</span>
+        <span className="text-muted-foreground">{ctx.recentCount !== undefined ? t('memRecentCount', { count: ctx.recentCount }) : '—'}</span>
       </div>
       {/* The window ITSELF — "what went to the model", ref by ref. Records written before the
           `recent` field existed fall back to the count line above alone. */}
@@ -84,7 +159,7 @@ export function MemoryContextPanel({ runId, threadId, threadMessages }: {
           <span className="truncate text-muted-foreground">{fill(r) ? `“${fill(r)}”` : '—'}</span>
         </div>
       ))}
-      {ctx.recent && ctx.recentCount > ctx.recent.length && (
+      {ctx.recent && ctx.recentCount !== undefined && ctx.recentCount > ctx.recent.length && (
         <div className="pl-4 text-[11px] text-muted-foreground">{t('memRecentTruncated', { count: ctx.recentCount - ctx.recent.length })}</div>
       )}
       {ctx.observationCount !== undefined && ctx.observationCount > 0 && (
@@ -193,6 +268,17 @@ function GhostRow({ preview }: { preview: string }) {
   );
 }
 
+/** The thread sent to the Lab's thread mode (offered only when the host has a lab). */
+function LabThreadButton({ threadId }: { threadId: string }) {
+  const { t } = useTranslation('inspector');
+  const navigate = useNavigate();
+  return (
+    <span className="ml-auto shrink-0">
+      <Btn variant="outline" size="xs" title={t('threadLabButtonTitle')} onClick={() => navigate(`/lab?threadId=${encodeURIComponent(threadId)}`)}>{t('threadLabButton')}</Btn>
+    </span>
+  );
+}
+
 type LedgerEntry = { kind: 'turn'; run: RunSummary } | { kind: 'ghost'; preview: string; key: string };
 
 /**
@@ -221,7 +307,7 @@ function buildLedger(messages: any[], orderedRuns: RunSummary[]): LedgerEntry[] 
   return out;
 }
 
-export function ThreadDetail({ threadId, title, runs, metricsById, onOpenRun, onBack }: {
+export function ThreadDetail({ threadId, title, runs, metricsById, caps, onOpenRun, onBack }: {
   threadId: string;
   title?: string;
   runs: RunSummary[];
@@ -251,6 +337,8 @@ export function ThreadDetail({ threadId, title, runs, metricsById, onOpenRun, on
           <h2 className={cn('truncate text-sm', title ? 'font-semibold text-foreground' : 'font-mono text-muted-foreground')} title={threadId}>
             {title ?? threadId}
           </h2>
+          {/* The thread's turns read in the Lab: why a turn went wrong, tried on copies — nothing here changes. */}
+          {caps?.lab && ordered.length > 0 && <LabThreadButton threadId={threadId} />}
         </div>
         <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-[11px] text-muted-foreground">
           <span>{t('turnCount', { count: ordered.length })}</span>

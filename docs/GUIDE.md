@@ -547,10 +547,15 @@ says how many of those were the chain's — "what memory holds" is `incomingCoun
 field is absent when the chain appended nothing, which is every run without input processors.
 
 **Counterfactual replay (prove it, don't infer it).** "The model must have read it from the recall
-snippet" is an inference — Studio's Regression tab can turn it into an experiment: *re-run without
-memory* strips exactly what the provenance record proves was injected and re-asks the same turn with
-the same model, then diffs the answers. It refuses to run on turns without a provenance record
-rather than guessing what to strip.
+snippet" is an inference — the Studio Lab's capsule turns it into an experiment: with *memory* off it
+leaves out exactly what the run's own memory layout proves memory put in — the observations, recall
+and recent rows, and the working memory inside the system prompt — and plays the same turn again,
+answering every tool call from the recording, then shows how often the calls came out the same (and,
+given what a right answer does, how often it did that). A row an input processor added stays. It
+refuses to run on a turn without a layout, with the reason, rather than guessing what to strip from
+the counts. In code:
+`runCapsule({ memory: false })` from `@gnldev/lab`, or `replayRun({ stripMemoryContext: true })` from
+`@gnldev/durable` for a new, real run.
 
 ### 7.4 RAG — answering from a document archive
 
@@ -779,7 +784,7 @@ buys the first list and costs the second.
 | **Model fallback is persistent** | The model that actually won is written to the journal; a resume sticks with it instead of re-rolling the dice |
 | **Dynamic agent-network decisions are frozen** | A routing decision made once is recorded, so a replay follows the same path |
 | **Resumable evals** | A test suite continues where it stopped instead of starting over |
-| **Governance surface** | Studio ships 20 views: approval queue, policy, budget, audit, dead-letter, regression comparison |
+| **Governance surface** | Studio ships 20 views: approval queue, policy, budget, audit, dead-letter, the Lab (explain a run, change it in a capsule) |
 | **Edge-native** | A thin core with optional dependencies, small enough to run inside a Workers-class bundle |
 
 **What it cost — deliberately, not by omission**
@@ -1181,6 +1186,6 @@ bet runs the opposite way: **what's critical isn't analytics, it's the RECORD** 
 in your hands and complete, you can pour analytics into any tool you like later; if you keep the
 record incomplete just to have a pretty dashboard, there's no coming back from that. That's why
 Studio isn't just a monitoring dashboard, it's an **operations/governance** panel (time-travel,
-approval queue, regression comparison, organization/budget — things dedicated tracing tools don't have);
+approval queue, the Lab's what-if capsule, organization/budget — things dedicated tracing tools don't have);
 fleet-wide analytics and alerting are deliberately left to the specialist at the other end of the
 plug.

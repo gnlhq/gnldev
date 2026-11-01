@@ -24,8 +24,7 @@ import {
 } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
 import { DIAGNOSE_NAMES } from './option-names.js';
-import { unwrapOutput } from './tool-output.js';
-import { readerOf, type JournalSource } from './journal-of.js';
+import { unwrapOutput, readerOf, type JournalSource } from '@gnldev/experiment';
 
 export interface DiagnoseOptions {
   /** Where the agent's runs are: the store's `runs`, the store, or a journal. Only read. */

@@ -7,6 +7,349 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+**`@gnldev/lab` is experimental** — its diagnosis is measured on planted faults with one model (39 of 40
+named, no wrong cause in 55 turns), and its API will move; see its README (Experimental).
+`@gnldev/experiment`, which `@gnldev/optimizer` runs on, is not.
+
+### Upgrading from 0.15
+
+- **Studio's Lab has three tabs: Improve, New agent, Scenarios** — the four modes (Explain, Capsule,
+  Diagnose a thread, New agent) are gone, and so are `mode=capsule` and `mode=thread` in its URL. Improve
+  opens a run (`/lab?runId=`, with `&threadId=` when the Inspector knows it) or a thread (`/lab?threadId=`) — picked in the Inspector only, a badge saying which — on one screen: the thread's turns on a strip,
+  the turn's explanation, its diagnosis and its capsule below, against one written expectation. The
+  Inspector's "Explain in Lab", "Try in a capsule" and "Diagnose in Lab" are one button, **Open in Lab**.
+- **`bestForm`'s `best` is absent when no form passed a single scenario run** (`BestFormResult.best` is
+  now optional, and so is `best` on `POST /lab/best-form`). It used to name the cheapest of forms that all
+  failed "best". A `target` above 0 that no form reaches still throws.
+- **A thread diagnosis that tested nothing says `untested`, not `not-found`.** `Verdict` has a new kind
+  `{ kind: 'untested'; untested: string[] }`: every arm played stopped too often at calls nobody answered,
+  or elimination could not finish and nothing else was played. `not-found` now means changes were tested
+  and none helped (it used to be said with none played). `verdictOf` takes a fifth argument, whether
+  elimination finished (default true).
+- **Studio's capsule plays a change beside the run as it was.** `POST /lab/capsule` with a changed prompt,
+  tools, history or memory off, or an override plays `trials` times changed and `trials` times unchanged,
+  so it spends about twice what it did; the result carries `unchanged` and `difference`. In code,
+  `runCapsule` does this only when given `unchanged: { tools }`.
+- **`replayCounterfactual`, `ReplaySourceError`, `DEFAULT_SUITE`, `runSuite`, `checkScenario` and
+  `normalizeAnswer` moved to `@gnldev/experiment`** (with their types). Import them from there; it is
+  installed with `@gnldev/optimizer`. `compareOnSuite` stays in the optimizer. No alias is left behind.
+- **Studio's Regression tab, `POST /runs/:id/regression` and the `regressionModel` option are removed.**
+  A run played again with another model, another prompt or without its memory is the Lab's capsule
+  (`POST /lab/capsule`, the Inspector's **Try in a capsule**), which answers every tool call from the
+  recording and writes nothing; the route wrote a new run (counted in the metrics) whose model was
+  offered no tools. `capabilities.regression` and the `run.regression` audit action go with it.
+  `GET /runs/:id/regression/:otherId` (the read-only diff of two runs) stays. In code, `replayRun` and
+  `regressionReport` in `@gnldev/durable` are unchanged.
+- **`:memctx` counts describe what the model was sent.** When `:memctx.layout.status` is `exact` or
+  `changed`, `recalled`, `recent`, `recentCount` and `observationCount` no longer include rows an input
+  processor removed (a `tokenLimiter` trim used to leave `recentCount` at memory's pre-trim count);
+  `layout.droppedByChain` counts those rows. Read positions with `readMemoryLayout` /
+  `readRunMemoryLayout`: a record without a layout reads `{ status: 'absent' }` — nothing derives one
+  from the counts.
+- **Only the attempt that froze `:input` writes `:memctx`.** A later attempt that finds no record writes
+  none (it used to write one from the thread as it is now, which described another input).
+- **Studio keeps an experiment on a run under the run** (`<runId>:derived:lab:exp:…`), so deleting the
+  run (`purgeRun`, `sweepRuns`, `eraseSubject`) deletes it. `GET /lab/experiments` now requires `kind`,
+  and `target` (the run id) for `explain` and `capsule`. Experiments kept at `__lab__:exp:explain:` /
+  `__lab__:exp:capsule:` by an earlier build are no longer listed; delete them by that prefix.
+- A run id containing the segment `:derived:` is refused (the family's prefix must be exact).
+- **Leaving memory out reads the run's layout, never its counts.** `runCapsule({ memory: false })`,
+  `memory: false` on `POST /lab/capsule` and `replayRun({ stripMemoryContext: true })` leave out the rows
+  the run's own layout proves are memory's — and now the working memory inside the system prompt too
+  (it used to stay) — and keep a row an input processor added (`stripMemoryContext` used to keep only the
+  turn). A run without a layout — recorded before layouts existed, of another version, unaligned — or
+  with a working memory of no known place (`unbounded`, `lost`) is refused with that reason; a
+  hand-written `:memctx` with an `incomingCount` alone no longer passes. A row the layout calls
+  `ambiguous` (memory's content, its part unknown) is kept and named: in the capsule's notes, and in
+  `replayRun`'s new `keptAmbiguous`.
+- **A capsule's `system` is the prompt without the working memory** when the run's layout places one in
+  it: `capsuleBase.system` shows it apart (`workingMemory`), and the working memory is put back behind
+  an edited prompt unless `memory` is false.
+- **Lab parts carry where they came from.** `LabPart.kind` adds `wm`, `om`, `recall` and `recent`, and
+  every part has `source: 'layout' | 'unknown'`; a memory run's recent-window turns are `recent N`, a row
+  no memory row accounts for `unlabelled N`. A memory run without a layout keeps the plain turns, each
+  `source: 'unknown'`. `LabPlan` and `LabCapsuleBase` add `layout`.
+- **`GET /runs/:id/memory-context` adds `layout`** — durable's reading of the record against the frozen
+  input (`present`, or `absent` with the reason). `context` is the stored record as before, of any shape.
+- **A capsule play that stopped at a call no one answered is judged where the rest cannot change it**
+  (`judgePlay`, also exported): a forbidden call it already made is a failure, every expected call made —
+  when the expectation asks nothing of the answer and forbids nothing — a pass; anything else stays in
+  `expected.undetermined`. It used to be undetermined always, so a right behaviour that is a call the
+  recording never made could not be counted.
+- **`explainRun`: one name in two maps is one part** (a system section and messages that go and come
+  together). It used to be refused as a duplicate. `toolResults` takes a tool name or a list of them.
+- `TracedCall.source` adds `'override'`. `StudioLab` (a host's own lab object) must implement
+  `threadPlan` and `thread`; `studioLab` does. `GET /lab/experiments` takes `kind=thread`. The audit adds
+  `lab.thread`.
+- No store step.
+
+### Added
+
+- **A thread diagnosis guesses first, then proves it.** `diagnoseTurn({ guess })` — and Studio's page, by
+  default — has a model name the one or two parts most likely to blame and what the data among them
+  should have said; only those are played beside the turn unchanged, and a guess the plays bear out is
+  the verdict, with no elimination. One they do not is said so, and the diagnosis runs as before at the
+  other half of the 5% level. A rule or a message is only left out from a guess, never "corrected" — a
+  corrected rule can carry the answer. Measured on 40 planted faults (gpt-6-luna, through Studio's
+  routes): 39 named right, none wrong, at a third of the cost per turn; elimination alone named 15.
+  `DiagnoseTurnResult.guess`, `elimination.skipped`, `DiagnosisPlan.guessPlays`, `MAX_GUESSES`; `guess`
+  on `/lab/thread` and `/lab/thread-plan`.
+
+- **Which words decided it, in Studio — and from a provider that gives no probability.** Under Why?, the
+  turn's last message is cut into groups of words (editable, at most ten) and each group's share of the
+  chance that the next call is the tool chosen is measured (`GET /lab/words-plan`, `POST /lab/words`;
+  audited `lab.words` by how many words, never which; nothing kept). OpenAI's API returns no logprobs on a
+  tool call (measured), so a model is asked `samples` times per subset unless `studioLab({ logprobs })`
+  names an endpoint that gives them. `@gnldev/lab`: `sampledToolChoice` (the share of tries, with its
+  variance); `wordShares` takes a value with its variance and gives each share its `sd`, and takes
+  `onProgress` and `signal`.
+- **Would removing this section change anything, in Studio.** Under Change and try, `checkPrune` on the
+  turn: a section of its prompt removed, optionally a control known to matter, new messages written on
+  the page, each tool answered with what the page wrote (a call with no answer gets an error and is
+  listed) — the verdict beside the noise, and whether the control was told apart (`GET /lab/prune-plan`,
+  `POST /lab/prune`; audited `lab.prune` by counts; nothing kept). `checkPrune` takes `onProgress`,
+  `signal` and `throttle` and says the tokens it spent.
+- **A new agent's forms take tools away and add them.** Beside the prompt's sections, each tool the
+  ticked scenarios offer can be taken away (`without <name>`) and a tool written on the page — its schema
+  and the answer every call gets — added (`with <name>`); `withoutTools` and `addTools` on
+  `/lab/form-plan` and `/lab/best-form`, whose plan now lists the tools the scenarios offer.
+- **Only the ticked scenarios are played.** Scenarios and the playground's own list have a box per
+  scenario; ticked ones are played by id (`ids`, now also on `/lab/playground/scenarios/run`), none ticked
+  plays them all.
+- **The Lab's New agent tab is a playground.** An agent is written on the page — from nothing or copied
+  from one the code defines — with its prompt, its tools and what each returns; it is talked to with every
+  tool call answered from the page (a call nothing answers stops, named), measured against what a right
+  answer does beside a pinned earlier definition, and kept as a scenario under the agent's own name —
+  played, with the others kept under it, against the definition on the page now. `/lab/playground/base`,
+  `/play`, `/measure`, `/scenario`, `/scenarios/run`; audited `lab.playground` by counts only, nothing kept. `@gnldev/lab`:
+  `playAgent`, `measureAgent`, `scenarioOfPlayground`; `runScenarios` takes `returns` (what the tools return
+  now). The prompt-section search (`bestForm`) is below it.
+- **A turn kept as a scenario, played again against the agent as it is now.** Studio's Lab keeps a turn
+  from Change and try (**Keep as scenario**) — a copy of its conversation, what a right answer does, the
+  prompt as edited and the tool answers typed — and its Scenarios tab plays them all, every call answered
+  from the copy (`/lab/saved-scenarios`, audited `lab.scenario-save`, `-delete`, `-run`; a play is kept
+  nowhere). A kept scenario's title, expectation, tool results and answers are edited on the page
+  (`PATCH /lab/saved-scenarios/:agent/:id`, audited `lab.scenario-edit`). `@gnldev/lab`: `scenarioOfRun`,
+  `saveScenario`, `listScenarios`, `findScenario`, `updateScenario`, `deleteScenario`, `runScenarios`.
+- **`personRecordKey` (`@gnldev/durable`): a record kept about a person goes with their erasure.**
+  `kept:res:<length>.<id>:` is a person-keyed family `eraseSubject` and `purgeResource` erase with nothing
+  wired; the id's length in the key keeps `bob`'s erasure off `bob:evil`'s records. A scenario copied
+  from a person's conversation is kept there.
+- **A thread diagnosis corrects a wrong fact, not only leaves it out.** `diagnoseTurn({ corrections })`
+  plays what a part should have said — a system section, a message, the working memory, a tool result —
+  as an arm `correct:<part>`; `suggest` (a model) proposes those corrections for the parts elimination
+  blamed, each played as its own arm marked suggested and listed in `suggestions`. A "not found" verdict
+  names the blamed parts only ever left out (`uncorrected`). Studio's thread mode proposes by default and
+  shows a box per blamed part to correct and diagnose again; `POST /lab/thread` takes `corrections` and
+  `suggest`, audited and kept by part id only. `@gnldev/experiment` gains `recordedResults` (a run's own
+  calls with what each returned). In a pilot with gpt-6-luna, three of the four planted wrong facts the
+  diagnosis had missed were blamed by elimination and only ever left out; the fourth's elimination did
+  not finish.
+- **Thread diagnosis** (`@gnldev/lab` `threadPlan`, `diagnoseTurn`, `planDiagnosis`):
+  why a turn of a thread went wrong, against what a right answer does. `threadPlan` calls no model: a
+  thread's turns a page at a time (at most 50), each classed (`infrastructure` — a provider 429/5xx, a
+  network code, a timeout or no model step, read from the outcome record — never diagnosed), its first
+  step's input tokens, its input by source in characters from the run's own layout, its candidates (the
+  layout's parts, and absences: earlier turns missing from the input, put back from their own records),
+  what cannot be tested and why, and what diagnosing it costs. `diagnoseTurn` refuses to start without
+  `expect`; it eliminates with `explainRun` (`match: 'expect'`, two plays per combination, four groups past
+  8 parts), then verifies the most blamed parts, every absence and the person's hypotheses (a corrected
+  working memory, tool results to try instead) with fresh plays beside the turn unchanged — Newcombe's
+  interval of each difference at the Bonferroni level, a joint arm when no single change helps — and
+  answers with a verdict by rules written beforehand: chance, a cause, two that cannot be told apart, two
+  together, or not among the candidates. Every comparison is read at its worst for the change (the arm's
+  undetermined plays counted wrong, the unchanged turn's right), so a change that only turns wrong answers
+  into calls nobody answered is no cause; an arm whose undetermined share is past 20% even at its 95%
+  lower bound is not tested and lists the calls to answer. The planner plans n for that worst-case
+  comparison with an assumed undetermined share (`undetermined`, default 0.1) and shows the worst-case
+  detectable difference; every count in the Lab is over the plays that ran, the worst case first. Each arm carries both bounds of its rate and the observed difference beside
+  the worst case. Measured with a mock model erring at random 30% of the time: a cause named in 3 of 200
+  seeded diagnoses.
+- **`replayCounterfactual({ overrides })`** (`@gnldev/experiment`): a result put in place of the recorded
+  one (same tool, same arguments), looked up before the recording, traced as `'override'`. `runCapsule`,
+  `POST /lab/capsule` and `diagnoseTurn` take it; Studio checks it like `answers`, audits the tool names
+  only and keeps how many.
+- `newcombe` and `normalQuantile` (`@gnldev/experiment`); `wilson` takes a `z`.
+- `runCapsule`'s `expected.bounds` (and the Lab's capsule result): the pass rate over every play with an
+  undetermined one counted a failure and a pass — beside `passRate`, which counts the judged plays only.
+- `POST /lab/thread` refuses `trials`, `eliminationTrials` and `topK` that are not JSON numbers (`"5"`).
+- Studio: `GET /lab/thread-plan` (`runs:read`; every turn checked visible, another organization's thread
+  not found) and `POST /lab/thread` (write; audited as `lab.thread` with the run, model, n and the arms
+  asked for — never the expectation, a corrected working memory or the results typed; the result kept
+  under the run at `<runId>:derived:lab:exp:thread:`, so deleting the run deletes it). The Lab tab's
+  **Diagnose a thread** mode, opened from the Inspector's thread ledger (**Diagnose in Lab**): a timeline
+  of the turns, a turn's input by source, the planner before anything is spent, and the result — the
+  verdict, the elimination's shares, each arm beside the turn unchanged, the ways the plays went — as
+  hand-drawn charts, each a figure with its finding and a screen-reader table; a Markdown report with the
+  request that reproduces it.
+
+- **`:memctx.layout`** — where each part of a memory run's frozen input came from (observations /
+  recall / recent / incoming spans over `:input.messages`, the working memory's span in `:input.system`),
+  computed by the run after the input processors ran. A row a processor replaced one-for-one is named
+  (`rewritten`), a row no memory row accounts for is named (`foreign`), and then the status is `changed`,
+  never `exact`. Where the run cannot tell, it says so instead of guessing: a copy that sits in two parts
+  and moved is `ambiguous` (no part claims it), a history too large to align is `unresolved`, a working
+  memory whose start cannot be anchored is `unbounded` (no span). The layout and `:input.turn` carry the
+  same attempt token; a reader that finds them apart reads `absent: input-mismatch`. No content hash is
+  kept.
+- **`outcome.errorName`, `errorCode`, `errorStatus`** on a failed run: the error's class, its own
+  `code` (`ECONNRESET`) and HTTP `statusCode` (a retry wrapper's last error's) — read off the error,
+  never parsed from its message.
+- **`derived` run-record family** (`runRecordKey(runId, 'derived', …)`): what a reader made out of a run
+  and keeps, deleted with the run.
+- **`@gnldev/experiment`** — change an agent, run it again, count what happened: the pieces the
+  optimizer and the lab share, so either installs without the other. The replay and the scenario set
+  (moved), and, new: `maskConversation` (a `prepareStep` that leaves input messages and tool results out
+  of every step, rebuilt each step from `initialMessages` and `responseMessages`), `runTrials` (a trial
+  that throws is counted apart and left out of every rate), `retryingFetch` (a reset connection, a 5xx
+  or a 429 is sent again — measured on NVIDIA NIM, 23–38% of requests on one day), and the arithmetic:
+  `coalitions`, `shapley` (shares that sum to value(all) − value(none)), `meanInterval` (Student's t),
+  `wilson`, `distribution`, `tvd`.
+- **`@gnldev/lab`** — why an agent did what it did, measured by running it again with parts left out.
+  `explainRun`: a recorded run's prompt sections, input messages and tool results, each part's Shapley
+  share of the run's own calls coming out again — replayed, no tool runs; it says first whether the
+  recording is what the model usually does (`representative`) and whether the outcome depends on the
+  parts at all (`dependsOnParts`), and gives each share a `noise`. `wordShares` with
+  `toolChoiceProbability`: which words of a message decided the next tool call, read from an
+  OpenAI-compatible provider's logprobs, one call per subset. `checkPrune`: whether a prompt section
+  can go, on new prompts, beside the noise floor and a control section. `bestForm`: before an agent
+  has runs, every subset of its components on a scenario set, and the cheapest form that passes as
+  well as the best. Each number in its README was measured on NVIDIA NIM.
+- **Studio: a Lab tab** (`createStudioApp({ lab: studioLab({ config, models }) })`). It lists no
+  runs of its own: a completed run is opened in the Inspector and sent with **Explain in Lab**
+  (`/lab?runId=`). For that run, the parts proposed from its own record (system prompt sections, earlier
+  turns, tools it called — never the last user message), the replays and an estimated cost before
+  anything is spent; an explanation behind a confirmation, audited as `lab.explain`, showing first
+  whether the recording is representative and whether the outcome depends on the parts. Routes
+  `/lab`, `/lab/plan`, `/lab/explain`, read through the caller's organization.
+  Its second mode, **New agent: best form**: the agent's prompt from its config, cut at blank lines, every
+  combination tried on ticked scenarios with fake tools (`/lab/scenarios`, `/lab/form-plan`,
+  `/lab/best-form`, audited as `lab.best-form`); the cheapest form that passes as well as the best.
+  `bestForm` forms gain `tokens`, and with an unpriced model "cheapest" is measured in tokens.
+  Both spend minutes of model calls, so both show how far they got as they go: asked with
+  `accept: text/event-stream`, `/lab/explain` and `/lab/best-form` send `progress` events (`done`,
+  `total`, `failed`, `lastError`) and end with `done` or `error`; the tab shows a bar, the failures with
+  their last reason, a warning when most fail, and a **Stop** button — a client that goes away starts no
+  further replay. `runTrials`, `explainRun` and `bestForm` take `onProgress` and `signal`.
+  **What the provider says decides the pace:** a 429 slows the run to one call at a time with growing
+  pauses (`throttle: { waitMs, maxWaits }`, default 15 s, 4 in a row) and the refused replay is played
+  again — the tab says it is waiting and for how long; refused past that, or a 5xx after the client's
+  retries, and the run stops with a `ProviderStoppedError` (a 503 from Studio) whose reason stays on the
+  screen. `classifyFailure` tells the two apart. A request `retryingFetch` sends again is reported as it
+  happens (`retrying` in the progress, found through the job's async context — `reportRetriesTo`), with
+  the jobs `running` and a first event before any job ends: a throttled provider no longer looks like a
+  page that hangs.
+- **`runCapsule` and the Lab tab's Capsule mode.** A recorded run copied and played again with the system
+  prompt, the tools (taken away, added, described otherwise) and the history changed — no tool runs and
+  nothing is written. A call the recording never made is answered by `answers` written by the person who
+  knows what the tool returns, or listed in `pending`. `replayCounterfactual` takes `answers` and returns
+  `trace`/`recordedTrace`; `recordedTrace()` reads a run's calls with their arguments. Studio:
+  `GET /lab/capsule`, `POST /lab/capsule` (audited as `lab.capsule` by what changed, not its text).
+- **Kept lab experiments.** A finished explanation, capsule play or best form is kept under the caller's
+  organization (`__lab__:exp:`, adoptable like the optimizer's history) with who ran it, what was asked
+  and the result; a capsule's answers are counted, not kept. `GET /lab/experiments` lists them for the
+  organization's admins, and each Lab mode shows the ones on its run or agent.
+- **The capsule's memory switch.** `runCapsule({ memory: false })` (and `memory` on `POST /lab/capsule`)
+  leaves out exactly what the run's memory layout proves memory put in — the experiment the Regression
+  tab's "re-run without memory" made, now without writing a run. A run without a layout is refused.
+- **What a right answer does, in the capsule.** `runCapsule({ expect })` (and `expect` on
+  `POST /lab/capsule`, checked by shape) checks every trial against an `Expectation` — calls it must make,
+  calls it must not, what the answer must say — by a program, no judge model: `expected.passRate` with
+  its interval, `undetermined` for trials that stopped at a call no one answered, and each path's
+  `passed` and `failures`. The Lab's capsule has the fields and shows the count.
+- **`Expectation` and `checkExpectation`** in `@gnldev/experiment` — the check a scenario's `expect` runs,
+  on any calls and answer; `checkScenario` uses it.
+- **`maskConversation({ replaceInput, insertInput })`** — an input message replaced, or a new one put in,
+  by its position in the original input, on every step.
+- **A tool the run called that the agent's config does not define** (memory's own
+  `updateWorkingMemory`) is offered to a Lab replay with no description and answered from the recording
+  (`LabCapsuleTool.recordedOnly`); every replay used to count that call missed.
+- **The Inspector's memory panel reads the layout:** what memory gave, what reached the model, and what
+  an input processor removed, added or rewrote — or, without a layout, that the turn cannot be diagnosed
+  by position and the counts are memory's own report.
+
+### Fixed
+
+- **The Lab said why a candidate could not be tested, and why a run has no memory layout, in English on a
+  Turkish page.** `Untestable` carries codes beside its words (`kind`, and `layoutReason`, `wmStatus` or
+  `rows`), and Studio says them, and a layout's absent `reason`, in the reader's language; a reason it
+  does not know is shown in the server's words.
+- **A turn without a layout drew no bar on the thread's timeline under Dark Reader.** The extension
+  rewrites inline backgrounds to variables it never defines; Studio has a dark theme of its own and now
+  asks it to leave the page alone (`<meta name="darkreader-lock">`).
+- The Lab's explain plan no longer counts every replay at the recorded run's full tokens: each part is
+  out of half the replays, so `LabPlan.estimatedTokens` takes half the parts' share of the input off
+  (on a run whose tokens follow its length: 23% over what was spent, where the old count was 67% over).
+  Every result's footer puts what was spent beside what the plan said; a thread diagnosis's plan is
+  named "at most", since its later stages may not run.
+- The Lab's "within noise" label follows the share's own ±: a share no larger than the difference
+  between the experiment's two halves is labelled, as is one inside the measured band (a −0.14 ± 0.43
+  share was shown with no label).
+- The thread timeline names the turns that ended in an error (marked !), from the turn's own class as
+  the thread ledger shows it; it said "none wrong or broken" beside a ledger showing a failed turn, and
+  says "none judged" when no right answer was given.
+- Every Lab confirmation says the same things in the same order: the plays, the tokens, the price, the
+  provider, and that no tool runs and no record changes.
+- **The Inspector offered the Lab for runs the Lab cannot play.** "Explain in Lab" and "Try in a capsule"
+  showed on every completed run; a scheduler or workflow run (no agent), or a run of an agent the host
+  did not give the lab, then failed in the Lab with an English message. They now show only for a run
+  of an agent the Lab offers, and the Lab's refusal carries `code: 'agent-not-offered'` (and the agent,
+  `null` when the run has none), which the tab says in the reader's language.
+- **Studio showed no conversations for a `BasicMemory` deployment.** `BasicMemory` had no thread listing,
+  so the Inspector's thread list was always empty and a thread could not be opened. It now lists the
+  threads it keeps a message log for — `listAllThreads()` and `listThreads({ resourceId })`, newest
+  first, the owner and start from the thread's owner record.
+- **A Lab replay of a memory run with observations never started.** Observational memory puts its
+  observations into the input as a system message; the run is called with `allowSystemInMessages`, the
+  replay was not, and the AI SDK refused the input. `replayCounterfactual` now passes it when the
+  recorded input holds a system message.
+- **The Inspector's memory panel crashed on a record it did not expect** — a `null` where a list belongs,
+  a string, a record of another version. Every field is now checked before use; an unreadable record
+  says so.
+- **A memory run that died between freezing its input and writing `:memctx` lost its question.** Entered
+  again (a retry with the same run id, or `resumeRun`), it could not locate the turn in the frozen input
+  and stored the answer with no question — 4 of 4 re-entry shapes, with and without input processors.
+  `:input` now carries the turn's locator (`turn: { count, appended? }`) in the same write.
+- **`forkRun` copies the source's `:memctx`.** The fork's input is the source's, so its account of where
+  that input came from is too; the fork used to get a fresh record from the thread as it is now.
+- **A Lab explanation the provider throttled answered a bare 500, after minutes.** NIM answered every
+  request 429; each replay was sent again until it failed, and when every replay of one combination had
+  failed the tab showed "500 Internal Server Error" — 18 minutes on one measured run. The reason now
+  reaches the screen ("the first: … Too Many Requests"), as it happens, and the run can be stopped.
+  A lab call is audited before it runs, so one that fails half way is in the audit log too.
+- **A replay counted the earlier turns' tool calls as the run's own.** A run's input carries the
+  conversation so far; its tool calls were read as this run's recorded work, so a candidate that did the
+  same work was reported as missing a call, and one that repeated an earlier call was answered from the
+  history instead of diverging. Measured on a real run: two recorded calls where the journal had one.
+- **`maskOldToolOutputs` as a `prepareStep` froze its notes.** ai@7 carries a step's returned messages
+  into the next one; masking those, the note stayed "from 2 steps ago" four steps on. It now masks the
+  conversation rebuilt from the step's `initialMessages` and `responseMessages`.
+
+## [0.15.1] — 2026-10-30
+
+**What is remembered about a person stays with that person, goes when they are erased, and is seen by
+the model that saved it.** Three defects in 0.15.0, each fixed at its rule: a person's lessons are read
+by the same boundary erasure draws, erasing a person takes their suggestions, and working memory with a
+`template` shows the saved values. Upgrading from 0.15.0 needs no store step and no code change.
+
+### Fixed
+
+- **A person's lessons stop at the person.** `lesson:res:<id>:` is not a boundary when ids may contain
+  ':' — `suggestions.lessons('alice')` returned `alice:evil`'s lessons too, and the next run of alice's
+  carried them in its system prompt. Erasure already drew the line; the lesson listing and the
+  injection now read the same rule.
+- **Erasing a person takes their suggestions.** `sugg:<id>` records are keyed by id, so `purgeResource`
+  / `eraseSubject` left a person's pending and rejected suggestions (rule text, evidence naming their
+  runs) behind. They are now matched on the owner the record stores and erased; on org-scope
+  promotions the person's evidence entries are removed, and a promotion nobody supports any more goes.
+  The storage conformance kit checks it on every adapter.
+- **Working memory with a `template` shows what was saved.** With a template set, the system message
+  carried the template text in place of the saved values, so the model never saw what it had stored
+  (and a `readOnly` reader saw nothing). The saved values are now always shown, with the template after
+  them as the shape to keep them in.
+
 ## [0.15.0] — 2026-10-25
 
 **What an agent costs, measured on its own runs — and lowered only where a replay shows it does the same

@@ -556,6 +556,12 @@ export interface RunOutcomeRecord {
    */
   attempt?: number;
   error?: string;
+  /** The failing error's class name (`err.name`, else its constructor's) — present only with `error`. */
+  errorName?: string;
+  /** The failing error's own `code` ('ECONNRESET'), when it carries a short identifier one. */
+  errorCode?: string;
+  /** The failing error's HTTP `statusCode` (a retry wrapper's: its last error's), when it carries one. */
+  errorStatus?: number;
 }
 
 

@@ -3,10 +3,6 @@
 // name not listed is refused where the bag is read, naming the option it is closest to.
 import { optionNames } from '@gnldev/options';
 
-export const REPLAY_NAMES = optionNames<import('./replay.js').CounterfactualOptions>()([
-  'journal', 'runId', 'model', 'tools', 'system', 'maxSteps', 'prepareStep', 'pricing', 'timeoutMs',
-]);
-
 export const DIAGNOSE_NAMES = optionNames<import('./diagnose.js').DiagnoseOptions>()([
   'journal', 'agent', 'limit', 'keepLast', 'minCacheTokens', 'pricing',
 ]);
@@ -15,8 +11,7 @@ export const MASK_NAMES = optionNames<import('./mask.js').MaskOldToolOutputsOpti
 
 export const CACHE_NAMES = optionNames<import('./cache.js').CacheBreakpointsOptions>()(['ttl', 'cacheKey']);
 
-export const SUITE_NAMES = optionNames<import('./suite.js').RunSuiteOptions>()(['model', 'scenarios', 'pricing', 'maxSteps', 'concurrency', 'timeoutMs']);
-export const COMPARE_NAMES = optionNames<import('./suite.js').CompareOptions>()(['baseline', 'candidate', 'scenarios', 'pricing', 'maxSteps', 'concurrency', 'timeoutMs']);
+export const COMPARE_NAMES = optionNames<import('./compare.js').CompareOptions>()(['baseline', 'candidate', 'scenarios', 'pricing', 'maxSteps', 'concurrency', 'timeoutMs']);
 
 export const REPLAY_AGENT_NAMES = optionNames<import('./replay-agent.js').ReplayAgentOptions>()([
   'journal', 'agent', 'model', 'tools', 'system', 'maxSteps', 'prepareStep', 'pricing', 'timeoutMs', 'limit', 'concurrency',

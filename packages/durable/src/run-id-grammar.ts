@@ -87,6 +87,14 @@ export const RUN_RECORD_FAMILIES = {
   wf: { shape: 'tree', listed: true, writer: '@gnldev/workflow (spells it itself: no dependency on this package) — workflow steps' },
   lease: { shape: 'tree', bookkeeping: true, writer: '@gnldev/queue — a worker\'s lease (`lease:lock`)' },
   fire: { shape: 'tree', bookkeeping: true, writer: '@gnldev/scheduler — a schedule fire (`fire:lock`)' },
+  /**
+   * What a READER made out of this run and keeps — an experiment on it, an annotation — spelled
+   * `<runId>:derived:<owner>:<rest>` by whoever writes it. Under the run's prefix ON PURPOSE: it is as
+   * much the person's data as the run it came from, and every deletion of the run (purgeRun, sweepRuns,
+   * eraseSubject) takes `<runId>:` whole, so it goes with the run without any of them knowing it exists.
+   * Bookkeeping: it says nothing about the run having started.
+   */
+  derived: { shape: 'tree', listed: true, bookkeeping: true, writer: 'a reader of the run (Studio keeps Lab experiments here) — deleted with the run' },
 } as const satisfies Record<string, RecordFamily>;
 
 export type RunRecordFamily = keyof typeof RUN_RECORD_FAMILIES;

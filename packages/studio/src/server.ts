@@ -1,12 +1,12 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { runRecordKey, runRecordPrefix, runIdFamilyOf, runIdentity, UNKNOWN, JOURNAL_GUARANTEES, missingGuarantees } from '@gnldev/durable';
+import { runRecordKey, runRecordPrefix, runIdFamilyOf, runIdentity, UNKNOWN, JOURNAL_GUARANTEES, missingGuarantees, readRunMemoryLayout, type MemoryLayoutReading } from '@gnldev/durable';
 import { randomUUID } from 'node:crypto';
 import { toFetchHandler, type FetchHandler } from './handler.js';
 import { Hono, type Context } from 'hono';
 import { sseResponse } from './sse.js';
 
 import { STUDIO_ERROR_CODES } from './error-codes.js';
-import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, beginFork, settleModelContent, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, replayRun, regressionReport, resolveModel, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, LIMIT_ERROR_CODES, requestRefusal, eraseSubject, subjectRuns, toJournal, decodeStepRecord, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
+import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, beginFork, settleModelContent, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, regressionReport, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, LIMIT_ERROR_CODES, requestRefusal, eraseSubject, subjectRuns, toJournal, decodeStepRecord, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
 import type { JournalReader, Journal, Memory, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser, RunSummary, RunChange } from '@gnldev/durable';
 import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
@@ -898,12 +898,6 @@ export interface StudioApiOptions {
     timeoutMs?: number;
   };
   /**
-   * W5 regression: converts POST /runs/:id/regression body.model (a 'provider/model' spec) to a real
-   * model. If not given, @gnldev/durable's `resolveModel` is used (dynamically imports the relevant provider
-   * package → a real API call). Provide this on hosts with a test/mock model store.
-   */
-  regressionModel?: (spec: string) => Promise<unknown> | unknown;
-  /**
    * OTEL export (host-provided): the UI/client NEVER sends data to an arbitrary endpoint — the host
    * itself CALLS @gnldev/otel's `exportRunToOtlp` with its configured target (Langfuse/Honeycomb/Datadog/
    * Collector) + auth (API key); Studio only TRIGGERS it (POST /runs/:id/otel-export). If not given,
@@ -917,6 +911,13 @@ export interface StudioApiOptions {
    * routes answer 501 and the tab (capabilities.optimizer) is hidden.
    */
   optimizer?: StudioOptimizer;
+  /**
+   * The lab (host-provided; `studioLab` from @gnldev/lab builds it): what brought a recorded run's calls
+   * about, each part of it left out in turn and the run replayed — no tool executes. Like the optimizer,
+   * Studio hands it this request's org-scoped reader and never holds a model. Not given: the routes
+   * answer 501 and the tab (capabilities.lab) is hidden.
+   */
+  lab?: StudioLab;
 }
 
 /** What Studio's optimizer tab calls — see StudioApiOptions.optimizer. */
@@ -931,6 +932,167 @@ export interface StudioOptimizer {
   history(journal: JournalReader, agent: string): Promise<unknown>;
   /** A Markdown report for the agent from `journal`. It recommends; it changes nothing. */
   report(journal: JournalReader, agent: string): Promise<{ markdown: string }>;
+}
+
+/** How a long lab call reports as it goes (`done` of `total`, failures so far), and how it is stopped. */
+export interface StudioLabControl {
+  onProgress?: (progress: { done: number; total: number; failed: number; lastError?: string; concurrency?: number; running?: number; throttled?: { waitMs: number; attempt: number; maxWaits: number; error: string }; retrying?: { reason: string; attempt: number; waitMs: number } }) => void;
+  signal?: AbortSignal;
+}
+
+/** What Studio's Lab tab calls — see StudioApiOptions.lab. */
+export interface StudioLab {
+  /** The agents to offer, and the models an explanation may use. */
+  catalog(): { agents: string[]; models: string[] } | Promise<{ agents: string[]; models: string[] }>;
+  /** The parts proposed for a run, how many replays an explanation takes, and roughly what it costs. Calls no model. */
+  plan(journal: JournalReader, request: { runId: string; model: string; trials?: number }): Promise<unknown>;
+  /** The run's parts left out in every combination, replayed with `model`; each part's share. */
+  explain(journal: JournalReader, request: { runId: string; model: string; trials?: number }, control?: StudioLabControl): Promise<unknown>;
+  /** The scenarios a new agent's forms can be tried on. Reads no journal. */
+  scenarios(agent: string): unknown;
+  /** The components of an agent's prompt and how many runs trying every form takes. Calls no model. */
+  formPlan(request: StudioLabFormRequest): unknown;
+  /** Every form of the agent (subset of its prompt's sections, and of the tools taken away or added) on the chosen scenarios, with fake tools. */
+  bestForm(request: StudioLabFormRequest & { model: string }, control?: StudioLabControl): Promise<unknown>;
+  /** The sections of a run's prompt one can try removing, the agent's tools to answer, and what the check takes. Calls no model. Optional. */
+  prunePlan?(journal: JournalReader, request: { runId: string; model: string; prompts: number; trials?: number; control?: boolean }): Promise<unknown>;
+  /** Would removing a section change what the agent does — on new messages, its tools answered from the page. Nothing is written. */
+  prune?(journal: JournalReader, request: StudioLabPruneRequest, control?: StudioLabControl): Promise<unknown>;
+  /** How the run's last message is cut into words, and what explaining one decision takes. Calls no model. Optional. */
+  wordsPlan?(journal: JournalReader, request: { runId: string; model: string; words?: string[]; samples?: number }): Promise<unknown>;
+  /** Which words of the run's last message decided whether its next call is `tool`. No tool runs, nothing is written. */
+  words?(journal: JournalReader, request: { runId: string; model: string; tool: string; words: string[]; samples?: number }, control?: StudioLabControl): Promise<unknown>;
+  /** What a run's capsule starts from: its recorded prompt, the agent's tools, its calls. Calls no model. */
+  capsuleBase(journal: JournalReader, request: { runId: string }): Promise<unknown>;
+  /**
+   * The run played again in its capsule — the prompt, tools and history changed as asked, calls it never
+   * made answered by `answers`. No tool runs and nothing is written.
+   */
+  capsule(journal: JournalReader, request: StudioLabCapsuleRequest, control?: StudioLabControl): Promise<unknown>;
+  /**
+   * A thread's turns, a page at a time, read through `journal`: how each ended (a provider's refusal told
+   * apart from the agent's mistake), where its input came from, and what diagnosing it would take. Calls no model.
+   */
+  threadPlan(journal: JournalReader, request: StudioLabThreadPlanRequest): Promise<{ total: number; turns: Array<{ runId: string }> }>;
+  /** One turn diagnosed against what a right answer does: elimination, then fresh plays of each candidate changed. Nothing is written. */
+  thread(journal: JournalReader, request: StudioLabThreadRequest, control?: StudioLabControl): Promise<unknown>;
+  /**
+   * A run's turn kept as a scenario of its agent, written through `journal` (this request's org-scoped
+   * view) — under the person whose conversation it copies, so their erasure takes it. Optional: a lab
+   * without it has no Scenarios to keep.
+   */
+  saveScenario?(journal: JournalReader, request: StudioLabSaveScenarioRequest, by: string): Promise<{ id: string; agent: string }>;
+  savedScenarios?(journal: JournalReader, agent: string): Promise<unknown[]>;
+  deleteScenario?(journal: JournalReader, agent: string, id: string): Promise<boolean>;
+  /** Changes a kept scenario in place — title, expectation, tool results, answers; undefined when there is none. */
+  updateScenario?(journal: JournalReader, agent: string, id: string, edit: { title?: string; expect?: StudioLabExpectation; results?: Array<{ toolName: string; args: unknown; output: unknown }>; answers?: Array<{ toolName: string; args: unknown; output: unknown }> }): Promise<unknown>;
+  /** An agent the lab offers, as the playground starts from it (its prompt when fixed, its tools' definitions). Calls no model. */
+  playgroundBase?(agent: string): Promise<unknown>;
+  /** One play of an agent written on the page; every tool call answered from the page, nothing runs or is written. */
+  play?(request: { agent: StudioPlaygroundAgent; model: string; messages: unknown[] }): Promise<unknown>;
+  /** A playground agent's last turn played `trials` times, and `compareTo` beside it. */
+  measure?(request: { agent: StudioPlaygroundAgent; model: string; messages: unknown[]; expect: StudioLabExpectation; trials?: number; compareTo?: StudioPlaygroundAgent }, control?: StudioLabControl): Promise<unknown>;
+  /** The scenarios kept under a playground agent's name, played against its definition as it is on the page now. */
+  runPlaygroundScenarios?(journal: JournalReader, request: { agent: string; definition: StudioPlaygroundAgent; model: string; trials?: number; ids?: string[] }, control?: StudioLabControl): Promise<unknown>;
+  /** A playground conversation kept as a scenario of the playground agent named. */
+  savePlaygroundScenario?(journal: JournalReader, request: { agent: string; title: string; definition: StudioPlaygroundAgent; messages: unknown[]; expect: StudioLabExpectation }, by: string): Promise<{ id: string; agent: string }>;
+  /** The agent's kept scenarios played against the agent as the host defines it now; no tool runs. */
+  runScenarios?(journal: JournalReader, request: { agent: string; model: string; trials?: number; ids?: string[] }, control?: StudioLabControl): Promise<unknown>;
+}
+
+/** A new agent's forms, as the Lab tab asks for them: tools the scenarios offer taken away, tools written on the page added. */
+export interface StudioLabFormRequest {
+  agent: string;
+  trials?: number;
+  scenarios?: string[];
+  withoutTools?: string[];
+  addTools?: Array<{ name: string; description: string; parameters: Record<string, unknown>; output: unknown }>;
+}
+
+/** "Would removing this section change what the agent does?", as the Lab tab asks it. */
+export interface StudioLabPruneRequest {
+  runId: string;
+  model: string;
+  remove: string;
+  control?: string;
+  prompts: string[];
+  answers?: Array<{ toolName: string; args: unknown; output: unknown }>;
+  otherwise?: Record<string, unknown>;
+  trials?: number;
+}
+
+/** An agent written on the Lab's playground: its prompt, its tools and what each returns. */
+export interface StudioPlaygroundAgent {
+  system: string;
+  tools: Array<{ name: string; description: string; parameters: unknown; answers?: Array<{ args: unknown; output: unknown }>; otherwise?: { output: unknown } }>;
+}
+
+/** A turn kept as a scenario, as the Lab tab sends it. */
+export interface StudioLabSaveScenarioRequest {
+  runId: string;
+  title: string;
+  expect: StudioLabExpectation;
+  overrides?: Array<{ toolName: string; args: unknown; output: unknown }>;
+  answers?: Array<{ toolName: string; args: unknown; output: unknown }>;
+  system?: string;
+}
+
+/** A thread plan, as the Lab tab asks for it. */
+export interface StudioLabThreadPlanRequest {
+  threadId: string;
+  model: string;
+  trials?: number;
+  offset?: number;
+  limit?: number;
+  expect?: StudioLabExpectation;
+  /** The hypotheses the person will bring, named only (a corrected working memory; tools whose result they will replace; parts they will correct; whether corrections are suggested). */
+  hypotheses?: { workingMemory?: boolean; overrides?: string[]; corrections?: string[]; suggest?: boolean; guess?: boolean };
+}
+
+/** A turn's diagnosis, as the Lab tab sends it — checked by Studio before it reaches the lab. */
+export interface StudioLabThreadRequest {
+  runId: string;
+  model: string;
+  /** What a right answer does — required: without it nothing can be diagnosed. */
+  expect: StudioLabExpectation;
+  /** Plays per arm; the lab's planned number when omitted. */
+  trials?: number;
+  eliminationTrials?: number;
+  topK?: number;
+  /** A corrected working memory to try in place of the recorded one. */
+  workingMemory?: string;
+  overrides?: Array<{ toolName: string; args: unknown; output: unknown }>;
+  answers?: Array<{ toolName: string; args: unknown; output: unknown }>;
+  /** What a part should have said, by part id — each an arm. Never audited or kept: only the part ids are. */
+  corrections?: Record<string, string>;
+  /** The diagnosing model also proposes the corrected text of the most blamed parts; each proposal is an arm. */
+  suggest?: boolean;
+  /** The diagnosing model first names the parts most likely to blame; only those are played first. */
+  guess?: boolean;
+}
+
+/** A capsule play, as the Lab tab sends it. */
+export interface StudioLabCapsuleRequest {
+  runId: string;
+  model: string;
+  trials: number;
+  system?: string;
+  tools?: Array<{ name: string; description: string; parameters?: unknown }>;
+  history?: boolean;
+  /** false: leave out what the run's memory layout proves memory put in. */
+  memory?: boolean;
+  /** What a right answer does (@gnldev/experiment Expectation): every play is checked against it. */
+  expect?: StudioLabExpectation;
+  answers?: Array<{ toolName: string; args: unknown; output: unknown }>;
+  /** Results put in place of the recorded ones (same tool, same arguments). Like answers, kept nowhere. */
+  overrides?: Array<{ toolName: string; args: unknown; output: unknown }>;
+}
+
+/** A capsule's expectation, as Studio checks it before it reaches the lab — @gnldev/experiment's Expectation by structure. */
+export interface StudioLabExpectation {
+  calls?: Array<{ toolName: string; args?: Record<string, unknown> }>;
+  forbidden?: string[];
+  answerIncludes?: Array<string | string[]>;
 }
 
 /** createStudioApp additionally takes the admin HTML's API base (apiBase). */
@@ -1629,10 +1791,11 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     | 'workflow.create' | 'workflow.update' | 'workflow.delete'
     | 'tool.exec' | 'agent.run'
     | 'agent.version' | 'agent.promote' | 'agent.gate' | 'agent.delete' | 'agent.version-delete'
-    | 'run.purge' | 'run.regression' | 'run.compensate' | 'run.cancel' | 'retention.sweep' | 'policy.update' | 'pricing.update'
+    | 'run.purge' | 'run.compensate' | 'run.cancel' | 'retention.sweep' | 'policy.update' | 'pricing.update'
     | 'org.budget' | 'org.create' | 'org.delete'
     | 'user.create' | 'user.delete' | 'user.revoke' | 'user.update'
-    | 'job.retry' | 'event.release' | 'cache.invalidate' | 'run.otel-export' | 'optimizer.replay' | 'workflow.cancel'
+    | 'job.retry' | 'event.release' | 'cache.invalidate' | 'run.otel-export' | 'optimizer.replay' | 'lab.explain' | 'lab.best-form' | 'lab.capsule' | 'lab.thread'
+    | 'lab.scenario-save' | 'lab.scenario-edit' | 'lab.scenario-delete' | 'lab.scenario-run' | 'lab.playground' | 'lab.prune' | 'lab.words' | 'workflow.cancel'
     | 'agent.approve' | 'agent.block';
   /**
    * Actor attribution — priority: an authenticated principal.id (e.g. a basic-auth user) > the
@@ -1920,9 +2083,6 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       agentVersions: agentStoreEnabled,
       evalGate: !!(opts.evalGate && datasets),
       purge: writable,
-      // W5: replay-based regression ("re-run" + decision-point diff). replayRun needs a writable
-      // journal since it writes a new run; diffing two EXISTING runs (GET) doesn't depend on that.
-      regression: writable,
       policy: writable,
       retention: !!opts.retention && writable,
       // OTEL export button: on if the host gave opts.otelExport (RBAC is again enforced server-side
@@ -1931,6 +2091,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       // Cost optimizer tab: on if the host gave opts.optimizer. Every call is handed this request's
       // org-scoped reader, so an organization's admin diagnoses and replays only its own runs.
       optimizer: !!opts.optimizer,
+      // Lab tab: on if the host gave opts.lab — the same org-scoped reader as every other route.
+      lab: !!opts.lab,
       // D3-A: durable run cancel (POST /runs/:id/cancel) — writes cancelAgentRun's cross-worker flag.
       // Studio has no in-process AbortController registry (unlike @gnldev/server's P0.3 in-flight abort),
       // so this is the durable-flag path ONLY: a canceled run stops at its NEXT fresh model step,
@@ -2075,13 +2237,17 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // the frozen input says WHAT the model saw; this says WHERE each part came from — recall hits with
   // similarity, recent-window count, OM observations, WM injection, echo-trim. `null` for runs
   // without memory, pre-provenance runs, or a read-only journal — the UI renders that honestly as
-  // "no provenance recorded", never as an error.
+  // "no provenance recorded", never as an error. `layout` is durable's own reading of the record against
+  // the frozen input (readRunMemoryLayout): `present`, or `absent` with the reason — a record written
+  // before layouts existed, of another version, or broken reads absent, and the route still answers.
   app.get('/runs/:id/memory-context', async (c) => {
     if (!(await allowP(c.req.raw, 'threads:read'))) return deny(c.req.raw, 'read');
-    if (!writable) return c.json({ context: null });
+    if (!writable) return c.json({ context: null, layout: { status: 'absent', reason: 'no-record' } });
     const id = decodeURIComponent(c.req.param('id'));
     const ctx = await rw.get!(runRecordKey(id, 'memctx')).catch(() => undefined);
-    return c.json({ context: ctx ?? null });
+    const layout: MemoryLayoutReading = await readRunMemoryLayout({ get: (k: string) => rw.get!(k) } as never, id)
+      .catch(() => ({ status: 'absent' as const, reason: 'malformed' as const }));
+    return c.json({ context: ctx ?? null, layout });
   });
 
   // Cost/token (getRunCost).
@@ -3663,44 +3829,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     return c.json({ ok: true, deleted });
   });
 
-  // ── W5: Replay-based regression (durable regression.ts: replayRun + regressionReport) ────
-  // Independently re-runs a recorded run's INPUT (runKeys.input) with a new model/system
-  // (replayRun — NOT forkRun, it never touches the original run's journal records), then
-  // returns the decision-point diff (regressionReport → diffRuns).
-  app.post('/runs/:id/regression', async (c) => {
-    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
-    if (!writable) return c.json({ error: 'regression requires a writable journal' }, 501);
-    const id = decodeURIComponent(c.req.param('id'));
-    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
-    const body = parsedBody.value as { model?: string; system?: string; newRunId?: string; memoryOff?: boolean };
-    if (!body.model) return c.json({ error: 'model is required (e.g. "openai/gpt-4o")' }, 400);
-    let model: unknown;
-    try {
-      model = await (opts.regressionModel ?? resolveModel)(body.model);
-    } catch (e: any) {
-      return c.json({ error: String(e?.message ?? e) }, 400);
-    }
-    try {
-      const { newRunId } = await replayRun({
-        journal: rw as unknown as Journal & JournalReader,
-        runId: id,
-        model: model as any,
-        ...(body.system != null ? { system: body.system } : {}),
-        ...(body.newRunId ? { newRunId: body.newRunId } : {}),
-        // Counterfactual memory-off replay (see durable regression.ts stripMemoryContext): re-ask the
-        // turn WITHOUT what memory injected — provable causation instead of "it probably read it".
-        ...(body.memoryOff ? { stripMemoryContext: true } : {}),
-      });
-      const report = await regressionReport(reader, id, newRunId);
-      await audit(c, 'run.regression', id, { newRunId, model: body.model, divergentAt: report.diff.divergentAt, ...(body.memoryOff ? { memoryOff: true } : {}) });
-      return c.json({ ok: true, ...report });
-    } catch (e: any) {
-      const refused = requestRefusal(e);
-      if (refused) return c.json(refused.body, refused.status, refused.headers);
-      return c.json({ error: String(e?.message ?? e) }, 400);
-    }
-  });
-
+  // ── Decision-point diff of two existing runs (durable regression.ts: regressionReport) ──────
+  // Playing a run again with another model or prompt is the Lab's capsule: it writes nothing.
   // Diffs two EXISTING runs (without re-running) at the decision-point level — read-only.
   app.get('/runs/:id/regression/:otherId', async (c) => {
     if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
@@ -3776,6 +3906,615 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const result = await opts.optimizer.replay(reader, request);
     await audit(c, 'optimizer.replay', body.agent, request);
     return c.json(result);
+  });
+
+  // Lab (host-provided, see StudioApiOptions.lab). A run is looked up through `reader`, this request's
+  // org-scoped view, and must be visible to the caller; an explanation calls a model many times (it
+  // costs money), so it takes 'write' and is audited. The plan calls no model.
+  const LAB_OFF = { error: 'the lab is not enabled (the host must provide lab)' };
+  // An experiment ON A RUN (explain, capsule, thread) is kept under that run — `<runId>:derived:lab:exp:` — so
+  // whatever deletes the run (purgeRun, sweepRuns, eraseSubject) deletes it too: it holds the person's
+  // prompt and the model's answers about it. Only best-form, which is an agent's and reads no run, is
+  // kept at the organization's `__lab__:exp:`.
+  const LAB_EXPERIMENT_PRE = '__lab__:exp:';
+  const LAB_RUN_EXPERIMENT = 'lab:exp:';
+  const labExperimentPrefix = (kind: LabKept['kind'], target?: string) => kind === 'best-form'
+    ? LAB_EXPERIMENT_PRE + `${kind}:` + (target !== undefined ? `${encodeURIComponent(target)}:` : '')
+    : runRecordPrefix(target!, 'derived') + LAB_RUN_EXPERIMENT + `${kind}:`;
+  const MAX_LAB_TRIALS = 10;
+  app.get('/lab', async (c) => {
+    if (!(await allowP(c.req.raw, 'catalog:read'))) return deny(c.req.raw, 'read');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    return c.json(await opts.lab.catalog());
+  });
+  /**
+   * A lab call that spends: audited BEFORE it runs (one that fails half way has still spent), then answered
+   * as JSON, or — asked with `accept: text/event-stream` — as `progress` events and one `done` or `error`.
+   * A client that goes away stops it: no further replay starts. A RangeError is the request's own fault (422);
+   * a ProviderStoppedError (@gnldev/experiment: the model's provider refused or broke) is a 503 with its reason.
+   */
+  async function labResponse(c: Context, work: (control: StudioLabControl) => Promise<unknown>, kept: LabKept | null): Promise<Response> {
+    if (!(c.req.header('accept') ?? '').includes('text/event-stream')) {
+      try { const result = await work({}); await keepLabExperiment(c, kept, result); return c.json(result); }
+      catch (e) { const status = labErrorStatus(e); if (status !== 500) return c.json(labRefusal(e as Error), status); throw e; }
+    }
+    return sseResponse(c, async (stream) => {
+      const stop = new AbortController();
+      stream.onAbort(() => stop.abort());
+      let writes = Promise.resolve();
+      const onProgress: StudioLabControl['onProgress'] = (p) => { writes = writes.then(() => stream.writeSSE({ event: 'progress', data: JSON.stringify(p) })).catch(() => {}); };
+      try {
+        const result = await work({ onProgress, signal: stop.signal });
+        await writes;
+        await keepLabExperiment(c, kept, result);
+        await stream.writeSSE({ event: 'done', data: JSON.stringify(result) });
+      } catch (e) {
+        await writes;
+        if (stop.signal.aborted) return;
+        await stream.writeSSE({ event: 'error', data: JSON.stringify({ error: e instanceof Error ? e.message : String(e), status: labErrorStatus(e) }) });
+      }
+    });
+  }
+  /**
+   * A finished lab experiment, kept for the organization's admins: what was asked, by whom, and what came
+   * back — through the caller's org-scoped reader, so an organization's experiments are its own. Answers
+   * the person wrote for a capsule are not in it (they live in the page); `request` says how many.
+   */
+  type LabKept = { kind: 'explain' | 'capsule' | 'thread' | 'best-form'; target: string; request: unknown };
+  async function keepLabExperiment(c: Context, kept: LabKept | null, result: unknown): Promise<void> {
+    if (!writable || kept === null) return;
+    const at = Date.now();
+    const stamp = `${String(at).padStart(15, '0')}-${Math.random().toString(36).slice(2, 8)}`;
+    const id = `${kept.kind}:${encodeURIComponent(kept.target)}:${stamp}`;
+    try { await rw.put!(labExperimentPrefix(kept.kind, kept.target) + stamp, { v: 1, id, at, actor: actorOf(c), ...kept, result }); }
+    catch { /* a lost record must not lose the result the person waited for */ }
+  }
+  /** A lab refusal as the response body: its message, and its code (and the agent it names) when the lab gave one — what the tab says it in the reader's language with. */
+  function labRefusal(e: Error): { error: string; code?: string; agent?: string | null } {
+    const x = e as Error & { code?: unknown; agent?: unknown };
+    return { error: e.message, ...(typeof x.code === 'string' ? { code: x.code } : {}), ...(typeof x.agent === 'string' || x.agent === null ? { agent: x.agent as string | null } : {}) };
+  }
+  function labErrorStatus(e: unknown): 422 | 503 | 500 {
+    return e instanceof RangeError ? 422 : (e as { name?: unknown } | null)?.name === 'ProviderStoppedError' ? 503 : 500;
+  }
+  /** A capsule's `expect`, checked by shape: what @gnldev/experiment's checkExpectation reads, nothing else. */
+  function isExpectation(x: unknown): boolean {
+    if (typeof x !== 'object' || x === null || Array.isArray(x)) return false;
+    const e = x as Record<string, unknown>;
+    if (Object.keys(e).some((k) => !['calls', 'forbidden', 'answerIncludes'].includes(k))) return false;
+    const str = (v: unknown) => typeof v === 'string' && v !== '';
+    if (e.calls !== undefined && !(Array.isArray(e.calls) && e.calls.every((w) => typeof w === 'object' && w !== null && !Array.isArray(w)
+      && str((w as Record<string, unknown>).toolName)
+      && ((w as Record<string, unknown>).args === undefined || (typeof (w as Record<string, unknown>).args === 'object' && (w as Record<string, unknown>).args !== null && !Array.isArray((w as Record<string, unknown>).args)))))) return false;
+    if (e.forbidden !== undefined && !(Array.isArray(e.forbidden) && e.forbidden.every(str))) return false;
+    if (e.answerIncludes !== undefined && !(Array.isArray(e.answerIncludes) && e.answerIncludes.every((a) => str(a) || (Array.isArray(a) && a.length > 0 && a.every(str))))) return false;
+    return true;
+  }
+  /** A list of tool results the person wrote (answers, overrides): `{ toolName, args, output }` each. */
+  function isToolResults(x: unknown): boolean {
+    return Array.isArray(x) && x.every((a) => typeof a === 'object' && a !== null && !Array.isArray(a) && typeof (a as { toolName?: unknown }).toolName === 'string' && 'args' in a && 'output' in a);
+  }
+  /** The run, model and trials of a lab request, checked; a Response when they are not usable. */
+  async function labRequest(c: Context, src: { runId?: unknown; model?: unknown; trials?: unknown }): Promise<{ runId: string; model: string; trials: number } | Response> {
+    if (typeof src.runId !== 'string' || !src.runId) return c.json({ error: 'runId is required' }, 400);
+    if (!(await runVisible(src.runId))) return c.json({ error: `run '${src.runId}' not found` }, 404);
+    const { models } = await opts.lab!.catalog();
+    if (typeof src.model !== 'string' || !models.includes(src.model)) return c.json({ error: 'model must be one the lab offers' }, 400);
+    const trials = src.trials === undefined || src.trials === '' ? 3 : Number(src.trials);
+    if (!Number.isInteger(trials) || trials < 1 || trials > MAX_LAB_TRIALS) return c.json({ error: `trials must be an integer from 1 to ${MAX_LAB_TRIALS}` }, 400);
+    return { runId: src.runId, model: src.model, trials };
+  }
+  app.get('/lab/plan', async (c) => {
+    if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    const req = await labRequest(c, { runId: c.req.query('runId'), model: c.req.query('model'), trials: c.req.query('trials') });
+    if (req instanceof Response) return req;
+    try { return c.json(await opts.lab.plan(reader, req)); }
+    catch (e) { if (e instanceof RangeError) return c.json(labRefusal(e), 422); throw e; }
+  });
+  // The organization's kept experiments, newest first — for its admins (the write permission: a record
+  // can hold an edited prompt and the model's answers). `kind` is required; an experiment on a run
+  // (explain, capsule) is listed by its run (`target`, required), best-form by agent or all of them.
+  app.get('/lab/experiments', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!writable || typeof rw.listKeys !== 'function') return c.json({ items: [] });
+    const kind = c.req.query('kind'), target = c.req.query('target');
+    if (kind === undefined || !['explain', 'capsule', 'best-form', 'thread'].includes(kind)) return c.json({ error: 'kind must be explain, capsule, thread or best-form' }, 400);
+    if (kind !== 'best-form' && !target) return c.json({ error: `an experiment on a run is listed by its run: ${kind} needs target (the run id)` }, 400);
+    const limit = Math.min(50, Math.max(1, Number(c.req.query('limit') ?? 20) || 20));
+    const prefix = labExperimentPrefix(kind as LabKept['kind'], target);
+    const stamp = (k: string) => k.slice(k.lastIndexOf(':') + 1);
+    const keys = (await rw.listKeys(prefix)).sort((a, b) => stamp(b).localeCompare(stamp(a))).slice(0, limit);
+    const items = (await Promise.all(keys.map((k) => rw.get!(k)))).filter((x) => x && typeof x === 'object' && (x as { v?: unknown }).v === 1);
+    return c.json({ items });
+  });
+  app.get('/lab/capsule', async (c) => {
+    if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    const runId = c.req.query('runId');
+    if (!runId) return c.json({ error: 'runId is required' }, 400);
+    if (!(await runVisible(runId))) return c.json({ error: `run '${runId}' not found` }, 404);
+    try { return c.json(await opts.lab.capsuleBase(reader, { runId })); }
+    catch (e) { if (e instanceof RangeError) return c.json(labRefusal(e), 422); throw e; }
+  });
+  // A capsule play: the run's copy, changed, played again. The answers the person wrote for calls the
+  // run never made come with every request and are kept nowhere — the audit names how many, not what.
+  app.post('/lab/capsule', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as Record<string, unknown>;
+    const req = await labRequest(c, body as { runId?: unknown; model?: unknown; trials?: unknown });
+    if (req instanceof Response) return req;
+    const { system, tools, history, memory, answers, overrides, expect } = body;
+    if (memory !== undefined && typeof memory !== 'boolean') return c.json({ error: 'memory must be true or false' }, 400);
+    if (system !== undefined && typeof system !== 'string') return c.json({ error: 'system must be a string' }, 400);
+    if (history !== undefined && typeof history !== 'boolean') return c.json({ error: 'history must be true or false' }, 400);
+    const isObj = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x);
+    if (tools !== undefined && !(Array.isArray(tools) && tools.every((t) => isObj(t) && typeof t.name === 'string' && t.name !== '' && typeof t.description === 'string' && (t.parameters === undefined || isObj(t.parameters)))))
+      return c.json({ error: 'tools must be a list of { name, description, parameters? } (parameters a JSON Schema object)' }, 400);
+    if (Array.isArray(tools) && new Set(tools.map((t) => (t as { name: string }).name)).size !== tools.length) return c.json({ error: 'tools must not name a tool twice' }, 400);
+    if (expect !== undefined && !isExpectation(expect))
+      return c.json({ error: 'expect must be { calls?: [{ toolName, args? }], forbidden?: [tool names], answerIncludes?: [text or [spellings]] }' }, 400);
+    if (answers !== undefined && !isToolResults(answers)) return c.json({ error: 'answers must be a list of { toolName, args, output }' }, 400);
+    if (overrides !== undefined && !isToolResults(overrides)) return c.json({ error: 'overrides must be a list of { toolName, args, output }' }, 400);
+    const capsule: StudioLabCapsuleRequest = {
+      ...req,
+      ...(system !== undefined ? { system } : {}),
+      ...(tools !== undefined ? { tools: tools as StudioLabCapsuleRequest['tools'] } : {}),
+      ...(history !== undefined ? { history } : {}),
+      ...(memory !== undefined ? { memory } : {}),
+      ...(expect !== undefined ? { expect: expect as StudioLabExpectation } : {}),
+      ...(answers !== undefined ? { answers: answers as StudioLabCapsuleRequest['answers'] } : {}),
+      ...(overrides !== undefined ? { overrides: overrides as StudioLabCapsuleRequest['overrides'] } : {}),
+    };
+    await audit(c, 'lab.capsule', req.runId, {
+      ...req, history: history ?? true, memory: memory ?? true, systemChanged: system !== undefined,
+      ...(Array.isArray(tools) ? { tools: tools.map((t) => (t as { name: string }).name) } : {}),
+      answers: Array.isArray(answers) ? answers.length : 0, expect: expect !== undefined,
+      ...(Array.isArray(overrides) ? { overrides: [...new Set(overrides.map((o) => (o as { toolName: string }).toolName))] } : {}),
+    });
+    const { answers: given, overrides: put, ...asked } = capsule;
+    return labResponse(c, (control) => opts.lab!.capsule(reader, capsule, control), { kind: 'capsule', target: req.runId, request: { ...asked, answers: given?.length ?? 0, ...(put ? { overrides: put.length } : {}) } });
+  });
+  app.post('/lab/explain', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const req = await labRequest(c, parsedBody.value as { runId?: unknown; model?: unknown; trials?: unknown });
+    if (req instanceof Response) return req;
+    await audit(c, 'lab.explain', req.runId, req);
+    return labResponse(c, (control) => opts.lab!.explain(reader, req, control), { kind: 'explain', target: req.runId, request: req });
+  });
+
+  // A thread's diagnosis. The plan reads the thread's runs through `reader` and calls no model ('runs:read');
+  // a turn whose run the caller cannot see is not in it, and a thread with none is not found. The
+  // diagnosis plays a turn many times: 'write', validated, audited (what was asked, never what was
+  // written: the expectation, a corrected working memory and the results the person typed are not in
+  // the audit), its result kept under the run like the capsule's.
+  const MAX_DIAGNOSIS_TRIALS = 100;
+  const MAX_ELIMINATION_TRIALS = 5;
+  /** Parts a diagnosis may correct, and the longest text one may be given. */
+  const MAX_CORRECTIONS = 20, MAX_CORRECTION_CHARS = 20_000;
+  const intIn = (v: unknown, lo: number, hi: number) => { const n = Number(v); return Number.isInteger(n) && n >= lo && n <= hi ? n : undefined; };
+  // A JSON body says a number as a number: "5" is refused there, as a query string's "5" is not.
+  const bodyInt = (v: unknown, lo: number, hi: number) => (typeof v === 'number' ? intIn(v, lo, hi) : undefined);
+  app.get('/lab/thread-plan', async (c) => {
+    if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    const threadId = c.req.query('threadId');
+    if (!threadId) return c.json({ error: 'threadId is required' }, 400);
+    const { models } = await opts.lab.catalog();
+    const model = c.req.query('model');
+    if (typeof model !== 'string' || !models.includes(model)) return c.json({ error: 'model must be one the lab offers' }, 400);
+    const q = (k: string) => { const v = c.req.query(k); return v === undefined || v === '' ? undefined : v; };
+    const trials = q('trials') === undefined ? undefined : intIn(q('trials'), 1, MAX_DIAGNOSIS_TRIALS);
+    if (q('trials') !== undefined && trials === undefined) return c.json({ error: `trials must be an integer from 1 to ${MAX_DIAGNOSIS_TRIALS}` }, 400);
+    const offset = q('offset') === undefined ? undefined : intIn(q('offset'), 0, Number.MAX_SAFE_INTEGER);
+    if (q('offset') !== undefined && offset === undefined) return c.json({ error: 'offset must be a non-negative integer' }, 400);
+    const limit = q('limit') === undefined ? undefined : intIn(q('limit'), 1, 50);
+    if (q('limit') !== undefined && limit === undefined) return c.json({ error: 'limit must be an integer from 1 to 50' }, 400);
+    let expect: unknown;
+    if (q('expect') !== undefined) {
+      try { expect = JSON.parse(q('expect')!); } catch { expect = null; }
+      if (!isExpectation(expect)) return c.json({ error: 'expect must be a JSON { calls?, forbidden?, answerIncludes? }' }, 400);
+    }
+    const overrideNames = (q('overrides') ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+    const correctionNames = (q('corrections') ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+    const hypotheses = {
+      ...(q('wm') === '1' ? { workingMemory: true } : {}), ...(overrideNames.length ? { overrides: overrideNames } : {}),
+      ...(correctionNames.length ? { corrections: correctionNames } : {}), ...(q('suggest') === '1' ? { suggest: true } : {}), ...(q('guess') === '1' ? { guess: true } : {}),
+    };
+    try {
+      const plan = await opts.lab.threadPlan(reader, {
+        threadId, model, ...(trials !== undefined ? { trials } : {}), ...(offset !== undefined ? { offset } : {}), ...(limit !== undefined ? { limit } : {}),
+        ...(expect !== undefined ? { expect: expect as StudioLabExpectation } : {}),
+        ...(Object.keys(hypotheses).length ? { hypotheses } : {}),
+      });
+      const turns: typeof plan.turns = [];
+      for (const t of plan.turns) if (await runVisible(t.runId)) turns.push(t);
+      if (plan.total === 0 || turns.length === 0 && (offset ?? 0) === 0) return c.json({ error: `thread '${threadId}' not found` }, 404);
+      return c.json({ ...plan, turns });
+    } catch (e) { if (e instanceof RangeError) return c.json(labRefusal(e), 422); throw e; }
+  });
+  app.post('/lab/thread', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as Record<string, unknown>;
+    if (typeof body.runId !== 'string' || !body.runId) return c.json({ error: 'runId is required' }, 400);
+    if (!(await runVisible(body.runId))) return c.json({ error: `run '${body.runId}' not found` }, 404);
+    const { models } = await opts.lab.catalog();
+    if (typeof body.model !== 'string' || !models.includes(body.model)) return c.json({ error: 'model must be one the lab offers' }, 400);
+    if (body.expect === undefined) return c.json({ error: 'expect is required: what a right answer does — without it nothing can be diagnosed' }, 400);
+    if (!isExpectation(body.expect) || Object.keys(body.expect as object).length === 0) return c.json({ error: 'expect must be { calls?: [{ toolName, args? }], forbidden?: [tool names], answerIncludes?: [text or [spellings]] }, not empty' }, 400);
+    const trials = body.trials === undefined ? undefined : bodyInt(body.trials, 1, MAX_DIAGNOSIS_TRIALS);
+    if (body.trials !== undefined && trials === undefined) return c.json({ error: `trials must be an integer from 1 to ${MAX_DIAGNOSIS_TRIALS}` }, 400);
+    const eliminationTrials = body.eliminationTrials === undefined ? undefined : bodyInt(body.eliminationTrials, 1, MAX_ELIMINATION_TRIALS);
+    if (body.eliminationTrials !== undefined && eliminationTrials === undefined) return c.json({ error: `eliminationTrials must be an integer from 1 to ${MAX_ELIMINATION_TRIALS}` }, 400);
+    const topK = body.topK === undefined ? undefined : bodyInt(body.topK, 1, 5);
+    if (body.topK !== undefined && topK === undefined) return c.json({ error: 'topK must be an integer from 1 to 5' }, 400);
+    if (body.workingMemory !== undefined && typeof body.workingMemory !== 'string') return c.json({ error: 'workingMemory must be a string' }, 400);
+    if (body.overrides !== undefined && !isToolResults(body.overrides)) return c.json({ error: 'overrides must be a list of { toolName, args, output }' }, 400);
+    if (body.answers !== undefined && !isToolResults(body.answers)) return c.json({ error: 'answers must be a list of { toolName, args, output }' }, 400);
+    if (body.suggest !== undefined && typeof body.suggest !== 'boolean') return c.json({ error: 'suggest must be true or false' }, 400);
+    if (body.guess !== undefined && typeof body.guess !== 'boolean') return c.json({ error: 'guess must be true or false' }, 400);
+    const corrections = body.corrections as Record<string, unknown> | undefined;
+    if (corrections !== undefined && (typeof corrections !== 'object' || corrections === null || Array.isArray(corrections)
+      || Object.keys(corrections).length > MAX_CORRECTIONS || Object.values(corrections).some((v) => typeof v !== 'string' || v.length > MAX_CORRECTION_CHARS))) {
+      return c.json({ error: `corrections must be { "<part id>": "<what it should have said>" }, at most ${MAX_CORRECTIONS} parts of at most ${MAX_CORRECTION_CHARS} characters` }, 400);
+    }
+    const overrides = body.overrides as StudioLabThreadRequest['overrides'];
+    const answers = body.answers as StudioLabThreadRequest['answers'];
+    const req: StudioLabThreadRequest = {
+      runId: body.runId, model: body.model, expect: body.expect as StudioLabExpectation,
+      ...(trials !== undefined ? { trials } : {}), ...(eliminationTrials !== undefined ? { eliminationTrials } : {}), ...(topK !== undefined ? { topK } : {}),
+      ...(body.workingMemory !== undefined ? { workingMemory: body.workingMemory as string } : {}),
+      ...(overrides?.length ? { overrides } : {}), ...(answers?.length ? { answers } : {}),
+      ...(corrections && Object.keys(corrections).length ? { corrections: corrections as Record<string, string> } : {}),
+      ...(body.suggest === true ? { suggest: true } : {}),
+      ...(body.guess === true ? { guess: true } : {}),
+    };
+    // The arms the person asked for by name; the suspects are chosen by the elimination, after this line.
+    // A correction is named by its part, never its text.
+    const arms = ['baseline', `suspects:top-${topK ?? 3}`, 'absences', ...(req.workingMemory !== undefined ? ['wm-replace'] : []), ...[...new Set((overrides ?? []).map((o) => o.toolName))].map((t) => `override:${t}`),
+      ...Object.keys(req.corrections ?? {}).map((id) => `correct:${id}`), ...(req.suggest ? ['suggested corrections'] : []), ...(req.guess ? ['guessed parts first'] : [])];
+    await audit(c, 'lab.thread', req.runId, { runId: req.runId, model: req.model, trials: trials ?? 'planned', eliminationTrials: eliminationTrials ?? 2, arms, answers: answers?.length ?? 0 });
+    const { overrides: put, answers: given, corrections: wrote, ...asked } = req;
+    return labResponse(c, (control) => opts.lab!.thread(reader, req, control), {
+      kind: 'thread', target: req.runId, request: { ...asked, overrides: put?.length ?? 0, answers: given?.length ?? 0, ...(wrote ? { corrections: Object.keys(wrote) } : {}) },
+    });
+  });
+
+  // An agent's kept scenarios. Each is a copy of a conversation, so every route takes 'write' (the
+  // experiments' permission); keeping one writes through this request's org-scoped view, under the
+  // person whose conversation it copies (their erasure takes it). Audited by title and run, never content.
+  const SCENARIOS_OFF = { error: "this lab does not keep scenarios (its host's lab has no saveScenario)" };
+  const MAX_SCENARIO_TITLE = 200;
+  app.get('/lab/saved-scenarios', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.savedScenarios) return c.json(SCENARIOS_OFF, 501);
+    const agent = c.req.query('agent');
+    if (!agent) return c.json({ error: 'agent is required' }, 400);
+    if (!writable || typeof rw.listKeys !== 'function') return c.json({ items: [] });
+    return c.json({ items: await opts.lab.savedScenarios(reader, agent) });
+  });
+  app.post('/lab/saved-scenarios', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.saveScenario) return c.json(SCENARIOS_OFF, 501);
+    if (!writable) return c.json({ error: 'scenarios need a writable journal' }, 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as Record<string, unknown>;
+    if (typeof body.runId !== 'string' || !body.runId) return c.json({ error: 'runId is required' }, 400);
+    if (!(await runVisible(body.runId))) return c.json({ error: `run '${body.runId}' not found` }, 404);
+    if (typeof body.title !== 'string' || !body.title.trim() || body.title.length > MAX_SCENARIO_TITLE) return c.json({ error: `title must be text of 1 to ${MAX_SCENARIO_TITLE} characters` }, 400);
+    if (!isExpectation(body.expect) || Object.keys(body.expect as object).length === 0) return c.json({ error: 'expect is required: what a right answer does' }, 400);
+    if (body.overrides !== undefined && !isToolResults(body.overrides)) return c.json({ error: 'overrides must be a list of { toolName, args, output }' }, 400);
+    if (body.answers !== undefined && !isToolResults(body.answers)) return c.json({ error: 'answers must be a list of { toolName, args, output }' }, 400);
+    if (body.system !== undefined && typeof body.system !== 'string') return c.json({ error: 'system must be a string' }, 400);
+    const req: StudioLabSaveScenarioRequest = {
+      runId: body.runId, title: body.title, expect: body.expect as StudioLabExpectation,
+      ...(body.overrides ? { overrides: body.overrides as StudioLabSaveScenarioRequest['overrides'] } : {}),
+      ...(body.answers ? { answers: body.answers as StudioLabSaveScenarioRequest['answers'] } : {}),
+      ...(body.system !== undefined ? { system: body.system as string } : {}),
+    };
+    try {
+      const s = await opts.lab.saveScenario(reader, req, actorOf(c));
+      await audit(c, 'lab.scenario-save', s.agent, { runId: req.runId, scenario: s.id, title: req.title });
+      return c.json(s, 201);
+    } catch (e) { if (e instanceof RangeError) return c.json(labRefusal(e), 422); throw e; }
+  });
+  app.patch('/lab/saved-scenarios/:agent/:id', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.updateScenario) return c.json(SCENARIOS_OFF, 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as Record<string, unknown>;
+    if (body.title !== undefined && (typeof body.title !== 'string' || !body.title.trim() || body.title.length > MAX_SCENARIO_TITLE)) return c.json({ error: `title must be text of 1 to ${MAX_SCENARIO_TITLE} characters` }, 400);
+    if (body.expect !== undefined && (!isExpectation(body.expect) || Object.keys(body.expect as object).length === 0)) return c.json({ error: 'expect must be what a right answer does, not empty' }, 400);
+    if (body.results !== undefined && !isToolResults(body.results)) return c.json({ error: 'results must be a list of { toolName, args, output }' }, 400);
+    if (body.answers !== undefined && !isToolResults(body.answers)) return c.json({ error: 'answers must be a list of { toolName, args, output }' }, 400);
+    const edit = {
+      ...(body.title !== undefined ? { title: body.title as string } : {}), ...(body.expect !== undefined ? { expect: body.expect as StudioLabExpectation } : {}),
+      ...(body.results !== undefined ? { results: body.results as Array<{ toolName: string; args: unknown; output: unknown }> } : {}),
+      ...(body.answers !== undefined ? { answers: body.answers as Array<{ toolName: string; args: unknown; output: unknown }> } : {}),
+    };
+    if (Object.keys(edit).length === 0) return c.json({ error: 'nothing to change: title, expect, results or answers' }, 400);
+    const agent = c.req.param('agent'), id = c.req.param('id');
+    try {
+      const s = await opts.lab.updateScenario(reader, agent, id, edit);
+      if (s === undefined) return c.json({ error: `no scenario '${id}' for agent '${agent}'` }, 404);
+      await audit(c, 'lab.scenario-edit', agent, { scenario: id, changed: Object.keys(edit) });
+      return c.json(s);
+    } catch (e) { if (e instanceof RangeError) return c.json(labRefusal(e), 422); throw e; }
+  });
+  app.delete('/lab/saved-scenarios/:agent/:id', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.deleteScenario) return c.json(SCENARIOS_OFF, 501);
+    const agent = c.req.param('agent'), id = c.req.param('id');
+    if (!(await opts.lab.deleteScenario(reader, agent, id))) return c.json({ error: `no scenario '${id}' for agent '${agent}'` }, 404);
+    await audit(c, 'lab.scenario-delete', agent, { scenario: id });
+    return c.json({ deleted: id });
+  });
+  app.post('/lab/saved-scenarios/run', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.runScenarios) return c.json(SCENARIOS_OFF, 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as Record<string, unknown>;
+    if (typeof body.agent !== 'string' || !body.agent) return c.json({ error: 'agent is required' }, 400);
+    const { models } = await opts.lab.catalog();
+    if (typeof body.model !== 'string' || !models.includes(body.model)) return c.json({ error: 'model must be one the lab offers' }, 400);
+    const trials = body.trials === undefined ? 3 : bodyInt(body.trials, 1, MAX_LAB_TRIALS);
+    if (trials === undefined) return c.json({ error: `trials must be an integer from 1 to ${MAX_LAB_TRIALS}` }, 400);
+    if (body.ids !== undefined && !(Array.isArray(body.ids) && body.ids.every((x) => typeof x === 'string'))) return c.json({ error: 'ids must be a list of scenario ids' }, 400);
+    const req = { agent: body.agent, model: body.model, trials, ...(Array.isArray(body.ids) && body.ids.length ? { ids: body.ids as string[] } : {}) };
+    await audit(c, 'lab.scenario-run', req.agent, { model: req.model, trials, ids: req.ids?.length ?? 'all' });
+    // Not kept: a play's failures quote the calls it made, and those carry the people's data — a record at
+    // the organization's level would outlive their erasure. The scenarios themselves are what is kept.
+    return labResponse(c, (control) => opts.lab!.runScenarios!(reader, req, control), null);
+  });
+
+  // The playground: an agent written on the page, talked to and measured. The definition and the
+  // conversation come with every request and are kept nowhere; a play calls a model, so it takes 'write'
+  // and is audited by how many tools and messages, never what they say.
+  const PLAYGROUND_OFF = { error: "this lab has no playground (its host's lab has no play)" };
+  const MAX_PLAYGROUND_TOOLS = 30, MAX_PLAYGROUND_MESSAGES = 200;
+  /** A playground definition checked by shape (the lab checks names and schemas). */
+  const isPlaygroundAgent = (x: unknown): x is StudioPlaygroundAgent => {
+    if (typeof x !== 'object' || x === null || Array.isArray(x)) return false;
+    const a = x as Record<string, unknown>;
+    return typeof a.system === 'string' && Array.isArray(a.tools) && a.tools.length <= MAX_PLAYGROUND_TOOLS && a.tools.every((t) => {
+      if (typeof t !== 'object' || t === null) return false;
+      const o = t as Record<string, unknown>;
+      return typeof o.name === 'string' && typeof o.description === 'string' && typeof o.parameters === 'object' && o.parameters !== null
+        && (o.answers === undefined || (Array.isArray(o.answers) && o.answers.every((r) => typeof r === 'object' && r !== null && 'args' in r && 'output' in r)))
+        && (o.otherwise === undefined || (typeof o.otherwise === 'object' && o.otherwise !== null && 'output' in o.otherwise));
+    });
+  };
+  const isConversation = (x: unknown): x is unknown[] => Array.isArray(x) && x.length > 0 && x.length <= MAX_PLAYGROUND_MESSAGES
+    && x.every((m) => typeof m === 'object' && m !== null && ['user', 'assistant', 'tool'].includes((m as { role?: unknown }).role as string) && 'content' in m)
+    && (x.at(-1) as { role?: unknown }).role === 'user';
+  /** The model, agent and conversation of a playground request, checked; a Response when not usable. */
+  async function playgroundRequest(c: Context, body: Record<string, unknown>) {
+    const { models } = await opts.lab!.catalog();
+    if (typeof body.model !== 'string' || !models.includes(body.model)) return c.json({ error: 'model must be one the lab offers' }, 400);
+    if (!isPlaygroundAgent(body.agent)) return c.json({ error: `agent must be { system, tools: [{ name, description, parameters, answers?, otherwise? }] }, at most ${MAX_PLAYGROUND_TOOLS} tools` }, 400);
+    if (!isConversation(body.messages)) return c.json({ error: `messages must be 1 to ${MAX_PLAYGROUND_MESSAGES} messages ({ role, content }) ending with the user's` }, 400);
+    return { model: body.model, agent: body.agent, messages: body.messages };
+  }
+  app.get('/lab/playground/base', async (c) => {
+    if (!(await allowP(c.req.raw, 'catalog:read'))) return deny(c.req.raw, 'read');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.playgroundBase) return c.json(PLAYGROUND_OFF, 501);
+    const agent = c.req.query('agent');
+    if (!agent) return c.json({ error: 'agent is required' }, 400);
+    try { return c.json(await opts.lab.playgroundBase(agent)); }
+    catch (e) { if (e instanceof RangeError) return c.json(labRefusal(e), 422); throw e; }
+  });
+  app.post('/lab/playground/play', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.play) return c.json(PLAYGROUND_OFF, 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const req = await playgroundRequest(c, parsedBody.value as Record<string, unknown>);
+    if (req instanceof Response) return req;
+    await audit(c, 'lab.playground', 'play', { model: req.model, tools: req.agent.tools.length, messages: req.messages.length });
+    try { return c.json(await opts.lab.play(req)); }
+    catch (e) { const status = labErrorStatus(e); if (status !== 500) return c.json(labRefusal(e as Error), status); throw e; }
+  });
+  app.post('/lab/playground/measure', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.measure) return c.json(PLAYGROUND_OFF, 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as Record<string, unknown>;
+    const req = await playgroundRequest(c, body);
+    if (req instanceof Response) return req;
+    if (!isExpectation(body.expect) || Object.keys(body.expect as object).length === 0) return c.json({ error: 'expect is required: what a right answer does' }, 400);
+    const trials = body.trials === undefined ? 5 : bodyInt(body.trials, 1, MAX_LAB_TRIALS);
+    if (trials === undefined) return c.json({ error: `trials must be an integer from 1 to ${MAX_LAB_TRIALS}` }, 400);
+    if (body.compareTo !== undefined && !isPlaygroundAgent(body.compareTo)) return c.json({ error: 'compareTo must be an agent like `agent`' }, 400);
+    const full = { ...req, expect: body.expect as StudioLabExpectation, trials, ...(body.compareTo ? { compareTo: body.compareTo as StudioPlaygroundAgent } : {}) };
+    await audit(c, 'lab.playground', 'measure', { model: req.model, tools: req.agent.tools.length, messages: req.messages.length, trials, compared: !!full.compareTo });
+    // Not kept: the definition and the conversation are the page's.
+    return labResponse(c, (control) => opts.lab!.measure!(full, control), null);
+  });
+  app.post('/lab/playground/scenario', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.savePlaygroundScenario) return c.json(SCENARIOS_OFF, 501);
+    if (!writable) return c.json({ error: 'scenarios need a writable journal' }, 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as Record<string, unknown>;
+    if (typeof body.agent !== 'string' || !body.agent) return c.json({ error: "agent is required: the playground agent's name, the scenario is kept under it" }, 400);
+    if (typeof body.title !== 'string' || !body.title.trim() || body.title.length > MAX_SCENARIO_TITLE) return c.json({ error: `title must be text of 1 to ${MAX_SCENARIO_TITLE} characters` }, 400);
+    if (!isPlaygroundAgent(body.definition)) return c.json({ error: 'definition must be the playground agent' }, 400);
+    if (!isConversation(body.messages)) return c.json({ error: "messages must be the conversation, ending with the user's message" }, 400);
+    if (!isExpectation(body.expect) || Object.keys(body.expect as object).length === 0) return c.json({ error: 'expect is required: what a right answer does' }, 400);
+    try {
+      const s = await opts.lab.savePlaygroundScenario(reader, { agent: body.agent, title: body.title, definition: body.definition, messages: body.messages, expect: body.expect as StudioLabExpectation }, actorOf(c));
+      await audit(c, 'lab.scenario-save', s.agent, { from: 'playground', scenario: s.id, title: body.title });
+      return c.json(s, 201);
+    } catch (e) { if (e instanceof RangeError) return c.json(labRefusal(e), 422); throw e; }
+  });
+
+  app.post('/lab/playground/scenarios/run', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.runPlaygroundScenarios) return c.json(PLAYGROUND_OFF, 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as Record<string, unknown>;
+    if (typeof body.agent !== 'string' || !body.agent) return c.json({ error: "agent is required: the playground agent's name" }, 400);
+    if (!isPlaygroundAgent(body.definition)) return c.json({ error: 'definition must be the playground agent' }, 400);
+    const { models } = await opts.lab.catalog();
+    if (typeof body.model !== 'string' || !models.includes(body.model)) return c.json({ error: 'model must be one the lab offers' }, 400);
+    const trials = body.trials === undefined ? 3 : bodyInt(body.trials, 1, MAX_LAB_TRIALS);
+    if (trials === undefined) return c.json({ error: `trials must be an integer from 1 to ${MAX_LAB_TRIALS}` }, 400);
+    if (body.ids !== undefined && !(Array.isArray(body.ids) && body.ids.every((x) => typeof x === 'string'))) return c.json({ error: 'ids must be a list of scenario ids' }, 400);
+    const req = { agent: body.agent, definition: body.definition, model: body.model, trials, ...(Array.isArray(body.ids) && body.ids.length ? { ids: body.ids as string[] } : {}) };
+    await audit(c, 'lab.scenario-run', req.agent, { from: 'playground', model: req.model, trials, tools: req.definition.tools.length, ids: req.ids?.length ?? 'all' });
+    // Not kept, as a play of the agent's scenarios is not: its failures quote the calls made.
+    return labResponse(c, (control) => opts.lab!.runPlaygroundScenarios!(reader, req, control), null);
+  });
+
+  // A new agent's best form: built from the agent's code and a scenario set with fake tools — no journal
+  // is read, so these routes are the same for every organization. Trying the forms calls a model many
+  // times: 'write', validated, audited.
+  const MAX_FORM_TRIALS = 5;
+  /** The agent, model, trials and scenarios of a best-form request, checked; a Response when not usable. */
+  const MAX_FORM_TOOLS = 5;
+  /** The agent, model, trials, scenarios and tools of a best-form request, checked; a Response when not usable. */
+  async function formRequest(c: Context, src: { agent?: unknown; model?: unknown; trials?: unknown; scenarios?: unknown; withoutTools?: unknown; addTools?: unknown }, needModel: boolean) {
+    const { agents, models } = await opts.lab!.catalog();
+    if (typeof src.agent !== 'string' || !agents.includes(src.agent)) return c.json({ error: 'agent must be one the lab offers' }, 400);
+    if (needModel && (typeof src.model !== 'string' || !models.includes(src.model))) return c.json({ error: 'model must be one the lab offers' }, 400);
+    const trials = src.trials === undefined || src.trials === '' ? 2 : Number(src.trials);
+    if (!Number.isInteger(trials) || trials < 1 || trials > MAX_FORM_TRIALS) return c.json({ error: `trials must be an integer from 1 to ${MAX_FORM_TRIALS}` }, 400);
+    const list = (x: unknown) => (typeof x === 'string' ? x.split(',').filter(Boolean) : x === undefined ? [] : x);
+    const scenarios = list(src.scenarios);
+    if (!Array.isArray(scenarios) || scenarios.some((x) => typeof x !== 'string')) return c.json({ error: 'scenarios must be a list of scenario ids' }, 400);
+    const withoutTools = list(src.withoutTools);
+    if (!Array.isArray(withoutTools) || withoutTools.some((x) => typeof x !== 'string') || withoutTools.length > MAX_FORM_TOOLS) return c.json({ error: `withoutTools must be a list of at most ${MAX_FORM_TOOLS} tool names` }, 400);
+    // On the plan (a GET) the added tools come as JSON in the query.
+    let addTools: unknown = src.addTools;
+    if (typeof addTools === 'string') { try { addTools = JSON.parse(addTools); } catch { return c.json({ error: 'addTools must be JSON' }, 400); } }
+    const isObj = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x);
+    if (addTools !== undefined && !(Array.isArray(addTools) && addTools.length <= MAX_FORM_TOOLS && addTools.every((t) => isObj(t) && typeof t.name === 'string' && /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(t.name) && typeof t.description === 'string' && isObj(t.parameters) && 'output' in t)))
+      return c.json({ error: `addTools must be a list of at most ${MAX_FORM_TOOLS} { name, description, parameters (a JSON Schema object), output }` }, 400);
+    return {
+      agent: src.agent, model: src.model as string, trials, scenarios: scenarios as string[],
+      ...(withoutTools.length ? { withoutTools: withoutTools as string[] } : {}),
+      ...(Array.isArray(addTools) && addTools.length ? { addTools: addTools as NonNullable<StudioLabFormRequest['addTools']> } : {}),
+    };
+  }
+  app.get('/lab/scenarios', async (c) => {
+    if (!(await allowP(c.req.raw, 'catalog:read'))) return deny(c.req.raw, 'read');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    const req = await formRequest(c, { agent: c.req.query('agent') }, false);
+    if (req instanceof Response) return req;
+    return c.json({ items: await opts.lab.scenarios(req.agent) });
+  });
+  app.get('/lab/form-plan', async (c) => {
+    if (!(await allowP(c.req.raw, 'catalog:read'))) return deny(c.req.raw, 'read');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    const req = await formRequest(c, { agent: c.req.query('agent'), trials: c.req.query('trials'), scenarios: c.req.query('scenarios'), withoutTools: c.req.query('withoutTools'), addTools: c.req.query('addTools') }, false);
+    if (req instanceof Response) return req;
+    const { model: _, ...plan } = req;
+    try { return c.json(await opts.lab.formPlan(plan)); }
+    catch (e) { if (e instanceof RangeError) return c.json(labRefusal(e), 422); throw e; }
+  });
+  app.post('/lab/best-form', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const req = await formRequest(c, parsedBody.value as Record<string, unknown>, true);
+    if (req instanceof Response) return req;
+    await audit(c, 'lab.best-form', req.agent, { ...req, ...(req.addTools ? { addTools: req.addTools.map((t) => t.name) } : {}) });
+    return labResponse(c, (control) => opts.lab!.bestForm(req, control), { kind: 'best-form', target: req.agent, request: req });
+  });
+
+  // "Would removing this section change what the agent does?" and "which words decided it?" — on a run,
+  // through `reader`. The plans call no model ('runs:read'). The checks call one many times ('write'),
+  // validated and audited; neither is kept: a prune's prompts and a word's text are the person's own words.
+  const MAX_PRUNE_PROMPTS = 10, MAX_PROMPT_CHARS = 4_000, MAX_PRUNE_TRIALS = 45, MAX_WORDS = 10, MAX_WORD_CHARS = 500, MAX_SAMPLES = 20;
+  const LAB_PART_OFF = (what: string) => ({ error: `this lab does not offer ${what}` });
+  /** A whole number in [1, max], or the default when absent; a Response when not. */
+  function whole(c: Context, x: unknown, name: string, fallback: number, max: number): number | Response {
+    const n = x === undefined || x === '' ? fallback : Number(x);
+    return Number.isInteger(n) && n >= 1 && n <= max ? n : c.json({ error: `${name} must be an integer from 1 to ${max}` }, 400);
+  }
+  function wordsOk(x: unknown): x is string[] {
+    return Array.isArray(x) && x.length >= 1 && x.length <= MAX_WORDS && x.every((w) => typeof w === 'string' && w.trim() !== '' && w.length <= MAX_WORD_CHARS);
+  }
+  app.get('/lab/prune-plan', async (c) => {
+    if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.prunePlan) return c.json(LAB_PART_OFF('removing a section'), 501);
+    const req = await labRequest(c, { runId: c.req.query('runId'), model: c.req.query('model') });
+    if (req instanceof Response) return req;
+    const prompts = whole(c, c.req.query('prompts'), 'prompts', 1, MAX_PRUNE_PROMPTS); if (prompts instanceof Response) return prompts;
+    const trials = whole(c, c.req.query('trials'), 'trials', 10, MAX_PRUNE_TRIALS); if (trials instanceof Response) return trials;
+    try { return c.json(await opts.lab.prunePlan(reader, { runId: req.runId, model: req.model, prompts, trials, control: c.req.query('control') === '1' })); }
+    catch (e) { if (e instanceof RangeError) return c.json(labRefusal(e), 422); throw e; }
+  });
+  app.post('/lab/prune', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.prune) return c.json(LAB_PART_OFF('removing a section'), 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as Record<string, unknown>;
+    const req = await labRequest(c, { runId: body.runId, model: body.model });
+    if (req instanceof Response) return req;
+    const trials = whole(c, body.trials, 'trials', 10, MAX_PRUNE_TRIALS); if (trials instanceof Response) return trials;
+    const { remove, control, prompts, answers, otherwise } = body;
+    if (typeof remove !== 'string' || !remove) return c.json({ error: 'remove must name a section' }, 400);
+    if (control !== undefined && (typeof control !== 'string' || !control || control === remove)) return c.json({ error: 'control must name another section' }, 400);
+    if (!(Array.isArray(prompts) && prompts.length >= 1 && prompts.length <= MAX_PRUNE_PROMPTS && prompts.every((p) => typeof p === 'string' && p.trim() !== '' && p.length <= MAX_PROMPT_CHARS)))
+      return c.json({ error: `prompts must be 1 to ${MAX_PRUNE_PROMPTS} messages of at most ${MAX_PROMPT_CHARS} characters` }, 400);
+    if (answers !== undefined && !isToolResults(answers)) return c.json({ error: 'answers must be a list of { toolName, args, output }' }, 400);
+    if (otherwise !== undefined && (typeof otherwise !== 'object' || otherwise === null || Array.isArray(otherwise))) return c.json({ error: 'otherwise must be an object of tool name → output' }, 400);
+    const prune: StudioLabPruneRequest = {
+      runId: req.runId, model: req.model, remove, prompts: prompts as string[], trials,
+      ...(control !== undefined ? { control: control as string } : {}),
+      ...(answers !== undefined ? { answers: answers as StudioLabPruneRequest['answers'] } : {}),
+      ...(otherwise !== undefined ? { otherwise: otherwise as Record<string, unknown> } : {}),
+    };
+    await audit(c, 'lab.prune', req.runId, { runId: req.runId, model: req.model, remove, control: control ?? null, prompts: prune.prompts.length, trials, answers: Array.isArray(answers) ? answers.length : 0 });
+    return labResponse(c, (ctl) => opts.lab!.prune!(reader, prune, ctl), null);
+  });
+  app.get('/lab/words-plan', async (c) => {
+    if (!(await allowP(c.req.raw, 'runs:read'))) return deny(c.req.raw, 'read');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.wordsPlan) return c.json(LAB_PART_OFF('which words decided'), 501);
+    const req = await labRequest(c, { runId: c.req.query('runId'), model: c.req.query('model') });
+    if (req instanceof Response) return req;
+    const samples = whole(c, c.req.query('samples'), 'samples', 5, MAX_SAMPLES); if (samples instanceof Response) return samples;
+    let words: unknown;
+    const raw = c.req.query('words');
+    if (raw !== undefined && raw !== '') { try { words = JSON.parse(raw); } catch { return c.json({ error: 'words must be JSON' }, 400); } if (!wordsOk(words)) return c.json({ error: `words must be 1 to ${MAX_WORDS} groups of at most ${MAX_WORD_CHARS} characters` }, 400); }
+    try { return c.json(await opts.lab.wordsPlan(reader, { runId: req.runId, model: req.model, samples, ...(words ? { words: words as string[] } : {}) })); }
+    catch (e) { if (e instanceof RangeError) return c.json(labRefusal(e), 422); throw e; }
+  });
+  app.post('/lab/words', async (c) => {
+    if (!(await allow(c.req.raw, 'write'))) return deny(c.req.raw, 'write');
+    if (!opts.lab) return c.json(LAB_OFF, 501);
+    if (!opts.lab.words) return c.json(LAB_PART_OFF('which words decided'), 501);
+    const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
+    const body = parsedBody.value as Record<string, unknown>;
+    const req = await labRequest(c, { runId: body.runId, model: body.model });
+    if (req instanceof Response) return req;
+    const samples = whole(c, body.samples, 'samples', 5, MAX_SAMPLES); if (samples instanceof Response) return samples;
+    if (typeof body.tool !== 'string' || !body.tool) return c.json({ error: 'tool must name the tool whose choice is explained' }, 400);
+    if (!wordsOk(body.words)) return c.json({ error: `words must be 1 to ${MAX_WORDS} groups of at most ${MAX_WORD_CHARS} characters` }, 400);
+    const words = { runId: req.runId, model: req.model, tool: body.tool, words: body.words, samples };
+    // The words are the person's message: the audit says how many, not which.
+    await audit(c, 'lab.words', req.runId, { runId: req.runId, model: req.model, tool: body.tool, words: body.words.length, samples });
+    return labResponse(c, (ctl) => opts.lab!.words!(reader, words, ctl), null);
   });
 
   // Retention sweep: PERMANENTLY clean up old runs per the policy (or the request body).

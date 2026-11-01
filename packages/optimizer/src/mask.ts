@@ -51,7 +51,7 @@ export function maskMessages(messages: readonly Msg[], opts: MaskOldToolOutputsO
  * the model's context.
  */
 export function maskOldToolOutputs(opts: MaskOldToolOutputsOptions = {}): Processor & {
-  prepareStep: (step: { messages: Msg[] }) => { messages: Msg[] } | undefined;
+  prepareStep: (step: { messages: Msg[]; initialMessages?: Msg[]; responseMessages?: Msg[] }) => { messages: Msg[] } | undefined;
 } {
   refuseUnknownNames('maskOldToolOutputs', opts, MASK_NAMES);
   const run = (step: { messages: Msg[] }) => {
@@ -61,6 +61,13 @@ export function maskOldToolOutputs(opts: MaskOldToolOutputsOptions = {}): Proces
   return {
     name: `mask-old-tool-outputs:${opts.keepLast ?? 2}:${opts.minChars ?? 200}`,
     processInputStep: (step: ProcessorStepInput) => run(step as never) as never,
-    prepareStep: run,
+    // ai@7 hands a step the messages the previous prepareStep returned. Masking those would freeze each
+    // note at the step it was written and never see the original output again, so the conversation is
+    // rebuilt from what the SDK keeps apart — the input and what the steps produced — and masked whole.
+    prepareStep: (step) => {
+      if (!step.initialMessages || !step.responseMessages) return run(step);
+      const conversation = [...step.initialMessages, ...step.responseMessages];
+      return { messages: maskMessages(conversation, opts) ?? conversation };
+    },
   };
 }

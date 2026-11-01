@@ -65,7 +65,6 @@ export function openapiSpec(apiBase = '') {
       '/runs/{id}/resume': P('post', 'Approval → resume', idParam, true),
       '/runs/{id}/cancel': P('post', 'Durably cancel a run (cross-worker flag, checked at the next model step)', idParam),
       '/runs/{id}/compensate': P('post', "Unwind an abandoned run's side effects (saga compensation); dryRun previews only", idParam, true),
-      '/runs/{id}/regression': P('post', 'Replay a run with a new model/system + decision-point diff', idParam, true),
       '/runs/{id}/otel-export': P('post', 'Export a run trace to the host-configured OTLP target', idParam),
       '/runs/{id}/score': P('post', 'Score a run with scorers', idParam, true),
       '/approvals': P('get', 'Pending tool approvals across all suspended runs (inbox)'),

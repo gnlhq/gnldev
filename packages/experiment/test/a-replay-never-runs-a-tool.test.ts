@@ -139,4 +139,26 @@ describe('a counterfactual replay never runs a tool', () => {
     await expect(replayCounterfactual({ journal, runId: 'r1', model: planned('small-model', [{ text: 'x' }]), maxStep: 3 } as any))
       .rejects.toThrow(/maxStep/);
   });
+
+  it("a call the recording never made: without an answer it stops and says the arguments; with one it goes on, marked as the caller's", async () => {
+    const { journal, executed, trap } = await recordedRun();
+    const plan: Plan = [{ toolName: 'lookup', args: { orderId: '42' } }, { toolName: 'refund', args: { orderId: '42', amount: 15 } }, { text: 'Half of order 42 refunded.' }];
+    const stopped = await replayCounterfactual({ journal, runId: 'r1', tools: trap as any, model: planned('small-model', plan) });
+    expect(stopped.divergence).toMatchObject({ at: 1, call: { toolName: 'refund' }, args: { orderId: '42', amount: 15 } });
+    expect(stopped.trace).toEqual([
+      { toolName: 'lookup', args: { orderId: '42' }, source: 'recorded' },
+      { toolName: 'refund', args: { orderId: '42', amount: 15 }, source: 'none' },
+    ]);
+    expect(stopped.recordedTrace).toEqual([{ toolName: 'lookup', args: { orderId: '42' } }, { toolName: 'refund', args: { orderId: '42', amount: 30 } }]);
+    const answered = await replayCounterfactual({
+      journal, runId: 'r1', tools: trap as any, model: planned('small-model', plan),
+      answers: [{ toolName: 'refund', args: { amount: 15, orderId: '42' }, output: { refunded: '42', amount: 15 } }], // key order does not matter
+    });
+    expect(answered.divergence).toBeUndefined();
+    expect(answered.trace.map((c) => c.source)).toEqual(['recorded', 'answer']);
+    expect(answered.candidate.text).toBe('Half of order 42 refunded.');
+    expect(answered.reordered).toBe(false); // an answered call is not compared with the recording
+    expect(executed).toEqual({ lookup: 1, refund: 1 });
+  });
 });
+
