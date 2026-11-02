@@ -566,6 +566,41 @@ importers:
         specifier: workspace:*
         version: link:../durable
 
+  packages/experiment:
+    dependencies:
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
+    devDependencies:
+      '@gnldev/durable':
+        specifier: workspace:*
+        version: link:../durable
+      ai:
+        specifier: ^7.0.0
+        version: 7.0.143(zod@3.25.76)
+      zod:
+        specifier: ^3.25.0
+        version: 3.25.76
+
+  packages/lab:
+    dependencies:
+      '@gnldev/experiment':
+        specifier: workspace:^
+        version: link:../experiment
+      '@gnldev/options':
+        specifier: workspace:^
+        version: link:../options
+    devDependencies:
+      '@gnldev/durable':
+        specifier: workspace:*
+        version: link:../durable
+      ai:
+        specifier: ^7.0.0
+        version: 7.0.143(zod@3.25.76)
+      zod:
+        specifier: ^3.25.0
+        version: 3.25.76
+
   packages/mcp:
     dependencies:
       '@gnldev/auth':
@@ -612,6 +647,9 @@ importers:
 
   packages/optimizer:
     dependencies:
+      '@gnldev/experiment':
+        specifier: workspace:^
+        version: link:../experiment
       '@gnldev/options':
         specifier: workspace:^
         version: link:../options
