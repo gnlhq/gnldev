@@ -1,4 +1,5 @@
 import { generateText, streamText, stepCountIs } from 'ai';
+import { randomUUID } from 'node:crypto';
 import type { ToolSchemaRuleLike } from './types.js';
 import type { StreamTextResult } from 'ai';
 import { withDurableModel } from './durable-model.js';
@@ -25,6 +26,7 @@ import type { Guard, Interrupt } from './guard.js';
 import { addressedId } from './guard.js';
 import { PROVENANCE_RECENT_CAP, messagePreview } from './memory.js';
 import type { Memory, MemoryContextProvenance } from './memory.js';
+import { buildMemoryLayout, settleProvenance, rowKey, type LayoutSeed, type MemoryLayout, type SystemSpans } from './memory-layout.js';
 import type { Processor, ProcessorCtx, ProcessorInput, ProcessorOutput } from './processor.js';
 import type { ModelInput, ToolSet } from './types.js';
 import { DuplicateSideEffectError, RunLimitExceededError, TaintedSideEffectError, ToolLoopDetectedError } from './limits.js';
@@ -774,11 +776,34 @@ export function hasRunProbe(journal: Journal, runId: string, claimTtlMs?: number
  * degrades a debugging panel, never the run — but the WRITE is on the run path and not try/caught,
  * matching persistInput (a journal that can't write is a failed run anyway).
  */
-async function persistMemoryContext(journal: Journal, runId: string, prov?: MemoryContextRecord): Promise<void> {
-  if (!prov) return;
+async function persistMemoryContext(journal: Journal, runId: string, prov: MemoryContextRecord | undefined, freezing: boolean): Promise<void> {
+  // Only the attempt that froze `:input` writes it. A later attempt's memory read describes TODAY's
+  // thread, not what the frozen input was built from — measured: recentCount 5 against a 3-row input.
+  // Such a record is no evidence, so none is written; a reader of that run gets `absent`
+  // (readMemoryLayout), and the turn is located by `:input.turn`, which never depended on it.
+  if (!prov || !freezing) return;
   const key = runKeys.memoryContext(runId);
   if ((await journal.get(key)) !== undefined) return;
   await journal.put(key, prov);
+}
+
+/** The turn's locator frozen into `:input` — the same numbers `:memctx` carries, in the same write as the input. */
+function frozenTurnOf(memCtx: MemoryContextRecord | undefined): FrozenTurn | undefined {
+  if (!memCtx) return undefined;
+  const count = memCtx.incomingUnrecoverable ? 0 : memCtx.incomingCount;
+  return { count, ...(memCtx.chainAppended ? { appended: memCtx.chainAppended } : {}), ...(memCtx.layout?.token ? { token: memCtx.layout.token } : {}) };
+}
+
+/**
+ * Write the layout into `:memctx` and settle its counts with what the chain left (memory-layout.ts) —
+ * against `rest` AFTER the chain, the very value persistInput freezes.
+ */
+function settleMemoryContext(memCtx: MemoryContextRecord, seed: LayoutSeed, rest: PreparedInput, lost: boolean, incomingInHistory: boolean): void {
+  const { layout, systemSpans, survivors } = buildMemoryLayout(seed, rest.messages, systemText(rest.system) || undefined, memCtx.incomingCount, lost, incomingInHistory);
+  // The attempt's token, also frozen into `:input.turn`: a reader pairs the two records by it (MemoryLayout.token).
+  memCtx.layout = { ...layout, token: randomUUID() };
+  if (systemSpans) memCtx.systemSpans = systemSpans;
+  settleProvenance(memCtx, seed, survivors);
 }
 
 async function persistInput(
@@ -809,6 +834,10 @@ async function persistInput(
   origin: InputOrigin = 'host',
   // The run that started this one, when it is a child — lets a run list show requests, not sub-agents.
   parentRunId?: string,
+  // Where the turn sits in `messages` (memory runs only). In THIS write, not only in `:memctx`: the
+  // two are separate puts, and a process that died between them left a frozen input whose turn no
+  // re-entry could locate — the answer was stored with no question (memctx-crash-window.test.ts).
+  turn?: FrozenTurn,
 ): Promise<void> {
   const key = runKeys.input(runId); // ':input' doesn't match parseJournalKey → invisible in the reader
   // `alreadyFrozen` is the SAME read, done once by the caller because the frozen-input adoption needs
@@ -839,7 +868,7 @@ async function persistInput(
   // answered). The `...(x ? {x} : {})` spelling is not cosmetic either — every reader here asks
   // `'workKey' in record`, and an explicit `undefined` would turn "this caller never declared a
   // name" into "this caller declared nothing", which are different facts.
-  await journal.put(key, stampFormat({ at: Date.now(), prompt: input.prompt, messages: input.messages, system: input.system, ...(threadId ? { threadId } : {}), ...(agentName ? { agent: agentName } : {}), ...ownerFields(owner), ...(rawInputHash ? { hash: rawInputHash } : {}), ...(actor ? { actor } : {}), ...(work?.workKey ? { workKey: work.workKey } : {}), ...(work?.workScope ? { workScope: work.workScope } : {}), origin, ...(parentRunId ? { parentRunId } : {}) })); // H13
+  await journal.put(key, stampFormat({ at: Date.now(), prompt: input.prompt, messages: input.messages, system: input.system, ...(threadId ? { threadId } : {}), ...(agentName ? { agent: agentName } : {}), ...ownerFields(owner), ...(rawInputHash ? { hash: rawInputHash } : {}), ...(actor ? { actor } : {}), ...(work?.workKey ? { workKey: work.workKey } : {}), ...(work?.workScope ? { workScope: work.workScope } : {}), origin, ...(parentRunId ? { parentRunId } : {}), ...(turn ? { turn } : {}) })); // H13
 }
 
 /** FAZ-6: `limits` is FROZEN to the journal and must stay serializable — the semantic block's
@@ -1338,6 +1367,23 @@ export interface MemoryContextRecord extends MemoryContextProvenance {
    * residual note). Absent when the dedupe did not fire.
    */
   incomingDedupedByShape?: true;
+  /**
+   * Where each part of the FROZEN `:input.messages` came from, as half-open spans (observations /
+   * recall / recent / incoming) — computed by the run after the input chain ran, so it is true to what
+   * was frozen, or says why it cannot be (see MemoryLayout.status). Read it with `readMemoryLayout`:
+   * a record without it reads `absent`, and nothing derives one from the counts.
+   *
+   * When its status is `exact` or `changed`, `recalled`, `recent`, `recentCount` and `observationCount`
+   * above are SETTLED with it (memory-layout.ts settleProvenance): they describe what the model was
+   * sent, rows an input processor removed are counted in `layout.droppedByChain`, and
+   * `observations + recalled + recentCount + foreign + ambiguous + incomingCount === layout.n` — a check
+   * that holds by construction and so proves nothing about the labels (an alignment that called every
+   * row foreign would pass it); `unresolved` exists so that case is never written as `changed`. Under every other
+   * status they are memory's own report, taken before the input processors ran.
+   */
+  layout?: MemoryLayout;
+  /** Where memory's system text (working memory) sits inside the frozen `:input.system`. */
+  systemSpans?: SystemSpans;
 }
 
 /**
@@ -1429,7 +1475,7 @@ async function prepareMemoryContext(
   resourceId: string | undefined,
   rest: PreparedInput,
   echoView?: (rows: any[], system?: unknown) => Promise<any[]>,
-): Promise<{ incoming: any[]; wmTool?: Record<string, any>; alreadyStored: boolean; provenance?: MemoryContextRecord; historyCount: number; adoptedResourceId?: string }> {
+): Promise<{ incoming: any[]; wmTool?: Record<string, any>; alreadyStored: boolean; provenance?: MemoryContextRecord; historyCount: number; adoptedResourceId?: string; layoutSeed?: LayoutSeed }> {
   const rawIncoming: any[] = rest.messages ?? (rest.prompt != null ? [{ role: 'user', content: rest.prompt }] : []);
   delete rest.prompt;
   const echoSystem = rest.system;
@@ -1458,7 +1504,15 @@ async function prepareMemoryContext(
     // would see the user message twice and writeAheadIncoming would store it twice.
     const alreadyStored = historyEndsWithIncoming(history, incoming);
     rest.messages = alreadyStored ? [...history] : [...history, ...incoming];
-    if (mc.system) rest.system = [systemText(rest.system), mc.system].filter(Boolean).join('\n\n');
+    const sysPrefix = systemText(rest.system);
+    if (mc.system) rest.system = [sysPrefix, mc.system].filter(Boolean).join('\n\n');
+    const layoutSeed: LayoutSeed = {
+      observations: (mc.provenance?.observationCount ?? 0) > 0 ? 1 : 0,
+      recalled: mc.provenance?.recalled?.length ?? 0,
+      recent: mc.provenance?.recentCount ?? history.length,
+      history,
+      ...(mc.system ? { wm: { text: mc.system, prefix: sysPrefix } } : {}),
+    };
     const provenance: MemoryContextRecord = {
       v: 1, threadId,
       recalled: mc.provenance?.recalled ?? [],
@@ -1471,7 +1525,7 @@ async function prepareMemoryContext(
     };
     // `historyCount` is the history/incoming BOUNDARY inside `rest.messages` — see
     // reconcileProcessedIncoming for why the split has to be recoverable after the input processors ran.
-    return { incoming, wmTool: mc.tools, alreadyStored, provenance, historyCount: history.length, ...(rid ? { adoptedResourceId: rid } : {}) };
+    return { incoming, wmTool: mc.tools, alreadyStored, provenance, historyCount: history.length, layoutSeed, ...(rid ? { adoptedResourceId: rid } : {}) };
   }
   // Legacy path (BasicMemory / SemanticMemory) — provenance is the limited truth this path can see:
   // everything loaded counts as the recent window (no recall refs, no OM).
@@ -1480,13 +1534,17 @@ async function prepareMemoryContext(
   const alreadyStored = historyEndsWithIncoming(history, incoming);
   rest.messages = alreadyStored ? [...history] : [...history, ...incoming];
   let wmChars: number | undefined;
+  let wmSeed: LayoutSeed['wm'];
   if (memory.getWorkingMemory) {
     const wm = await memory.getWorkingMemory(threadId);
     if (wm) {
-      rest.system = [systemText(rest.system), `# Working Memory\n${wm}`].filter(Boolean).join('\n\n');
+      const text = `# Working Memory\n${wm}`;
+      wmSeed = { text, prefix: systemText(rest.system) };
+      rest.system = [wmSeed.prefix, text].filter(Boolean).join('\n\n');
       wmChars = String(wm).length;
     }
   }
+  const layoutSeed: LayoutSeed = { observations: 0, recalled: 0, recent: history.length, history, ...(wmSeed ? { wm: wmSeed } : {}) };
   // Legacy refs: plain message objects (no store seq) — seq is the array index; preview via the
   // SHARED messagePreview (memory.ts) so tool-call/tool-result rows read structurally, not as "—".
   const provenance: MemoryContextRecord = {
@@ -1498,7 +1556,7 @@ async function prepareMemoryContext(
     incomingCount: incoming.length,
     echoTrimmed: rawIncoming.length - incoming.length,
   };
-  return { incoming, alreadyStored, provenance, historyCount: history.length, ...(rid ? { adoptedResourceId: rid } : {}) };
+  return { incoming, alreadyStored, provenance, historyCount: history.length, layoutSeed, ...(rid ? { adoptedResourceId: rid } : {}) };
 }
 
 /**
@@ -1613,7 +1671,13 @@ const PROMPT_IS_TURN = -2;
  *  `resourceId` was always WRITTEN here (see persistInput) and simply never listed — the type
  *  described the fields the replay path read. The derived-run ownership gate reads it, so it is spelled
  *  out now rather than reached for through a cast. */
-type FrozenInput = { prompt?: unknown; messages?: unknown; system?: unknown; threadId?: string; resourceId?: string; hash?: string; actor?: string; workKey?: string; workScope?: WorkScope; origin?: InputOrigin };
+type FrozenInput = { prompt?: unknown; messages?: unknown; system?: unknown; threadId?: string; resourceId?: string; hash?: string; actor?: string; workKey?: string; workScope?: WorkScope; origin?: InputOrigin; turn?: FrozenTurn };
+/**
+ * Where this turn sits in the frozen `messages`: its trailing `count` rows, the last `appended` of them
+ * input-processor output behind it. Frozen WITH the input, in the same write, because a re-entry needs
+ * it to persist the question — see adoptFrozenInput.
+ */
+type FrozenTurn = { count: number; appended?: number; token?: string };
 
 /**
  * NOT EVERY `:input` IS A FROZEN AGENT INPUT.
@@ -1950,16 +2014,18 @@ function historyInside(before: any[], after: any[], span: IncomingSpan): boolean
  *
  * LOCATING THE TURN INSIDE THE FROZEN ARRAY. The evidence ladders cannot help: they carry a boundary
  * across ONE transform, and here the transform (the whole chain, on a possibly different history) ran
- * in another process, another day. `:memctx` is the record of exactly that — written next to `:input`,
- * first-attempt-wins for the same reason, and defined as "`incomingCount` trailing rows of the frozen
- * input are this turn, `chainAppended` of them are the chain's". That is a promise the frozen input
- * already makes to regression.ts's `stripMemoryContext`; reading it here is using it, not extending it.
+ * in another process, another day. The frozen input's own `turn` is the record of exactly that —
+ * written IN THE SAME PUT as the input, and defined as "`count` trailing rows of the frozen input are
+ * this turn, `appended` of them are the chain's" (the same numbers `:memctx` carries as
+ * `incomingCount`/`chainAppended`, which regression.ts's `stripMemoryContext` reads).
  *
- * When it is absent or already says the turn was unrecoverable, the honest answer is BOUNDARY_LOST —
- * stamped and warned by reportIncomingLoss — and NOT the caller's raw array. That window is narrow by
- * construction (`persistInput` then `persistMemoryContext`, back to back), and deliberately not closed
- * by writing `:memctx` first: `:memctx` would then be able to outlive an `:input` that never landed,
- * and describe a memory context the frozen input does not have.
+ * It used to be read from `:memctx` alone, the SECOND of two separate puts. A process that died between
+ * them left an input no re-entry could locate the turn in: BOUNDARY_LOST, and the thread got the
+ * answer with no question — 4 of 4 re-entry shapes (memctx-crash-window.test.ts). Writing `:memctx`
+ * first was rejected, as before: it could then outlive an `:input` that never landed. `:memctx` is now
+ * read only for an input frozen before `turn` existed. When neither says where the turn is, or the one
+ * that does says it was unrecoverable, the honest answer is still BOUNDARY_LOST — stamped and warned
+ * by reportIncomingLoss — and NOT the caller's raw array.
  *
  * THE FROZEN INPUT BELONGS TO ONE THREAD, and that has to be checked rather than assumed — this
  * function hands the model a whole conversation, so getting it wrong is a cross-conversation leak
@@ -2004,11 +2070,14 @@ async function adoptFrozenInput(
     // no memory attached — and then `prompt` IS the turn, whole and POST-chain (masked), because that
     // is the very thing prepareMemoryContext turns into `[{role:'user', content: prompt}]`. Reporting
     // a loss there stored an answer with no question while a usable copy sat in the frozen input.
-    return rec === undefined && rest.prompt != null ? { start: PROMPT_IS_TURN, end: PROMPT_IS_TURN } : span;
+    return rec === undefined && frozen.turn === undefined && rest.prompt != null ? { start: PROMPT_IS_TURN, end: PROMPT_IS_TURN } : span;
   }
   const len = rest.messages.length;
-  const count = rec && !rec.incomingUnrecoverable ? rec.incomingCount : 0;
-  const appended = rec?.chainAppended ?? 0;
+  // The locator frozen WITH the input wins; `:memctx` is the second, separate write (a crash can fall
+  // between the two) and is read only for an input frozen before the locator existed.
+  const loc: FrozenTurn | undefined = frozen.turn ?? (rec ? { count: rec.incomingUnrecoverable ? 0 : rec.incomingCount, ...(rec.chainAppended ? { appended: rec.chainAppended } : {}) } : undefined);
+  const count = loc?.count ?? 0;
+  const appended = loc?.appended ?? 0;
   if (!(count > appended) || count > len) return { start: BOUNDARY_LOST, end: BOUNDARY_LOST };
   return { start: len - count, end: len - appended };
 }
@@ -3068,6 +3137,8 @@ async function runDurableInner(args: RunDurableArgs, admission: Admission, erasu
   let wmTool: Record<string, any> | undefined; // Phase 14: rich memory's updateWorkingMemory tool
   let incomingStored = false; // retry dedupe — see prepareMemoryContext/writeAheadIncoming
   let memCtx: MemoryContextRecord | undefined; // ':memctx' provenance — frozen next to ':input' below
+  let layoutSeed: LayoutSeed | undefined; // what memory returned, pre-chain — the layout's evidence
+  let layoutLost = false;
   let historyCount = 0; // where the loaded history ends inside rest.messages — see reconcileProcessedIncoming
   // Özne beyan edilmediğinde belleğin BENİMSEDİĞİ thread sahibi — `:input`'a o yazılır (aşağıya bak).
   let adoptedResourceId: string | undefined;
@@ -3077,8 +3148,10 @@ async function runDurableInner(args: RunDurableArgs, admission: Admission, erasu
   // away from it.
   if (threadId) warnThreadIgnored(threadId, memory);
   if (memory && threadId) {
-    ({ incoming, wmTool, alreadyStored: incomingStored, provenance: memCtx, historyCount, adoptedResourceId } = await prepareMemoryContext(memory, threadId, resourceId, rest, makeEchoView(processors, journal, runId)));
+    ({ incoming, wmTool, alreadyStored: incomingStored, provenance: memCtx, historyCount, adoptedResourceId, layoutSeed } = await prepareMemoryContext(memory, threadId, resourceId, rest, makeEchoView(processors, journal, runId)));
     loadedHistory = Array.isArray(rest.messages) ? rest.messages.slice(0, historyCount) : [];
+    // Keys taken BEFORE the chain: a processor may rewrite a row in place (see LayoutSeed.keys).
+    if (layoutSeed && processors?.length && frozenInput === undefined) layoutSeed.keys = layoutSeed.history.map(rowKey);
     // F4: same-runId re-entry with interleaved turns — drop the re-concat if the stored copy is visible.
     incomingStored = await dropIncomingIfAppendedEarlier(journal, runId, rest, incoming, incomingStored);
   }
@@ -3095,7 +3168,7 @@ async function runDurableInner(args: RunDurableArgs, admission: Admission, erasu
     const rec = reconcileProcessedIncoming(rest, span, incoming, loadedHistory);
     incoming = rec.incoming;
     incomingStored = rec.alreadyStored;
-    if (rec.lost) reportIncomingLoss(runId, threadId!, memCtx, rec.lost);
+    if (rec.lost) { layoutLost = true; reportIncomingLoss(runId, threadId!, memCtx, rec.lost); }
     else if (memCtx) {
       memCtx.incomingCount = rec.trailing; // the chain may have changed the count — keep `:memctx` true to `:input`
       if (rec.chainAppended) memCtx.chainAppended = rec.chainAppended;
@@ -3110,8 +3183,11 @@ async function runDurableInner(args: RunDurableArgs, admission: Admission, erasu
   // sahipsiz bir koşumda `ownershipDenied` sessiz geçer: sonradan gelen bir çağrı kendi öznesini
   // beyan edip cevabı kurbanın thread'ine yazdırabiliyordu. Belleğin okuduğu sahiple journal'ın
   // yazdığı sahip AYNI olmalı, yoksa iki farklı gerçeklik olur ve kapı yanlış olanı okur.
-  await persistInput(journal, runId, rest, frozenInput !== undefined, threadId, agentName, caller, rawInputHash, actor, { ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}) }, origin, parentOf(args));
-  await persistMemoryContext(journal, runId, memCtx);
+  // The layout is computed against `rest` AFTER the chain — the very value persistInput freezes — and
+  // BEFORE it, so the attempt token it mints rides in `:input.turn` too (persistInput does not touch `rest`).
+  if (memCtx && layoutSeed && frozenInput === undefined) settleMemoryContext(memCtx, layoutSeed, rest, layoutLost, incomingStored);
+  await persistInput(journal, runId, rest, frozenInput !== undefined, threadId, agentName, caller, rawInputHash, actor, { ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}) }, origin, parentOf(args), frozenTurnOf(memCtx));
+  await persistMemoryContext(journal, runId, memCtx, frozenInput === undefined);
   // Freeze `limits` into the journal on the first run (idempotent via `claim` — the FIRST
   // run's limits win, a later resume never overwrites them). resumeRun reads this back when the caller
   // doesn't re-supply `limits`, so a resumed run keeps its cost cap / loop / duplicate / taint gates.
@@ -3578,14 +3654,18 @@ async function streamDurableHeld(args: StreamDurableArgs, run: StreamRun): Promi
   let wmTool: Record<string, any> | undefined;
   let incomingStored = false; // retry dedupe — see prepareMemoryContext/writeAheadIncoming
   let memCtx: MemoryContextRecord | undefined; // ':memctx' provenance — parity with runDurableInner
+  let layoutSeed: LayoutSeed | undefined; // parity with runDurableInner
+  let layoutLost = false;
   let historyCount = 0;
   // runDurableInner ile parite: benimsenen thread sahibi `:input`'a yazılır.
   let adoptedResourceId: string | undefined;
   let loadedHistory: any[] = []; // parity with runDurableInner — the dedupe's second witness
   if (threadId) warnThreadIgnored(threadId, memory); // parity with runDurableInner
   if (memory && threadId) {
-    ({ incoming, wmTool, alreadyStored: incomingStored, provenance: memCtx, historyCount, adoptedResourceId } = await prepareMemoryContext(memory, threadId, resourceId, rest, makeEchoView(processors, journal, runId)));
+    ({ incoming, wmTool, alreadyStored: incomingStored, provenance: memCtx, historyCount, adoptedResourceId, layoutSeed } = await prepareMemoryContext(memory, threadId, resourceId, rest, makeEchoView(processors, journal, runId)));
     loadedHistory = Array.isArray(rest.messages) ? rest.messages.slice(0, historyCount) : [];
+    // Keys taken BEFORE the chain: a processor may rewrite a row in place (see LayoutSeed.keys).
+    if (layoutSeed && processors?.length && frozenInput === undefined) layoutSeed.keys = layoutSeed.history.map(rowKey);
     // F4: same-runId re-entry with interleaved turns — parity with runDurableInner.
     incomingStored = await dropIncomingIfAppendedEarlier(journal, runId, rest, incoming, incomingStored);
   }
@@ -3602,7 +3682,7 @@ async function streamDurableHeld(args: StreamDurableArgs, run: StreamRun): Promi
     const rec = reconcileProcessedIncoming(rest, span, incoming, loadedHistory);
     incoming = rec.incoming;
     incomingStored = rec.alreadyStored;
-    if (rec.lost) reportIncomingLoss(runId, threadId!, memCtx, rec.lost);
+    if (rec.lost) { layoutLost = true; reportIncomingLoss(runId, threadId!, memCtx, rec.lost); }
     else if (memCtx) {
       memCtx.incomingCount = rec.trailing;
       if (rec.chainAppended) memCtx.chainAppended = rec.chainAppended;
@@ -3617,8 +3697,11 @@ async function streamDurableHeld(args: StreamDurableArgs, run: StreamRun): Promi
   // sahipsiz bir koşumda `ownershipDenied` sessiz geçer: sonradan gelen bir çağrı kendi öznesini
   // beyan edip cevabı kurbanın thread'ine yazdırabiliyordu. Belleğin okuduğu sahiple journal'ın
   // yazdığı sahip AYNI olmalı, yoksa iki farklı gerçeklik olur ve kapı yanlış olanı okur.
-  await persistInput(journal, runId, rest, frozenInput !== undefined, threadId, agentName, caller, rawInputHash, actor, { ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}) }, origin, parentOf(args));
-  await persistMemoryContext(journal, runId, memCtx);
+  // The layout is computed against `rest` AFTER the chain — the very value persistInput freezes — and
+  // BEFORE it, so the attempt token it mints rides in `:input.turn` too (persistInput does not touch `rest`).
+  if (memCtx && layoutSeed && frozenInput === undefined) settleMemoryContext(memCtx, layoutSeed, rest, layoutLost, incomingStored);
+  await persistInput(journal, runId, rest, frozenInput !== undefined, threadId, agentName, caller, rawInputHash, actor, { ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}) }, origin, parentOf(args), frozenTurnOf(memCtx));
+  await persistMemoryContext(journal, runId, memCtx, frozenInput === undefined);
   // Freeze `limits` on the first run (parity with runDurableInner) — idempotent via `claim`.
   if (limits) await claim(journal, runKeys.cfgLimits(runId), serializableLimits(limits));
   // WRITE-AHEAD user message (parity with runDurableInner — see writeAheadIncoming). Pre-model, so a

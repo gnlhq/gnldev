@@ -9,7 +9,7 @@
 import { generateText, jsonSchema, stepCountIs, tool, wrapLanguageModel, type LanguageModel, type ToolSet } from 'ai';
 import { effectivePricingTable, usageAndCostFromModelValue, type ModelPricing } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
-import { SUITE_NAMES, COMPARE_NAMES } from './option-names.js';
+import { SUITE_NAMES } from './option-names.js';
 
 export type ScenarioCategory = 'support' | 'lookup' | 'multi-step' | 'no-tool' | 'arguments';
 
@@ -21,23 +21,26 @@ export interface ScenarioTool {
   run: (args: any) => unknown;
 }
 
+/** What a right answer does: a program checks it (checkExpectation), no judge model reads it. */
+export interface Expectation {
+  /** Every one must be made; `args` must match the call's arguments on the keys it names. */
+  calls?: Array<{ toolName: string; args?: Record<string, unknown> }>;
+  /** None of these may be called. */
+  forbidden?: string[];
+  /**
+   * The answer must contain each — a string, or a list of spellings any one of which will do. Compared
+   * after normalizing both sides (see `normalizeAnswer`).
+   */
+  answerIncludes?: Array<string | string[]>;
+}
+
 export interface Scenario {
   id: string;
   category: ScenarioCategory;
   system: string;
   prompt: string;
   tools: Record<string, ScenarioTool>;
-  expect: {
-    /** Every one must be made; `args` must match the call's arguments on the keys it names. */
-    calls?: Array<{ toolName: string; args?: Record<string, unknown> }>;
-    /** None of these may be called. */
-    forbidden?: string[];
-    /**
-     * The answer must contain each — a string, or a list of spellings any one of which will do. Compared
-     * after normalizing both sides (see `normalizeAnswer`).
-     */
-    answerIncludes?: Array<string | string[]>;
-  };
+  expect: Expectation;
 }
 
 // ── The fake store every scenario reads ─────────────────────────────────────────────────────────────
@@ -191,19 +194,24 @@ export function normalizeAnswer(text: string): string {
     .trim();
 }
 
-/** Checks one finished scenario against its expectation. */
-export function checkScenario(s: Scenario, calls: Array<{ toolName: string; args: unknown }>, text: string): string[] {
+/** Checks calls and an answer against an expectation; each failure in words, none when it holds. */
+export function checkExpectation(expect: Expectation, calls: ReadonlyArray<{ toolName: string; args: unknown }>, text: string): string[] {
   const failures: string[] = [];
-  for (const w of s.expect.calls ?? []) {
+  for (const w of expect.calls ?? []) {
     if (!calls.some((c) => c.toolName === w.toolName && (w.args === undefined || matches(w.args, c.args)))) failures.push(`missing call ${w.toolName}${w.args ? ` ${JSON.stringify(w.args)}` : ''}`);
   }
-  for (const f of s.expect.forbidden ?? []) if (calls.some((c) => c.toolName === f)) failures.push(`called forbidden ${f}`);
+  for (const f of expect.forbidden ?? []) if (calls.some((c) => c.toolName === f)) failures.push(`called forbidden ${f}`);
   const answer = normalizeAnswer(text);
-  for (const a of s.expect.answerIncludes ?? []) {
+  for (const a of expect.answerIncludes ?? []) {
     const spellings = Array.isArray(a) ? a : [a];
     if (!spellings.some((w) => answer.includes(normalizeAnswer(w)))) failures.push(`answer lacks "${spellings.join('" or "')}"`);
   }
   return failures;
+}
+
+/** Checks one finished scenario against its expectation. */
+export function checkScenario(s: Scenario, calls: Array<{ toolName: string; args: unknown }>, text: string): string[] {
+  return checkExpectation(s.expect, calls, text);
 }
 
 async function runOne(s: Scenario, model: LanguageModel, pricing: Record<string, ModelPricing>, maxSteps: number, timeoutMs: number): Promise<ScenarioResult> {
@@ -257,42 +265,5 @@ export async function runSuite(opts: RunSuiteOptions): Promise<SuiteResult> {
     passRate: ran.length ? ran.filter((r) => r.pass).length / ran.length : NaN,
     errored: results.length - ran.length,
     costUsd: results.reduce((a, r) => a + r.costUsd, 0),
-  };
-}
-
-export interface CompareOptions extends Omit<RunSuiteOptions, 'model'> {
-  baseline: LanguageModel;
-  candidate: LanguageModel;
-}
-
-export interface Comparison {
-  baseline: SuiteResult;
-  candidate: SuiteResult;
-  /** Scenarios both models ran — the only ones compared. */
-  compared: string[];
-  /** Candidate cost as a share of the baseline's (0.2 = 80% cheaper), over the compared scenarios. */
-  costRatio: number;
-  /** Scenarios the baseline passed and the candidate failed. */
-  regressions: string[];
-  /** Scenarios the baseline failed and the candidate passed. */
-  improvements: string[];
-}
-
-/** The same scenarios on two models: what the candidate costs, and where it does worse. */
-export async function compareOnSuite(opts: CompareOptions): Promise<Comparison> {
-  refuseUnknownNames('compareOnSuite', opts, COMPARE_NAMES);
-  const { baseline: b, candidate: c, ...rest } = opts;
-  const [baseline, candidate] = await Promise.all([runSuite({ ...rest, model: b }), runSuite({ ...rest, model: c })]);
-  const byId = new Map(candidate.results.map((r) => [r.id, r]));
-  const both = baseline.results.filter((r) => r.error === undefined && byId.get(r.id)?.error === undefined);
-  const cost = (rs: ScenarioResult[]) => rs.reduce((a, r) => a + r.costUsd, 0);
-  const baseCost = cost(both);
-  return {
-    baseline,
-    candidate,
-    compared: both.map((r) => r.id),
-    costRatio: baseCost > 0 ? cost(both.map((r) => byId.get(r.id)!)) / baseCost : NaN,
-    regressions: both.filter((r) => r.pass && !byId.get(r.id)!.pass).map((r) => r.id),
-    improvements: both.filter((r) => !r.pass && byId.get(r.id)!.pass).map((r) => r.id),
   };
 }

@@ -87,7 +87,6 @@ const VERDICTS: Record<string, { verdict: Verdict; why: string }> = {
   'GET /runs/:id/network': { verdict: 'org-scoped', why: 'derived from a run' },
   'GET /runs/:id/memory-context': { verdict: 'org-scoped', why: 'derived from a run' },
   'GET /runs/:id/regression/:otherId': { verdict: 'org-scoped', why: 'compares two runs; both are org data' },
-  'POST /runs/:id/regression': { verdict: 'org-scoped', why: 'operates on a run' },
   'POST /runs/:id/fork': { verdict: 'org-scoped', why: 'copies a run' },
   'POST /runs/:id/resume': { verdict: 'org-scoped', why: 'continues a run' },
   'POST /runs/:id/cancel': { verdict: 'org-scoped', why: 'terminally stops a run' },
@@ -99,6 +98,31 @@ const VERDICTS: Record<string, { verdict: Verdict; why: string }> = {
   'POST /optimizer/replay': { verdict: 'org-scoped', why: "replays an agent's runs read through the caller's scoped reader" },
   'GET /optimizer/history': { verdict: 'org-scoped', why: "the agent's kept replays, read through the caller's scoped reader" },
   'GET /optimizer/report': { verdict: 'org-scoped', why: "a report built from the caller's scoped reader" },
+  'GET /lab': { verdict: 'global', why: 'the host lab catalog: agent and model names from code, not journal data' },
+  'GET /lab/plan': { verdict: 'org-scoped', why: "reads one run's record through the caller's scoped reader" },
+  'POST /lab/explain': { verdict: 'org-scoped', why: "replays one run read through the caller's scoped reader" },
+  'GET /lab/experiments': { verdict: 'org-scoped', why: "lists the experiments kept through the caller's scoped reader" },
+  'GET /lab/capsule': { verdict: 'org-scoped', why: "reads one run's record through the caller's scoped reader" },
+  'POST /lab/capsule': { verdict: 'org-scoped', why: "plays one run's copy read through the caller's scoped reader; writes nothing" },
+  'GET /lab/thread-plan': { verdict: 'org-scoped', why: "lists a thread's runs through the caller's scoped reader, each checked visible" },
+  'POST /lab/thread': { verdict: 'org-scoped', why: "diagnoses one run read through the caller's scoped reader; its result is kept under that run" },
+  'GET /lab/prune-plan': { verdict: 'org-scoped', why: "reads one run's record through the caller's scoped reader" },
+  'POST /lab/prune': { verdict: 'org-scoped', why: "plays new messages beside one run's prompt read through the caller's scoped reader; keeps nothing" },
+  'GET /lab/words-plan': { verdict: 'org-scoped', why: "reads one run's record through the caller's scoped reader" },
+  'POST /lab/words': { verdict: 'org-scoped', why: "asks about one run's last message read through the caller's scoped reader; keeps nothing" },
+  'GET /lab/playground/base': { verdict: 'global', why: "an agent's definition from the host's code — the same for every organization; reads no journal" },
+  'POST /lab/playground/play': { verdict: 'global', why: 'plays a definition and conversation sent in the request; reads and writes no journal' },
+  'POST /lab/playground/measure': { verdict: 'global', why: 'plays a definition and conversation sent in the request; reads and writes no journal, keeps nothing' },
+  'POST /lab/playground/scenarios/run': { verdict: 'org-scoped', why: "plays the scenarios listed through the caller's scoped reader against the definition sent; keeps nothing" },
+  'POST /lab/playground/scenario': { verdict: 'org-scoped', why: "writes the scenario through the caller's scoped view; reads no run" },
+  'GET /lab/saved-scenarios': { verdict: 'org-scoped', why: "lists the scenarios kept through the caller's scoped reader" },
+  'POST /lab/saved-scenarios': { verdict: 'org-scoped', why: "copies one run read through the caller's scoped reader, after runVisible; writes through the same view" },
+  'PATCH /lab/saved-scenarios/:agent/:id': { verdict: 'org-scoped', why: "changes a scenario found through the caller's scoped reader, in place; another organization's is not found" },
+  'DELETE /lab/saved-scenarios/:agent/:id': { verdict: 'org-scoped', why: "removes a scenario found through the caller's scoped reader; another organization's is not found" },
+  'POST /lab/saved-scenarios/run': { verdict: 'org-scoped', why: "plays the scenarios listed through the caller's scoped reader; keeps nothing" },
+  'GET /lab/scenarios': { verdict: 'global', why: "the host's scenario set: code, not journal data" },
+  'GET /lab/form-plan': { verdict: 'global', why: "an agent's prompt sections from code and a count — reads no journal" },
+  'POST /lab/best-form': { verdict: 'global', why: 'runs forms of an agent from code on fake-tool scenarios — reads and writes no journal data' },
   'GET /metrics': { verdict: 'org-scoped', why: 'aggregates the org-scoped journal' },
   'GET /metrics/runs': { verdict: 'org-scoped', why: 'aggregates the org-scoped journal' },
   'GET /audit': { verdict: 'org-scoped', why: 'the audit log is per organization' },
@@ -456,15 +480,29 @@ async function makeApi(optIn = false) {
       history: async (j: any, agent: string) => optimizerSeen(j, agent),
       report: async (j: any, agent: string) => ({ markdown: JSON.stringify(await optimizerSeen(j, agent)) }),
     },
+    // The lab stand-in answers with the record of the run it was asked about, read through the reader it
+    // was handed — so a stranger naming acme's run sees nothing of it.
+    lab: {
+      catalog: () => ({ agents: ['support'], models: ['openai/gpt-4o-mini'] }),
+      plan: async (j: any, req: { runId: string }) => ({ input: await j.get(`${req.runId}:input`) }),
+      explain: async (j: any, req: { runId: string }) => ({ input: await j.get(`${req.runId}:input`) }),
+      capsuleBase: async (j: any, req: { runId: string }) => ({ input: await j.get(`${req.runId}:input`) }),
+      capsule: async (j: any, req: { runId: string }) => ({ input: await j.get(`${req.runId}:input`) }),
+      // The runs the reader it was handed can list: a stranger's reader lists the stranger's own.
+      threadPlan: async (j: any) => { const runs = await j.listRuns(); return { total: runs.length, turns: runs.map((r: { runId: string }) => ({ runId: r.runId, agent: r.runId })) }; },
+      thread: async (j: any, req: { runId: string }) => ({ input: await j.get(`${req.runId}:input`) }),
+      prunePlan: async (j: any, req: { runId: string }) => ({ input: await j.get(`${req.runId}:input`) }),
+      prune: async (j: any, req: { runId: string }) => ({ input: await j.get(`${req.runId}:input`) }),
+      wordsPlan: async (j: any, req: { runId: string }) => ({ input: await j.get(`${req.runId}:input`) }),
+      words: async (j: any, req: { runId: string }) => ({ input: await j.get(`${req.runId}:input`) }),
+      scenarios: () => [],
+      formPlan: (req: unknown) => req,
+      bestForm: async (req: unknown) => req,
+    },
     // `chat` is a FUNCTION, not an object with `.send` — the route calls `chat(message, {runId}, ctx)`.
     // An earlier fixture used `{ send }`, which produced "chat is not a function" and left the route
     // looking uncontrollable when it was simply never reached.
     chat: async (_m: string, _o: unknown, ctx?: { orgId?: string }) => rec('chat', ctx, { text: 'chat-ok' }),
-    // POST /runs/:id/regression converts `body.model` ('provider/model') to a real model object via
-    // `resolveModel` unless the host injects this seam (server.ts:597). Without it the route reaches a
-    // real provider and dies on a missing OPENAI_API_KEY — an environment failure, not an organization
-    // one, and one that would flip meaning on a machine that happens to have the key set.
-    regressionModel: () => mockModel(),
     scorers: { list: () => [{ name: 'quality' }], score: async () => ({ quality: 1 }) },
     // Scoped by the org the store is asked about, the way a real user store is.
     /**
@@ -546,6 +584,11 @@ const QUERY: Record<string, string> = {
   'GET /optimizer/diagnosis': '?agent=support',
   'GET /optimizer/history': '?agent=support',
   'GET /optimizer/report': '?agent=support',
+  'GET /lab/plan': '?runId=r-acme&model=openai/gpt-4o-mini',
+  'GET /lab/capsule': '?runId=r-acme',
+  'GET /lab/thread-plan': '?threadId=t-acme&model=openai/gpt-4o-mini',
+  'GET /lab/prune-plan': '?runId=r-acme&model=openai/gpt-4o-mini',
+  'GET /lab/words-plan': '?runId=r-acme&model=openai/gpt-4o-mini',
 };
 
 async function drive(api: (r: Request) => Promise<Response>, route: { method: string; path: string }, who: Record<string, string>) {
@@ -573,6 +616,10 @@ async function drive(api: (r: Request) => Promise<Response>, route: { method: st
       topic: 'orders.created', consumer: 'acme-consumer',
       // `POST /optimizer/replay` names the agent (and the model, above) it replays; both must be offered.
       agent: 'support',
+      // `POST /lab/thread` refuses a diagnosis with no expectation before it reads a run.
+      expect: { calls: [{ toolName: 'refund' }] },
+      // `POST /lab/prune` names the section to remove and the new messages; `POST /lab/words` the tool and the words.
+      remove: 'system 1', prompts: ['x'], tool: 'refund', words: ['x'],
       // Running a managed workflow BEGINS a run: `r-acme` is an agent run of acme's, and a workflow may
       // not write under another target's id (refused at its birth — the target rule). Its own id.
       ...(/^\/workflows\/:name\/run(-stream)?$/.test(route.path) ? { runId: 'wf-run-acme' } : {}),
@@ -686,6 +733,8 @@ describe('the ownership control — acme must SEE what globex must not', () => {
     'GET /scheduler/triggers', 'GET /runs/:id/memory-context',
     'POST /runs/:id/otel-export', 'GET /runs/:id/regression/:otherId', 'POST /runs/:id/resume',
     'GET /optimizer/diagnosis', 'POST /optimizer/replay', 'GET /optimizer/history', 'GET /optimizer/report',
+    'GET /lab/plan', 'POST /lab/explain', 'GET /lab/capsule', 'POST /lab/capsule', 'GET /lab/thread-plan', 'POST /lab/thread',
+    'GET /lab/prune-plan', 'POST /lab/prune', 'GET /lab/words-plan', 'POST /lab/words',
     'POST /runs/:id/score', 'GET /runs/:id/scores', 'GET /runs/:id/state', 'GET /runs/:id/trace',
     'POST /users',
     'GET /threads', 'GET /threads/:id/messages', 'GET /threads/:id/working-memory',
@@ -696,14 +745,14 @@ describe('the ownership control — acme must SEE what globex must not', () => {
    * Controlled by an explicit REFUSAL, for routes whose successful answer embeds a nondeterministic
    * value, so "the two bodies differ" is not evidence of anything.
    *
-   * `POST /runs/:id/regression` answers `{ newRunId: "<id>:replay:<Date.now()>:0", ... }`. Measured: with
-   * every caller's organization forced to `acme` (a total collapse of the boundary) globex successfully
-   * replayed acme's run — and the by-answer control still PASSED, because the two timestamps differed.
-   * The assertion was riding along on the clock. What actually separates owner from stranger here is that
-   * the stranger's replay cannot find the run at all, so that is what gets asserted.
+   * The first was `POST /runs/:id/regression` (removed: a run played again is the Lab's capsule), which
+   * answered `{ newRunId: "<id>:replay:<Date.now()>:0", ... }`. Measured: with every caller's organization
+   * forced to `acme` (a total collapse of the boundary) globex successfully replayed acme's run — and the
+   * by-answer control still PASSED, because the two timestamps differed. The assertion was riding along
+   * on the clock. What actually separates owner from stranger is that the stranger cannot find the run.
    */
-  const REFUSAL_CONTROLLED = ['POST /runs/:id/regression',
-    // Same hazard: `/run` answers a `runId` built from `Date.now()`, and `/run-stream` answers an SSE
+  const REFUSAL_CONTROLLED = [
+    // `/run` answers a `runId` built from `Date.now()`, and `/run-stream` answers an SSE
     // body whose frames carry it too — so "the bodies differ" would be true even on a total leak.
     'POST /workflows/:name/run', 'POST /workflows/:name/run-stream',
     // Both fork routes answer `newRunId: "<src>:fork:<Date.now()>"`. They had been by-answer controls,
@@ -935,6 +984,20 @@ describe('the ownership control — acme must SEE what globex must not', () => {
     // leak-check above already proves a stranger org reads its own (empty) aggregate, and the
     // scoped-reader wiring is pinned by studio-semantic-guard.test.ts.
     'GET /semantic-guard': 'aggregate read over the org-scoped reader; no per-id surface to own',
+    // A list read through the org-scoped `rw` reader under the reserved `__lab__:exp:` prefix; the
+    // fixture keeps no experiment, so there is nothing for acme to see. lab-endpoints.test.ts keeps one
+    // for acme and shows globex's list empty.
+    'GET /lab/experiments': "list over the org-scoped reader; the fixture keeps none — lab-endpoints.test.ts shows another organization's is empty",
+    // The fixture's lab keeps no scenarios (it has no saveScenario: every scenario route answers 501 to both
+    // callers). lab-scenario-routes.test.ts drives them over a real lab: acme's scenario is listed to acme
+    // only, globex's copy of acme's run is not found (404), globex cannot remove it (404).
+    'POST /lab/playground/scenarios/run': 'the fixture lab keeps no scenarios — it plays only those listed through the caller\'s scoped reader',
+    'POST /lab/playground/scenario': 'the fixture lab keeps no scenarios — it writes through the caller\'s scoped view, as POST /lab/saved-scenarios does',
+    'GET /lab/saved-scenarios': 'the fixture lab keeps no scenarios — lab-scenario-routes.test.ts shows another organization sees none of them',
+    'POST /lab/saved-scenarios': 'the fixture lab keeps no scenarios — lab-scenario-routes.test.ts shows another organization cannot copy the run (404)',
+    'PATCH /lab/saved-scenarios/:agent/:id': 'the fixture lab keeps no scenarios — lab-scenario-routes.test.ts shows another organization cannot change one (404)',
+    'DELETE /lab/saved-scenarios/:agent/:id': 'the fixture lab keeps no scenarios — lab-scenario-routes.test.ts shows another organization cannot remove one (404)',
+    'POST /lab/saved-scenarios/run': 'the fixture lab keeps no scenarios — it plays only those listed through the caller\'s scoped reader',
   };
 
   /**

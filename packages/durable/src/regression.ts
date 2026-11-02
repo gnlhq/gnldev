@@ -4,6 +4,7 @@
 // the diff logic has no dependency on evals whatsoever (dependency is one-directional: evals -> durable).
 import { settleModelContent } from './time-travel.js';
 import { runKeys } from './journal.js';
+import { readRunMemoryLayout, memoryRowsOf, cutWorkingMemory } from './memory-layout.js';
 import type { Journal, JournalEntry, JournalReader } from './journal.js';
 import { runDurable } from './run.js';
 import { minted, derivedRunIdBase, rerunRunId } from './run-id-grammar.js';
@@ -253,14 +254,16 @@ export interface ReplayRunConfig {
   /** Replay determinism mode (see DurableCtx.replay) — the new run is the first run in its own journal. */
   replay?: 'strict' | 'lenient';
   /**
-   * COUNTERFACTUAL memory-off replay: re-run the turn WITHOUT what memory injected. Reads the run's
-   * ':memctx' provenance record (runKeys.memoryContext) and keeps only the turn's own incoming
-   * message(s) — the recalled/window/observation messages that memory composed in front of them are
-   * dropped. This turns "the model must have read it from the recall snippet" from an inference into
-   * an experiment: strip the injection, re-ask, diff the answers. Requires a ':memctx' record
-   * (throws otherwise — runs from before provenance existed can't be stripped honestly).
-   * HONEST BOUNDARY: the frozen `system` string is NOT surgically edited — if working memory was
-   * injected there (provenance.workingMemoryChars), it remains; callers should disclose that.
+   * COUNTERFACTUAL memory-off replay: re-run the turn WITHOUT what memory put in. Reads the run's own
+   * memory layout (`:memctx.layout`, read with readRunMemoryLayout) and leaves out exactly the rows it
+   * proves are memory's — observations, recall, the recent window — and, unless `system` is given, the
+   * working memory inside the frozen system text. Rows no memory row accounts for (an input processor's
+   * own) stay. This turns "the model must have read it from the recall snippet" from an inference into
+   * an experiment: strip the injection, re-ask, diff the answers.
+   * Refused, with the reason, whenever the layout does not prove it: no layout (a run recorded before
+   * layouts existed), an unaligned or broken one, or a working memory whose place in the system text
+   * is not known. Nothing is derived from the counts. A row memory may have put in but whose part the
+   * layout cannot tell (`ambiguous`) is kept — and named in the result's `keptAmbiguous`.
    */
   stripMemoryContext?: boolean;
   /** The host vouches for the source run's recorded input (see RunDurableArgs.trustRecordedInput). */
@@ -270,6 +273,12 @@ export interface ReplayRunConfig {
 export interface ReplayRunResult {
   newRunId: string;
   result: DurableResult;
+  /**
+   * A memory-off replay only: positions in the source's input that were kept although memory may have
+   * put them in — the layout calls them ambiguous. Absent when there were none, so "memory was left
+   * out" is exact only then.
+   */
+  keptAmbiguous?: number[];
 }
 
 let replaySeq = 0;
@@ -331,17 +340,22 @@ export async function replayRun(cfg: ReplayRunConfig): Promise<ReplayRunResult> 
   if (trustRecordedInput !== true) { const refusal = recordedInputProblem(runId, input); if (refusal) throw refusal; }
 
   let messages = input.messages as any[] | undefined;
+  let recordedSystem = input.system as string | undefined;
+  let keptAmbiguous: number[] | undefined;
   if (stripMemoryContext) {
-    const memctx = await journal.get<{ incomingCount?: number }>(runKeys.memoryContext(runId));
-    const incoming = memctx?.incomingCount ?? 0;
-    if (!memctx || incoming <= 0 || !Array.isArray(messages)) {
-      throw new Error(
-        `@gnldev/durable: run "${runId}" has no usable ':memctx' provenance — a memory-off replay can only strip what was provably injected.`,
-      );
+    const rows = memoryRowsOf(await readRunMemoryLayout(journal, runId));
+    const refuse = (why: string) => new Error(
+      `@gnldev/durable: run "${runId}" cannot be replayed without its memory (:memctx) — ${why}. A memory-off replay strips only what the run's own layout proves memory put in.`,
+    );
+    if (!rows.known) throw refuse(rows.detail);
+    if (!Array.isArray(messages)) throw refuse('its frozen input has no messages');
+    if (rows.workingMemory && system === undefined) {
+      if (!('span' in rows.workingMemory)) throw refuse(`the working memory's place in the system text is not known ('${rows.workingMemory.status}')`);
+      recordedSystem = cutWorkingMemory(typeof input.system === 'string' ? input.system : '', rows.workingMemory.span);
     }
-    // The frozen input is [ ...memory-composed history, ...incoming ] (see run.ts prepareMemoryContext)
-    // the turn's own contribution is exactly the trailing incomingCount messages.
-    messages = messages.slice(-incoming);
+    const memoryRows = new Set(rows.positions);
+    messages = messages.filter((_, i) => !memoryRows.has(i));
+    if (rows.ambiguous.length) keptAmbiguous = [...rows.ambiguous];
   }
 
   const dst = newRunId ?? (await pickReplayRunId(journal, runId));
@@ -363,13 +377,13 @@ export async function replayRun(cfg: ReplayRunConfig): Promise<ReplayRunResult> 
     replay,
     ...(messages ? { messages } : {}),
     ...(input.prompt && !messages ? { prompt: input.prompt } : {}),
-    system: system ?? (input.system as string | undefined),
+    system: system ?? recordedSystem,
     ...(src.state === 'owned' ? { caller: src.owner } : {}),
     ...(input.origin !== undefined ? { origin: input.origin } : {}),
   } as any;
   const result = await runDurable(newRunId === undefined ? minted(replayArgs) : replayArgs);
 
-  return { newRunId: dst, result };
+  return { newRunId: dst, result, ...(keptAmbiguous ? { keptAmbiguous } : {}) };
 }
 
 // ── Report skeleton ────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 import { toJournal, type Journal, type JournalReader, type RunJournal, type Storage } from '@gnldev/durable';
 
-/** What the optimizer reads runs from: a store's `runs` (what runDurable is handed), the store, or a journal. */
+/** What an experiment reads runs from: a store's `runs` (what runDurable is handed), the store, or a journal. */
 export type JournalSource = RunJournal | Storage | (Journal & JournalReader);
 
 /**

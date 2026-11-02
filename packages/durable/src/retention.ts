@@ -25,7 +25,7 @@ import { LOG_SWEEP_TARGET_NAMES, PURGE_ORGANIZATION_NAMES, PURGE_RESOURCE_NAMES,
 // What a run, a thread and a person own, and the one executor that deletes by it (model.ts). The
 // journal primitives (exact and neighbour-safe deletes, the thread-key readers) live there with it.
 import {
-  requireDelete, deleteExactKey, escOwnerPart, ownershipTraceKey, planRun, planThread, planOrganization, executePlan, PERSON_FAMILIES, isOwnLessonRest,
+  requireDelete, deleteExactKey, escOwnerPart, ownershipTraceKey, planRun, planThread, planOrganization, executePlan, PERSON_FAMILIES, personRecordPrefix, isOwnLessonRest,
   MEM_PREFIX, XTHR_PREFIX, threadIdOfMemKey, threadIdOfXthrKey, threadIdOfSemKey,
 } from './model.js';
 import type { DeleteTarget } from './model.js';
@@ -176,6 +176,8 @@ async function purgePersonFamilies(journal: Journal, resourceId: string): Promis
   const del = requireDelete(journal);
   // The families are the model's (`PERSON_FAMILIES`, model.ts); what follows the id tells each one's own keys apart.
   const [xidFamily, lessonFamily, statsFamily] = PERSON_FAMILIES;
+  // Records kept about the person: their prefix carries the id's length, so it is theirs alone.
+  const kept = await del(personRecordPrefix(resourceId));
   const xidPre = `${xidFamily}${resourceId}:`;
   const lessonPre = `${lessonFamily}${resourceId}:`;
   const statsPre = `${statsFamily}${resourceId}:`;
@@ -194,8 +196,8 @@ async function purgePersonFamilies(journal: Journal, resourceId: string): Promis
       if (!isStats) suggIds.add(rest);
     }
   }
-  if (!foreign) return (await del(xidPre)) + (await del(lessonPre)) + (await del(statsPre));
-  let total = 0;
+  if (!foreign) return kept + (await del(xidPre)) + (await del(lessonPre)) + (await del(statsPre));
+  let total = kept;
   for (const k of own) total += await deleteExactKey(journal, k);
   // A counter row is invisible to listKeys and to get(): reached by its full key. The key ends in a
   // uuid, so the prefix delete of the full key is that one row.

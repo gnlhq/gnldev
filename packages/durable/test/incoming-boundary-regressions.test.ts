@@ -516,11 +516,31 @@ describe('`:memctx` locates the turn inside the frozen input, and only within it
     const rec: any = await journal.get(runKeys.memoryContext('u6-1'));
     expect(rec.incomingCount).toBe(1);
     await journal.put(runKeys.memoryContext('u6-1'), { ...rec, incomingCount: 99 });
+    // An input frozen before `:input.turn` existed: `:memctx` is then the only locator (adoptFrozenInput).
+    { const { turn, ...legacy }: any = await journal.get(runKeys.input('u6-1')); await journal.put(runKeys.input('u6-1'), legacy); }
 
     await runDurable({ ...opts, runId: 'u6-1', model: replyModel('ok'), prompt: 'second question' });
     // `first question` is turn 1's question: it may appear ONCE (its own row), never a second time as part
     // of turn 2's incoming block.
     expect(occurrences(await dumpOf(memory, 'u6'), 'first question')).toBe(1);
+    expect(warn.mock.calls.flat().join(' ')).toContain('no recoverable copy of this turn');
+    warn.mockRestore();
+  });
+
+  it('an `:input.turn` that claims more rows than the frozen input HAS refuses instead of storing history', async () => {
+    const journal = new DieOnWriteAhead();
+    const memory = new BasicMemory(journal);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const opts = { journal, memory, threadId: 'u6t', processors: [redactor] } as const;
+    journal.armed = false;
+    await runDurable({ ...opts, runId: 'u6t-a', model: replyModel('one'), prompt: 'first question' });
+    journal.armed = true;
+    await expect(runDurable({ ...opts, runId: 'u6t-1', model: replyModel('x'), prompt: 'second question' })).rejects.toThrow('disk gone');
+    const inp: any = await journal.get(runKeys.input('u6t-1'));
+    expect(inp.turn).toMatchObject({ count: 1 });
+    await journal.put(runKeys.input('u6t-1'), { ...inp, turn: { count: 99 } });
+    await runDurable({ ...opts, runId: 'u6t-1', model: replyModel('ok'), prompt: 'second question' });
+    expect(occurrences(await dumpOf(memory, 'u6t'), 'first question')).toBe(1);
     expect(warn.mock.calls.flat().join(' ')).toContain('no recoverable copy of this turn');
     warn.mockRestore();
   });
@@ -541,6 +561,8 @@ describe('`:memctx` locates the turn inside the frozen input, and only within it
     ).rejects.toThrow('disk gone');
     const rec: any = await journal.get(runKeys.memoryContext('u5b-1'));
     await journal.put(runKeys.memoryContext('u5b-1'), { ...rec, incomingUnrecoverable: 'boundary-lost', incomingCount: 2 });
+    // An input frozen before `:input.turn` existed: `:memctx` is then the only locator (adoptFrozenInput).
+    { const { turn, ...legacy }: any = await journal.get(runKeys.input('u5b-1')); await journal.put(runKeys.input('u5b-1'), legacy); }
 
     await runDurable({ ...opts, runId: 'u5b-1', model: replyModel('ok'), prompt: 'second question' });
     // A count of 2 against a 3-row frozen input would have sliced turn 1's answer in as the question.

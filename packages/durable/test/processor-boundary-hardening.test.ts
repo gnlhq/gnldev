@@ -135,10 +135,16 @@ describe('a same-runId re-entry runs on the FROZEN input, never on the caller’
 
     expect(await dumpOf(memory, 'r3')).not.toContain(SECRET); // memory
     expect(JSON.stringify(seen)).not.toContain(SECRET);       // and the provider
-    // The `:memctx` write is what died, so nothing records where the turn sits inside the frozen
-    // input — the turn is refused rather than guessed at, and that has to be visible.
-    expect(warn.mock.calls.flat().join(' ')).toContain('no recoverable copy of this turn');
-    expect(((await journal.get(runKeys.memoryContext('r3-1'))) as any).incomingUnrecoverable).toBe('boundary-lost');
+    // The `:memctx` write is what died. Before `:input.turn`, nothing then recorded where the turn sat
+    // inside the frozen input: the turn was refused ('boundary-lost') and the thread got the answer
+    // with no question. The locator rides in `:input` now, so the MASKED question is stored, once.
+    expect(warn.mock.calls.flat().join(' ')).not.toContain('no recoverable copy of this turn');
+    const thread = await dumpOf(memory, 'r3');
+    expect(thread).toContain('SORU');
+    expect(thread).toContain(MASK);
+    expect(thread.split('SORU').length - 1).toBe(1);
+    // Only the attempt that froze `:input` writes `:memctx`; this one did not.
+    expect(await journal.get(runKeys.memoryContext('r3-1'))).toBeUndefined();
     warn.mockRestore();
   });
 });

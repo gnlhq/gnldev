@@ -28,5 +28,6 @@
   "pendingApprovalsBadge_other": "{{count}} bekleyen onay",
   "failedJobsBadge_one": "{{count}} başarısız iş",
   "failedJobsBadge_other": "{{count}} başarısız iş",
-  "optimizer": "Optimizer"
+  "optimizer": "Optimizer",
+  "lab": "Lab"
 }
