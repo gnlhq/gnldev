@@ -419,8 +419,34 @@ export const RUN_DEPENDENTS = {
   usage: usageCountedKey,
 } as const;
 
-/** The record families a PERSON's id names (`<prefix><resourceId>:…`): cross-channel ids, lessons, lesson counters. */
-export const PERSON_FAMILIES = ['xid:res:', 'lesson:res:', 'suggstats:lesson:res:'] as const;
+/**
+ * The record families a PERSON's id names (`<prefix><resourceId>:…`): cross-channel ids, lessons, lesson
+ * counters, and records a package keeps about the person (`personRecordKey`) — every one erased with them.
+ */
+export const PERSON_FAMILIES = ['xid:res:', 'lesson:res:', 'suggstats:lesson:res:', 'kept:res:'] as const;
+
+/**
+ * Where a package keeps a record ABOUT a person — a copy of their conversation, say — so that erasing the
+ * person erases it (`eraseSubject`, `purgeResource`), with nothing to wire: `kept:res:<length>.<id>:<rest>`.
+ * The id's length is in the key, so `bob`'s prefix (`kept:res:3.bob:`) never reaches `bob:evil`'s
+ * (`kept:res:8.bob:evil:`), whatever the ids hold.
+ */
+export function personRecordKey(resourceId: string, rest: string): string {
+  return `${personRecordPrefix(resourceId)}${rest}`;
+}
+/** Every record kept about one person (`personRecordKey`) starts here. */
+export function personRecordPrefix(resourceId: string): string {
+  if (typeof resourceId !== 'string' || resourceId === '') throw new TypeError('@gnldev/durable: a person record needs the id of the person');
+  return `kept:res:${resourceId.length}.${resourceId}:`;
+}
+
+/**
+ * What follows `<family><resourceId>:` in the two lesson families is ONE suggestion id, which never holds
+ * a ':' (a uuid). The prefix alone is not a person boundary — ids may contain ':', and `alice:evil`'s
+ * lessons sit under `alice`'s prefix — so a rest with a ':' is a longer id's. Erasure and every read of
+ * a person's lessons decide "is this key theirs" with this one rule.
+ */
+export const isOwnLessonRest = (rest: string): boolean => !rest.includes(':');
 
 /**
  * Everything a PERSON owns: their threads (by owner record — the one owner source — and by the memory's
@@ -432,6 +458,7 @@ export const PERSON_DEPENDENTS = {
   threads: 'owner records (listOwnerRecords) + MemoryStore.listThreads({ resourceId })',
   runs: 'listRunsWhere({ resourceId })',
   families: PERSON_FAMILIES,
+  suggestions: 'sugg:<id> records owned (scope personal, resourceId) + their evidence on org records (eraseSuggestionsOf)',
   workingMemory: 'workingMemoryScope.resource + legacyWorkingMemoryScope.resource',
   vectors: 'delete({ owner })',
   work: 'deleteIdPrefix(ownedPrefix(owner))',

@@ -32,11 +32,11 @@ const BASELINE = new Set([
   'processors/TokenLimiterOptions.countTokens', 'processors/TokenLimiterOptions.keepSystem',
   'rag/GraphRagOptions.hops', 'rag/GraphRagOptions.decay',
   'rag/GraphRagOptions.seeds', 'scheduler/WorkflowWakerOptions.jitterMs',
-  'scheduler/WorkflowWakerOptions.wakeEvented', 'semantic-qualify/QualifyOptions.onProgress',
+  'scheduler/WorkflowWakerOptions.wakeEvented',
   'server/OrgOptions.requireRegistration', 'server/OrgOptions.maxInstances',
   'studio/MakeRunnerOptions.toJsonSchema',
   'studio/StudioApiOptions.evalGate', 'studio/StudioApiOptions.modelSuggestions',
-  'studio/StudioApiOptions.regressionModel', 'studio/StudioApiOptions.otelExport',
+  'studio/StudioApiOptions.otelExport',
 ]);
 
 const SKIP = new Set(['node_modules', '.git', 'dist', 'coverage', '.comprehension']);

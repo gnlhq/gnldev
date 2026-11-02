@@ -7,10 +7,10 @@
 // counts toward nothing.
 import { refuseUnknownNames } from '@gnldev/options';
 import { REPLAY_AGENT_NAMES } from './option-names.js';
-import { readerOf } from './journal-of.js';
-import { replayCounterfactual, type CounterfactualOptions, type CounterfactualResult } from './replay.js';
+import { readerOf, replayCounterfactual, type CounterfactualOptions, type CounterfactualResult } from '@gnldev/experiment';
 
-export interface ReplayAgentOptions extends Omit<CounterfactualOptions, 'runId'> {
+// `answers` and `overrides` are results for one run's calls; over many runs there is nobody to have written them.
+export interface ReplayAgentOptions extends Omit<CounterfactualOptions, 'runId' | 'answers' | 'overrides'> {
   /** The agent's registry name; its latest completed runs are replayed. */
   agent: string;
   /** How many of them (default 20). */
