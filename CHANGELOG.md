@@ -7,7 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.16.0] — 2026-11-02
+
+**Why an agent did what it did, and what to change so it does what you meant.** Studio gets a Lab, opened
+from the Inspector: each part's share of a run, a thread turn diagnosed against a written expectation (a
+guess first, then played to prove it), the words that decided a call, a changed copy of a turn played
+beside the run as it was, and whether a prompt section can go. Two new packages carry it,
+`@gnldev/experiment` and `@gnldev/lab`.
 
 **`@gnldev/lab` is experimental** — its diagnosis is measured on planted faults with one model (39 of 40
 named, no wrong cause in 55 turns), and its API will move; see its README (Experimental).
