@@ -144,6 +144,29 @@ function messageOf(err: unknown): string {
   try { return String(err); } catch { return 'unknown error'; }
 }
 
+/**
+ * The error's TYPE, beside its message: what a reader groups failures by ("every RateLimitError this
+ * week") without parsing prose. `name` when the class set one, else the constructor's — a subclass
+ * that forgot `this.name = ...` still reads as itself rather than as 'Error'. Absent for a non-Error throw.
+ */
+function errorNameOf(err: unknown): { errorName?: string; errorCode?: string; errorStatus?: number } {
+  if (!(err instanceof Error)) return {};
+  const ctor = (err as { constructor?: { name?: unknown } }).constructor?.name;
+  const name = err.name && err.name !== 'Error' ? err.name : typeof ctor === 'string' && ctor ? ctor : err.name;
+  // The two facts a NAME cannot carry, read off the error as thrown (never parsed from the message):
+  // a system/driver `code` ('ECONNRESET', '57P01') — a plain `Error` from the network reads apart from
+  // a plain `Error` from host code only by it — and an HTTP `statusCode`, which separates a provider's
+  // 429/503 (try later) from its 400/401 (this request, this key). A retry wrapper's is its last error's.
+  const last = (err as { lastError?: unknown }).lastError as { statusCode?: unknown; code?: unknown } | undefined;
+  const code = (err as { code?: unknown }).code ?? last?.code;
+  const status = (err as { statusCode?: unknown }).statusCode ?? last?.statusCode;
+  return {
+    ...(name ? { errorName: String(name).slice(0, 120) } : {}),
+    ...(typeof code === 'string' && /^[\w.-]{1,40}$/.test(code) ? { errorCode: code } : {}),
+    ...(typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599 ? { errorStatus: status } : {}),
+  };
+}
+
 /** @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it. */
 export async function recordRunOutcome(
   journal: Journal,
@@ -233,11 +256,11 @@ export const runSucceeded = (journal: Journal, runId: string, at: number, attemp
   recordRunOutcome(journal, runId, { status: 'completed', at, ...ofAttempt(attempt) });
 
 export const runFailed = (journal: Journal, runId: string, err: unknown, at: number, attempt?: number): Promise<void> =>
-  recordRunOutcome(journal, runId, { status: 'failed', at, error: messageOf(err), ...ofAttempt(attempt) });
+  recordRunOutcome(journal, runId, { status: 'failed', at, error: messageOf(err), ...errorNameOf(err), ...ofAttempt(attempt) });
 
 /** A fenced-out attempt's failure: only ever fills an ABSENT verdict — the surviving executor's wins. */
 export const runFailedIfUnrecorded = (journal: Journal, runId: string, err: unknown, at: number, attempt?: number): Promise<void> =>
-  recordRunOutcome(journal, runId, { status: 'failed', at, error: messageOf(err), ...ofAttempt(attempt) }, { fillOnly: true });
+  recordRunOutcome(journal, runId, { status: 'failed', at, error: messageOf(err), ...errorNameOf(err), ...ofAttempt(attempt) }, { fillOnly: true });
 
 /**
  * The write-ahead start marker. Recorded at every attempt's entry (a resume is a new attempt), so a

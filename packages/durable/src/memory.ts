@@ -1,6 +1,7 @@
 import type { Journal } from './journal.js';
 import { assertThreadId } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
+import { threadOwnerKey } from './thread-owner.js';
 
 // Conversation (thread) + working memory. Journal-backed → durable & replayable by construction.
 // (Rich memory like semantic recall / observational memory lives in a separate @gnldev/memory package in the future.)
@@ -564,4 +565,36 @@ export class BasicMemory implements Memory {
   async setWorkingMemory(threadId: string, value: string): Promise<void> {
     await this.journal.put(memKey(threadId, 'working'), value);
   }
+
+  /**
+   * A resource's threads, newest first — the contract Studio's thread list renders (AgentMemory's too).
+   * A thread is one with a message log; its owner and its start come from the thread's owner record.
+   * Without these two methods every BasicMemory deployment showed Studio an empty thread list.
+   */
+  async listThreads(opts: { resourceId: string }): Promise<BasicThread[]> {
+    if (!opts.resourceId) return [];
+    return (await this.listAllThreads()).filter((t) => t.resourceId === opts.resourceId);
+  }
+
+  /** Every thread in this journal (the operator's view), newest first. */
+  async listAllThreads(): Promise<BasicThread[]> {
+    const suffix = ':messages';
+    const ids = (await this.journal.listKeys('mem:')).filter((k) => k.endsWith(suffix)).map((k) => k.slice('mem:'.length, -suffix.length));
+    const out = await Promise.all(ids.map(async (id): Promise<BasicThread> => {
+      const owner = await this.journal.get<{ resourceId?: unknown; at?: unknown }>(threadOwnerKey(id));
+      return {
+        id,
+        ...(typeof owner?.resourceId === 'string' ? { resourceId: owner.resourceId } : {}),
+        createdAt: typeof owner?.at === 'number' ? owner.at : 0,
+      };
+    }));
+    return out.sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id));
+  }
+}
+
+/** A thread as BasicMemory lists it. `createdAt` is 0 when the thread has no owner record. */
+export interface BasicThread {
+  id: string;
+  resourceId?: string;
+  createdAt: number;
 }

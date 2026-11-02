@@ -55,6 +55,38 @@ export interface CounterfactualOptions {
   prepareStep?: Parameters<typeof generateText>[0]['prepareStep'];
   /** Prices, for both sides. The journal's `__pricing__`/the defaults when omitted. */
   pricing?: Record<string, ModelPricing>;
+  /**
+   * Results for calls the recorded run never made, written by someone who knows what the tool would have
+   * returned — a call matching one (same tool, same arguments) gets its `output` instead of diverging.
+   * They are the caller's assumption: every call they answered is listed in `trace` as `'answer'`.
+   */
+  answers?: ReadonlyArray<ToolAnswer>;
+  /**
+   * Results put in place of what the recording holds — "what if the tool had said this instead?". A call
+   * matching one (same tool, same arguments) gets its `output`, whether or not the recorded run made that
+   * call; a recorded call it stands for is used up, as the recorded result would have been. Looked up
+   * BEFORE the recording (the recording would otherwise always answer first, and a wrong tool result
+   * could never be tried as the cause). Every call they answered is listed in `trace` as `'override'`.
+   */
+  overrides?: ReadonlyArray<ToolAnswer>;
+}
+
+/** What a tool would have returned for one call, given by the person running the replay. */
+export interface ToolAnswer {
+  toolName: string;
+  args: unknown;
+  output: unknown;
+}
+
+/** One tool call as it went: its arguments and where its result came from. */
+export interface TracedCall {
+  toolName: string;
+  args: unknown;
+  /**
+   * 'recorded': the run's own result; 'answer': one of `answers`; 'override': one of `overrides`, in place
+   * of the recording; 'none': there was none — the replay stopped.
+   */
+  source: 'recorded' | 'answer' | 'override' | 'none';
 }
 
 export interface CounterfactualSide {
@@ -74,8 +106,12 @@ export interface CounterfactualResult {
   runId: string;
   recorded: CounterfactualSide;
   candidate: CounterfactualSide;
-  /** The first call the recorded run never made — the replay stopped after its step. */
-  divergence?: { at: number; call: CallSignature };
+  /** The first call the recorded run never made and no answer covered — the replay stopped after its step. */
+  divergence?: { at: number; call: CallSignature; args: unknown };
+  /** The recorded run's calls with their arguments, in order. */
+  recordedTrace: Array<{ toolName: string; args: unknown }>;
+  /** The candidate's calls, in order, and where each result came from. */
+  trace: TracedCall[];
   /** Calls the recorded run made that the candidate did not make (before any divergence). */
   missed: CallSignature[];
   /** The candidate made the recorded calls in another order. */
@@ -87,7 +123,7 @@ export class ReplaySourceError extends Error {
   constructor(message: string) { super(message); this.name = 'ReplaySourceError'; }
 }
 
-type RecordedCall = CallSignature & { output: unknown };
+type RecordedCall = CallSignature & { output: unknown; args: unknown };
 
 /** The recorded run's tool calls with their results, in order — paired by `reconstructState`. */
 function recordedCalls(messages: ModelMessage[]): RecordedCall[] {
@@ -101,7 +137,8 @@ function recordedCalls(messages: ModelMessage[]): RecordedCall[] {
     if (m.role !== 'assistant' || !Array.isArray(m.content)) continue;
     for (const p of m.content as any[]) {
       if (p?.type !== 'tool-call' || !outputs.has(p.toolCallId)) continue;
-      out.push({ toolName: p.toolName, argsHash: argsHash(parseInput(p.input)), output: outputs.get(p.toolCallId) });
+      const args = parseInput(p.input);
+      out.push({ toolName: p.toolName, argsHash: argsHash(args), output: outputs.get(p.toolCallId), args });
     }
   }
   return out;
@@ -133,6 +170,23 @@ function sideOf(values: unknown[], pricing: Record<string, ModelPricing>, text: 
   return side;
 }
 
+/** The calls the run itself made, with their arguments, in order — calls of earlier turns in its input are history. Calls no model. */
+export async function recordedTrace(source: JournalSource, runId: string): Promise<Array<{ toolName: string; args: unknown }>> {
+  return (await recordedResults(source, runId)).map(({ toolName, args }) => ({ toolName, args }));
+}
+
+/** The same calls with what each returned. Calls no model; the run is only read. */
+export async function recordedResults(source: JournalSource, runId: string): Promise<Array<{ toolName: string; args: unknown; output: unknown }>> {
+  const journal = readerOf(source);
+  const input = await journal.get<{ prompt?: unknown; messages?: unknown }>(runKeys.input(runId));
+  if (!input) throw new ReplaySourceError(`@gnldev/experiment: no recorded input for run '${runId}' — only a run started by GNL can be replayed`);
+  const entries = await journal.readRun(runId);
+  const seed = Array.isArray(input.messages) ? { messages: input.messages } : { prompt: input.prompt as string };
+  const { messages } = reconstructState(entries, entries.length, seed);
+  const seedLength = Array.isArray(input.messages) ? input.messages.length : 1;
+  return recordedCalls((messages as ModelMessage[]).slice(seedLength)).map(({ toolName, args, output }) => ({ toolName, args, output }));
+}
+
 /**
  * Plays `runId` again with `model` (and `system`, `prepareStep`), answering every tool call from the
  * recorded run and never executing a tool. Compares cost and calls with the recorded run.
@@ -142,11 +196,15 @@ export async function replayCounterfactual(opts: CounterfactualOptions): Promise
   const { runId } = opts;
   const journal = readerOf(opts.journal);
   const input = await journal.get<{ prompt?: unknown; messages?: unknown; system?: unknown }>(runKeys.input(runId));
-  if (!input) throw new ReplaySourceError(`@gnldev/optimizer: no recorded input for run '${runId}' — only a run started by GNL can be replayed`);
+  if (!input) throw new ReplaySourceError(`@gnldev/experiment: no recorded input for run '${runId}' — only a run started by GNL can be replayed`);
   const entries = await journal.readRun(runId);
   const seed = Array.isArray(input.messages) ? { messages: input.messages } : { prompt: input.prompt as string };
   const { messages: recordedMessages } = reconstructState(entries, entries.length, seed);
-  const recorded = recordedCalls(recordedMessages as ModelMessage[]);
+  // The seed is the run's input — earlier turns of the conversation, their tool calls included. Those
+  // were another run's work: counted here they read as calls this run made (a candidate that did the
+  // same work "missed" them), and a candidate that repeated one would be answered from the history.
+  const seedLength = Array.isArray(input.messages) ? input.messages.length : 1;
+  const recorded = recordedCalls((recordedMessages as ModelMessage[]).slice(seedLength));
 
   // Both sides priced from ONE table: the caller's, or the journal's `__pricing__` over the defaults —
   // two tables would make the comparison measure the tables.
@@ -158,6 +216,9 @@ export async function replayCounterfactual(opts: CounterfactualOptions): Promise
   // Candidate side.
   const unused = [...recorded];
   const made: CallSignature[] = [];
+  const trace: TracedCall[] = [];
+  const answers = new Map((opts.answers ?? []).map((a) => [`${a.toolName}:${argsHash(a.args)}`, a.output]));
+  const overrides = new Map((opts.overrides ?? []).map((a) => [`${a.toolName}:${argsHash(a.args)}`, a.output]));
   let divergence: CounterfactualResult['divergence'];
   const tools: Record<string, Tool> = {};
   for (const [name, def] of Object.entries(opts.tools ?? {})) {
@@ -167,10 +228,19 @@ export async function replayCounterfactual(opts: CounterfactualOptions): Promise
         const call = { toolName: name, argsHash: argsHash(args) };
         made.push(call);
         const i = unused.findIndex((r) => r.toolName === call.toolName && r.argsHash === call.argsHash);
+        const key = `${call.toolName}:${call.argsHash}`;
+        if (overrides.has(key)) {
+          if (i !== -1) unused.splice(i, 1);
+          trace.push({ toolName: name, args, source: 'override' });
+          return overrides.get(key);
+        }
         if (i === -1) {
-          divergence ??= { at: made.length - 1, call };
+          if (answers.has(key)) { trace.push({ toolName: name, args, source: 'answer' }); return answers.get(key); }
+          trace.push({ toolName: name, args, source: 'none' });
+          divergence ??= { at: made.length - 1, call, args };
           return { error: 'GNL replay: the recorded run never made this call, so it has no result to give' };
         }
+        trace.push({ toolName: name, args, source: 'recorded' });
         return unused.splice(i, 1)[0]!.output;
       },
     } as Tool;
@@ -188,9 +258,14 @@ export async function replayCounterfactual(opts: CounterfactualOptions): Promise
     } as any,
   });
   const system = opts.system ?? (typeof input.system === 'string' ? input.system : undefined);
+  // A memory run's input can hold a system message among its messages (observational memory puts its
+  // observations there). The run itself was called with allowSystemInMessages (@gnldev/durable run.ts);
+  // the AI SDK refuses such an input without it, so a replay of that run would never start.
+  const systemInMessages = Array.isArray(input.messages) && input.messages.some((m) => (m as { role?: unknown } | null)?.role === 'system');
   const result = await generateText({
     model,
     ...(Array.isArray(input.messages) ? { messages: input.messages as ModelMessage[] } : { prompt: String(input.prompt ?? '') }),
+    ...(systemInMessages ? { allowSystemInMessages: true } : {}),
     ...(system !== undefined ? { system } : {}),
     tools,
     stopWhen: [stepCountIs(opts.maxSteps ?? 20), () => divergence !== undefined],
@@ -199,7 +274,8 @@ export async function replayCounterfactual(opts: CounterfactualOptions): Promise
   } as any);
   const candidateSide = sideOf(seen, pricing, divergence ? '' : result.text, made);
 
-  const matched = made.filter((c, i) => !(divergence && i >= divergence.at));
+  // `made` and `trace` are pushed together: only the calls answered from the recording are compared with it.
+  const matched = made.filter((_, i) => trace[i]!.source === 'recorded' && !(divergence && i >= divergence.at));
   const recordedOrder = recorded.map((r) => `${r.toolName}:${r.argsHash}`).filter((k) => matched.some((c) => `${c.toolName}:${c.argsHash}` === k));
   const reordered = matched.map((c) => `${c.toolName}:${c.argsHash}`).join('|') !== recordedOrder.join('|');
   return {
@@ -207,6 +283,8 @@ export async function replayCounterfactual(opts: CounterfactualOptions): Promise
     recorded: recordedSide,
     candidate: candidateSide,
     ...(divergence ? { divergence } : {}),
+    recordedTrace: recorded.map(({ toolName, args }) => ({ toolName, args })),
+    trace,
     missed: divergence ? [] : unused.map(({ toolName, argsHash: h }) => ({ toolName, argsHash: h })),
     reordered: !divergence && reordered,
   };

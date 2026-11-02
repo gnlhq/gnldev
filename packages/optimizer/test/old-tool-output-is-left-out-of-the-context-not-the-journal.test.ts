@@ -4,7 +4,8 @@ import { tool } from 'ai';
 import { z } from 'zod';
 import { runDurable, gnlTool, InMemoryJournal, reconstructState } from '@gnldev/durable';
 import { createMockModel } from '../../durable/test/mock.js';
-import { maskMessages, maskOldToolOutputs, replayCounterfactual } from '../src/index.js';
+import { replayCounterfactual } from '@gnldev/experiment';
+import { maskMessages, maskOldToolOutputs } from '../src/index.js';
 
 const BIG = 'x'.repeat(4000);
 const result = (id: string, toolName: string, value: unknown) => ({ role: 'tool', content: [{ type: 'tool-result', toolCallId: id, toolName, output: { type: 'json', value } }] });
@@ -78,5 +79,34 @@ describe('old tool output is left out of the context, not the journal', () => {
 
   it('a misspelled option is refused', () => {
     expect(() => maskOldToolOutputs({ keeplast: 1 } as any)).toThrow(/keeplast/);
+  });
+});
+
+describe('as an AI SDK prepareStep, every step is masked from the conversation as it is, not from the last masked copy', () => {
+  // ai@7 carries the messages a prepareStep returned into the next step. A mask computed from those
+  // would freeze a note at the step it was first written ("2 steps ago" four steps later) and could
+  // never see the original output again.
+  it('four steps on: the note names the real distance', async () => {
+    const { generateText, stepCountIs } = await import('ai');
+    const seen: string[] = [];
+    let step = 0;
+    const model = createMockModel(async (o: any) => {
+      seen.push(JSON.stringify(o.prompt));
+      step++;
+      if (step <= 4) return { content: [{ type: 'tool-call', toolCallId: `t${step}`, toolName: step === 1 ? 'lookup' : 'ping', input: '{}' }], finishReason: 'tool-calls', usage: { inputTokens: 10, outputTokens: 1 } };
+      return { content: [{ type: 'text', text: 'done' }], finishReason: 'stop', usage: { inputTokens: 10, outputTokens: 1 } };
+    });
+    await generateText({
+      model: model as any, prompt: 'go', stopWhen: stepCountIs(6),
+      tools: {
+        lookup: tool({ description: 'Look up', inputSchema: z.object({}), execute: async () => BIG }),
+        ping: tool({ description: 'Ping', inputSchema: z.object({}), execute: async () => 'ok' }),
+      },
+      prepareStep: maskOldToolOutputs({ keepLast: 1 }).prepareStep as any,
+    });
+    expect(seen).toHaveLength(5);
+    expect(seen[2]).toMatch(/lookup output from 2 steps ago/);
+    expect(seen[4]).toMatch(/lookup output from 4 steps ago/);
+    expect(seen[4]).not.toMatch(/lookup output from 2 steps ago/);
   });
 });

@@ -24,7 +24,7 @@ export type {
   RunOutcomeRecord,
   RunRecord,
 } from './journal.js';
-export { BasicMemory, appendToJournalLog, retractFromJournalLog, readJournalLog, JournalLogContentionError, JOURNAL_LOG_MAX_ATTEMPTS, PROVENANCE_RECENT_CAP, messagePreview, memKey, MEM_LEAVES, OM_LEAVES, OM_VECTOR_SOURCE, semanticLogKey, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX, type OmLeaf } from './memory.js';
+export { BasicMemory, type BasicThread, appendToJournalLog, retractFromJournalLog, readJournalLog, JournalLogContentionError, JOURNAL_LOG_MAX_ATTEMPTS, PROVENANCE_RECENT_CAP, messagePreview, memKey, MEM_LEAVES, OM_LEAVES, OM_VECTOR_SOURCE, semanticLogKey, SEMANTIC_LOG_PREFIX, SEMANTIC_LOG_SUFFIX, type OmLeaf } from './memory.js';
 export type { Memory, MemoryContextProvenance, RecalledMessageRef, MemLeaf } from './memory.js';
 export { getRunCost, toTraceSpans } from './cost.js';
 // Sibling packages (@gnldev/otel's span builder) read the same journal records and hit the same
@@ -102,6 +102,8 @@ export { toolDescriptionText } from './types.js';
 export type { ToolDurability } from './types.js';
 export { runDurable, resumeRun, streamDurable, admitAgentRun, limitBreachFromSteps, blockedFromSteps, surfacedInterrupts, resolveApprovals, decisionOf, hasRunProbe, assertRunIdSafe, type ApprovalRecord } from './run.js';
 export type { RunDurableArgs, StreamDurableArgs, DurableResult, ResumeAgentConfig, StreamBreach, MemoryContextRecord } from './run.js';
+export { readMemoryLayout, readRunMemoryLayout, memoryRowsOf, cutWorkingMemory } from './memory-layout.js';
+export type { MemoryLayout, MemoryLayoutReading, SystemSpans, Span as MemoryLayoutSpan, LayoutPart as MemoryLayoutPart, MemoryRows } from './memory-layout.js';
 // K1/W1 (B): sentinel→error conversion helper for code that consumes streamDurable directly.
 export { streamFinishError } from './run.js';
 // Greenfield storage contracts (ports + Storage + capability + composite).
@@ -160,7 +162,7 @@ export type { ProtectionRow, ProtectionMark, ProtectionSource, ProtectionContext
 export { runNetwork, getNetworkTrace, netKeys } from './network.js';
 export type { NetworkResult, NetworkStep, NetworkTarget, NetworkChildRun, RouteDecision, RunNetworkOptions } from './network.js';
 export { withOrg, withRootScope, orgScopeOf, orgPrefix, isOrganizationKey, parseOrganizationKey, orgSpaceSql, ORG_KEY_PREFIX, isPlatformKey, assertOrgRegistered, ORG_RECORD_PRE, ADOPTABLE_RESERVED_PREFIXES, ENGINE_META_KEYS } from './organization.js';
-export { assertNoRunsInFlight } from './model.js';
+export { assertNoRunsInFlight, personRecordKey, personRecordPrefix } from './model.js';
 export { withOrgStorage, orgStorageScopeOf, scopeConfigToOrg } from './org-storage.js';
 export { MEMORY_PARTITION, memoryPartitionOf, inMemoryPartition, assertRootThreadId, ReservedThreadIdError, type MemoryPartition, type MemoryPartitionOption } from './storage.js';
 export { withSubjectJournal, withSubjectMemory, type SubjectViewOptions, type SubjectMemoryOptions } from './subject-view.js';
