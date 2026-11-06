@@ -150,7 +150,7 @@ describe('PostgresStorage schema tooling (pg-mem)', () => {
     expect(before.missingColumns.map((c) => c.column).sort()).toEqual(['resource_id', 'suspended_count', 'thread_id']);
     expect(before.missingColumns.every((c) => c.table === 'gnl_runs')).toBe(true);
     expect(before.missingTables.sort()).toEqual(
-      ['gnl_counters', 'gnl_run_journal', 'gnl_threads', 'gnl_messages', 'gnl_working_memory', 'gnl_observations', 'gnl_message_batches', 'gnl_vectors', 'gnl_work_log', 'gnl_work_kv', 'gnl_work_seq', 'gnl_cache'].sort(),
+      ['gnl_counters', 'gnl_run_journal', 'gnl_threads', 'gnl_messages', 'gnl_working_memory', 'gnl_observations', 'gnl_message_batches', 'gnl_vectors', 'gnl_work_log', 'gnl_work_kv', 'gnl_work_seq', 'gnl_work_ready', 'gnl_work_ready_lane', 'gnl_cache'].sort(), // k5 E: the ready set's two tables
     );
 
     const dry = await schemaStep(storage, true);

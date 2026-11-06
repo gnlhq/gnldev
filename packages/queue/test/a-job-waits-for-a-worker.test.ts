@@ -8,7 +8,8 @@
 // after a while with no live worker on its store is reported, once per type.
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { InMemoryStorage } from '@gnldev/durable';
-import { createQueue, createWorker, enqueue, listJobs, NO_WORKER_NOTICE_MS } from '../src/index.js';
+import { createQueue, createWorker, enqueue, NO_WORKER_NOTICE_MS } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function until(cond: () => boolean | Promise<boolean>, ms = 5_000): Promise<boolean> {

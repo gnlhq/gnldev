@@ -1,5 +1,5 @@
 // gnl.config convention: defineConfig (type helper) + loadConfig (dynamic loader).
-import type { CreateGnlConfig } from '@gnldev/durable';
+import type { CreateGnlConfig, RunLimits } from '@gnldev/durable';
 import { readFileSync } from 'node:fs';
 import { parseEnv } from 'node:util';
 import { refuseUnknownNames } from '@gnldev/options';
@@ -124,6 +124,14 @@ export interface GnlDevConfig extends CreateGnlConfig {
    * and GNL_END_USER_SECRET for `endUsers.secret`. `endUsers` is how end users hold a token of their own.
    */
   auth?: { superAdmin?: GnlCred; admin?: GnlCred; client?: GnlCred; viewer?: GnlCred; endUsers?: GnlEndUsers };
+  /**
+   * The per-run limits of every run this deployment starts — `maxCostUsd`, `maxTokens`, `maxToolCalls`,
+   * loop detection. They are `createRestApi`'s `limits`: the SERVER-SIDE upper bound, which a request's
+   * own `limits` can only tighten, and which applies as-is when a request names none. `gnl dev` passes
+   * it, and so does the `src/app.ts` that `gnl add host` writes. Unset → no limit, exactly as before.
+   * Studio's own Playground runs are not REST requests and are not capped by it.
+   */
+  limits?: RunLimits;
   /** Paid @gnldev/auth-ee license key (or GNL_LICENSE_KEY env). If installed, the premium provider takes over. */
   license?: string;
   /** License signature public key (base64url DER spki; or GNL_EE_PUBLIC_KEY env). */

@@ -4,7 +4,8 @@
 // holder) is never counted: it runs again on every poll, past maxAttempts, and never dead-letters.
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, acquireRunLock, runDurable, toJournal, type Storage } from '@gnldev/durable';
-import { enqueue, createWorker, listJobs } from '../../src/index.js';
+import { enqueue, createWorker } from '../../src/index.js';
+import { listAllJobs as listJobs } from '../fixtures/k5-list-all.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const answer: any = {

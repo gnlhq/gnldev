@@ -13,7 +13,8 @@
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, type Storage, type Guard } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
-import { enqueue, createWorker, retryJob, listJobs } from '../src/index.js';
+import { enqueue, createWorker, retryJob } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 

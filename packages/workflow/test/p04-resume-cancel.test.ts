@@ -193,6 +193,7 @@ describe('FLOW-08 — workflowName mirrored into the wfrun: status record', () =
       status: 'completed',
       workflowName: 'my-workflow',
       updatedAt: completedStatus!.updatedAt,
+      suspendSeq: 1, // suspended once, then completed: the counter is carried over
     });
   });
 
@@ -212,6 +213,7 @@ describe('FLOW-08 — workflowName mirrored into the wfrun: status record', () =
       waitId: 'approval',
       reason: { kind: 'resume' },
       updatedAt: raw.updatedAt,
+      suspendSeq: 1,
     });
 
     const status = await getWorkflowRunStatus(journal, 'r-flow08-b');

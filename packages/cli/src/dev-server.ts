@@ -48,8 +48,11 @@ function credFromEnv(role: 'SUPERADMIN' | 'ADMIN' | 'CLIENT' | 'VIEWER'): Cred |
   return token || (user && pass) ? { token, user, pass } : undefined;
 }
 
-/** Free role-based provider (sync): config.auth → env fallback. undefined if no role is set (opt-in). */
-function freeAuth(config: GnlDevConfig, auth: typeof Auth): AuthProvider | undefined {
+/**
+ * Free role-based provider (sync): config.auth → env fallback. undefined if no role is set (opt-in).
+ * @internal — also read by `gnl doctor`, which asks the same question `gnl dev` answers at boot.
+ */
+export function freeAuth(config: GnlDevConfig, auth: typeof Auth): AuthProvider | undefined {
   // Every class `roleAuth` has. This passed admin and viewer only, so `client` and `endUsers` in a
   // gnl.config were dropped without a word — measured: a correctly signed end-user token got 403.
   const endUserSecret = process.env.GNL_END_USER_SECRET;
@@ -130,6 +133,8 @@ export function buildDevApp(config: GnlDevConfig, rt: DevRuntimeModules, auth?: 
     title: config.title,
     auth: provider,
     protectionsBanner: false,
+    // The per-run limits the config declares: the REST host's server-side bound (a request may only tighten them).
+    ...(config.limits ? { limits: config.limits } : {}),
     // The formats the project declares (the scaffold's chat surface), and the browser origin its
     // generated src/identity.ts points at — the same two things the project's own server passes.
     ...(config.surfaces?.length ? { surfaces: config.surfaces as never } : {}),

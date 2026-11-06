@@ -13,6 +13,7 @@
 // Best-effort, like every other observability write here (usage counters, metrics, incidents): a
 // journal that refuses this write must not take down a run that otherwise succeeded, and must not
 // convert a real error into a different one on the failure path.
+import { revokedWhy, continuesElsewhere } from './execution-grant.js';
 import { runKeys } from './journal.js';
 import type { Journal, RunOutcomeRecord } from './journal.js';
 import { RunBusyError, CALLER_CONFLICT_CODES } from './errors.js';
@@ -120,12 +121,17 @@ export function classifyRunError(err: unknown): 'failure' | 'contended' | 'not-a
  *                spend: the unit ends now, failed, with that error — retried, it reported a deletion
  *                "while it was running" on every attempt of a run that no longer ran (e2e F1). Another
  *                run deleted under the unit is the unit's own code failing: an attempt.
- *   'attempt'  — everything else: the unit's own code ran and failed.
+ *   'attempt'  — everything else: the unit's own code ran and failed — a time limit (`timeout`) or a cancel
+ *                that stopped it included (execution-grant.ts); a lost lease or a release is 'released'.
  *
  * By name, one `cause` deep (a library may wrap what it rethrows): a host with two resolved copies of
  * this package must not get a different answer from a failed `instanceof`.
  */
 export function attemptEndOf(err: unknown, unitRunId: string): 'released' | 'deferred' | 'erased' | 'attempt' {
+  // Its right to execute was revoked (execution-grant.ts): released or taken by another holder → the work
+  // continues elsewhere, nothing of it ended here. A time limit or a cancel is the unit's own attempt.
+  const why = revokedWhy(err);
+  if (why !== undefined) return continuesElsewhere(why) ? 'released' : 'attempt';
   for (let e = err as { name?: unknown; atLockAcquisition?: unknown; runId?: unknown; cause?: unknown } | null | undefined, i = 0; e && typeof e === 'object' && i < 2; e = e.cause as typeof e, i++) {
     if (e.name === 'RunDrainedError' || e.name === 'LivenessUnavailableError') return 'released';
     if (e.name === 'RunBusyError' && e.atLockAcquisition === true && e.runId === unitRunId) return 'deferred';

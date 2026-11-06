@@ -20,7 +20,7 @@ import { SEM_RULESET_VERSION } from './semantic-rules.js';
 import { judgeGrayPair } from './semantic-judge.js';
 import { xidPlanOf, readXid, xidWhen, amountsDifferOf, completeOwnXid, writeXid, type XidPlan, type XidHeld } from './xid.js';
 import { Attempt, AttemptLost, compareAndSet, isUnstartedRelease, type DupMarker, type TerminalWriter } from './attempt.js';
-import { claimTtlFor, claimTimeLeft, claimIsLive, journalNow, newHoldId } from './liveness.js';
+import { claimTtlFor, claimTimeLeft, claimIsLive, journalNow, newHoldId, releaseHold } from './liveness.js';
 import { procStampFor, bindOwnLiveness, isDraining, RunDrainedError, livenessFor } from './process-liveness.js';
 import type { SemPlan } from './semantic-dup.js';
 import type { RunLimits, ToolSeat } from './limits.js';
@@ -887,7 +887,10 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           const now = await journalNow(ctx.journal);
           if (!(await claimIsLive(rec, now, claimTtl, ctx.journal))) break; // stale (or undated): the crash ladder's
           if (mode !== 'args') return { answered: busy() };
-          await sleep(Math.max(5, Math.min(poll, claimTimeLeft(rec, now, claimTtl))));
+          // Its age bounds the wait only while its age decides: a claim its holder answers for (live past
+          // its TTL) is waited out on the backoff, not re-read every 5 ms.
+          const left = claimTimeLeft(rec, now, claimTtl);
+          await sleep(left > 0 ? Math.max(5, Math.min(poll, left)) : poll);
           poll = Math.min(poll * 2, POLL_MAX_MS);
           rec = readRecord(await ctx.journal.get<ToolJournalRecord>(key));
           if (isAnswer(rec)) return { answered: await consumeExistingRecord(ctx, key, rec, toolCallId) };
@@ -1880,6 +1883,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
             if (ownerKey) await claimCrossRunOwner(ctx, toolName, hash);
             break claimLoop;
           }
+          releaseHold(stamp.hold, ctx.journal); // lost: its attempt never began
           record = upgradeFormat(raw, key); // H13
           if (record) await assertCrossRunOwner(record);
           if (isAnswer(record)) return await consumeExistingRecord(ctx, key, record, toolCallId);
@@ -2190,6 +2194,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         const priorAttempts = attemptsInDoubt(before) ?? 0;
         const takeover = runningStamp(ctx.journal, nowTakeover, priorAttempts + 1, claimTtl, keyOf(before));
         if (rawBefore === undefined || !(await compareAndSet(ctx.journal, key, rawBefore, takeover))) {
+          releaseHold(takeover.hold, ctx.journal); // lost: its attempt never began
           record = upgradeFormat(await ctx.journal.get<ToolJournalRecord>(key), key);
           if (isAnswer(record)) return await consumeExistingRecord(ctx, key, record, toolCallId);
           if (mode !== 'args') return busy();

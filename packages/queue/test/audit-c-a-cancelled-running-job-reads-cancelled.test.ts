@@ -5,7 +5,8 @@
 // `failed`, not `cancelled`.
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, type Storage } from '@gnldev/durable';
-import { enqueue, createWorker, cancelJob, listJobs } from '../src/index.js';
+import { enqueue, createWorker, cancelJob } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 describe('a job cancelled while its handler runs', () => {
   it('reads cancelled when the handler stops on ctx.signal', async () => {

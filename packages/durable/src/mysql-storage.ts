@@ -28,18 +28,18 @@ import { cosineSimilarity } from 'ai';
 import { refuseUnknownNames } from '@gnldev/options';
 import { leafSuffix, runRecordKey } from './run-id-grammar.js';
 import { closeExecutorFor } from './executors.js';
-import { unbindLiveness, livenessIdOf, LivenessUnavailableError, reconnectGraceOf, sessionSignals, proofWithin, HEARTBEAT_MS, type ProcessLiveness } from './process-liveness.js';
+import { unbindLiveness, StoreLivenessSlot, livenessIdOf, LivenessUnavailableError, reconnectGraceOf, sessionSignals, proofWithin, HEARTBEAT_MS, type ProcessLiveness } from './process-liveness.js';
 import { ROOT_EXEC_RECORDS, isScopeFact, scopeFactKeys, scopeFactsDroppedByAdoption, staysAtRoot, onAdoptionCollision, adoptionConflict } from './adoption.js';
 import { prefixUpperBound, ENGINE_META_KEYS, assertOrgRegistered, isPlatformKey, orgPrefix, orgSpaceSql, prefixSql } from './organization.js';
 import {
   assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition, markWorkOf, memoryPartitionOf, memoryPartitionSql,
   NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, rankVectorMatches, assertVectorDimension,
-  vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, vectorDocumentOf, vectorFilterDocument,
+  vectorDeletePlan, VECTOR_OUTSIDE_ORGANIZATIONS_SQL, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, vectorDocumentOf, vectorFilterDocument, readyRankSql, readyStep, planAppendMany, rankAppendMany, manyRows, valuesSql,
   type MemoryPartitionOption,
 } from './storage.js';
 import type {
   AdoptIntoOrgResult, Storage, CapabilityMatrix, Page, ListQuery, RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
-  ThreadRecord, MessageRecord, MessageAppend, Observation, RecallOptions, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord,
+  ThreadRecord, MessageRecord, MessageAppend, Observation, RecallOptions, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord, ReadyEntry, ReadyTake, ReadyItem, ReadyHeld, WorkRecord,
 } from './storage.js';
 import {
   runIdOfKey, parseJournalKey, outcomeStatusOf, runRelationsOf, relationsOfInput, ownerColumnOf, ownerOfRecord, OWNER_RECORD_LIKE, RunRowChanges,
@@ -179,6 +179,9 @@ const TABLES = [
   `CREATE TABLE IF NOT EXISTS gnl_work_log (ns VARBINARY(1024) NOT NULL, id VARBINARY(2048) NOT NULL, payload LONGBLOB NOT NULL, ts BIGINT NOT NULL, seq BIGINT NOT NULL DEFAULT 0, ord BIGINT NOT NULL AUTO_INCREMENT, PRIMARY KEY (ns, id), KEY gnl_work_log_ord (ord))`,
   `CREATE TABLE IF NOT EXISTS gnl_work_seq (ns VARBINARY(1024) NOT NULL PRIMARY KEY, seq BIGINT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS gnl_work_kv (\`key\` VARBINARY(3072) NOT NULL PRIMARY KEY, value LONGBLOB NOT NULL)`,
+  // A ready set's entries (`WorkStore.appendReady`) and the rows a namespace's ranking locks (PgWorkStore).
+  `CREATE TABLE IF NOT EXISTS gnl_work_ready (rset VARBINARY(255) NOT NULL, id VARBINARY(2048) NOT NULL, ns VARBINARY(1024) NOT NULL, kind VARBINARY(1024) NOT NULL, not_before BIGINT NOT NULL, rnk DOUBLE NOT NULL, seq BIGINT NOT NULL AUTO_INCREMENT, hold VARBINARY(255) NULL, hproc VARBINARY(255) NULL, hat BIGINT NULL, httl BIGINT NULL, PRIMARY KEY (rset, id), KEY gnl_work_ready_seq (seq), KEY gnl_work_ready_take (rset, rnk, seq), KEY gnl_work_ready_ns (rset, ns, rnk), KEY gnl_work_ready_id (id), KEY gnl_work_ready_held (rset, hold))`,
+  `CREATE TABLE IF NOT EXISTS gnl_work_ready_lane (rset VARBINARY(255) NOT NULL, ns VARBINARY(1024) NOT NULL, PRIMARY KEY (rset, ns))`,
   `CREATE TABLE IF NOT EXISTS gnl_cache (\`key\` VARBINARY(3072) NOT NULL PRIMARY KEY, value LONGBLOB NOT NULL, expires_at BIGINT)`,
 ];
 const INDEXES = [
@@ -210,6 +213,8 @@ function expectedTables(): Map<string, Map<string, string>> {
 }
 
 /** `col >= $n [AND col < $n+1]`, numbered from `from`; no upper bound for the empty prefix (every key). */
+/** Keys per `IN` of `getMany`. */
+const KV_MANY = 500;
 function myRange(col: string, prefix: string, from: number): { where: string; params: string[] } {
   const upper = prefixUpperBound(prefix);
   return upper === undefined
@@ -272,6 +277,13 @@ export interface MysqlStorageOptions {
   connectionString?: string;
   /** Or a `mysql2/promise` pool of your own (its connections are given this store's session settings when it announces them). */
   pool?: MysqlPool;
+  /**
+   * This process's liveness on this database (`mysqlLiveness`), when the store cannot make its own. It is
+   * THE store's liveness — every component on this store (registry, queue worker, scheduler, a direct
+   * primitive) stamps and proves with it. Default: a session the store opens from its connection. Closed
+   * by its owner, not by the store.
+   */
+  liveness?: ProcessLiveness | Promise<ProcessLiveness>;
 }
 
 /** What `MysqlStorage` shares with its ports: the database name (lock namespaces), settled at boot. */
@@ -298,7 +310,8 @@ export class MysqlStorage implements Storage {
   private readonly shared: Shared = { db: '' };
   private ready?: Promise<void>;
   private connectionBudget?: { poolMax: number; serverMax: number };
-  private ownLiveness?: Promise<ProcessLiveness>;
+  /** This store's liveness: the one given (`MysqlStorageOptions.liveness`), else its own session — see `StoreLivenessSlot`. */
+  private readonly livenessSlot: StoreLivenessSlot<Promise<ProcessLiveness>>;
   /** The connection pool — for companion stores in the same database. */
   get pool(): MysqlPool { return this._pool; }
 
@@ -306,6 +319,13 @@ export class MysqlStorage implements Storage {
     refuseUnknownNames('MysqlStorage', opts, MYSQL_STORAGE_NAMES);
     if (!opts.pool && !opts.connectionString) throw new Error('@gnldev/durable: MysqlStorage needs a connectionString (mysql://user:password@localhost:3306/database) or a pool.');
     this.connectionString = opts.connectionString;
+    this.livenessSlot = new StoreLivenessSlot(opts.liveness && Promise.resolve(opts.liveness), () => {
+      const cfg = this._pool.pool?.config?.connectionConfig;
+      if (!this.connectionString && !cfg) {
+        return Promise.reject(new Error('@gnldev/durable: this MySQL pool does not say where it connects, so no process liveness can be made for it — pass `liveness: await mysqlLiveness({ connectionString })` to MysqlStorage'));
+      }
+      return mysqlLiveness(this.connectionString ? { connectionString: this.connectionString } : { connection: cfg! });
+    });
     this._pool = opts.pool ?? driver().createPool({ uri: opts.connectionString, ...CONNECTION_DEFAULTS, waitForConnections: true, connectionLimit: 10 });
     // Every connection the pool opens gets the session settings before its first statement: the driver
     // runs a connection's statements in order, so these are sent ahead of whatever asked for it.
@@ -360,18 +380,8 @@ export class MysqlStorage implements Storage {
     this.meta = new MyMetaStore(q);
   }
 
-  /** This process's liveness on this database: a named lock held by a dedicated session (`mysqlLiveness`), made on first use, ended by `close()`. */
-  processLiveness(): Promise<ProcessLiveness> {
-    if (this.ownLiveness) return this.ownLiveness;
-    const cfg = this._pool.pool?.config?.connectionConfig;
-    if (!this.connectionString && !cfg) {
-      return Promise.reject(new Error('@gnldev/durable: this MySQL pool does not say where it connects, so no process liveness can be made for it — pass `liveness: await mysqlLiveness({ connectionString })` to createGnl'));
-    }
-    const made = mysqlLiveness(this.connectionString ? { connectionString: this.connectionString } : { connection: cfg! });
-    this.ownLiveness = made;
-    made.catch(() => { if (this.ownLiveness === made) this.ownLiveness = undefined; });
-    return made;
-  }
+  /** This process's liveness on this database: the one the store was given, else a named lock held by a dedicated session (`mysqlLiveness`), made on first use, ended by `close()`. */
+  processLiveness(): Promise<ProcessLiveness> { return this.livenessSlot.get(); }
 
   private ensureReady(): Promise<void> {
     if (this.ready) return this.ready;
@@ -417,9 +427,7 @@ export class MysqlStorage implements Storage {
   async close(): Promise<void> {
     await closeExecutorFor(this.runs as unknown as Parameters<typeof closeExecutorFor>[0]);
     unbindLiveness(this.runs);
-    const own = this.ownLiveness;
-    this.ownLiveness = undefined;
-    if (own) await (await own.catch(() => undefined))?.close();
+    await this.livenessSlot.close();
     await this._pool.end();
   }
 
@@ -499,7 +507,7 @@ export class MysqlStorage implements Storage {
       this.booted(threadRecordsStep(this, ['schema'])),
       this.booted(relationsStep(this.runs as MyRunJournal, ['schema'])),
       this.booted(verifyRelationsStep(this.runs as MyRunJournal, ['schema'])),
-    ], opts, () => this.holdsAStore());
+    ], opts, () => this.holdsAStore(), this);
   }
   private booted(step: UpgradeStep): UpgradeStep {
     const plan = step.plan;
@@ -1376,6 +1384,108 @@ class MyWorkStore implements WorkStore {
       await q(`UPDATE gnl_work_log SET seq = CASE id ${cases.join(' ')} END WHERE ns = $1 AND seq = 0 AND id IN (${ids.map((_, i) => `$${at + i + 1}`).join(', ')})`, params);
     });
   }
+  /** By the primary key `(ns, id)` (`WorkStore.read`). */
+  async read<T = unknown>(ns: string, id: string): Promise<LogRecord<T> | undefined> {
+    const x = (await this.q('SELECT id, payload, ts FROM gnl_work_log WHERE ns = $1 AND id = $2', [ns, id])).rows[0];
+    return x ? { id: x.id as string, payload: deserialize<T>(x.payload as string), ts: Number(x.ts) } : undefined;
+  }
+  /**
+   * The record and its entry in one transaction (`WorkStore.appendReady`). The record first, outside the
+   * turn; then the namespace's turn, its lane row locked (`FOR UPDATE`), and in it only the statement that
+   * computes the rank (`readyRankSql`) and writes it, and the commit. Two statements, not one with
+   * `FOR UPDATE OF`, which MariaDB does not parse. The rank's inputs are read by the statement after the
+   * lock, under READ COMMITTED: what every earlier holder committed, so two entries of one namespace are
+   * never ranked alike. A namespace's first entry makes its lane row and ranks the same way. (Not
+   * `LAST_INSERT_ID(expr)`: it keeps a BIGINT UNSIGNED, and a rank is a DOUBLE — a step below 1 gives
+   * fractions; nothing is read back here at all.)
+   */
+  async appendReady(ns: string, payload: unknown, id: string, e: ReadyEntry): Promise<string> {
+    const rank = `INSERT INTO gnl_work_ready (rset, id, ns, kind, not_before, rnk)
+      SELECT l.rset, $2, l.ns, $3, $4, ${readyRankSql(
+        '(SELECT MIN(f.rnk) FROM gnl_work_ready f WHERE f.rset = l.rset AND f.not_before <= $5 AND f.hold IS NULL)',
+        '(SELECT MAX(t.rnk) FROM gnl_work_ready t WHERE t.rset = l.rset AND t.ns = l.ns)',
+        '$6',
+      )} FROM gnl_work_ready_lane l
+      WHERE l.rset = $1 AND l.ns = $7 AND NOT EXISTS (SELECT 1 FROM gnl_work_ready h WHERE h.rset = l.rset AND h.id = $2)`;
+    const turn = 'SELECT ns FROM gnl_work_ready_lane WHERE rset = $1 AND ns = $2 FOR UPDATE';
+    const p = [e.set, id, e.kind, e.notBefore, e.now, readyStep(e.step), ns];
+    await this.tx(async (q) => {
+      await insertNew(q, 'INSERT INTO gnl_work_log (ns, id, payload, ts) VALUES ($1,$2,$3,$4)', [ns, id, serialize(payload), Date.now()]);
+      if ((await q(turn, [e.set, ns])).rowCount === 0) {
+        await q('INSERT INTO gnl_work_ready_lane (rset, ns) VALUES ($1,$2) ON DUPLICATE KEY UPDATE ns = ns', [e.set, ns]);
+        await q(turn, [e.set, ns]);
+      }
+      await q(rank, p);
+    });
+    return id;
+  }
+  /**
+   * Every record and entry in one transaction (`WorkStore.appendMany`), each namespace ranked in ONE turn, as
+   * `PgWorkStore.appendMany`: the records in call order, then the call's lane rows locked in name order
+   * (`FOR UPDATE`) and held to the commit, then the rank's inputs read once under them (READ COMMITTED) and
+   * the entries (`rankAppendMany`). An existing record stays (`ON DUPLICATE KEY UPDATE` that changes
+   * nothing: `INSERT IGNORE` would also turn a value strict mode refuses into a warning).
+   */
+  async appendMany(records: readonly WorkRecord[]): Promise<void> {
+    const plan = planAppendMany(records);
+    if (!plan.records.length) return;
+    const rows = plan.records.map((r) => [r.ns, r.id, serialize(r.payload)]);
+    const ts = Date.now();
+    const list = (n: number, from: number) => Array.from({ length: n }, (_, i) => `$${from + i}`).join(', ');
+    await this.tx(async (q) => {
+      for (const part of manyRows(rows)) {
+        await q(`INSERT INTO gnl_work_log (ns, id, payload, ts) VALUES ${valuesSql(part.length, 4)} ON DUPLICATE KEY UPDATE ns = ns`, part.flatMap((r) => [...r, ts]));
+      }
+      const ready = plan.ready;
+      if (!ready) return;
+      const lanes = [...plan.lanes].sort();
+      for (const part of manyRows(lanes)) {
+        await q(`INSERT INTO gnl_work_ready_lane (rset, ns) VALUES ${valuesSql(part.length, 2)} ON DUPLICATE KEY UPDATE ns = ns`, part.flatMap((ns) => [ready.set, ns]));
+        await q(`SELECT ns FROM gnl_work_ready_lane WHERE rset = $1 AND ns IN (${list(part.length, 2)}) ORDER BY ns FOR UPDATE`, [ready.set, ...part]);
+      }
+      const floor = (await q('SELECT MIN(rnk) AS floor FROM gnl_work_ready WHERE rset = $1 AND not_before <= $2 AND hold IS NULL', [ready.set, ready.now])).rows[0] as { floor: number | null } | undefined;
+      const tops = new Map<string, number | undefined>();
+      for (const part of manyRows(lanes)) {
+        const r = await q(`SELECT ns, MAX(rnk) AS top FROM gnl_work_ready WHERE rset = $1 AND ns IN (${list(part.length, 2)}) GROUP BY ns`, [ready.set, ...part]);
+        for (const x of r.rows as { ns: unknown; top: number | null }[]) tops.set(String(x.ns), x.top === null ? undefined : Number(x.top));
+      }
+      const has = new Set<string>();
+      for (const part of manyRows(plan.entries.map((x) => x.id))) {
+        const r = await q(`SELECT id FROM gnl_work_ready WHERE rset = $1 AND id IN (${list(part.length, 2)})`, [ready.set, ...part]);
+        for (const x of r.rows as { id: unknown }[]) has.add(String(x.id));
+      }
+      const floorRank = floor?.floor === null || floor === undefined ? undefined : Number(floor.floor);
+      for (const part of manyRows(rankAppendMany(plan, floorRank, tops, has))) {
+        await q(`INSERT INTO gnl_work_ready (rset, id, ns, kind, not_before, rnk) VALUES ${valuesSql(part.length, 6)}`, part.flatMap((x) => [ready.set, x.id, x.ns, x.kind, x.notBefore, x.rank]));
+      }
+    });
+  }
+  /** The lowest-ranked ready entry nobody holds and no other taker is taking (`FOR UPDATE SKIP LOCKED`), held by `holder`, in one transaction. */
+  async takeReady(set: string, t: ReadyTake): Promise<ReadyItem | undefined> {
+    const skip = [...(t.skipKinds ?? [])];
+    const h = t.holder;
+    return this.tx(async (q) => {
+      const x = (await q(
+        `SELECT id, ns FROM gnl_work_ready WHERE rset = $1 AND not_before <= $2 AND hold IS NULL${skip.length ? ` AND kind NOT IN (${skip.map((_, i) => `$${i + 3}`).join(', ')})` : ''} ORDER BY rnk, seq LIMIT 1 FOR UPDATE SKIP LOCKED`,
+        [set, t.now, ...skip],
+      )).rows[0] as { id: string; ns: string } | undefined;
+      if (!x) return undefined;
+      await q('UPDATE gnl_work_ready SET hold = $3, hproc = $4, hat = $5, httl = $6 WHERE rset = $1 AND id = $2', [set, x.id, h.hold, h.proc ?? null, t.now, h.ttlMs]);
+      return { ns: x.ns, id: x.id };
+    });
+  }
+  async heldReady(set: string): Promise<ReadyHeld[]> {
+    const r = await this.q('SELECT id, hold, hproc, hat, httl FROM gnl_work_ready WHERE rset = $1 AND hold IS NOT NULL', [set]);
+    return (r.rows as { id: unknown; hold: unknown; hproc: unknown; hat: unknown; httl: unknown }[])
+      .map((x) => ({ id: String(x.id), hold: String(x.hold), ...(x.hproc != null ? { proc: String(x.hproc) } : {}), at: Number(x.hat), ttlMs: Number(x.httl) }));
+  }
+  async deferReady(set: string, id: string, notBefore: number, hold?: string): Promise<void> {
+    if (hold === undefined) await this.q('UPDATE gnl_work_ready SET not_before = $3, hold = NULL, hproc = NULL, hat = NULL, httl = NULL WHERE rset = $1 AND id = $2', [set, id, notBefore]);
+    else await this.q('UPDATE gnl_work_ready SET not_before = $3, hold = NULL, hproc = NULL, hat = NULL, httl = NULL WHERE rset = $1 AND id = $2 AND hold = $4', [set, id, notBefore, hold]);
+  }
+  async dropReady(set: string, id: string): Promise<void> {
+    await this.q('DELETE FROM gnl_work_ready WHERE rset = $1 AND id = $2', [set, id]);
+  }
   async list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>> {
     const limit = q?.limit ?? 50;
     await this.numberNew(ns, Math.max(NUMBER_BATCH, limit + 1));
@@ -1393,6 +1503,34 @@ class MyWorkStore implements WorkStore {
     const r = await this.q('SELECT value FROM gnl_work_kv WHERE `key` = $1', [key]);
     return r.rows[0] ? deserialize<T>(r.rows[0].value) : undefined;
   }
+  /** One `IN` per KV_MANY keys (`WorkStore.getMany`), answered in the order asked. */
+  async getMany<T = unknown>(keys: string[]): Promise<(T | undefined)[]> {
+    const got = new Map<string, string>();
+    for (let i = 0; i < keys.length; i += KV_MANY) {
+      const part = [...new Set(keys.slice(i, i + KV_MANY))];
+      const r = await this.q(`SELECT \`key\`, value FROM gnl_work_kv WHERE \`key\` IN (${part.map((_, j) => `$${j + 1}`).join(', ')})`, part);
+      for (const x of r.rows as { key: unknown; value: string }[]) got.set(String(x.key), x.value);
+    }
+    return keys.map((k) => (got.has(k) ? deserialize<T>(got.get(k)!) : undefined));
+  }
+  /** One index probe per name (`WorkStore.listNamespaces`); `ns` is VARBINARY, so `>` and `ORDER BY` are byte order. */
+  async listNamespaces(prefix: string, q?: ListQuery): Promise<Page<string>> {
+    const limit = q?.limit ?? 50;
+    const r = myRange('ns', prefix, 1);
+    const names: string[] = [];
+    let after = q?.cursor;
+    while (names.length <= limit) {
+      const x = (after === undefined
+        ? await this.q(`SELECT ns FROM gnl_work_log WHERE ${r.where} ORDER BY ns LIMIT 1`, r.params)
+        : await this.q(`SELECT ns FROM gnl_work_log WHERE ${r.where} AND ns > $${r.params.length + 1} ORDER BY ns LIMIT 1`, [...r.params, after])).rows[0] as { ns: unknown } | undefined;
+      if (!x) break;
+      names.push(String(x.ns));
+      after = String(x.ns);
+    }
+    const more = names.length > limit;
+    if (more) names.pop();
+    return { items: names, nextCursor: more ? names[names.length - 1] : undefined };
+  }
   async put(key: string, value: unknown): Promise<void> {
     await this.q('INSERT INTO gnl_work_kv (`key`, value) VALUES ($1,$2) ON DUPLICATE KEY UPDATE value = VALUES(value)', [key, serialize(value)]);
   }
@@ -1407,11 +1545,15 @@ class MyWorkStore implements WorkStore {
     const l = await this.q(`DELETE FROM gnl_work_log WHERE ${lr.where}`, lr.params);
     const kr = myRange('`key`', prefix, 1);
     const k = await this.q(`DELETE FROM gnl_work_kv WHERE ${kr.where}`, kr.params);
-    return l.rowCount + k.rowCount;
+    const rr = await this.q(`DELETE FROM gnl_work_ready WHERE ${lr.where}`, lr.params);
+    await this.q(`DELETE FROM gnl_work_ready_lane WHERE ${lr.where}`, lr.params);
+    return l.rowCount + k.rowCount + rr.rowCount;
   }
   async deleteIdPrefix(idPrefix: string): Promise<number> {
     const r = myRange('id', idPrefix, 1);
-    return (await this.q(`DELETE FROM gnl_work_log WHERE ${r.where}`, r.params)).rowCount;
+    const n = (await this.q(`DELETE FROM gnl_work_log WHERE ${r.where}`, r.params)).rowCount;
+    await this.q(`DELETE FROM gnl_work_ready WHERE ${r.where}`, r.params);
+    return n;
   }
 }
 

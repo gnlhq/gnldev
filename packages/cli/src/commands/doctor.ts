@@ -29,7 +29,7 @@ import { flag, flagBool } from '../args.js';
 import { loadConfig } from '../config.js';
 import type { GnlDevConfig } from '../config.js';
 import { getJournal } from '../journal-util.js';
-import { loadDurable, projectDirOf } from '../runtime.js';
+import { loadDurable, projectDirOf, registerInstalledUpgradeSteps } from '../runtime.js';
 import { identityRow } from '../protections-view.js';
 import { bold, dim, yellow } from '../ansi.js';
 
@@ -244,12 +244,33 @@ export const doctorCommand: Command = {
       for (const r of unwired) console.log(`  ${r.file}  ${dim(`— ${configPath} never imports it, so it does nothing. Wire it:`)}\n${r.humanWire.split('\n').map((l) => `      ${l}`).join('\n')}`);
       console.log('');
     }
+    // WHO CAN CALL THE API. The matrix above is about the journal's protections; whether the HTTP
+    // surface has a credential at all is a separate fact, and the one `gnl dev` states at boot
+    // ("auth: open"). A paid license makes the answer the EE provider's, which only `gnl dev` can
+    // resolve — so it is not claimed here either way.
+    if (!config.license && !process.env.GNL_LICENSE_KEY) {
+      try {
+        const { freeAuth } = await import('../dev-server.js');
+        const { loadAuth } = await import('../runtime.js');
+        if (!freeAuth(config, await loadAuth(projectDirOf(configPath)))) {
+          console.log(`${yellow('api access: open')} ${dim('— no credential is configured, so every endpoint answers anyone who can reach the port.')}`);
+          console.log(dim('  That includes GET /agents, which lists each agent\'s system prompt, and every run\'s record.'));
+          console.log(dim('  Fine on localhost while you build (gnl dev binds there). Before it is reachable from elsewhere: set'));
+          console.log(dim('  GNL_ADMIN_TOKEN (and GNL_VIEWER_TOKEN), or `auth` in gnl.config.ts.'));
+          console.log('');
+        }
+      } catch {
+        // @gnldev/auth is not installed here: nothing to state. `gnl dev` says its own side at boot.
+      }
+    }
     console.log(d.formatProtections(rows, { title: bold('gnl protections') }).join('\n'));
     console.log('');
     // A store an earlier version wrote answers correctly but at that version's speed until its steps
     // run. Asked as a dry run: doctor never writes.
     const store = config.storage;
     if (typeof store?.upgrade === 'function') {
+      // The packages the project has installed bring their steps, as `gnl upgrade` finds them.
+      await registerInstalledUpgradeSteps(store, d, projectDirOf(configPath));
       // A dry run that fails has not said "nothing pending": it is said as what it is, and doctor fails.
       const asked = await store.upgrade({ dryRun: true }).then((r) => ({ r }), (e: unknown) => ({ e }));
       if ('e' in asked) {
@@ -258,10 +279,17 @@ export const doctorCommand: Command = {
         console.log('');
         process.exitCode = 1;
       }
-      const pending = 'r' in asked ? asked.r.steps.filter((s) => s.pending) : [];
+      const rows = 'r' in asked ? asked.r.steps : [];
+      const registered = rows.filter((s) => d.isPackageStep(s.name) && s.detail?.notRegistered !== true);
+      if (registered.length) console.log(`${bold('upgrade steps registered')}  ${dim(registered.map((s) => s.name).join(', '))}`);
+      const pending = rows.filter((s) => s.pending);
       if (pending.length) {
         console.log(bold('upgrade pending'));
-        for (const s of pending) console.log(`  ${s.name}  ${dim(`— ${s.description}`)}`);
+        for (const s of pending) {
+          console.log(`  ${s.name}  ${dim(`— ${s.description}`)}${typeof s.detail?.waits === 'string' ? dim('  (waits for every process of the earlier version to be gone)') : ''}`);
+          // A debt no registered step answers is the one pending thing that stays pending whatever is run: say what fixes it.
+          if (s.detail?.notRegistered === true) { console.log(dim(`      add where the store is built:  ${s.detail.register as string}`)); process.exitCode = 1; }
+        }
         console.log(dim('  `gnl upgrade --list` shows what each step does; `gnl upgrade` runs them.'));
         console.log('');
       }

@@ -345,6 +345,20 @@ export class RunOwnerMismatchError extends Error {
 }
 
 /**
+ * The model's stream ended without saying it finished: a cut between the provider and this process.
+ * What came before the cut is not the step's answer, so nothing complete is recorded for it, and the
+ * same runId calls the model again (a tool call already journaled replays instead of being re-planned).
+ * `code` is the wire code — `upstreamFailure` reads it, on the thrown error and on one read back.
+ */
+export class RunUnfinishedError extends Error {
+  readonly code = 'run_unfinished';
+  constructor(runId: string, step: number, cause?: unknown) {
+    super(`run '${runId}': the model's stream was cut at step ${step} — it ended without saying it finished${cause === undefined ? '' : ` (${String((cause as Error | null)?.message ?? cause)})`}`, cause === undefined ? undefined : { cause });
+    this.name = 'RunUnfinishedError';
+  }
+}
+
+/**
  * FAZ-4 (critical profile, `tombstonePolicy: 'reject'`) — the runId was retention-swept
  * (`${runId}:swept` tombstone) and a late retry arrived AFTER the dedup window died with the run.
  * Re-running it silently would repeat the side effects the swept journal used to dedup; the critical
@@ -610,7 +624,7 @@ export function blockedErrorCode(err: unknown): BlockedErrorCode | undefined {
  * works for any provider that follows the same shape.
  */
 /**
- * The four codes above, as an ENUMERABLE value rather than only a union in the interface below.
+ * The four provider codes above (plus `run_unfinished`, the executor's own upstream reading), as an ENUMERABLE value rather than only a union in the interface below.
  *
  * A union type vanishes at compile time, so `scripts/check-error-pages.mjs` — which reads BUILT
  * modules on purpose — could not see this family at all. Measured: all four were on the wire with no
@@ -626,6 +640,13 @@ export const UPSTREAM_ERROR_CODES = {
   unauthorized: 'upstream_unauthorized',
   unavailable: 'upstream_unavailable',
   timeout: 'upstream_timeout',
+  /**
+   * The run's stream ended without saying it finished and nothing (cancel, release, timeout) stopped it:
+   * the engine's own reading (`RunUnfinishedError` from the recorder, or detached.ts), not a provider error
+   * it was handed. Upstream because the cut happened between the model and the run, never in the caller's
+   * request.
+   */
+  unfinished: 'run_unfinished',
 } as const;
 
 /**
@@ -759,6 +780,8 @@ function retryAfterSeconds(headers: unknown): number | undefined {
  *   which is the definition of a bad gateway.
  * a 4xx the provider blamed on the request body (400/404/422) also becomes **502**: the request the
  *   provider rejected is the one WE built, not the one the caller sent.
+ * a run that ended `run_unfinished` (its stream stopped without saying it finished, nothing stopped it)
+ *   becomes **502**: the answer was cut upstream; re-driving the same runId replays what completed.
  */
 export function upstreamFailure(err: unknown): UpstreamFailure | undefined {
   const e = unwrapRetry(err) as
@@ -767,6 +790,8 @@ export function upstreamFailure(err: unknown): UpstreamFailure | undefined {
     | undefined;
   if (!e || typeof e !== 'object') return undefined;
 
+  // A run that ended without finishing, read back from its ending (errorOf keeps the code).
+  if ((e as { code?: unknown }).code === UPSTREAM_ERROR_CODES.unfinished) return { status: 502, code: UPSTREAM_ERROR_CODES.unfinished };
   if (e.name === 'AI_LoadAPIKeyError') return { status: 502, code: UPSTREAM_ERROR_CODES.unauthorized };
 
   const status = typeof e.statusCode === 'number' ? e.statusCode : undefined;
@@ -822,6 +847,7 @@ const WIRE_STATUS_BY_CODE = {
   upstream_unauthorized: 502,
   upstream_unavailable: 502,
   upstream_timeout: 504,
+  run_unfinished: 502,
   // reserved id — the caller named what its scope may not name; change the id
   thread_id_reserved: 400,
   // request shape — the body is not a JSON object (readJsonObject); fix the request

@@ -32,18 +32,18 @@ import { cosineSimilarity } from 'ai';
 import { refuseUnknownNames } from '@gnldev/options';
 import { leafSuffix, runRecordKey } from './run-id-grammar.js';
 import { closeExecutorFor } from './executors.js';
-import { unbindLiveness, livenessIdOf, LivenessUnavailableError, reconnectGraceOf, sessionSignals, proofWithin, HEARTBEAT_MS, type ProcessLiveness } from './process-liveness.js';
+import { unbindLiveness, StoreLivenessSlot, livenessIdOf, LivenessUnavailableError, reconnectGraceOf, sessionSignals, proofWithin, HEARTBEAT_MS, type ProcessLiveness } from './process-liveness.js';
 import { ROOT_EXEC_RECORDS, isScopeFact, scopeFactKeys, scopeFactsDroppedByAdoption, staysAtRoot, onAdoptionCollision, adoptionConflict } from './adoption.js';
 import { prefixUpperBound, ENGINE_META_KEYS, assertOrgRegistered, isPlatformKey, orgPrefix, ORG_KEY_PREFIX } from './organization.js';
 import {
   assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition, markWorkOf, memoryPartitionOf,
   NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKeyAdoptCollision, matchFilter, vectorWriteBatch, assertSameVectorOwner, rankVectorMatches, assertVectorDimension,
-  vectorDeletePlan, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, vectorDocumentOf, vectorFilterDocument,
+  vectorDeletePlan, vectorQueryScope, vectorMetadataMatches, vectorAdoptCollision, vectorDocumentOf, vectorFilterDocument, readyRankExpr, readyStep, readyRunOffsets, planAppendMany,
   type MemoryPartition, type MemoryPartitionOption,
 } from './storage.js';
 import type {
   AdoptIntoOrgResult, Storage, CapabilityMatrix, Page, ListQuery, RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
-  ThreadRecord, MessageRecord, MessageAppend, Observation, RecallOptions, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord,
+  ThreadRecord, MessageRecord, MessageAppend, Observation, RecallOptions, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord, ReadyEntry, ReadyTake, ReadyItem, ReadyHeld, WorkRecord,
 } from './storage.js';
 import {
   runIdOfKey, parseJournalKey, outcomeStatusOf, runRelationsOf, relationsOfInput, ownerColumnOf, ownerOfRecord, isOwnerRecordKey, RunRowChanges,
@@ -125,8 +125,31 @@ const RETRY = Symbol('retry');
 const TX_BUDGET_MS = 60_000;
 const TX_OPTIONS = { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' }, readPreference: 'primary' };
 
+/** How often a write that keeps conflicting looks for a transaction nobody is left to finish. */
+const ORPHAN_LOOK_MS = 1_000;
+
 type TxOptions = { budgetMs?: number; lock?: string };
 type Tx = <T>(fn: (s: Session) => Promise<T>, opts?: TxOptions) => Promise<T>;
+
+/**
+ * A TRANSACTION NOBODY IS LEFT TO FINISH holds what it wrote until the server's own limit. A process killed
+ * between a transaction's writes and its commit leaves it open with no connection under it, and every
+ * write on those documents conflicts with it for `transactionLifetimeLimitSeconds` (60 s by default):
+ * measured, the next claim on the run failed at this store's 60 s budget, although the process that
+ * held the run was gone and its run taken over. So a write that keeps conflicting ends the idle sessions
+ * in a transaction whose connection is gone. A live client's connection is there; and should a live
+ * client's have closed between two of its commands, its transaction is refused and runs again whole
+ * (`TransientTransactionError`) — nothing is lost either way.
+ *
+ * Needs what the liveness needs (`inprog`, to see the connections) and ends only this user's sessions, unless
+ * it may kill any (`killAnySession`). Without them, or when the look fails, the server's limit stands.
+ */
+async function endOrphanedTransactions(client: Any): Promise<void> {
+  const ops: Doc[] = await client.db('admin').aggregate([{ $currentOp: { allUsers: true, idleSessions: true, idleConnections: true } }]).toArray();
+  const connected = new Set(ops.filter((o) => o.type !== 'idleSession').map((o) => o.client));
+  const orphans = ops.filter((o) => o.type === 'idleSession' && o.transaction && o.client && !connected.has(o.client));
+  if (orphans.length) await client.db('admin').command({ killSessions: orphans.map((o) => ({ id: (o.lsid as Doc).id })) });
+}
 
 /**
  * Runs `fn` in one transaction, again from a new snapshot each time it conflicts (see the head of the
@@ -137,6 +160,7 @@ type Tx = <T>(fn: (s: Session) => Promise<T>, opts?: TxOptions) => Promise<T>;
 async function transact<T>(client: Any, fn: (s: Session) => Promise<T>, o: TxOptions = {}): Promise<T> {
   const budget = o.budgetMs ?? TX_BUDGET_MS;
   const t0 = performance.now();
+  let nextLook = t0 + ORPHAN_LOOK_MS;
   const s = client.startSession();
   const again = (e: unknown) => (e === RETRY || hasLabel(e, TRANSIENT));
   try {
@@ -149,6 +173,10 @@ async function transact<T>(client: Any, fn: (s: Session) => Promise<T>, o: TxOpt
         await s.abortTransaction().catch(() => undefined);
         if (!again(e)) throw e;
         if (performance.now() - t0 >= budget) throw contended(e, o);
+        if (e !== RETRY && performance.now() >= nextLook) {
+          nextLook = performance.now() + ORPHAN_LOOK_MS;
+          await endOrphanedTransactions(client).catch(() => undefined);
+        }
         await pause(attempt);
         continue;
       }
@@ -248,7 +276,7 @@ const SCHEMA_VERSION = '1';
  */
 const COLLECTIONS = [
   'gnl_meta', 'gnl_run_journal', 'gnl_runs', 'gnl_counters', 'gnl_threads', 'gnl_messages', 'gnl_working_memory', 'gnl_observations',
-  'gnl_message_batches', 'gnl_vectors', 'gnl_work_log', 'gnl_work_seq', 'gnl_work_kv', 'gnl_cache', 'gnl_seq', 'gnl_locks',
+  'gnl_message_batches', 'gnl_vectors', 'gnl_work_log', 'gnl_work_seq', 'gnl_work_kv', 'gnl_work_ready', 'gnl_work_ready_lane', 'gnl_cache', 'gnl_seq', 'gnl_locks',
 ] as const;
 type Name = (typeof COLLECTIONS)[number];
 /** Collections a process makes on its own (not at boot), known so `checkSchema` does not list them as foreign. */
@@ -273,6 +301,13 @@ const INDEXES: ReadonlyArray<{ coll: Name; name: string; key: Doc; unique?: bool
   { coll: 'gnl_work_log', name: 'gnl_work_log_seq', key: { ns: 1, seq: 1, ts: 1, id: 1 } },
   { coll: 'gnl_work_log', name: 'gnl_work_log_new', key: { ns: 1, seq: 1, ord: 1 } },
   { coll: 'gnl_work_log', name: 'gnl_work_log_ids', key: { id: 1 } },
+  // A ready set's entries (`WorkStore.appendReady`): one per record, taken by rank, a namespace's top by rank.
+  { coll: 'gnl_work_ready', name: 'gnl_work_ready_id', key: { set: 1, id: 1 }, unique: true },
+  { coll: 'gnl_work_ready', name: 'gnl_work_ready_take', key: { set: 1, rnk: 1, ord: 1 } },
+  { coll: 'gnl_work_ready', name: 'gnl_work_ready_ns', key: { set: 1, ns: 1, rnk: 1 } },
+  { coll: 'gnl_work_ready', name: 'gnl_work_ready_ids', key: { id: 1 } },
+  { coll: 'gnl_work_ready', name: 'gnl_work_ready_held', key: { set: 1 }, partialFilterExpression: { hold: { $type: 'string' } } },
+  { coll: 'gnl_work_ready_lane', name: 'gnl_work_ready_lane_ns', key: { set: 1, ns: 1 }, unique: true },
 ];
 
 /** The field a SQL table's column is in here — the names `SCOPE_TABLES` and `adoptedColumns` speak. */
@@ -287,6 +322,7 @@ const FIELD: Record<string, Record<string, string>> = {
   gnl_message_batches: { thread_id: 'thread_id' },
   gnl_work_log: { ns: 'ns', id: 'id' },
   gnl_work_kv: { key: '_id' },
+  gnl_work_ready: { rset: 'set', ns: 'ns' },
   gnl_cache: { key: '_id' },
   gnl_meta: { k: '_id' },
 };
@@ -310,6 +346,13 @@ export interface MongoStorageOptions {
   connectionString: string;
   /** The database, when the connection string names none (or another one, e.g. the users' `authSource`). */
   database?: string;
+  /**
+   * This process's liveness on this database (`mongoLiveness`), when the store cannot make its own. It is
+   * THE store's liveness — every component on this store (registry, queue worker, scheduler, a direct
+   * primitive) stamps and proves with it. Default: a connection the store opens from its connection string.
+   * Closed by its owner, not by the store.
+   */
+  liveness?: MongoProcessLiveness | Promise<MongoProcessLiveness>;
 }
 
 export class MongoStorage implements Storage {
@@ -325,7 +368,8 @@ export class MongoStorage implements Storage {
   private readonly connectionString: string;
   private readonly dbName: string;
   private ready?: Promise<Colls>;
-  private ownLiveness?: Promise<MongoProcessLiveness>;
+  /** This store's liveness: the one given (`MongoStorageOptions.liveness`), else its own connection — see `StoreLivenessSlot`. */
+  private readonly livenessSlot: StoreLivenessSlot<Promise<MongoProcessLiveness>>;
   /** The database — for companion stores beside this one. */
   get db(): MongoDatabase { return this.client.db(this.dbName); }
 
@@ -334,12 +378,14 @@ export class MongoStorage implements Storage {
     if (!opts?.connectionString) throw new Error('@gnldev/durable: MongoStorage needs a connectionString (mongodb://user:password@localhost:27017/database?replicaSet=rs0).');
     this.connectionString = opts.connectionString;
     this.dbName = databaseOf(opts.connectionString, opts.database, 'MongoStorage');
+    this.livenessSlot = new StoreLivenessSlot(opts.liveness && Promise.resolve(opts.liveness), () => mongoLiveness({ connectionString: this.connectionString, database: this.dbName }));
     this.client = new (driver().MongoClient)(opts.connectionString);
     const boot = () => this.ensureReady();
     const tx: Tx = async (fn, o) => { await this.ensureReady(); return transact(this.client, fn, o); };
-    const nextOrd = async (name: string): Promise<number> => {
+    /** The next of a counter's values; with `count`, the last of that many (the rest just below it). */
+    const nextOrd = async (name: string, count = 1): Promise<number> => {
       const c = await boot();
-      const r = await c.gnl_seq.findOneAndUpdate({ _id: name }, { $inc: { n: 1 } }, { upsert: true, returnDocument: 'after' });
+      const r = await c.gnl_seq.findOneAndUpdate({ _id: name }, { $inc: { n: count } }, { upsert: true, returnDocument: 'after' });
       return Number(r.n);
     };
     this.runs = new MoRunJournal(boot, tx, nextOrd, () => driver().Double);
@@ -352,14 +398,8 @@ export class MongoStorage implements Storage {
     this.meta = new MoMetaStore(boot);
   }
 
-  /** This process's liveness on this database: a connection named for it (`mongoLiveness`), made on first use, ended by `close()`. */
-  processLiveness(): Promise<MongoProcessLiveness> {
-    if (this.ownLiveness) return this.ownLiveness;
-    const made = mongoLiveness({ connectionString: this.connectionString, database: this.dbName });
-    this.ownLiveness = made;
-    made.catch(() => { if (this.ownLiveness === made) this.ownLiveness = undefined; });
-    return made;
-  }
+  /** This process's liveness on this database: the one the store was given, else a connection named for it (`mongoLiveness`), made on first use, ended by `close()`. */
+  processLiveness(): Promise<MongoProcessLiveness> { return this.livenessSlot.get(); }
 
   private ensureReady(): Promise<Colls> {
     if (this.ready) return this.ready;
@@ -383,9 +423,7 @@ export class MongoStorage implements Storage {
   async close(): Promise<void> {
     await closeExecutorFor(this.runs as unknown as Parameters<typeof closeExecutorFor>[0]);
     unbindLiveness(this.runs);
-    const own = this.ownLiveness;
-    this.ownLiveness = undefined;
-    if (own) await (await own.catch(() => undefined))?.close();
+    await this.livenessSlot.close();
     await this.client.close();
   }
 
@@ -412,7 +450,8 @@ export class MongoStorage implements Storage {
     } catch { notes.push('The deployment\'s default write concern is not readable by this user. This store writes every transaction with w: "majority"; its single writes use the default.'); }
     if (members < 3) notes.push(`This replica set has ${members === 1 ? 'one server' : `${members} members`}: an acknowledged write lives on ${members === 1 ? 'that server only, and is lost with its disk' : 'too few members to survive the loss of one with a majority left'}. Run three members for failover.`);
     notes.push(KEEPALIVE_UNREADABLE);
-    const own = this.ownLiveness ? await this.ownLiveness.catch(() => undefined) : undefined;
+    const held = this.livenessSlot.current();
+    const own = held ? await held.catch(() => undefined) : undefined;
     const connectionVisibility = own ? own.visibility : 'not checked: this process has not opened its liveness';
     return {
       syncCommit: `transactions: w=majority; default write concern: ${defaultWrite}`, standbyNames: others.join(','), connectedStandbys: others.length,
@@ -477,7 +516,7 @@ export class MongoStorage implements Storage {
       this.booted(threadRecordsStep(this, ['schema'])),
       this.booted(relationsStep(this.runs as MoRunJournal, ['schema'])),
       this.booted(verifyRelationsStep(this.runs as MoRunJournal, ['schema'])),
-    ], opts, () => this.holdsAStore());
+    ], opts, () => this.holdsAStore(), this);
   }
   private booted(step: UpgradeStep): UpgradeStep {
     const plan = step.plan;
@@ -1431,7 +1470,7 @@ class MoVectorStore implements VectorStore {
 // ── work ───────────────────────────────────────────────────────────────────────────────────────────
 
 class MoWorkStore implements WorkStore {
-  constructor(private readonly boot: () => Promise<Colls>, private readonly tx: Tx, private readonly nextOrd: (name: string) => Promise<number>) {}
+  constructor(private readonly boot: () => Promise<Colls>, private readonly tx: Tx, private readonly nextOrd: (name: string, count?: number) => Promise<number>) {}
   /** Written UNNUMBERED (`seq` 0) and numbered by the first `list` that sees it (see PgWorkStore.append). */
   async append(ns: string, payload: unknown, id?: string): Promise<string> {
     const c = await this.boot();
@@ -1457,6 +1496,172 @@ class MoWorkStore implements WorkStore {
       await c.gnl_work_log.bulkWrite(rows.map((r, i) => ({ updateOne: { filter: { _id: r._id, seq: 0 }, update: { $set: { seq: top + 1 + i } } } })), o);
     });
   }
+  /** By the unique index `gnl_work_log_id` `(ns, id)` (`WorkStore.read`). */
+  async read<T = unknown>(ns: string, id: string): Promise<LogRecord<T> | undefined> {
+    const c = await this.boot();
+    const x = await c.gnl_work_log.findOne({ ns, id }, { projection: { id: 1, payload: 1, ts: 1 } }) as Doc | null;
+    return x ? { id: String(x.id), payload: deserialize<T>(x.payload as string), ts: Number(x.ts) } : undefined;
+  }
+  /**
+   * The record and its entry (`WorkStore.appendReady`), ranked by ONE `findOneAndUpdate` on the
+   * namespace's lane document — the namespace's turn, outside any transaction: MongoDB runs writes to one
+   * document one after another, where two transactions writing it abort each other (it was the lane write
+   * in the record's transaction, and 200 appends of one namespace at once retried each other for seconds).
+   * The lane document keeps `top`, the highest rank among the namespace's entries (null when it has none):
+   * this write sets it to the rank (`readyRankExpr`) from `floor`, read just before, and from `top` as the
+   * document has it — a rank given a moment ago counts though its entry is not written yet — or as the
+   * entries have it (an entry the lane never ranked: adopted from another namespace). Then the record and
+   * the entry in one transaction that writes no shared document. When the entry's namespace loses its top
+   * entry, `top` follows (`settleTop`). Bound, stated: a process that dies between the turn and the
+   * transaction leaves `top` one rank ahead, so the namespace's next entry is ranked one turn later.
+   */
+  async appendReady(ns: string, payload: unknown, id: string, e: ReadyEntry): Promise<string> {
+    const c = await this.boot();
+    const step = readyStep(e.step);
+    const record = async (o: Doc) => {
+      // Asked, not caught: a duplicate key aborts a transaction.
+      if (!(await c.gnl_work_log.findOne({ ns, id }, { ...o, projection: { _id: 1 } }))) {
+        await c.gnl_work_log.insertOne({ ns, id, payload: serialize(payload), ts: Date.now(), seq: 0, ord: await this.nextOrd('work') }, o);
+      }
+    };
+    const [has, floor, top] = await Promise.all([
+      c.gnl_work_ready.findOne({ set: e.set, id }, { projection: { _id: 1 } }),
+      c.gnl_work_ready.find({ set: e.set, nb: { $lte: e.now }, hold: null }, { projection: { rnk: 1 } }).sort({ rnk: 1 }).limit(1).next(),
+      c.gnl_work_ready.find({ set: e.set, ns }, { projection: { rnk: 1 } }).sort({ rnk: -1 }).limit(1).next(),
+    ]) as Array<Doc | null>;
+    if (has) { await this.tx((s) => record({ session: s })); return id; }
+    const lane = await c.gnl_work_ready_lane.findOneAndUpdate(
+      { set: e.set, ns },
+      [{ $set: { top: readyRankExpr(lit(floor ? Number(floor.rnk) : null), { $max: ['$top', lit(top ? Number(top.rnk) : null)] }, step) } }],
+      { upsert: true, returnDocument: 'after', projection: { top: 1 } },
+    ) as Doc;
+    const rnk = Number(lane.top);
+    try {
+      const ord = await this.nextOrd('ready');
+      await this.tx(async (s) => {
+        await record({ session: s });
+        await c.gnl_work_ready.insertOne({ set: e.set, id, ns, kind: e.kind, nb: e.notBefore, rnk, ord }, { session: s });
+      });
+    } catch (err) {
+      await this.settleTop(e.set, ns, rnk);
+      if (isDup(err)) return id; // the same id, appended at once: the other append's entry stands
+      throw err;
+    }
+    return id;
+  }
+  /**
+   * Every record and entry (`WorkStore.appendMany`), each namespace ranked in ONE turn — `appendReady`'s:
+   * one `findOneAndUpdate` on its lane document moves `top` past the call's last entry of it, the first
+   * ranked by `readyRankExpr` and the rest after it (`readyRunOffsets`), so N ranks cost one write. Then
+   * every record and entry in ONE transaction: all of them or none. A transaction that does not commit
+   * gives its turns back (`settleTop`); `appendReady`'s bound holds (a process that dies between the turns
+   * and the transaction leaves `top` ahead, and the namespace's next entry is ranked that much later). An
+   * entry that an `appendReady` of the same id wrote meanwhile stands, and its rank here stays unused.
+   */
+  async appendMany(records: readonly WorkRecord[]): Promise<void> {
+    const plan = planAppendMany(records);
+    if (!plan.records.length) return;
+    const c = await this.boot();
+    const payloads = plan.records.map((r) => serialize(r.payload));
+    const ready = plan.ready;
+    const rows: Doc[] = [];
+    const turns: Array<[string, number]> = [];
+    if (ready) {
+      const has = new Set<string>();
+      for (const part of chunks(plan.entries.map((x) => x.id))) {
+        for (const d of await c.gnl_work_ready.find({ set: ready.set, id: { $in: part } }, { projection: { id: 1 } }).toArray() as Doc[]) has.add(String(d.id));
+      }
+      const lanes = new Map<string, typeof plan.entries>();
+      for (const x of plan.entries) if (!has.has(x.id)) { const l = lanes.get(x.ns); if (l) l.push(x); else lanes.set(x.ns, [x]); }
+      const floor = await c.gnl_work_ready.find({ set: ready.set, nb: { $lte: ready.now }, hold: null }, { projection: { rnk: 1 } }).sort({ rnk: 1 }).limit(1).next() as Doc | null;
+      const rank = new Map<string, number>();
+      try {
+        for (const [ns, lane] of lanes) {
+          const top = await c.gnl_work_ready.find({ set: ready.set, ns }, { projection: { rnk: 1 } }).sort({ rnk: -1 }).limit(1).next() as Doc | null;
+          const offsets = readyRunOffsets(lane.map((x) => x.step));
+          const span = offsets[offsets.length - 1]!;
+          const turn = await c.gnl_work_ready_lane.findOneAndUpdate(
+            { set: ready.set, ns },
+            [{ $set: { top: { $add: [readyRankExpr(lit(floor ? Number(floor.rnk) : null), { $max: ['$top', lit(top ? Number(top.rnk) : null)] }, lane[0]!.step), span] } } }],
+            { upsert: true, returnDocument: 'after', projection: { top: 1 } },
+          ) as Doc;
+          turns.push([ns, Number(turn.top)]);
+          lane.forEach((x, i) => rank.set(x.id, Number(turn.top) - span + offsets[i]!));
+        }
+        const last = plan.entries.length ? await this.nextOrd('ready', plan.entries.length) : 0;
+        plan.entries.forEach((x, i) => { if (rank.has(x.id)) rows.push({ set: ready.set, id: x.id, ns: x.ns, kind: x.kind, nb: x.notBefore, rnk: rank.get(x.id), ord: last - plan.entries.length + 1 + i }); });
+      } catch (err) {
+        for (const [ns, top] of turns) await this.settleTop(ready.set, ns, top);
+        throw err;
+      }
+    }
+    try {
+      const lastOrd = await this.nextOrd('work', plan.records.length);
+      const ts = Date.now();
+      const docs = plan.records.map((r, i) => ({ ns: r.ns, id: r.id, payload: payloads[i], ts, seq: 0, ord: lastOrd - plan.records.length + 1 + i }));
+      await this.tx(async (s) => {
+        const o = { session: s };
+        // Asked, not caught: a duplicate key aborts a transaction.
+        const there = new Set<string>();
+        for (const part of chunks(docs)) {
+          const found = await c.gnl_work_log.find({ $or: part.map((d) => ({ ns: d.ns, id: d.id })) }, { ...o, projection: { ns: 1, id: 1 } }).toArray() as Doc[];
+          for (const d of found) there.add(`${d.ns}\u0000${d.id}`);
+        }
+        const fresh = docs.filter((d) => !there.has(`${d.ns}\u0000${d.id}`));
+        for (const part of chunks(fresh)) await c.gnl_work_log.insertMany(part, o);
+        if (!rows.length) return;
+        const taken = new Set<string>();
+        for (const part of chunks(rows)) {
+          for (const d of await c.gnl_work_ready.find({ set: ready!.set, id: { $in: part.map((x) => x.id) } }, { ...o, projection: { id: 1 } }).toArray() as Doc[]) taken.add(String(d.id));
+        }
+        for (const part of chunks(rows.filter((x) => !taken.has(String(x.id))))) await c.gnl_work_ready.insertMany(part, o);
+      });
+    } catch (err) {
+      for (const [ns, top] of turns) await this.settleTop(ready!.set, ns, top);
+      throw err;
+    }
+  }
+  /**
+   * A namespace's lane `top` after its entry ranked `gone` left (dropped, erased, or never written): the
+   * highest rank among its entries again, or null. Compare-and-set, so a rank given meanwhile stands; and
+   * asked again when the new top left meanwhile too.
+   */
+  private async settleTop(set: string, ns: string, gone: number): Promise<void> {
+    const c = await this.boot();
+    for (let cur = gone; ;) {
+      const next = await c.gnl_work_ready.find({ set, ns }, { projection: { rnk: 1 } }).sort({ rnk: -1 }).limit(1).next() as Doc | null;
+      const m = next ? Number(next.rnk) : null;
+      if ((await c.gnl_work_ready_lane.updateOne({ set, ns, top: cur }, { $set: { top: m } })).matchedCount === 0 || m === null) return;
+      if (await c.gnl_work_ready.findOne({ set, ns, rnk: m }, { projection: { _id: 1 } })) return;
+      cur = m;
+    }
+  }
+  /** One `findOneAndUpdate`: the lowest-ranked ready entry nobody holds, held by `holder`; a concurrent taker of the same entry re-matches and takes the next. */
+  async takeReady(set: string, t: ReadyTake): Promise<ReadyItem | undefined> {
+    const c = await this.boot();
+    const skip = [...(t.skipKinds ?? [])];
+    const h = t.holder;
+    const x = await c.gnl_work_ready.findOneAndUpdate(
+      { set, nb: { $lte: t.now }, hold: null, ...(skip.length ? { kind: { $nin: skip } } : {}) },
+      { $set: { hold: h.hold, hproc: h.proc ?? null, hat: t.now, httl: h.ttlMs } },
+      { sort: { rnk: 1, ord: 1 }, projection: { ns: 1, id: 1 }, returnDocument: 'after' },
+    ) as Doc | null;
+    return x ? { ns: String(x.ns), id: String(x.id) } : undefined;
+  }
+  async heldReady(set: string): Promise<ReadyHeld[]> {
+    const c = await this.boot();
+    const docs = await c.gnl_work_ready.find({ set, hold: { $type: 'string' } }, { projection: { id: 1, hold: 1, hproc: 1, hat: 1, httl: 1 } }).toArray() as Doc[];
+    return docs.map((x) => ({ id: String(x.id), hold: String(x.hold), ...(typeof x.hproc === 'string' ? { proc: x.hproc } : {}), at: Number(x.hat), ttlMs: Number(x.httl) }));
+  }
+  async deferReady(set: string, id: string, notBefore: number, hold?: string): Promise<void> {
+    const c = await this.boot();
+    await c.gnl_work_ready.updateOne({ set, id, ...(hold !== undefined ? { hold } : {}) }, { $set: { nb: notBefore }, $unset: { hold: '', hproc: '', hat: '', httl: '' } });
+  }
+  async dropReady(set: string, id: string): Promise<void> {
+    const c = await this.boot();
+    const gone = await c.gnl_work_ready.findOneAndDelete({ set, id }, { projection: { ns: 1, rnk: 1 } }) as Doc | null;
+    if (gone && await c.gnl_work_ready_lane.findOne({ set, ns: gone.ns, top: gone.rnk }, { projection: { _id: 1 } })) await this.settleTop(set, String(gone.ns), Number(gone.rnk));
+  }
   async list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>> {
     const c = await this.boot();
     const limit = q?.limit ?? 50;
@@ -1477,6 +1682,30 @@ class MoWorkStore implements WorkStore {
     const d = await c.gnl_work_kv.findOne({ _id: key });
     return d ? deserialize<T>(d.v) : undefined;
   }
+  /** One `$in` (`WorkStore.getMany`), answered in the order asked. */
+  async getMany<T = unknown>(keys: string[]): Promise<(T | undefined)[]> {
+    const c = await this.boot();
+    const got = new Map<string, string>();
+    if (keys.length) for (const d of await c.gnl_work_kv.find({ _id: { $in: [...new Set(keys)] } }).toArray()) got.set(String(d._id), d.v as string);
+    return keys.map((k) => (got.has(k) ? deserialize<T>(got.get(k)!) : undefined));
+  }
+  /** One probe of an index led by `ns` (`gnl_work_log_id`) per name (`WorkStore.listNamespaces`); strings compare in byte order. */
+  async listNamespaces(prefix: string, q?: ListQuery): Promise<Page<string>> {
+    const c = await this.boot();
+    const limit = q?.limit ?? 50;
+    const names: string[] = [];
+    let after = q?.cursor;
+    while (names.length <= limit) {
+      const cond: Doc = { ...range(prefix), ...(after !== undefined ? { $gt: after } : {}) };
+      const x = await c.gnl_work_log.find({ ns: cond }, { projection: { _id: 0, ns: 1 } }).sort({ ns: 1 }).limit(1).next();
+      if (!x) break;
+      names.push(String(x.ns));
+      after = String(x.ns);
+    }
+    const more = names.length > limit;
+    if (more) names.pop();
+    return { items: names, nextCursor: more ? names[names.length - 1] : undefined };
+  }
   async put(key: string, value: unknown): Promise<void> {
     const c = await this.boot();
     await c.gnl_work_kv.updateOne({ _id: key }, { $set: { v: serialize(value) } }, { upsert: true });
@@ -1493,11 +1722,18 @@ class MoWorkStore implements WorkStore {
     const c = await this.boot();
     const l = await c.gnl_work_log.deleteMany(within('ns', prefix));
     const k = await c.gnl_work_kv.deleteMany(within('_id', prefix));
-    return l.deletedCount + k.deletedCount;
+    const r = await c.gnl_work_ready.deleteMany(within('ns', prefix));
+    await c.gnl_work_ready_lane.deleteMany(within('ns', prefix));
+    return l.deletedCount + k.deletedCount + r.deletedCount;
   }
   async deleteIdPrefix(idPrefix: string): Promise<number> {
     const c = await this.boot();
-    return (await c.gnl_work_log.deleteMany(within('id', idPrefix))).deletedCount;
+    const n = (await c.gnl_work_log.deleteMany(within('id', idPrefix))).deletedCount;
+    // Each namespace's highest erased rank: its lane `top` when that entry was its top (`settleTop`).
+    const tops = await c.gnl_work_ready.aggregate([{ $match: within('id', idPrefix) }, { $group: { _id: { set: '$set', ns: '$ns' }, rnk: { $max: '$rnk' } } }]).toArray() as Doc[];
+    await c.gnl_work_ready.deleteMany(within('id', idPrefix));
+    for (const t of tops) await this.settleTop(String(t._id.set), String(t._id.ns), Number(t.rnk));
+    return n;
   }
 }
 

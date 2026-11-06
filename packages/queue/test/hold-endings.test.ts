@@ -153,7 +153,7 @@ const SITES: Site[] = [
     run: (ending) => queueCase(ending, 'job'),
   },
   {
-    site: 'scheduler fire', file: 'scheduler/src/index.ts', marker: 'await holdWhile(async (): Promise<void> => {',
+    site: 'scheduler fire', file: 'scheduler/src/index.ts', marker: 'fires.push(holdWhile(async (): Promise<void> => {', // k4: due triggers fire at once
     endings: ['complete', 'error', 'drain-from-inside'],
     run: async (ending) => {
       const journal = new InMemoryJournal();

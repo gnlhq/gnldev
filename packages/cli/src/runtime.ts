@@ -156,6 +156,44 @@ export async function loadDurable(projectDir: string): Promise<typeof Durable> {
   return mod as unknown as typeof Durable;
 }
 
+/**
+ * The first-party packages whose upgrade steps `gnl upgrade` and `gnl doctor` find on their own, and the
+ * factory each exports (`registerUpgradeSteps(storage, [queueUpgrade])` in application code). A package
+ * the project does not have, or a version of it that exports no factory, has nothing to register.
+ */
+export const UPGRADE_PACKAGES: ReadonlyArray<{ readonly spec: string; readonly factory: string }> = [
+  { spec: '@gnldev/queue', factory: 'queueUpgrade' },
+  { spec: '@gnldev/scheduler', factory: 'schedulerUpgrade' },
+];
+
+/**
+ * Registers on `storage` the upgrade steps of the packages the project has installed. Resolved from the
+ * project like every other runtime package, so the factory is the very function application code would
+ * pass — one the store already holds is registered once. Silent about a package that is not installed.
+ */
+export async function registerInstalledUpgradeSteps(
+  storage: Durable.Storage,
+  d: typeof Durable,
+  projectDir: string,
+  packages: typeof UPGRADE_PACKAGES = UPGRADE_PACKAGES,
+): Promise<void> {
+  if (typeof storage.upgrade !== 'function') return;
+  const req = createRequire(join(projectDir, 'noop.js'));
+  const factories: Durable.UpgradeStepFactory[] = [];
+  for (const p of packages) {
+    let resolved: string;
+    try {
+      resolved = req.resolve(p.spec);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND') continue;
+      throw e;
+    }
+    const factory = ((await import(pathToFileURL(resolved).href)) as Record<string, unknown>)[p.factory];
+    if (typeof factory === 'function') factories.push(factory as Durable.UpgradeStepFactory);
+  }
+  d.registerUpgradeSteps(storage, factories);
+}
+
 /** The project's @gnldev/server — createRestApi. */
 export async function loadServer(projectDir: string): Promise<typeof Server> {
   const { mod, resolvedFile } = await resolveModuleFromProject('@gnldev/server', projectDir);

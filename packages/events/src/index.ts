@@ -11,9 +11,9 @@
 // in the same pass, and after `maxAttempts` the event is QUARANTINED (dead-letter) rather than
 // retried forever — listDeadEvents() shows it, retryDeadEvent() hands it back. Quarantine is not an
 // ack: a quarantined event is never counted as delivered, because the consumer never saw it.
-import { createPollLoop, orgPrefix, orgStorageScopeOf, ownedName, ownedPrefix, ownerOfName, assertSystemName, assertRootWorkForErasure, portOf } from '@gnldev/durable';
+import { createPollLoop, executionGrant, orgPrefix, orgStorageScopeOf, ownedName, ownedPrefix, ownerOfName, assertSystemName, assertRootWorkForErasure, portOf } from '@gnldev/durable';
 import { randomUUID } from 'node:crypto';
-import type { WorkStore } from '@gnldev/durable';
+import type { WorkStore, UnheededText } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
 import { EMIT_OPTS_NAMES, CREATE_CONSUMER_OPTS_NAMES } from './option-names.js';
 
@@ -26,6 +26,14 @@ export interface EventOwner {
 export interface EventMeta extends EventOwner {
   id: string;
   topic: string;
+  /**
+   * Aborted when this attempt's hold on the event ends, with an `ExecutionRevokedError` saying why
+   * (`reason.why`): `timeout` (`maxHoldMs` — the event is due again and that start counts), `lease-lost`
+   * (its hold was taken: a release, or another poll after an expiry). A handler that stops on it has
+   * failed this attempt. The framework cannot stop a handler that ignores the signal; one still running
+   * `leaseMs` after a `lease-lost` or `timeout` is warned about once (`console.warn`).
+   */
+  signal: AbortSignal;
 }
 
 /**
@@ -39,6 +47,18 @@ function ownerOf(id: string): EventOwner {
 }
 
 export type EventHandler = (payload: any, meta: EventMeta) => Promise<void> | void;
+
+/**
+ * What a handler that ignores `meta.signal` costs, for the warning `executionGrant` says (@gnldev/durable
+ * `UnheededText`). There is no `ctx.run` here: delivery is at-least-once, so the handler is the one to make
+ * its effects safe to repeat.
+ */
+const UNHEEDED: UnheededText = {
+  body: 'the handler',
+  signal: 'meta.signal',
+  lost: 'The event may be delivered again beside it: its side effects must be idempotent (delivery is at-least-once).',
+  timeout: 'The event is due again and may be delivered beside it: its side effects must be idempotent (delivery is at-least-once).',
+};
 
 export interface ConsumerOptions {
   /** Consumer identity — ack markers are separated by this (fan-out). */
@@ -531,21 +551,20 @@ export function createConsumer(
         // redelivery is possible. Write the handler idempotently, or use durable (runDurable/claim) inside it.
         // While the handler runs, the hold is renewed (every leaseMs/3) so a slow handler is not taken
         // for a dead process. A lost renewal (a release, or another poll after an expiry) stops it.
+        // The hold is this attempt's RIGHT TO RUN (@gnldev/durable executionGrant): the handler's signal
+        // aborts when it ends — at maxHoldMs (`timeout`), or when a renewal finds the hold taken (`lease-lost`).
+        // Past maxHoldMs the renewal writes no later `nextAt` (capped): the hold runs out while the handler is told.
         let held = startRec;
-        let beating: Promise<void> | undefined;
-        const beat = setInterval(() => {
-          if (beating) return;
-          if (Date.now() - startedAt >= maxHoldMs) { clearInterval(beat); return; } // held as long as it may be: let the hold run out
-          beating = (async () => {
-            const renewed: StoredAttempts = { ...held, nextAt: Math.min(Date.now() + leaseMs, startedAt + maxHoldMs) };
-            const ok = !work.putIfMatch ? (await work.put(ak, renewed), true) : await work.putIfMatch(ak, held, renewed);
-            if (ok) held = renewed; else clearInterval(beat);
-          })().catch(() => {}).finally(() => { beating = undefined; });
-        }, Math.max(1, Math.floor(leaseMs / 3)));
-        (beat as any).unref?.();
-        const stopBeat = async () => { clearInterval(beat); await beating; };
+        const grant = executionGrant(`@gnldev/events: event ${e.id} (topic ${topic}, consumer ${opts.name})`, { unheededAfterMs: leaseMs, unheeded: UNHEEDED, ...(maxHoldMs === Infinity ? {} : { maxHoldMs }) });
+        grant.keep(async () => {
+          const renewed: StoredAttempts = { ...held, nextAt: Math.min(Date.now() + leaseMs, startedAt + maxHoldMs) };
+          const ok = !work.putIfMatch ? (await work.put(ak, renewed), true) : await work.putIfMatch(ak, held, renewed);
+          if (ok) held = renewed;
+          return ok;
+        }, { everyMs: leaseMs / 3 });
+        const stopBeat = () => grant.dispose();
         try {
-          await handler(e.payload, { id: e.id, topic, ...ownerOf(e.id) });
+          await handler(e.payload, { id: e.id, topic, ...ownerOf(e.id), signal: grant.signal });
           await stopBeat();
         } catch (err) {
           await stopBeat();

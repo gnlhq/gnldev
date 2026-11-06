@@ -41,7 +41,7 @@ export type { ModelPricing, PricingDoc } from './pricing.js';
 export {
   DivergenceError, RunBusyError, SideEffectRetryBlockedError, RetryLimitExceededError, OutcomeUnknownError,
   SuiteVersionMismatchError, RunThreadMismatchError, RunTargetMismatchError, ThreadRunsInFlightError,
-  RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunNotFoundError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, VectorFilterError, VectorDimensionError, RunSweptError, BatchPlanMismatchError, AdoptionConflictError,
+  RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunNotFoundError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, VectorFilterError, VectorDimensionError, RunSweptError, RunUnfinishedError, BatchPlanMismatchError, AdoptionConflictError,
   CALLER_CONFLICT_CODES, callerConflictCode, callerConflictAnswer, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, FOREIGN_PARTY_DETAIL_FIELDS,
   BLOCKED_ERROR_CODES, blockedErrorCode, upstreamFailure, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES,
   RESERVED_ID_ERROR_CODES, VISIBILITY_ERROR_CODES, runNotFound, REQUEST_ERROR_CODES, ADOPTION_ERROR_CODES, DRAIN_ERROR_CODES, requestRefusal,
@@ -122,7 +122,7 @@ export type { AdoptIntoOrgResult,
   Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
   ThreadRecord, MessageRecord, MessageAppend, Observation, RecallOptions,
-  VectorDoc, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord,
+  VectorDoc, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord, ReadyEntry, ReadyTake, ReadyItem, ReadyHolder, ReadyHeld, WorkRecord,
   Storage, CapabilityLevel, CapabilityMatrix, StoreName, CompositeConfig,
 } from './storage.js';
 export { InMemoryStorage } from './in-memory-storage.js';
@@ -133,6 +133,7 @@ export { durableProcessorStep, createProcessorCtx, ProcessorTripwire, recordProc
 export { ProcessorRetry, RetryExhaustedByProcessorError } from './processor.js';
 export { recordIncident, readIncidents } from './incidents.js';
 export { readRunOutcome, recordRunOutcome, runStarted, runCanceled, isRunFailure, attemptEndOf } from './outcome.js';
+export { executionGrant, ExecutionRevokedError, revokedWhy, continuesElsewhere, type ExecutionGrant, type RevokeWhy, type UnheededText } from './execution-grant.js';
 export { acquireLease, releaseLease, readLease } from './lease.js';
 export type { Lease } from './lease.js';
 export type { RunIncident } from './incidents.js';
@@ -257,7 +258,7 @@ export type {
 // (PostgresStorage). For a bare durable run use `new SqliteStorage(path).runs` (RunJournal = journal).
 // P2-migrate schema introspection/migration façade — see migrate.ts.
 export { runMigrationCheck, tablesFromDDL } from './migrate.js';
-export { UPGRADE_STEPS, type UpgradeStepName, type UpgradeOptions, type UpgradeReport, type UpgradeStepReport } from './upgrade.js';
+export { UPGRADE_STEPS, FORMAT_STEPS, registerUpgradeSteps, isPackageStep, markUpgradeDue, clearUpgradeDue, UpgradeFailedError, type UpgradeStep, type UpgradeStepFactory, type UpgradeDue, type UpgradeDueTarget, type UpgradeStepName, type UpgradeOptions, type UpgradeReport, type UpgradeStepReport } from './upgrade.js';
 export type { SchemaCheckResult, SchemaMigrationResult, MissingColumn, MigratableStorage, MigrationCheckResult } from './migrate.js';
 export { agentStreamEvents, interruptsFromSteps, type AgentStreamEvent, type AgentStreamCodes } from './agent-stream.js';
 export type { StreamSurface, StreamSurfaceInput } from './stream-surface.js';
@@ -274,9 +275,11 @@ export { pendingWork, recoverInDoubt, declareInDoubtDone, cancelPendingRun, type
 export { followedRun, type FollowedRun, type RunEnding } from './followed-run.js';
 export { appendRunEvent, readRunEvents, lastRunEvent, endsFollow, runEventKey, type RunEvent, type RunState } from './run-events.js';
 export {
-  installProcessLiveness, processLiveness, storeLiveness, livenessFor, unbindLiveness, inMemoryLiveness, sqliteLiveness, postgresLiveness, beginDrain, isDraining, endDrain,
-  holdWhile, settledExceptOwn, handNamePrefix, type HandFace, RunDrainedError, LivenessUnavailableError, TransactionPoolerError, procLockKey, isProcessLocal, type ProcessLiveness, type PgProcessSession, type PostgresLivenessOptions,
+  installProcessLiveness, processLiveness, storeLiveness, bindOwnLiveness, livenessFor, unbindLiveness, inMemoryLiveness, sqliteLiveness, postgresLiveness, beginDrain, isDraining, endDrain,
+  holdWhile, settledExceptOwn, handNamePrefix, type HandFace, RunDrainedError, LivenessUnavailableError, LivenessConflictError, TransactionPoolerError, procLockKey, isProcessLocal, type ProcessLiveness, type PgProcessSession, type PostgresLivenessOptions,
 } from './process-liveness.js';
+// A ready entry held by the one ownership rule (liveness.ts `stampIsLive`), not a duration: @gnldev/queue's take.
+export { takeReadyHeld, letGoReady, reclaimReady, type ReadyTaken } from './ready-hold.js';
 // The run-id grammar: every family written under a run id, every family of id the engine composes, and
 // the one admission gate (run-id-grammar.ts). The packages on this one spell run keys through it.
 export {

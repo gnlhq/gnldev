@@ -20,8 +20,8 @@ import { listRunsArray } from './journal.js';
 import type { RunSummary } from './journal.js';
 import { withOrg, withRootScope, registeredOrganizations } from './organization.js';
 import { execKey } from './exec-record.js';
-import { claimIsLive } from './liveness.js';
-import { holderAlive, heldUnits } from './process-liveness.js';
+import { claimIsLive, holderIsLive } from './liveness.js';
+import { heldUnits } from './process-liveness.js';
 import { journalNow } from './liveness.js';
 import { compareAndSet } from './attempt.js';
 import { stampFormat, upgradeFormat } from './format.js';
@@ -188,9 +188,9 @@ export async function pendingWork(journal: Journal): Promise<PendingWork> {
       }
       if (busy) { held.delete(`${scope ?? ''}\u0000${run.runId}`); continue; }
       // A run on the executor: running while its process is (detached.ts). The record is the platform's.
-      const exec = await journal.get<{ status?: string; owner?: unknown; at?: unknown }>(execKey(scope, run.runId));
+      const exec = await journal.get<{ status?: string; owner?: unknown; hold?: unknown; at?: unknown }>(execKey(scope, run.runId));
       // A process that cannot be asked about (no liveness here) counts as alive: the safe side blocks.
-      if (exec?.status === 'running' && (await holderAlive(exec.owner, journal)) !== false) {
+      if (exec?.status === 'running' && (await holderIsLive({ proc: exec.owner, hold: exec.hold }, journal)) !== false) {
         held.delete(`${scope ?? ''}\u0000${run.runId}`);
         out.running.push({
           ...at, what: 'the run is executing',

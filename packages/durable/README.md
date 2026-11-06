@@ -141,18 +141,29 @@ const again = await gnl.follow(s.runId, { after: at }); // continues right after
   a call's claim is held while its attempt is, whatever its age, on every store. Only a claim on a store
   other processes share that brings no liveness, with none installed, is judged by its age
   (`claimTtlMs`) — a holder frozen past it there is taken over. The executor refuses such a store
-  (`LivenessRequiredError`): pass `createGnl({ liveness: await postgresLiveness({ connectionString }) })`,
-  or `inMemoryLiveness()` for a store only this process reaches.
+  (`LivenessRequiredError`): pass `createGnl({ liveness })` for a custom store, or `inMemoryLiveness()`
+  for a store only this process reaches. The built-in stores answer for themselves — their own liveness,
+  or the one you give them (`new SqliteStorage(path, { liveness })`, `new LibsqlStorage(path, { liveness })`,
+  `new PostgresStorage({ …, liveness })`, `new MysqlStorage({ …, liveness })`, `new MongoStorage({ …, liveness })`) —
+  and a liveness passed to `createGnl` or `createWorker` beside it is refused (`LivenessConflictError`).
+  `unbindLiveness(journal)` forgets the store's liveness in this process only until the next
+  acquisition there: `acquireRunLock` and the claims of `durableTool` / `durableModel` / `runDurable`
+  bind it again on their next call. It is for a store closing for good (the built-in stores' `close()`
+  calls it), not a way to make this process's work look dead — its session still says it is alive, and
+  a live process's lock is never taken over.
 - **A Postgres liveness needs a real session.** Behind a transaction-mode pooler (PgBouncer
   `pool_mode=transaction`, a managed "-pooler" endpoint) a session lock lands on a server connection lent
   to other clients, so the liveness is refused when it is opened (`TransactionPoolerError`), and a direct
   call on such a store is refused before its body unless a liveness is installed. The store may stay on
   the pooler; give the liveness the direct URL:
-  `createGnl({ storage: new PostgresStorage({ connectionString: POOLED_URL }), liveness: await postgresLiveness({ connectionString: DIRECT_URL }) })`
+  `new PostgresStorage({ connectionString: POOLED_URL, liveness: await postgresLiveness({ connectionString: DIRECT_URL }) })`
   (or `installProcessLiveness(…)` for direct calls).
 - **Tuning the executor** (`createGnl({ detached: { … } })`, or `new DetachedRuns({ … })` used
   directly): `sweepMs` — how often it looks for runs whose process is gone (default 1 s; `0` runs no
-  sweeper in this process); `pollMs` — how often a reader on another process reads the store (200 ms);
+  sweeper in this process). **The executor, and so its sweeper, starts with the first run, stream, follow,
+  cancel or task this process handles** — `createGnl` itself opens no session and no timer. A restarted
+  process that has handled nothing yet therefore takes over nothing: a dead process's run waits for the
+  first request that reaches any live process (or for `gnl resume <runId>`); `pollMs` — how often a reader on another process reads the store (200 ms);
   `coalesceMs` — the store's segment of a streamed answer (1 s); `outcomeAskMs` — the first wait
   before a call in doubt is put to its tool again (2 s, doubling); `onComplete` — a notice per run that
   completed or failed, at least once, with an `id` stable across deliveries. Used directly, `journal`
@@ -924,8 +935,11 @@ unauditable dedup):
   `result.replayedToolCalls: [{ toolCallId, toolName, status, origin }]` — out-of-band, never shown
   to the model. `origin` separates `'window'` (genuinely earlier work) from `'self'` (this very
   request resuming — an approval continuation must not be narrated as "an earlier request"; the
-  identity test is `resolvedToolCallIds`, not key prefix). `@gnldev/server` forwards the field on
-  run responses; UIs can badge it.
+  identity test is `resolvedToolCallIds`, not key prefix). The field is on the result of `runDurable` /
+  `streamDurable` (the process that executes the run). `@gnldev/server` forwards it when the result it holds
+  carries it, which `POST /agents/:name/run` does not today: that route follows a detached run, and the
+  replay ledger lives in the executing process's memory, not in the journal. The replay itself is unaffected
+  (the tool still runs once); only the badge data does not reach that response.
 - **`replayDisclosure: 'explain'` (opt-in, per run or `createGnl` config):** a TRANSIENT system
   note is injected into the step FOLLOWING the consume — the model then narrates honestly ("the
   operation was not performed again; this is the record of the earlier one"). The note is
@@ -1235,6 +1249,21 @@ const gnl = createGnl({ storage, agents });
   keepalive — see below.
 - **No triggers.** Every write of this store places or unplaces a run's person/thread columns in its
   own transaction. Rows written behind the store's back (plain SQL) are outside its contract.
+
+### A transaction a killed process left open
+
+A process killed between a transaction's writes and its commit leaves it open on the server, with no
+connection under it, for `transactionLifetimeLimitSeconds` (60 s by default), and every write on those
+documents conflicts with it. A write that keeps conflicting for a second ends such transactions: it
+looks for idle sessions in a transaction whose connection is gone (`$currentOp`, the `inprog` action above)
+and ends them (`killSessions`). That reaches this user's sessions; processes that run as different users
+need `killAnySession` for each other's, and without it, or without `inprog`, the server's limit stands: a
+write on those documents can fail with a write conflict after the store's 60 s budget.
+
+The look is not limited to this store's database: another application that shares the MongoDB user can
+have a transaction ended the same way once its connection is gone. Its commit is refused, nothing it
+wrote in the transaction lands, and it must run the transaction again. Give each application its own user
+to keep them apart.
 
 ### Required: short TCP keepalives on the server
 

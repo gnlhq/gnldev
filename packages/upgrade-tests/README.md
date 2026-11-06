@@ -29,6 +29,9 @@ turn green, so a red root suite still means a new regression. Run it with `pnpm 
 | `generate/0.10.0.mjs` | Writes the 0.10.0 fixtures, with the 0.10.0 code. |
 | `generate/runs.mjs` | The run history and the questions asked of it: the generator writes it with 0.10.0, the tests write it again with the current code and compare every answer. |
 | `test/from-0.10.0/` | 0.10.0 → this version (the `run-status` upgrade): opening and listing change nothing; after `gnl upgrade`, and after `--only run-status,schema` alone, every answer equals a store this version wrote with the same history; what a user does next repeats no side effect. |
+| `fixtures/0.16.0/queue*.db`, `postgres-queue*.sql`, `mysql-queue*.sql`, `mongo-queue*.ejson` | A queue as 0.16.0 left it, on each backend: every job in the one `qjob` log, the first few run by a 0.16.0 worker (one dead-lettered); `queue-many` also has 0.16.0's `qcursor`. MongoDB's is canonical Extended JSON (per collection a line with its index specs, then its documents sorted by `_id`), not a `mongodump` archive, which is not byte-for-byte reproducible. |
+| `fixtures/0.16.0/notes-*.json` | What 0.16.0's writer printed: ids, names, what ran, what finished, the dead letter, `qcursor`. |
+| `generate/0.16.0.mjs` | Writes the 0.16.0 fixtures by running the queue's own 0.16.0 writer (`packages/queue/test/fixtures/k5-q016-writer.mjs`) with the fixed clock. Read by `packages/queue/test/k5-queue-upgrade.test.ts` (the `queue/lanes` and `queue/lanes-cleanup` steps), which runs in the root `pnpm test`. |
 
 ## Run
 
@@ -73,6 +76,21 @@ node generate/0.10.0.mjs                                 # fixtures/0.10.0/runs.
 node generate/0.10.0.mjs --check
 GNL_PG_URL=… GNL_PG_DUMP='docker exec -i <container> pg_dump' node generate/0.10.0.mjs --backend postgres [--db <name>]
 ```
+
+For 0.16.0 (`GNL_016_ROOT`: an install of the published packages; without it the generator installs them from npm):
+
+```sh
+node generate/0.16.0.mjs                                 # fixtures/0.16.0/queue.db, queue-many.db
+node generate/0.16.0.mjs --check
+GNL_PG_URL=… GNL_PG_DUMP='docker exec -i <container> pg_dump' node generate/0.16.0.mjs --backend postgres [--check]
+GNL_MYSQL_URL=mysql://root:pw@localhost:3306/mysql GNL_MYSQL_DUMP='docker exec -i <container> mysqldump' node generate/0.16.0.mjs --backend mysql [--check]
+GNL_MONGO_URL='mongodb://root:pw@localhost:27017/admin?authSource=admin' node generate/0.16.0.mjs --backend mongo [--check]
+```
+
+Every 0.16.0 fixture is reproducible (measured with `--check`). For MongoDB, `generate/deterministic-bson.mjs`
+also fixes the driver's ObjectIds and keeps the driver's own clock reads (pool events, handshakes on its
+timers) from moving the fixed clock: without it two runs differed by a few milliseconds from one write on.
+`k5-queue-upgrade.test.ts` loads the MySQL and MongoDB fixtures when `GNL_MYSQL_URL` / `GNL_MONGO_URL` is set.
 
 The 0.10.0 Postgres dump is not byte-for-byte reproducible: 0.10.0's metrics counters read the database's
 own clock (`now()`), and the dump's row order is the heap's. The Sqlite file is.

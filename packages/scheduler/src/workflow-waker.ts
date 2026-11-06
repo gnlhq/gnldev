@@ -9,24 +9,33 @@
 // The waker does NOT know how to rebuild a workflow instance — it has no `workflows: {}` registry.
 // `resume(runId, status)` is host-supplied and closes over whatever registry (e.g. `createGnl` /
 // a plain `Workflow` map) actually knows how to call `runResumable` again for that run.
-import { claim, createPollLoop, withOrg } from '@gnldev/durable';
+import { acquireRunLock, createPollLoop, withOrg } from '@gnldev/durable';
 import type { PollLoop } from '@gnldev/durable';
 import { rootJournal } from './root-journal.js';
-import { listWorkflowRuns } from '@gnldev/workflow';
+import { getWorkflowRunStatus, listWorkflowRuns } from '@gnldev/workflow';
 import type { JournalLike, WorkflowRunStatus } from '@gnldev/workflow';
 import { refuseUnknownNames } from '@gnldev/options';
 import { CREATE_WORKFLOW_WAKER_NAMES } from './option-names.js';
 
 /**
- * Per-run wake ticket key. Includes `updatedAt` so a run that later re-suspends (sleep/waitFor
- * rewrite the `wfrun:` record with a fresh `updatedAt` on every suspend) gets a FRESH ticket —
- * the same run at a NEW suspend point is a different wake opportunity, not a repeat of the old one.
- * Bound (honest, low-stakes): `updatedAt` is ms-epoch — two re-suspends of the SAME run within the
- * SAME millisecond share a ticket (one is silently skipped that tick, picked up the next). This only
- * matters for a run that suspends multiple times faster than 1ms apart, which a real `resume()`
- * round-trip never does; it's a cost/politeness bound anyway (see the correctness note below).
+ * Per-run wake lock: held (run-lock.ts) for the length of ONE `resume()` and released after it, however
+ * it ends. It used to be a permanent ticket per suspend point (`wfwake:<runId>:<updatedAt>`, put-if-absent,
+ * no holder, no expiry), taken BEFORE `resume()`: a resume that threw, or a process that died inside it,
+ * never gave it back, and since a failed attempt does not move `updatedAt` the run stayed suspended for
+ * good (k3, A1). A lock has a holder: released when the resume ends, read as free once its process is
+ * gone (or, with no liveness for the store, once its TTL passes on the store's clock).
  */
-const WAKE_TICKET = (runId: string, updatedAt: number) => `wfwake:${runId}:${updatedAt}`;
+const WAKE_LOCK = (runId: string) => `wfwake:${runId}`;
+/**
+ * Written AFTER a `resume()` that returned: this suspend point was woken. A suspend point is
+ * `(runId, suspendSeq)` — the run's own suspend counter (@gnldev/workflow), so the same run at a NEW
+ * suspend point is a new wake. It used to be `updatedAt`, a clock: a run that re-suspended within the
+ * same millisecond shared the key of the point just woken and was never woken again (k3). A resume
+ * that threw writes none, and the run is woken again on a later tick.
+ */
+const WOKEN = (run: WorkflowRunStatus) => `wfwake:${run.runId}:${run.suspendSeq}`;
+/** How long a wake lock lasts when no process liveness answers for its holder (its age then decides). */
+const WAKE_LOCK_TTL_MS = 60_000;
 
 /** Best-effort narrowing of `WorkflowRunStatus.reason` — see `sleep`/`waitFor`/`waitForResume` in @gnldev/workflow. */
 function reasonKind(reason: unknown): { kind?: string; untilMs?: number } {
@@ -64,8 +73,8 @@ export interface WorkflowWakerOptions {
    * Evented (`waitFor`) and HITL (`waitForResume`) suspends have NO time signal — the waker cannot
    * tell whether the event/payload has arrived. Default (false): SKIP them entirely (only time-based
    * sleeps are woken). Opt-in `true`: resume them too, on every tick they remain suspended. Honest
-   * cost: since a still-not-ready evented run gets a FRESH `wfrun:` `updatedAt` (and thus a fresh
-   * wake ticket) every time `resume()` re-suspends it, this means one `resume()` round-trip (and
+   * cost: since a still-not-ready evented run is at a NEW suspend point (`suspendSeq`, and thus a
+   * fresh wake) every time `resume()` re-suspends it, this means one `resume()` round-trip (and
    * whatever `check()`/host work it triggers) PER TICK PER still-suspended evented run, for as long
    * as it stays unresolved — a busy-poll, not a push. Fine for a handful of runs; expensive at scale
    * (prefer delivering the event directly, e.g. `runResumable({ resume })`, when you can).
@@ -81,10 +90,12 @@ export interface WorkflowWakerOptions {
 }
 
 export interface WorkflowWakerTickResult {
-  /** Runs whose `resume()` was called AND won the wake ticket (or the CAS-less fallback let through). */
+  /** Runs whose `resume()` was called (this waker held their wake lock for it). */
   resumed: number;
-  /** Runs not due yet, evented/HITL runs skipped (wakeEvented off), or runs that lost the wake-ticket race. */
+  /** Runs not due yet, evented/HITL runs skipped (wakeEvented off), or runs already woken at this suspend point. */
   skipped: number;
+  /** Due runs another waker is resuming right now (it holds their wake lock): tried again on a later tick. */
+  busy: number;
   /** `resume()` calls that threw (swallowed — see `onError`). Included in `resumed` (the call WAS made). */
   errored: number;
 }
@@ -116,9 +127,10 @@ export function createWorkflowWaker(opts: WorkflowWakerOptions): WorkflowWaker {
   // succeeding (or stops showing up as suspended) drops out of the map, so a LATER failure streak
   // warns again.
   const failStreak = new Map<string, number>();
+  const owner = `waker-${Math.random().toString(36).slice(2, 10)}`;
 
   async function tick(now: number = Date.now()): Promise<WorkflowWakerTickResult> {
-    const out: WorkflowWakerTickResult = { resumed: 0, skipped: 0, errored: 0 };
+    const out: WorkflowWakerTickResult = { resumed: 0, skipped: 0, busy: 0, errored: 0 };
     // The root, then each organization's partition — its runs, and its wake tickets, live there.
     const orgList = typeof opts.orgs === 'function' ? await opts.orgs() : (opts.orgs ?? []);
     const partitions: Array<{ j: JournalLike; orgId?: string }> = [
@@ -146,9 +158,17 @@ export function createWorkflowWaker(opts: WorkflowWakerOptions): WorkflowWaker {
         // them actually advances the run.
         // Per partition: two organizations may each have a run with this id.
         const streakKey = `${orgId ?? ''}\u0000${run.runId}`;
-        const ticketKey = WAKE_TICKET(run.runId, run.updatedAt);
-        const gotTicket = await claim(j as never, ticketKey, { at: now });
-        if (!gotTicket) {
+        const wokenKey = WOKEN(run);
+        const lock = await acquireRunLock(j as never, WAKE_LOCK(run.runId), owner, WAKE_LOCK_TTL_MS);
+        if (!lock) {
+          out.busy++;
+          continue;
+        }
+        // Decided under the lock, never from the scan: the scan is a snapshot, and another waker may have
+        // woken this suspend point since — the run has moved on, or its point is marked woken.
+        const cur = await getWorkflowRunStatus(j, run.runId);
+        if (cur?.status !== 'suspended' || cur.suspendSeq !== run.suspendSeq || (await j.get(wokenKey)) !== undefined) {
+          await lock.release();
           out.skipped++;
           continue;
         }
@@ -156,6 +176,7 @@ export function createWorkflowWaker(opts: WorkflowWakerOptions): WorkflowWaker {
         out.resumed++;
         try {
           await (orgId === undefined ? resume(run.runId, run) : resume(run.runId, run, { orgId }));
+          await j.put(wokenKey, { at: now });
           failStreak.delete(streakKey);
         } catch (err) {
           out.errored++;
@@ -168,6 +189,8 @@ export function createWorkflowWaker(opts: WorkflowWakerOptions): WorkflowWaker {
               console.warn(`@gnldev/scheduler: workflow-waker resume('${run.runId}') failed (chain continues):`, err);
             }
           }
+        } finally {
+          await lock.release();
         }
       }
     }

@@ -1,7 +1,7 @@
 // M4 — Concurrency / optimistic locking.
 // putIfAbsent is atomic (3 storages) · TOCTOU: concurrent same toolCallId → body runs once ·
 // failed-retry is protected by the claim path · acquireRunLock acquire/release/takeover.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { newDb } from 'pg-mem';
 import { InMemoryJournal } from '../src/journal.js';
 import { InMemoryStorage } from '../src/in-memory-storage.js';
@@ -10,6 +10,13 @@ import { PostgresStorage } from '../src/postgres-storage.js';
 import { durableTool } from '../src/durable-tool.js';
 import { acquireRunLock } from '../src/run-lock.js';
 import { RunBusyError } from '../src/errors.js';
+
+// k3: acquireRunLock dates and judges a lock on the store's clock only; a test moves that clock.
+async function atClock<T>(t: number, f: () => Promise<T>): Promise<T> {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(t);
+  try { return await f(); } finally { vi.useRealTimers(); }
+}
 
 function pgmemPool() {
   const { Pool } = newDb().adapters.createPg();
@@ -99,7 +106,7 @@ describe('M4 acquireRunLock', () => {
     expect(l3).not.toBeNull(); // free after release
 
     // fast-forward now → l3 is considered expired → gets taken over
-    const l4 = await acquireRunLock(journal, 'r', 'D', 1000, Date.now() + 10_000);
+    const l4 = await atClock(Date.now() + 10_000, () => acquireRunLock(journal, 'r', 'D', 1000));
     expect(l4).not.toBeNull();
   });
 });

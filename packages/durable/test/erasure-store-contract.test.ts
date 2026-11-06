@@ -23,7 +23,8 @@ import {
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { indexDocuments } from '../../rag/src/index.js';
-import { enqueue, createWorker, listJobs, jobEraser } from '../../queue/src/index.js';
+import { enqueue, createWorker, jobEraser } from '../../queue/src/index.js';
+import { listAllJobs as listJobs } from '../../queue/test/fixtures/k5-list-all.js';
 import { emit, createConsumer, eventEraser } from '../../events/src/index.js';
 import { scheduleWorkflow, pollScheduler, listTriggers, triggerEraser } from '../../scheduler/src/index.js';
 import { workflow, step } from '../../workflow/src/index.js';
@@ -56,7 +57,7 @@ const BACKENDS: Array<[string, () => Promise<Backend>]> = [
     };
   }],
   ['SQLite', async () => {
-    const storage = new SqliteStorage(':memory:');
+    const storage = new SqliteStorage(':memory:'); // an in-memory database is one process: its own liveness is in-memory
     const db = (storage as unknown as { db: { prepare(s: string): { all(): Array<Record<string, string>> } } }).db;
     return {
       storage,
@@ -82,7 +83,9 @@ if (PG_URL) {
   }]);
 }
 
-for (const [name, make] of mysqlStores(' (real)')) {
+// One process reaches these stores (pg-mem is in this process; the others are reached by this test alone): this
+// process's in-memory identity is the truth, given to each store, and a pg-mem pool cannot make a session.
+for (const [name, make] of mysqlStores(' (real)', { liveness: inMemoryLiveness() })) {
   BACKENDS.push([name, async () => {
     const storage = await make();
     ends.push(() => storage.close());
@@ -97,7 +100,7 @@ for (const [name, make] of mysqlStores(' (real)')) {
   }]);
 }
 
-for (const [name, make] of mongoStores(' (real)')) {
+for (const [name, make] of mongoStores(' (real)', { liveness: inMemoryLiveness() })) {
   BACKENDS.push([name, async () => {
     const storage = await make();
     ends.push(() => storage.close());
@@ -113,7 +116,7 @@ for (const [name, make] of mongoStores(' (real)')) {
 }
 
 async function pgBackend(pool: pg.Pool): Promise<Backend> {
-  const storage = new PostgresStorage({ pool });
+  const storage = new PostgresStorage({ pool, liveness: inMemoryLiveness() });
   return {
     storage,
     rawWork: async () => [
@@ -137,9 +140,6 @@ async function world(b: Backend, people: Person[]) {
   const wf = workflow<{ who: string }>().then(step('s', async (i) => ({ text: `WF|${i.who}|` })));
   const config = {
     storage,
-    // One process reaches these stores (pg-mem is in this process; the others are reached by this test
-    // alone): this process's in-memory identity is the truth, and a pg-mem pool cannot make a session.
-    liveness: inMemoryLiveness(),
     workflows: { weekly: wf },
     agents: { a: { model: model() } },
     memoryFactory: (s: Storage | Journal) => new BasicMemory(('runs' in s ? toJournal(s.runs) : s) as Journal),
@@ -161,7 +161,7 @@ async function world(b: Backend, people: Person[]) {
   // Each job runs as its owner (a job run) and fails once with an error naming them (a `qfail`).
   await createWorker(storage, {
     weekly: async (p, ctx) => { const n = (p as { note: string }).note; await ctx.run({ model: model(), prompt: `JOBRUN|${n}` }); throw new Error(`FAIL|${n}`); },
-  }, { maxAttempts: 1, liveness: inMemoryLiveness() }).drain(); // every store here lives in this process (pg-mem included)
+  }, { maxAttempts: 1 }).drain();
   // One consumer dead-letters every event (a record holding the error text), one acks.
   await createConsumer(work, 'audit', (p) => { throw new Error(`DEAD|${(p as { note: string }).note}`); }, { name: 'bad', maxAttempts: 1 }).poll();
   await createConsumer(work, 'audit', () => {}, { name: 'ok' }).poll();

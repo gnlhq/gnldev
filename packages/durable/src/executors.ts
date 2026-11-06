@@ -6,16 +6,19 @@
 // the process's liveness and its drain are the process's, not an organization's: so is the executor.
 //
 // A registry REGISTERS its scope here — the journal its runs live in, and how to continue one of them —
-// and gets the shared executor back. The sweep takes over only scopes registered in this process; a run
-// of a scope nobody here registered is somebody else's to continue (`pending()` lists it).
+// and gets the shared executor back. The ROOT registry also says how to continue a run of ANY
+// organization (`anyScope`: the registry an organization gets from the root's config, as every door
+// builds it): the sweep is the process's, so it continues every organization's runs, not only those of
+// the organizations a request happened to reach here. A scope nothing here can continue (no root
+// registry, or a config that cannot be scoped) is somebody else's to continue (`pending()` lists it).
 import { DetachedRuns, type DetachedRunsOptions, type ExecRecord, type Launch } from './detached.js';
 import type { Journal } from './journal.js';
 import { orgParentOf, orgScopeOf } from './organization.js';
 import { storeLiveness, type ProcessLiveness } from './process-liveness.js';
 import { JOURNAL_SOURCE } from './storage.js';
 
-interface ScopeEntry { journal: Journal; resume: (rec: ExecRecord) => Launch | Promise<Launch> }
-interface Shared { scopes: Map<string, ScopeEntry>; runs: Promise<DetachedRuns> }
+export interface ScopeEntry { journal: Journal; resume: (rec: ExecRecord) => Launch | Promise<Launch> }
+interface Shared { scopes: Map<string, ScopeEntry>; runs: Promise<DetachedRuns>; anyScope?: (scope: string) => ScopeEntry | undefined }
 
 const shared = new WeakMap<object, Shared>();
 /** Every executor this process made, for the process-wide drain. */
@@ -42,6 +45,8 @@ export interface ExecutorRegistration {
   resume: (rec: ExecRecord) => Launch | Promise<Launch>;
   /** The store's liveness, when the first registration settles it (`storeLiveness`): configured, or the store's own. */
   liveness?: { given?: ProcessLiveness; own?: () => ProcessLiveness | undefined | Promise<ProcessLiveness | undefined> };
+  /** The root registry's way to continue a run of any organization (see the head of this file). */
+  anyScope?: (scope: string) => ScopeEntry | undefined;
   /** Tuning, taken from the first registration on a store. */
   options?: Pick<DetachedRunsOptions, 'sweepMs' | 'pollMs' | 'coalesceMs' | 'outcomeAskMs' | 'signal' | 'onComplete'>;
 }
@@ -67,8 +72,17 @@ export function executorFor(journal: Journal, reg: ExecutorRegistration): Promis
   let s = shared.get(key);
   if (!s) {
     const scopes = new Map<string, ScopeEntry>();
-    const entry = (sc: string | undefined): ScopeEntry => {
+    // A scope registered here, else one the root registry can make (kept, as a registration of its own).
+    const find = (sc: string | undefined): ScopeEntry | undefined => {
       const e = scopes.get(sc ?? '');
+      if (e || sc === undefined || !s?.anyScope) return e;
+      let made: ScopeEntry | undefined;
+      try { made = s.anyScope(sc); } catch { made = undefined; }
+      if (made) scopes.set(sc, made);
+      return made;
+    };
+    const entry = (sc: string | undefined): ScopeEntry => {
+      const e = find(sc);
       if (!e) throw new Error(`@gnldev/durable: no registry for scope '${sc ?? ''}' in this process`);
       return e;
     };
@@ -79,7 +93,7 @@ export function executorFor(journal: Journal, reg: ExecutorRegistration): Promis
         journal: root,
         journalFor: (sc) => entry(sc).journal,
         resume: (rec) => entry(rec.scope).resume(rec),
-        handles: (sc) => scopes.has(sc ?? ''),
+        handles: (sc) => find(sc) !== undefined,
         ...(liveness ? { liveness } : {}),
         ...(reg.options ?? {}),
       });
@@ -91,5 +105,6 @@ export function executorFor(journal: Journal, reg: ExecutorRegistration): Promis
     runs.catch(() => { if (shared.get(key) === s) shared.delete(key); all.delete(runs); });
   }
   s.scopes.set(scope, { journal, resume: reg.resume });
+  if (reg.anyScope && scope === '') s.anyScope = reg.anyScope;
   return s.runs;
 }

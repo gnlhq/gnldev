@@ -15,7 +15,8 @@ import { createRequire } from 'node:module';
 import { InMemoryStorage, eraseSubject, purgeResource, toJournal, user, type Storage } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
 import { PostgresStorage } from '@gnldev/durable/postgres';
-import { enqueue, createWorker, listJobs, retryJob, jobEraser } from '../src/index.js';
+import { enqueue, createWorker, retryJob, jobEraser } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fromDurable = createRequire(join(here, '..', '..', 'durable', 'package.json'));

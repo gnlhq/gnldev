@@ -4,7 +4,8 @@
 // job's owner as the run's owner before the handler runs, and `ctx.run` / `ctx.caller` carry it.
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, runDurable, runOwnerOf, toJournal, withOrgStorage, user, staff, UNKNOWN, type Caller } from '@gnldev/durable';
-import { enqueue, createWorker, retryJob, listJobs } from '../src/index.js';
+import { enqueue, createWorker, retryJob } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 import { createMockModel, finalTextResult } from '../../durable/test/mock.js';
 
 const model = () => createMockModel(async () => finalTextResult('ok'));

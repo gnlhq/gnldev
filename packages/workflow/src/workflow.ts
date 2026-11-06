@@ -105,6 +105,11 @@ export interface StepCtx {
    *  Taşımayan bir adım claim'inden ÖNCE reddedilir — build()'in göremediği kombinatör kolları ve
    *  Nested çocuklar dahil her yolda. Registry critical'de kurar; elle kullanılabilir. */
   strictSideEffects?: boolean;
+  /**
+   * The occurrence a scheduler fired this run for (epoch ms), when one did — see @gnldev/scheduler.
+   * Present only on the call that was handed it: a resume that does not pass it again has none.
+   */
+  scheduledFor?: number;
 }
 
 // ── P0.4 key builders (single source of truth for the new key shapes) ──────────
@@ -163,6 +168,12 @@ const resumeKey = (runId: string, waitId: string) => `${runId}:wf:_resume:${wait
 /** Durable cancel flag — once written, NO worker will run further steps of this run (cross-process). */
 const canceledKey = (runId: string) => `${runId}:wf:_canceled`;
 
+/** An abort reason that ends an execution's right to run without canceling the run (@gnldev/durable execution-grant.ts, read by name). */
+function revokedNotCanceled(reason: unknown): boolean {
+  const r = reason as { name?: unknown; why?: unknown } | null | undefined;
+  return !!r && typeof r === 'object' && r.name === 'ExecutionRevokedError' && r.why !== 'canceled';
+}
+
 /**
  * Where a retry records that a step's output came from its fallback rather than from the step.
  *
@@ -196,6 +207,47 @@ const fallbackMarkerKey = (runId: string, keyPrefix: string | undefined, stepId:
  */
 const statusKey = (runId: string) => `wfrun:${runId}`;
 const WFRUN_PRE = 'wfrun:';
+
+/** A registry record as stored: written before `suspendSeq` existed, it has none. */
+type StoredRunStatus = Omit<WorkflowRunStatus, 'suspendSeq'> & { suspendSeq?: number };
+
+/**
+ * A stored registry record as `WorkflowRunStatus` — the one place a missing `suspendSeq` gets its
+ * meaning. A record written before the field existed is at the only suspend point anyone can still
+ * address, and it reads as 0: the next suspend is 1, a new point.
+ */
+function asRunStatus(raw: StoredRunStatus): WorkflowRunStatus {
+  return { ...raw, suspendSeq: raw.suspendSeq ?? 0 };
+}
+
+/** One registry record (by its key), read through `asRunStatus`. */
+async function readRunStatus(journal: JournalLike, key: string): Promise<WorkflowRunStatus | undefined> {
+  const raw = await journal.get<StoredRunStatus>(key);
+  return raw === undefined ? undefined : asRunStatus(raw);
+}
+
+/**
+ * Every write of a run's registry record goes through here. The new record is built from the one it
+ * replaces — `suspendSeq` carried over, +1 when the run suspends — and is written only if that record
+ * is still the stored one, so two attempts writing at once can never take the counter back (a lost
+ * update would put the run back on a suspend point a waker already marked woken). Without CAS the
+ * write is get→put: single-process safe, same posture as `adoptClaim`.
+ */
+async function writeStatus(
+  journal: JournalLike,
+  runId: string,
+  next: (prev: WorkflowRunStatus | undefined) => { record: Omit<WorkflowRunStatus, 'suspendSeq'>; suspends: boolean },
+): Promise<void> {
+  const key = statusKey(runId);
+  for (;;) {
+    const raw = await journal.get<StoredRunStatus>(key);
+    const prev = raw === undefined ? undefined : asRunStatus(raw);
+    const { record, suspends } = next(prev);
+    const value: WorkflowRunStatus = { ...record, suspendSeq: (prev?.suspendSeq ?? 0) + (suspends ? 1 : 0) };
+    if (!journal.putIfMatch || !journal.putIfAbsent) return journal.put(key, value);
+    if (raw === undefined ? await journal.putIfAbsent(key, value) : await journal.putIfMatch(key, raw, value)) return;
+  }
+}
 
 export interface Step<I = any, O = any> {
   id: string;
@@ -987,6 +1039,10 @@ export class Workflow<I = any, O = any> {
       // quiet (another worker/operator canceled), and an in-process abort is made durable immediately.
       // A deleted run is checked first: it is not canceled, it is gone — nothing of it is written again.
       await lease?.live();
+      // A signal aborted because this attempt's RIGHT TO RUN ended (its lock taken by another poller, its
+      // process releasing it, its time up — @gnldev/durable `ExecutionRevokedError`) is not a cancel: the
+      // run is continued by whoever holds it now, or retried. The attempt stops here, nothing written.
+      if (opts.signal?.aborted && revokedNotCanceled(opts.signal.reason)) throw opts.signal.reason;
       const flag = await journal.get<{ reason?: unknown }>(canceledKey(ctx.runId));
       if (flag !== undefined || opts.signal?.aborted) {
         if (flag === undefined) await journal.put(canceledKey(ctx.runId), { at: Date.now(), reason: 'signal' });
@@ -1018,16 +1074,14 @@ export class Workflow<I = any, O = any> {
   private async putStatus(
     journal: JournalLike,
     runId: string,
-    s: Omit<WorkflowRunStatus, 'runId' | 'updatedAt' | 'workflowName'>,
+    s: Omit<WorkflowRunStatus, 'runId' | 'updatedAt' | 'workflowName' | 'suspendSeq'>,
     workflowName?: string,
   ): Promise<void> {
     try {
-      await journal.put(statusKey(runId), {
-        ...s,
-        runId,
-        ...(workflowName !== undefined ? { workflowName } : {}),
-        updatedAt: Date.now(),
-      } satisfies WorkflowRunStatus);
+      await writeStatus(journal, runId, () => ({
+        record: { ...s, runId, ...(workflowName !== undefined ? { workflowName } : {}), updatedAt: Date.now() },
+        suspends: s.status === 'suspended',
+      }));
     } catch { /* advisory registry — the WorkflowResult return value is the source of truth */ }
   }
 }
@@ -1136,6 +1190,14 @@ export interface WorkflowRunStatus {
    *  one. Absent on records written before FLOW-08 or when the caller didn't pass a name. */
   workflowName?: string;
   updatedAt: number;
+  /**
+   * How many times the run has suspended: +1 on every suspend, carried over by every later record.
+   * `(runId, suspendSeq)` names one suspend point — a waker marks THAT point woken. `updatedAt` cannot:
+   * it is a clock, and a run that re-suspends within the same millisecond would share it with the
+   * point just woken, and never be woken again (k3). Always present on a record read through this
+   * package (a record stored without it reads as 0 — see `asRunStatus`).
+   */
+  suspendSeq: number;
 }
 
 /**
@@ -1293,22 +1355,25 @@ export async function cancelWorkflowRun(
   opts: { reason?: unknown } = {},
 ): Promise<boolean> {
   refuseUnknownNames('cancelWorkflowRun', opts, CANCEL_WORKFLOW_RUN_OPTS_NAMES);
-  const st = await journal.get<WorkflowRunStatus>(statusKey(runId));
+  const st = await readRunStatus(journal, statusKey(runId));
   // A cancel continues a run; it does not begin one. A run with no registry record and no step record
   // does not exist: refused, nothing written — its flag would have made the id read as a run.
   if (st === undefined && !(await hasStepRecords(journal, runId))) throw new RunNotFoundError(runId);
   if (st?.status === 'completed') return false;
   await journal.put(canceledKey(runId), { at: Date.now(), ...(opts.reason !== undefined ? { reason: opts.reason } : {}) });
-  await journal.put(statusKey(runId), {
-    runId,
-    status: 'canceled',
-    ...(st?.stepId ? { stepId: st.stepId } : {}),
-    // FLOW-08: carry the name forward from the existing record (same pattern as stepId above) —
-    // an external cancelWorkflowRun() call doesn't know the name itself, only runResumable does.
-    ...(st?.workflowName ? { workflowName: st.workflowName } : {}),
-    ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
-    updatedAt: Date.now(),
-  } satisfies WorkflowRunStatus);
+  await writeStatus(journal, runId, (cur) => ({
+    record: {
+      runId,
+      status: 'canceled',
+      ...(cur?.stepId ? { stepId: cur.stepId } : {}),
+      // FLOW-08: carry the name forward from the existing record (same pattern as stepId above) —
+      // an external cancelWorkflowRun() call doesn't know the name itself, only runResumable does.
+      ...(cur?.workflowName ? { workflowName: cur.workflowName } : {}),
+      ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
+      updatedAt: Date.now(),
+    },
+    suspends: false,
+  }));
   return true;
 }
 
@@ -1320,7 +1385,7 @@ async function hasStepRecords(journal: JournalLike, runId: string): Promise<bool
 
 /** Reads one run's registry record (undefined: the run never wrote one — pre-P0.4, or still mid-flight without a suspend). */
 export async function getWorkflowRunStatus(journal: JournalLike, runId: string): Promise<WorkflowRunStatus | undefined> {
-  return journal.get<WorkflowRunStatus>(statusKey(runId));
+  return readRunStatus(journal, statusKey(runId));
 }
 
 /**
@@ -1340,7 +1405,7 @@ export async function listWorkflowRuns(
   const keys = await journal.listKeys(WFRUN_PRE);
   const out: WorkflowRunStatus[] = [];
   for (const k of keys) {
-    const st = await journal.get<WorkflowRunStatus>(k);
+    const st = await readRunStatus(journal, k);
     if (st && (!opts.status || st.status === opts.status)) out.push(st);
   }
   out.sort((a, b) => b.updatedAt - a.updatedAt);

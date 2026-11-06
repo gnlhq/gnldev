@@ -16,7 +16,8 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import type { Storage } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
-import { enqueue, listJobs } from '../src/index.js';
+import { enqueue } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const on = process.env.NP_MEASURE === '1';
 const kind = (process.env.NP_KIND ?? 'sqlite') as 'sqlite' | 'postgres';

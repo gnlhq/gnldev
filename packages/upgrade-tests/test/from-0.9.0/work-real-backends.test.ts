@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { eraseSubject } from '@gnldev/durable';
 import { PostgresStorage } from '@gnldev/durable/postgres';
 import { createConsumer, eventEraser } from '@gnldev/events';
-import { createWorker, jobEraser } from '@gnldev/queue';
+import { createWorker, jobEraser, queueUpgrade } from '@gnldev/queue';
 import * as S from '../../generate/shapes.mjs';
 import { FIXTURES_090 } from '../support.js';
 
@@ -103,6 +103,8 @@ async function loadPostgres(variant: Variant): Promise<Loaded> {
   return { storage, containing, reopen: open };
 }
 
+/** k5 E: the queue's upgrade steps, in order: a 0.9.0 queue's one log moved into this version's lanes, the documented upgrade. */
+const upgradeQueue = async (f: Loaded) => { for (const step of [queueUpgrade(f.storage)].flat()) await step.run(); return f; };
 const worker = (storage: Store, ran: string[]) =>
   createWorker(storage, { plain: async (p: { n: string }) => { ran.push(p.n); } }, { maxAttempts: 2, heartbeat: false });
 const consumer = (storage: Store, seen: string[]) =>
@@ -119,7 +121,7 @@ describe.skipIf(!RUN)('upgrade from 0.9.0 — work store on a real Postgres', ()
   });
 
   it('the first drain after the upgrade runs every job 0.9.0 left pending, once', async () => {
-    const f = await load();
+    const f = await upgradeQueue(await load());
     const ran: string[] = [];
     await worker(f.storage, ran).drain();
     expect([...ran].sort()).toEqual(pendingJobs);
@@ -127,7 +129,7 @@ describe.skipIf(!RUN)('upgrade from 0.9.0 — work store on a real Postgres', ()
   });
 
   it("erasing a person right after the upgrade skips none of anybody else's jobs, and leaves nothing of theirs", async () => {
-    const f = await load();
+    const f = await upgradeQueue(await load());
     await eraseSubject(f.storage, 'ayse', { erasers: [jobEraser(f.storage), eventEraser(f.storage.work!)] });
     const ran: string[] = [];
     await worker(f.storage, ran).drain();
@@ -152,7 +154,7 @@ describe.skipIf(!RUN)('upgrade from 0.9.0 — work store on a real Postgres', ()
   });
 
   it('a queue 0.9.0 itself erased a person from: the first drain runs every job that was pending, once', async () => {
-    const f = await loadAs('work-erased');
+    const f = await upgradeQueue(await loadAs('work-erased'));
     const ran: string[] = [];
     await worker(f.storage, ran).drain();
     expect([...ran].sort()).toEqual(pendingJobs);

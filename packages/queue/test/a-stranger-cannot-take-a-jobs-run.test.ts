@@ -5,7 +5,8 @@
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, createGnl, eraseSubject, user, runOwnerOf, type Storage } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
-import { enqueue, createWorker, listJobs, jobEraser } from '../src/index.js';
+import { enqueue, createWorker, jobEraser } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const model = () => ({
   specificationVersion: 'v4' as const, provider: 'm', modelId: 'm', supportedUrls: {},

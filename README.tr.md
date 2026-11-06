@@ -145,7 +145,7 @@ cd my-agent && pnpm install
 pnpm dev                          # REST API + Studio Playground (tek port). Aç: http://localhost:3000/studio
                                   # (REST API `/` altına mount'lu ve index route'u yok — çıplak `/` 404 döner)
 ```
-**Zaten bir uygulaman mı var?** Kökünde `npx gnl init` koş: projeyi tanır (`package.json`) ve yalnız
+**Zaten bir uygulaman mı var?** Kökünde `npx @gnldev/cli init` koş (`gnl` binary'si `@gnldev/cli` içindedir; bağımlılık olunca `npx gnl …` çalışır): projeyi tanır (`package.json`) ve yalnız
 *yeni* dosyalar yazar — `gnl.config.ts`, `src/agents/`, `src/tools/` — seninkilere asla dokunmaz; manifest'i
 düzenlemek yerine ekleyeceğin `pnpm add` satırını basar.
 **Mock'tan gerçek modele:** `npx gnl add model <nvidia|openai|anthropic|openai-compatible>` sağlayıcı

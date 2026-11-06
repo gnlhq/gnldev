@@ -5,10 +5,10 @@
 import { leafSuffix } from './run-id-grammar.js';
 import { runRecordKey } from './run-id-grammar.js';
 import { closeExecutorFor } from './executors.js';
-import { postgresLiveness, unbindLiveness, type PgProcessSession } from './process-liveness.js';
+import { postgresLiveness, unbindLiveness, StoreLivenessSlot, type ProcessLiveness } from './process-liveness.js';
 import { ROOT_EXEC_RECORDS } from './adoption.js';
 import { prefixUpperBound } from './organization.js';
-import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition, markWorkOf } from './storage.js';
+import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition, markWorkOf, readyRankSql, readyStep, planAppendMany, rankAppendMany, manyRows, valuesSql, type WorkRecord } from './storage.js';
 import { memoryPartitionOf, memoryPartitionSql, type MemoryPartitionOption } from './storage.js';
 import { requireOptionalPeer } from './optional-peer.js';
 import { cosineSimilarity } from 'ai';
@@ -22,6 +22,7 @@ import type { AdoptIntoOrgResult,
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
   ThreadRecord, MessageRecord, MessageAppend, Observation, RecallOptions, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord,
+  ReadyEntry, ReadyTake, ReadyItem, ReadyHeld,
 } from './storage.js';
 // P2-migrate schema introspection/migration façade — see migrate.ts's header.
 import { tablesFromDDL, indexesFromDDL } from './migrate.js';
@@ -62,6 +63,14 @@ const SCHEMA_VERSION = '1';
 export interface PostgresStorageOptions {
   connectionString?: string;
   pool?: Pool;
+  /**
+   * This process's liveness on this database (process-liveness.ts), when the store cannot make its own:
+   * behind a transaction-mode pooler, `postgresLiveness({ connectionString: <direct URL> })`. It is THE
+   * store's liveness — every component on this store (registry, queue worker, scheduler, a direct
+   * primitive) stamps and proves with it, whichever attaches first. Default: a session the store opens
+   * from the pool's connection fields. Closed by its owner, not by the store.
+   */
+  liveness?: ProcessLiveness | Promise<ProcessLiveness>;
 }
 
 function offset(q?: ListQuery) { return { start: q?.cursor ? Number(q.cursor) || 0 : 0, limit: q?.limit ?? 50 }; }
@@ -102,6 +111,8 @@ type PrefixShape = {
   relationGuard?: boolean;
   /** Both guards installed and enabled (settled at boot) — what placing a run with no `:input` needs; RELATIONS_VERIFY_KEY aside. */
   guardsInstalled?: boolean;
+  /** READY_RANK_FN defined on this database (settled at boot): `appendReady` ranks through it. */
+  readyFns?: boolean;
 };
 
 /**
@@ -122,6 +133,27 @@ type Settled = () => Promise<PrefixShape>;
  * WHEN clause keeps it off every row that is not a placed owner record — the journal's hot writes. A
  * rewrite by this version that keeps the same person lands unplaced too: still found, from the record.
  */
+/**
+ * The rank's inputs (`readyRank`): `floor` and `top` of a set at `$now`, as SQL over `$set`, `$ns`, `$now`.
+ * `floor` in the take order `(rnk, seq)` — the order of `gnl_work_ready_take`, so the plan walks it from
+ * its first entry: ordered by `rnk` alone, a plan made before the table had statistics read every entry of
+ * the set through `gnl_work_ready_ns` and sorted them (measured: a 30 000-entry fill, 40 M index reads).
+ * `hold IS NULL` word for word as `gnl_work_ready_take`'s predicate, which is how the planner proves it may use it.
+ */
+const readyFloorSql = (set: string, now: string) => `(SELECT rnk FROM gnl_work_ready WHERE rset = ${set} AND not_before <= ${now} AND hold IS NULL ORDER BY rnk, seq LIMIT 1)`;
+const readyTopSql = (set: string, ns: string) => `(SELECT rnk FROM gnl_work_ready WHERE rset = ${set} AND ns = ${ns} ORDER BY rnk DESC LIMIT 1)`;
+/**
+ * The rank (`readyRankSql`) as a function, so the ONE statement that ranks an entry
+ * (`PgWorkStore.appendReady`) reads its inputs AFTER it holds the namespace's lane row: a VOLATILE
+ * function takes a fresh snapshot for the query it runs, where a subquery reads the statement's snapshot
+ * — taken before it waited for the row, missing the entry the previous holder just committed (measured:
+ * 200 appends of one namespace at once, 68 distinct ranks). SQL, not PL/pgSQL: a PL/pgSQL body keeps the
+ * plan its session made first — on an empty table, a sort of every entry of the set — until statistics
+ * arrive (measured: a 30 000-job fill of a fresh database took 56 s instead of ~24 s). (Re)defined on every boot, like the guards;
+ * a backend without SQL functions (pg-mem, one statement at a time) ranks with the same SQL inline.
+ */
+const READY_RANK_FN = `CREATE OR REPLACE FUNCTION gnl_work_ready_rank(p_set TEXT, p_ns TEXT, p_now BIGINT, p_step DOUBLE PRECISION) RETURNS DOUBLE PRECISION LANGUAGE sql VOLATILE AS $$
+  SELECT ${readyRankSql(readyFloorSql('p_set', 'p_now'), readyTopSql('p_set', 'p_ns'), 'p_step')} $$`;
 const OWNER_UNPLACE = [
   `CREATE OR REPLACE FUNCTION gnl_owner_unplace() RETURNS trigger LANGUAGE plpgsql AS $$
    BEGIN
@@ -285,6 +317,25 @@ const DDL = [
   `ALTER TABLE gnl_work_log ALTER COLUMN ord SET DEFAULT nextval('gnl_work_log_ord')`,
   `CREATE TABLE IF NOT EXISTS gnl_work_seq (ns TEXT PRIMARY KEY, seq BIGINT NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS gnl_work_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+  // A ready set's entries (`WorkStore.appendReady`): taken by `(rnk, seq)` (`gnl_work_ready_take`), a
+  // namespace's highest rank read by `gnl_work_ready_ns`. `gnl_work_ready_lane`: one row per namespace of
+  // a set — the namespace's turn: the one statement that ranks an entry updates it (`turns`, how many it
+  // ranked) and reads the rank while it holds it, so two entries of one namespace are ranked one after the other.
+  `CREATE TABLE IF NOT EXISTS gnl_work_ready (rset TEXT NOT NULL, id TEXT NOT NULL, ns TEXT NOT NULL, kind TEXT NOT NULL, not_before BIGINT NOT NULL, rnk DOUBLE PRECISION NOT NULL, seq BIGSERIAL, hold TEXT, hproc TEXT, hat BIGINT, httl BIGINT, PRIMARY KEY (rset, id))`,
+  // `gnl_work_ready_take` holds the entries nobody holds — exactly what its two readers ask for (the
+  // floor, `readyFloorSql`, and `takeReady`, both `hold IS NULL` in `(rnk, seq)` order). Partial, so a plan
+  // made before the table has statistics still walks it from its first entry: as a whole-set index, that
+  // plan guessed `hold IS NULL` to match ~1 row and read every entry of the set through
+  // `gnl_work_ready_held` and sorted them — inside the lane turn, so every enqueue to a namespace waited on
+  // it (measured: a fresh database's 30 000-job fill, 200 producers, took 47–63 s until autovacuum's first
+  // ANALYZE landed and 181–206 s with none; 29–30 s analyzed from the first entry).
+  `CREATE INDEX IF NOT EXISTS gnl_work_ready_take ON gnl_work_ready (rset, rnk, seq) WHERE hold IS NULL`,
+  `CREATE INDEX IF NOT EXISTS gnl_work_ready_ns ON gnl_work_ready (rset, ns, rnk)`,
+  `CREATE INDEX IF NOT EXISTS gnl_work_ready_id ON gnl_work_ready (id)`,
+  // The held entries of a set (`heldReady`): as many as are being run, read on every poll. Not a partial
+  // index: pg-mem reads one as a whole index of the rows it holds, and found no entry of a set through it.
+  `CREATE INDEX IF NOT EXISTS gnl_work_ready_held ON gnl_work_ready (rset, hold)`,
+  `CREATE TABLE IF NOT EXISTS gnl_work_ready_lane (rset TEXT NOT NULL, ns TEXT NOT NULL, PRIMARY KEY (rset, ns))`,
   `CREATE TABLE IF NOT EXISTS gnl_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at BIGINT)`,
 ];
 
@@ -294,6 +345,8 @@ const DDL = [
  * for an empty prefix, which means every key — `col < ''` is never true, so emitting it unconditionally
  * turned `deletePrefix('')` into a delete of nothing that still reported success.
  */
+/** Keys per `IN` of `getMany`. */
+const KV_MANY = 500;
 function pgRange(col: string, collate: string, prefix: string, from: number): { where: string; params: string[] } {
   const upper = prefixUpperBound(prefix);
   return upper === undefined
@@ -388,28 +441,15 @@ export class PostgresStorage implements Storage {
    * which puts admin/developer accounts in their own `gnl_ee_*` tables next to the run journal.
    */
   get pool(): Pool { return this._pool; }
-  /** This store's own liveness session, once made; ended by `close()`. */
-  private ownLiveness?: Promise<PgProcessSession>;
+  /** This store's liveness: the one given (`PostgresStorageOptions.liveness`), else its own session — see `StoreLivenessSlot`. */
+  private readonly livenessSlot: StoreLivenessSlot<Promise<ProcessLiveness>>;
   /**
-   * This process's liveness on this database (process-liveness.ts): a session that holds the process
-   * lock on its own connection, made from the pool's connection fields — one per store, made on first
-   * use and ended by `close()`. Behind a transaction-mode pooler, pass
-   * `postgresLiveness({ connectionString: <direct URL> })` to the registry instead.
+   * This process's liveness on this database (process-liveness.ts): the one the store was given, else a
+   * session that holds the process lock on its own connection, made from the pool's connection fields —
+   * one per store, made on first use and ended by `close()`. Behind a transaction-mode pooler, pass
+   * `postgresLiveness({ connectionString: <direct URL> })` as the store's `liveness`.
    */
-  processLiveness(): Promise<PgProcessSession> {
-    if (this.ownLiveness) return this.ownLiveness;
-    const options = (this._pool as unknown as { options?: Record<string, unknown> }).options ?? {};
-    // A pool that does not say where it connects (a test double, a custom pool) cannot have a session made
-    // beside it: say so, rather than connecting to the driver's defaults.
-    if (!options.connectionString && !options.host) {
-      return Promise.reject(new Error('@gnldev/durable: this Postgres pool does not say where it connects, so no process liveness can be made for it — pass `liveness: await postgresLiveness({ connectionString })` to createGnl (or `inMemoryLiveness()` for a store only this process reaches)'));
-    }
-    const made = postgresLiveness({ client: { ...options } });
-    this.ownLiveness = made;
-    // A session that could not be made is not kept: the next call says it again.
-    made.catch(() => { if (this.ownLiveness === made) this.ownLiveness = undefined; });
-    return made;
-  }
+  processLiveness(): Promise<ProcessLiveness> { return this.livenessSlot.get(); }
   private ready?: Promise<void>;
   readonly runs: RunJournal;
   /** Absent when the pool cannot hold a transaction — see the constructor and NO_TX_MSG. */
@@ -421,6 +461,15 @@ export class PostgresStorage implements Storage {
 
   constructor(opts: PostgresStorageOptions = {}) {
     refuseUnknownNames('PostgresStorage', opts, POSTGRES_STORAGE_NAMES);
+    this.livenessSlot = new StoreLivenessSlot(opts.liveness && Promise.resolve(opts.liveness), () => {
+      const options = (this._pool as unknown as { options?: Record<string, unknown> }).options ?? {};
+      // A pool that does not say where it connects (a test double, a custom pool) cannot have a session made
+      // beside it: say so, rather than connecting to the driver's defaults.
+      if (!options.connectionString && !options.host) {
+        return Promise.reject(new Error('@gnldev/durable: this Postgres pool does not say where it connects, so no process liveness can be made for it — pass `liveness: await postgresLiveness({ connectionString })` to PostgresStorage (or `inMemoryLiveness()` for a store only this process reaches)'));
+      }
+      return postgresLiveness({ client: { ...options } });
+    });
     if (opts.pool) this._pool = opts.pool;
     else {
       const { Pool } = requireOptionalPeer<{ Pool: new (c: any) => Pool }>('pg');
@@ -661,6 +710,7 @@ export class PostgresStorage implements Storage {
           }
           const verify = after.ok && (await this._pool.query(`SELECT 1 AS x FROM gnl_meta WHERE k = $1`, [RELATIONS_VERIFY_KEY]).then((r: QueryResult) => r.rows.length > 0, () => false));
           this.prefixShape.guardsInstalled = after.ok;
+          this.prefixShape.readyFns = await this._pool.query(READY_RANK_FN).then(() => true, () => false);
           this.prefixShape.relationGuard = after.ok && !verify;
           // Rows the step can place — runs from before the columns, or placements to verify — make every
           // lookup by person or thread read them all (see RELATIONS_PENDING_ADVICE). Said once, at boot,
@@ -686,6 +736,8 @@ export class PostgresStorage implements Storage {
               `CREATE INDEX IF NOT EXISTS gnl_run_journal_cprefix ON gnl_run_journal (key COLLATE "C")`,
               `CREATE INDEX IF NOT EXISTS gnl_runs_cprefix ON gnl_runs (run_id COLLATE "C")`,
               `CREATE INDEX IF NOT EXISTS gnl_counters_cprefix ON gnl_counters (key COLLATE "C")`,
+              // The namespaces of a prefix (`listNamespaces`), and the work log's prefix deletes.
+              `CREATE INDEX IF NOT EXISTS gnl_work_log_cprefix ON gnl_work_log (ns COLLATE "C")`,
             ]) await this._pool.query(sql);
           }
           await backfillVectorDocuments((sql, p) => this._pool.query(sql, p));
@@ -757,9 +809,7 @@ export class PostgresStorage implements Storage {
     // Then this store's liveness: no stamp is written into it from here, and its session — a connection
     // to this database — ends with it (a-closed-store-holds-no-connection.test.ts).
     unbindLiveness(this.runs);
-    const own = this.ownLiveness;
-    this.ownLiveness = undefined;
-    if (own) await (await own.catch(() => undefined))?.close();
+    await this.livenessSlot.close();
     if (this._pool.end) await this._pool.end();
   }
 
@@ -1031,7 +1081,7 @@ export class PostgresStorage implements Storage {
       this.booted(threadRecordsStep(this, ['schema'])),
       this.booted(relationsStep(this.runs as PgRunJournal, ['schema'])),
       this.booted(verifyRelationsStep(this.runs as PgRunJournal, ['schema'])),
-    ], opts, () => this.holdsAStore());
+    ], opts, () => this.holdsAStore(), this);
   }
 
   /**
@@ -2673,6 +2723,143 @@ class PgWorkStore implements WorkStore {
       }
     }, { atomic: true });
   }
+  /** By the primary key `(ns, id)` (`WorkStore.read`). */
+  async read<T = unknown>(ns: string, id: string): Promise<LogRecord<T> | undefined> {
+    const x = (await this.q('SELECT id, payload, ts FROM gnl_work_log WHERE ns = $1 AND id = $2', [ns, id])).rows[0];
+    return x ? { id: x.id as string, payload: deserialize<T>(x.payload as string), ts: Number(x.ts) } : undefined;
+  }
+  /**
+   * The record and its entry in ONE statement (`WorkStore.appendReady`), ranked by it: the statement
+   * counts a turn on the namespace's lane row and returns the rank (`readyRankSql`) read while it holds the
+   * row — held for that one statement, not across round trips (READY_RANK_FN) — so two entries of one
+   * namespace are never ranked alike. An entry already there stays as it is; a record already there too.
+   */
+  async appendReady(ns: string, payload: unknown, id: string, e: ReadyEntry): Promise<string> {
+    if (this.oneStatement && (await this.settled()).readyFns) {
+      try {
+        await this.q(
+          `WITH rec AS (
+             INSERT INTO gnl_work_log (ns, id, payload, ts) VALUES ($2, $3, $4, $7) ON CONFLICT (ns, id) DO NOTHING RETURNING 1 AS one
+           ), lane AS (
+             INSERT INTO gnl_work_ready_lane AS l (rset, ns) SELECT $1, $2 FROM (SELECT count(*) AS n FROM rec) r
+             ON CONFLICT (rset, ns) DO UPDATE SET ns = l.ns WHERE FALSE
+             RETURNING 1 AS one
+           )
+           INSERT INTO gnl_work_ready (rset, id, ns, kind, not_before, rnk) SELECT $1, $3, $2, $8, $9, gnl_work_ready_rank($1, $2, $5, $6) FROM (SELECT count(*) AS n FROM lane) k
+           ON CONFLICT (rset, id) DO NOTHING`,
+          [e.set, ns, id, serialize(payload), e.now, readyStep(e.step), Date.now(), e.kind, e.notBefore],
+        );
+        return id;
+      } catch (err) {
+        // pg-mem's own words for a writing WITH it does not run; real Postgres has it.
+        if (!/not supported|not implemented|failed to parse/i.test(String((err as Error)?.message ?? err))) throw err;
+        this.oneStatement = false;
+      }
+    }
+    // An engine without SQL functions or a writing WITH (pg-mem, one statement at a time): the same two
+    // writes, each one statement, in one transaction.
+    await this.tx(async (q) => {
+      await q('INSERT INTO gnl_work_log (ns, id, payload, ts) VALUES ($1, $2, $3, $4) ON CONFLICT (ns, id) DO NOTHING', [ns, id, serialize(payload), Date.now()]);
+      await q(
+        `INSERT INTO gnl_work_ready (rset, id, ns, kind, not_before, rnk) SELECT $1, $3, $2, $6, $7::bigint, ${readyRankSql(readyFloorSql('$1', '$4::bigint'), readyTopSql('$1', '$2'), '$5::double precision')}
+         ON CONFLICT (rset, id) DO NOTHING`,
+        [e.set, ns, id, e.now, readyStep(e.step), e.kind, e.notBefore],
+      );
+    }, { atomic: true });
+    return id;
+  }
+  /**
+   * Every record and entry in ONE transaction (`WorkStore.appendMany`), each namespace ranked in ONE turn:
+   * the records first, in call order; then the call's lane rows, locked in name order and held to the
+   * commit — an `appendReady` or another call on one of those namespaces waits for this one and ranks
+   * after it (READ COMMITTED: each statement reads what committed before it). Then the rank's inputs, read
+   * once under the locks, and the entries (`rankAppendMany`). Rows go in numbered VALUES lists (`manyRows`;
+   * pg-mem reads no array UNNEST, see incrSql).
+   * Bound, stated: two calls that name the same new ids in different orders at once can deadlock on them;
+   * Postgres refuses one, which writes nothing.
+   */
+  async appendMany(records: readonly WorkRecord[]): Promise<void> {
+    const plan = planAppendMany(records);
+    if (!plan.records.length) return;
+    const rows = plan.records.map((r) => [r.ns, r.id, serialize(r.payload)]);
+    const ts = Date.now();
+    await this.tx(async (q) => {
+      for (const part of manyRows(rows)) {
+        await q(`INSERT INTO gnl_work_log (ns, id, payload, ts) VALUES ${valuesSql(part.length, 4)} ON CONFLICT (ns, id) DO NOTHING`, part.flatMap((r) => [...r, ts]));
+      }
+      const ready = plan.ready;
+      if (!ready) return;
+      const lanes = [...plan.lanes].sort();
+      for (const part of manyRows(lanes)) {
+        await q(`INSERT INTO gnl_work_ready_lane (rset, ns) VALUES ${valuesSql(part.length, 2)} ON CONFLICT (rset, ns) DO NOTHING`, part.flatMap((ns) => [ready.set, ns]));
+        await q(`SELECT ns FROM gnl_work_ready_lane WHERE rset = $1 AND ns IN (${part.map((_, i) => `$${i + 2}`).join(', ')}) ORDER BY ns FOR UPDATE`, [ready.set, ...part]);
+      }
+      const floor = (await q(`SELECT ${readyFloorSql('$1', '$2::bigint')} AS floor`, [ready.set, ready.now])).rows[0] as { floor: number | null } | undefined;
+      const tops = new Map<string, number | undefined>();
+      for (const part of manyRows(lanes)) {
+        const r = await q(`SELECT ns, MAX(rnk) AS top FROM gnl_work_ready WHERE rset = $1 AND ns IN (${part.map((_, i) => `$${i + 2}`).join(', ')}) GROUP BY ns`, [ready.set, ...part]);
+        for (const x of r.rows as { ns: string; top: number | null }[]) tops.set(x.ns, x.top === null ? undefined : Number(x.top));
+      }
+      const has = new Set<string>();
+      for (const part of manyRows(plan.entries.map((x) => x.id))) {
+        const r = await q(`SELECT id FROM gnl_work_ready WHERE rset = $1 AND id IN (${part.map((_, i) => `$${i + 2}`).join(', ')})`, [ready.set, ...part]);
+        for (const x of r.rows as { id: string }[]) has.add(x.id);
+      }
+      const floorRank = floor?.floor === null || floor === undefined ? undefined : Number(floor.floor);
+      for (const part of manyRows(rankAppendMany(plan, floorRank, tops, has))) {
+        await q(
+          `INSERT INTO gnl_work_ready (rset, id, ns, kind, not_before, rnk) VALUES ${valuesSql(part.length, 6, ['', '', '', '', '::bigint', '::double precision'])} ON CONFLICT (rset, id) DO NOTHING`,
+          part.flatMap((x) => [ready.set, x.id, x.ns, x.kind, x.notBefore, x.rank]),
+        );
+      }
+    }, { atomic: true, readCommitted: true });
+  }
+  /** `false` once the engine has refused the one ranking statement (pg-mem): see `appendReady`. */
+  private oneStatement = true;
+  /** `false` once the engine has refused `FOR UPDATE SKIP LOCKED` (pg-mem): see `takeReady`. */
+  private skipLocked = true;
+  /** One statement: the lowest-ranked ready entry nobody holds and no other taker is taking (`SKIP LOCKED`), held by `holder`. */
+  async takeReady(set: string, t: ReadyTake): Promise<ReadyItem | undefined> {
+    const kinds = [...(t.skipKinds ?? [])];
+    const h = t.holder;
+    if (this.skipLocked) {
+      try {
+        const r = await this.q(
+          `UPDATE gnl_work_ready SET hold = $3, hproc = $5, hat = $2, httl = $6 WHERE rset = $1 AND id = (
+             SELECT id FROM gnl_work_ready WHERE rset = $1 AND not_before <= $2 AND hold IS NULL AND NOT (kind = ANY($4::text[]))
+             ORDER BY rnk, seq LIMIT 1 FOR UPDATE SKIP LOCKED
+           ) RETURNING ns, id`,
+          [set, t.now, h.hold, kinds, h.proc ?? null, h.ttlMs],
+        );
+        const x = r.rows[0] as { ns: string; id: string } | undefined;
+        return x ? { ns: x.ns, id: x.id } : undefined;
+      } catch (e) {
+        // pg-mem's own words for a locking clause it does not plan; real Postgres has it.
+        if (!/not supported|not implemented|failed to parse/i.test(String((e as Error)?.message ?? e))) throw e;
+        this.skipLocked = false;
+      }
+    }
+    // An engine without `SKIP LOCKED`: the candidate is taken only while it is still ready — a taker that
+    // lost the race to it reads again. The same outcome, with a retry per lost race.
+    for (;;) {
+      const x = (await this.q('SELECT id FROM gnl_work_ready WHERE rset = $1 AND not_before <= $2 AND hold IS NULL AND NOT (kind = ANY($3::text[])) ORDER BY rnk, seq LIMIT 1', [set, t.now, kinds])).rows[0] as { id: string } | undefined;
+      if (!x) return undefined;
+      const r = (await this.q('UPDATE gnl_work_ready SET hold = $3, hproc = $5, hat = $4, httl = $6 WHERE rset = $1 AND id = $2 AND hold IS NULL AND not_before <= $4 RETURNING ns, id', [set, x.id, h.hold, t.now, h.proc ?? null, h.ttlMs])).rows[0] as { ns: string; id: string } | undefined;
+      if (r) return { ns: r.ns, id: r.id };
+    }
+  }
+  async heldReady(set: string): Promise<ReadyHeld[]> {
+    const r = await this.q('SELECT id, hold, hproc, hat, httl FROM gnl_work_ready WHERE rset = $1 AND hold IS NOT NULL', [set]);
+    return (r.rows as { id: string; hold: string; hproc: string | null; hat: string | number; httl: string | number }[])
+      .map((x) => ({ id: x.id, hold: x.hold, ...(x.hproc !== null ? { proc: x.hproc } : {}), at: Number(x.hat), ttlMs: Number(x.httl) }));
+  }
+  async deferReady(set: string, id: string, notBefore: number, hold?: string): Promise<void> {
+    if (hold === undefined) await this.q('UPDATE gnl_work_ready SET not_before = $3, hold = NULL, hproc = NULL, hat = NULL, httl = NULL WHERE rset = $1 AND id = $2', [set, id, notBefore]);
+    else await this.q('UPDATE gnl_work_ready SET not_before = $3, hold = NULL, hproc = NULL, hat = NULL, httl = NULL WHERE rset = $1 AND id = $2 AND hold = $4', [set, id, notBefore, hold]);
+  }
+  async dropReady(set: string, id: string): Promise<void> {
+    await this.q('DELETE FROM gnl_work_ready WHERE rset = $1 AND id = $2', [set, id]);
+  }
   /** Keyset on `(seq, ts, id)` from the cursor's position (`WorkStore.list`); one extra row says "more". */
   async list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>> {
     const limit = q?.limit ?? 50;
@@ -2695,6 +2882,39 @@ class PgWorkStore implements WorkStore {
   async get<T = unknown>(key: string): Promise<T | undefined> {
     const r = await this.q('SELECT value FROM gnl_work_kv WHERE key = $1', [key]);
     return r.rows[0] ? deserialize<T>(r.rows[0].value) : undefined;
+  }
+  /** One `IN` per KV_MANY keys (`WorkStore.getMany`; an `IN` list, not `= ANY`, which pg-mem reads too), answered in the order asked. */
+  async getMany<T = unknown>(keys: string[]): Promise<(T | undefined)[]> {
+    const got = new Map<string, string>();
+    for (let i = 0; i < keys.length; i += KV_MANY) {
+      const part = [...new Set(keys.slice(i, i + KV_MANY))];
+      const r = await this.q(`SELECT key, value FROM gnl_work_kv WHERE key IN (${part.map((_, j) => `$${j + 1}`).join(', ')})`, part);
+      for (const x of r.rows as { key: string; value: string }[]) got.set(x.key, x.value);
+    }
+    return keys.map((k) => (got.has(k) ? deserialize<T>(got.get(k)!) : undefined));
+  }
+  /**
+   * One index probe per name (`WorkStore.listNamespaces`): the next namespace in the range after the last,
+   * compared under the probed collation like every prefix range here (`gnl_work_log_cprefix` serves it
+   * when that is `COLLATE "C"`, the primary key otherwise).
+   */
+  async listNamespaces(prefix: string, q?: ListQuery): Promise<Page<string>> {
+    const limit = q?.limit ?? 50;
+    const c = (await this.settled()).collate;
+    const r = pgRange('ns', c, prefix, 1);
+    const names: string[] = [];
+    let after = q?.cursor;
+    while (names.length <= limit) {
+      const x = (after === undefined
+        ? await this.q(`SELECT ns FROM gnl_work_log WHERE ${r.where} ORDER BY ns${c} LIMIT 1`, r.params)
+        : await this.q(`SELECT ns FROM gnl_work_log WHERE ${r.where} AND ns${c} > $${r.params.length + 1} ORDER BY ns${c} LIMIT 1`, [...r.params, after])).rows[0] as { ns: string } | undefined;
+      if (!x) break;
+      names.push(x.ns);
+      after = x.ns;
+    }
+    const more = names.length > limit;
+    if (more) names.pop();
+    return { items: names, nextCursor: more ? names[names.length - 1] : undefined };
   }
   async put(key: string, value: unknown): Promise<void> {
     await this.q(`INSERT INTO gnl_work_kv (key, value) VALUES ($1,$2) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value`, [key, serialize(value)]);
@@ -2720,7 +2940,9 @@ class PgWorkStore implements WorkStore {
     const l = await this.q(`DELETE FROM gnl_work_log WHERE ${lr.where}`, lr.params);
     const kr = pgRange('key', c, prefix, 1);
     const k = await this.q(`DELETE FROM gnl_work_kv WHERE ${kr.where}`, kr.params);
-    return Number(l.rowCount ?? 0) + Number(k.rowCount ?? 0);
+    const rr = await this.q(`DELETE FROM gnl_work_ready WHERE ${lr.where}`, lr.params);
+    await this.q(`DELETE FROM gnl_work_ready_lane WHERE ${lr.where}`, lr.params);
+    return Number(l.rowCount ?? 0) + Number(k.rowCount ?? 0) + Number(rr.rowCount ?? 0);
   }
   /** Every log record whose ID starts with `idPrefix`, in every namespace (`WorkStore.deleteIdPrefix`).
    *  A byte range under the probed collation, like `deletePrefix`: literal (no LIKE, so `%`, `_` and
@@ -2728,7 +2950,9 @@ class PgWorkStore implements WorkStore {
   async deleteIdPrefix(idPrefix: string): Promise<number> {
     const shape = await this.settled();
     const r = pgRange('id', shape.collate, idPrefix, 1);
-    return Number((await this.q(`DELETE FROM gnl_work_log WHERE ${r.where}`, r.params)).rowCount ?? 0);
+    const n = Number((await this.q(`DELETE FROM gnl_work_log WHERE ${r.where}`, r.params)).rowCount ?? 0);
+    await this.q(`DELETE FROM gnl_work_ready WHERE ${r.where}`, r.params);
+    return n;
   }
 }
 

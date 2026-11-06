@@ -31,7 +31,7 @@
 // one instruction away from the effect — and it is surfaced (`pending`), not taken over.
 import { randomUUID, createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createRequire } from 'node:module';
+import { requireNodeSqlite } from './node-sqlite.js';
 import { requireOptionalPeer } from './optional-peer.js';
 import { mkdirSync, rmSync, existsSync, realpathSync, statSync, openSync, closeSync } from 'node:fs';
 import { join, resolve as resolvePath, dirname, basename } from 'node:path';
@@ -125,16 +125,157 @@ export function storeOf(journal: unknown): object | undefined {
   return (cur[Symbol.for('@gnldev/durable.journalSource')] as object | undefined) ?? cur;
 }
 
-/** Makes `l` the liveness of `journal`'s store in this process (the executor's, the queue worker's). */
-export function bindLiveness(journal: unknown, l: ProcessLiveness): void {
-  const store = storeOf(journal);
-  if (store && !l.processOnly) bound.set(store, l);
+/**
+ * Two livenesses offered for one store in one process. A store has ONE liveness in a process: every stamp
+ * this process writes there names it, and every check of its own work proves it. A second one bound over
+ * the first (a worker that settled the store's own session, then a registry given another) left two
+ * sessions, and claims stamped with one id while the process proved the other.
+ */
+export class LivenessConflictError extends Error {
+  readonly code = 'liveness_conflict';
+  constructor(had: string, offered: string) {
+    super(
+      `@gnldev/durable: this store already has a process liveness in this process ('${had}'), and another one ('${offered}') ` +
+      'was offered for it. A store has one: give it to the storage (its `liveness` option, e.g. `new PostgresStorage({ liveness })`), ' +
+      'not to the components on it (createGnl, createWorker) — they all use the store\'s.',
+    );
+    this.name = 'LivenessConflictError';
+  }
 }
 
-/** Forgets `journal`'s store's liveness (the store is closing). The liveness itself is its owner's to close. */
+/**
+ * A store's one liveness, kept by the store: the one it was GIVEN (`new XStorage({ liveness })`; its owner
+ * closes it), else its OWN, made on first use and ended with the store. Every store keeps its liveness
+ * through this, so the choice between the two is made here and nowhere else (the components' side of it is
+ * `storeLiveness`, which refuses a second one offered beside the store's).
+ */
+export class StoreLivenessSlot<R extends ProcessLiveness | Promise<ProcessLiveness>> {
+  private own?: R;
+  constructor(private readonly given: R | undefined, private readonly make: () => R) {}
+  /** The store's liveness: the given one, else its own (made now if it is not yet). */
+  get(): R {
+    if (this.given) return this.given;
+    if (this.own) return this.own;
+    const made = this.make();
+    this.own = made;
+    // A session that could not be made is not kept: the next call says it again.
+    if (made instanceof Promise) made.catch(() => { if (this.own === made) this.own = undefined; });
+    return made;
+  }
+  /** What the store has already — the given one, or its own once made — without making one. */
+  current(): R | undefined { return this.given ?? this.own; }
+  /** Ends the store's OWN liveness; the given one is its owner's to close. */
+  async close(): Promise<void> {
+    const own = this.own;
+    this.own = undefined;
+    if (own) await (await Promise.resolve(own).catch(() => undefined))?.close();
+  }
+}
+
+/**
+ * Makes `l` the liveness of `journal`'s store in this process (the executor's, the queue worker's). Once:
+ * a different one offered later is refused (`LivenessConflictError`), never bound over the first.
+ */
+export function bindLiveness(journal: unknown, l: ProcessLiveness): void {
+  const store = storeOf(journal);
+  if (!store || l.processOnly) return;
+  const had = bound.get(store);
+  if (had && had !== l) throw new LivenessConflictError(had.id, l.id);
+  bound.set(store, l);
+}
+
+/**
+ * Forgets `journal`'s store's liveness in this process, and drops its pending give-backs (the store is
+ * closing). The liveness itself is its owner's to close.
+ *
+ * It holds only until the next acquisition on that store in this process: `acquireRunLock`, the claims of
+ * `durableTool` / `durableModel` (exclusive step) and `runDurable` bind the store's liveness again on
+ * their next call (`bindOwnLiveness` — the store's own, else the installed one), and an executor or worker
+ * started on it binds its own. So it is not a way to make this process's work look dead to the others,
+ * nor to have its claims judged by their age: a live process's lock is never taken over. Call it when
+ * the store is closed for good (the built-in stores' `close()` does).
+ */
 export function unbindLiveness(journal: unknown): void {
   const store = storeOf(journal);
   if (store) bound.delete(store);
+  if (store) dropGiveBacks(store);
+}
+
+// ── Giving back what this process holds ─────────────────────────────────────────────────────────────
+//
+// A record this process holds (a run lock, a detached execution record) names this process, and while it
+// is alive every OTHER process reads the record as held. So the write that gives it back is the only way
+// it is ever free before this process dies: a give-back that failed once (a dropped connection, a
+// failover) used to leave it held for the life of the process (k3). The holder retries it here, one rule
+// for every such record:
+//
+//   · the write is the caller's own FENCED write (it changes the record only while it still carries this
+//     acquisition's token/hold), so a retry that lands late never touches a later acquisition — the
+//     holder's own re-acquisition included;
+//   · retried with backoff (GIVE_BACK_FIRST_MS doubling to GIVE_BACK_MAX_MS) until it lands — the store
+//     coming back is what it waits for, however long;
+//   · at most GIVE_BACK_MAX pending: past that, one is not kept and is said once — what this process
+//     holds is then free when it dies, as before;
+//   · the store closing drops its pending give-backs: its session (and this process's liveness in it)
+//     closes with it, so the others read the holder as gone and the records as free — a closing store is
+//     not waited on for writes that the closing itself makes unnecessary, and that a store which is down
+//     would never complete. A store with no liveness (judged by age) frees them at their TTL.
+
+const GIVE_BACK_FIRST_MS = 100;
+const GIVE_BACK_MAX_MS = 30_000;
+const GIVE_BACK_MAX = 1024;
+interface GiveBack { store: object | undefined; write: () => Promise<void>; delay: number; timer?: ReturnType<typeof setTimeout> }
+const giveBacks = new Map<string, GiveBack>();
+let saidFull = false;
+
+/**
+ * Gives back a record this process holds: `write` now, and — when it throws — again in the background
+ * until it lands. Never throws (a give-back is the caller's cleanup). `id` is the acquisition's own
+ * unique id (its token or hold). @internal
+ */
+export async function giveBack(id: string, journal: unknown, write: () => Promise<void>): Promise<void> {
+  try {
+    await write();
+  } catch {
+    if (giveBacks.has(id)) return;
+    if (giveBacks.size >= GIVE_BACK_MAX) {
+      if (!saidFull) {
+        saidFull = true;
+        console.warn(`@gnldev/durable: ${GIVE_BACK_MAX} records this process holds could not be given back (the store keeps refusing the write) — more are not retried; they are free when this process stops.`);
+      }
+      return;
+    }
+    const entry: GiveBack = { store: storeOf(journal), write, delay: GIVE_BACK_FIRST_MS };
+    giveBacks.set(id, entry);
+    retryGiveBack(id, entry);
+  }
+}
+
+function retryGiveBack(id: string, entry: GiveBack): void {
+  entry.timer = setTimeout(() => {
+    entry.write().then(
+      () => { giveBacks.delete(id); },
+      () => {
+        if (giveBacks.get(id) !== entry) return; // dropped meanwhile (its store closed)
+        entry.delay = Math.min(entry.delay * 2, GIVE_BACK_MAX_MS);
+        retryGiveBack(id, entry);
+      },
+    );
+  }, entry.delay);
+  entry.timer.unref?.();
+}
+
+function dropGiveBacks(store: object): void {
+  for (const [id, entry] of giveBacks) {
+    if (entry.store !== store) continue;
+    clearTimeout(entry.timer);
+    giveBacks.delete(id);
+  }
+}
+
+/** How many give-backs this process is still retrying. @internal (tests) */
+export function pendingGiveBacks(): number {
+  return giveBacks.size;
 }
 
 /**
@@ -150,6 +291,12 @@ export async function storeLiveness(
   opts: { given?: ProcessLiveness; own?: () => ProcessLiveness | undefined | Promise<ProcessLiveness | undefined> } = {},
 ): Promise<ProcessLiveness | undefined> {
   const store = storeOf(journal);
+  // A store that answers for its own liveness (a SqliteStorage, a PostgresStorage) is the one place it is
+  // chosen: a component handed another one beside it was how a process came to hold two sessions on one
+  // store, stamping with one and proving the other — depending on which component attached first.
+  if (opts.given && store && typeof (store as { processLiveness?: unknown }).processLiveness === 'function') {
+    throw new LivenessConflictError('the store\'s own', opts.given.id);
+  }
   const l = opts.given ?? (store && bound.get(store)) ?? (opts.own ? await opts.own() : undefined) ?? installed;
   if (l) bindLiveness(journal, l);
   return l;
@@ -193,7 +340,7 @@ export async function bindOwnLiveness(journal: unknown): Promise<void> {
     // could not be opened) keeps its claims judged by their age, as before — said once, not failed: the
     // call itself does not need it, and an executor or worker given a liveness binds one later.
     unbindable.add(store);
-    console.warn('@gnldev/durable: no process liveness could be made for this store, so a claim another process holds on it is judged by its age (claimTtlMs) — pass `liveness` to createGnl or createWorker:', err instanceof Error ? err.message : err);
+    console.warn('@gnldev/durable: no process liveness could be made for this store, so a claim another process holds on it is judged by its age (claimTtlMs) — give it to the storage (`new PostgresStorage({ liveness })`, or the same option of the store you use):', err instanceof Error ? err.message : err);
   }
 }
 
@@ -319,6 +466,22 @@ export function sessionSignals(graceMs: number): { signal(): AbortSignal; proven
     proven() { if (ctl.signal.aborted) ctl = new AbortController(); arm(); },
     close() { if (timer) { clearTimeout(timer); timer = undefined; } },
   };
+}
+
+/**
+ * Waits for this process's own session to be proven again — as long as the bodies it started may still run
+ * (`sessionSignal`: half the grace after the last proof). Inside that time nothing was lost: the session
+ * comes back under the same id and the others read this process as dead only a whole grace after its lock
+ * went. `true`: proven (a session that was never gone answers at once). `false`: still gone when that time
+ * ended, or a liveness whose lock has no session to come back (no `sessionSignal`).
+ */
+export async function sessionBack(l: ProcessLiveness): Promise<boolean> {
+  for (;;) {
+    if (await l.confirm()) return true;
+    const signal = l.sessionSignal?.();
+    if (!signal || signal.aborted) return false;
+    await new Promise((r) => setTimeout(r, 25));
+  }
 }
 
 // ── The work in hand: one set, two faces ────────────────────────────────────────────────────────────
@@ -709,7 +872,10 @@ export function sqliteLivenessDir(dbPath: string): string {
 
 function storeIdentity(dbPath: string): { dir: string; links: number } {
   const abs = resolvePath(dbPath);
-  try { closeSync(openSync(abs, 'a')); } catch { /* cannot be created here: keyed by its path below */ }
+  // Created only when absent ('wx'), never opened when it exists: closing any descriptor of a file drops
+  // every POSIX lock this process holds on it — a store already open on it here lost its locks, and
+  // another process's last close deleted its -wal and -shm under it (k1-takeover T1, libSQL).
+  try { closeSync(openSync(abs, 'wx')); } catch { /* exists, or cannot be created here: keyed by its path below */ }
   try {
     const real = realpathSync(abs);
     const st = statSync(real);
@@ -729,7 +895,7 @@ const linkedWarned = new Set<string>();
  */
 export function sqliteLiveness(dbPath: string, idPrefix?: string): ProcessLiveness {
   const id = livenessIdOf(idPrefix);
-  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
+  const { DatabaseSync } = requireNodeSqlite(import.meta.url);
   const { dir, links } = storeIdentity(dbPath);
   if (links > 1 && !linkedWarned.has(dir)) {
     linkedWarned.add(dir);

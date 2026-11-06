@@ -215,8 +215,8 @@ describe('Streaming mid-checkpoint', () => {
     // No forensic copy of the parts (removed: nothing read it). A text stream's progress lives in a detached
     // run's event log; a step with a tool call is written ahead at the call (the safety record).
     expect(await journal.get('ck2:proc:__gnl_stream_checkpoint:0')).toBeUndefined();
-    expect(await journal.get('ck2:model:0')).toBeUndefined(); // no final record — flush did not run
-    // the claim stays at least 'running' (succeeded was never reached) — the crash is VISIBLE.
-    expect((await journal.get<any>('ck2:proc:__gnl_model_claim:0'))?.status).toBe('running');
+    expect(await journal.get('ck2:model:0')).toBeUndefined(); // no final record — the stream broke
+    // the claim says so (succeeded was never reached) — the break is VISIBLE, as a failed doStream's is.
+    expect((await journal.get<any>('ck2:proc:__gnl_model_claim:0'))?.status).toBe('failed');
   });
 });

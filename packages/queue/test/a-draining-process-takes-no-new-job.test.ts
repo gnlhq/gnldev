@@ -8,7 +8,8 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { InMemoryStorage, beginDrain, endDrain } from '@gnldev/durable';
 import * as durable from '@gnldev/durable';
-import { createQueue, listJobs } from '../src/index.js';
+import { createQueue } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function until(cond: () => boolean | Promise<boolean>, ms = 5_000): Promise<boolean> {

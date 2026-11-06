@@ -7,6 +7,221 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.17.0] — 2026-11-06
+
+**A store's process liveness, a job's and a fire's right to run, and a store's upgrade are each one rule.**
+The queue takes jobs fairly across organizations from per-organization lanes; the scheduler decides a
+fire under its lock and no longer makes due triggers wait for each other; cancel, a lost lease and a time
+limit reach a handler as one signal with its reason; packages register their upgrade steps on the store,
+and `gnl upgrade` finds them.
+
+### Breaking — upgrading from 0.16
+
+- **The floors are `ai` 7.0.149, `@ai-sdk/openai` 4.0.100, `@ai-sdk/anthropic` 4.0.86 and
+  `@ai-sdk/provider` 4.0.32**: the first versions that report a cut stream as `interrupted`. An
+  OpenAI-compatible endpoint that ends every stream with no `finish_reason` now answers `run_unfinished`
+  on each attempt, where it answered 200; see `docs/errors/run_unfinished.md`.
+- **Run `gnl upgrade` before this version's queue workers start.** The queue keeps jobs in per-organization
+  lanes now, not in 0.16's one `qjob` log. A worker of this version on a store whose jobs are still in that
+  log does not start, and says what to run. `gnl upgrade` (or, in code,
+  `registerUpgradeSteps(storage, [queueUpgrade])` and `storage.upgrade()`) runs `queue/lanes`, which moves
+  them and is safe while 0.16 workers and producers still run; what they add meanwhile, this version's
+  workers move. Once every 0.16 process is gone, `gnl upgrade --only queue/lanes-cleanup` deletes the old
+  log; it refuses while a 0.16 worker is still seen polling the store (a 0.16 producer with no worker is
+  not seen).
+- **A store's process liveness is given to the storage, not to the components on it.**
+  `createGnl({ liveness })` and `createWorker(storage, handlers, { liveness })` on a built-in store
+  (SqliteStorage, LibsqlStorage, PostgresStorage, MysqlStorage, MongoStorage) throw
+  `LivenessConflictError`: a store has one liveness in a process, and every component on it (registry,
+  queue worker, scheduler, direct primitives) uses that one. All five stores take it:
+
+  ```ts
+  // before
+  const liveness = await postgresLiveness({ connectionString: DIRECT_URL });
+  const gnl = createGnl({ storage: new PostgresStorage({ connectionString: POOLED_URL }), liveness });
+
+  // after
+  const liveness = await postgresLiveness({ connectionString: DIRECT_URL });
+  const gnl = createGnl({ storage: new PostgresStorage({ connectionString: POOLED_URL, liveness }) });
+  ```
+
+  The same for `new SqliteStorage(path, { liveness: sqliteLiveness(path) })` (a new second argument),
+  `new LibsqlStorage(path, { liveness })`, `new MysqlStorage({ connectionString, liveness })` and
+  `new MongoStorage({ connectionString, liveness })`. The storage never closes a liveness it was given.
+  `createGnl({ liveness })` / `createWorker({ liveness })` stay for a custom `Storage` with no
+  `processLiveness()`.
+- **`listJobs` returns a page, and without `orgId` lists only the jobs that have no organization.**
+  `listJobs(work, { orgId?, cursor?, limit? })` is `{ items, nextCursor? }` (read `.items`). Every
+  organization's jobs, for an operator, are `listAllJobs` (below).
+- **Custom work stores: `WorkStore.read`, `appendMany` and the ready set are required.** `read(ns, id)`,
+  `appendMany(records)` (many records and their ready entries in one write, each namespace ranked in one
+  turn), and `appendReady`, `takeReady`, `heldReady`, `deferReady`, `dropReady` — the fair take the queue
+  is built on. `listNamespaces` and `getMany` are optional. Every bundled store implements them; the
+  conformance kit checks them.
+- **The scheduler's `misfire: 'skip'` is gone, with no alias, and the default is `'latest'`.**
+  `scheduleWorkflow({ misfire: 'skip' })` is an unknown-value error. After an outage a trigger registered
+  without `misfire` — or stored by 0.16 as `'skip'` — fires the LATEST missed occurrence, not the oldest; for
+  the old behaviour pass `misfire: 'earliest'` (and `ifExists: 'replace'` on a stored trigger). The values
+  are `'latest'`, `'earliest'`, `'none'` (no missed occurrence runs) and `'catchup'` (all, oldest first). A
+  misfire not given is stored as "the default", so calling `schedule()` on every boot stays a no-op; stored
+  0.16 `'skip'` records read as the default, and `upgradeTriggers(journal, { dryRun })` — or the
+  `scheduler/misfire-default` step, once every 0.16 poller is gone — rewrites them.
+- **Due triggers no longer wait for each other.** A long fire used to hold the whole poll loop (a 10 s
+  workflow cut a 2 s cron from 12 fires to 2); every due trigger now fires at once and `concurrency` (on
+  `createScheduler` and `pollScheduler`) has no default limit. Pass `concurrency: n` to cap it.
+- **A lost lease stops the handler's work: `ctx.signal`, `EventMeta.signal`, `WorkflowRunner` `opts.signal`.**
+  A queue job's `ctx.signal` aborts with an `ExecutionRevokedError` whose `reason.why` is `canceled`,
+  `lease-lost` (another worker holds the job now) or `timeout` (`maxHoldMs`); it used to abort on a cancel
+  only, and a worker that lost its lease ran on beside the new holder. An event handler gets `meta.signal`
+  (`timeout`, `lease-lost`) — a test comparing `meta` with `toEqual` needs `toMatchObject`. A scheduler
+  fire's runner gets `opts.signal`, aborted as `lease-lost` when a renewal answers that the lock is not its
+  own or three renewals in a row go unanswered; `createGnl().runWorkflow` stops the workflow at its next
+  step boundary on it (it does not cancel it). The framework cannot stop code that ignores the signal.
+- **A detached run's ending is read from its stream, never assumed.** A stream that stops without its
+  `finish` part and without being stopped ends `failed` (`run_unfinished`, answered 502), not `completed`; runs an
+  executor stops at `close()` end `released` (another process continues them), not failed.
+- **`acquireRunLock` takes no `now`.** A lock is dated on the store's clock; the fifth argument is gone. A
+  call whose success write fails takes the recover path instead of answering busy, and a workflow waker's
+  tick result has a `busy` count.
+- **`storage.upgrade()` throws `UpgradeFailedError` when a step throws** (instead of the step's own error):
+  read `.report` and `.cause`; the steps that ran are idempotent, so fix the cause and run it again.
+  `UpgradeOptions.only` is `readonly string[]` (it was the union of the store's step names), and
+  `UpgradeStep.name` / `UpgradeStepReport.name` are `string`; `UpgradeStepName` stays the union of the
+  store's own steps.
+- `@gnldev/cli` requires `@gnldev/durable` as a peer; a project without it now gets it installed (npm) or a
+  peer warning (pnpm/yarn).
+- New journal field `configuredModelId` on model records; older records lack it and price as before.
+
+### Added
+
+- **`enqueueMany(work, jobs)`** (and `queue.enqueueMany(jobs)`) adds many jobs in one write — all or none.
+  Each job is `{ type, payload, options? }` with `enqueue`'s options, checked as `enqueue` checks them (one
+  invalid job refuses the call before anything is written); ids come back in call order; an id already
+  enqueued or repeated in the call is one job; `maxDepth` counts the call's own jobs. Fairness is that of
+  `enqueue` one after another; the call takes each organization's turn once, not once per job — for a large
+  batch on one organization (a CSV import: 30 000 jobs on Postgres in about 3 s).
+- **`listAllJobs(work, { cursor?, limit? })`** — a page of every job on the store, for an operator: the jobs
+  with no organization, then each organization's lane in name order, each in enqueue order. A listing is
+  fixed at its start: every job enqueued before its first page is listed exactly once, one enqueued after
+  it (into any lane) is the next listing's, so it ends under producers that never stop.
+- **`maxHoldMs` on a queue worker** (default: no limit): when it is up the handler's `ctx.signal` aborts
+  (`timeout`); the attempt counts as failed — retried, dead-lettered at `maxAttempts`. The lease is kept
+  until the handler returns, so nothing runs beside it.
+- **A handler still running after its lease was lost or its `maxHoldMs` ran out is warned about once**
+  (`console.warn`), `ttlMs` (queue) / `leaseMs` (events) / `lockTtlMs` (scheduler) later, in that package's
+  words: the queue's names `ctx.signal` and `ctx.run`, an event consumer's `meta.signal` and an idempotent
+  handler, the scheduler's the runner's signal and the workflow's recorded steps. No new option.
+- **`ctx.scheduledFor`** — every fire carries the occurrence it is for (also `WorkflowRunner` `opts.scheduledFor`),
+  kept across retries and resumes.
+- **`maxCatchup` for `misfire: 'catchup'`** (default: no limit — a day asleep on a minute cron is 1440
+  fires, as before); with `maxCatchup: n` only the `n` latest missed occurrences fire, and the trigger logs
+  one warning naming how many were skipped and the oldest one's time.
+- **`registerUpgradeSteps(storage, factories)`**: packages add their upgrade steps to a store, so
+  `storage.upgrade()`, `gnl upgrade` and `gnl doctor` see one list. `UpgradeStep`, `UpgradeStepFactory` and
+  `FORMAT_STEPS` (the store's format steps, `run-status` and `schema`) are public; package steps are named
+  `<package>/<step>`. `UpgradeStep.afterOlderGone`: a step that cannot run while a process of the earlier
+  version runs — a plain `upgrade()` reports it waiting; `only` runs it. `UpgradeFailedError` (`report`, `step`).
+- **`markUpgradeDue(target, step, due)` / `clearUpgradeDue`** — a package's note that the store holds data its
+  step has not moved (`target`: the storage, or a journal on it). `upgrade()` with no `only` reports a note
+  no registered step answers (dry run: `detail.notRegistered`; a real run: `UpgradeFailedError` carrying the
+  line to add). The queue notes `queue/lanes` / `queue/lanes-cleanup` when its worker meets 0.16 data, the
+  scheduler `scheduler/misfire-default` when a poller reads a 0.16 `'skip'` trigger; each step clears its own.
+- **`queueUpgrade`** (`queue/lanes`, then `queue/lanes-cleanup`, `afterOlderGone`), **`schedulerUpgrade`**
+  (`scheduler/misfire-default`, `afterOlderGone`) and **`moveLegacyJob`** (the one move of an old job into its lane).
+- **`gnl upgrade` finds the installed `@gnldev/queue` / `@gnldev/scheduler` itself** (optional peers) and
+  registers the steps they export; no flag. It prints `ran`, `failed`, `not attempted (after a failure)`,
+  `pending`, `waits for older processes`, `not registered`, `done`; exit 1 on a failed step or an
+  unregistered debt, 0 when only `afterOlderGone` steps wait; `--dry-run` shows "data vX → package vY".
+  Work in hand (`gnl pending`) no longer holds back a package step that is not `afterOlderGone`. `gnl doctor`
+  lists the registered package steps, the waiting ones and unregistered debts (exit 1 for those).
+  `gnl init --features job|schedule` writes `storage: registerUpgradeSteps(new …Storage(…), [queueUpgrade, schedulerUpgrade])`.
+- **`limits` in `gnl.config.ts`** (`maxCostUsd`, `maxTokens`, `maxToolCalls`, loop detection): `gnl dev` and the
+  `src/app.ts` that `gnl add host` writes pass it to `createRestApi` as the server-side bound. A request may
+  only tighten it. Studio Playground runs are not REST requests and are not capped by it.
+- `gnl doctor` states when the API has no credential, and that `GET /agents` then lists every system prompt.
+
+### Changed
+
+- **The queue takes the next fair job in one store call.** Each organization's jobs are a lane; a worker asks
+  the store for the next job of the organization that has waited longest and locks it (Postgres and MySQL
+  `SKIP LOCKED`, MongoDB `findOneAndUpdate`, SQLite / libSQL one writer). An empty poll is a constant number
+  of queries, whatever the number of organizations.
+- **A process that serves no request still continues what a dead process left**: the root registry's
+  executor starts when the registry is built and continues every organization's runs.
+- A scheduler's fire lock names the process (the store's liveness), whichever component attached first.
+- A lock, hold or tool claim whose give-back write fails is given back again in the background until it
+  lands; a process that dies is released by its liveness as before.
+
+### Fixed
+
+- **A liveness session gone for a moment no longer fails the tool calls that meet it.** A process whose
+  database answered a heartbeat late counted its session as lost and took the lock back under the same id
+  moments later. A tool call reaching its body in between was read as taken over, answered "being executed
+  by another executor" from its own claim, and the run ended `failed` with the claim left `running`: on a
+  loaded store, a whole process's share of its runs at once. The body now waits for the session, for as long
+  as the bodies already started may still run; a session not back by then starts nothing and gives the claim
+  back.
+- **A detached run whose session is gone is released, not finished without its tool call.** The refusal
+  reached the model as a failed tool, and the run could end `completed` with the tool run zero times. The
+  execution is now released and the next sweep continues the run from its log. A call that never started
+  runs once; a body told to stop after it started may have had its effect, so it is not run again and the
+  run waits on `SideEffectRetryBlockedError`.
+- **A model stream that was cut no longer answers as finished.** The AI SDK gives a cut stream a `finish` of
+  its own, so a provider connection that closed mid-answer reached the caller as `200` with half a text,
+  `finishReason: 'other'`; the step was recorded complete, and retrying the runId replayed the half. Such a
+  stream now ends `run_unfinished` (502; on `/agents/:name/stream` the `error` event carries the code, for
+  every upstream failure), nothing complete is recorded, and the same runId calls the model again. A step cut
+  after a tool call replays its journaled call: the tool runs once. A stream that carried an error is no
+  longer recorded as the step's answer either, so a retry calls the model instead of failing again. New
+  export: `RunUnfinishedError`. What counts as cut, and what `v2` models do, is in
+  [docs/errors/run_unfinished.md](./docs/errors/run_unfinished.md). A run recorded before this change replays
+  what it recorded.
+- A fire's lock is taken and its decision checked under it with the store's clock: a process with a skewed
+  clock, or one behind a long fire, no longer starts the same occurrence twice; a retry keeps its
+  occurrence and the schedule no longer drifts.
+- A suspend point is named by the run's suspend counter, not its `updatedAt`: a run that suspended again
+  within the same millisecond it was woken stayed suspended for good.
+- A queue job's ready entry is held by the one ownership rule (its holder alive and holding it), not for
+  `ttlMs / 3`: a slow but live worker's job is not given to another, and a dead one's is taken over as soon
+  as its liveness says so.
+- Postgres: the queue's take reads one index entry on a table no `ANALYZE` has seen (it sorted every entry
+  of the set; enqueue one by one was 23 s or 54–62 s for 30 000 jobs, by when autovacuum first ran).
+- Sqlite and libSQL: making a store's process liveness no longer opens and closes the database file when
+  it exists. The close dropped every POSIX lock the process held on the file, so another process's last
+  close checkpointed and deleted the open store's `-wal` and `-shm`; the store went on in files nobody
+  else saw (a process that took a run over stopped in the middle of it, every store call pending).
+- MongoDB: a write no longer waits out a transaction a killed process left open. It held the run's documents
+  until the server's limit (60 s): the process that took the run over stood at its tool call and failed the
+  claim with a write conflict. A write that keeps conflicting for a second ends the idle sessions in a
+  transaction whose connection is gone (this user's; `killAnySession` for other users').
+- **`npm create gnl@latest` and `npx @gnldev/cli init` work in an empty directory.** `@gnldev/cli` loads
+  `@gnldev/durable` at startup (every command, `--version` included) but declared it an *optional* peer,
+  which `npx` never installs: the first command died with `Cannot find package '@gnldev/durable'`. It is
+  now a required peer (the other peers stay optional). The README no longer shows `npx gnl init`: no
+  package is named `gnl`; the binary lives in `@gnldev/cli`.
+- **A `maxCostUsd` ceiling now fires on a model whose response does not name itself.** Pricing read the
+  model id from the response only; a provider, proxy or middleware that omits it priced every step as
+  `unknown` = $0 and the ceiling never fired. The model's configured id (what `wrapLanguageModel` keeps) is
+  now the fallback, written beside each step as `configuredModelId`; the response's own id still wins. The
+  unpriced warning names the real id instead of `unknown`.
+- A mock model without `doStream`/`doGenerate` is now named in the error (`the model 'x' has no doStream
+  ...`) instead of a bare `400 Not implemented`.
+- `node:sqlite`'s "SQLite is an experimental feature" notice is no longer printed in every process. Only
+  that notice is held back, while the module loads; every other warning passes.
+- `gnl init` in a non-empty directory without a `package.json` says how to proceed.
+- `gnl init --identity end-users` writes `.env.example` with `GNL_END_USER_SECRET=`, the place the
+  credential its summary asks for goes.
+- The scaffold's `zod` floor is `^3.25.76`, the floor the packages' peer range states.
+
+### Documented
+
+- The executor (and its sweeper) starts with the first run, stream, follow, cancel or task a process
+  handles; a restarted process that has handled nothing takes over nothing.
+- `replayedToolCalls` is on the result of `runDurable`/`streamDurable`; `POST /agents/:name/run` (which
+  follows a detached run) does not carry it yet.
+
+---
+
 ## [0.16.0] — 2026-11-02
 
 **Why an agent did what it did, and what to change so it does what you meant.** Studio gets a Lab, opened

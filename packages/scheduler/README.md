@@ -53,6 +53,34 @@ await scheduleWorkflow(journal, { id: 'nightly', name: 'report', cron: '0 4 * * 
 by 0.9.0) is replaced by the next valid registration whatever `ifExists` says, and the poller fails it
 instead of firing it.
 
+## Missed occurrences and concurrency
+
+If no poller ran (the machine slept, every process was down), a trigger comes back with several occurrences
+owed. `misfire` says what happens; an occurrence is *missed* when a later one is due as well.
+
+| `misfire` | What fires |
+|---|---|
+| `'latest'` (default) | The last missed occurrence, once. |
+| `'earliest'` | The oldest missed occurrence, once. |
+| `'none'` | No missed occurrence. Only one that is due on its own fires; the calendar goes on from the next slot. |
+| `'catchup'` | Every missed occurrence, oldest first, one per poll. |
+
+Under every value the schedule goes on from the first occurrence after now, on its planned grid, and each
+fire is told which occurrence it is for (`scheduledFor`). `'catchup'` has no limit: a day asleep on a minute
+cron is 1440 fires. `maxCatchup: n` keeps only the `n` latest, and the trigger logs one warning saying how
+many occurrences the limit dropped and when the oldest was.
+
+`concurrency` (on `createScheduler` and `pollScheduler`) has no default limit: every due trigger fires at
+once. Pass a number to cap how many fires run at the same time; the triggers still due stay due and fire as
+slots free. Two fires of one trigger never overlap.
+
+A trigger registered without `misfire` is stored as "the default", not as a value, so calling `schedule` again
+without it is always the same spec. 0.16 stored `'skip'` for those triggers (named or not, it could not tell);
+this version reads such a record as the default, and `upgradeTriggers(journal, { dryRun })` rewrites it for good
+(idempotent; run it once every 0.16 poller is gone). Either way these triggers now fire the latest missed
+occurrence, not the oldest: pass `misfire: 'earliest'` for the old behaviour. `schedulerUpgrade` is the same
+migration as a step for `registerUpgradeSteps` (`scheduler/misfire-default`).
+
 ## Time zones
 
 `cron` is read in UTC unless the spec names an IANA zone in `tz`:
@@ -283,6 +311,7 @@ replay sees the same schedule the original run saw.
 | `createScheduler` | The stateful wrapper, if you would rather hold an object than call functions |
 | `nextCronTime`, `parseField` | The cron arithmetic, exported for testing and for building your own UI |
 | `createWorkflowWaker` | Wakes a suspended workflow when its sleep or wait elapses |
+| `upgradeTriggers`, `schedulerUpgrade` | Rewrites stored `misfire: 'skip'` (0.16) to "the default"; the second is the same as an upgrade step |
 | `moveTrigger` | Gives a pre-upgrade system trigger its owner, without doubling it |
 | `triggerEraser` | One person's triggers, for `eraseSubject` |
 

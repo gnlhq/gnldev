@@ -88,7 +88,7 @@ describe('@gnldev/scheduler', () => {
     expect(runner.calls).toHaveLength(0);
   });
 
-  it('every + misfire skip (default): missed fires on a late poll are skipped, no drift accumulates, single fire', async () => {
+  it('every + misfire latest (default): missed fires on a late poll are skipped, no drift accumulates, single fire', async () => {
     const j = new InMemoryJournal();
     const runner = mockRunner(() => ({ output: 'ok' }));
     await scheduleWorkflow(j, { id: 'sk', name: 'wf', every: 1000 }, 0); // nextRunAt=1000
@@ -152,7 +152,7 @@ describe('@gnldev/scheduler', () => {
     expect(runner.calls).toHaveLength(5);
   });
 
-  it('cron + misfire skip (default): missed cron matches are skipped, jumps to the first future match', async () => {
+  it('cron + misfire latest (default): missed cron matches are skipped, jumps to the first future match', async () => {
     const j = new InMemoryJournal();
     const runner = mockRunner(() => ({ output: 'ok' }));
     // cron that fires every minute; first nextRunAt = 00:01
@@ -325,7 +325,7 @@ describe('@gnldev/scheduler', () => {
       const list = await listTriggers(j);
       expect(list).toEqual([{
         id: 'e1', name: 'wf-every', kind: 'every', value: 1000, input: undefined,
-        nextRunAt: 1000, attempts: 0, maxAttempts: 3, fireCount: 0, status: 'pending', misfire: 'skip',
+        nextRunAt: 1000, attempts: 0, maxAttempts: 3, fireCount: 0, status: 'pending', misfire: 'latest',
       }]);
     });
 

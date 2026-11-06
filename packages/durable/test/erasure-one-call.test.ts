@@ -9,7 +9,8 @@
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, createGnl, scopeConfigToOrg, eraseSubject, toJournal, withOrgStorage, runOwnerOf, VECTOR_ALL_PARTITIONS } from '../src/index.js';
 import { indexDocuments } from '../../rag/src/index.js';
-import { enqueue, createWorker, listJobs, jobEraser } from '../../queue/src/index.js';
+import { enqueue, createWorker, jobEraser } from '../../queue/src/index.js';
+import { listAllJobs as listJobs } from '../../queue/test/fixtures/k5-list-all.js';
 import { emit, createConsumer, eventEraser } from '../../events/src/index.js';
 import { scheduleWorkflow, pollScheduler, listTriggers, triggerEraser } from '../../scheduler/src/index.js';
 import { workflow, step } from '../../workflow/src/index.js';

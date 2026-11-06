@@ -18,7 +18,8 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { InMemoryStorage, type Storage, type WorkStore } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
-import { createWorker, enqueue, listJobs } from '../src/index.js';
+import { createWorker, enqueue } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 /** A view of `storage` whose work store holds the FIRST read of `holdKey` open until `release()`. */
 function holdingFirstRead(storage: Storage, holdKey: string) {
@@ -58,11 +59,14 @@ describe('worker: "finished?" is answered under the lease', () => {
     const effects: string[] = [];
     const handler = (who: string) => ({ t: async () => { effects.push(who); } });
     const a = holdingFirstRead(storage, `qdone:${id}`);
-    const workerA = createWorker(a.view, handler('A'), { owner: 'A', heartbeat: false });
-    const workerB = createWorker(storage, handler('B'), { owner: 'B', heartbeat: false });
+    // k5 E3: A's take holds the job's entry as its lease would be held — in a store no liveness answers
+    // for (in memory), by its age — so B reaches it only once A's stamp is older than its ttlMs.
+    const workerA = createWorker(a.view, handler('A'), { owner: 'A', heartbeat: false, ttlMs: 30 });
+    const workerB = createWorker(storage, handler('B'), { owner: 'B', heartbeat: false, ttlMs: 30 });
 
     const runA = workerA.runOnce();
     await a.atGate; // A has read "not done"
+    await new Promise((r) => setTimeout(r, 45));
     expect(await workerB.runOnce()).toBe(true); // B: lease, handler, qdone, release
     a.release();
     await runA;
@@ -77,11 +81,12 @@ describe('worker: "finished?" is answered under the lease', () => {
     const effects: string[] = [];
     const handler = (who: string) => ({ t: async () => { effects.push(who); throw new Error('down'); } });
     const a = holdingFirstRead(storage, `qfail:${id}`);
-    const workerA = createWorker(a.view, handler('A'), { owner: 'A', heartbeat: false, maxAttempts: 1 });
-    const workerB = createWorker(storage, handler('B'), { owner: 'B', heartbeat: false, maxAttempts: 1 });
+    const workerA = createWorker(a.view, handler('A'), { owner: 'A', heartbeat: false, maxAttempts: 1, ttlMs: 30 });
+    const workerB = createWorker(storage, handler('B'), { owner: 'B', heartbeat: false, maxAttempts: 1, ttlMs: 30 });
 
     const runA = workerA.runOnce();
     await a.atGate;
+    await new Promise((r) => setTimeout(r, 45));
     await workerB.runOnce();
     a.release();
     await runA;

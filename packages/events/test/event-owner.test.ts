@@ -27,7 +27,8 @@ describe('an event carries its owner', () => {
     expect((await storage.work!.list('evt:t')).items[0]?.payload ?? (await storage.work!.list('t')).items[0]?.payload).toEqual({ n: 1 });
     const [[payload, meta]] = await consume(storage, 't') as any;
     expect(payload).toEqual({ n: 1 });
-    expect(meta).toEqual({ id: 'e1', topic: 't' });
+    expect({ ...meta, signal: undefined }).toEqual({ id: 'e1', topic: 't', signal: undefined });
+    expect(meta.signal).toBeInstanceOf(AbortSignal);
   });
 
   it('explicit ids are names within their owner', async () => {

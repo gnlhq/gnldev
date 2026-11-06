@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { BasicMemory, toJournal } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
 import { createConsumer, emit } from '@gnldev/events';
-import { createWorker, enqueue } from '@gnldev/queue';
+import { createWorker, enqueue, queueUpgrade } from '@gnldev/queue';
 import { SemanticMemory } from '@gnldev/rag';
 import * as w from '@gnldev/workflow';
 import * as S from '../../generate/shapes.mjs';
@@ -47,6 +47,8 @@ const plainWorker = (storage: SqliteStorage, ran: string[]) =>
 const consumer = (storage: SqliteStorage, seen: string[]) =>
   createConsumer(storage.work, S.EVENTS.topic, async (p: { n: string }) => { seen.push(p.n); }, { name: S.EVENTS.consumer });
 const many = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => `${prefix}${i}`);
+/** k5 E: `queue/lanes`, what `gnl upgrade` runs while 0.9.0 processes still do. It leaves the old log: its cleanup waits for them to go. */
+const moveLanes = async (storage: SqliteStorage) => { await [queueUpgrade(storage)].flat()[0]!.run(); };
 
 describe.skipIf(!ROOT_090)('rolling deploy with a 0.9.0 process — queue and events (Known limits: what holds)', () => {
   it('jobs a 0.9.0 producer enqueues after the current worker has a cursor are run by it, once', async () => {
@@ -55,8 +57,14 @@ describe.skipIf(!ROOT_090)('rolling deploy with a 0.9.0 process — queue and ev
     for (const n of many('new', 60)) await enqueue(storage.work, 'plain', { n }, { id: n });
     await plainWorker(storage, ran).drain();
     expect(as090('enqueue', file, '3')).toMatchObject({ ok: true });
+    await expect(plainWorker(storage, ran).drain()).rejects.toThrow(/gnl upgrade/);
+    await moveLanes(storage);
     await plainWorker(storage, ran).drain();
     expect(ran.filter((n) => n.startsWith('old')).sort()).toEqual(many('old', 3));
+    // The 0.9.0 producer is still there: what it adds after the move, this version's worker moves.
+    expect(as090('enqueue', file, '5')).toMatchObject({ ok: true });
+    await plainWorker(storage, ran).drain();
+    expect(ran.filter((n) => n.startsWith('old')).sort()).toEqual(many('old', 5));
     expect(new Set(ran).size).toBe(ran.length);
   });
 
@@ -81,6 +89,8 @@ describe.skipIf(!ROOT_090)('rolling deploy with a 0.9.0 process — a 0.9.0 work
     const old = as090('drain', file);
     expect(old).toEqual({ ok: true, value: [] });
     expect(as090('enqueue', file, '2')).toMatchObject({ ok: true });
+    await expect(plainWorker(storage, ran).drain()).rejects.toThrow(/gnl upgrade/);
+    await moveLanes(storage);
     await plainWorker(storage, ran).drain();
     expect(ran.filter((n) => n.startsWith('old')).sort()).toEqual(many('old', 2));
     expect(new Set(ran).size).toBe(ran.length);

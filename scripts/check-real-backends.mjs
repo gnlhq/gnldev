@@ -185,6 +185,10 @@ try {
   step('real Postgres + pgvector + MySQL + MariaDB + MongoDB — every other real-backend test', () =>
     run('node', ['scripts/real-backend-tests.mjs', '--run', 'shared', '--', '--maxWorkers=3', '--minWorkers=1'], { env }).status === 0);
 
+  // docker-compose.yml opens none of these: the files that read them skip themselves, and only CI's
+  // integration job runs them. A green run here says nothing about them (test/vector-servers-gate.test.ts).
+  skipped.push('vector servers — Qdrant, Chroma, Weaviate, Elasticsearch and OpenSearch run only in CI\'s integration job');
+
   step('real model provider', () => {
     if (!process.env.NVIDIA_API_KEY && !process.env.OPENAI_API_KEY) {
       skipped.push('real model provider — no NVIDIA_API_KEY or OPENAI_API_KEY in the environment');

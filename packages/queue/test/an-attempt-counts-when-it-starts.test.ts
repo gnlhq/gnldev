@@ -6,7 +6,8 @@
 // when it starts as well.
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage } from '@gnldev/durable';
-import { enqueue, createWorker, listJobs } from '../src/index.js';
+import { enqueue, createWorker } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const quiet = async <T>(f: () => Promise<T>) => { const w = console.warn; console.warn = () => undefined; try { return await f(); } finally { console.warn = w; } };

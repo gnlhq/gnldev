@@ -73,7 +73,9 @@ describe('worker lease × run lock', () => {
     // not a reason for the worker to skip the job silently.
     const storage = new InMemoryStorage();
     let ran = 0;
-    const worker = createWorker(storage, { t: async () => { ran++; } }, { heartbeat: false });
+    // k5 E: a job whose lease another holder refused is not handed out again until its turn's hold ends
+    // (ttlMs/3) — a queue worker that lets go of a job ends the hold itself; this rival is a bare lease.
+    const worker = createWorker(storage, { t: async () => { ran++; } }, { heartbeat: false, ttlMs: 30 });
     await enqueue(storage.work!, 't', {}, { id: 'j' });
 
     const lease = await acquireRunLock(storage.runs, 'job:j:lease', 'rival-worker', 60_000);
@@ -81,6 +83,7 @@ describe('worker lease × run lock', () => {
     expect(ran).toBe(0); // the rival worker owns this job
 
     await lease!.release();
+    await new Promise((r) => setTimeout(r, 15));
     await acquireRunLock(storage.runs, 'job:j', 'somebody-elses-run', 60_000);
     await worker.runOnce();
     expect(ran).toBe(1); // the run key is not the worker's business

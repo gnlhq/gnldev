@@ -18,7 +18,7 @@ describe('a composed id is spelled where it is composed', () => {
     it(`a job named '${name}' is refused at enqueue and writes nothing`, async () => {
       const s: any = new InMemoryStorage();
       await expect(enqueue(s.work, 't', {}, { id: name, caller: user('alice') })).rejects.toThrow(/record separator/);
-      expect(await listJobs(s.work)).toEqual([]);
+      expect((await listJobs(s.work)).items).toEqual([]);
     });
   }
   it('control: a plain name schedules, fires and runs; a plain job id runs once', async () => {

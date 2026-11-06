@@ -2,12 +2,12 @@
 // Keeps triggers in the journal (definition immutable, state mutable). The poll loop (now=Date.now())
 // fires due triggers exactly-once (acquireRunLock + per-fireCount runId). The workflow run carries its
 // own durable guarantee. Time = DATA (nextRunAt in the journal) → resolve-then-freeze, replay-safe.
-import { acquireRunLock, argsHash, attemptEndOf, createPollLoop, holdWhile, isDraining, orgPrefix, ownedName, ownedPrefix, ownerOfName, stableStringify, user, staff, UNKNOWN, refuseRunIdThatCannotBeBorn, withOrg, claimRunOwner, composerMark } from '@gnldev/durable';
-import type { Journal, Caller } from '@gnldev/durable';
+import { acquireRunLock, argsHash, toJournal, attemptEndOf, executionGrant, createPollLoop, holdWhile, isDraining, orgPrefix, ownedName, ownedPrefix, ownerOfName, stableStringify, user, staff, UNKNOWN, refuseRunIdThatCannotBeBorn, withOrg, claimRunOwner, composerMark, markUpgradeDue, clearUpgradeDue } from '@gnldev/durable';
+import type { Journal, Caller, UpgradeStep, UpgradeStepFactory, UnheededText } from '@gnldev/durable';
 import { canonicalTimeZone, cronNeverFires, nextCronTime } from './cron.js';
 import { rootJournal } from './root-journal.js';
 import { refuseUnknownNames } from '@gnldev/options';
-import { SCHEDULE_WORKFLOW_INPUT_NAMES, POLL_SCHEDULER_OPTS_NAMES, CREATE_SCHEDULER_OPTS_NAMES, MOVE_TRIGGER_TO_NAMES } from './option-names.js';
+import { SCHEDULE_WORKFLOW_INPUT_NAMES, POLL_SCHEDULER_OPTS_NAMES, CREATE_SCHEDULER_OPTS_NAMES, MOVE_TRIGGER_TO_NAMES, UPGRADE_TRIGGERS_OPTS_NAMES } from './option-names.js';
 
 export { nextCronTime, parseField } from './cron.js';
 export { createWorkflowWaker } from './workflow-waker.js';
@@ -21,8 +21,20 @@ export interface WorkflowRunner {
     /**
      * `caller` is the trigger's recorded owner (see `ScheduleSpec.caller`), decided by the scheduler.
      * The run `runId` names is already born, for that owner, by the scheduler: the runner continues it.
+     * `signal` aborts when this poller's right to the fire ends (an `ExecutionRevokedError`, `why:
+     * 'lease-lost'`: another poller took its lock and continues the run) — `createGnl().runWorkflow`
+     * stops the workflow at its next step boundary, and does not cancel it.
      */
-    opts?: { runId?: string; caller?: Caller },
+    opts?: {
+      runId?: string;
+      caller?: Caller;
+      /**
+       * The occurrence this fire is for (epoch ms) — the slot on the trigger's schedule, not the time
+       * the poll ran: a fire after a day asleep, a retry, a resume all carry the slot they were decided for.
+       */
+      scheduledFor?: number;
+      signal?: AbortSignal;
+    },
   ): Promise<{ runId: string; suspended?: boolean; output?: unknown }>;
 }
 
@@ -70,11 +82,25 @@ export interface ScheduleSpec {
    */
   orgId?: string;
   /**
-   * Policy for missed (misfire) fires — only meaningful for every/cron:
-   * 'skip'    (default) — skip missed fires, jump to the next slot aligned to the planned grid (no drift accumulates).
-   * 'catchup' — fire each missed occurrence in sequence (one per poll), none are skipped.
+   * Policy for occurrences missed because no poller ran (the machine slept, every process was down) —
+   * only meaningful for every/cron. Read in ONE place (`slotToFire`). An occurrence is MISSED when a
+   * later one is due as well; the schedule always goes on from the first occurrence after now (on the
+   * planned grid: no drift), except under 'catchup':
+   * 'latest'   (default) — the LATEST missed occurrence fires once; the older ones do not run.
+   * 'earliest' — the OLDEST missed occurrence fires once; the newer ones do not run.
+   * 'none'     — no missed occurrence runs: only an occurrence that is due on its own (no later one due
+   *              as well) fires.
+   * 'catchup'  — the missed occurrences fire in sequence, one per poll, oldest first — all of them, or at
+   *              most the `maxCatchup` latest (a warning names what the limit dropped).
+   * Each fire is told which occurrence it is for (`scheduledFor`).
    */
   misfire?: MisfirePolicy;
+  /**
+   * With `misfire: 'catchup'`: how many missed occurrences are run at most, the latest ones (default:
+   * no limit — a day asleep on a minute cron is 1440 fires). When the limit drops some, the trigger logs
+   * ONE warning: how many, and the time of the oldest.
+   */
+  maxCatchup?: number;
   /**
    * What to do when this id is already scheduled with a DIFFERENT spec (the same spec again is always
    * a no-op — that is what makes calling this on every boot safe):
@@ -87,19 +113,76 @@ export interface ScheduleSpec {
 }
 
 export type Kind = 'at' | 'every' | 'cron';
-export type MisfirePolicy = 'skip' | 'catchup';
+export type MisfirePolicy = 'latest' | 'earliest' | 'none' | 'catchup';
+const MISFIRE_POLICIES: readonly MisfirePolicy[] = ['latest', 'earliest', 'none', 'catchup'];
+/** What a trigger does about missed occurrences when its caller named no policy. */
+const DEFAULT_MISFIRE: MisfirePolicy = 'latest';
+/** What 0.16 stored for a trigger — the policy the caller named or not, it could not tell which (see `misfireOf`). */
+const LEGACY_MISFIRE = 'skip';
+/**
+ * What a fire whose workflow runs on after its lock was taken costs, for the warning `executionGrant` says
+ * (@gnldev/durable `UnheededText`). No hold limit here: only `lease-lost`.
+ */
+const UNHEEDED: UnheededText = {
+  body: 'the workflow',
+  signal: "the runner's signal (WorkflowRunner opts.signal)",
+  lost: "createGnl().runWorkflow stops at its next step boundary on it; work outside the workflow's recorded steps may be repeated by the poller that took the lock.",
+};
+/** The upgrade step that rewrites 0.16 'skip' records (`schedulerUpgrade`), and the note a poller leaves for it. */
+const MISFIRE_STEP = 'scheduler/misfire-default';
+/**
+ * A poller that reads a 0.16 'skip' record notes it once per journal (@gnldev/durable `markUpgradeDue`):
+ * a `storage.upgrade()` where `schedulerUpgrade` is not registered then says so. `upgradeTriggers` clears it.
+ * Never fails a poll: the record is read as "none named" either way (`misfireOf`).
+ */
+const misfireNoted = new WeakSet<object>();
+function noteLegacyMisfire(journal: Journal): void {
+  if (misfireNoted.has(journal)) return;
+  misfireNoted.add(journal);
+  markUpgradeDue(journal, MISFIRE_STEP, { by: '@gnldev/scheduler', register: 'registerUpgradeSteps(storage, [schedulerUpgrade])' })
+    .catch(() => misfireNoted.delete(journal));
+}
 interface TriggerDef {
   name: string;
   input: unknown;
   kind: Kind;
   value: number | string;
   maxAttempts: number;
-  misfire: MisfirePolicy;
+  /**
+   * Absent = the caller named none: the record says "default", never a value, so the default can change
+   * without every stored trigger looking like a different spec. Read only through `misfireOf`.
+   */
+  misfire?: MisfirePolicy;
+  /** Absent = no limit (and absent on every definition written before it existed). */
+  maxCatchup?: number;
   resourceId?: string;
   orgId?: string;
   ownerKind?: 'staff';
   /** Canonical IANA zone for a cron; absent = UTC (and absent on every definition written before it existed). */
   tz?: string;
+}
+
+/**
+ * THE ONE READING of a trigger's misfire policy: the stored value, or the CURRENT default when none was
+ * named. A 0.16 record ('skip', stored whether the caller named a policy or not) is read as "none named":
+ * the data is read up, the API has no such alias (`scheduleWorkflow` refuses 'skip'). `upgradeTriggers`
+ * rewrites such records for good.
+ */
+function misfireOf(def: TriggerDef): MisfirePolicy {
+  const stored: unknown = def.misfire;
+  return stored === undefined || stored === LEGACY_MISFIRE ? DEFAULT_MISFIRE : def.misfire!;
+}
+
+/** Why a misfire value is not one a trigger can have, or `undefined`. */
+function misfireProblem(value: unknown): string | undefined {
+  return MISFIRE_POLICIES.includes(value as MisfirePolicy) ? undefined : `misfire must be 'latest', 'earliest', 'none' or 'catchup', got ${JSON.stringify(value)}`;
+}
+
+/** A definition as a spec reads: a 0.16 'skip' is "none named", the same as an absent misfire (see `misfireOf`). */
+function asSpecified(def: TriggerDef): TriggerDef {
+  if ((def.misfire as unknown) !== LEGACY_MISFIRE) return def;
+  const { misfire: _m, ...rest } = def;
+  return rest;
 }
 
 /** The caller a trigger's recorded owner stands for — the ONE reading every fire uses. */
@@ -126,7 +209,21 @@ function triggerOwnerOf(spec: Pick<ScheduleSpec, 'caller' | 'resourceId' | 'orgI
   };
 }
 interface TriggerState {
+  /** When the poller next tries this trigger — the slot itself, or a retry/deferral time for it. */
   nextRunAt: number;
+  /**
+   * THE OCCURRENCE the next fire is for (`scheduledFor`), when it is not `nextRunAt`: frozen at the
+   * fire's decision (`slotToFire`) and kept across its retries, suspensions and deferrals, which move
+   * only `nextRunAt`. The next slot is computed from it, never from a retry time (that drifted the grid).
+   * Absent = `nextRunAt` (every state written before it existed).
+   */
+  slot?: number;
+  /**
+   * Where the calendar goes on once the fire for `slot` has ended — frozen with `slot` (`slotToFire`),
+   * since only the policy knows it: the occurrence after `slot` for 'latest' and 'catchup', the first one
+   * after now for 'earliest' (the newer missed ones do not run). Absent = the occurrence after `slot`.
+   */
+  resumeAt?: number;
   attempts: number;
   fireCount: number;
   /**
@@ -238,6 +335,7 @@ const BUSY_SKIP = (id: string) => `sched:busy-skip:${id}`;
  * side-effecting tool once — drain the pollers over an upgrade if that matters to the workflow.
  */
 const FIRE_LOCK = (runId: string) => `${runId}:fire`;
+const FIRE_AT = (runId: string) => `${runId}:fire:at`;
 
 /**
  * 1.4: optional budget/quota hook — called BEFORE the trigger starts (before runner.runWorkflow is
@@ -290,7 +388,13 @@ function definitionProblem(def: TriggerDef): string | undefined {
     return `unknown kind ${JSON.stringify(def.kind)}`;
   }
   if (!Number.isInteger(def.maxAttempts) || def.maxAttempts < 1) return `maxAttempts must be an integer of at least 1, got ${String(def.maxAttempts)}`;
-  if (def.misfire !== 'skip' && def.misfire !== 'catchup') return `misfire must be 'skip' or 'catchup', got ${JSON.stringify(def.misfire)}`;
+  const misfire = misfireOf(def);
+  const badMisfire = misfireProblem(misfire);
+  if (badMisfire !== undefined) return badMisfire;
+  if (def.maxCatchup !== undefined) {
+    if (misfire !== 'catchup') return `maxCatchup is only for misfire: 'catchup' (the other policies run one missed occurrence at most), got maxCatchup ${String(def.maxCatchup)} with misfire '${misfire}'`;
+    if (def.maxCatchup !== Infinity && (!Number.isInteger(def.maxCatchup) || def.maxCatchup < 1)) return `maxCatchup must be an integer of at least 1, or Infinity, got ${String(def.maxCatchup)}`;
+  }
   if (def.tz !== undefined) {
     if (def.kind !== 'cron') return `tz is only for cron (a time zone means nothing to ${def.kind === 'at' ? 'an instant' : 'a period'}), got tz ${JSON.stringify(def.tz)} with ${def.kind}`;
     if (canonicalTimeZone(def.tz) === undefined) return `tz ${JSON.stringify(def.tz)} is not a time zone this runtime knows (an IANA name, e.g. 'Europe/Berlin')`;
@@ -308,6 +412,10 @@ function definitionOf(spec: ScheduleSpec, id: string, owner: ReturnType<typeof t
         : `@gnldev/scheduler: trigger '${id}' — give only one of at | every | cron (got ${given.join(' and ')}); a second one was silently ignored before.`,
     );
   }
+  // A policy the caller names must be one a trigger can have. (Not left to definitionProblem, which
+  // reads a stored 0.16 'skip' as "none named" and so would let a caller's 'skip' through.)
+  const badMisfire = spec.misfire === undefined ? undefined : misfireProblem(spec.misfire);
+  if (badMisfire !== undefined) throw new Error(`@gnldev/scheduler: trigger '${id}' — ${badMisfire}. Nothing was written.`);
   const kind: Kind = given[0]!;
   // The canonical spelling, so two spellings of one zone are one spec; an unknown zone is kept as given
   // and refused by definitionProblem below. Absent when not given, so a definition stored before `tz`
@@ -319,7 +427,8 @@ function definitionOf(spec: ScheduleSpec, id: string, owner: ReturnType<typeof t
     kind,
     value: spec[kind]!,
     maxAttempts: spec.maxAttempts ?? 5,
-    misfire: spec.misfire ?? 'skip',
+    ...(spec.misfire !== undefined ? { misfire: spec.misfire } : {}),
+    ...(spec.maxCatchup !== undefined ? { maxCatchup: spec.maxCatchup } : {}),
     ...owner,
     ...(tz !== undefined ? { tz } : {}),
   };
@@ -333,8 +442,9 @@ function definitionOf(spec: ScheduleSpec, id: string, owner: ReturnType<typeof t
  * caller who does not own the trigger (an ownerless id is shared), and the stored input is the owner's
  * data. Measured: printing both specs put another caller's trigger input into the refusal.
  */
-function definitionDiff(stored: TriggerDef, given: TriggerDef): string {
-  const fields = (['name', 'input', 'maxAttempts', 'misfire', 'resourceId', 'orgId', 'ownerKind', 'tz'] as const)
+function definitionDiff(storedDef: TriggerDef, given: TriggerDef): string {
+  const stored = asSpecified(storedDef);
+  const fields = (['name', 'input', 'maxAttempts', 'misfire', 'maxCatchup', 'resourceId', 'orgId', 'ownerKind', 'tz'] as const)
     .filter((k) => stableStringify(stored[k] ?? null) !== stableStringify(given[k] ?? null));
   const schedule = stored.kind !== given.kind ? `the schedule (${stored.kind} → ${given.kind})`
     : stableStringify(stored.value) !== stableStringify(given.value) ? `the ${given.kind} value` : undefined;
@@ -348,23 +458,71 @@ function firstRunAt(def: TriggerDef, now: number): number {
   return nextCronTime(def.value as string, now, def.tz);
 }
 /**
- * Computes the next fire time. `prevSlot` = the PLANNED slot that just fired (state.nextRunAt) —
- * NOT `now` (poll time). This aligns the 'every' calculation to the planned grid rather than the actual
- * elapsed time → poll delay doesn't accumulate drift (part b). Missed occurrences are skipped or caught
- * up in sequence depending on policy (part a).
+ * The schedule's occurrence right after `slot` — on the planned grid, whatever time it is now: poll
+ * delay never accumulates as drift. Missed occurrences are the misfire policy's business (`slotToFire`),
+ * never this function's.
  */
-function computeNext(def: TriggerDef, prevSlot: number, now: number): number {
+function slotAfter(def: TriggerDef, slot: number): number {
+  if (def.kind === 'every') return slot + (def.value as number);
+  return nextCronTime(def.value as string, slot, def.tz);
+}
+
+/**
+ * What a due trigger does about the occurrences it missed: which one it fires for (`fire`, absent when
+ * none runs), where the calendar goes on afterwards (`resume`), and what `maxCatchup` dropped.
+ */
+interface MisfirePlan {
+  fire: number | undefined;
+  resume: number;
+  dropped?: { count: number; oldest: number };
+}
+
+/**
+ * The occurrences due at `now` that are not among the `keep` latest: the first of the `keep` latest
+ * (`start`), and how many came before it (`dropped`, counted from `slot`, the oldest not yet fired).
+ */
+function latestDue(def: TriggerDef, slot: number, now: number, keep: number): { start: number; dropped: number } {
+  if (keep === Infinity) return { start: slot, dropped: 0 };
   if (def.kind === 'every') {
     const interval = def.value as number;
-    if (def.misfire === 'catchup') return prevSlot + interval; // next missed occurrence — may be due again immediately
-    const missed = Math.floor((now - prevSlot) / interval); // number of fully missed intervals (0 = on time)
-    return prevSlot + interval * (missed + 1); // aligned to the planned grid, the first slot right after now
+    const due = Math.floor((now - slot) / interval) + 1; // occurrences at or before now, from `slot`
+    const dropped = Math.max(0, due - keep);
+    return { start: slot + interval * dropped, dropped };
   }
-  // cron: nextCronTime already works off the absolute time grid (no drift). The policy difference is
-  // where the scan starts from: 'catchup' starts from the last planned slot (finds the next missed one,
-  // may be due immediately), 'skip' starts from the current time (skips everything missed, jumps to the
-  // next future match).
-  return nextCronTime(def.value as string, def.misfire === 'catchup' ? prevSlot : now, def.tz);
+  // Any other schedule (cron): no arithmetic for "n occurrences back", so the due ones are walked
+  // forward with `slotAfter`, keeping the last `keep` (once per fire: the answer is frozen into the state).
+  const window: number[] = [];
+  let dropped = 0;
+  for (let s = slot; s <= now; s = slotAfter(def, s)) {
+    window.push(s);
+    if (window.length > keep) { window.shift(); dropped++; }
+  }
+  return { start: window[0] ?? slot, dropped };
+}
+
+/**
+ * THE MISFIRE POLICY, the one place it is read: given the oldest occurrence not yet fired (`slot`) and
+ * the time now, which occurrence a due trigger fires for and where its calendar goes on. An occurrence
+ * is missed when a later one is due too. An `at` trigger has one occurrence. The answer is frozen into
+ * the state before the fire (see `dispatchDue`): a second poller with another clock fires the same
+ * occurrence, not its own guess.
+ */
+function slotToFire(def: TriggerDef, slot: number, now: number): MisfirePlan {
+  if (def.kind === 'at' || now < slot) return { fire: slot, resume: slot };
+  const misfire = misfireOf(def);
+  switch (misfire) {
+    case 'earliest':
+      return { fire: slot, resume: slotAfter(def, latestDue(def, slot, now, 1).start) };
+    case 'none': {
+      const latest = latestDue(def, slot, now, 1).start;
+      return { fire: latest === slot ? slot : undefined, resume: slotAfter(def, latest) };
+    }
+    default: { // 'latest' keeps the one latest occurrence; 'catchup' all of them, or the `maxCatchup` latest
+      const keep = misfire === 'latest' ? 1 : (def.maxCatchup ?? Infinity);
+      const { start, dropped } = latestDue(def, slot, now, keep);
+      return { fire: start, resume: slotAfter(def, start), ...(misfire === 'catchup' && dropped > 0 ? { dropped: { count: dropped, oldest: slot } } : {}) };
+    }
+  }
 }
 function backoff(attempts: number): number {
   return Math.min(1000 * 2 ** (attempts - 1), 60_000);
@@ -441,7 +599,7 @@ export async function scheduleWorkflow(journal: Journal, input: ScheduleSpec, no
   // "Already scheduled" is an answer only for the SAME spec. For a different one it was the silent
   // failure: 0.9 stored `{ at }`, the host now passes `{ every }`, and the one-shot that had already
   // fired stayed done forever while every boot was told all was well.
-  const changed = stored !== undefined && storedProblem === undefined && stableStringify(stored) !== stableStringify(def);
+  const changed = stored !== undefined && storedProblem === undefined && stableStringify(asSpecified(stored)) !== stableStringify(def);
   if (changed && ifExists === 'refuse') {
     throw new Error(
       `@gnldev/scheduler: trigger '${id}' is already scheduled with a different spec (differs in ${definitionDiff(stored, def)}). `
@@ -565,9 +723,43 @@ export interface PollResult {
   skipped: number;
 }
 
+export interface PollOptions {
+  owner?: string;
+  retryMs?: number;
+  budgetGuard?: BudgetGuard;
+  lockTtlMs?: number;
+  runnerForOrg?: RunnerForOrg;
+  onInvalidTime?: InvalidTimePolicy;
+  /**
+   * How many fires run at once in this scheduler (default: no limit). A fire never holds up the decision about
+   * another trigger: the poll decides, the fire runs beside it. When every slot is busy, the triggers
+   * still due stay due — not skipped, not failed — and fire as soon as a slot frees. Two fires of ONE
+   * trigger never overlap: its next occurrence is decided only after its fire ends.
+   */
+  concurrency?: number;
+}
+
 /**
- * Fires triggers that are due ('pending' && now≥nextRunAt). Double-firing is prevented via the run-lock;
- * the real exactly-once guarantee comes from the durable workflow run (per-fireCount runId).
+ * THE FIRES IN HAND of one scheduler in this process: at most `limit` at once, and never two of one
+ * trigger. The poll is the only writer of `inFlight`; a fire removes itself when it ends.
+ */
+interface FireSlots {
+  limit: number;
+  inFlight: Set<string>;
+}
+
+function fireSlots(concurrency: number | undefined, fn: string): FireSlots {
+  const limit = concurrency ?? Infinity;
+  if (limit !== Infinity && (!Number.isInteger(limit) || limit < 1)) {
+    throw new TypeError(`@gnldev/scheduler: ${fn} — concurrency must be a positive integer (or Infinity), got ${String(concurrency)}.`);
+  }
+  return { limit, inFlight: new Set() };
+}
+
+/**
+ * Fires triggers that are due ('pending' && now≥nextRunAt) and resolves when those fires have ended.
+ * Double-firing is prevented via the run-lock; the real exactly-once guarantee comes from the durable
+ * workflow run (per-fireCount runId).
  *
  * Y2: the lock is kept alive by a heartbeat while the workflow runs (`lockTtlMs`, default 60s, renewed
  * every ttl/3) — a long workflow no longer lets a second poller take the fire over. And EVERY state
@@ -578,20 +770,45 @@ export async function pollScheduler(
   journal: Journal,
   runner: WorkflowRunner,
   now: number = Date.now(),
-  opts: { owner?: string; retryMs?: number; budgetGuard?: BudgetGuard; lockTtlMs?: number; runnerForOrg?: RunnerForOrg; onInvalidTime?: InvalidTimePolicy } = {},
+  opts: PollOptions = {},
 ): Promise<PollResult> {
   refuseUnknownNames('pollScheduler', opts, POLL_SCHEDULER_OPTS_NAMES);
   journal = rootJournal(journal, 'pollScheduler');
+  const out: PollResult = { fired: 0, rescheduled: 0, failed: 0, skipped: 0 };
+  const fires = await dispatchDue(journal, runner, now, opts, fireSlots(opts.concurrency, 'pollScheduler'), out);
+  // Every fire ends before the answer; a journal error in one of them is the poll's error, as it was.
+  const ended = await Promise.allSettled(fires);
+  const failed = ended.find((e): e is PromiseRejectedResult => e.status === 'rejected');
+  if (failed) throw failed.reason;
+  return out;
+}
+
+/**
+ * THE DECISION: which due triggers fire now, each under its fire lock and with its occurrence frozen —
+ * and nothing else. A fire is started, not awaited: the returned promises are the fires, each held
+ * (`holdWhile`) from its lock to its release, so a drain still waits for every one of them. The lock is
+ * taken with the time the decision was made at, never a time a previous fire has aged.
+ */
+async function dispatchDue(
+  journal: Journal,
+  runner: WorkflowRunner,
+  now: number,
+  opts: PollOptions,
+  slots: FireSlots,
+  out: PollResult,
+): Promise<Promise<void>[]> {
   const owner = opts.owner ?? `sched-${Math.random().toString(36).slice(2, 8)}`;
   const retryMs = opts.retryMs ?? 30_000;
   const lockTtlMs = opts.lockTtlMs ?? 60_000;
   const onInvalidTime = invalidTimePolicy(opts.onInvalidTime, 'pollScheduler');
-  const out: PollResult = { fired: 0, rescheduled: 0, failed: 0, skipped: 0 };
+  const fires: Promise<void>[] = [];
 
+  const due: Array<{ id: string; def: TriggerDef; state: TriggerState }> = [];
   const defKeys = await journal.listKeys('sched:def:');
   for (const dkey of defKeys) {
     const id = dkey.slice('sched:def:'.length);
     const def = await journal.get<TriggerDef>(DEF(id));
+    if ((def?.misfire as unknown) === LEGACY_MISFIRE) noteLegacyMisfire(journal);
     const state = await journal.get<TriggerState>(STATE(id));
     // A definition with NO state is invisible otherwise: skipped here, dropped by listTriggers. 0.9.0
     // wrote one for a cron it then refused (`'99 * * * *'`, `'hello'`): it never fires and nothing says
@@ -651,14 +868,56 @@ export async function pollScheduler(
       continue;
     }
     if (!isDue(state, now)) continue;
+    // Its fire is in hand here: the state moves when that fire ends, and the next occurrence is decided then.
+    if (slots.inFlight.has(id)) continue;
+    due.push({ id, def, state });
+  }
+  // THE OLDEST DUE OCCURRENCE FIRST: when the slots are fewer than the due triggers, the one that has
+  // waited longest takes the next free slot — the order of ids in the journal never starves a trigger.
+  due.sort((x, y) => x.state.nextRunAt - y.state.nextRunAt);
+  for (const { id, def, state: decided } of due) {
+    let state = decided;
     // GRACEFUL DRAIN (@gnldev/durable drainProcess): a process shutting down fires nothing new. The
     // trigger stays due; a process that is not leaving fires it.
     if (isDraining()) break;
+    // Every slot busy: the triggers still due stay due, untouched, for the next poll.
+    if (slots.inFlight.size >= slots.limit) break;
 
     const runId = `sched:${id}:${state.fireCount}`;
     // The fire lock, on its OWN key — see FIRE_LOCK. `runId` below is the RUN's name and is passed to
     // the runner untouched; the two must not be the same lock.
-    const lock = await acquireRunLock(journal, FIRE_LOCK(runId), owner, lockTtlMs, now);
+    // The fire lock names this process: `acquireRunLock` binds the store's liveness itself (run-lock.ts),
+    // so a frozen holder keeps it and a dead one loses it at once, whatever component attached first.
+    // Dated on the store's clock (run-lock.ts H2), not this poll's `now`: `now` was read at the start of
+    // the poll, before every earlier fire of it ran — a lock dated by it was born expired behind a long one.
+    const lock = await acquireRunLock(journal, FIRE_LOCK(runId), owner, lockTtlMs);
+    if (lock) {
+      // THE DECISION, CONFIRMED UNDER THE LOCK — one CAS against the state it was made from, which also
+      // freezes the occurrence (`slotToFire`; kept if already frozen): every later attempt of this run id
+      // — a retry, a resume, another poller after a takeover — is told the same one. The state was read
+      // BEFORE the lock: another poller may have fired this occurrence, committed and released in
+      // between, and taking the released lock is not permission to start it again (measured: the same
+      // run id started twice, k4 S5b/S5c). A lost CAS means exactly that — decided again on the next poll.
+      const plan = state.slot === undefined ? slotToFire(def, state.nextRunAt, now) : undefined;
+      const frozen: TriggerState = plan === undefined ? state
+        : plan.fire === undefined ? { ...state, nextRunAt: plan.resume } // nothing runs: the calendar goes on
+        : { ...state, slot: plan.fire, resumeAt: plan.resume };
+      const confirmed = await writeTrigger(journal, id, def, frozen, state);
+      if (!confirmed) {
+        await lock.release();
+        continue;
+      }
+      if (plan?.dropped) {
+        console.warn(`[scheduler] trigger ${id}: ${plan.dropped.count} missed occurrence(s) were not run because of maxCatchup ${def.maxCatchup} — the oldest was ${new Date(plan.dropped.oldest).toISOString()}.`);
+      }
+      if (plan !== undefined && plan.fire === undefined) {
+        await lock.release();
+        out.rescheduled++;
+        continue;
+      }
+      state = confirmed;
+    }
+    const slot = state.slot ?? state.nextRunAt;
     if (!lock) {
       // SESSİZ DEĞİL: bu dal `out.skipped`'a da yazmıyordu, log da basmıyordu — yani zamanlanmış bir
       // tetik atlandığında hiçbir iz kalmıyordu. Atlama DOĞRU (başka bir poller o ateşlemeyi tutuyor),
@@ -673,24 +932,17 @@ export async function pollScheduler(
     // again. The core's `RunLock.renew()` (run-lock.ts) exists exactly for this: "long-running jobs
     // should call this at an interval shorter than the ttl". We renew every ttl/3 for as long as the
     // trigger is in flight — the same pattern as @gnldev/queue's createWorker.
-    // A renew returning FALSE (a real takeover) or THROWING (a transient journal hiccup) is only
-    // LOGGED here: it deliberately does NOT gate the STATE WRITES below, because those are already
-    // gated by something stronger and exact — see `commit`. A `lockLost` flag (the queue's approach)
-    // would be a delayed approximation for that job and can be flipped by a mere network blip.
-    // KNOWN LIMIT — the CAS covers the WRITE, not the EXECUTION: when renew() returns false the
-    // workflow this poller already started KEEPS RUNNING to completion, so during a takeover window
-    // the same runId can be in flight in two pollers at once (only one of them can commit). The
-    // durable run's own per-runId guarantee is what keeps that convergent; making the poller actually
-    // STOP would need runWorkflow's AbortSignal to be plumbed through from here — it is not, today.
-    // A `lockLost` flag would not have fixed this either (the workflow is already running).
-    const heartbeat = setInterval(() => {
-      lock
-        .renew(lockTtlMs)
-        .then((ok) => {
-          if (!ok) console.warn(`[scheduler] the lock was taken over (trigger ${id}, run ${runId}) — the CAS on the state write will decide the result.`);
-        })
-        .catch((err) => console.warn(`[scheduler] renew transient error (trigger ${id}), the next tick will retry:`, err));
-    }, Math.max(1, Math.floor(lockTtlMs / 3)));
+    // The renewal is this poller's RIGHT TO THE FIRE (@gnldev/durable executionGrant): a renew that
+    // answers false (a real takeover) or throws three times in a row revokes it as `lease-lost`, and the
+    // workflow this poller started is told through the runner's `signal` — it stops at its next step
+    // boundary instead of running on beside the poller that took the lock (it used to: the CAS below
+    // covered the write, not the execution). The STATE WRITES are still gated by the CAS in `commit`,
+    // which decides atomically at write time; the grant decides whether this poller keeps executing.
+    const grant = executionGrant(`[scheduler] trigger ${id}, run ${runId}`, { unheededAfterMs: lockTtlMs, unheeded: UNHEEDED });
+    grant.keep(() => lock.renew(lockTtlMs), {
+      everyMs: lockTtlMs / 3,
+      onTransient: (err) => console.warn(`[scheduler] renew transient error (trigger ${id}), the next tick will retry:`, err),
+    });
 
     // Fencing: every state write is a CAS against the state we read AT THE START of this fire
     // (`expected = state`). CAS — not a "do I still hold the lock?" hunch — is the AUTHORITY FOR THE
@@ -723,7 +975,8 @@ export async function pollScheduler(
     // and `gnl pending` lists it — from this process, or from its shadow in another. The unit IS this block:
     // it ends when the block does, on every way out (each `return` below goes on to the next trigger), and
     // the workflow runs as part of it — a drain from inside the fire does not wait for itself (R2-7).
-    await holdWhile(async (): Promise<void> => {
+    slots.inFlight.add(id);
+    fires.push(holdWhile(async (): Promise<void> => {
       try {
         // 1.4: optional budget/quota hook — checked before runner.runWorkflow is CALLED.
         if (opts.budgetGuard) {
@@ -763,7 +1016,8 @@ export async function pollScheduler(
           // In the organization's run space, where the runner for that organization keeps its runs.
           const caller = callerOfTrigger(def);
           await claimRunOwner((def.orgId !== undefined ? withOrg(journal, def.orgId) : journal) as never, runId, caller, composerMark(runId));
-          result = await target.runWorkflow(def.name, def.input, { runId, caller });
+          await (def.orgId !== undefined ? withOrg(journal, def.orgId) : journal).putIfAbsent(FIRE_AT(runId), slot);
+          result = await target.runWorkflow(def.name, def.input, { runId, caller, scheduledFor: slot, signal: grant.signal });
         } catch (e) {
           // DEFERRAL, not attempt: the run is already in flight elsewhere — the engine refused this poller AT
           // LOCK ACQUISITION, before the run did anything. Nothing was tried and nothing went wrong; counting it
@@ -831,7 +1085,7 @@ export async function pollScheduler(
           if (await commit({ ...state, status: 'done' }, 'done')) out.fired++;
         } else {
           const next: TriggerState = {
-            nextRunAt: computeNext(def, state.nextRunAt, now),
+            nextRunAt: state.resumeAt ?? slotAfter(def, slot),
             attempts: 0,
             fireCount: state.fireCount + 1,
             status: 'pending',
@@ -843,14 +1097,15 @@ export async function pollScheduler(
         // into the past), so a heartbeat tick that survives this fire would find its own token still in
         // the record and RESURRECT the lock it just released (expires: 0 → now+ttl) — blocking every
         // later poll of the same runId (a suspended trigger's resume, most visibly). Pinned by test.
-        clearInterval(heartbeat);
+        await grant.dispose();
         // If the lock was genuinely taken over, release() is a no-op anyway (the fencing token no
         // longer matches — run-lock.ts mkLock.release), so we never free somebody else's lock.
         await lock.release();
       }
-    }, { journal, name: runId, what: `trigger '${id}' is firing`, ...(def.orgId !== undefined ? { scope: def.orgId } : {}) });
+    }, { journal, name: runId, what: `trigger '${id}' is firing`, ...(def.orgId !== undefined ? { scope: def.orgId } : {}) })
+      .finally(() => slots.inFlight.delete(id)));
   }
-  return out;
+  return fires;
 }
 
 /** THE ONE ANSWER to "does this trigger fire now" — read by the poller, and by nothing that writes. */
@@ -947,7 +1202,7 @@ export async function listTriggers(journal: Journal): Promise<TriggerInfo[]> {
       const problem = definitionProblem(def);
       out.push({
         id, name: def.name, kind: def.kind, value: def.value, input: def.input,
-        nextRunAt: 0, attempts: 0, maxAttempts: def.maxAttempts, fireCount: 0, status: 'failed', misfire: def.misfire,
+        nextRunAt: 0, attempts: 0, maxAttempts: def.maxAttempts, fireCount: 0, status: 'failed', misfire: misfireOf(def),
         ...(def.tz !== undefined ? { tz: def.tz } : {}),
         ...(def.resourceId !== undefined ? { resourceId: def.resourceId } : {}),
         ...(def.orgId !== undefined ? { orgId: def.orgId } : {}),
@@ -969,7 +1224,7 @@ export async function listTriggers(journal: Journal): Promise<TriggerInfo[]> {
       maxAttempts: def.maxAttempts,
       fireCount: state.fireCount,
       status: state.status,
-      misfire: def.misfire,
+      misfire: misfireOf(def),
       ...(def.tz !== undefined ? { tz: def.tz } : {}),
       ...(def.resourceId !== undefined ? { resourceId: def.resourceId } : {}),
       ...(def.orgId !== undefined ? { orgId: def.orgId } : {}),
@@ -993,6 +1248,67 @@ export async function listTriggers(journal: Journal): Promise<TriggerInfo[]> {
   }
   return out.sort((a, b) => a.id.localeCompare(b.id));
 }
+
+/** What `upgradeTriggers` did (or, with `dryRun`, would do). */
+export interface UpgradeTriggersResult {
+  dryRun: boolean;
+  /** The ids of the triggers whose stored `misfire: 'skip'` was (would be) rewritten to "the default". */
+  migrated: string[];
+}
+
+/**
+ * THE MIGRATION for triggers stored by 0.16, which wrote `misfire: 'skip'` whether the caller named a
+ * policy or not (it could not tell the two apart). Each becomes "none named": the record says "default"
+ * and the trigger follows the default, `'latest'` — after an outage it fires the LATEST missed
+ * occurrence, not the oldest as 'skip' did (`misfire: 'earliest'` is that policy now). The definition
+ * and its state (which names the definition it was computed for) are rewritten as one unit. Idempotent:
+ * a second run finds nothing. Run it once every 0.16 poller is gone: that poller reads a record without
+ * a policy as one that cannot fire and fails the trigger. (This version's poller reads a stored 'skip'
+ * as "none named" itself, so a trigger not yet migrated keeps firing.)
+ */
+export async function upgradeTriggers(journal: Journal, opts: { dryRun?: boolean } = {}): Promise<UpgradeTriggersResult> {
+  refuseUnknownNames('upgradeTriggers', opts, UPGRADE_TRIGGERS_OPTS_NAMES);
+  journal = rootJournal(journal, 'upgradeTriggers');
+  const dryRun = opts.dryRun === true;
+  const migrated: string[] = [];
+  for (const dkey of await journal.listKeys('sched:def:')) {
+    const id = dkey.slice('sched:def:'.length);
+    const stored = await journal.get<TriggerDef>(DEF(id));
+    if (stored === undefined || (stored.misfire as unknown) !== LEGACY_MISFIRE) continue;
+    migrated.push(id);
+    if (dryRun) continue;
+    const def = asSpecified(stored);
+    const state = await journal.get<TriggerState>(STATE(id));
+    if (state !== undefined) await writeTrigger(journal, id, def, state);
+    else await journal.put(DEF(id), def);
+  }
+  // Last: no 0.16 record is left, so the note a poller left for this (`noteLegacyMisfire`) goes.
+  if (!dryRun) await clearUpgradeDue(journal, MISFIRE_STEP);
+  return { dryRun, migrated: migrated.sort() };
+}
+
+
+/**
+ * `upgradeTriggers` as an upgrade step: `registerUpgradeSteps(storage, [schedulerUpgrade])`. The step
+ * is that function — pending/plan/run only report and run it, nothing is decided here.
+ * `afterOlderGone`: a 0.16 poller treats the rewritten records as ones that cannot fire.
+ */
+export const schedulerUpgrade: UpgradeStepFactory = (storage) => {
+  const journal = toJournal(storage);
+  const triggers = async (dryRun: boolean) => ({ triggers: (await upgradeTriggers(journal, { dryRun })).migrated });
+  const step: UpgradeStep = {
+    name: MISFIRE_STEP,
+    description: "rewrites the misfire 0.16 stored as 'skip' to \"the default\" (the latest missed occurrence fires, not the oldest)",
+    // It reads the triggers: asked only once the store is in this version's format (an earlier one's
+    // refuses the read), as the queue's step is.
+    requires: ['schema'],
+    afterOlderGone: true,
+    pending: async () => (await triggers(true)).triggers.length > 0,
+    plan: () => triggers(true),
+    run: () => triggers(false),
+  };
+  return step;
+};
 
 // ─── Remove, pause, resume ─────────────────────────────────────────────────────────────────────
 
@@ -1127,7 +1443,7 @@ export interface Scheduler {
 export function createScheduler(
   journal: Journal,
   runner: WorkflowRunner,
-  opts: { pollMs?: number; owner?: string; retryMs?: number; backoff?: boolean; maxPollMs?: number; budgetGuard?: BudgetGuard; lockTtlMs?: number; runnerForOrg?: RunnerForOrg; onInvalidTime?: InvalidTimePolicy } = {},
+  opts: { pollMs?: number; owner?: string; retryMs?: number; backoff?: boolean; maxPollMs?: number; budgetGuard?: BudgetGuard; lockTtlMs?: number; runnerForOrg?: RunnerForOrg; onInvalidTime?: InvalidTimePolicy; concurrency?: number } = {},
 ): Scheduler {
   refuseUnknownNames('createScheduler', opts, CREATE_SCHEDULER_OPTS_NAMES);
   journal = rootJournal(journal, 'createScheduler');
@@ -1135,8 +1451,24 @@ export function createScheduler(
   const pollMs = opts.pollMs ?? 1000;
   const backoffOn = opts.backoff ?? false;
   const maxPollMs = opts.maxPollMs ?? pollMs * 32;
-  const poll = (now: number = Date.now()) =>
-    pollScheduler(journal, runner, now, { owner: opts.owner, retryMs: opts.retryMs, budgetGuard: opts.budgetGuard, lockTtlMs: opts.lockTtlMs, runnerForOrg: opts.runnerForOrg, onInvalidTime });
+  const pollOpts: PollOptions = { owner: opts.owner, retryMs: opts.retryMs, budgetGuard: opts.budgetGuard, lockTtlMs: opts.lockTtlMs, runnerForOrg: opts.runnerForOrg, onInvalidTime };
+  // ONE set of slots for this scheduler, across its ticks and its manual polls: the limit is per scheduler.
+  const slots = fireSlots(opts.concurrency, 'createScheduler');
+  const poll = async (now: number = Date.now()): Promise<PollResult> => {
+    const out: PollResult = { fired: 0, rescheduled: 0, failed: 0, skipped: 0 };
+    const ended = await Promise.allSettled(await dispatchDue(journal, runner, now, pollOpts, slots, out));
+    const failed = ended.find((e): e is PromiseRejectedResult => e.status === 'rejected');
+    if (failed) throw failed.reason;
+    return out;
+  };
+  // A TICK DECIDES AND RETURNS: the fires it started run beside the loop (held — a drain waits for them),
+  // so the next tick comes on time and a long fire does not hold up any other trigger. A fire's own
+  // journal error is logged as a tick's was; it never stops the loop.
+  const tick = async (): Promise<boolean> => {
+    const fires = await dispatchDue(journal, runner, Date.now(), pollOpts, slots, { fired: 0, rescheduled: 0, failed: 0, skipped: 0 });
+    for (const f of fires) f.catch((err) => console.warn('[scheduler] a fire failed outside the workflow (the trigger stays due):', err));
+    return fires.length > 0;
+  };
 
   // Phase 8.1: the tick/backoff/"polling" flag loop now lives in @gnldev/durable's shared createPollLoop
   // (it used to be triplicated across queue/events/scheduler) — behavior is identical: pollScheduler only
@@ -1144,7 +1476,7 @@ export function createScheduler(
   // createPollLoop (the chain doesn't die). While `fired === 0` and backoffOn, the interval grows ×2
   // (cap maxPollMs); it resets to pollMs once something fires. Default backoff is OFF (see the comment
   // above — timing-critical).
-  const loop = createPollLoop(async () => (await poll()).fired > 0, { pollMs, backoff: backoffOn, maxPollMs });
+  const loop = createPollLoop(tick, { pollMs, backoff: backoffOn, maxPollMs });
 
   return {
     poll,
@@ -1239,4 +1571,8 @@ export function triggerEraser(journal: Journal): SubjectEraser {
     erase: (owner) => eraseOwned(owner),
     eraseOrganization: (orgId) => eraseOwned({ orgId }),
   };
+}
+
+export async function scheduledForOf(ctx: { journal: Pick<Journal, 'get'>; runId: string }): Promise<number | undefined> {
+  return ctx.journal.get<number>(FIRE_AT(ctx.runId));
 }

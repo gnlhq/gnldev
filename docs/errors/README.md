@@ -84,6 +84,7 @@ itself.
 | [`upstream_unauthorized`](./upstream_unauthorized.md) | 502 | The provider refused the operator's key — never the caller's. |
 | [`upstream_unavailable`](./upstream_unavailable.md) | 502 | The provider broke, or rejected the request we built. |
 | [`upstream_timeout`](./upstream_timeout.md) | 504 | The provider took too long. |
+| [`run_unfinished`](./run_unfinished.md) | 502 | The run's stream ended with no `finish` and nothing stopped it. |
 
 ## A run stopped at a limit
 

@@ -7,7 +7,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { InMemoryStorage, eraseSubject, type Storage } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
-import { enqueue, createWorker, jobEraser } from '../src/index.js';
+import { enqueue, createWorker, jobEraser, queueUpgrade } from '../src/index.js';
 
 const stores: Array<[string, () => Storage]> = [
   ['in-memory', () => new InMemoryStorage()],
@@ -111,6 +111,8 @@ describe('UPGRADE — a `qcursor` persisted by 0.9 (a row offset)', () => {
     await r.worker().drain();
     expect(r.ran.filter((x) => x.startsWith('new'))).toEqual(['new0', 'new1', 'new2', 'new3', 'new4']);
     expect(r.ran).toHaveLength(75); // the 70 done jobs were skipped by their markers, not re-run
-    expect(await storage.work!.get('qcursor')).not.toBe('300'); // not a one-time rescan on every poll
+    // k5 E: no worker reads a cursor any more; the upgrade removes the one 0.9 left.
+    for (const step of [queueUpgrade(storage)].flat()) await step.run();
+    expect(await storage.work!.get('qcursor')).toBeUndefined();
   });
 });

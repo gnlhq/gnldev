@@ -9,7 +9,8 @@
 // records that it ran.
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage } from '@gnldev/durable';
-import { enqueue, createWorker, listJobs, retryJob } from '../src/index.js';
+import { enqueue, createWorker, retryJob } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

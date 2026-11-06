@@ -2,7 +2,8 @@
 // two workers, one job; drain.
 import { describe, it, expect, vi } from 'vitest';
 import { InMemoryStorage, runDurable } from '@gnldev/durable';
-import { enqueue, createWorker, listJobs, retryJob, QueueDepthExceededError, type JobHandler } from '../src/index.js';
+import { enqueue, createWorker, retryJob, QueueDepthExceededError, type JobHandler } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 function mockModel(crash: { active: boolean }): any {
   return {
@@ -100,9 +101,8 @@ describe('@gnldev/queue', () => {
     expect(statuses.length).toBe(N);
     expect(statuses.every((s) => s.status === 'done')).toBe(true);
 
-    // The cursor must have advanced permanently past the first (fully terminal) page.
-    const cursor = await storage.work.get('qcursor');
-    expect(cursor).toBeDefined();
+    // k5 E: every finished job has left the ready set — no later poll reads it again.
+    expect(await storage.work.takeReady('qready', { now: Date.now() + 3_600_000, holder: { hold: 'probe', ttlMs: 1 } })).toBeUndefined();
   });
 
   it('the cursor does not skip a job awaiting retry; moves to the next job once it goes terminal', async () => {
@@ -429,11 +429,11 @@ describe('@gnldev/queue', () => {
   describe('poll backoff (poll storm prevention)', () => {
     it('on an empty queue, consecutive poll intervals grow', async () => {
       const storage = new InMemoryStorage();
-      const origList = storage.work.list.bind(storage.work);
+      const origTake = storage.work.takeReady.bind(storage.work);
       const times: number[] = [];
-      vi.spyOn(storage.work, 'list').mockImplementation((...args: any[]) => {
-        times.push(Date.now());
-        return (origList as any)(...args);
+      vi.spyOn(storage.work, 'takeReady').mockImplementation((...args: any[]) => {
+        times.push(Date.now()); // k5 E: one take per poll
+        return (origTake as any)(...args);
       });
       const worker = createWorker(storage, {}, { pollMs: 15, maxPollMs: 120 });
       // Virtual time: the assertion is about tick count and gap ratios, unmeasurable on a loaded machine.
@@ -497,11 +497,11 @@ describe('@gnldev/queue', () => {
       vi.useFakeTimers();
       try {
         const storage = new InMemoryStorage();
-        const origList = storage.work.list.bind(storage.work);
+        const origTake = storage.work.takeReady.bind(storage.work);
         let calls = 0;
-        vi.spyOn(storage.work, 'list').mockImplementation((...args: any[]) => {
-          calls++;
-          return (origList as any)(...args);
+        vi.spyOn(storage.work, 'takeReady').mockImplementation((...args: any[]) => {
+          calls++; // k5 E: one take per poll
+          return (origTake as any)(...args);
         });
         const worker = createWorker(storage, {}, { pollMs: 10, backoff: false });
         worker.start();

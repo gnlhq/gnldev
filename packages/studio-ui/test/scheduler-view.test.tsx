@@ -110,8 +110,8 @@ describe('Scheduler view', () => {
     stubFetch({
       '/capabilities': { ...CAPS_NO_SCHED, scheduler: true },
       '/scheduler/triggers': [
-        { id: 'daily', name: 'wf-report', kind: 'cron', value: '0 9 * * *', nextRunAt: 1_700_000_000_000, attempts: 0, maxAttempts: 5, fireCount: 3, status: 'pending', misfire: 'skip' },
-        { id: 'f1', name: 'wf-fail', kind: 'at', value: 0, nextRunAt: 0, attempts: 1, maxAttempts: 1, fireCount: 0, status: 'failed', misfire: 'skip', lastError: 'connection dropped' },
+        { id: 'daily', name: 'wf-report', kind: 'cron', value: '0 9 * * *', nextRunAt: 1_700_000_000_000, attempts: 0, maxAttempts: 5, fireCount: 3, status: 'pending', misfire: 'latest' },
+        { id: 'f1', name: 'wf-fail', kind: 'at', value: 0, nextRunAt: 0, attempts: 1, maxAttempts: 1, fireCount: 0, status: 'failed', misfire: 'latest', lastError: 'connection dropped' },
       ],
     });
     wrap(<Scheduler />);

@@ -24,14 +24,12 @@ import { enqueue, createWorker, jobEraser } from '../../queue/src/index.js';
 beforeAll(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
 const ends: Array<() => Promise<unknown>> = [];
 afterAll(async () => { for (const e of ends.reverse()) await e(); });
-/** Every store here lives in this process (pg-mem included, which cannot say where it connects). */
-const inProcess = { liveness: inMemoryLiveness() };
 
 const PG_URL = process.env.GNL_PG_URL;
 const STORES: Array<[string, () => Promise<Storage>]> = [
   ['in-memory', async () => new InMemoryStorage()],
   ['sqlite', async () => new SqliteStorage(':memory:')],
-  ['postgres (pg-mem)', async () => { const { Pool } = newDb().adapters.createPg(); return new PostgresStorage({ pool: new Pool() }); }],
+  ['postgres (pg-mem)', async () => { const { Pool } = newDb().adapters.createPg(); return new PostgresStorage({ pool: new Pool(), liveness: inMemoryLiveness() /* in this process; pg-mem cannot say where it connects */ }); }],
 ];
 if (PG_URL) {
   STORES.push(['postgres (real)', async () => {
@@ -41,7 +39,7 @@ if (PG_URL) {
     const db = `adopt_pos_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     await admin.query(`CREATE DATABASE ${db}`);
     const url = new URL(PG_URL); url.pathname = `/${db}`;
-    const s = new PostgresStorage({ connectionString: url.toString() });
+    const s = new PostgresStorage({ connectionString: url.toString(), liveness: inMemoryLiveness() /* in this process; pg-mem cannot say where it connects */ });
     ends.push(async () => { await s.close(); await admin.query(`DROP DATABASE IF EXISTS ${db}`); await admin.end(); });
     return s;
   }]);
@@ -55,18 +53,16 @@ describe.each(STORES)('adoptIntoOrg and read positions — %s', (_name, make) =>
     const ran = new Set<string>();
     const h = { t: async (p: { k: string }) => { ran.add(p.k); } };
     for (let i = 0; i < 60; i++) await enqueue(s.work!, 't', { k: `a${i}` }); // > one page (50): a cursor is persisted
-    await createWorker(s, h, inProcess).drain();
+    await createWorker(s, h).drain();
     for (let i = 0; i < 10; i++) await enqueue(s.work!, 't', { k: `pend${i}` });
     await s.adoptIntoOrg!('acme', ADOPT);
     for (let i = 0; i < 60; i++) await enqueue(s.work!, 't', { k: `b${i}` });
-    await createWorker(s, h, inProcess).drain();
-    expect(await s.work!.get('qcursor')).toBeTruthy(); // the root has a position of its own again
-    const r2 = await s.adoptIntoOrg!('acme', ADOPT);
-    expect(r2.resetPositions).toEqual(['qcursor']);
-    expect(await s.work!.get('qcursor')).toBeUndefined();
+    await createWorker(s, h).drain();
+    // k5 E: the queue keeps no read position (its worker takes from the ready set, which moves with the logs).
+    await s.adoptIntoOrg!('acme', ADOPT);
     const org = withOrgStorage(s, 'acme', { allowUnregistered: true } as never);
     const before = new Set(ran);
-    await createWorker(org, h, inProcess).drain();
+    await createWorker(org, h).drain();
     const pendRan = [...Array(10).keys()].filter((i) => ran.has(`pend${i}`) && !before.has(`pend${i}`));
     expect(pendRan).toHaveLength(10);
     expect(ran.size).toBe(130); // and nothing ran twice into a missing key either
@@ -80,14 +76,12 @@ describe.each(STORES)('adoptIntoOrg and read positions — %s', (_name, make) =>
     const ran: string[] = [];
     const h = { t: async (p: { k: string }) => { ran.push(p.k); } };
     for (let i = 0; i < 60; i++) await enqueue(s.work!, 't', { k: `x${i}` }, { resourceId: 'x' });
-    await createWorker(s, h, inProcess).drain();
-    expect(await s.work!.get('qcursor')).toBeTruthy();
+    await createWorker(s, h).drain();
     await jobEraser(s).erase({ resourceId: 'x' }); // their records are gone: the numbers behind the cursor are spent
     for (let i = 0; i < 10; i++) await enqueue(s.work!, 't', { k: `p${i}` });
-    const r = await s.adoptIntoOrg!('acme', ADOPT);
-    expect(r.resetPositions).toEqual(['qcursor']);
+    await s.adoptIntoOrg!('acme', ADOPT); // k5 E: no queue cursor to reset
     ran.length = 0;
-    await createWorker(withOrgStorage(s, 'acme', { allowUnregistered: true } as never), h, inProcess).drain();
+    await createWorker(withOrgStorage(s, 'acme', { allowUnregistered: true } as never), h).drain();
     expect(ran.sort()).toEqual([...Array(10).keys()].map((i) => `p${i}`).sort());
   });
 
@@ -117,6 +111,6 @@ describe.each(STORES)('adoptIntoOrg and read positions — %s', (_name, make) =>
     expect(await s.work!.get('settings:x')).toEqual({ a: 1 });
     expect(await s.work!.get('org:acme:settings:x')).toEqual({ a: 2 });
     expect(await s.work!.get('qcursor')).toBe('w1:1:1:j'); // not dropped by the refused run
-    expect((await s.work!.list('qjob')).items).toHaveLength(1);
+    expect((await s.work!.list('qlane')).items).toHaveLength(1); // k5 E: the queue's system lane
   });
 });

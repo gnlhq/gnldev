@@ -85,12 +85,15 @@ describe.skipIf(!PG_URL)('a body whose process cannot get its session back', () 
     let entered!: () => void;
     const inBody = new Promise<void>((r) => { entered = r; });
     let finished = false;
+    // When the body was TOLD (the abort reaches it), not when its call has settled: the settle writes the failed
+    // record through the store's pool, and how long that takes is the database's load, not the signal's.
+    let toldAt: number | undefined;
     const tool = {
       sideEffect: true,
       execute: async (_: unknown, opts: { abortSignal?: AbortSignal }) => {
         entered();
         if (honours) {
-          await new Promise((_r, reject) => opts.abortSignal?.addEventListener('abort', () => reject(opts.abortSignal!.reason)));
+          await new Promise((_r, reject) => opts.abortSignal?.addEventListener('abort', () => { toldAt = performance.now(); reject(opts.abortSignal!.reason); }));
         } else {
           await sleep(1_500);
         }
@@ -104,7 +107,7 @@ describe.skipIf(!PG_URL)('a body whose process cannot get its session back', () 
     const stop = holdOff(liv.id);
     const t0 = performance.now();
     const out = await call;
-    const took = performance.now() - t0;
+    const took = (toldAt ?? performance.now()) - t0;
     await stop();
     return { out, took, finished };
   };

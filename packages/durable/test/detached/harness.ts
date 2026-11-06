@@ -1,6 +1,6 @@
 // Spawns detached-node.ts app processes and talks to them over HTTP. Real OS processes: SIGSTOP,
 // SIGCONT, SIGKILL and SIGTERM are the kernel's, not simulated.
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -17,13 +17,24 @@ export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export const PG_BASE = process.env.GNL_PG_URL;
 
-export interface Store { kind: 'sqlite' | 'postgres'; where: string; dir: string; effects: string; drop(): void }
+export type StoreKind = 'sqlite' | 'postgres' | 'mysql' | 'mongo' | 'libsql';
+export interface Store { kind: StoreKind; where: string; dir: string; effects: string; drop(): void }
 
 let dbSeq = 0;
-export function newStore(kind: 'sqlite' | 'postgres', dbPrefix = 'm3cdetached'): Store {
+export function newStore(kind: StoreKind, dbPrefix = 'm3cdetached'): Store {
   const dir = mkdtempSync(join(tmpdir(), 'gnl-detached-'));
   const effects = join(dir, 'effects.log');
-  if (kind === 'sqlite') return { kind, where: join(dir, 'runs.db'), dir, effects, drop() {} };
+  if (kind === 'sqlite' || kind === 'libsql') return { kind, where: join(dir, 'runs.db'), dir, effects, drop() {} };
+  if (kind === 'mysql' || kind === 'mongo') {
+    const name = `${dbPrefix}_${process.pid}_${Date.now().toString(36)}_${dbSeq++}`;
+    const url = new URL(kind === 'mysql' ? process.env.GNL_MYSQL_URL! : process.env.GNL_MONGO_URL!);
+    url.pathname = `/${name}`;
+    if (kind === 'mysql') {
+      const admin = new URL(url); admin.pathname = '/';
+      execFileSync(process.execPath, ['-e', "const m=require(process.argv[1]);m.createConnection(process.argv[2]).then(c=>c.query('CREATE DATABASE '+process.argv[3]).then(()=>c.end()),e=>{console.error(e.message);process.exit(1)})", createRequire(join(here, '..', '..', 'package.json')).resolve('mysql2/promise'), admin.toString(), name], { stdio: 'pipe' });
+    }
+    return { kind, where: url.toString(), dir, effects, drop() {} };
+  }
   const name = `${dbPrefix}_${process.pid}_${Date.now().toString(36)}_${dbSeq++}`;
   const where = createDatabaseSync(name);
   return { kind, where, dir, effects, drop() { dropDatabaseSync(name); } };

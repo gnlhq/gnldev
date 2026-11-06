@@ -4,7 +4,8 @@
 // 'work')". One reading for every package: @gnldev/durable portOf / storageOf.
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage } from '@gnldev/durable';
-import { enqueue, listJobs, createWorker } from '../src/index.js';
+import { enqueue, createWorker } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 import { emit } from '../../events/src/index.js';
 
 describe('the right handle, or a sentence that names it', () => {

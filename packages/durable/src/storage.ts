@@ -1068,6 +1068,159 @@ export interface VectorStore {
 
 // ── 4) WorkStore = queue + events + scheduler primitive (has its OWN namespace; doesn't pollute RunJournal) ──
 
+/** A record's entry in a ready set (`WorkStore.appendReady`). */
+export interface ReadyEntry {
+  /** The ready set — one per consumer (@gnldev/queue's is `qready`); a set's entries span namespaces. */
+  set: string;
+  /** What `takeReady({ skipKinds })` matches (the queue: the job's type). */
+  kind: string;
+  /** Not taken before this time (epoch ms; compared with `takeReady`'s `now`). */
+  notBefore: number;
+  /** The clock `floor` is read at (the rank rule, `WorkStore.appendReady`). */
+  now: number;
+  /** How far past its namespace's last entry it is ranked (default 1). */
+  step?: number;
+}
+/**
+ * Who holds a taken entry (`WorkStore.takeReady`): a holder stamp, judged by the one rule every claim is
+ * judged by (liveness.ts `stampIsLive`) — the attempt that took it (`hold`), the process it runs in
+ * (`proc`), and only when neither can answer, its age (`at`, the take's `now`) against `ttlMs`.
+ */
+export interface ReadyHolder {
+  hold: string;
+  proc?: string;
+  ttlMs: number;
+}
+/** What `WorkStore.takeReady` takes. */
+export interface ReadyTake {
+  now: number;
+  /** Written on the taken entry: it is not handed out again while this holder holds it. */
+  holder: ReadyHolder;
+  skipKinds?: readonly string[];
+}
+/** A held entry (`WorkStore.heldReady`): its id and its holder's stamp. */
+export interface ReadyHeld extends ReadyHolder {
+  id: string;
+  /** The take's `now`. */
+  at: number;
+}
+/** What `WorkStore.takeReady` gives: the record's namespace and id (read it with `WorkStore.read`). */
+export interface ReadyItem {
+  ns: string;
+  id: string;
+}
+
+/**
+ * THE RANK RULE of a ready set (`WorkStore.appendReady`), written here and nowhere else: a store reads
+ * `floor` (the lowest rank ready now, `undefined` when none is) and `top` (its namespace's highest,
+ * `undefined` when it has none) in its namespace's turn, and ranks the entry with this. A store that ranks
+ * inside ONE statement — so the turn is that statement's, not a lock held across round trips — takes the
+ * same rule in its engine's words: `readyRankSql` (Postgres, MySQL), `readyRankExpr` (MongoDB).
+ */
+export function readyRank(floor: number | undefined, top: number | undefined, step: number | undefined): number {
+  return Math.max(floor ?? 0, (top ?? 0) + readyStep(step));
+}
+/**
+ * The rank rule for a namespace's entries appended together (`WorkStore.appendMany`), in their order: the
+ * first by `readyRank`, each next by `readyRank` over the one before — which already stands at or above
+ * `floor`, so it is that one plus its own step. What `appendReady` one after another gives them.
+ */
+export function readyRanks(floor: number | undefined, top: number | undefined, steps: ReadonlyArray<number | undefined>): number[] {
+  const out: number[] = [];
+  for (const s of steps) out.push((top = readyRank(floor, top, s)));
+  return out;
+}
+/** Each of `readyRanks`' ranks above the first one — what a store that ranks the first in its engine adds to it (MongoDB). */
+export function readyRunOffsets(steps: ReadonlyArray<number | undefined>): number[] {
+  const first = readyRanks(undefined, undefined, steps.slice(0, 1))[0] ?? 0;
+  return readyRanks(undefined, undefined, steps).map((r) => r - first);
+}
+/** One record of `WorkStore.appendMany`: a log record, with its ready entry when it has one. */
+export interface WorkRecord {
+  ns: string;
+  payload: unknown;
+  id: string;
+  entry?: ReadyEntry;
+}
+/** `WorkStore.appendMany`'s records, read once for every store (`planAppendMany`). */
+export interface AppendManyPlan {
+  /** Each `(ns, id)` once, the first the call names. */
+  records: WorkRecord[];
+  /** The entries' set and `now` — one of each per call — or `undefined` when no record has an entry. */
+  ready?: { set: string; now: number };
+  /** The entries in call order, an id once (the first the call names). */
+  entries: Array<{ ns: string; id: string; kind: string; notBefore: number; step: number }>;
+  /** The namespaces the entries are in. */
+  lanes: string[];
+}
+/**
+ * What every store's `appendMany` writes, before it writes anything: a repeated record or entry counts once
+ * (the first), and a call naming two sets or two times is refused — its entries are ranked in one turn, at
+ * one `now`. Steps are checked (`readyStep`).
+ */
+export function planAppendMany(records: readonly WorkRecord[]): AppendManyPlan {
+  if (!Array.isArray(records)) throw new TypeError('@gnldev/durable: appendMany takes an array of records');
+  const seen = new Set<string>();
+  const ids = new Set<string>();
+  const lanes = new Set<string>();
+  const plan: AppendManyPlan = { records: [], entries: [], lanes: [] };
+  for (const r of records) {
+    const key = `${r.ns}\u0000${r.id}`;
+    if (!seen.has(key)) { seen.add(key); plan.records.push(r); }
+    const e = r.entry;
+    if (e === undefined) continue;
+    plan.ready ??= { set: e.set, now: e.now };
+    if (e.set !== plan.ready.set || e.now !== plan.ready.now) {
+      throw new TypeError(`@gnldev/durable: appendMany ranks its entries in one set at one time — got set '${e.set}' at ${e.now} beside '${plan.ready.set}' at ${plan.ready.now}`);
+    }
+    const step = readyStep(e.step);
+    if (ids.has(r.id)) continue;
+    ids.add(r.id);
+    lanes.add(r.ns);
+    plan.entries.push({ ns: r.ns, id: r.id, kind: e.kind, notBefore: e.notBefore, step });
+  }
+  plan.lanes = [...lanes];
+  return plan;
+}
+/**
+ * The entries of `plan` to write, in call order, ranked (`readyRanks`) from the turn's inputs: `floor` of
+ * the set, each namespace's `top`, and the ids that already have an entry (left as they are, and given no
+ * rank). Each namespace is ranked in its own turn, so `floor` is the set's without the call's entries —
+ * as if the call's namespaces were appended at once.
+ */
+export function rankAppendMany(plan: AppendManyPlan, floor: number | undefined, tops: ReadonlyMap<string, number | undefined>, has: ReadonlySet<string>) {
+  const fresh = plan.entries.filter((x) => !has.has(x.id));
+  const lanes = new Map<string, typeof fresh>();
+  for (const x of fresh) { const l = lanes.get(x.ns); if (l) l.push(x); else lanes.set(x.ns, [x]); }
+  const rank = new Map<string, number>();
+  for (const [ns, lane] of lanes) readyRanks(floor, tops.get(ns), lane.map((x) => x.step)).forEach((r, i) => rank.set(lane[i]!.id, r));
+  return fresh.map((x) => ({ ns: x.ns, id: x.id, kind: x.kind, notBefore: x.notBefore, rank: rank.get(x.id)! }));
+}
+/** `appendMany`'s rows in parts a SQL statement takes: at most 1 000 rows (6 000 of a statement's 65 535 parameters at 6 a row). */
+export function manyRows<T>(xs: readonly T[]): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < xs.length; i += 1000) out.push(xs.slice(i, i + 1000));
+  return out;
+}
+/** `($1, $2), ($3, $4), …`: `rows` groups of `width` numbered placeholders, each with its cast from `casts`. */
+export function valuesSql(rows: number, width: number, casts: readonly string[] = []): string {
+  return Array.from({ length: rows }, (_, i) => `(${Array.from({ length: width }, (_, k) => `$${i * width + k + 1}${casts[k] ?? ''}`).join(', ')})`).join(', ');
+}
+/** A ready entry's step, checked: a positive finite number (default 1). */
+export function readyStep(step: number | undefined): number {
+  const s = step ?? 1;
+  if (!Number.isFinite(s) || s <= 0) throw new TypeError(`@gnldev/durable: a ready entry's step must be a positive number, got ${String(step)}`);
+  return s;
+}
+/** `readyRank` as a SQL expression over three SQL expressions (`NULL` floor or top = `undefined`); the step checked by `readyStep`. */
+export function readyRankSql(floor: string, top: string, step: string): string {
+  return `GREATEST(COALESCE(${floor}, 0), COALESCE(${top}, 0) + ${step})`;
+}
+/** `readyRank` as a MongoDB aggregation expression (`null` floor or top = `undefined`). */
+export function readyRankExpr(floor: unknown, top: unknown, step: number): Record<string, unknown> {
+  return { $max: [{ $ifNull: [floor, 0] }, { $add: [{ $ifNull: [top, 0] }, step] }] };
+}
+
 export interface LogRecord<T = unknown> {
   id: string;
   payload: T;
@@ -1179,8 +1332,84 @@ export interface WorkStore {
    * re-scan and nothing runs twice.
    */
   list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>>;
+  /**
+   * One record of a log namespace by its id, or `undefined` — a point read: every bundled store keys
+   * the log by `(ns, id)`. A record `list` has not numbered yet is read too (it was appended). What
+   * reading one job needs: finding one record by `list` read the namespace from its head, so its cost
+   * grew with every record before it, another organization's included.
+   */
+  read<T = unknown>(ns: string, id: string): Promise<LogRecord<T> | undefined>;
+  /**
+   * (optional) The names of the log namespaces that start with `prefix` (literal, no wildcard) and hold
+   * at least one record, in byte order, a page at a time: `nextCursor` is the page's last name, and the
+   * next page starts after it. A cursor is a NAME, not a count, so a namespace that gets its first record
+   * while the pages are read appears when its name is after the cursor, and one that held a record when
+   * a page before it was read is never passed. What a reader of many logs at once asks first (@gnldev/queue
+   * `listAllJobs`: every organization's lane, each then read with `list`). Each name is one index probe
+   * (Postgres, MySQL, SQLite, MongoDB), so the cost grows with the names returned, not with the records.
+   * Every bundled store implements it.
+   */
+  listNamespaces?(prefix: string, q?: ListQuery): Promise<Page<string>>;
+  /**
+   * A READY SET: the records of some namespaces a consumer may take now, and the order it takes them in
+   * — what a shared worker asks ONE question of: "the next record, fairly, and nobody else's". It used to
+   * read every log from a cursor and try each record in turn, so an idle poll cost a query per namespace
+   * (per organization) and one organization's backlog stood in front of another's ready record.
+   *
+   * `appendReady` is `append` and the record's entry in `entry.set`, in ONE write: a record is never in
+   * the log without its entry, nor an entry without its record. Idempotent like `append`: an existing
+   * record is left alone, and its entry is added only when it has none.
+   *
+   * THE RANK RULE, the same in every store: an entry's rank is `max(floor, top + step)`, where `top` is the
+   * highest rank among the set's entries of the SAME namespace (0 when it has none) and `floor` the lowest
+   * among the set's entries ready at `entry.now` (0 when none is). So a namespace's entries are ranked in
+   * append order, one `step` apart, and a namespace with nothing waiting joins at the front of the round
+   * under way: entries are taken by rank, so every namespace with work is served once per round — and
+   * `step` below 1 gives a namespace more turns per round. Ranked in the namespace's own turn — one
+   * statement on its lane row (Postgres, MySQL), one document write (MongoDB), the one writer (SQLite) —
+   * with the inputs as that turn sees them: two entries of one namespace appended at once are ranked one
+   * after the other, never the same; entries of different namespaces are ranked at once.
+   */
+  appendReady(ns: string, payload: unknown, id: string, entry: ReadyEntry): Promise<string>;
+  /**
+   * Many records, and the entries of those that carry one, in ONE write: all of them, or — on any failure,
+   * a crash included — none. What `append` and `appendReady` one after another would leave, idempotent
+   * the same way (a record or entry already there stays; an id the call repeats counts once, the first),
+   * with each namespace's entries ranked in ONE turn (`planAppendMany`, `rankAppendMany`): the first by the
+   * rank rule, each next one step after it — so a call of 5 000 entries of one namespace takes its turn
+   * once, not 5 000 times. The entries of one call share a set and a `now`. Namespaces of one call are
+   * ranked as if appended at once (each from the set's `floor` without the call's other entries).
+   */
+  appendMany(records: readonly WorkRecord[]): Promise<void>;
+  /**
+   * The set's entry ready at `q.now` and held by nobody, with the lowest rank (append order among equal
+   * ranks), whose kind is not in `q.skipKinds` — and, in the same write, held by `q.holder`. Two callers
+   * at once never get the same entry (Postgres and MySQL `FOR UPDATE SKIP LOCKED`, MongoDB
+   * `findOneAndUpdate`, SQLite one writer). A held entry is out of the take, and out of the rank rule's
+   * `floor`, until it is let go (`deferReady`, `dropReady`). The store does not judge holders: whether one
+   * still holds is asked of it by the caller (`heldReady`; @gnldev/durable `reclaimReady`). Whoever runs
+   * the record still takes its own lease. `undefined` when no entry is ready. The cost of a take does not
+   * grow with the number of namespaces.
+   */
+  takeReady(set: string, q: ReadyTake): Promise<ReadyItem | undefined>;
+  /** The set's held entries, with their holders' stamps. */
+  heldReady(set: string): Promise<ReadyHeld[]>;
+  /**
+   * An entry let go: held by nobody, and not ready again before `notBefore` (its rank kept). With `hold`,
+   * only while that holder still holds it (a late let-go never frees a later holder's). No entry → nothing happens.
+   */
+  deferReady(set: string, id: string, notBefore: number, hold?: string): Promise<void>;
+  /** Removes an entry (its record stays in its log). */
+  dropReady(set: string, id: string): Promise<void>;
   /** Work-scope KV (markers like qdone/qfail/qatt, sched:def — NOT in RunJournal). */
   get<T = unknown>(key: string): Promise<T | undefined>;
+  /**
+   * (optional) Several KV keys in ONE read: what `get` answers for each, in the order given (`undefined`
+   * for a key with no value; a key named twice answered twice). What a reader of many records' markers
+   * asks (@gnldev/queue's status of a page of jobs) instead of a round trip per key. A caller without it
+   * reads each key with `get` — the same answers. Every bundled store implements it.
+   */
+  getMany?<T = unknown>(keys: string[]): Promise<(T | undefined)[]>;
   put(key: string, value: unknown): Promise<void>;
   /** Exactly-once consumer ack (CAS): true on the first call, false on subsequent ones. */
   ackOnce(key: string): Promise<boolean>;
@@ -1212,15 +1441,17 @@ export interface WorkStore {
    *
    * Returns the number of records removed (log records + KV entries). Optional like the rest of this
    * port's extensions: a custom WorkStore without it makes `purgeOrganization` refuse, deleting nothing,
-   * rather than report a silent success.
+   * rather than report a silent success. A ready-set entry (`appendReady`) whose namespace starts with
+   * `prefix` goes too, with the namespace's lane row.
    */
   deletePrefix?(prefix: string): Promise<number>;
   /**
    * (optional) Delete every LOG RECORD whose id starts with `idPrefix`, in every namespace. An owned
    * job or event carries its owner in its id (`ownedName`), so this is how one person's jobs and
    * events are erased without the store knowing what a job is. The prefix is LITERAL (no wildcard
-   * characters), and KV keys are not touched — only log records. Every bundled store implements it
-   * (in-memory, SQLite, Postgres); `eraseSubject` refuses a work store without it.
+   * characters), and KV keys are not touched — only log records, and their ready-set entries
+   * (`appendReady`). Every bundled store implements it (in-memory, SQLite, Postgres); `eraseSubject`
+   * refuses a work store without it.
    */
   deleteIdPrefix?(idPrefix: string): Promise<number>;
 }

@@ -346,6 +346,17 @@ function scopedWork(work: WorkStore, p: string, orgId: string): WorkStore {
   const scoped: WorkStore = {
     append: (ns, payload, id) => work.append(add(p, ns), payload, id),
     list: <T = unknown>(ns: string, q?: ListQuery) => work.list<T>(add(p, ns), q) as Promise<Page<LogRecord<T>>>,
+    read: <T = unknown>(ns: string, id: string) => work.read<T>(add(p, ns), id),
+    // The set and the namespace both under the organization: its ready set is its own, as its logs are.
+    appendReady: (ns, payload, id, entry) => work.appendReady(add(p, ns), payload, id, { ...entry, set: add(p, entry.set) }),
+    appendMany: (records) => work.appendMany(records.map((r) => ({ ...r, ns: add(p, r.ns), ...(r.entry ? { entry: { ...r.entry, set: add(p, r.entry.set) } } : {}) }))),
+    takeReady: async (set, q) => {
+      const got = await work.takeReady(add(p, set), q);
+      return got ? { ns: got.ns.slice(p.length), id: got.id } : undefined;
+    },
+    heldReady: (set) => work.heldReady(add(p, set)),
+    deferReady: (set, id, notBefore, hold) => work.deferReady(add(p, set), id, notBefore, hold),
+    dropReady: (set, id) => work.dropReady(add(p, set), id),
     get: <T = unknown>(key: string) => work.get<T>(add(p, key)),
     put: (key, value) => work.put(add(p, key), value),
     ackOnce: (key) => work.ackOnce(add(p, key)),
@@ -355,6 +366,18 @@ function scopedWork(work: WorkStore, p: string, orgId: string): WorkStore {
   }
   if (work.deletePrefix) {
     scoped.deletePrefix = (prefix) => work.deletePrefix!(add(p, prefix));
+  }
+  if (work.getMany) {
+    const many = work.getMany.bind(work);
+    scoped.getMany = <T = unknown>(keys: string[]) => many<T>(keys.map((k) => add(p, k)));
+  }
+  if (work.listNamespaces) {
+    // The organization's own namespaces, named as it names them (its prefix taken off, and put back on the cursor).
+    const names = work.listNamespaces.bind(work);
+    scoped.listNamespaces = async (prefix, q) => {
+      const page = await names(add(p, prefix), { ...q, ...(q?.cursor !== undefined ? { cursor: add(p, q.cursor) } : {}) });
+      return { items: page.items.map((n) => n.slice(p.length)), ...(page.nextCursor !== undefined ? { nextCursor: page.nextCursor.slice(p.length) } : {}) };
+    };
   }
   // Marked like the storage it belongs to, so `orgStorageScopeOf(work)` answers too. @gnldev/queue
   // reads it: a job appended here lands under `org:<id>:qjob`, where no worker polls.

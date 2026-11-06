@@ -7,7 +7,8 @@
 // None of them is an attempt: the job stays due (or reads what it is), and `onError` hears nothing.
 import { describe, it, expect, afterEach } from 'vitest';
 import { InMemoryStorage, LivenessUnavailableError, RunDrainedError, acquireRunLock, beginDrain, endDrain, drainProcess, toJournal, type Storage } from '@gnldev/durable';
-import { enqueue, createWorker, cancelJob, listJobs } from '../src/index.js';
+import { enqueue, createWorker, cancelJob } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const answer: any = {

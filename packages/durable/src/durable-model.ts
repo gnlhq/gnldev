@@ -11,7 +11,7 @@ import { isDraining, RunDrainedError, procStampFor, bindOwnLiveness } from './pr
 import { claimIsLive, newHoldId, holdHere, releaseHold } from './liveness.js';
 import { assertNotErased } from './erasure-fence.js';
 import { settleModelContent } from './time-travel.js';
-import { RunBusyError } from './errors.js';
+import { RunBusyError, RunUnfinishedError, upstreamFailure } from './errors.js';
 import { withTimeout } from './timeout.js';
 import type { DurableCtx } from './journal.js';
 import type { JournalReader } from './journal.js';
@@ -106,6 +106,7 @@ async function acquireModelClaim(
       holdHere(hold, ctx.journal);
       return { hold, mine };
     }
+    releaseHold(hold, ctx.journal); // not written: this round's id is given back
     if (busy || round >= 2) {
       throw new RunBusyError(
         `model step '${claimKey}' is being processed by another worker (claim ${now - (existing?.startedAt ?? now)}ms old, ttl ${ttlMs}ms)`,
@@ -349,10 +350,92 @@ function asGenerateRecord(hit: unknown): unknown {
   return { ...(h.rest ?? {}), content: settleModelContent({ parts }), finishReason: finish?.finishReason, usage: finish?.usage, warnings, ...(finish?.providerMetadata ? { providerMetadata: finish.providerMetadata } : {}) };
 }
 
+/**
+ * Whether a model's stream stopped without saying it finished. Read from what the provider sent, below
+ * the AI SDK: the SDK gives a cut stream a `finish` of its own (`other`) above this recorder, so what it
+ * reports upward cannot tell a cut from an ending.
+ *
+ * A cut shows three ways. No `finish` part at all (Anthropic up to 4.0.71: only `message_stop` sends one).
+ * `interrupted`, the SDK's own word for it (`@ai-sdk/openai` 4.0.100, `@ai-sdk/anthropic` 4.0.86). Or
+ * the adapter's default sent as a `finish` when the body closed — `{ unified: 'other', raw: undefined }`
+ * with no usage (OpenAI's three, up to 4.0.46): the provider named no reason and reported nothing, where
+ * an ending it did not recognize has `raw` set, and an ending of any kind has its usage.
+ *
+ * A v2 model cannot be read by its reason: the SDK's v2 bridge drops `raw` from every ending, so `other`
+ * with no `raw` is an ordinary v2 ending. It is read by `v2` only when the model says it is one — a v2
+ * model behind `wrapLanguageModel` reports `v4` and nothing below that says otherwise. The usage is what
+ * keeps its endings from reading as cuts; one that reports none reads as a cut, the same finish to the byte.
+ */
+function endedUnfinished(parts: any[], v2: boolean): boolean {
+  const finish = parts.filter((p) => p?.type === 'finish').at(-1);
+  if (finish === undefined) return true;
+  const { unified, raw } = finish.finishReason ?? {};
+  if (unified === 'interrupted') return true;
+  return !v2 && unified === 'other' && raw === undefined
+    && finish.usage?.inputTokens?.total === undefined && finish.usage?.outputTokens?.total === undefined;
+}
+
+/**
+ * A provider failure the taxonomy has a name for keeps it (a 429 mid-stream is a 429). One that came after
+ * the provider answered 200 is the body breaking: a cut, whichever way the adapter wrapped it.
+ */
+function keepsItsOwnName(error: unknown): boolean {
+  const up = upstreamFailure(error);
+  return up !== undefined && up.upstreamStatus !== 200;
+}
+
+/** A failure of the stream itself, as a part: the recorder only hears of what passes through it. */
+const SOURCE_FAILED = 'gnl-source-failed';
+
+/**
+ * The model's stream with its failure carried in-band. A `TransformStream` is told nothing of the
+ * readable it is piped from erroring — no transform, no flush — which left a step cut by a socket reset
+ * with its claim `running` and its failure unread.
+ */
+function failureInBand(stream: ReadableStream<any>): ReadableStream<any> {
+  const reader = stream.getReader();
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else controller.enqueue(value);
+      } catch (error) {
+        controller.enqueue({ type: SOURCE_FAILED, error });
+        controller.close();
+      }
+    },
+    cancel: (reason) => reader.cancel(reason),
+  });
+}
+
+/**
+ * The AI SDK's own test mock answers every method you did not give it with `throw new Error('Not
+ * implemented')`. GNL runs an agent on the STREAMING path (the REST host, Studio and `streamDurable`
+ * all do), so a mock written with only `doGenerate` reached the caller as a bare "Not implemented" —
+ * a sentence that names neither the model nor the method. Only that exact message is rewritten, with
+ * the original kept as `cause`; every other error (a provider's, a limit's, a timeout) passes through
+ * untouched, so no error class is changed.
+ */
+function explainMissingMethod(err: unknown, model: LanguageModelV4, method: 'doGenerate' | 'doStream'): unknown {
+  if (!(err instanceof Error) || err.message !== 'Not implemented') return err;
+  return new Error(
+    `the model '${model.modelId}' (provider '${model.provider}') has no ${method}: it threw "Not implemented". ` +
+      `GNL calls ${method === 'doStream' ? 'doStream (agents run on the streaming path)' : 'doGenerate'}, so a mock model needs it. ` +
+      'Give the mock a doStream, or use echoModel() / toolCallingModel() from @gnldev/durable, which have both.',
+    { cause: err },
+  );
+}
+
 export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?: DurableModelOptions): LanguageModelV4 {
   refuseUnknownNames('withDurableModel', opts, DURABLE_MODEL_NAMES);
   refuseUnknownNames('withDurableModel: exclusiveStep', opts?.exclusiveStep, EXCLUSIVE_STEP_NAMES);
   let step = 0;
+  const v2 = (model as { specificationVersion?: string }).specificationVersion === 'v2';
+  // The id this model was CONFIGURED with, written beside every step so pricing has one when the
+  // response names none (cost.ts `modelRecordFacts`; the provider's own answer still wins). `model` is
+  // whatever the caller passed in, a `wrapLanguageModel` wrapper included — it keeps `modelId ?? model.modelId`.
+  const configuredModelId = typeof model.modelId === 'string' && model.modelId ? { configuredModelId: model.modelId } : {};
   // The run is born at its first row (run-identity.ts `bornOnFirstWrite`).
   bornOnFirstWrite(ctx);
   const middleware: LanguageModelV4Middleware = {
@@ -408,14 +491,14 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
           : await doGenerate();
         // H13: format stamp (a copy — _v does not leak into result). The step is answered once: an
         // answer recorded meanwhile is this step's, and this attempt returns it instead of its own.
-        const answered = await answerStep(ctx, key, [], stampFormat(generated as object));
+        const answered = await answerStep(ctx, key, [], stampFormat({ ...(generated as object), ...configuredModelId }));
         result = answered.lost ? (asGenerateRecord(answered.recorded) as typeof generated) : generated;
         await settleModelClaim(ctx, claimKey, claimed, 'succeeded', reqHash);
       } catch (error) {
         // Transient error: mark the claim as 'failed' → the NEXT attempt (retry/resume) continues
         // immediately — the existing "retry does not shift the replay key" behavior is PRESERVED (step did not advance).
         await settleModelClaim(ctx, claimKey, claimed, 'failed', reqHash);
-        throw error;
+        throw explainMissingMethod(error, model, 'doGenerate');
       } finally {
         releaseHold(claimed.hold, ctx.journal);
       }
@@ -469,7 +552,7 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
           : await doStream();
       } catch (error) {
         await settleModelClaim(ctx, claimKey, claimed, 'failed', reqHash);
-        throw error;
+        throw explainMissingMethod(error, model, 'doStream');
       } finally {
         // Held while the provider is asked (the call a twin would repeat), not while the caller reads the
         // stream: a stream nobody finishes reading would otherwise hold the step in this process forever.
@@ -509,12 +592,18 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       // stream there with `AttemptLost` — before the tool call that would have run its own plan — and
       // its run's next attempt replays the recorded answer.
       const mine: object[] = [];
+      // How the stream went, for flush: the failure of the stream itself, an adapter's report that it was
+      // cut (openai-compatible's way of saying what the others' default `finish` says), an error it carried.
+      let sourceFailure: { error: unknown } | undefined;
+      let cutReported = false;
+      let carriedError = false;
       const recorder = new TransformStream<any, any>({
         async transform(chunk, controller) {
+          if (chunk?.type === SOURCE_FAILED) { sourceFailure = { error: chunk.error }; return; }
           parts.push(chunk);
           if (chunk?.type === 'tool-call') {
             try {
-              const answered = await answerStep(ctx, runKeys.model(ctx.runId, myStep), mine, stampFormat({ parts: parts.slice(), rest, partial: true }));
+              const answered = await answerStep(ctx, runKeys.model(ctx.runId, myStep), mine, stampFormat({ parts: parts.slice(), rest, partial: true, ...configuredModelId }));
               if (answered.lost) {
                 controller.error(new AttemptLost(runKeys.model(ctx.runId, myStep)));
                 return;
@@ -539,18 +628,36 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
               }
             }
           }
+          if (chunk?.type === 'error') {
+            if ((chunk.error as { name?: unknown } | undefined)?.name === 'AI_InvalidResponseDataError') { cutReported = true; return; }
+            carriedError = true;
+          }
+          // The `finish` of a cut is held back: the SDK would close the step on it, and the run with it.
+          if (chunk?.type === 'finish' && !carriedError && (cutReported || endedUnfinished(parts, v2))) return;
           controller.enqueue(chunk);
         },
         flush: async () => {
+          // No answer came, so none is recorded: the next attempt calls the model again — or replays the
+          // write-ahead copy above, when the step got as far as a tool call. An error the stream carried
+          // has reached its reader and is the run's failure; a stream this run's own abort stopped ends
+          // as the abort says; anything else was cut.
+          const finish = parts.filter((p) => p?.type === 'finish').at(-1);
+          if (sourceFailure || cutReported || carriedError || finish?.finishReason?.unified === 'error' || endedUnfinished(parts, v2)) {
+            await settleModelClaim(ctx, claimKey, claimed, 'failed', reqHash);
+            const aborted = params.abortSignal?.aborted === true;
+            if (sourceFailure && (aborted || keepsItsOwnName(sourceFailure.error))) throw sourceFailure.error;
+            if (aborted || carriedError || (finish?.finishReason?.unified === 'error' && !cutReported)) return;
+            throw new RunUnfinishedError(ctx.runId, myStep, sourceFailure?.error);
+          }
           // Happy path: the final record is written with the full `parts` (H13), over this attempt's own copy.
-          const answered = await answerStep(ctx, runKeys.model(ctx.runId, myStep), mine, stampFormat({ parts, rest }));
+          const answered = await answerStep(ctx, runKeys.model(ctx.runId, myStep), mine, stampFormat({ parts, rest, ...configuredModelId }));
           await settleModelClaim(ctx, claimKey, claimed, 'succeeded', reqHash);
           if (answered.lost) throw new AttemptLost(runKeys.model(ctx.runId, myStep));
           // SAME post-hoc check as generate (see wrapGenerate) — the step is already journaled.
           if (ctx.limits) await enforceStepLimits(ctx.journal as unknown as JournalReader, ctx.runId, ctx.limits, {}, ctx.identity ? requestOf(ctx.identity) : ctx.runId);
         },
       });
-      return { stream: (stream as any).pipeThrough(recorder), ...rest } as any;
+      return { stream: failureInBand(stream as ReadableStream<any>).pipeThrough(recorder), ...rest } as any;
     },
   };
   return wrapLanguageModel({ model, middleware });

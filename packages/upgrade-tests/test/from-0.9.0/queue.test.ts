@@ -2,10 +2,18 @@
 // ("50"), jobs still pending behind it, dead letters and a 0.9.0 retry copy — opened by the current code.
 import { describe, expect, it } from 'vitest';
 import { eraseSubject } from '@gnldev/durable';
-import { createWorker, enqueue, jobEraser, listJobs, retryJob } from '@gnldev/queue';
+import { createWorker, enqueue, jobEraser, listJobs, queueUpgrade, retryJob } from '@gnldev/queue';
 import * as S from '../../generate/shapes.mjs';
 import { itMigrates, notes090, openFixture, rowsContaining } from '../support.js';
 
+/** k5 E: a 0.9.0 queue opened, then its one log moved into this version's lanes (`queueUpgrade`'s steps) — the documented upgrade. */
+async function openUpgraded(name: string) {
+  const f = await openFixture(name);
+  for (const step of [queueUpgrade(f.storage)].flat()) await step.run();
+  return f;
+}
+/** k5 E: `listJobs` lists one organization's lane a page at a time; these jobs have none. */
+const allJobs = async (work: Parameters<typeof listJobs>[0]) => (await listJobs(work, { limit: 1000 })).items;
 const pad = (n: number) => String(n).padStart(3, '0');
 /** Every job 0.9.0 left pending, by payload: p030..p079 and carol's three. */
 const pendingOn090 = [
@@ -25,16 +33,16 @@ describe('upgrade from 0.9.0 — queue', () => {
   });
 
   it('the first drain after the upgrade runs every job 0.9.0 left pending, once, and nothing 0.9.0 finished', async () => {
-    const { storage } = await openFixture('queue.db');
+    const { storage } = await openUpgraded('queue.db');
     const ran: string[] = [];
     await plainWorker(storage, ran).drain();
     expect([...ran].sort()).toEqual([...pendingOn090].sort());
     expect(await plainWorker(storage, ran).drain()).toBe(0);
-    expect((await listJobs(storage.work)).filter((j) => j.status !== 'done')).toEqual([]);
+    expect((await allJobs(storage.work)).filter((j) => j.status !== 'done')).toEqual([]);
   });
 
   it('a worker restarted after the first drain runs nothing again', async () => {
-    const f = await openFixture('queue.db');
+    const f = await openUpgraded('queue.db');
     const ran: string[] = [];
     await plainWorker(f.storage, ran).drain();
     const again: string[] = [];
@@ -43,7 +51,7 @@ describe('upgrade from 0.9.0 — queue', () => {
   });
 
   it('erasing a person right after the upgrade skips none of anybody else\'s pending jobs', async () => {
-    const { storage } = await openFixture('queue.db');
+    const { storage } = await openUpgraded('queue.db');
     await eraseSubject(storage, 'ayse', { erasers: [jobEraser(storage)] });
     const ran: string[] = [];
     await plainWorker(storage, ran).drain();
@@ -51,14 +59,14 @@ describe('upgrade from 0.9.0 — queue', () => {
   });
 
   it('the erasure leaves nothing of the erased person\'s 0.9.0 jobs behind', async () => {
-    const f = await openFixture('queue.db');
+    const f = await openUpgraded('queue.db');
     await eraseSubject(f.storage, 'ayse', { erasers: [jobEraser(f.storage)] });
     expect(rowsContaining(f.path, '~o~:ayse:')).toEqual([]);
     expect(rowsContaining(f.path, '~o~:carol:').length).toBeGreaterThan(0);
   });
 
   it('a job enqueued after the upgrade runs once, after the 0.9.0 backlog', async () => {
-    const { storage } = await openFixture('queue.db');
+    const { storage } = await openUpgraded('queue.db');
     const ran: string[] = [];
     await enqueue(storage.work, 'plain', { n: 'new-1' }, { id: 'new-1' });
     await plainWorker(storage, ran).drain();
@@ -76,7 +84,7 @@ describe('upgrade from 0.9.0 — a queue 0.9.0 itself erased a person from', () 
   });
 
   it('the first drain after the upgrade runs every job that was pending when 0.9.0 erased, once', async () => {
-    const { storage } = await openFixture('queue-erased.db');
+    const { storage } = await openUpgraded('queue-erased.db');
     const ran: string[] = [];
     await plainWorker(storage, ran).drain();
     expect([...ran].sort()).toEqual([...pendingOn090].sort());
@@ -105,7 +113,7 @@ describe('upgrade from 0.9.0 — queue dead letters', () => {
   });
 
   it('the 0.9.0 retry copy runs once, under its own run (documented: a 0.9.0 copy carries no link)', async () => {
-    const { storage } = await openFixture('queue-dead.db');
+    const { storage } = await openUpgraded('queue-dead.db');
     const charges: string[] = [];
     const ran: string[] = [];
     await payWorker(storage, charges, ran).drain();
@@ -115,7 +123,7 @@ describe('upgrade from 0.9.0 — queue dead letters', () => {
   });
 
   it('a 0.9.0 dead letter retried after the upgrade continues its run: the charge is not made again', async () => {
-    const { storage } = await openFixture('queue-dead.db');
+    const { storage } = await openUpgraded('queue-dead.db');
     const charges: string[] = [];
     const ran: string[] = [];
     const retried = await retryJob(storage.work, dl1);
@@ -126,7 +134,7 @@ describe('upgrade from 0.9.0 — queue dead letters', () => {
   });
 
   it('two clicks on retry for the same 0.9.0 dead letter still charge nothing', async () => {
-    const { storage } = await openFixture('queue-dead.db');
+    const { storage } = await openUpgraded('queue-dead.db');
     const charges: string[] = [];
     const ran: string[] = [];
     await retryJob(storage.work, dl1);
@@ -136,16 +144,16 @@ describe('upgrade from 0.9.0 — queue dead letters', () => {
   });
 
   it('the dead letters stay listed as failed for audit after their retry', async () => {
-    const { storage } = await openFixture('queue-dead.db');
+    const { storage } = await openUpgraded('queue-dead.db');
     await retryJob(storage.work, dl1);
     await payWorker(storage, [], []).drain();
-    const status = new Map((await listJobs(storage.work)).map((j) => [j.id, j.status]));
+    const status = new Map((await allJobs(storage.work)).map((j) => [j.id, j.status]));
     expect(status.get(dl1)).toBe('failed');
     expect(status.get(dl2)).toBe('failed');
   });
 
   it('retryJob(…, { newRun: true }) on a 0.9.0 dead letter starts an empty run (the documented way back to 0.9.0 behaviour)', async () => {
-    const { storage } = await openFixture('queue-dead.db');
+    const { storage } = await openUpgraded('queue-dead.db');
     const charges: string[] = [];
     const id = await retryJob(storage.work, dl2, { newRun: true });
     await payWorker(storage, charges, []).drain();

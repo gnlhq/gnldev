@@ -187,4 +187,12 @@ describe('the published tarball', () => {
       expect(files, `\`exports\` points at ${t}, which the tarball does not contain`).toContain(t);
     }
   });
+
+  // `npm create gnl` / `npx @gnldev/cli init` run in an EMPTY directory. scaffold.js, doctor.js and
+  // option-names.js import `@gnldev/durable` at load time, and a peer marked optional is never
+  // installed by npx, so every command (even `--version`) died with ERR_MODULE_NOT_FOUND.
+  it('declares @gnldev/durable as a REQUIRED peer, because the CLI loads it at startup', () => {
+    expect(pkg.peerDependencies[ALLOWED_ON_ROOT]).toBeDefined();
+    expect(pkg.peerDependenciesMeta?.[ALLOWED_ON_ROOT]?.optional, 'an optional peer is not installed by npx').not.toBe(true);
+  });
 });

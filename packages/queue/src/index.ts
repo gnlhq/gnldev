@@ -8,11 +8,11 @@ import { randomUUID } from 'node:crypto';
 import {
   acquireRunLock, requireCapability, createPollLoop, orgPrefix, withOrgStorage, orgStorageScopeOf, ownedName, ownedPrefix,
   claimRunOwner, composerMark, runDurable, user, staff, UNKNOWN, toJournal, ownerOfName, assertRootWorkForErasure, portOf, storageOf,
-  processLiveness, storeLiveness, isProcessLocal, isDraining, LivenessRequiredError, attemptEndOf, holdWhile, settledExceptOwn, handNamePrefix,
-  refuseRunIdThatCannotBeBorn, storageOfWork, isStorage } from '@gnldev/durable';
-import type { Storage, WorkStore, RunJournal, LogRecord, Caller, RunDurableArgs, DurableResult, ProcessLiveness } from '@gnldev/durable';
+  processLiveness, storeLiveness, isProcessLocal, isDraining, LivenessRequiredError, attemptEndOf, holdWhile, settledExceptOwn, handNamePrefix, executionGrant,
+  refuseRunIdThatCannotBeBorn, storageOfWork, isStorage, takeReadyHeld, letGoReady, reclaimReady, markUpgradeDue, clearUpgradeDue } from '@gnldev/durable';
+import type { Storage, WorkStore, RunJournal, LogRecord, Caller, RunDurableArgs, DurableResult, ProcessLiveness, Page, ReadyTaken, WorkRecord, ReadyEntry, UpgradeStep, UpgradeStepFactory, UnheededText } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
-import { ENQUEUE_OPTIONS_NAMES, RETRY_JOB_OPTS_NAMES, CREATE_WORKER_OPTS_NAMES, CREATE_QUEUE_OPTS_NAMES, MOVE_JOB_TO_NAMES } from './option-names.js';
+import { ENQUEUE_OPTIONS_NAMES, ENQUEUE_MANY_JOB_NAMES, RETRY_JOB_OPTS_NAMES, CREATE_WORKER_OPTS_NAMES, CREATE_QUEUE_OPTS_NAMES, MOVE_JOB_TO_NAMES, LIST_JOBS_OPTS_NAMES, LIST_ALL_JOBS_OPTS_NAMES } from './option-names.js';
 
 /** What `ctx.run` takes: `runDurable`'s arguments without the four the job already decides. */
 export type JobRunArgs = RunDurableArgs extends infer A ? (A extends unknown ? Omit<A, 'journal' | 'runId' | 'caller' | 'resourceId'> : never) : never;
@@ -54,9 +54,13 @@ export interface JobCtx {
    */
   enqueue(type: string, payload: unknown, opts?: EnqueueOptions): Promise<string>;
   /**
-   * Aborted when the job is cancelled (`cancelJob`) while this handler runs. The worker notices on its
-   * heartbeat tick (every `ttlMs/3`), so with `heartbeat: false` it is never aborted. `ctx.run` already
-   * passes it on to the run; a handler doing other long work checks it itself.
+   * Aborted when this worker's right to run the job ends, with an `ExecutionRevokedError` saying why
+   * (`reason.why`): `canceled` (`cancelJob`), `lease-lost` (another worker holds the job now: stop, it
+   * continues there), `timeout` (`maxHoldMs`). Noticed on the heartbeat tick (every `ttlMs/3`; with
+   * `heartbeat: false` only the time limit). `ctx.run` already passes it on to the run; a handler doing
+   * other long work checks it itself. The framework cannot stop code that ignores the signal; keep side
+   * effects inside `ctx.run` so a takeover does not repeat them. A handler still running `ttlMs` after
+   * a `lease-lost` or `timeout` is warned about once (`console.warn`).
    */
   signal: AbortSignal;
 }
@@ -110,8 +114,10 @@ const STATE_MARKERS = ['qdone', 'qfail', 'qcancel', 'qatt', 'qtry', 'qlate'] as 
  */
 type TryRecord = { attempts: number; notBefore: number };
 async function attemptsOf(work: WorkStore, jobId: string): Promise<TryRecord> {
-  const t = await work.get<TryRecord>(`qtry:${jobId}`);
-  const old = await work.get<unknown>(`qatt:${jobId}`);
+  return triesFrom(await work.get<TryRecord>(`qtry:${jobId}`), await work.get<unknown>(`qatt:${jobId}`));
+}
+/** The attempt record from its two keys as read (`qtry`, and 0.10's bare `qatt`): the one rule `attemptsOf` and `statusesOf` share. */
+function triesFrom(t: TryRecord | undefined, old: unknown): TryRecord {
   return { attempts: Math.max(t?.attempts ?? 0, typeof old === 'number' ? old : 0), notBefore: t?.notBefore ?? 0 };
 }
 
@@ -184,6 +190,93 @@ function jobOwnerOf(opts: EnqueueOptions): JobOwner & { ownerKind?: 'staff' } {
  */
 const depthNs = (orgId: string | undefined) => (orgId === undefined ? 'qdepth' : `${orgPrefix(orgId)}qdepth`);
 
+/**
+ * THE ONE MAP FROM AN ORGANIZATION TO ITS LANE: the log its jobs are kept in, one per organization, and
+ * `qlane` for jobs with none. Reading or listing an organization's jobs touches its own lane only, at a
+ * cost that does not grow with any other organization's (N3). A lane is named by its organization's owned
+ * prefix, which every job id of that organization starts with: a job's id names its lane (`laneOfJob`).
+ */
+const SYSTEM_LANE = 'qlane';
+const laneOf = (orgId: string | undefined): string => (orgId === undefined ? SYSTEM_LANE : `${SYSTEM_LANE}:${ownedPrefix({ orgId })}`);
+const laneOfJob = (id: string): string => laneOf(ownerOfName(id).orgId);
+/**
+ * WHERE A WORKER TAKES ITS NEXT JOB FROM: the store's ready set (`WorkStore.appendReady`), one entry per job
+ * that is not finished, across every lane. One question per take — "the next job, fairly, and nobody
+ * else's" — answered by the store in one write: the lowest rank, and every lane with work is served once
+ * per round (the rank rule, `WorkStore.appendReady`). The worker used to read each lane from its cursor,
+ * so an idle poll cost a query per organization, and before lanes one organization's 200 jobs stood in
+ * front of another's one (N2). The entry is a turn, not ownership: the job's lease still decides who runs it.
+ */
+const READY = 'qready';
+/** The one log every job was appended to before lanes (0.16 and earlier); `queue/lanes` moves it into the lanes. */
+const LEGACY_LOG = 'qjob';
+/** The read position 0.16's workers keep in that log ("every record before here is finished"). */
+const LEGACY_CURSOR = 'qcursor';
+/**
+ * How far THIS version has moved that log into the lanes: every record before it is in its lane. A key of
+ * its own — 0.16's workers read the log from `qcursor` while this version moves it, and neither moves the other's.
+ */
+const MOVE_CURSOR = 'qmovecursor';
+/**
+ * Records one read of the old log takes. The move cursor advances only past a full page (a store hands
+ * out no cursor after its last record), so the records after it — fewer than this — are read again by the
+ * next move and found in their lanes by a point read each.
+ */
+const MOVE_PAGE = 50;
+/**
+ * THE QUEUE'S DATA VERSION — the shape its jobs are stored in:
+ *   1 = the one log (`qjob`, 0.16 and earlier): its jobs are in no lane, and this version's worker does not start;
+ *   2 = lanes and a ready set, the old log still there — still written by a process of the earlier version
+ *       in a deploy window, and moved by this version's workers as they find it (`queue/lanes` ran);
+ *   3 = lanes only: the old log and its cursors are gone (`queue/lanes-cleanup` ran, once every earlier
+ *       process was gone) and no worker of this version looks at it again.
+ * Read from the data itself, with one record (`qversion`) for the one thing the data cannot say — that
+ * the old log's jobs were moved, as opposed to never moved: `queueDataVersion`, the one reading.
+ */
+const QUEUE_DATA_VERSION = 3;
+/** The first data version this version's worker takes jobs at: lanes. */
+const LANES_DATA_VERSION = 2;
+const DATA_VERSION_KEY = 'qversion';
+/** Whether the earlier version's log holds a job: one record of it is enough. */
+const legacyLogHolds = async (work: WorkStore): Promise<boolean> => (await work.list(LEGACY_LOG, { limit: 1 })).items.length > 0;
+/**
+ * The one reading of the store's queue data version. Nothing of the old log left (no record, no cursor
+ * of either version): 3, whatever was recorded — a store this version wrote, or one cleaned up. Something
+ * left: 2 once `queue/lanes` recorded that it moved the log, else 1 — and an old cursor with an empty log
+ * is 2 as well (there is nothing to move, only to delete).
+ */
+async function queueDataVersion(work: WorkStore): Promise<number> {
+  const oldLog = await legacyLogHolds(work);
+  if (!oldLog && (await work.get(LEGACY_CURSOR)) === undefined && (await work.get(MOVE_CURSOR)) === undefined) return QUEUE_DATA_VERSION;
+  const recorded = (await work.get<{ version: number }>(DATA_VERSION_KEY))?.version ?? 1;
+  return oldLog && recorded < LANES_DATA_VERSION ? 1 : LANES_DATA_VERSION;
+}
+/** What this version's worker says on a store whose queue data is at v1 (it does not start). */
+const DATA_VERSION_REFUSAL =
+  `@gnldev/queue: this store's job data is at v1 (the one 'qjob' log of 0.16 and earlier); this version's worker needs v${LANES_DATA_VERSION} (lanes) ` +
+  'and takes no job from that log. Run `gnl upgrade` once — it moves those jobs into lanes and is safe while workers and producers ' +
+  "of the earlier version still run (in code: registerUpgradeSteps(storage, [queueUpgrade]) and storage.upgrade()) — then start this version's. " +
+  'Once every process of the earlier version is gone, `gnl upgrade --only queue/lanes-cleanup` retires the old log.';
+/**
+ * The step a store's queue data at `version` waits for — `queue/lanes` at v1, `queue/lanes-cleanup` at v2 —
+ * and the note a worker leaves for it (@gnldev/durable `markUpgradeDue`), so a `storage.upgrade()` on a
+ * store where `queueUpgrade` is not registered says so instead of finding nothing to do. Each step clears
+ * its own note as its last act (`moveLanes`, `cleanUpLanes`).
+ */
+/** What a job handler that ignores `ctx.signal` costs, for the warning `executionGrant` says (@gnldev/durable `UnheededText`). */
+const UNHEEDED: UnheededText = {
+  body: 'the handler',
+  signal: 'ctx.signal',
+  lost: 'Side effects outside ctx.run may be repeated by the worker that took it over.',
+  timeout: 'The lease is kept until it returns, so nothing runs beside it; keep side effects inside ctx.run so a retry does not repeat them.',
+};
+const LANES_STEP = 'queue/lanes';
+const CLEANUP_STEP = 'queue/lanes-cleanup';
+const dueStepOf = (version: number): string => (version < LANES_DATA_VERSION ? LANES_STEP : CLEANUP_STEP);
+const QUEUE_DUE = { by: '@gnldev/queue', register: 'registerUpgradeSteps(storage, [queueUpgrade])' } as const;
+/** The storage whose run journal keeps the notes, from what a step was given. */
+const dueHostOf = (arg: unknown, work: WorkStore): Storage | undefined => (isStorage(arg) ? arg : storageOfWork(work));
+
 
 export type JobHandler = (payload: any, ctx: JobCtx) => Promise<any>;
 
@@ -197,11 +290,12 @@ export interface QueueWorkerOptions {
   ttlMs?: number;
   /**
    * This process's liveness (@gnldev/durable `sqliteLiveness`/`postgresLiveness`): whether the worker
-   * holding a job is alive is asked of it, not of the lease's age. Default: the one installed in this
-   * process, else the one the storage makes for itself (a SqliteStorage or PostgresStorage answers for
-   * itself), installed for the process. A store only this process reaches (in memory) needs none; any
-   * other store without one is refused (`LivenessRequiredError`) — guessed by age, a frozen worker's job
-   * is taken and its side effect runs twice.
+   * holding a job is alive is asked of it, not of the lease's age. Only for a store that cannot answer for
+   * itself (a custom `Storage`): the built-in stores answer for themselves — their own liveness, or the one
+   * given to them (`new PostgresStorage({ liveness })`) — and one passed here beside it is refused
+   * (`LivenessConflictError`). Default: the one installed in this process. A store only this process
+   * reaches (in memory) needs none; any other store without one is refused (`LivenessRequiredError`) —
+   * guessed by age, a frozen worker's job is taken and its side effect runs twice.
    */
   liveness?: ProcessLiveness;
   /** start() poll interval (also the base for backoff growth on an empty queue). */
@@ -226,13 +320,20 @@ export interface QueueWorkerOptions {
   heartbeat?: boolean;
   /**
    * Phase 8 (review leftover): if renew THROWS THIS MANY TIMES IN A ROW (the transient error has become
-   * persistent — e.g. journal/network is consistently unreachable), `lockLost=true` is assumed: a
+   * persistent — e.g. journal/network is consistently unreachable), the job's grant is revoked as `lease-lost` (`ctx.signal` aborts): a
    * persistent transient error is treated as the best available signal that the lock may have REALLY
    * expired via TTL — the worker can't know for certain, so this is the best approximation (until
    * WorkStore CAS/fencing lands — a tracked backlog item). Default 3. The consecutive counter is
-   * reset by any SUCCESSFUL renew (a single hiccup never PRODUCES a lockLost — current behavior, see tests).
+   * reset by any SUCCESSFUL renew (a single hiccup never PRODUCES a lost lease — current behavior, see tests).
    */
   maxRenewFailures?: number;
+  /**
+   * How long one attempt may hold its job (default: no limit). When it is up the handler's `ctx.signal`
+   * aborts (`timeout`); a handler that stops on it has failed this attempt — retried, dead-lettered at
+   * `maxAttempts`. The lease is kept until the handler returns: a handler that ignores its signal still
+   * holds the job (nothing runs it beside itself).
+   */
+  maxHoldMs?: number;
   /**
    * Called with a handler's error that counts as a failed attempt — not for a job this process released
    * (a drain, a lost liveness session), one whose run was executing elsewhere, or one cancelled while it ran.
@@ -351,6 +452,71 @@ async function appendJob(
   runId?: string,
   given?: unknown,
 ): Promise<string> {
+  const job = jobOf(work, type, payload, options, runId);
+  await refuseOverDepth(work, [job]);
+  await refuseUnbornRun(work, job, given);
+  // The record and its ready entry in ONE write (`appendReady`): a job is never in its lane without a
+  // turn, nor a turn without the job.
+  const [rec, depth] = jobWrites(job, Date.now());
+  await work.appendReady(rec.ns, rec.payload, rec.id, rec.entry);
+  // The depth index, under the SAME id (idempotent with the job). A crash between the two appends
+  // under-counts this one job by one; never over-counts.
+  await work.append(depth.ns, depth.payload, depth.id);
+  noticeIfUnconsumed(work, type, job.id);
+  return job.id;
+}
+
+/** One job of `enqueueMany`: `enqueue`'s arguments after the store. */
+export interface EnqueueManyJob {
+  type: string;
+  payload: unknown;
+  options?: EnqueueOptions;
+}
+
+/**
+ * Adds many jobs in ONE write: all of them, or — when one is refused, or the write fails — none. Each job
+ * is what `enqueue(work, type, payload, options)` adds, checked the same way, idempotent the same way (an
+ * id already enqueued, or repeated in the call, is one job); the ids come back in call order.
+ *
+ * Fair the same way: an organization's jobs are taken in call order, one turn apart, exactly as one
+ * `enqueue` after another ranks them — and another organization's job still starts within its round. What
+ * differs is the cost: the call takes each organization's turn ONCE (`WorkStore.appendMany`), where
+ * `enqueue` takes it once per job — the way to put a large batch (a CSV import) on one organization's queue.
+ * Jobs of several organizations may share a call. `maxDepth` counts the call's own jobs before each one.
+ */
+export async function enqueueMany(workArg: WorkStore, jobs: readonly EnqueueManyJob[]): Promise<string[]> {
+  if (!Array.isArray(jobs)) throw new TypeError('@gnldev/queue: enqueueMany takes an array of jobs ({ type, payload, options? })');
+  const work = portOf(workArg, 'work', 'enqueueMany');
+  const all = jobs.map((j) => {
+    if (j === null || typeof j !== 'object') throw new TypeError(`@gnldev/queue: enqueueMany takes jobs ({ type, payload, options? }), got ${String(j)}`);
+    refuseUnknownNames('enqueueMany', j, ENQUEUE_MANY_JOB_NAMES);
+    refuseUnknownNames('enqueue', j.options ?? {}, ENQUEUE_OPTIONS_NAMES);
+    return jobOf(work, j.type, j.payload, j.options ?? {});
+  });
+  if (!all.length) return [];
+  await refuseOverDepth(work, all);
+  for (const job of all) await refuseUnbornRun(work, job, workArg);
+  const now = Date.now();
+  await work.appendMany(all.flatMap((job) => jobWrites(job, now)));
+  for (const job of all) noticeIfUnconsumed(work, job.rec.type, job.id);
+  return all.map((job) => job.id);
+}
+
+/** A job checked and named, not written yet (`jobOf`). */
+interface JobToAppend {
+  rec: JobRecord;
+  /** The stored id: what `retryJob` and `listJobs` speak. */
+  id: string;
+  orgId?: string;
+  maxDepth?: number;
+  /** The run a caller-chosen id (or a retry) names, asked before the write (`refuseUnbornRun`). */
+  runOfJob?: string;
+  /** The entry's time (`ReadyEntry.notBefore`). */
+  notBefore: number;
+}
+
+/** Everything `enqueue` checks and decides about one job that needs no read: its owner, its time, its record and its id. */
+function jobOf(work: WorkStore, type: string, payload: unknown, options: EnqueueOptions, runId?: string): JobToAppend {
   const opts: EnqueueOptions = { ...options, ...jobOwnerOf(options), caller: undefined };
   const ownerKind = options.caller?.kind === 'staff' ? ('staff' as const) : undefined;
   // The queue is ONE log that the worker polls at the root. An organization-scoped work store (a
@@ -371,18 +537,6 @@ async function appendJob(
   if (runAt !== undefined && !Number.isFinite(runAt)) {
     throw new TypeError(`@gnldev/queue: invalid runAt '${String(opts.runAt)}' — an epoch-ms number or a valid Date`);
   }
-  if (opts.maxDepth != null) {
-    // Counted per organization: one organization filling the queue refused every other one's work.
-    // Read from the organization's own depth index, so an organization with 5 jobs pays for 5 records,
-    // not for every other organization's backlog (R22).
-    const depth = await countUpTo(work, depthNs(opts.orgId), opts.maxDepth);
-    if (depth >= opts.maxDepth) {
-      throw new QueueDepthExceededError(
-        `@gnldev/queue: queue depth limit exceeded (${depth} >= ${opts.maxDepth}) — job rejected (type='${type}').`,
-        { type, depth, maxDepth: opts.maxDepth },
-      );
-    }
-  }
   const rec: JobRecord = {
     type,
     payload,
@@ -400,81 +554,202 @@ async function appendJob(
   const stored = name === undefined ? undefined : ownedName(name, { resourceId: opts.resourceId, orgId: opts.orgId });
   // The job's run is born at its first lease (`claimRunOwner`), under `job:<id>` or the run a retry
   // continues. An id a deletion fenced is never born again, so a job under it could never run: refused
-  // here by that same rule, before anything is written — not accepted, then failed on every attempt
-  // (e2e F1). A fresh random id was never anybody's run; only a caller-chosen one is asked.
+  // before anything is written (`refuseUnbornRun`) — not accepted, then failed on every attempt (e2e F1).
+  // A fresh random id was never anybody's run; only a caller-chosen one is asked.
   const runOfJob = runId ?? (opts.id !== undefined && stored !== undefined ? `job:${stored}` : undefined);
-  const runs = runOfJob === undefined ? undefined : jobRunsOf(work, given, opts.orgId);
-  // Asked here too: a spelling no run can carry (`job:…:tool`) is refused at enqueue, not failed at every
-  // attempt. The queue composes the job's run id (a retry's is the run the queue composed before).
-  if (runOfJob !== undefined && runs !== undefined) await refuseRunIdThatCannotBeBorn(runs, runOfJob, composerMark(runOfJob));
-  const id = await work.append('qjob', rec, stored);
-  // The depth index, under the SAME id (idempotent with the job). A crash between the two appends
-  // under-counts this one job by one; never over-counts.
-  await work.append(depthNs(opts.orgId), { type }, id);
-  noticeIfUnconsumed(work, type, id);
-  return id;
+  // The entry's time may be EARLIER than the job's, never later: an id the caller chose may already hold
+  // a record whose `runAt` the store keeps, and a worker that takes the entry early reads the record and waits.
+  return {
+    rec,
+    id: stored ?? randomUUID(),
+    ...(opts.orgId !== undefined ? { orgId: opts.orgId } : {}),
+    ...(opts.maxDepth != null ? { maxDepth: opts.maxDepth } : {}),
+    ...(runOfJob !== undefined ? { runOfJob } : {}),
+    notBefore: opts.id === undefined ? (runAt ?? 0) : 0,
+  };
 }
 
 /**
- * Exhausts WorkStore.list pagination (default limit, e.g. 50) to return ALL records in a namespace.
- * Intended for management/listing (listJobs, drain's cap calculation) — NOT USED in the poll loop
- * (runOnce); that path reads only the necessary pages via a cursor (5.1: reduce O(n)-per-poll).
+ * Phase 8 `maxDepth`, before anything is written. Counted per organization: one organization filling the
+ * queue refused every other one's work. Read from the organization's own depth index, so an organization
+ * with 5 jobs pays for 5 records, not for every other organization's backlog (R22). A job of
+ * `enqueueMany` counts the call's jobs of its organization before it too (each id once).
  */
-async function listAll<T>(work: WorkStore, ns: string): Promise<LogRecord<T>[]> {
-  const out: LogRecord<T>[] = [];
-  let cursor: string | undefined;
-  for (;;) {
-    const page = await work.list<T>(ns, { cursor });
-    out.push(...page.items);
-    if (!page.nextCursor) return out;
-    cursor = page.nextCursor;
-  }
-}
-
-/** Summary of all jobs (pending/done/failed + attempt count). */
-export async function listJobs(workArg: WorkStore): Promise<JobStatus[]> {
-  const work = portOf(workArg, 'work', 'listJobs');
-  const jobs = await listAll<JobRecord>(work, 'qjob');
-  const out: JobStatus[] = [];
+async function refuseOverDepth(work: WorkStore, jobs: readonly JobToAppend[]): Promise<void> {
+  const limits = new Map<string | undefined, number>();
+  for (const j of jobs) if (j.maxDepth != null) limits.set(j.orgId, Math.max(limits.get(j.orgId) ?? 0, j.maxDepth));
+  if (!limits.size) return;
+  const depths = new Map<string | undefined, number>();
+  for (const [orgId, limit] of limits) depths.set(orgId, await countUpTo(work, depthNs(orgId), limit));
+  const before = new Map<string | undefined, Set<string>>();
   for (const j of jobs) {
-    const done = await work.get(`qdone:${j.id}`);
-    const fail = await work.get(`qfail:${j.id}`);
-    const cancelled = await work.get(`qcancel:${j.id}`);
-    const { attempts } = await attemptsOf(work, j.id);
-    // A job cancelled while it ran, and which then finished, ran: `done` wins over `cancelled`.
-    // `in-doubt`: dead-lettered with its outcome unknown (its last attempt never reported) — a late
-    // report makes it `done`.
-    const status = done ? 'done' : fail ? ((fail as { inDoubt?: unknown }).inDoubt === true ? 'in-doubt' : 'failed') : cancelled !== undefined ? 'cancelled' : 'pending';
-    const notBefore = status === 'pending' ? await notBeforeOf(work, j) : 0;
-    out.push({
-      id: j.id,
-      type: j.payload.type,
-      status,
-      attempts,
-      ...(notBefore > 0 ? { notBefore } : {}),
-      ...(j.payload.resourceId !== undefined ? { resourceId: j.payload.resourceId } : {}),
-      ...(j.payload.orgId !== undefined ? { orgId: j.payload.orgId } : {}),
-    });
+    const earlier = before.get(j.orgId) ?? new Set<string>();
+    before.set(j.orgId, earlier);
+    if (j.maxDepth != null) {
+      const depth = depths.get(j.orgId)! + earlier.size - (earlier.has(j.id) ? 1 : 0);
+      if (depth >= j.maxDepth) {
+        throw new QueueDepthExceededError(
+          `@gnldev/queue: queue depth limit exceeded (${depth} >= ${j.maxDepth}) — job rejected (type='${j.rec.type}').`,
+          { type: j.rec.type, depth, maxDepth: j.maxDepth },
+        );
+      }
+    }
+    earlier.add(j.id);
   }
-  return out;
+}
+
+/** A spelling no run can carry (`job:…:tool`), or an id a deletion fenced, refused before the write (`jobOf`). */
+async function refuseUnbornRun(work: WorkStore, job: JobToAppend, given: unknown): Promise<void> {
+  if (job.runOfJob === undefined) return;
+  const runs = jobRunsOf(work, given, job.orgId);
+  // The queue composes the job's run id (a retry's is the run the queue composed before).
+  if (runs !== undefined) await refuseRunIdThatCannotBeBorn(runs, job.runOfJob, composerMark(job.runOfJob));
+}
+
+/** What a job writes: its record with its ready entry in its lane, and its depth-index record under the SAME id. */
+function jobWrites(job: JobToAppend, now: number): [WorkRecord & { entry: ReadyEntry }, WorkRecord] {
+  return [
+    { ns: laneOf(job.orgId), payload: job.rec, id: job.id, entry: { set: READY, kind: job.rec.type, notBefore: job.notBefore, now } },
+    { ns: depthNs(job.orgId), payload: { type: job.rec.type }, id: job.id },
+  ];
+}
+
+/** What `listJobs` takes: whose jobs (an organization's, or with no `orgId` the jobs that have none), and a page of them. */
+export interface ListJobsOptions {
+  orgId?: string;
+  cursor?: string;
+  limit?: number;
 }
 
 /**
- * Finds the job record with `id` (if any) in the `qjob` log. Unlike `listAll` it does NOT READ the
- * entire log — it scans page by page and stops as soon as the id is found (cost O(pages read until found)).
+ * A page of one organization's jobs (pending/done/failed + attempt count), in the order they were
+ * enqueued — or, with no `orgId`, of the jobs that have no organization. Reads that organization's lane
+ * only: never another organization's job, and at a cost that does not grow with any other's.
  */
+export async function listJobs(workArg: WorkStore, opts: ListJobsOptions = {}): Promise<Page<JobStatus>> {
+  refuseUnknownNames('listJobs', opts, LIST_JOBS_OPTS_NAMES);
+  const work = portOf(workArg, 'work', 'listJobs');
+  if (opts.orgId !== undefined) orgPrefix(opts.orgId);
+  const page = await work.list<JobRecord>(laneOf(opts.orgId), { ...(opts.cursor !== undefined ? { cursor: opts.cursor } : {}), ...(opts.limit !== undefined ? { limit: opts.limit } : {}) });
+  return { items: await statusesOf(work, page.items), ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
+}
+
+/** What `listAllJobs` takes: a page of every organization's jobs. */
+export interface ListAllJobsOptions {
+  cursor?: string;
+  limit?: number;
+}
+
+/**
+ * A page of EVERY job on the store — the jobs with no organization first, then each organization's, lane
+ * by lane in the lanes' name order, each lane in enqueue order: the operator's view (5b). `listJobs` with no
+ * `orgId` is the jobs with no organization only; seeing every organization's is this call, named for it.
+ *
+ * FIXED AT ITS START (5h-1): the first page takes the moment it was asked, and the cursor carries it — every
+ * job enqueued before it is listed, exactly once; one enqueued after it (its record's `ts`, its producer's
+ * clock) is not, whatever lane it went to, a new organization's included: it is the next listing's. So a
+ * listing ends under producers that never stop. A lane is read up to its first record after that moment.
+ * The cursor is a position — a lane, a place in it (`WorkStore.list`'s own cursor) and that moment — so a
+ * job enqueued while the pages are read is never listed twice and never makes the reader skip a job that
+ * was there. A page reads the lanes it covers (`WorkStore.list`), one probe for each next lane
+ * (`WorkStore.listNamespaces`), and the markers of its jobs in one read (`statusesOf`): never a query per job.
+ * Refuses an organization's view of the store, which holds no lane: pass the root storage.
+ */
+export async function listAllJobs(workArg: WorkStore, opts: ListAllJobsOptions = {}): Promise<Page<JobStatus>> {
+  refuseUnknownNames('listAllJobs', opts, LIST_ALL_JOBS_OPTS_NAMES);
+  const work = portOf(workArg, 'work', 'listAllJobs');
+  const org = orgStorageScopeOf(work);
+  if (org !== undefined) {
+    throw new Error(`@gnldev/queue: listAllJobs was handed organization '${org}''s work store, which holds no lane: every job is in the root store's lanes. Pass the root storage (its \`work\`); for one organization's jobs, listJobs(work, { orgId }).`);
+  }
+  if (typeof work.listNamespaces !== 'function') {
+    throw new Error('@gnldev/queue: listAllJobs needs a work store that lists its namespaces (`listNamespaces`); every bundled store does. One organization at a time: listJobs(work, { orgId }).');
+  }
+  const limit = opts.limit ?? 50;
+  if (!Number.isInteger(limit) || limit < 1) throw new TypeError(`@gnldev/queue: listAllJobs limit must be a positive integer, got ${String(opts.limit)}`);
+  let at: AllJobsCursor | undefined = opts.cursor === undefined ? { lane: SYSTEM_LANE, until: Date.now() } : decodeAllJobsCursor(opts.cursor);
+  const until = at.until;
+  const jobs: LogRecord<JobRecord>[] = [];
+  while (at) {
+    const page = await work.list<JobRecord>(at.lane, { limit: limit - jobs.length, ...(at.at !== undefined ? { cursor: at.at } : {}) });
+    // The lane as it was at the start: up to its first record enqueued after it — the rest is the next listing's.
+    const after = page.items.findIndex((j) => j.ts > until);
+    jobs.push(...(after === -1 ? page.items : page.items.slice(0, after)));
+    if (after === -1 && page.nextCursor) { at = { lane: at.lane, at: page.nextCursor, until }; break; } // the page is full, the lane is not
+    const next = await laneAfter(work, at.lane);
+    at = next === undefined ? undefined : { lane: next, until };
+    if (jobs.length >= limit) break;
+  }
+  return { items: await statusesOf(work, jobs), ...(at ? { nextCursor: encodeAllJobsCursor(at) } : {}) };
+}
+/**
+ * Where `listAllJobs` stands: a lane, the place in it (`WorkStore.list`'s cursor; none = its head), and the
+ * moment the listing started (`until`, epoch ms): the one bound every page of it reads to.
+ */
+interface AllJobsCursor { lane: string; at?: string; until: number }
+const encodeAllJobsCursor = (c: AllJobsCursor): string => Buffer.from(JSON.stringify([c.lane, c.at ?? null, c.until])).toString('base64url');
+function decodeAllJobsCursor(s: string): AllJobsCursor {
+  try {
+    const v = JSON.parse(Buffer.from(s, 'base64url').toString('utf8')) as unknown;
+    if (Array.isArray(v) && v.length === 3 && typeof v[0] === 'string' && (v[0] === SYSTEM_LANE || v[0].startsWith(`${SYSTEM_LANE}:`))
+      && (v[1] === null || typeof v[1] === 'string') && typeof v[2] === 'number' && Number.isFinite(v[2])) {
+      return { lane: v[0], ...(v[1] !== null ? { at: v[1] as string } : {}), until: v[2] };
+    }
+  } catch { /* said below */ }
+  throw new TypeError('@gnldev/queue: listAllJobs was given a cursor it did not hand out — pass the `nextCursor` of its previous page, or none for the first.');
+}
+/** The lane after `lane` in name order (the jobs with no organization come first): one probe. */
+async function laneAfter(work: WorkStore, lane: string): Promise<string | undefined> {
+  const page = await work.listNamespaces!(`${SYSTEM_LANE}:`, { limit: 1, ...(lane === SYSTEM_LANE ? {} : { cursor: lane }) });
+  return page.items[0];
+}
+
+/** One job's status, read by its id; `undefined` when there is no such job. */
+export async function getJob(workArg: WorkStore, id: string): Promise<JobStatus | undefined> {
+  const work = portOf(workArg, 'work', 'getJob');
+  const job = await findJob(work, id);
+  return job === undefined ? undefined : (await statusesOf(work, [job]))[0];
+}
+
+/** The markers a job's status is read from (`statusesOf`), in the order it reads them. */
+const STATUS_KEYS = (id: string): string[] => [`qdone:${id}`, `qfail:${id}`, `qcancel:${id}`, `qtry:${id}`, `qatt:${id}`];
+/**
+ * THE ONE READING of jobs' statuses from their markers (`listJobs`, `listAllJobs`, `getJob`): every
+ * job's markers in one read (`WorkStore.getMany`), or key by key on a store without it.
+ */
+async function statusesOf(work: WorkStore, jobs: readonly LogRecord<JobRecord>[]): Promise<JobStatus[]> {
+  const keys = jobs.flatMap((j) => STATUS_KEYS(j.id));
+  let values: unknown[];
+  if (work.getMany) values = keys.length ? await work.getMany(keys) : [];
+  else { values = []; for (const k of keys) values.push(await work.get(k)); }
+  const n = STATUS_KEYS('').length;
+  return jobs.map((j, i) => statusFrom(j, values.slice(i * n, i * n + n)));
+}
+function statusFrom(j: LogRecord<JobRecord>, [done, fail, cancelled, tryRec, oldAttempts]: unknown[]): JobStatus {
+  const tries = triesFrom(tryRec as TryRecord | undefined, oldAttempts);
+  // A job cancelled while it ran, and which then finished, ran: `done` wins over `cancelled`.
+  // `in-doubt`: dead-lettered with its outcome unknown (its last attempt never reported) — a late
+  // report makes it `done`.
+  const status = done ? 'done' : fail ? ((fail as { inDoubt?: unknown }).inDoubt === true ? 'in-doubt' : 'failed') : cancelled !== undefined ? 'cancelled' : 'pending';
+  const runAt = typeof j.payload.runAt === 'number' ? j.payload.runAt : 0;
+  const notBefore = status === 'pending' ? Math.max(runAt, tries.notBefore) : 0;
+  return {
+    id: j.id,
+    type: j.payload.type,
+    status,
+    attempts: tries.attempts,
+    ...(notBefore > 0 ? { notBefore } : {}),
+    ...(j.payload.resourceId !== undefined ? { resourceId: j.payload.resourceId } : {}),
+    ...(j.payload.orgId !== undefined ? { orgId: j.payload.orgId } : {}),
+  };
+}
+
+/** The job record with `id`, if any: a point read in the lane its id names (`WorkStore.read`), whatever else the queue holds. */
 async function findJob(
   work: WorkStore,
   id: string,
 ): Promise<LogRecord<JobRecord> | undefined> {
-  let cursor: string | undefined;
-  for (;;) {
-    const page = await work.list<JobRecord>('qjob', { cursor });
-    const hit = page.items.find((j) => j.id === id);
-    if (hit) return hit;
-    if (!page.nextCursor) return undefined;
-    cursor = page.nextCursor;
-  }
+  return work.read<JobRecord>(laneOfJob(id), id);
 }
 
 /**
@@ -617,19 +892,38 @@ export async function cancelJob(workArg: WorkStore, id: string): Promise<boolean
 export const NO_WORKER_NOTICE_MS = 10_000;
 
 /**
- * Every polling worker on a store announces itself in `__qworkers__`, every ttlMs/3: `owner → { at, ttlMs }`. It
- * answers "is anyone polling now", so it is judged by its age alone — a process that is alive and no
- * longer polls (a worker stopped, a one-off `drain()` long done) consumes nothing. Advisory: it decides
- * no job, only whether "nobody consumes this" is said. One key per store: a worker takes every job it
- * sees (a type it has no handler for is dead-lettered), so the question is whether a worker polls, not
- * which types it handles.
+ * Every polling worker on a store announces itself in `__qworkers__`, every ttlMs/3: `owner → { at, ttlMs,
+ * packageVersion }`. It answers "is anyone polling now", so it is judged by its age alone — a process that
+ * is alive and no longer polls (a worker stopped, a one-off `drain()` long done) consumes nothing. It
+ * decides no job: it says whether "nobody consumes this" is said, and whether a worker of an earlier
+ * version still polls (`olderWorkersLive`, what `queue/lanes-cleanup` asks). One key per store: a worker
+ * takes every job it sees (a type it has no handler for is dead-lettered), so the question is whether a
+ * worker polls, not which types it handles.
+ *
+ * `packageVersion`: the queue data version the worker's package speaks (QUEUE_DATA_VERSION). 0.16 and
+ * earlier wrote `{ at, ttlMs }` only, so an entry without it is a worker of an earlier version. 0.16's
+ * workers rewrite the record keeping every live entry as they found it, so this field survives them.
  */
 // `__`: a platform key (organization.ts `isPlatformKey`) — process state, never moved into an organization.
 const PRESENCE = '__qworkers__';
-interface Presence { at: number; ttlMs: number }
+interface Presence { at: number; ttlMs: number; packageVersion?: number }
 
+/**
+ * THE ONE READING of "this entry's worker polls now": announced within its own ttl. An entry from further
+ * in the future than its ttl (a clock far ahead, a hand-written one) or with no numeric time is not live:
+ * it would otherwise hold back `queue/lanes-cleanup` for as long as it says, and nothing renews it.
+ */
+function presenceIsLive(p: unknown, now: number): p is Presence {
+  const { at, ttlMs } = (p ?? {}) as Partial<Presence>;
+  return typeof at === 'number' && typeof ttlMs === 'number' && Number.isFinite(at) && Number.isFinite(ttlMs) && at + ttlMs >= now && at <= now + ttlMs;
+}
 function livePresence(map: Record<string, Presence> | undefined, now: number): Record<string, Presence> {
-  return Object.fromEntries(Object.entries(map ?? {}).filter(([, p]) => p.at + p.ttlMs >= now));
+  return Object.fromEntries(Object.entries(map ?? {}).filter(([, p]) => presenceIsLive(p, now)));
+}
+/** The live entries of workers of an earlier version: no `packageVersion` (0.16 and earlier), or a lower one. */
+async function olderWorkersLive(work: WorkStore): Promise<Array<[string, Presence]>> {
+  const now = Date.now();
+  return Object.entries(livePresence(await work.get(PRESENCE), now)).filter(([, p]) => !(typeof p.packageVersion === 'number' && p.packageVersion >= QUEUE_DATA_VERSION));
 }
 
 /** Writes (`entry`) or removes (`undefined`) one worker's presence; entries no longer live are dropped. */
@@ -740,7 +1034,7 @@ export function createWorker(
     if (stopped || announcing || performance.now() - announcedAt < ttlMs / 3) return;
     announcing = true;
     try {
-      await setPresence(work, owner, { at: Date.now(), ttlMs });
+      await setPresence(work, owner, { at: Date.now(), ttlMs, packageVersion: QUEUE_DATA_VERSION });
       announcedAt = performance.now();
       // Stopped while this was written (a poll already under way when stop() ran): taken back.
       if (stopped) await setPresence(work, owner, undefined);
@@ -773,14 +1067,6 @@ export function createWorker(
     }
     return null;
   }
-  // Queue-wide scan cursor (WorkStore KV): persistently tracks the position "all jobs before this
-  // point are terminal (done/fail)" → subsequent polls never re-scan earlier pages (5.1: starvation +
-  // O(n)-per-poll fix). If a job is still pending (awaiting retry / locked) the cursor does NOT PASS
-  // it → exactly-once/retry semantics are preserved. Old (cursor-less) queues also flow from the
-  // start (cursor=undefined), and so does a cursor 0.9 persisted (a row offset — see WorkStore.list:
-  // the cursor is a record's position now, so an erasure or a slow producer clock cannot move it).
-  const QCURSOR = 'qcursor';
-
   /**
    * May this job start now? Finished (`isTerminal`) or not yet eligible (`notBeforeOf`) → no. Asked
    * before the lease as a cheap filter and AGAIN under it, where the answer is the one that counts.
@@ -800,294 +1086,366 @@ export function createWorker(
     void p.finally(() => held.delete(p)).catch(() => {});
     return p;
   }
+  /**
+   * Where a job's ready entry stands once this worker lets go of it: gone when the job is finished, else
+   * ready again at the job's own time — its retry delay, its `runAt`, or now. THE ONE place an entry
+   * follows its job. Not written → the entry stays held as its stamp says (@gnldev/durable `letGoReady`):
+   * by the one ownership rule, like a lease whose release did not land.
+   */
+  async function settleReady(job: LogRecord<JobRecord>, taken: ReadyTaken): Promise<void> {
+    await letGoReady(taken, journal, async () => {
+      if (await isTerminal(work, job.id)) await work.dropReady(READY, job.id);
+      else await work.deferReady(READY, job.id, await notBeforeOf(work, job), taken.hold);
+    });
+  }
+  /**
+   * Lets go of the entries whose holders no longer hold them (@gnldev/durable `reclaimReady`: the one
+   * ownership rule) — a worker that died with its job, between its take and its lease or while it ran.
+   * One at a time per worker: a poll that finds one under way does not start another.
+   */
+  let reclaiming: Promise<number> | undefined;
+  function reclaim(): Promise<number> {
+    reclaiming ??= (async () => reclaimReady(work, READY, journal, await now()))()
+      .catch(() => 0)
+      .finally(() => { reclaiming = undefined; });
+    return reclaiming;
+  }
+  // THE OLD LOG, by the store's queue data version (`queueDataVersion`), asked by every drain and by a
+  // polling worker as often as it announces itself (ttlMs/3):
+  //   · v1 — `queue/lanes` never moved it, its jobs are in no lane: refused out loud, not left waiting unseen;
+  //   · v2 — moved, but a process of the earlier version may still write to it (a rolling deploy, pm2
+  //     reload): what it added is moved into its lane (`moveLegacyLog`, the one move), not refused. A worker
+  //     of that version may be running the same job from the old log: both take the job's one lease
+  //     (`<runId>:lease`) and ask its one set of markers (`qdone`, …) under it, so it runs once;
+  //   · v3 — `queue/lanes-cleanup` retired it (and recorded so): never asked again by this worker.
+  let legacyAskedAt = -Infinity;
+  let legacyRetired = false;
+  // A worker's share of the old log per call: the rest waits for its next call (or another worker's).
+  const LEGACY_PAGES_PER_CALL = 8;
+  const legacySeen = { at: undefined as string | undefined, ids: new Set<string>() };
+  let followingLegacy: Promise<void> | undefined;
+  // The steps this worker has left a note for (once each: the note is a putIfAbsent, not asked every poll).
+  const noted = new Set<string>();
+  function followLegacyLog(now: boolean): Promise<void> {
+    if (legacyRetired || (!now && performance.now() - legacyAskedAt < ttlMs / 3)) return Promise.resolve();
+    followingLegacy ??= (async () => {
+      const v = await queueDataVersion(work);
+      // Data a step has not moved (v1) or retired (v2): noted for `storage.upgrade()`. Never fails the worker —
+      // the refusal below says the same thing out loud.
+      if (v < QUEUE_DATA_VERSION && !noted.has(dueStepOf(v))) {
+        const step = dueStepOf(v);
+        await markUpgradeDue(storage, step, { ...QUEUE_DUE, dataVersion: v, packageVersion: QUEUE_DATA_VERSION })
+          .then(() => noted.add(step), () => undefined);
+      }
+      if (v < LANES_DATA_VERSION) throw new Error(DATA_VERSION_REFUSAL);
+      // Retired only by what the cleanup recorded: a store that merely holds nothing old (a new one) is
+      // asked again — an earlier producer appearing there is v1, and refused out loud.
+      if (v >= QUEUE_DATA_VERSION) legacyRetired = ((await work.get<{ version: number }>(DATA_VERSION_KEY))?.version ?? 0) >= QUEUE_DATA_VERSION;
+      else await moveLegacyLog(work, false, legacySeen, { pages: LEGACY_PAGES_PER_CALL });
+      legacyAskedAt = performance.now();
+    })().finally(() => { followingLegacy = undefined; });
+    return followingLegacy;
+  }
   async function runOnceHeld(): Promise<boolean> {
+    await followLegacyLog(false);
     const live = await liveness();
     await announce();
-    let cursor = await work.get<string>(QCURSOR);
-    for (;;) {
-      const page = await work.list<JobRecord>('qjob', { cursor });
-      let allTerminal = true;
-      for (const job of page.items) {
-        // A cheap pre-filter only. It decides nothing: see the re-check under the lease below.
-        const before = await mayStart(job);
-        if (before === 'finished') continue;
-        allTerminal = false; // a waiting job is not finished: the cursor must not pass it
-        if (before === 'waiting') continue;
+    // Kinds this poll found no free fleet-wide slot for (`typeConcurrency`): not taken again in it.
+    const skipKinds: string[] = [];
+    // Entries whose job's lease another worker holds: held by this poll until it ends (so it does not take
+    // them again), then let go — their turn comes again on the next poll.
+    const busy: Array<{ job: LogRecord<JobRecord>; taken: ReadyTaken }> = [];
+    // Asked alongside the take, not before it: a holder being judged (a process gone, its grace running)
+    // does not keep this poll from the next job. Awaited when nothing is ready, so what it let go is taken.
+    const reclaimed = reclaim();
+    try {
+      for (let asked = false; ;) {
         // GRACEFUL DRAIN (@gnldev/durable drainProcess): a process shutting down takes no new job — the
-        // same boundary rule as a run's next step. A scan under way when the drain began stops here; the
-        // job is left for a process that is not leaving.
+        // same boundary rule as a run's next step. Asked before the take, so a leaving process holds no turn.
         if (isDraining()) return false;
-        const runId = runIdOfJob(job); // `job:<id>`, or the run a retried dead letter continues
-        // THE LEASE'S KEY — deliberately NOT the runId.
-        //
-        // This lock answers "which WORKER owns this job". The runId's own lock answers "is this RUN
-        // executing anywhere". Two questions, and they used to be written to one place:
-        // `acquireRunLock(runs, runId, …)` produces `<runId>:lock`, and `runId` is then handed to the
-        // handler as `ctx.runId` — the value this package's own README tells handlers to pass to
-        // `runDurable({ runId: ctx.runId, … })`. So the moment that inner call took a lock of its own
-        // (a `lock` option, or a critical-preset `runWorkflow`), the worker refused the handler it had
-        // just invoked. RunBusyError on every attempt, the job dead-lettering at maxAttempts having
-        // never run once. Not a race — it could not work at all.
-        //
-        // Found in @gnldev/scheduler first, where the same construction killed a production health
-        // trigger; this package had it in the same shape and is fixed the same way. The two locks now
-        // nest instead of competing.
-        //
-        // SUFFIXED rather than moved to a namespace of its own, for the reason the scheduler's
-        // FIRE_LOCK gives at length: `<runId>:lease:lock` stays under the run's key prefix, which is
-        // what purgeRun/sweepRuns delete by. A sibling namespace would leak one small record per job,
-        // forever. `parseJournalKey` ignores it either way (it claims only `:model:`/`:tool:`).
-        //
-        // The WorkStore fencing chain below is unaffected: `qown:<jobId>` stores `lock.token`, and a
-        // token is a token whichever key it was minted on.
-        const stampedBy = live?.id;
-        const lock = await acquireRunLock(runs, `${runId}:lease`, owner, ttlMs);
-        if (!lock) continue; // held by another worker / fresh lease
-        // "Is it finished?" is answered AGAIN, now that this worker holds the lease. The check above
-        // ran before it, and between the two another worker could take the lease, run the job, write
-        // `qdone` and release — after which this lease is simply free, and the handler ran a second
-        // time. Measured on Postgres with 3 workers: 3-5% of jobs ran twice (0.9.0 too), side effects
-        // outside `ctx.run` included. A finisher writes `qdone`/`qfail` BEFORE it releases (or its
-        // lease expires), so under the lease the answer cannot change any more.
-        // The same holds for "not yet": a failed attempt writes its retry delay before it releases, so a
-        // worker that read the job as ready just before that failure sees the retry delay here.
-        if ((await mayStart(job)) !== 'ready') {
-          await lock.release();
+        const got = await takeReadyHeld(work, READY, journal, { now: await now(), ttlMs, skipKinds });
+        if (!got) {
+          if (asked || (await reclaimed) === 0) return false;
+          asked = true;
           continue;
         }
-        // A process that cannot prove it still holds its own liveness (its session is gone — a partition)
-        // may already be judged dead elsewhere, its job taken: it starts nothing. Nor when the lease names
-        // an id it no longer holds (its session came back under a new one).
-        if (live && !live.processOnly && (live.id !== stampedBy || !(await live.confirm()))) {
-          await lock.release();
+        const job = await work.read<JobRecord>(got.ns, got.id);
+        // Erased since it was taken (its record and its entry go together; the entry went second).
+        if (!job) { await letGoReady(got, journal, () => work.dropReady(READY, got.id)); continue; }
+        const r = await tryJob(job, got, live, skipKinds, busy);
+        if (r !== undefined) return r;
+      }
+    } finally {
+      for (const b of busy) await letGoReady(b.taken, journal, () => work.deferReady(READY, b.job.id, 0, b.taken.hold));
+    }
+  }
+  /** One job, taken from the ready set: the claim's outcome, or `undefined` when it may not start now. */
+  async function tryJob(
+    job: LogRecord<JobRecord>, taken: ReadyTaken, live: ProcessLiveness | undefined, skipKinds: string[],
+    busy: Array<{ job: LogRecord<JobRecord>; taken: ReadyTaken }>,
+  ): Promise<boolean | undefined> {
+    // A cheap pre-filter only. It decides nothing: see the re-check under the lease below.
+    if ((await mayStart(job)) !== 'ready') {
+      await settleReady(job, taken);
+      return undefined;
+    }
+    const runId = runIdOfJob(job); // `job:<id>`, or the run a retried dead letter continues
+    // THE LEASE'S KEY — deliberately NOT the runId.
+    //
+    // This lock answers "which WORKER owns this job". The runId's own lock answers "is this RUN
+    // executing anywhere". Two questions, and they used to be written to one place:
+    // `acquireRunLock(runs, runId, …)` produces `<runId>:lock`, and `runId` is then handed to the
+    // handler as `ctx.runId` — the value this package's own README tells handlers to pass to
+    // `runDurable({ runId: ctx.runId, … })`. So the moment that inner call took a lock of its own
+    // (a `lock` option, or a critical-preset `runWorkflow`), the worker refused the handler it had
+    // just invoked. RunBusyError on every attempt, the job dead-lettering at maxAttempts having
+    // never run once. Not a race — it could not work at all.
+    //
+    // Found in @gnldev/scheduler first, where the same construction killed a production health
+    // trigger; this package had it in the same shape and is fixed the same way. The two locks now
+    // nest instead of competing.
+    //
+    // SUFFIXED rather than moved to a namespace of its own, for the reason the scheduler's
+    // FIRE_LOCK gives at length: `<runId>:lease:lock` stays under the run's key prefix, which is
+    // what purgeRun/sweepRuns delete by. A sibling namespace would leak one small record per job,
+    // forever. `parseJournalKey` ignores it either way (it claims only `:model:`/`:tool:`).
+    //
+    // The WorkStore fencing chain below is unaffected: `qown:<jobId>` stores `lock.token`, and a
+    // token is a token whichever key it was minted on.
+    const lock = await acquireRunLock(runs, `${runId}:lease`, owner, ttlMs);
+    // Held by another worker (a live one: its liveness answered), or a fresh lease: its holder lets the
+    // entry go when it ends. This poll keeps it until it ends, then lets it go (`busy`).
+    if (!lock) { busy.push({ job, taken }); return undefined; }
+    // "Is it finished?" is answered AGAIN, now that this worker holds the lease. The check above
+    // ran before it, and between the two another worker could take the lease, run the job, write
+    // `qdone` and release — after which this lease is simply free, and the handler ran a second
+    // time. Measured on Postgres with 3 workers: 3-5% of jobs ran twice (0.9.0 too), side effects
+    // outside `ctx.run` included. A finisher writes `qdone`/`qfail` BEFORE it releases (or its
+    // lease expires), so under the lease the answer cannot change any more.
+    // The same holds for "not yet": a failed attempt writes its retry delay before it releases, so a
+    // worker that read the job as ready just before that failure sees the retry delay here.
+    if ((await mayStart(job)) !== 'ready') {
+      await lock.release();
+      await settleReady(job, taken);
+      return undefined;
+    }
+    // A process that cannot prove it still holds its own liveness (its session is gone — a partition)
+    // may already be judged dead elsewhere, its job taken: it starts nothing. (The lease names `live`:
+    // a store has one liveness in a process, never rebound — process-liveness.ts bindLiveness.)
+    if (live && !live.processOnly && !(await live.confirm())) {
+      await lock.release();
+      await settleReady(job, taken);
+      return false;
+    }
+    // The fleet-wide per-type limit: taken after the job's lease (so a slot is never held for a
+    // job this worker lost), given back with it.
+    const slot = await acquireSlot(job.payload.type);
+    if (!slot) {
+      await lock.release();
+      await settleReady(job, taken);
+      skipKinds.push(job.payload.type);
+      return undefined;
+    }
+    // 8.2 (closes a correctness debt): terminal writes (qdone/qfail/qatt) get their OWN fencing
+    // chain inside WorkStore. `qown:<jobId>` answers "who currently holds this" for the ENTIRE
+    // DURATION of this run via WorkStore's own in-engine CAS (putIfMatch) — INDEPENDENT of the
+    // lock record in RunJournal, within WorkStore's own consistency boundary. The first write is
+    // an UNCONDITIONAL put: the claim itself was already deduplicated via RunJournal CAS
+    // (acquireRunLock) → overwriting here is safe (a new claim = a new token = a new "ownership
+    // epoch"). If WorkStore doesn't support putIfMatch this key is never written (stillOwns()
+    // below then falls back to `lease-lost` only — old behavior preserved EXACTLY).
+    const fencingKey = `qown:${job.id}`;
+    if (work.putIfMatch) await work.put(fencingKey, lock.token);
+    // Y2 (heartbeat): if the handler runs longer than ttlMs, the lock TTL expires → a second
+    // worker could take over the SAME job and DOUBLE-RUN it (the actual bug). We keep the lock
+    // alive until the handler finishes by renewing it every ttlMs/3. If renew returns FALSE
+    // (fencing token mismatch — the lock was genuinely taken over), `lease-lost` is marked: this
+    // worker can no longer WRITE THE JOB RESULT — the worker that took over will write its own
+    // run; a stale worker's qdone/qfail/qatt write could overwrite it and make an
+    // INCONSISTENT/wrong result permanent. `lease-lost` is a DELAYED approximation, up to one
+    // heartbeat tick (ttlMs/3) — if the handler finishes mid-tick, `lease-lost` may not be true yet
+    // even though a real takeover happened. If WorkStore supports it, `stillOwns()` (below) closes
+    // this narrow window AT WRITE TIME via the `qown` CAS; if not, we rely on `lease-lost` alone
+    // (WorkStore.put is NOT CAS-backed — see storage.ts WorkStore).
+    // renew THROWING (a TRANSIENT error like a network/journal hiccup) is a separate case: a
+    // SINGLE throw does NOT PROVE a token mismatch — we don't know a real takeover happened —
+    // so a single hiccup does NOT TOUCH `lease-lost` (flipping it to true by mistake would mean
+    // qdone/qfail/qatt never get written even if the handler finishes successfully, AND
+    // release() would genuinely free the lock since the token still matches → another worker
+    // would RE-RUN the job, exactly the double-run Y2 is meant to prevent). It's just logged; the
+    // lock's TTL already tolerates a few renew ticks (ttlMs/3 interval), and the next tick
+    // retries. BUT (Phase 8 review leftover) if the throw repeats `maxRenewFailures` times IN A
+    // ROW, the transient error has become PERSISTENT — this is the best approximation of the
+    // lock having GENUINELY expired via TTL (the worker can't be certain since WorkStore lacks
+    // CAS/fencing here — "WorkStore fencing" is a tracked backlog item) → at
+    // that point the grant revoked as `lease-lost` is assumed. Any SUCCESSFUL renew (non-throwing) resets the
+    // consecutive counter — a single hiccup never produces `lease-lost`.
+    const heartbeatOn = opts.heartbeat ?? true;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    // THE RIGHT TO RUN THE JOB (@gnldev/durable executionGrant): the handler's `ctx.signal`. A lease
+    // renewal that answers false (a real takeover, token mismatch) or throws maxRenewFailures times in
+    // a row revokes it as `lease-lost`; a cancel as `canceled`; maxHoldMs as `timeout`. One signal,
+    // its reason saying which — a lost lease used to only mark the job's outcome unwritable while the
+    // handler ran on, its side effect beside the new holder's (audit N4).
+    const grant = executionGrant(`@gnldev/queue: job ${job.id}`, { unheededAfterMs: ttlMs, unheeded: UNHEEDED, ...(opts.maxHoldMs !== undefined ? { maxHoldMs: opts.maxHoldMs } : {}) });
+    if (heartbeatOn) {
+      grant.keep(() => lock.renew(ttlMs), {
+        everyMs: ttlMs / 3,
+        maxFailures: maxRenewFailures,
+        onTransient: (err, n) => console.warn(`[queue] renew transient error (job ${job.id}, ${n}x in a row), next tick will retry:`, err),
+      });
+      heartbeat = setInterval(() => {
+        // A cancel requested while the handler runs reaches it here, as `ctx.signal`.
+        if (!grant.signal.aborted) {
+          work.get(`qcancel:${job.id}`).then((c) => { if (c !== undefined) grant.revoke('canceled', `@gnldev/queue: job ${job.id} was cancelled`); }, () => {});
+        }
+        slot.renew().catch(() => {}); // a lost slot only loosens the limit until this job ends; never fails it
+      }, Math.max(1, Math.floor(ttlMs / 3)));
+    }
+    // 8.2: the terminal-write GATE. `lease-lost` (precautionary — also becomes true on consecutive
+    // renew failures, a real takeover is NOT REQUIRED) is STILL the first condition and is the
+    // behavior the existing tests rely on. ON TOP OF THAT: if WorkStore supports putIfMatch, a
+    // second, stricter check is added via an INSTANT in-engine CAS on `qown` — this catches a
+    // real takeover even if it happened mid-heartbeat-tick (not yet reflected in the grant). If
+    // putIfMatch isn't available, we fall back to `lease-lost` alone (old behavior preserved
+    // EXACTLY).
+    const stillOwns = async (): Promise<boolean> => {
+      if (grant.revoked === 'lease-lost') return false;
+      if (!work.putIfMatch) return true;
+      return work.putIfMatch(fencingKey, lock.token, lock.token);
+    };
+    // THE JOB IN HAND, from here to its lease's release (@gnldev/durable `holdWhile`): a drain waits for
+    // it whoever called runOnce, and `gnl pending` lists it — from this process, or from its shadow in
+    // another (audit C7). The unit IS this block: it ends when the block does, on every way out, and the
+    // handler runs as part of it — a handler that closes its worker or drains the process does not wait
+    // for itself (R2-7).
+    return await holdWhile(async (): Promise<boolean> => {
+      // The attempt record as it was before this attempt counted itself: what a release gives back.
+      let started: TryRecord | undefined;
+      try {
+        // The attempt is counted when it STARTS: a process that dies while the handler runs (a crash,
+        // an OOM, a kill) has used an attempt too. Counted at the end, such a job never reached maxAttempts.
+        started = await attemptsOf(work, job.id);
+        if (started.attempts >= maxAttempts) {
+          // Its last attempt started and never reported: its OUTCOME IS UNKNOWN, not failed — a worker
+          // judged gone because it was cut off from the store (a partition) can still be in the handler
+          // and finish it after this (measured, ADR-0008: 5 partitions in a row,
+          // the job dead-lettered while the handler then finished). No attempt starts again (the
+          // ceiling holds); the job reads `in-doubt` until a report settles it — that worker's own
+          // late `qdone` (below), or an operator's `retryJob`.
+          if (await stillOwns()) {
+            await putJobMarker(work, job.id, 'qfail', { error: `the job's last attempt did not report in ${started.attempts} attempts (its process stopped or was cut off while it ran) — its outcome is unknown`, attempts: started.attempts, inDoubt: true });
+            // Written first, read second (recordLateSuccess does the reverse): a handler that finished
+            // late is seen by one side or the other.
+            await settleFromLateReport(work, job.id);
+          }
+          return true;
+        }
+        if (!(await stillOwns())) return false;
+        if (await settleFromLateReport(work, job.id, true)) return true;
+        if (!(await putJobMarker(work, job.id, 'qtry', { attempts: started.attempts + 1, notBefore: started.notBefore }))) return true;
+        const handler = handlers[job.payload.type];
+        if (!handler) {
+          if (await stillOwns()) await putJobMarker(work, job.id, 'qfail', { error: `no handler: ${job.payload.type}` });
+          return true;
+        }
+        const rec = job.payload;
+        const orgId = rec.orgId;
+        const scoped = orgId !== undefined ? withOrgStorage(storage, orgId) : storage;
+        const caller = callerOfJob(rec);
+        // ADR-0002 5a: the job's run belongs to the job's recorded owner WITHOUT the handler passing
+        // it. Recorded here, before the handler runs (first write wins, so a retry or a resumed run
+        // keeps the owner it was born with). A handler that starts `runId` as anyone else — the old
+        // `runDurable({ runId: ctx.runId, … })` with the user forgotten — is now refused by the
+        // engine's own admission instead of producing a run nobody but staff can see.
+        // The queue composed `job:<id>`, so the queue begins it (run-id-grammar.ts `begin: 'composer'`);
+        // a run a retry continues was born already, and the mark changes nothing for it.
+        await claimRunOwner(toJournal(scoped.runs), runId, caller, composerMark(runId));
+        const followUp = (o: EnqueueOptions = {}): EnqueueOptions => {
+          if (o.caller !== undefined) return o;
+          const base = ownerOptionsOf(rec);
+          if (o.resourceId !== undefined) delete base.caller;
+          else if (base.caller && o.orgId !== undefined) base.caller = staff(o.orgId);
+          return { ...base, ...o };
+        };
+        await handler(rec.payload, {
+          journal: scoped.runs, jobId: job.id, runId, storage: scoped, caller,
+          ...(orgId !== undefined ? { orgId } : {}),
+          run: (args) => runDurable({
+            ...args,
+            abortSignal: args.abortSignal ? AbortSignal.any([args.abortSignal, grant.signal]) : grant.signal,
+            journal: toJournal(scoped.runs), runId, caller,
+          }),
+          enqueue: (type, payload, o) => enqueue(work, type, payload, followUp(o)),
+          signal: grant.signal,
+        });
+        // The handler returned: it ran. Whether this worker still holds the job decides only where that
+        // goes — a worker cut off from the store cannot even ask (its session was terminated), and that
+        // is not the handler failing.
+        const owns = await stillOwns().catch(() => false);
+        if (owns) { if (!(await settleFromLateReport(work, job.id, true))) await putJobMarker(work, job.id, 'qdone', { at: Date.now(), ok: true }); }
+        else await recordLateSuccess(work, job.id);
+      } catch (err) {
+        // NOT AN ATTEMPT (@gnldev/durable `attemptEndOf`, the one answer the scheduler gives too): this
+        // process released the job — it drains, or cannot judge other processes right now — or the job's
+        // run is executing elsewhere. The attempt counted at its start is given back and nothing else is
+        // written; the lease goes below and the job stays due for another process (or this one, later).
+        // Not reported to onError: the job did not fail.
+        const end = attemptEndOf(err, runId);
+        if (end === 'released' || end === 'deferred') {
+          if (started && (await stillOwns().catch(() => false))) await putJobMarker(work, job.id, 'qtry', started).catch(() => undefined);
           return false;
         }
-        // The fleet-wide per-type limit: taken after the job's lease (so a slot is never held for a
-        // job this worker lost), given back with it.
-        const slot = await acquireSlot(job.payload.type);
-        if (!slot) {
-          await lock.release();
-          continue;
-        }
-        // 8.2 (closes a correctness debt): terminal writes (qdone/qfail/qatt) get their OWN fencing
-        // chain inside WorkStore. `qown:<jobId>` answers "who currently holds this" for the ENTIRE
-        // DURATION of this run via WorkStore's own in-engine CAS (putIfMatch) — INDEPENDENT of the
-        // lock record in RunJournal, within WorkStore's own consistency boundary. The first write is
-        // an UNCONDITIONAL put: the claim itself was already deduplicated via RunJournal CAS
-        // (acquireRunLock) → overwriting here is safe (a new claim = a new token = a new "ownership
-        // epoch"). If WorkStore doesn't support putIfMatch this key is never written (stillOwns()
-        // below then falls back to lockLost only — old behavior preserved EXACTLY).
-        const fencingKey = `qown:${job.id}`;
-        if (work.putIfMatch) await work.put(fencingKey, lock.token);
-        // Y2 (heartbeat): if the handler runs longer than ttlMs, the lock TTL expires → a second
-        // worker could take over the SAME job and DOUBLE-RUN it (the actual bug). We keep the lock
-        // alive until the handler finishes by renewing it every ttlMs/3. If renew returns FALSE
-        // (fencing token mismatch — the lock was genuinely taken over), `lockLost` is marked: this
-        // worker can no longer WRITE THE JOB RESULT — the worker that took over will write its own
-        // run; a stale worker's qdone/qfail/qatt write could overwrite it and make an
-        // INCONSISTENT/wrong result permanent. `lockLost` is a DELAYED approximation, up to one
-        // heartbeat tick (ttlMs/3) — if the handler finishes mid-tick, `lockLost` may not be true yet
-        // even though a real takeover happened. If WorkStore supports it, `stillOwns()` (below) closes
-        // this narrow window AT WRITE TIME via the `qown` CAS; if not, we rely on `lockLost` alone
-        // (WorkStore.put is NOT CAS-backed — see storage.ts WorkStore).
-        // renew THROWING (a TRANSIENT error like a network/journal hiccup) is a separate case: a
-        // SINGLE throw does NOT PROVE a token mismatch — we don't know a real takeover happened —
-        // so a single hiccup does NOT TOUCH `lockLost` (flipping it to true by mistake would mean
-        // qdone/qfail/qatt never get written even if the handler finishes successfully, AND
-        // release() would genuinely free the lock since the token still matches → another worker
-        // would RE-RUN the job, exactly the double-run Y2 is meant to prevent). It's just logged; the
-        // lock's TTL already tolerates a few renew ticks (ttlMs/3 interval), and the next tick
-        // retries. BUT (Phase 8 review leftover) if the throw repeats `maxRenewFailures` times IN A
-        // ROW, the transient error has become PERSISTENT — this is the best approximation of the
-        // lock having GENUINELY expired via TTL (the worker can't be certain since WorkStore lacks
-        // CAS/fencing here — "WorkStore fencing" is a tracked backlog item) → at
-        // that point `lockLost=true` is assumed. Any SUCCESSFUL renew (non-throwing) resets the
-        // consecutive counter — a single hiccup never produces lockLost.
-        const heartbeatOn = opts.heartbeat ?? true;
-        let lockLost = false;
-        let consecutiveRenewFailures = 0;
-        let heartbeat: ReturnType<typeof setInterval> | undefined;
-        const cancel = new AbortController();
-        if (heartbeatOn) {
-          heartbeat = setInterval(() => {
-            // A cancel requested while the handler runs reaches it here, as `ctx.signal`.
-            if (!cancel.signal.aborted) {
-              work.get(`qcancel:${job.id}`).then((c) => { if (c !== undefined) cancel.abort(new Error(`@gnldev/queue: job ${job.id} was cancelled`)); }, () => {});
-            }
-            slot.renew().catch(() => {}); // a lost slot only loosens the limit until this job ends; never fails it
-            lock
-              .renew(ttlMs)
-              .then((ok) => {
-                if (!ok) { lockLost = true; return; } // false = a real takeover (token mismatch)
-                consecutiveRenewFailures = 0; // successful renew → consecutive failure counter resets
-              })
-              .catch((err) => {
-                consecutiveRenewFailures++;
-                console.warn(`[queue] renew transient error (job ${job.id}, ${consecutiveRenewFailures}x in a row), next tick will retry:`, err);
-                if (consecutiveRenewFailures >= maxRenewFailures) {
-                  lockLost = true;
-                  console.warn(`[queue] renew threw ${consecutiveRenewFailures} times in a row (job ${job.id}) — the lock has likely expired via TTL, assuming lockLost=true (best approximation until WorkStore fencing).`);
-                }
-              });
-          }, Math.max(1, Math.floor(ttlMs / 3)));
-        }
-        // 8.2: the terminal-write GATE. `lockLost` (precautionary — also becomes true on consecutive
-        // renew failures, a real takeover is NOT REQUIRED) is STILL the first condition and is the
-        // behavior the existing tests rely on. ON TOP OF THAT: if WorkStore supports putIfMatch, a
-        // second, stricter check is added via an INSTANT in-engine CAS on `qown` — this catches a
-        // real takeover even if it happened mid-heartbeat-tick (not yet reflected in lockLost). If
-        // putIfMatch isn't available, we fall back to `lockLost` alone (old behavior preserved
-        // EXACTLY).
-        const stillOwns = async (): Promise<boolean> => {
-          if (lockLost) return false;
-          if (!work.putIfMatch) return true;
-          return work.putIfMatch(fencingKey, lock.token, lock.token);
-        };
-        // THE JOB IN HAND, from here to its lease's release (@gnldev/durable `holdWhile`): a drain waits for
-        // it whoever called runOnce, and `gnl pending` lists it — from this process, or from its shadow in
-        // another (audit C7). The unit IS this block: it ends when the block does, on every way out, and the
-        // handler runs as part of it — a handler that closes its worker or drains the process does not wait
-        // for itself (R2-7).
-        return await holdWhile(async (): Promise<boolean> => {
-          // The attempt record as it was before this attempt counted itself: what a release gives back.
-          let started: TryRecord | undefined;
-          try {
-            // The attempt is counted when it STARTS: a process that dies while the handler runs (a crash,
-            // an OOM, a kill) has used an attempt too. Counted at the end, such a job never reached maxAttempts.
-            started = await attemptsOf(work, job.id);
-            if (started.attempts >= maxAttempts) {
-              // Its last attempt started and never reported: its OUTCOME IS UNKNOWN, not failed — a worker
-              // judged gone because it was cut off from the store (a partition) can still be in the handler
-              // and finish it after this (measured, ADR-0008: 5 partitions in a row,
-              // the job dead-lettered while the handler then finished). No attempt starts again (the
-              // ceiling holds); the job reads `in-doubt` until a report settles it — that worker's own
-              // late `qdone` (below), or an operator's `retryJob`.
-              if (await stillOwns()) {
-                await putJobMarker(work, job.id, 'qfail', { error: `the job's last attempt did not report in ${started.attempts} attempts (its process stopped or was cut off while it ran) — its outcome is unknown`, attempts: started.attempts, inDoubt: true });
-                // Written first, read second (recordLateSuccess does the reverse): a handler that finished
-                // late is seen by one side or the other.
-                await settleFromLateReport(work, job.id);
-              }
-              return true;
-            }
-            if (!(await stillOwns())) return false;
-            if (await settleFromLateReport(work, job.id, true)) return true;
-            if (!(await putJobMarker(work, job.id, 'qtry', { attempts: started.attempts + 1, notBefore: started.notBefore }))) return true;
-            const handler = handlers[job.payload.type];
-            if (!handler) {
-              if (await stillOwns()) await putJobMarker(work, job.id, 'qfail', { error: `no handler: ${job.payload.type}` });
-              return true;
-            }
-            const rec = job.payload;
-            const orgId = rec.orgId;
-            const scoped = orgId !== undefined ? withOrgStorage(storage, orgId) : storage;
-            const caller = callerOfJob(rec);
-            // ADR-0002 5a: the job's run belongs to the job's recorded owner WITHOUT the handler passing
-            // it. Recorded here, before the handler runs (first write wins, so a retry or a resumed run
-            // keeps the owner it was born with). A handler that starts `runId` as anyone else — the old
-            // `runDurable({ runId: ctx.runId, … })` with the user forgotten — is now refused by the
-            // engine's own admission instead of producing a run nobody but staff can see.
-            // The queue composed `job:<id>`, so the queue begins it (run-id-grammar.ts `begin: 'composer'`);
-            // a run a retry continues was born already, and the mark changes nothing for it.
-            await claimRunOwner(toJournal(scoped.runs), runId, caller, composerMark(runId));
-            const followUp = (o: EnqueueOptions = {}): EnqueueOptions => {
-              if (o.caller !== undefined) return o;
-              const base = ownerOptionsOf(rec);
-              if (o.resourceId !== undefined) delete base.caller;
-              else if (base.caller && o.orgId !== undefined) base.caller = staff(o.orgId);
-              return { ...base, ...o };
-            };
-            await handler(rec.payload, {
-              journal: scoped.runs, jobId: job.id, runId, storage: scoped, caller,
-              ...(orgId !== undefined ? { orgId } : {}),
-              run: (args) => runDurable({
-                ...args,
-                abortSignal: args.abortSignal ? AbortSignal.any([args.abortSignal, cancel.signal]) : cancel.signal,
-                journal: toJournal(scoped.runs), runId, caller,
-              }),
-              enqueue: (type, payload, o) => enqueue(work, type, payload, followUp(o)),
-              signal: cancel.signal,
-            });
-            // The handler returned: it ran. Whether this worker still holds the job decides only where that
-            // goes — a worker cut off from the store cannot even ask (its session was terminated), and that
-            // is not the handler failing.
-            const owns = await stillOwns().catch(() => false);
-            if (owns) { if (!(await settleFromLateReport(work, job.id, true))) await putJobMarker(work, job.id, 'qdone', { at: Date.now(), ok: true }); }
-            else await recordLateSuccess(work, job.id);
-          } catch (err) {
-            // NOT AN ATTEMPT (@gnldev/durable `attemptEndOf`, the one answer the scheduler gives too): this
-            // process released the job — it drains, or cannot judge other processes right now — or the job's
-            // run is executing elsewhere. The attempt counted at its start is given back and nothing else is
-            // written; the lease goes below and the job stays due for another process (or this one, later).
-            // Not reported to onError: the job did not fail.
-            const end = attemptEndOf(err, runId);
-            if (end === 'released' || end === 'deferred') {
-              if (started && (await stillOwns().catch(() => false))) await putJobMarker(work, job.id, 'qtry', started).catch(() => undefined);
-              return false;
-            }
-            // ITS RUN WAS DELETED: refused at its birth, or stopped while it ran. No attempt can run it
-            // again, so none is left to spend — the job ends here, failed with that error, reported once.
-            if (end === 'erased') {
-              if (await stillOwns().catch(() => false)) {
-                const n = (await attemptsOf(work, job.id)).attempts;
-                await putJobMarker(work, job.id, 'qfail', { error: String((err as any)?.message ?? err), attempts: n, erased: true });
-              }
-              opts.onError?.(err, job.id);
-              return true;
-            }
-            // Ended while it ran — cancelled (cancelJob: "else `cancelled`"), or settled by a late report:
-            // not a failed attempt. A handler that stopped on ctx.signal used to dead-letter the job as
-            // `failed` on its last attempt (audit C9).
-            if (await isTerminal(work, job.id).catch(() => false)) return true;
-            if (await stillOwns() && !(await settleFromLateReport(work, job.id, true))) {
-              const n = (await attemptsOf(work, job.id)).attempts; // this attempt was counted when it started
-              const delay = n < maxAttempts ? retryDelay(n, err) : 0;
-              await putJobMarker(work, job.id, 'qtry', { attempts: n, notBefore: delay > 0 ? (await now()) + delay : 0 });
-              if (n >= maxAttempts) {
-                await putJobMarker(work, job.id, 'qfail', { error: String((err as any)?.message ?? err), attempts: n });
-              }
-            }
-            opts.onError?.(err, job.id);
-            // swallowed: the worker loop continues; the job (unless qfail) retries on the next turn → crash-resume.
-          } finally {
-            if (heartbeat) clearInterval(heartbeat);
-            await slot.release();
-            // While lockLost=true (a real takeover), release() is naturally a no-op because this
-            // worker's token no longer matches the current record (see run-lock.ts mkLock.release) —
-            // it never overwrites the lock of the worker that took over. On a transient renew error
-            // (lockLost stays false) the token is STILL OURS, so release() here deliberately, genuinely
-            // frees the lock (the job was already written as terminal).
-            await lock.release();
+        // ITS RUN WAS DELETED: refused at its birth, or stopped while it ran. No attempt can run it
+        // again, so none is left to spend — the job ends here, failed with that error, reported once.
+        if (end === 'erased') {
+          if (await stillOwns().catch(() => false)) {
+            const n = (await attemptsOf(work, job.id)).attempts;
+            await putJobMarker(work, job.id, 'qfail', { error: String((err as any)?.message ?? err), attempts: n, erased: true });
           }
-          return true; // one job was processed (success or retry)
-        }, {
-          journal: toJournal((job.payload.orgId !== undefined ? withOrgStorage(storage, job.payload.orgId) : storage).runs),
-          name: runId, what: `job '${job.payload.type}' is running`,
-        });
+          opts.onError?.(err, job.id);
+          return true;
+        }
+        // Ended while it ran — cancelled (cancelJob: "else `cancelled`"), or settled by a late report:
+        // not a failed attempt. A handler that stopped on ctx.signal used to dead-letter the job as
+        // `failed` on its last attempt (audit C9).
+        if (await isTerminal(work, job.id).catch(() => false)) return true;
+        if (await stillOwns() && !(await settleFromLateReport(work, job.id, true))) {
+          const n = (await attemptsOf(work, job.id)).attempts; // this attempt was counted when it started
+          const delay = n < maxAttempts ? retryDelay(n, err) : 0;
+          await putJobMarker(work, job.id, 'qtry', { attempts: n, notBefore: delay > 0 ? (await now()) + delay : 0 });
+          if (n >= maxAttempts) {
+            await putJobMarker(work, job.id, 'qfail', { error: String((err as any)?.message ?? err), attempts: n });
+          }
+        }
+        opts.onError?.(err, job.id);
+        // swallowed: the worker loop continues; the job (unless qfail) retries on the next turn → crash-resume.
+      } finally {
+        if (heartbeat) clearInterval(heartbeat);
+        await grant.dispose();
+        await slot.release();
+        // While the lease is lost (a real takeover), release() is naturally a no-op because this
+        // worker's token no longer matches the current record (see run-lock.ts mkLock.release) —
+        // it never overwrites the lock of the worker that took over. On a transient renew error
+        // (the lease is not lost) the token is STILL OURS, so release() here deliberately, genuinely
+        // frees the lock (the job was already written as terminal).
+        await lock.release();
+        // After the release: a turn handed out while this worker still held the lease would be spent on a refusal.
+        await settleReady(job, taken);
       }
-      if (allTerminal) {
-        if (!page.nextCursor) return false; // end of log, all terminal — nothing to process
-        // ALL jobs on this page are terminal → advance the cursor permanently (never re-scan it), move to the next page.
-        cursor = page.nextCursor;
-        await work.put(QCURSOR, cursor);
-        continue;
-      }
-      if (!page.nextCursor) return false; // remaining job(s) exist but are all locked (another worker) — retried on the next poll
-      // Page is only partially terminal (has a pending/locked job) → the cursor is NOT advanced permanently (retry preserved), check the next page.
-      cursor = page.nextCursor;
-    }
+      return true; // one job was processed (success or retry)
+    }, {
+      journal: toJournal((job.payload.orgId !== undefined ? withOrgStorage(storage, job.payload.orgId) : storage).runs),
+      name: runId, what: `job '${job.payload.type}' is running`,
+    });
   }
 
   async function drain(): Promise<number> {
+    await followLegacyLog(true);
     let n = 0;
-    // upper bound of TOTAL job count to prevent infinite retries (each turn either advances or approaches dead-letter).
-    // listAll (5.1): counted correctly even if the job count exceeds the store's default page size (e.g. 50).
-    const total = (await listAll(work, 'qjob')).length;
-    const cap = total * (maxAttempts + 1) + 1;
-    for (let i = 0; i < cap; i++) {
-      if (await runOnce()) n++;
-      else break;
-    }
+    // Until a take finds nothing ready: every job ends within `maxAttempts` attempts, and one waiting for
+    // its retry delay is not ready. A cap counted the queue's jobs first — every lane, read in full.
+    while (await runOnce()) n++;
     return n;
   }
 
@@ -1129,6 +1487,8 @@ export function createWorker(
       // Every job this worker holds except the one the caller runs inside: a job closing its own worker
       // would otherwise wait for itself, and neither would ever settle (R2-7).
       await settledExceptOwn(() => held);
+      // A reclaim a poll started runs on its own (see `runOnceHeld`): done before the store may be closed.
+      await reclaiming;
       announcedAt = -Infinity;
       await setPresence(work, owner, undefined).catch(() => {});
     },
@@ -1149,6 +1509,8 @@ export interface QueueOptions extends QueueWorkerOptions {
 export interface Queue {
   /** `enqueue(storage.work, type, payload, options)`. */
   enqueue(type: string, payload: unknown, options?: EnqueueOptions): Promise<string>;
+  /** `enqueueMany(storage.work, jobs)`. */
+  enqueueMany(jobs: readonly EnqueueManyJob[]): Promise<string[]>;
   /** The worker running here; absent with `worker: false`. */
   readonly worker?: Worker;
   /** Stops the worker running here (the job it holds finishes; nothing new is taken). */
@@ -1171,12 +1533,196 @@ export function createQueue(storageArg: Storage, handlers: Record<string, JobHan
   worker?.start();
   return {
     enqueue: (type, payload, options) => enqueue(work, type, payload, options),
+    enqueueMany: (jobs) => enqueueMany(work, jobs),
     ...(worker ? { worker } : {}),
     close: async () => { await worker?.close(); },
   };
 }
 
 // ─── Upgrades and erasure ──────────────────────────────────────────────────────────────────────
+
+/** What a step moved, or under `dryRun` would move. */
+interface LanesMoved {
+  /** Records of the earlier version's log appended to their lanes (found there already: not counted). */
+  jobs: number;
+  /** Of those, the jobs not finished: each given a ready entry. */
+  ready: number;
+}
+
+/**
+ * THE MOVE of the old log: every record of it this version has not moved yet (from `qmovecursor`), each
+ * into its lane (`moveOne`); a record already in its lane is passed by. What `queue/lanes`, its cleanup's
+ * last look, and a worker in a deploy window run. Concurrent calls (two workers) move a record twice at
+ * worst, which finds it in place. `seen` (a worker's, across its calls): ids it found moved after the
+ * cursor, not read again while the cursor stands. Leaves the old log as it is.
+ *
+ * BOUNDED, because an earlier producer may append faster than this moves (measured: MongoDB under three
+ * 0.16 producers — `queue/lanes` chased the log and never ended). `until`: stop after the first page
+ * that reaches a record appended after it (its `ts`) — what comes later is a deploy window's, which this
+ * version's workers move. `pages`: stop after that many pages (a worker's share per call). Neither bound
+ * decides correctness: a record not moved now is after the cursor, and the next call moves it.
+ */
+async function moveLegacyLog(
+  work: WorkStore,
+  dryRun: boolean,
+  seen?: { at: string | undefined; ids: Set<string> },
+  bound: { until?: number; pages?: number } = {},
+): Promise<LanesMoved> {
+  const report: LanesMoved = { jobs: 0, ready: 0 };
+  let cursor = await work.get<string>(MOVE_CURSOR);
+  if (seen && seen.at !== cursor) { seen.ids.clear(); seen.at = cursor; }
+  for (let pages = 1; ; pages++) {
+    const page = await work.list<JobRecord>(LEGACY_LOG, { limit: MOVE_PAGE, ...(cursor !== undefined ? { cursor } : {}) });
+    for (const j of page.items) {
+      if (seen?.ids.has(j.id)) continue;
+      if ((await work.read(laneOfJob(j.id), j.id)) === undefined) {
+        report.jobs++;
+        if ((dryRun ? ((await isTerminal(work, j.id)) ? 'finished' : 'ready') : await moveOne(work, j)) === 'ready') report.ready++;
+      }
+      if (!dryRun) seen?.ids.add(j.id);
+    }
+    if (!page.nextCursor) return report;
+    cursor = page.nextCursor;
+    if (!dryRun) {
+      // Every record before it is in its lane now.
+      await work.put(MOVE_CURSOR, cursor);
+      if (seen) { seen.ids.clear(); seen.at = cursor; }
+    }
+    if ((bound.until !== undefined && (page.items.at(-1)?.ts ?? 0) > bound.until) || (bound.pages !== undefined && pages >= bound.pages)) return report;
+  }
+}
+
+/** `queue/lanes`: the old log moved, and that recorded — from then the store is at v2 and this version's worker starts. */
+async function moveLanes(work: WorkStore, dryRun: boolean, host?: Storage): Promise<LanesMoved> {
+  if ((await queueDataVersion(work)) >= QUEUE_DATA_VERSION) {
+    if (!dryRun && host) await clearUpgradeDue(host, LANES_STEP);
+    return { jobs: 0, ready: 0 };
+  }
+  // Up to what was there when it started: what an earlier producer adds after, the workers move (v2).
+  const report = await moveLegacyLog(work, dryRun, undefined, { until: Date.now() });
+  // Last: recorded only once every record found is in its lane.
+  if (!dryRun && ((await work.get<{ version: number }>(DATA_VERSION_KEY))?.version ?? 1) < LANES_DATA_VERSION) {
+    await work.put(DATA_VERSION_KEY, { version: LANES_DATA_VERSION });
+  }
+  if (!dryRun && host) await clearUpgradeDue(host, LANES_STEP);
+  return report;
+}
+
+/**
+ * What `queue/lanes-cleanup` says while workers of an earlier version poll the store (`olderWorkersLive`):
+ * how many, when each was last seen and when its entry expires unless renewed, and what to do. 0.16's
+ * entry records its last announcement only, not when the worker started.
+ */
+function olderWorkersRefusal(older: Array<[string, Presence]>, now: number): string {
+  const n = older.length;
+  const seen = older.map(([owner, p]) => `'${owner}' last seen ${new Date(p.at).toISOString()} (${Math.max(0, Math.round((now - p.at) / 1000))} s ago), gone from the record by ${new Date(p.at + p.ttlMs).toISOString()} unless it announces again`).join('; ');
+  return (
+    `@gnldev/queue: queue/lanes-cleanup refused: ${n} worker${n === 1 ? '' : 's'} of an earlier version (0.16 or before) ` +
+    `still poll${n === 1 ? 's' : ''} this store — ${seen}. The cleanup deletes the old log and the cursor ${n === 1 ? 'it reads' : 'they read'}: ` +
+    'a worker of 0.16 still running would read that log from its head again, and a producer of 0.16 would write jobs no worker of this version looks for. ' +
+    'Stop them (finish the deploy), then run it again: `gnl upgrade --only queue/lanes-cleanup`. ' +
+    "An entry that is never renewed (a killed process) goes by itself when its time above passes. " +
+    'This sees workers only: a 0.16 process that enqueues without running a worker leaves no entry — make sure none is left.'
+  );
+}
+
+/**
+ * `queue/lanes-cleanup`: one last move, then the old log, 0.16's cursor and this version's move cursor go,
+ * and v3 is recorded. Only once every process of the earlier version is gone: a worker of it still running
+ * would read the log from its head again (its cursor gone), and a producer of it would write a job after the
+ * last move — which this version's workers, at v3, no longer look for. A live worker of it (its presence) is
+ * refused here — the dry run reports it (`olderWorkers`, `refusal`); a producer without a worker cannot be seen.
+ */
+async function cleanUpLanes(work: WorkStore, dryRun: boolean, host?: Storage): Promise<LanesMoved & { removed: number; olderWorkers?: number; refusal?: string }> {
+  if ((await queueDataVersion(work)) >= QUEUE_DATA_VERSION) {
+    if (!dryRun && host) await clearUpgradeDue(host, CLEANUP_STEP);
+    return { jobs: 0, ready: 0, removed: 0 };
+  }
+  if (!dryRun && typeof work.deletePrefix !== 'function') {
+    throw new Error('@gnldev/queue: queue/lanes-cleanup needs a work store that can delete by prefix (`deletePrefix`) to retire the old log');
+  }
+  const older = await olderWorkersLive(work);
+  const refused = older.length > 0 ? { olderWorkers: older.length, refusal: olderWorkersRefusal(older, Date.now()) } : undefined;
+  if (refused && !dryRun) throw new Error(refused.refusal);
+  const report = await moveLegacyLog(work, dryRun);
+  let removed = 0;
+  if (dryRun) {
+    let cursor: string | undefined;
+    do {
+      const page = await work.list(LEGACY_LOG, cursor !== undefined ? { cursor } : undefined);
+      removed += page.items.length;
+      cursor = page.nextCursor;
+    } while (cursor);
+    for (const k of [LEGACY_CURSOR, MOVE_CURSOR]) if ((await work.get(k)) !== undefined) removed++;
+  } else {
+    for (const k of [LEGACY_LOG, LEGACY_CURSOR, MOVE_CURSOR]) removed += await work.deletePrefix!(k);
+    // Last: recorded only once the old log and both cursors are gone.
+    await work.put(DATA_VERSION_KEY, { version: QUEUE_DATA_VERSION });
+    if (host) await clearUpgradeDue(host, CLEANUP_STEP);
+  }
+  return { ...report, removed, ...refused };
+}
+
+/**
+ * Moves ONE job of the earlier version's log (`qjob`, a record as `work.list('qjob')` returns it) into this
+ * version's lanes — THE move, which `queue/lanes` makes for every record and a worker meeting a job an
+ * earlier producer appended during a deploy makes for that one. Appended to its organization's lane under
+ * its own id; a job not finished (`qdone` / `qfail` / `qcancel`) also gets its ready entry, ranked as a new
+ * job is. Idempotent: moved again, the record and its entry are found in place (`WorkStore.appendReady`)
+ * and the job still runs once. It leaves the old record where it is.
+ * Answers `'ready'` (it has a turn) or `'finished'` (moved without one).
+ */
+export async function moveLegacyJob(workArg: WorkStore, job: LogRecord<JobRecord>): Promise<'ready' | 'finished'> {
+  return moveOne(portOf(workArg, 'work', 'moveLegacyJob'), job);
+}
+async function moveOne(work: WorkStore, j: LogRecord<JobRecord>): Promise<'ready' | 'finished'> {
+  if (await isTerminal(work, j.id)) {
+    await work.append(laneOfJob(j.id), j.payload, j.id);
+    return 'finished';
+  }
+  await work.appendReady(laneOfJob(j.id), j.payload, j.id, { set: READY, kind: j.payload.type, notBefore: 0, now: Date.now() });
+  return 'ready';
+}
+
+
+/**
+ * The queue's upgrade steps, for the store they are registered on: `registerUpgradeSteps(storage, [queueUpgrade])`.
+ * Two, by when they may run (the data versions, `queueDataVersion`):
+ *   · `queue/lanes` — pending at v1: moves the old log's jobs into lanes and records v2. It leaves the log
+ *     and 0.16's cursor alone, so it runs while workers and producers of the earlier version still do
+ *     (a plain `gnl upgrade`); what they add after it, this version's workers move.
+ *   · `queue/lanes-cleanup` — pending below v3, `afterOlderGone`: deletes the old log and both cursors and
+ *     records v3, after which no worker of this version looks at the old log again.
+ * Each answers the data version before it ("data v1 → package v3"); nothing is decided here.
+ */
+export const queueUpgrade: UpgradeStepFactory = (storageArg) => {
+  const work = (): WorkStore => portOf(storageArg, 'work', 'queueUpgrade');
+  const answer = async (f: (w: WorkStore) => Promise<LanesMoved>): Promise<Record<string, unknown>> => {
+    const dataVersion = await queueDataVersion(work());
+    return { dataVersion, packageVersion: QUEUE_DATA_VERSION, ...(await f(work())) };
+  };
+  const host = (): Storage | undefined => dueHostOf(storageArg, work());
+  const steps: UpgradeStep[] = [
+    {
+      name: LANES_STEP,
+      description: "moves the jobs 0.16 and earlier enqueued (the one 'qjob' log) into their organizations' lanes and the ready set; leaves the old log",
+      requires: ['schema'],
+      pending: async () => (await queueDataVersion(work())) < LANES_DATA_VERSION,
+      plan: () => answer((w) => moveLanes(w, true)),
+      run: () => answer((w) => moveLanes(w, false, host())),
+    },
+    {
+      name: CLEANUP_STEP,
+      description: "deletes the old 'qjob' log and its cursors, after a last move",
+      requires: [LANES_STEP],
+      afterOlderGone: true,
+      pending: async () => (await queueDataVersion(work())) < QUEUE_DATA_VERSION,
+      plan: () => answer((w) => cleanUpLanes(w, true)),
+      run: () => answer((w) => cleanUpLanes(w, false, host())),
+    },
+  ];
+  return steps;
+};
 
 /**
  * Give an existing SYSTEM job (an id written before jobs had owners) to an owner, without doubling it.
@@ -1256,6 +1802,8 @@ export function jobEraser(storageArg: Storage): SubjectEraser {
     // reads it after every write of a job's state, so a write lands either before this erasure reaches
     // it or before that worker's read sees the fence gone, and the worker takes it back.
     for (const m of ['qown', 'qtry', ...STATE_MARKERS.filter((x) => x !== 'qtry')]) n += await work.deletePrefix(`${m}:${prefix}`);
+    // An organization's lane, with its ready entries and its ranking lock (a person's prefix names no lane).
+    n += await work.deletePrefix(`${SYSTEM_LANE}:${prefix}`);
     // The lease lock lives in the ROOT journal (`job:<id>:lease:lock`); the run in the job's organization.
     n += await root.deletePrefix(`job:${prefix}`);
     if (owner.orgId !== undefined) n += await scoped.deletePrefix(`job:${prefix}`);

@@ -220,7 +220,10 @@ describe.each(STORES)('a storage error between the claim and the body — %s', (
     expect(f.injected()).toBe(1);
     expect(executions()).toBe(1);
     expect(await statusOf(storage.runs, toolKey)).toBe('running');
-    await expect(call(storage.runs)).rejects.toBeInstanceOf(RunBusyError);
+    // k3: the attempt is over in this process, so its claim is not live here either: the call meets the
+    // crash ladder — in doubt, never re-run without recover() or a person (it answered busy for the life of
+    // the process before; after a restart it answered this, as it does now).
+    await expect(call(storage.runs)).rejects.toBeInstanceOf(SideEffectRetryBlockedError);
     expect(executions()).toBe(1);
   });
 }, 60_000);

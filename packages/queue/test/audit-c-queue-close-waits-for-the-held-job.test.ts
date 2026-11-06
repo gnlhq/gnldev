@@ -9,7 +9,8 @@ import { join } from 'node:path';
 import type { Storage } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
 import { createDatabaseSync, dropDatabaseSync } from '../../../test/support/pg-admin.js';
-import { createQueue, createWorker, listJobs } from '../src/index.js';
+import { createQueue, createWorker } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const dirs: string[] = [];
 afterAll(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });

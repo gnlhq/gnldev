@@ -22,7 +22,7 @@
 //     also returns a row on conflict (known fidelity limitation — same note as in storage-backend.test.ts) →
 //     the putIfAbsent boolean is NOT RELIABLE. So for pg-mem we verify the DATA invariant (value preserved /
 //     single row) rather than the boolean; against real PG the boolean is correct (proven with SQL Sqlite above).
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -35,6 +35,13 @@ import { acquireRunLock } from '../src/run-lock.js';
 import { RunBusyError } from '../src/errors.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 import { newDb } from 'pg-mem';
+
+// k3: acquireRunLock dates and judges a lock on the store's clock only; a test moves that clock.
+async function atClock<T>(t: number, f: () => Promise<T>): Promise<T> {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(t);
+  try { return await f(); } finally { vi.useRealTimers(); }
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -253,13 +260,13 @@ describe('§3.1(d) lock expiry / stale takeover', () => {
   it('if the owner dies (no release), the second instance takes over after TTL', async () => {
     const j = new InMemoryJournal();
     const t0 = 1000;
-    const lA = await acquireRunLock(j, 'r', 'A', 100, t0); // short TTL
+    const lA = await atClock(t0, () => acquireRunLock(j, 'r', 'A', 100)); // short TTL
     expect(lA).not.toBeNull();
     // A "dies": release() is NEVER called. The lock record in the journal stays 'alive' (owner=A).
     // Before the TTL elapses, the second acquisition is rejected:
-    expect(await acquireRunLock(j, 'r', 'B', 5000, t0 + 50)).toBeNull(); // still alive
+    expect(await atClock(t0 + 50, () => acquireRunLock(j, 'r', 'B', 5000))).toBeNull(); // still alive
     // Once the TTL passes, it can be taken over (current mechanism: expires<now → best-effort takeover):
-    const lB = await acquireRunLock(j, 'r', 'B', 5000, t0 + 200);
+    const lB = await atClock(t0 + 200, () => acquireRunLock(j, 'r', 'B', 5000));
     expect(lB).not.toBeNull();
     expect(lB!.owner).toBe('B');
   });
@@ -271,12 +278,12 @@ describe('§3.1(d) lock expiry / stale takeover', () => {
     // you overwrite it — exactly ONE winner.
     const j = new InMemoryJournal(); // supports putIfMatch
     const t0 = 1000;
-    await acquireRunLock(j, 'r', 'A', 100, t0); // A gets a short TTL, no release (death)
+    await atClock(t0, () => acquireRunLock(j, 'r', 'A', 100)); // A gets a short TTL, no release (death)
     const past = t0 + 200; // A's TTL has passed
-    const [lB, lC] = await Promise.all([
-      acquireRunLock(j, 'r', 'B', 5000, past),
-      acquireRunLock(j, 'r', 'C', 5000, past),
-    ]);
+    const [lB, lC] = await atClock(past, () => Promise.all([
+      acquireRunLock(j, 'r', 'B', 5000),
+      acquireRunLock(j, 'r', 'C', 5000),
+    ]));
     const held = [lB, lC].filter((x) => x !== null).length;
     expect(held).toBe(1); // split-brain closed; the loser gets null and DOES NOT RUN
     // The winner's handle is valid: the token in the record belongs to the winner (fencing integrity).
@@ -295,12 +302,14 @@ describe('§3.1(d) lock expiry / stale takeover', () => {
     const b = new SqliteStorage(p); // SAME file, SEPARATE connection
     try {
       const t0 = 1000;
-      await acquireRunLock(a.runs, 'to-run', 'A', 100, t0); // A gets a short TTL, no release (death)
+      // A died holding a short-TTL lock: its record, written by a process that is gone (k3: a handle never
+      // released in THIS process is an acquisition still held here, not a death — liveness is bound now).
+      await a.runs.put('to-run:lock', { owner: 'A', expires: t0 + 100, token: 'dead-A' });
       const past = t0 + 200; // A's TTL passed → two workers attempt a concurrent takeover
-      const [lB, lC] = await Promise.all([
-        acquireRunLock(a.runs, 'to-run', 'B', 5000, past),
-        acquireRunLock(b.runs, 'to-run', 'C', 5000, past),
-      ]);
+      const [lB, lC] = await atClock(past, () => Promise.all([
+        acquireRunLock(a.runs, 'to-run', 'B', 5000),
+        acquireRunLock(b.runs, 'to-run', 'C', 5000),
+      ]));
       const held = [lB, lC].filter((x) => x !== null).length;
       expect(held).toBe(1); // now with putIfMatch: NO split-brain (used to be able to be 2)
       const winner = [lB, lC].find((x) => x !== null)!;

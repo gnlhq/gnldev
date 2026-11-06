@@ -19,7 +19,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { stepCountIs } from 'ai';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { acquireRunLock } from '../src/run-lock.js';
-import { unbindLiveness } from '../src/process-liveness.js';
+import { runRecordKey } from '../src/run-id-grammar.js';
 import { purgeResource } from '../src/retention.js';
 import { toJournal } from '../src/index.js';
 import { runDurable } from '../src/run.js';
@@ -129,14 +129,15 @@ describe.skipIf(!RUN)('REAL Postgres — multi-pool CAS + run-lock + exactly-onc
     // affected-row count of 1 in only ONE of the two concurrent pools. The expired record is written
     // with ttlMs<0 as "already expired in the past"; the takeover calls run WITHOUT a `now` parameter
     // → the H2 journal.now() (PG clock) path is exercised on a real server too.
-    // The holders here are processes with no liveness on the store: a lock is judged by its expiry. (An
-    // earlier direct run in this file bound the store's own liveness, which names THIS live process on
-    // every lock it writes — and a live process's lock is never taken over, expired or not.)
-    unbindLiveness(a.runs); unbindLiveness(b.runs);
+    // The expired holder is a process with no liveness on the store: its lock names no process and is
+    // judged by its expiry alone. It is WRITTEN as that record, not acquired: `acquireRunLock` binds the
+    // store's liveness itself (run-lock.ts, k3), so a lock acquired from THIS process names this live
+    // process — and a live process's lock is never taken over, expired or not (unbinding first no
+    // longer helps: the next acquisition binds again). What is raced is unchanged: two pools CAS one
+    // expired record.
     for (let round = 0; round < 10; round++) {
       const runId = `${SEED}:takeover:${round}`;
-      const dead = await acquireRunLock(a.runs, runId, 'old', -1000); // expires = now-1000 → immediately expired
-      expect(dead).not.toBeNull(); // the fresh claim succeeded (the record exists but is already expired)
+      await a.runs.put(runRecordKey(runId, 'lock'), { owner: 'old', expires: Date.now() - 60_000, token: `dead-${round}` });
       const [lB, lC] = await Promise.all([
         acquireRunLock(a.runs, runId, 'B', 60_000),
         acquireRunLock(b.runs, runId, 'C', 60_000),

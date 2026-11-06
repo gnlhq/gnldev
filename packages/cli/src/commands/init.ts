@@ -185,6 +185,8 @@ export const initCommand: Command = {
       console.error(`gnl init: target directory is not empty: ${targetDir}`);
       console.error('  An existing project is recognised by its package.json; a directory with neither');
       console.error('  a manifest nor room to scaffold is one this command will not guess about.');
+      console.error('  Way out:  gnl init <new-dir>        scaffold into an empty (or new) directory');
+      console.error('            npm init -y && gnl init     make this directory a project first, then gnl init adds only new files');
       process.exit(1);
     }
 

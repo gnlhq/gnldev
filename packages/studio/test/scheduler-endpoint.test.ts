@@ -22,7 +22,7 @@ describe('GET /scheduler/triggers', () => {
     expect(list.map((t: any) => t.id)).toEqual(['daily', 'poll']); // alphabetical
 
     const daily = list.find((t: any) => t.id === 'daily');
-    expect(daily).toMatchObject({ name: 'wf-report', kind: 'cron', value: '0 9 * * *', maxAttempts: 3, misfire: 'skip', status: 'pending' });
+    expect(daily).toMatchObject({ name: 'wf-report', kind: 'cron', value: '0 9 * * *', maxAttempts: 3, misfire: 'latest', status: 'pending' });
 
     const poll = list.find((t: any) => t.id === 'poll');
     expect(poll).toMatchObject({ name: 'wf-sync', kind: 'every', value: 60_000, misfire: 'catchup', nextRunAt: 60_000, status: 'pending' });

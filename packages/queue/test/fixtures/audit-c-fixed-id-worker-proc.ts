@@ -2,12 +2,14 @@
 import { appendFileSync, existsSync } from 'node:fs';
 import { sqliteLiveness } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
-import { createWorker, listJobs } from '../../src/index.js';
+import { createWorker } from '../../src/index.js';
+import { listAllJobs as listJobs } from './k5-list-all.js';
 
 const [db, effects, go, name, ttl, runner, id] = process.argv.slice(2) as [string, string, string, string, string, string, string];
 setInterval(() => { try { process.kill(Number(runner), 0); } catch { process.exit(1); } }, 500).unref();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const storage = new SqliteStorage(db);
+// The configured liveness id belongs to the store's liveness: it is given to the storage.
+const storage = new SqliteStorage(db, { liveness: sqliteLiveness(db, id) });
 await storage.init();
 const worker = createWorker(storage as never, {
   t: async () => {
@@ -15,7 +17,7 @@ const worker = createWorker(storage as never, {
     while (!existsSync(go)) await sleep(10);
     appendFileSync(effects, `effect ${name}\n`);
   },
-}, { owner: name, ttlMs: Number(ttl), pollMs: 20, backoff: false, liveness: sqliteLiveness(db, id) });
+}, { owner: name, ttlMs: Number(ttl), pollMs: 20, backoff: false });
 const allDone = async () => (await listJobs(storage.work!)).every((j) => j.status !== 'pending');
 worker.start();
 const deadline = Date.now() + 8_000;

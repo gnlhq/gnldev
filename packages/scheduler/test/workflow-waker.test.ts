@@ -30,35 +30,27 @@ describe('@gnldev/scheduler — createWorkflowWaker', () => {
 
     // Not due yet — resume must NOT be called.
     const before = await waker.tick();
-    expect(before).toEqual({ resumed: 0, skipped: 1, errored: 0 });
+    expect(before).toEqual({ resumed: 0, skipped: 1, busy: 0, errored: 0 });
     expect(resumeCalls).toEqual([]);
 
     await new Promise((r) => setTimeout(r, 200)); // real clock — past untilMs now
 
     const after = await waker.tick();
-    expect(after).toEqual({ resumed: 1, skipped: 0, errored: 0 });
+    expect(after).toEqual({ resumed: 1, skipped: 0, busy: 0, errored: 0 });
     expect(resumeCalls).toEqual(['r1']);
 
     // The run completed — a later tick sees nothing suspended left to wake.
     const later = await waker.tick();
-    expect(later).toEqual({ resumed: 0, skipped: 0, errored: 0 });
+    expect(later).toEqual({ resumed: 0, skipped: 0, busy: 0, errored: 0 });
   });
 
   it('evented (waitFor): skipped by default, resumed only with wakeEvented: true', async () => {
     const journal = new InMemoryJournal();
     let ready = false;
     const wf = workflow<Record<string, never>>()
-      // A tiny real delay when not-ready guarantees consecutive suspend generations of the SAME run
-      // land on DIFFERENT milliseconds — otherwise, on a fast in-memory journal, a resume() that
-      // re-suspends can rewrite `updatedAt` to the SAME ms it started from, colliding with the wake
-      // ticket THAT SAME tick just claimed (an artifact of synchronous back-to-back ticks in a test;
-      // real deployments always have `intervalMs` of real time between ticks, so this never happens
-      // in production — see the WAKE_TICKET bound noted in workflow-waker.ts).
-      .then(waitFor('ev', async () => {
-        if (ready) return { ok: true };
-        await new Promise((r) => setTimeout(r, 2));
-        return null;
-      }))
+      // No delay when not ready: a resume() that re-suspends within the same millisecond is at a new
+      // suspend point all the same (`suspendSeq`, not the clock — k3). A 2 ms delay here used to hide that.
+      .then(waitFor('ev', async () => (ready ? { ok: true } : null)))
       .then(step('after', async (v) => v));
 
     await wf.runResumable({}, { runId: 'r2', journal });
@@ -74,7 +66,7 @@ describe('@gnldev/scheduler — createWorkflowWaker', () => {
       },
     });
     const r1 = await defaultWaker.tick();
-    expect(r1).toEqual({ resumed: 0, skipped: 1, errored: 0 });
+    expect(r1).toEqual({ resumed: 0, skipped: 1, busy: 0, errored: 0 });
     expect(resumeCalls).toBe(0); // no readiness signal → left alone by default
 
     const eventedWaker = createWorkflowWaker({
@@ -86,12 +78,12 @@ describe('@gnldev/scheduler — createWorkflowWaker', () => {
       },
     });
     const r2 = await eventedWaker.tick();
-    expect(r2).toEqual({ resumed: 1, skipped: 0, errored: 0 });
+    expect(r2).toEqual({ resumed: 1, skipped: 0, busy: 0, errored: 0 });
     expect(resumeCalls).toBe(1); // opt-in: resumed even without a readiness signal (still not ready → re-suspends)
 
     ready = true; // now the event is actually satisfied
     const r3 = await eventedWaker.tick();
-    expect(r3).toEqual({ resumed: 1, skipped: 0, errored: 0 });
+    expect(r3).toEqual({ resumed: 1, skipped: 0, busy: 0, errored: 0 });
     expect(resumeCalls).toBe(2);
     expect((await journal.get<WorkflowRunStatus>('wfrun:r2'))!.status).toBe('completed');
   });
@@ -187,7 +179,7 @@ describe('@gnldev/scheduler — createWorkflowWaker', () => {
     });
 
     const result = await waker.tick(); // must not throw
-    expect(result).toEqual({ resumed: 2, skipped: 0, errored: 1 });
+    expect(result).toEqual({ resumed: 2, skipped: 0, busy: 0, errored: 1 });
     expect(resumed).toEqual(['good']);
     expect(errors).toHaveLength(1);
     expect(errors[0]!.runId).toBe('bad');
@@ -200,17 +192,19 @@ describe('@gnldev/scheduler — createWorkflowWaker', () => {
     try {
       let seq = 0;
       let shouldFail = true;
-      // Each tick gets a FRESH updatedAt (simulating a real workflow's own suspend-status rewrite on
-      // every resume attempt) → a fresh wake ticket every time, so the SAME waker instance's
-      // per-run failStreak bookkeeping is what's under test here, not the ticket.
+      let calls = 0;
+      // Y5 (k3): a FAILED resume does not move the run — no workflow rewrites its suspend record when
+      // the attempt throws — so the record is NOT refreshed between failing ticks. Refreshing it here hid
+      // A1: a waker that never retries a failed wake passed this test.
       const putFresh = async () =>
         journal.put('wfrun:w', {
-          runId: 'w', status: 'suspended', reason: { kind: 'time', untilMs: 0 }, updatedAt: ++seq,
+          runId: 'w', status: 'suspended', reason: { kind: 'time', untilMs: 0 }, updatedAt: 1, suspendSeq: ++seq,
         } satisfies WorkflowRunStatus);
 
       const waker = createWorkflowWaker({
         journal,
         resume: async () => {
+          calls++;
           if (shouldFail) throw new Error('boom');
         },
       });
@@ -219,18 +213,19 @@ describe('@gnldev/scheduler — createWorkflowWaker', () => {
       await waker.tick(); // fail #1 — new streak → warns
       expect(warn).toHaveBeenCalledTimes(1);
 
-      await putFresh();
-      await waker.tick(); // fail #2 — same streak (no success in between) → no re-warn
+      await waker.tick(); // fail #2, SAME suspend point — retried, same streak → no re-warn
+      expect(calls).toBe(2);
       expect(warn).toHaveBeenCalledTimes(1);
 
       shouldFail = false;
-      await putFresh();
-      await waker.tick(); // succeeds → streak reset
+      await waker.tick(); // retried again, succeeds → streak reset
+      expect(calls).toBe(3);
       expect(warn).toHaveBeenCalledTimes(1);
 
       shouldFail = true;
-      await putFresh();
+      await putFresh(); // the run suspended again: a new wake
       await waker.tick(); // fails again → NEW streak → warns again
+      expect(calls).toBe(4);
       expect(warn).toHaveBeenCalledTimes(2);
     } finally {
       warn.mockRestore();

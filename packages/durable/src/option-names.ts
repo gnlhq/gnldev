@@ -41,7 +41,7 @@ export const RUN_NAMES = optionNames<RunOptions>()([
 const TIMEOUT_NAMES = optionNames<NonNullable<RunOptions['timeouts']>>()(['modelStepMs', 'toolMs', 'claimTtlMs']);
 const LOCK_NAMES = ['owner', 'ttlMs', 'maxHoldMs'] as const;
 export const WORKFLOW_RUN_NAMES = optionNames<WorkflowRunOpts>()([
-  'runId', 'workKey', 'workScope', 'maxSteps', 'resume', 'signal', 'resourceId', 'caller', 'parent', 'actor', 'threadId', 'context',
+  'runId', 'workKey', 'workScope', 'maxSteps', 'resume', 'signal', 'resourceId', 'caller', 'parent', 'actor', 'threadId', 'context', 'scheduledFor',
 ]);
 
 const LIMIT_NAMES = optionNames<RunLimits>()([
@@ -111,7 +111,7 @@ const PROMOTION_NAMES = optionNames<NonNullable<SuggestionsConfig['promotion']>>
  * takes these and reads none of them; @gnldev/cli holds its config type to this list, so a name gnl dev
  * adds and this list lacks fails its typecheck.
  */
-export const PROJECT_CONFIG_NAMES = ['port', 'studio', 'title', 'subjects', 'surfaces', 'auth', 'license', 'licensePublicKey', 'licenseStrict'] as const;
+export const PROJECT_CONFIG_NAMES = ['port', 'studio', 'title', 'subjects', 'surfaces', 'auth', 'license', 'licensePublicKey', 'licenseStrict', 'limits'] as const;
 const CONFIG_FILE_NAMES = [...CREATE_GNL_NAMES, ...PROJECT_CONFIG_NAMES] as const;
 
 /** A gnl config's own names — the engine's and the project file's — without the bags inside it. */
@@ -223,9 +223,10 @@ export const SEMANTIC_IDENTITY_NAMES = optionNames<NonNullable<import('./types.j
 export const CONFIRM_NAMES = optionNames<Extract<NonNullable<import('./types.js').ToolDurability['confirm']>, object>>()(['reason']);
 export const LOG_SWEEP_TARGET_NAMES = optionNames<import('./retention.js').LogSweepTarget>()(['ns', 'olderThanMs', 'markerFor', 'now']);
 export const PROCESSOR_RETRY_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./processor.js').ProcessorRetry>[2]>>()(['maxRetries']);
-export const POSTGRES_STORAGE_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./postgres-storage.js').PostgresStorage>[0]>>()(['connectionString', 'pool']);
-export const MYSQL_STORAGE_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./mysql-storage.js').MysqlStorage>[0]>>()(['connectionString', 'pool']);
-export const MONGO_STORAGE_NAMES = optionNames<ConstructorParameters<typeof import('./mongo-storage.js').MongoStorage>[0]>()(['connectionString', 'database']);
+export const POSTGRES_STORAGE_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./postgres-storage.js').PostgresStorage>[0]>>()(['connectionString', 'pool', 'liveness']);
+export const SQLITE_STORAGE_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./sqlite-storage.js').SqliteStorage>[1]>>()(['liveness']);
+export const MYSQL_STORAGE_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./mysql-storage.js').MysqlStorage>[0]>>()(['connectionString', 'pool', 'liveness']);
+export const MONGO_STORAGE_NAMES = optionNames<ConstructorParameters<typeof import('./mongo-storage.js').MongoStorage>[0]>()(['connectionString', 'database', 'liveness']);
 /** A sub-agent runs as its parent's caller; its config named an owner once, and that name is refused. */
 export const REMOVED_AGENT_TOOL_NAMES = {
   resourceId: "was removed: a sub-agent runs as its parent's caller, so its config cannot name a user. Pass the user to the parent's run.",

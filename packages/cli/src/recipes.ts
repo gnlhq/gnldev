@@ -119,6 +119,12 @@ export interface Recipe {
    * which is what `gnl init --features otel|cache|schedule|job` wrote into gnl.config.ts on 0.9.0.
    */
   wiring?: RecipeWiring;
+  /**
+   * The upgrade steps this recipe's package brings, for the store the config builds: `generateConfig`
+   * wraps the storage in `registerUpgradeSteps(storage, [factory])`, so `storage.upgrade()`, `gnl upgrade`
+   * and `gnl doctor` see the package's steps. Omit when the package has none.
+   */
+  upgrade?: { import: string; factory: string };
   /** The corrected instruction `gnl add` prints (decoupled: edit the config object, NOT defineConfig). */
   humanWire: string;
   /** Honesty note about maturity / required setup, if any. */
@@ -152,8 +158,8 @@ export interface Recipe {
  * Declared before RECIPES because `modelRecipe` reads it while the object literal is being built.
  */
 const AI_SDK_PROVIDER_RANGES: Record<string, string> = {
-  '@ai-sdk/openai': '^4.0.0',
-  '@ai-sdk/anthropic': '^4.0.0',
+  '@ai-sdk/openai': '^4.0.100',
+  '@ai-sdk/anthropic': '^4.0.86',
   '@ai-sdk/openai-compatible': '^3.0.0',
 };
 
@@ -368,6 +374,7 @@ export const auth: { admin?: Cred; viewer?: Cred } = {
     hint: 'cron / interval',
     file: 'src/schedules/index.ts',
     dep: '@gnldev/scheduler',
+    upgrade: { import: "import { schedulerUpgrade } from '@gnldev/scheduler';", factory: 'schedulerUpgrade' },
     script: { name: 'schedules', cmd: 'tsx src/schedules/index.ts' },
     contents: `// Triggers, and the loop that fires them. A SEPARATE PROCESS from your API: \`pnpm schedules\`.
 //
@@ -399,9 +406,13 @@ scheduler.start();
 console.log('→ scheduler polling every 30s');
 `,
     // No `wiring`: this file READS the config and runs beside the app (see Recipe.wiring).
-    humanWire: `Nothing to add to gnl.config.ts — this runs as its own process:
+    humanWire: `Nothing to add to the config object — this runs as its own process:
   pnpm schedules
-The workflow it fires must exist in your config (\`gnl add workflow\` writes one).`,
+The workflow it fires must exist in your config (\`gnl add workflow\` writes one).
+So that \`storage.upgrade()\` and \`gnl upgrade\` know this package's steps, register them where the store is built:
+  import { registerUpgradeSteps } from '@gnldev/durable';
+  import { schedulerUpgrade } from '@gnldev/scheduler';
+  storage: registerUpgradeSteps(new …Storage(…), [schedulerUpgrade]),`,
     note: 'A busy run is deferred, not failed: if the workflow is already running under that id the trigger waits for `retryMs` and keeps its attempt budget. Watch `deferrals` on listTriggers() — climbing deferrals with a flat fireCount means it is being refused, not waiting.',
   },
 
@@ -411,6 +422,7 @@ The workflow it fires must exist in your config (\`gnl add workflow\` writes one
     hint: 'durable queue + worker',
     file: 'src/jobs/index.ts',
     dep: '@gnldev/queue',
+    upgrade: { import: "import { queueUpgrade } from '@gnldev/queue';", factory: 'queueUpgrade' },
     script: { name: 'worker', cmd: 'tsx src/jobs/index.ts' },
     contents: `// A durable job queue and the worker that drains it. A SEPARATE PROCESS: \`pnpm worker\`.
 //
@@ -450,9 +462,13 @@ console.log('→ worker draining the queue');
 void enqueue;
 `,
     // No `wiring`: nothing goes into gnl.config.ts (see Recipe.wiring).
-    humanWire: `Nothing to add to gnl.config.ts — this runs as its own process:
+    humanWire: `Nothing to add to the config object — this runs as its own process:
   pnpm worker
-Produce jobs with \`enqueue(storage.work, 'summarize', payload, { id })\` from anywhere.`,
+Produce jobs with \`enqueue(storage.work, 'summarize', payload, { id })\` from anywhere.
+So that \`storage.upgrade()\` and \`gnl upgrade\` know this package's steps, register them where the store is built:
+  import { registerUpgradeSteps } from '@gnldev/durable';
+  import { queueUpgrade } from '@gnldev/queue';
+  storage: registerUpgradeSteps(new …Storage(…), [queueUpgrade]),`,
     note: 'A handler that throws is retried with backoff and dead-lettered after `maxAttempts` (default 5); Studio lists dead letters and can release them back. Give every enqueue a stable `id` — that is what makes producing idempotent.',
   },
 

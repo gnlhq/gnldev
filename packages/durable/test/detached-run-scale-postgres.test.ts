@@ -13,6 +13,30 @@ afterEach(async () => {
 const RUNS = 200;
 const stats = async (n: Node) => (await fetch(n.url('/stats'))).json();
 
+/**
+ * What a short run says for itself. It went red once in CI and three times in eight on a loaded machine
+ * (`completed` 150: one process's share, each run stopped at nine or ten of its fifteen events), and the
+ * counts alone could not tell a run that stopped from one that moved. So: how each stream ended, by the
+ * process that started the run and the one that followed it, whether a run that looked short ends when it
+ * is followed again, and what the processes said.
+ */
+async function whyShort(mode: string, nodes: Node[], results: any[][]) {
+  const ended = (evs: any[]) => evs.findLast((e) => e.kind === 'status')?.data?.state ?? 'no status';
+  const short = results.flatMap((evs, i) => (ended(evs) === 'completed' ? [] : [{ i, evs }]));
+  const streams: Record<string, number> = {};
+  for (const { i, evs } of short) {
+    const key = `started on ${i % 4}, followed on ${(i + 1) % 4}: ${ended(evs)}, ${evs.length} events, last ${evs.at(-1)?.kind ?? 'none'}`;
+    streams[key] = (streams[key] ?? 0) + 1;
+  }
+  const followedAgain = await Promise.all(short.slice(0, 5).map(async ({ i }) => {
+    const res = await fetch(nodes[(i + 2) % 4]!.url(`/events?runId=s5-${i}`), { signal: AbortSignal.timeout(20_000) }).catch((e) => String(e));
+    if (typeof res === 'string') return { i, error: res };
+    const evs = await readEvents(res).catch((e) => String(e));
+    return typeof evs === 'string' ? { i, error: evs } : { i, state: ended(evs), events: evs.length };
+  }));
+  return { mode, short: short.length, streams, followedAgain, stderr: nodes.map((n) => n.stderr().slice(-1500)) };
+}
+
 describe.skipIf(!PG_BASE)('S5 scale on postgres', () => {
   for (const mode of ['baseline-in-request', 'in-process', 'poll', 'notify'] as const) {
     it(`S5 ${mode}: 4 processes, ${RUNS} concurrent runs, one observer each`, { timeout: 300_000 }, async () => {
@@ -47,6 +71,7 @@ describe.skipIf(!PG_BASE)('S5 scale on postgres', () => {
         execWrites: sum('execWrites'), notifies: sum('notifies'), livenessStatements: sum('liveness'),
       };
       console.log(`[S5] ${JSON.stringify(line)}`);
+      if (completed !== RUNS) console.log(`[S5 short] ${JSON.stringify(await whyShort(mode, nodes, results))}`);
       expect(completed).toBe(RUNS);
     });
   }

@@ -61,7 +61,7 @@ const callerOption: Same<ScheduleSpec['caller'], Caller | undefined> = true;
 
 const scheduler = createScheduler(journal, {
   async runWorkflow(name, input, opts) {
-    const optsType: Same<typeof opts, { runId?: string; caller?: Caller } | undefined> = true;
+    const optsType: Same<typeof opts, { runId?: string; caller?: Caller; scheduledFor?: number; signal?: AbortSignal } | undefined> = true;
     const caller = opts?.caller;
     const userId = caller?.kind === 'user' ? caller.id : undefined;
     return { runId: opts?.runId ?? name, output: { input, optsType, userId } };

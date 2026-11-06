@@ -532,6 +532,9 @@ export const SCOPE_TABLES: ReadonlyArray<readonly [table: string, column: string
   ['gnl_message_batches', 'thread_id', 'memory', true, 'record'],
   ['gnl_work_log', 'ns', 'work', true, undefined],
   ['gnl_work_kv', 'key', 'work', true, undefined],
+  // A ready set and the namespaces of its entries move with the logs they index (`WorkStore.appendReady`).
+  ['gnl_work_ready', 'rset', 'work', false, undefined],
+  ['gnl_work_ready', 'ns', 'work', false, undefined],
   ['gnl_cache', 'key', 'cache', true, 'content-addressed'],
 ];
 

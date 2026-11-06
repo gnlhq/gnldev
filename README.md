@@ -147,7 +147,7 @@ cd my-agent && pnpm install
 pnpm dev                          # REST API + Studio Playground (single port). Open http://localhost:3000/studio
                                   # (the REST API is mounted at `/`, which has no index route — bare `/` answers 404)
 ```
-**Already have an app?** Run `npx gnl init` in its root: it detects the project (`package.json`) and
+**Already have an app?** Run `npx @gnldev/cli init` in its root (the `gnl` binary lives in `@gnldev/cli`; once it is a dependency, `npx gnl …` works): it detects the project (`package.json`) and
 writes only *new* files — `gnl.config.ts`, `src/agents/`, `src/tools/` — never editing yours; the exact
 `pnpm add` line is printed instead of touching your manifest.
 **Off the mock, onto a real model:** `npx gnl add model <nvidia|openai|anthropic|openai-compatible>`

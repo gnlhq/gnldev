@@ -65,7 +65,7 @@ export interface ModelStepUsage {
  * the ceiling fired correctly while every OTel span for the same run still reported 0 tokens and an
  * undefined model. Two readers, one rule — a second reader must not be able to miss it again.
  */
-export function modelRecordFacts(value: unknown): { usage: unknown; modelId: string | undefined; finishReason: unknown } {
+export function modelRecordFacts(value: unknown): { usage: unknown; modelId: string | undefined; configuredModelId: string | undefined; finishReason: unknown } {
   const v: any = value;
   const parts: any[] | undefined = Array.isArray(v?.parts) ? v.parts : undefined;
   const finish = parts?.find((p: any) => p?.type === 'finish');
@@ -73,6 +73,9 @@ export function modelRecordFacts(value: unknown): { usage: unknown; modelId: str
     usage: v?.usage ?? finish?.usage,
     modelId: v?.response?.modelId ?? v?.rest?.response?.modelId
       ?? parts?.find((p: any) => p?.type === 'response-metadata')?.modelId,
+    // What the model was CONFIGURED with (durable-model.ts). Kept apart from `modelId` because it is the
+    // weakest witness: the response's own id wins, and so does a caller's explicit `opts.modelId`.
+    configuredModelId: typeof v?.configuredModelId === 'string' ? v.configuredModelId : undefined,
     finishReason: v?.finishReason ?? finish?.finishReason,
   };
 }
@@ -92,7 +95,9 @@ export function usageAndCostFromModelValue(value: unknown, opts: RunCostOptions 
   // every streamDurable step used to price as 'unknown' — priceFor returned nothing, costUsd was 0 and
   // maxCostUsd could not fire at ANY threshold on the streaming path. One real call, same model, same
   // table, 158 vs 161 tokens: generate $0.303, stream $0.
-  const modelId = facts.modelId ?? opts.modelId ?? 'unknown';
+  // A response that names no model (a proxy, a middleware, a local server) used to leave 'unknown' here:
+  // priced $0, so a `maxCostUsd` over it could never fire. The configured id is the last witness.
+  const modelId = facts.modelId ?? opts.modelId ?? facts.configuredModelId ?? 'unknown';
   const pricing = priceFor(modelId, table);
   // costOf reads FLAT fields, so it must be handed the flattened object — a nested usage would
   // price every step at zero.

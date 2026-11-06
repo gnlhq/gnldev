@@ -4,12 +4,12 @@
 // vectors = 'scan' (brute-force cosine; no pgvector). node:sqlite (loaded at runtime via createRequire).
 import { runRecordKey } from './run-id-grammar.js';
 import { closeExecutorFor } from './executors.js';
-import { sqliteLiveness, inMemoryLiveness, unbindLiveness, type ProcessLiveness } from './process-liveness.js';
+import { sqliteLiveness, inMemoryLiveness, unbindLiveness, StoreLivenessSlot, type ProcessLiveness } from './process-liveness.js';
 import { ROOT_EXEC_RECORDS } from './adoption.js';
 import { prefixUpperBound } from './organization.js';
-import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition, markWorkOf } from './storage.js';
+import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition, markWorkOf, readyRank, planAppendMany, rankAppendMany, type WorkRecord } from './storage.js';
 import { memoryPartitionOf, memoryPartitionSql, type MemoryPartitionOption } from './storage.js';
-import { createRequire } from 'node:module';
+import { requireNodeSqlite } from './node-sqlite.js';
 import { statSync, existsSync } from 'node:fs';
 import { cosineSimilarity } from 'ai';
 import { runIdOfKey, parseJournalKey, outcomeStatusOf, runRelationsOf, relationsOfInput, ownerColumnOf, ownerOfRecord, OWNER_RECORD_GLOB, RunRowChanges, runStatusOf, runStatusCaseSql, storedOutcomeOf, runRecordOf, runsCutBy } from './journal.js';
@@ -22,19 +22,19 @@ import { NUMBER_BATCH, decodeLogCursor, encodeLogCursor, workKeyAdoption, workKe
 import type {
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
-  AdoptIntoOrgResult, ThreadRecord, MessageRecord, MessageAppend, Observation, RecallOptions, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord,
+  AdoptIntoOrgResult, ThreadRecord, MessageRecord, MessageAppend, Observation, RecallOptions, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord, ReadyEntry, ReadyTake, ReadyItem, ReadyHeld,
 } from './storage.js';
 // P2-migrate schema introspection/migration façade — see migrate.ts's header.
 import { tablesFromDDL, indexesFromDDL } from './migrate.js';
 import type { SchemaCheckResult, SchemaMigrationResult, MissingColumn } from './migrate.js';
 import { refuseUnknownNames } from '@gnldev/options';
-import { ADOPT_INTO_ORG_NAMES } from './option-names.js';
+import { ADOPT_INTO_ORG_NAMES, SQLITE_STORAGE_NAMES } from './option-names.js';
 import { runUpgrade, threadRecordsStep, relationsStep, verifyRelationsStep, runStatusStep, runStatusPending, RUN_STATUS_FLAGS, RUN_STATUS_PENDING_MESSAGE, RELATIONS_PENDING_ADVICE, type UpgradeOptions, type UpgradeReport } from './upgrade.js';
 import { UPGRADE_NAMES } from './option-names.js';
 import { SCOPE_TABLES, adoptedColumns, assertNoRunsInFlight } from './model.js';
 import { isScopeFact, scopeFactKeys, scopeFactsDroppedByAdoption, staysAtRoot, onAdoptionCollision, adoptionConflict } from './adoption.js';
 
-const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
+const { DatabaseSync } = requireNodeSqlite(import.meta.url);
 
 const SCHEMA_VERSION = '1';
 
@@ -214,11 +214,23 @@ const hasNorm = (v?: number[] | null): v is number[] => !!v && v.some((x) => x !
  * `key >= lower [AND key < upper]` — the upper bound is omitted for an empty prefix, which means every
  * key. Built in one place so the four call sites cannot disagree about what "no bound" means.
  */
+/** Keys per `IN` of `getMany`: well under every SQLite build's bound on a statement's parameters. */
+const KV_MANY = 500;
 function range(col: string, prefix: string): { where: string; params: string[] } {
   const upper = prefixUpperBound(prefix);
   return upper === undefined
     ? { where: `${col} >= ?`, params: [prefix] }
     : { where: `${col} >= ? AND ${col} < ?`, params: [prefix, upper] };
+}
+
+export interface SqliteStorageOptions {
+  /**
+   * This process's liveness on this database file (`sqliteLiveness`), when the store should not make its
+   * own. It is THE store's liveness — every component on this store (registry, queue worker, scheduler, a
+   * direct primitive) stamps and proves with it. Default: the store's own, made on first use. Closed by its
+   * owner, not by the store.
+   */
+  liveness?: ProcessLiveness;
 }
 
 /**
@@ -252,16 +264,13 @@ export class SqliteStorage implements Storage {
   readonly meta: MetaStore;
 
   private readonly dbPath: string;
-  /** This store's own liveness, once made; closed by `close()`. */
-  private ownLiveness?: ProcessLiveness;
+  /** This store's liveness: the one given (`SqliteStorageOptions.liveness`), else its own — see `StoreLivenessSlot`. */
+  private readonly livenessSlot: StoreLivenessSlot<ProcessLiveness>;
   /**
-   * This process's liveness on this database file (process-liveness.ts) — one per store, made on first
-   * use and closed by `close()`; an in-memory database is one process.
+   * This process's liveness on this database file (process-liveness.ts): the one the store was given, else
+   * its own — one per store, made on first use and closed by `close()`; an in-memory database is one process.
    */
-  processLiveness(): ProcessLiveness {
-    this.ownLiveness ??= this.dbPath === ':memory:' || this.dbPath === '' ? inMemoryLiveness() : sqliteLiveness(this.dbPath);
-    return this.ownLiveness;
-  }
+  processLiveness(): ProcessLiveness { return this.livenessSlot.get(); }
 
   /**
    * The driver connection for `path`: node:sqlite here. A store on another SQLite-dialect driver with
@@ -273,8 +282,10 @@ export class SqliteStorage implements Storage {
     return new DatabaseSync(path);
   }
 
-  constructor(path = ':memory:') {
+  constructor(path = ':memory:', opts: SqliteStorageOptions = {}) {
+    refuseUnknownNames('SqliteStorage', opts, SQLITE_STORAGE_NAMES);
     this.dbPath = path;
+    this.livenessSlot = new StoreLivenessSlot(opts.liveness, () => (this.dbPath === ':memory:' || this.dbPath === '' ? inMemoryLiveness() : sqliteLiveness(this.dbPath)));
     // Every statement below (and in every store class) goes through the SQLITE_BUSY retry wrapper —
     // see BusyRetryDatabase. Transient lock contention is absorbed; anything else still throws.
     this.db = new BusyRetryDatabase(this.openDatabase(path));
@@ -466,9 +477,7 @@ export class SqliteStorage implements Storage {
     await closeExecutorFor(this.runs as unknown as Parameters<typeof closeExecutorFor>[0]);
     // Then this store's liveness: no stamp is written into it from here, and its lock file is released.
     unbindLiveness(this.runs);
-    const own = this.ownLiveness;
-    this.ownLiveness = undefined;
-    await own?.close();
+    await this.livenessSlot.close();
     // Flush the WAL to the main file on close → no leftover side file buildup (H12). WITHOUT WAITING:
     // a TRUNCATE checkpoint waits (busy handler) for any writer, and a writer frozen mid-write never
     // finishes — a close, and with it every read-only command, took the whole busy timeout (5 s) for a
@@ -736,7 +745,7 @@ export class SqliteStorage implements Storage {
       threadRecordsStep(this, ['schema']),
       relationsStep(this.runs as SqliteRunJournal, ['schema']),
       verifyRelationsStep(this.runs as SqliteRunJournal, ['schema']),
-    ], opts);
+    ], opts, undefined, this);
   }
 
   /** See RunStatusMigrator. */
@@ -870,6 +879,11 @@ CREATE TABLE IF NOT EXISTS gnl_work_log (ns TEXT NOT NULL, id TEXT NOT NULL, pay
 CREATE INDEX IF NOT EXISTS gnl_work_log_ns ON gnl_work_log (ns, ts);
 CREATE TABLE IF NOT EXISTS gnl_work_seq (ns TEXT PRIMARY KEY, seq INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS gnl_work_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS gnl_work_ready (rset TEXT NOT NULL, id TEXT NOT NULL, ns TEXT NOT NULL, kind TEXT NOT NULL, not_before INTEGER NOT NULL, rnk REAL NOT NULL, hold TEXT, hproc TEXT, hat INTEGER, httl INTEGER, PRIMARY KEY (rset, id));
+CREATE INDEX IF NOT EXISTS gnl_work_ready_take ON gnl_work_ready (rset, rnk);
+CREATE INDEX IF NOT EXISTS gnl_work_ready_ns ON gnl_work_ready (rset, ns, rnk);
+CREATE INDEX IF NOT EXISTS gnl_work_ready_id ON gnl_work_ready (id);
+CREATE INDEX IF NOT EXISTS gnl_work_ready_held ON gnl_work_ready (rset) WHERE hold IS NOT NULL;
 CREATE TABLE IF NOT EXISTS gnl_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER);
 `;
 /**
@@ -2066,6 +2080,89 @@ class SqliteWorkStore implements WorkStore {
       raw.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
     }
   }
+  /** By the primary key `(ns, id)` (`WorkStore.read`). */
+  async read<T = unknown>(ns: string, id: string): Promise<LogRecord<T> | undefined> {
+    const r = this.db.prepare('SELECT id, payload, ts FROM gnl_work_log WHERE ns = ? AND id = ?').get(ns, id) as { id: string; payload: string; ts: number } | undefined;
+    return r ? { id: r.id, payload: deserialize<T>(r.payload), ts: Number(r.ts) } : undefined;
+  }
+  /**
+   * The record and its entry in one write transaction (`WorkStore.appendReady`): SQLite admits one writer,
+   * so no other entry is ranked between reading the rank's inputs and writing this one. Entries are taken
+   * in `rowid` order among equal ranks — a new row's rowid is above every existing one's.
+   */
+  async appendReady(ns: string, payload: unknown, id: string, e: ReadyEntry): Promise<string> {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare(`INSERT INTO gnl_work_log (ns, id, payload, ts) VALUES (?, ?, ?, ?) ON CONFLICT(ns, id) DO NOTHING`).run(ns, id, serialize(payload), Date.now());
+      const r = this.db.prepare(
+        `SELECT EXISTS (SELECT 1 FROM gnl_work_ready WHERE rset = ? AND id = ?) AS has,
+           (SELECT MIN(rnk) FROM gnl_work_ready WHERE rset = ? AND not_before <= ? AND hold IS NULL) AS floor,
+           (SELECT MAX(rnk) FROM gnl_work_ready WHERE rset = ? AND ns = ?) AS top`,
+      ).get(e.set, id, e.set, e.now, e.set, ns) as { has: number; floor: number | null; top: number | null };
+      if (!r.has) {
+        this.db.prepare('INSERT INTO gnl_work_ready (rset, id, ns, kind, not_before, rnk) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(e.set, id, ns, e.kind, e.notBefore, readyRank(r.floor ?? undefined, r.top ?? undefined, e.step));
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+    return id;
+  }
+  /**
+   * Every record and entry in one write transaction (`WorkStore.appendMany`): the one writer, so the rank's
+   * inputs are read once for the whole call and nothing is ranked between reading them and the entries.
+   * Payloads are serialized before the transaction opens.
+   */
+  async appendMany(records: readonly WorkRecord[]): Promise<void> {
+    const plan = planAppendMany(records);
+    if (!plan.records.length) return;
+    const rows = plan.records.map((r) => [r.ns, r.id, serialize(r.payload)] as const);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const log = this.db.prepare(`INSERT INTO gnl_work_log (ns, id, payload, ts) VALUES (?, ?, ?, ?) ON CONFLICT(ns, id) DO NOTHING`);
+      const ts = Date.now();
+      for (const [ns, id, payload] of rows) log.run(ns, id, payload, ts);
+      const ready = plan.ready;
+      if (ready) {
+        const { floor } = this.db.prepare('SELECT MIN(rnk) AS floor FROM gnl_work_ready WHERE rset = ? AND not_before <= ? AND hold IS NULL').get(ready.set, ready.now) as { floor: number | null };
+        const topOf = this.db.prepare('SELECT MAX(rnk) AS top FROM gnl_work_ready WHERE rset = ? AND ns = ?');
+        const tops = new Map(plan.lanes.map((ns) => [ns, (topOf.get(ready.set, ns) as { top: number | null }).top ?? undefined]));
+        const hasOne = this.db.prepare('SELECT 1 AS one FROM gnl_work_ready WHERE rset = ? AND id = ?');
+        const has = new Set(plan.entries.filter((x) => hasOne.get(ready.set, x.id) !== undefined).map((x) => x.id));
+        const entry = this.db.prepare('INSERT INTO gnl_work_ready (rset, id, ns, kind, not_before, rnk) VALUES (?, ?, ?, ?, ?, ?)');
+        for (const x of rankAppendMany(plan, floor ?? undefined, tops, has)) entry.run(ready.set, x.id, x.ns, x.kind, x.notBefore, x.rank);
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+  /** One statement, so one writer at a time: the lowest-ranked ready entry nobody holds, held by `holder`. */
+  async takeReady(set: string, t: ReadyTake): Promise<ReadyItem | undefined> {
+    const skip = [...(t.skipKinds ?? [])];
+    const h = t.holder;
+    const r = this.db.prepare(
+      `UPDATE gnl_work_ready SET hold = ?, hproc = ?, hat = ?, httl = ? WHERE rowid = (
+         SELECT rowid FROM gnl_work_ready WHERE rset = ? AND not_before <= ? AND hold IS NULL${skip.length ? ` AND kind NOT IN (${skip.map(() => '?').join(', ')})` : ''}
+         ORDER BY rnk, rowid LIMIT 1
+       ) RETURNING ns, id`,
+    ).get(h.hold, h.proc ?? null, t.now, h.ttlMs, set, t.now, ...skip) as { ns: string; id: string } | undefined;
+    return r ? { ns: r.ns, id: r.id } : undefined;
+  }
+  async heldReady(set: string): Promise<ReadyHeld[]> {
+    const rows = this.db.prepare('SELECT id, hold, hproc, hat, httl FROM gnl_work_ready WHERE rset = ? AND hold IS NOT NULL').all(set) as { id: string; hold: string; hproc: string | null; hat: number; httl: number }[];
+    return rows.map((x) => ({ id: x.id, hold: x.hold, ...(x.hproc !== null ? { proc: x.hproc } : {}), at: Number(x.hat), ttlMs: Number(x.httl) }));
+  }
+  async deferReady(set: string, id: string, notBefore: number, hold?: string): Promise<void> {
+    if (hold === undefined) this.db.prepare('UPDATE gnl_work_ready SET not_before = ?, hold = NULL, hproc = NULL, hat = NULL, httl = NULL WHERE rset = ? AND id = ?').run(notBefore, set, id);
+    else this.db.prepare('UPDATE gnl_work_ready SET not_before = ?, hold = NULL, hproc = NULL, hat = NULL, httl = NULL WHERE rset = ? AND id = ? AND hold = ?').run(notBefore, set, id, hold);
+  }
+  async dropReady(set: string, id: string): Promise<void> {
+    this.db.prepare('DELETE FROM gnl_work_ready WHERE rset = ? AND id = ?').run(set, id);
+  }
   /** Keyset on `(seq, ts, id)` from the cursor's position (`WorkStore.list`); one extra row says "more". */
   async list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>> {
     const limit = q?.limit ?? 50;
@@ -2087,6 +2184,33 @@ class SqliteWorkStore implements WorkStore {
   async get<T = unknown>(key: string): Promise<T | undefined> {
     const r = this.db.prepare('SELECT value FROM gnl_work_kv WHERE key = ?').get(key) as { value: string } | undefined;
     return r ? deserialize<T>(r.value) : undefined;
+  }
+  /** One `IN` per KV_MANY keys (`WorkStore.getMany`), answered in the order asked. */
+  async getMany<T = unknown>(keys: string[]): Promise<(T | undefined)[]> {
+    const got = new Map<string, string>();
+    for (let i = 0; i < keys.length; i += KV_MANY) {
+      const part = [...new Set(keys.slice(i, i + KV_MANY))];
+      for (const r of this.db.prepare(`SELECT key, value FROM gnl_work_kv WHERE key IN (${part.map(() => '?').join(', ')})`).all(...part) as { key: string; value: string }[]) got.set(r.key, r.value);
+    }
+    return keys.map((k) => (got.has(k) ? deserialize<T>(got.get(k)!) : undefined));
+  }
+  /** One index probe per name (`WorkStore.listNamespaces`): the next namespace in the range after the last. */
+  async listNamespaces(prefix: string, q?: ListQuery): Promise<Page<string>> {
+    const limit = q?.limit ?? 50;
+    const r = range('ns', prefix);
+    const names: string[] = [];
+    let after = q?.cursor;
+    while (names.length <= limit) {
+      const x = (after === undefined
+        ? this.db.prepare(`SELECT ns FROM gnl_work_log WHERE ${r.where} ORDER BY ns LIMIT 1`).get(...r.params)
+        : this.db.prepare(`SELECT ns FROM gnl_work_log WHERE ${r.where} AND ns > ? ORDER BY ns LIMIT 1`).get(...r.params, after)) as { ns: string } | undefined;
+      if (!x) break;
+      names.push(x.ns);
+      after = x.ns;
+    }
+    const more = names.length > limit;
+    if (more) names.pop();
+    return { items: names, nextCursor: more ? names[names.length - 1] : undefined };
   }
   async put(key: string, value: unknown): Promise<void> {
     this.db.prepare(`INSERT INTO gnl_work_kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
@@ -2115,14 +2239,17 @@ class SqliteWorkStore implements WorkStore {
     const li = this.db.prepare(`DELETE FROM gnl_work_log WHERE ${lr.where}`).run(...lr.params);
     const kr = range('key', prefix);
     const ki = this.db.prepare(`DELETE FROM gnl_work_kv WHERE ${kr.where}`).run(...kr.params);
-    return Number(li.changes ?? 0) + Number(ki.changes ?? 0);
+    const ri = this.db.prepare(`DELETE FROM gnl_work_ready WHERE ${lr.where}`).run(...lr.params);
+    return Number(li.changes ?? 0) + Number(ki.changes ?? 0) + Number(ri.changes ?? 0);
   }
   /** Every log record whose ID starts with `idPrefix`, in every namespace (`WorkStore.deleteIdPrefix`).
    *  The same byte range as the other prefix deletes, so the prefix is literal: no LIKE, nothing in an
    *  id (`%`, `_`, `\`) can act as a wildcard. One statement, so it is all or nothing. */
   async deleteIdPrefix(idPrefix: string): Promise<number> {
     const r = range('id', idPrefix);
-    return Number(this.db.prepare(`DELETE FROM gnl_work_log WHERE ${r.where}`).run(...r.params).changes ?? 0);
+    const n = Number(this.db.prepare(`DELETE FROM gnl_work_log WHERE ${r.where}`).run(...r.params).changes ?? 0);
+    this.db.prepare(`DELETE FROM gnl_work_ready WHERE ${r.where}`).run(...r.params);
+    return n;
   }
 }
 

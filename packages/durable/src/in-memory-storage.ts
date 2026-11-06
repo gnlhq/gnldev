@@ -3,7 +3,7 @@
 // Correctness matters, not perf (naive filter/sort). Date.now/Math.random are free to use here (runtime code).
 import { cosineSimilarity } from 'ai';
 import { serialize, deserialize, copyValue } from './serialize.js';
-import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition, markWorkOf } from './storage.js';
+import { assertUniformSeq, workingMemoryScope, legacyWorkingMemoryScope, assertOrganizationPartition, markWorkOf, readyRank, planAppendMany, rankAppendMany } from './storage.js';
 import { memoryPartitionOf, inMemoryPartition, type MemoryPartitionOption } from './storage.js';
 import { InMemoryJournal } from './journal.js';
 import { withBirth } from './run-identity.js';
@@ -22,7 +22,7 @@ import type {
   Storage, CapabilityMatrix, Page, ListQuery,
   RunJournal, MemoryStore, VectorStore, WorkStore, CacheStore, MetaStore,
   ThreadRecord, MessageRecord, MessageAppend, Observation, RecallOptions,
-  AdoptIntoOrgResult, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord } from './storage.js';
+  AdoptIntoOrgResult, VectorItem, VectorMatch, VectorQueryOptions, VectorDeleteWhere, LogRecord, ReadyEntry, ReadyTake, ReadyItem, ReadyHeld, WorkRecord } from './storage.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { ADOPT_INTO_ORG_NAMES } from './option-names.js';
 
@@ -380,6 +380,9 @@ class InMemoryVectorStore implements VectorStore {
 }
 
 // ── WorkStore (append-log + KV + CAS ack) ─────────────────────────────────────
+/** Byte order of two strings (UTF-8, as the SQL stores' binary collations and MongoDB compare them). */
+const byteOrder = (a: string, b: string): number => Buffer.compare(Buffer.from(a), Buffer.from(b));
+const byteAfter = (a: string, b: string): boolean => byteOrder(a, b) > 0;
 class InMemoryWorkStore implements WorkStore {
   /**
    * @internal — see Storage.adoptIntoOrg. A moved log is APPENDED to the log already under its new
@@ -399,6 +402,16 @@ class InMemoryWorkStore implements WorkStore {
       this.logs.set(to, target);
       this.logs.delete(ns);
       n++;
+    }
+    // A ready set moves with the logs it indexes, its entries' namespaces with it.
+    for (const [set, entries] of [...this.readySets]) {
+      const to = f(set);
+      for (const x of entries.values()) x.ns = f(x.ns) ?? x.ns;
+      if (to === undefined || to === set) continue;
+      const target = this.readySets.get(to) ?? new Map();
+      for (const [id, x] of entries) target.set(id, x);
+      this.readySets.set(to, target);
+      this.readySets.delete(set);
     }
     // Keys by `workKeyAdoption` — a read position is dropped, not carried (a collision on any other key
     // was refused by `_kvCollision` before anything moved).
@@ -439,7 +452,17 @@ class InMemoryWorkStore implements WorkStore {
   /** The last sequence handed out per namespace. Survives deletions on purpose: see `WorkStore.list`. */
   private seqs = new Map<string, number>();
   private kv = new Map<string, unknown>();
+  /** Each ready set's entries by record id (`WorkStore.appendReady`), and the append order of entries. */
+  private readySets = new Map<string, Map<string, { ns: string; id: string; kind: string; notBefore: number; rank: number; seq: number; held?: Omit<ReadyHeld, 'id'> }>>();
+  private readySeq = 0;
   async append(ns: string, payload: unknown, id?: string): Promise<string> {
+    return this.appendNow(ns, payload, id);
+  }
+  /**
+   * `append` without an await: `appendReady` writes the record and its entry in one synchronous step.
+   * `copied`: the payload is a copy already (`appendMany` copies every payload before it writes one).
+   */
+  private appendNow(ns: string, payload: unknown, id?: string, copied = false): string {
     const log = this.logs.get(ns) ?? [];
     const eid = id ?? genId(ns);
     if (!log.some((r) => r.id === eid)) {
@@ -447,10 +470,75 @@ class InMemoryWorkStore implements WorkStore {
       // new name's counter must not start below the records it now holds.
       const seq = Math.max(this.seqs.get(ns) ?? 0, log[log.length - 1]?.seq ?? 0) + 1;
       this.seqs.set(ns, seq);
-      log.push({ id: eid, payload: copyValue(payload), ts: Date.now(), seq });
+      log.push({ id: eid, payload: copied ? payload : copyValue(payload), ts: Date.now(), seq });
       this.logs.set(ns, log);
     }
     return eid;
+  }
+  /** One synchronous step (no await): the rank's inputs cannot change between reading them and the entry. */
+  async appendReady(ns: string, payload: unknown, id: string, e: ReadyEntry): Promise<string> {
+    const eid = this.appendNow(ns, payload, id);
+    const set = this.readySets.get(e.set) ?? new Map();
+    this.readySets.set(e.set, set);
+    if (!set.has(eid)) {
+      let floor: number | undefined;
+      let top: number | undefined;
+      for (const x of set.values()) {
+        if (x.notBefore <= e.now && !x.held && (floor === undefined || x.rank < floor)) floor = x.rank;
+        if (x.ns === ns && (top === undefined || x.rank > top)) top = x.rank;
+      }
+      set.set(eid, { ns, id: eid, kind: e.kind, notBefore: e.notBefore, rank: readyRank(floor, top, e.step), seq: ++this.readySeq });
+    }
+    return eid;
+  }
+  /**
+   * One synchronous step, as `appendReady`: every payload copied first (a payload that cannot be copied
+   * refuses the call before anything is written), then the records, then the entries ranked from one read
+   * of the set (`rankAppendMany`).
+   */
+  async appendMany(records: readonly WorkRecord[]): Promise<void> {
+    const plan = planAppendMany(records);
+    const copies = plan.records.map((r) => copyValue(r.payload));
+    plan.records.forEach((r, i) => this.appendNow(r.ns, copies[i], r.id, true));
+    if (!plan.ready) return;
+    const set = this.readySets.get(plan.ready.set) ?? new Map();
+    this.readySets.set(plan.ready.set, set);
+    const lanes = new Set(plan.lanes);
+    let floor: number | undefined;
+    const tops = new Map<string, number>();
+    for (const x of set.values()) {
+      if (x.notBefore <= plan.ready.now && !x.held && (floor === undefined || x.rank < floor)) floor = x.rank;
+      if (lanes.has(x.ns) && (!tops.has(x.ns) || x.rank > tops.get(x.ns)!)) tops.set(x.ns, x.rank);
+    }
+    const has = new Set(plan.entries.filter((x) => set.has(x.id)).map((x) => x.id));
+    for (const x of rankAppendMany(plan, floor, tops, has)) set.set(x.id, { ...x, seq: ++this.readySeq });
+  }
+  async takeReady(set: string, q: ReadyTake): Promise<ReadyItem | undefined> {
+    const skip = new Set(q.skipKinds ?? []);
+    let best: { ns: string; id: string; notBefore: number; rank: number; seq: number; held?: Omit<ReadyHeld, 'id'> } | undefined;
+    for (const x of this.readySets.get(set)?.values() ?? []) {
+      if (x.notBefore > q.now || x.held || skip.has(x.kind)) continue;
+      if (!best || x.rank < best.rank || (x.rank === best.rank && x.seq < best.seq)) best = x;
+    }
+    if (!best) return undefined;
+    best.held = { ...q.holder, at: q.now };
+    return { ns: best.ns, id: best.id };
+  }
+  async heldReady(set: string): Promise<ReadyHeld[]> {
+    return [...(this.readySets.get(set)?.values() ?? [])].flatMap((x) => (x.held ? [{ ...x.held, id: x.id }] : []));
+  }
+  async deferReady(set: string, id: string, notBefore: number, hold?: string): Promise<void> {
+    const x = this.readySets.get(set)?.get(id);
+    if (!x || (hold !== undefined && x.held?.hold !== hold)) return;
+    x.notBefore = notBefore;
+    delete x.held;
+  }
+  async dropReady(set: string, id: string): Promise<void> {
+    this.readySets.get(set)?.delete(id);
+  }
+  async read<T = unknown>(ns: string, id: string): Promise<LogRecord<T> | undefined> {
+    const r = this.logs.get(ns)?.find((x) => x.id === id);
+    return r ? { id: r.id, payload: copyValue(r.payload) as T, ts: r.ts } : undefined;
   }
   /** Keyset on the store-assigned sequence (`WorkStore.list`): a deletion behind the cursor cannot move it. */
   async list<T = unknown>(ns: string, q?: ListQuery): Promise<Page<LogRecord<T>>> {
@@ -472,8 +560,17 @@ class InMemoryWorkStore implements WorkStore {
       nextCursor: start + limit < log.length && last ? encodeLogCursor(last) : undefined,
     };
   }
+  /** The namespaces under `prefix` that hold a record, in byte order after the cursor (`WorkStore.listNamespaces`). */
+  async listNamespaces(prefix: string, q?: ListQuery): Promise<Page<string>> {
+    const limit = q?.limit ?? 50;
+    const after = q?.cursor;
+    const names = [...this.logs].filter(([ns, log]) => log.length > 0 && ns.startsWith(prefix) && (after === undefined || byteAfter(ns, after))).map(([ns]) => ns).sort(byteOrder);
+    const items = names.slice(0, limit);
+    return { items, nextCursor: names.length > limit ? items[items.length - 1] : undefined };
+  }
   // Copies in and out, as the SQL work stores (serialized rows) do: see copyValue.
   async get<T = unknown>(key: string) { return this.kv.has(key) ? copyValue(this.kv.get(key) as T) : undefined; }
+  async getMany<T = unknown>(keys: string[]): Promise<(T | undefined)[]> { return keys.map((k) => (this.kv.has(k) ? copyValue(this.kv.get(k) as T) : undefined)); }
   async put(key: string, value: unknown) { this.kv.set(key, copyValue(value)); }
   async ackOnce(key: string): Promise<boolean> {
     if (this.kv.has(key)) return false;
@@ -489,6 +586,7 @@ class InMemoryWorkStore implements WorkStore {
       n += log.length - keep.length;
       this.logs.set(ns, keep);
     }
+    for (const set of this.readySets.values()) for (const id of [...set.keys()]) if (id.startsWith(idPrefix)) set.delete(id);
     return n;
   }
   async deletePrefix(prefix: string): Promise<number> {
@@ -499,6 +597,7 @@ class InMemoryWorkStore implements WorkStore {
     for (const k of [...this.kv.keys()]) {
       if (k.startsWith(prefix)) { this.kv.delete(k); n++; }
     }
+    for (const set of this.readySets.values()) for (const [id, x] of [...set]) if (x.ns.startsWith(prefix)) set.delete(id);
     return n;
   }
   /** 8.2: SAME pattern as RunJournal.putIfMatch (stableStringify comparison) — there is NO await
@@ -569,7 +668,7 @@ export class InMemoryStorage implements Storage {
   /** See `Storage.upgrade`. One step, `thread-records` — for runs written into this store before its threads had marks. */
   async upgrade(opts?: UpgradeOptions): Promise<UpgradeReport> {
     refuseUnknownNames('InMemoryStorage.upgrade', opts, UPGRADE_NAMES);
-    return runUpgrade('InMemoryStorage', [threadRecordsStep(this)], opts);
+    return runUpgrade('InMemoryStorage', [threadRecordsStep(this)], opts, undefined, this);
   }
   readonly runs = new InMemoryRunJournal();
   readonly memory = new InMemoryMemoryStore();

@@ -35,7 +35,8 @@ import type { Processor } from './processor.js';
 import type { RunLimits } from './limits.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import type { DetachedRuns, DetachedRunsOptions, ExecRecord, Launch, LaunchEnd } from './detached.js';
-import { executorFor } from './executors.js';
+import { executorFor, type ScopeEntry } from './executors.js';
+import { scopeConfigToOrg } from './org-storage.js';
 import { followedRun } from './followed-run.js';
 import { lastRunEvent, readCursor } from './run-events.js';
 import { streamable } from './generate-as-stream.js';
@@ -458,6 +459,11 @@ export interface WorkflowRunOpts {
   actor?: string;
   threadId?: string;
   context?: RequestContext;
+  /**
+   * The occurrence a scheduler fired this run for (epoch ms) — handed to every step as
+   * `ctx.scheduledFor`. Given by `@gnldev/scheduler` on each fire; absent for a run nobody scheduled.
+   */
+  scheduledFor?: number;
 }
 
 /** Result of a workflow run (with step outputs). */
@@ -492,10 +498,12 @@ export interface WorkflowRunResult {
 export interface CreateGnlConfig {
   /**
    * This process's liveness (process-liveness.ts): what its executor holds while it lives, and what
-   * another process asks before continuing its runs. Default: the one installed for the process, else the
-   * storage's own (`storage.processLiveness()`: a Sqlite file lock, a Postgres session); a store only this
-   * process reaches (in memory) needs none. Behind a transaction-mode pooler pass
-   * `await postgresLiveness({ connectionString: <direct URL> })`.
+   * another process asks before continuing its runs. Only for a store that cannot answer for itself (a
+   * custom `Storage`): the built-in stores answer for themselves — their own liveness, or the one given to
+   * them (`new PostgresStorage({ liveness })`, behind a transaction-mode pooler
+   * `await postgresLiveness({ connectionString: <direct URL> })`) — and one passed here beside it is
+   * refused (`LivenessConflictError`). Default: the one installed for the process; a store only this
+   * process reaches (in memory) needs none.
    */
   liveness?: ProcessLiveness;
   /** Tuning of the process's run executor (detached.ts), taken from the first registry on a store. */
@@ -911,6 +919,11 @@ function childRunOptions(parent: RunOptions, own: RunOptions): RunOptions {
   return { ...(inherited as RunOptions), ...own };
 }
 
+/** How the executor continues a run of a registry's scope (executors.ts `anyScope`). */
+const scopeEntries = new WeakMap<object, ScopeEntry>();
+/** Stores whose executor could not be made at a registry's construction, said once. */
+const warnedNoExecutor = new WeakSet<object>();
+
 export function createGnl(config: CreateGnlConfig) {
   refuseCreateGnlNames(config);
   // Task 3 (opt-in): run BEFORE anything else — a version-skewed suite should be caught up front, not
@@ -1160,9 +1173,26 @@ export function createGnl(config: CreateGnlConfig) {
           return source.processLiveness?.();
         },
       },
+      // The root registry continues every organization's runs: the registry an organization gets from this
+      // config (`scopeConfigToOrg`, as every door builds it). A config that cannot be scoped (a shared
+      // `memory` object) continues none: scopeConfigToOrg refuses it, and the scope stays somebody else's.
+      ...(orgScopeOf(journal) === undefined ? { anyScope: (scope: string) => scopeEntries.get(createGnl(scopeConfigToOrg(config, scope).config)) } : {}),
       ...(config.detached ? { options: config.detached } : {}),
     });
   }
+
+  // THE STORE'S RECOVERY LOOP STARTS WITH THE REGISTRY, not with its first request. The executor (and its
+  // sweep) is the store's in this process (executors.ts): the first registry built on a store makes it, every
+  // later one registers its scope with it; the root registry makes it continue every organization's runs.
+  // A process that never served a request — a fresh replica, a host that only runs workers — continues what
+  // a dead one left. It ends with the store (`storage.close()`). A store this process cannot make an
+  // executor for (a shared journal with no liveness) is said once here; a request still gets the error.
+  executor().catch((e: unknown) => {
+    if (!warnedNoExecutor.has(journal)) {
+      warnedNoExecutor.add(journal);
+      console.warn('@gnldev/durable: this process cannot continue runs on this store until it has an executor:', e instanceof Error ? e.message : e);
+    }
+  });
 
   /**
    * How this process continues a run it did not start (a takeover, an approval that arrived elsewhere):
@@ -2153,7 +2183,7 @@ export function createGnl(config: CreateGnlConfig) {
     }
     // The step context carries the run's identity: a step that calls a tool or starts an agent
     // passes it on (`toolContextFor(ctx.identity)`, `runDurable({ caller: ctx.identity })`).
-    const ctx = { runId, journal: journal, identity: wfRunIdentity, ...(strictSideEffects ? { strictSideEffects: true } : {}) };
+    const ctx = { runId, journal: journal, identity: wfRunIdentity, ...(strictSideEffects ? { strictSideEffects: true } : {}), ...(opts?.scheduledFor !== undefined ? { scheduledFor: opts.scheduledFor } : {}) };
     let output: unknown;
     let suspended = false;
     let paused = false;
@@ -2246,5 +2276,7 @@ export function createGnl(config: CreateGnlConfig) {
     return followedRun(runs, { runId, ...(scope !== undefined ? { scope } : {}), journal, after: readCursor(opts.after), state: 'following' });
   }
 
-  return { agent, run, stream, follow, cancel, listWorkflows, runWorkflow, runNetwork, listNetworks, memory: resolvedMemory, suggestions: suggestionsApi };
+  const gnl = { agent, run, stream, follow, cancel, listWorkflows, runWorkflow, runNetwork, listNetworks, memory: resolvedMemory, suggestions: suggestionsApi };
+  scopeEntries.set(gnl, { journal, resume: resumeLaunch });
+  return gnl;
 }

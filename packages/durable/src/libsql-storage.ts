@@ -19,6 +19,7 @@
 import { requireOptionalPeer } from './optional-peer.js';
 import { refuseUnknownNames, optionNames } from '@gnldev/options';
 import { SqliteStorage } from './sqlite-storage.js';
+import type { ProcessLiveness } from './process-liveness.js';
 
 /**
  * Options a libSQL driver offers that this store does NOT take, named so that passing one says why
@@ -29,8 +30,10 @@ export interface LibsqlStorageOptions {
   syncUrl?: never;
   /** Refused: a token is for a remote database, which this store does not open (see the module comment). */
   authToken?: never;
+  /** This process's liveness on this file (`sqliteLiveness`) — the store's, as SqliteStorage's (see `SqliteStorageOptions.liveness`). */
+  liveness?: ProcessLiveness;
 }
-const LIBSQL_STORAGE_NAMES = optionNames<LibsqlStorageOptions>()(['syncUrl', 'authToken']);
+const LIBSQL_STORAGE_NAMES = optionNames<LibsqlStorageOptions>()(['syncUrl', 'authToken', 'liveness']);
 
 const REMOTE = /^(libsql|https?|wss?):/i;
 
@@ -65,7 +68,7 @@ function refuseWhatCannotBeKept(path: string, opts: LibsqlStorageOptions): void 
 export class LibsqlStorage extends SqliteStorage {
   constructor(path = ':memory:', opts: LibsqlStorageOptions = {}) {
     refuseWhatCannotBeKept(path, opts);
-    super(path);
+    super(path, opts.liveness ? { liveness: opts.liveness } : {});
   }
 
   protected override openDatabase(path: string): unknown {

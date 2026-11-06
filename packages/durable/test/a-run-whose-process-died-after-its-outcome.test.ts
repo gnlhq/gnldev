@@ -27,8 +27,15 @@ const PG_URL = process.env.GNL_PG_URL;
 const STORES: Array<[string, () => Promise<Storage>]> = [['sqlite', async () => new SqliteStorage(':memory:')]];
 if (PG_URL) {
   STORES.push(['postgres (real)', async () => {
-    const s = new PostgresStorage({ connectionString: PG_URL });
-    ends.push(() => s.close());
+    // A database of its own: 'D' below answers for no session in the store, so another file's executor reads
+    // these runs as dead and takes them, and 'D' reads every other run as dead and takes that.
+    const pg = (await import('pg')).default;
+    const admin = new pg.Client({ connectionString: PG_URL }); await admin.connect();
+    const db = `died_${unique()}`;
+    await admin.query(`CREATE DATABASE ${db}`);
+    const url = new URL(PG_URL); url.pathname = `/${db}`;
+    const s = new PostgresStorage({ connectionString: url.toString() });
+    ends.push(async () => { await s.close(); await admin.query(`DROP DATABASE IF EXISTS ${db}`); await admin.end(); });
     return s;
   }]);
 }

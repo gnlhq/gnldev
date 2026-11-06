@@ -210,6 +210,10 @@ jobs:
           DEFAULT_VECTORIZER_MODULE: none
           PERSISTENCE_DATA_PATH: /var/lib/weaviate
           CLUSTER_HOSTNAME: node1
+          # Past 90 % of its disk Weaviate turns its shards read-only and writes hang. A test server's disk is
+          # the runner's, not ours to guard (test/vector-servers-gate.test.ts).
+          DISK_USE_WARNING_PERCENTAGE: '100'
+          DISK_USE_READONLY_PERCENTAGE: '100'
         ports: ['8080']
       # Elasticsearch 9.4 and OpenSearch 3.9, for @gnldev/rag's ElasticsearchVectorStore and
       # OpenSearchVectorStore (the vector kit and their own tests): one node, security off, a small heap.
@@ -220,6 +224,9 @@ jobs:
           discovery.type: single-node
           xpack.security.enabled: 'false'
           ES_JAVA_OPTS: -Xms512m -Xmx512m
+          # Past its high watermark an index never goes green and the next write hangs, which fails every
+          # test as a 30 s timeout; the same reason as OpenSearch's below.
+          cluster.routing.allocation.disk.threshold_enabled: 'false'
         ports: ['9200']
         options: >-
           --health-cmd "curl -fs http://localhost:9200/_cluster/health || exit 1" --health-interval 5s --health-timeout 5s --health-retries 40
@@ -317,6 +324,9 @@ jobs:
           [ "$(ask 'db.hello().isWritablePrimary')" = "true" ] || { docker logs gnl-mongo | tail -50; exit 1; }
           port=$(docker port gnl-mongo 27017/tcp | head -1 | sed 's/.*://')
           echo "GNL_MONGO_URL=mongodb://root:gnl@127.0.0.1:${port}/gnl?authSource=admin&directConnection=true" >> "$GITHUB_ENV"
+      # What the runner's disk holds when the tests start: with the servers' own guards off, this is where a
+      # full disk can be read.
+      - run: df -h /
       # Run from the root: the root vitest.config include is 'packages/*/test/**', so running from
       # inside a package directory reports "No test files found" (a known monorepo quirk).
       #

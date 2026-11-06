@@ -144,6 +144,39 @@ The owned job takes over the old one's state (finished stays finished, a dead le
 the old one is marked done with `movedTo`. After that, `enqueue(…, { id: 'weekly-report', orgId: 'acme' })`
 finds the moved job.
 
+### Upgrading from 0.16 (lanes)
+
+0.16 and earlier appended every job to one log; this version takes jobs from per-organization lanes and a
+ready set. Register the queue's upgrade steps once, next to the store, and `gnl upgrade` runs them:
+
+```ts
+import { registerUpgradeSteps } from '@gnldev/durable';
+import { queueUpgrade } from '@gnldev/queue';
+
+registerUpgradeSteps(storage, [queueUpgrade]);
+```
+
+1. `gnl upgrade` — runs `queue/lanes`: the old log's jobs are moved into their lanes (a finished job stays
+   finished, a pending one runs once). The old log is left as it is, so this runs while 0.16 workers and
+   producers are still up. A worker of this version does not start before it (it names the command).
+2. Deploy this version (a rolling deploy, `pm2 reload`). While a 0.16 process still enqueues, this
+   version's workers move what it adds; a job a 0.16 worker and a new one both find runs once (one lease).
+3. Once every 0.16 process is gone: `gnl upgrade --only queue/lanes-cleanup` deletes the old log and its
+   cursors. Run before that, a 0.16 worker would read the log from its head again, and a 0.16 producer would
+   write jobs no worker of this version looks for any more.
+
+   The cleanup checks what it can: every polling worker records itself in the store (`__qworkers__`), and
+   this version's record carries its data version. While a worker without one — a 0.16 worker — is live
+   (announced within its `ttlMs`), the cleanup refuses and deletes nothing: the error (and `--dry-run`) says
+   how many, when each was last seen, and when its record expires. A worker stopped normally takes its record
+   back; one that was killed holds the cleanup back until its `ttlMs` passes.
+
+   **It does not see a 0.16 process that only enqueues** (a web server that calls `enqueue` and runs no
+   worker): such a process writes no record. Make sure every 0.16 producer is gone too before you run it.
+
+A store you wrote that has no `upgrade()` has nowhere to register the steps; run them yourself once every 0.16
+process is gone: `for (const step of [queueUpgrade(storage)].flat()) await step.run();`.
+
 ### Erasing a person
 
 `jobEraser(storage)` removes one person's jobs: the records, the `qdone`/`qfail`/`qcancel`/`qtry`/`qatt`/`qown` markers
@@ -173,13 +206,22 @@ rather than report a partial erasure as done.
 - `enqueue(work, type, payload, { id?, maxDepth?, caller?, resourceId?, orgId?, runAt? }) → jobId` — `work` is `storage.work`.
   `caller` is an engine `Caller` (`user(id, org)`, `staff(org?)`); `resourceId`/`orgId` are its shorthand.
 - `createQueue(storage, handlers, opts?) → { enqueue, worker?, close }` — a worker over `handlers` started in this process; `opts` are `createWorker`'s plus `worker: false` (run nothing here).
-- `createWorker(storage, handlers, opts?) → { runOnce, drain, start, stop }` — `opts`: `owner`, `liveness` (default: the process's, or the storage's own; a shared store with none is refused), `ttlMs` (lease reclaim when no process can be asked), `pollMs`, `maxAttempts`, `onError`, `backoff`, `maxPollMs`, `heartbeat`, `maxRenewFailures` (after this many heartbeat renewals fail in a row — default 3 — the worker treats the lock as lost rather than risk running the job twice), `retryDelayMs`, `concurrency`, `typeConcurrency`
+- `createWorker(storage, handlers, opts?) → { runOnce, drain, start, stop }` — `opts`: `owner`, `liveness` (only for a custom storage that cannot answer for itself — the built-in stores take it as `new XStorage({ liveness })`, and one passed here beside it is refused; default: the process's; a shared store with none is refused), `ttlMs` (lease reclaim when no process can be asked), `pollMs`, `maxAttempts`, `onError`, `backoff`, `maxPollMs`, `heartbeat`, `maxRenewFailures` (after this many heartbeat renewals fail in a row — default 3 — the worker treats the lock as lost rather than risk running the job twice), `retryDelayMs`, `concurrency`, `typeConcurrency`
 - `JobCtx` gives the handler `{ journal, jobId, runId, caller, run, storage, orgId?, enqueue, signal }`. `ctx.run(args)` is
   `runDurable` on `journal`/`runId` as `caller` — it keeps the side effect at-most-once and the run the owner's.
-- `listJobs(work)` shows each job's `resourceId`/`orgId` next to its status.
+- `listJobs(work, { orgId?, cursor?, limit? })` — a page of ONE organization's jobs (with no `orgId`: the jobs that
+  have no organization, and only those), each with its `resourceId`/`orgId` next to its status.
+- `listAllJobs(work, { cursor?, limit? })` — a page of EVERY job, for an operator: the jobs with no organization,
+  then each organization's, lane by lane in name order, each in enqueue order. A listing is fixed at its
+  start: every job enqueued before its first page is listed exactly once, and one enqueued after it — into
+  any lane, a new organization's included — is not (it is the next listing's), so it ends under producers
+  that never stop. "Before" is the job record's time, its producer's clock. Refuses an organization's view of the store. A page costs its lanes' reads and
+  one read of its jobs' markers, never a query per job (measured, Postgres, 100 organizations × 100 jobs: 503
+  statements for all 10 000 at 100 a page).
 - `retryJob(work, id)` re-enqueues a dead letter for the same owner.
 - `cancelJob(work, id)` cancels a job that has not finished (see above).
 - `moveJob(work, id, owner)` gives a pre-upgrade system job its owner, without doubling it.
+- `queueUpgrade` — the queue's upgrade steps (`queue/lanes`, `queue/lanes-cleanup`) for `registerUpgradeSteps`.
 - `jobEraser(storage)` erases one person's jobs (see above).
 
 ## How it works

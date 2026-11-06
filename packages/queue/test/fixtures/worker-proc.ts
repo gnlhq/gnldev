@@ -3,7 +3,8 @@
 // the test. Exits when every job is terminal.
 import { appendFileSync } from 'node:fs';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
-import { createWorker, listJobs } from '../../src/index.js';
+import { createWorker } from '../../src/index.js';
+import { listAllJobs as listJobs } from './k5-list-all.js';
 
 const [db, effects, name] = process.argv.slice(2) as [string, string, string];
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

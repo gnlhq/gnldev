@@ -4,7 +4,8 @@
 // start the handler again, and the job must not end `failed`.
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage } from '@gnldev/durable';
-import { enqueue, createWorker, listJobs } from '../../src/index.js';
+import { enqueue, createWorker } from '../../src/index.js';
+import { listAllJobs as listJobs } from '../fixtures/k5-list-all.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

@@ -990,6 +990,13 @@ export function storageConformance(
       await s.work!.append('w1', { n: 3 });
       assert.deepEqual((await s.work!.list<{ n: number }>('w1')).items.map((r) => r.payload.n), [1, 2, 3]);
     });
+    scenario('work', 'W1b read: one record by its id, whatever else the namespace holds; another namespace\'s id, or none, is undefined', async (s) => {
+      for (let i = 0; i < 60; i++) await s.work!.append('w1b', { n: i }, `r${i}`);
+      await s.work!.append('w1b-other', { n: -1 }, 'x');
+      assert.deepEqual((await s.work!.read<{ n: number }>('w1b', 'r57'))?.payload, { n: 57 });
+      assert.equal(await s.work!.read('w1b', 'x'), undefined);
+      assert.equal(await s.work!.read('w1b', 'nope'), undefined);
+    });
     scenario('work', 'W2 ackOnce: of many racing acknowledgements exactly one wins', async (s) => {
       const won = await Promise.all(Array.from({ length: 16 }, () => s.work!.ackOnce('w2:ack')));
       if (exactClaim) {
@@ -1007,6 +1014,228 @@ export function storageConformance(
       const read = await s.work!.get('w3:own');
       const won = await Promise.all(Array.from({ length: 16 }, (_, i) => s.work!.putIfMatch!('w3:own', read, { token: `t${i}` })));
       assert.equal(won.filter(Boolean).length, 1);
+    });
+    // ── The ready set (`WorkStore.appendReady`): one take, fair across namespaces, never twice ────────
+    const readySet = () => `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const takeAll = async (s: Storage, set: string, now: number) => {
+      const out: string[] = [];
+      const holder = { hold: `${set}-all`, ttlMs: 60_000 };
+      for (let got = await s.work!.takeReady(set, { now, holder }); got; got = await s.work!.takeReady(set, { now, holder })) out.push(got.id);
+      return out;
+    };
+    scenario('work', 'W4 ready set: a namespace with nothing waiting joins the round under way; each namespace is taken in append order', async (s) => {
+      const set = readySet();
+      const e = { set, kind: 'k', notBefore: 0, now: 1 };
+      for (const id of ['a1', 'a2', 'a3']) await s.work!.appendReady(`${set}:a`, { id }, id, e);
+      await s.work!.appendReady(`${set}:b`, { id: 'b1' }, 'b1', e);
+      await s.work!.appendReady(`${set}:c`, { id: 'c1' }, 'c1', e);
+      await s.work!.appendReady(`${set}:b`, { id: 'b2' }, 'b2', e);
+      assert.deepEqual(await takeAll(s, set, 1), ['a1', 'b1', 'c1', 'a2', 'b2', 'a3']);
+      assert.deepEqual((await s.work!.read(`${set}:a`, 'a2'))?.payload, { id: 'a2' });
+    });
+    scenario('work', 'W5 ready set: entries of one namespace appended at once are ranked one after another, never alike', async (s) => {
+      if (serialisesAppends === false) return;
+      const set = readySet();
+      const e = { set, kind: 'k', notBefore: 0, now: 1 };
+      await Promise.all(Array.from({ length: 12 }, (_, i) => s.work!.appendReady(`${set}:x`, {}, `x${i}`, e)));
+      await s.work!.appendReady(`${set}:y`, {}, 'y0', e);
+      const order = await takeAll(s, set, 1);
+      assert.equal(order.length, 13);
+      assert.ok(order.indexOf('y0') <= 1, `y0 was taken ${order.indexOf('y0') + 1}th: ${order.join(' ')}`);
+    });
+    scenario('work', 'W6 ready set: of many racing takers each entry goes to one; a held, deferred, dropped or skipped entry is not taken', async (s) => {
+      const set = readySet();
+      const holder = (hold: string) => ({ hold, ttlMs: 100 });
+      for (let i = 0; i < 20; i++) await s.work!.appendReady(`${set}:n${i % 4}`, {}, `j${i}`, { set, kind: i === 19 ? 'slow' : 'k', notBefore: 0, now: 1 });
+      await s.work!.deferReady(set, 'j0', 50);
+      await s.work!.dropReady(set, 'j1');
+      const got = await Promise.all(Array.from({ length: 24 }, (_, i) => s.work!.takeReady(set, { now: 10, holder: holder(`h${i}`), skipKinds: ['slow'] })));
+      const ids = got.filter((g) => g !== undefined).map((g) => g!.id);
+      assert.equal(new Set(ids).size, ids.length, `an entry was taken twice: ${ids.join(' ')}`);
+      assert.deepEqual([...ids].sort(), Array.from({ length: 17 }, (_, i) => `j${i + 2}`).sort());
+      assert.equal(await s.work!.takeReady(set, { now: 10, holder: holder('x'), skipKinds: ['slow'] }), undefined);
+      assert.equal((await s.work!.takeReady(set, { now: 10, holder: holder('y') }))?.id, 'j19');
+      assert.equal((await s.work!.takeReady(set, { now: 60, holder: holder('z') }))?.id, 'j0');
+      // A held entry is not handed out again however late it is asked: only its holder lets it go.
+      assert.equal(await s.work!.takeReady(set, { now: 1e12, holder: holder('late') }), undefined);
+    });
+    scenario('work', 'W11 ready set: a held entry carries its holder\'s stamp; only its own hold lets it go, and it keeps its rank', async (s) => {
+      const set = readySet();
+      const e = { set, kind: 'k', notBefore: 0, now: 1 };
+      for (const id of ['a1', 'a2']) await s.work!.appendReady(`${set}:a`, {}, id, e);
+      await s.work!.appendReady(`${set}:b`, {}, 'b1', e);
+      assert.equal((await s.work!.takeReady(set, { now: 7, holder: { hold: 'h1', proc: 'p1', ttlMs: 5 } }))?.id, 'a1');
+      assert.deepEqual(await s.work!.heldReady(set), [{ id: 'a1', hold: 'h1', proc: 'p1', at: 7, ttlMs: 5 }]);
+      await s.work!.deferReady(set, 'a1', 7, 'not-h1');
+      assert.equal((await s.work!.heldReady(set)).length, 1, 'another hold does not let it go');
+      assert.equal((await s.work!.takeReady(set, { now: 8, holder: { hold: 'h2', ttlMs: 5 } }))?.id, 'b1');
+      assert.deepEqual((await s.work!.heldReady(set)).map((h) => [h.id, h.hold, h.proc]).sort(), [['a1', 'h1', 'p1'], ['b1', 'h2', undefined]]);
+      await s.work!.deferReady(set, 'a1', 8, 'h1');
+      assert.deepEqual((await s.work!.heldReady(set)).map((h) => h.id), ['b1']);
+      // Let go, it is taken in its own rank's turn again: before a2.
+      assert.equal((await s.work!.takeReady(set, { now: 9, holder: { hold: 'h3', ttlMs: 5 } }))?.id, 'a1');
+      assert.equal((await s.work!.takeReady(set, { now: 9, holder: { hold: 'h4', ttlMs: 5 } }))?.id, 'a2');
+    });
+    scenario('work', 'W7 ready set: appendReady is idempotent; an erased id and an erased namespace take their entries with them', async (s) => {
+      const set = readySet();
+      const e = { set, kind: 'k', notBefore: 0, now: 1 };
+      const nsA = `${set}:a`;
+      const nsB = `${set}:b`;
+      await s.work!.appendReady(nsA, { v: 1 }, 'p:1', e);
+      await s.work!.appendReady(nsA, { v: 2 }, 'p:1', e);
+      await s.work!.appendReady(nsA, {}, 'q:1', e);
+      await s.work!.appendReady(nsB, {}, 'b:1', e);
+      assert.deepEqual((await s.work!.read(nsA, 'p:1'))?.payload, { v: 1 });
+      if (s.work!.deleteIdPrefix) await s.work!.deleteIdPrefix('p:');
+      if (s.work!.deletePrefix) await s.work!.deletePrefix(nsB);
+      const left = await takeAll(s, set, 1);
+      assert.deepEqual(left, [...(s.work!.deleteIdPrefix ? [] : ['p:1']), 'q:1', ...(s.work!.deletePrefix ? [] : ['b:1'])]);
+    });
+    scenario('work', 'W8 ready set: 100 entries of one namespace appended at once are ranked one step apart from the first', async (s) => {
+      if (serialisesAppends === false) return;
+      const set = readySet();
+      const e = { set, kind: 'k', notBefore: 0, now: 1 };
+      await Promise.all(Array.from({ length: 100 }, (_, i) => s.work!.appendReady(`${set}:x`, {}, `x${i}`, e)));
+      await s.work!.appendReady(`${set}:y`, {}, 'y1', e);
+      await s.work!.appendReady(`${set}:y`, {}, 'y2', e);
+      const order = await takeAll(s, set, 1);
+      assert.equal(order.length, 102);
+      // y1 joins at the first rank (after the x there, appended first), y2 one step later (after the x there).
+      assert.deepEqual([order.indexOf('y1'), order.indexOf('y2')], [1, 3], order.slice(0, 6).join(' '));
+    });
+    scenario('work', 'W9 ready set: when a namespace\'s highest entry leaves (dropped or erased), its next entry is ranked after the highest one left', async (s) => {
+      const set = readySet();
+      const e = { set, kind: 'k', notBefore: 0, now: 1 };
+      for (const id of ['a1', 'a2', 'a3']) await s.work!.appendReady(`${set}:a`, {}, id, e);
+      for (const id of ['c1', 'c2', 'c3', 'c4']) await s.work!.appendReady(`${set}:c`, {}, id, e);
+      await s.work!.dropReady(set, 'a3');
+      await s.work!.appendReady(`${set}:a`, {}, 'a4', e);
+      assert.deepEqual(await takeAll(s, set, 1), ['a1', 'c1', 'a2', 'c2', 'c3', 'a4', 'c4']);
+      if (!s.work!.deleteIdPrefix) return;
+      const set2 = readySet();
+      const e2 = { ...e, set: set2 };
+      const id = (x: string) => `${set2}-${x}`;
+      for (const x of ['a1', 'a2', 'z3']) await s.work!.appendReady(`${set2}:a`, {}, id(x), e2);
+      for (const x of ['c1', 'c2', 'c3', 'c4']) await s.work!.appendReady(`${set2}:c`, {}, id(x), e2);
+      await s.work!.deleteIdPrefix(id('z'));
+      await s.work!.appendReady(`${set2}:a`, {}, id('a4'), e2);
+      assert.deepEqual(await takeAll(s, set2, 1), ['a1', 'c1', 'a2', 'c2', 'c3', 'a4', 'c4'].map(id));
+    });
+    scenario('work', 'W10 ready set: a namespace whose every entry left joins the round under way again', async (s) => {
+      const set = readySet();
+      const e = { set, kind: 'k', notBefore: 0, now: 1 };
+      for (const id of ['a1', 'a2', 'a3']) await s.work!.appendReady(`${set}:a`, {}, id, e);
+      for (const id of ['c1', 'c2', 'c3', 'c4']) await s.work!.appendReady(`${set}:c`, {}, id, e);
+      for (const id of ['a3', 'a1', 'a2']) await s.work!.dropReady(set, id);
+      await s.work!.appendReady(`${set}:a`, {}, 'a5', e);
+      assert.deepEqual(await takeAll(s, set, 1), ['c1', 'a5', 'c2', 'c3', 'c4']);
+    });
+    // ── appendMany: many records and their entries in one write, each namespace ranked in one turn ─────
+    scenario('work', 'W12 appendMany: each namespace\'s entries in call order, one step apart, ranked as appendReady one after another would rank them', async (s) => {
+      const set = readySet();
+      const e = { set, kind: 'k', notBefore: 0, now: 1 };
+      await s.work!.appendReady(`${set}:a`, { id: 'a1' }, 'a1', e);
+      await s.work!.appendMany([
+        { ns: `${set}:b`, payload: { id: 'b1' }, id: 'b1', entry: e },
+        { ns: `${set}:b`, payload: { id: 'b2' }, id: 'b2', entry: e },
+        { ns: `${set}:plain`, payload: { id: 'p1' }, id: 'p1' },
+        { ns: `${set}:b`, payload: { id: 'b3' }, id: 'b3', entry: e },
+        { ns: `${set}:c`, payload: { id: 'c1' }, id: 'c1', entry: e },
+        { ns: `${set}:a`, payload: { id: 'a2' }, id: 'a2', entry: e },
+      ]);
+      assert.deepEqual(await takeAll(s, set, 1), ['a1', 'b1', 'c1', 'b2', 'a2', 'b3']);
+      assert.deepEqual((await s.work!.list<{ id: string }>(`${set}:b`)).items.map((r) => r.payload.id), ['b1', 'b2', 'b3']);
+      assert.deepEqual((await s.work!.read(`${set}:plain`, 'p1'))?.payload, { id: 'p1' }, 'a record with no entry is appended to its log, and is in no set');
+    });
+    scenario('work', 'W13 appendMany is idempotent: a record or entry already there stays, an id repeated in the call counts once and takes no rank', async (s) => {
+      const set = readySet();
+      const e = { set, kind: 'k', notBefore: 0, now: 1 };
+      const a = `${set}:a`;
+      await s.work!.appendReady(a, { v: 1 }, 'p1', e);
+      await s.work!.appendMany([
+        { ns: a, payload: { v: 2 }, id: 'p1', entry: e },
+        { ns: a, payload: { v: 1 }, id: 'q1', entry: e },
+        { ns: a, payload: { v: 3 }, id: 'q1', entry: e },
+        { ns: a, payload: { v: 1 }, id: 'q2', entry: e },
+      ]);
+      for (const id of ['b1', 'b2', 'b3']) await s.work!.appendReady(`${set}:b`, {}, id, e);
+      assert.deepEqual(await takeAll(s, set, 1), ['p1', 'b1', 'q1', 'b2', 'q2', 'b3']);
+      assert.deepEqual((await s.work!.list<{ v: number }>(a)).items.map((r) => [r.id, r.payload.v]), [['p1', 1], ['q1', 1], ['q2', 1]]);
+    });
+    scenario('work', 'W14 appendMany: calls on one namespace at once are ranked one after another, never alike', async (s) => {
+      if (serialisesAppends === false) return;
+      const set = readySet();
+      const e = { set, kind: 'k', notBefore: 0, now: 1 };
+      await Promise.all(Array.from({ length: 4 }, (_, b) => s.work!.appendMany(Array.from({ length: 25 }, (_, i) => ({ ns: `${set}:x`, payload: {}, id: `x${b}-${i}`, entry: e })))));
+      for (const id of ['y1', 'y2', 'y3']) await s.work!.appendReady(`${set}:y`, {}, id, e);
+      const order = await takeAll(s, set, 1);
+      assert.equal(order.length, 103);
+      assert.deepEqual(['y1', 'y2', 'y3'].map((y) => order.indexOf(y)), [1, 3, 5], order.slice(0, 8).join(' '));
+    });
+    scenario('work', 'W15 appendMany: an empty call writes nothing; a call naming two sets or two times is refused before anything is written; an erased top is followed', async (s) => {
+      const set = readySet();
+      const e = { set, kind: 'k', notBefore: 0, now: 1 };
+      await s.work!.appendMany([]);
+      await assert.rejects(s.work!.appendMany([
+        { ns: `${set}:a`, payload: {}, id: 'm1', entry: e },
+        { ns: `${set}:a`, payload: {}, id: 'm2', entry: { ...e, set: `${set}-other` } },
+      ]), TypeError);
+      await assert.rejects(s.work!.appendMany([
+        { ns: `${set}:a`, payload: {}, id: 'm1', entry: e },
+        { ns: `${set}:a`, payload: {}, id: 'm2', entry: { ...e, now: 2 } },
+      ]), TypeError);
+      assert.equal(await s.work!.read(`${set}:a`, 'm1'), undefined);
+      assert.deepEqual(await takeAll(s, set, 1), []);
+      // As W9: when the namespace's highest entry leaves, its next entry follows the highest one left.
+      await s.work!.appendMany(['a1', 'a2', 'a3'].map((id) => ({ ns: `${set}:a`, payload: {}, id, entry: e })));
+      await s.work!.appendMany(['c1', 'c2', 'c3', 'c4'].map((id) => ({ ns: `${set}:c`, payload: {}, id, entry: e })));
+      await s.work!.dropReady(set, 'a3');
+      await s.work!.appendMany([{ ns: `${set}:a`, payload: {}, id: 'a4', entry: e }]);
+      assert.deepEqual(await takeAll(s, set, 1), ['a1', 'c1', 'a2', 'c2', 'c3', 'a4', 'c4']);
+    });
+    scenario('work', 'W16 listNamespaces: the namespaces of a prefix that hold a record, in byte order, paged by name; a new one after the cursor appears, none is passed or repeated', async (s) => {
+      const w = s.work!;
+      assert.equal(typeof w.listNamespaces, 'function', 'every bundled store lists the namespaces of a prefix');
+      const p = `${readySet()}n`;
+      await w.append(`${p}x`, {}, 'o1'); // outside the prefix `${p}:`
+      for (const ns of ['b', 'a', 'B', 'a:z', 'c']) await w.append(`${p}:${ns}`, {}, `i-${ns}`);
+      await w.append(`${p}:a`, {}, 'i-a2');
+      const all = async (limit: number, during?: (i: number) => Promise<void>) => {
+        const out: string[] = [];
+        let cursor: string | undefined;
+        for (let i = 0; ; i++) {
+          const page = await w.listNamespaces!(`${p}:`, { limit, ...(cursor !== undefined ? { cursor } : {}) });
+          assert.ok(page.items.length <= limit);
+          out.push(...page.items);
+          await during?.(i);
+          if (!page.nextCursor) return out;
+          cursor = page.nextCursor;
+        }
+      };
+      const want = ['B', 'a', 'a:z', 'b', 'c'].map((x) => `${p}:${x}`); // byte order: 'B' (0x42) before 'a'
+      assert.deepEqual(await all(50), want);
+      assert.deepEqual(await all(2), want);
+      assert.deepEqual(await all(1), want);
+      // Added while paging: after the cursor it appears, before it it does not; nothing repeats.
+      const seen = await all(2, async (i) => { if (i === 0) { await w.append(`${p}:A`, {}, 'n1'); await w.append(`${p}:d`, {}, 'n2'); } });
+      assert.deepEqual(seen, [...want, `${p}:d`]);
+      assert.deepEqual((await w.listNamespaces!(`${p}:zz`)).items, []);
+      // A namespace whose records were all deleted holds none.
+      await w.deleteIdPrefix?.('i-c');
+      if (w.deleteIdPrefix) assert.equal((await all(50)).includes(`${p}:c`), false);
+    });
+    scenario('work', 'W17 getMany: every key\'s value as get answers it, in the order asked, a missing key undefined, a repeated key twice', async (s) => {
+      const w = s.work!;
+      assert.equal(typeof w.getMany, 'function', 'every bundled store reads several keys at once');
+      const p = readySet();
+      await w.put(`${p}:a`, { n: 1 });
+      await w.put(`${p}:b`, 'two');
+      assert.deepEqual(await w.getMany!([`${p}:b`, `${p}:none`, `${p}:a`, `${p}:b`]), ['two', undefined, { n: 1 }, 'two']);
+      assert.deepEqual(await w.getMany!([]), []);
+      const many = Array.from({ length: 1200 }, (_, i) => `${p}:m${i}`);
+      for (const k of many.slice(0, 1200).filter((_, i) => i % 97 === 0)) await w.put(k, k);
+      const got = await w.getMany!(many);
+      assert.deepEqual(got, many.map((k, i) => (i % 97 === 0 ? k : undefined)));
     });
 
     // ── VectorStore: the vector kit itself (vector-conformance.ts), one copy of its rules ──────────

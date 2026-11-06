@@ -284,8 +284,9 @@ const limit: Same<typeof LIMIT_ERROR_CODES, { readonly runLimitExceeded: 'run_li
 const upstream: Same<typeof UPSTREAM_ERROR_CODES, {
   readonly rateLimited: 'upstream_rate_limited'; readonly unauthorized: 'upstream_unauthorized';
   readonly unavailable: 'upstream_unavailable'; readonly timeout: 'upstream_timeout';
+  readonly unfinished: 'run_unfinished';
 }> = true;
-const upstreamCode: Same<UpstreamFailure['code'], 'upstream_rate_limited' | 'upstream_unauthorized' | 'upstream_unavailable' | 'upstream_timeout'> = true;
+const upstreamCode: Same<UpstreamFailure['code'], 'upstream_rate_limited' | 'upstream_unauthorized' | 'upstream_unavailable' | 'upstream_timeout' | 'run_unfinished'> = true;
 const upstreamStatus: Same<UpstreamFailure['status'], 429 | 502 | 504> = true;
 const upstreamReturn: Same<ReturnType<typeof upstreamFailure>, UpstreamFailure | undefined> = true;
 const canceled: Same<RunCanceledError['code'], 'run_canceled'> = true;

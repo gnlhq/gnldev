@@ -21,7 +21,8 @@ import type { Storage } from '@gnldev/durable';
 import { pendingWork, storeLiveness, toJournal, unbindLiveness } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
 import { createDatabaseSync, dropDatabaseSync } from '../../../test/support/pg-admin.js';
-import { enqueue, listJobs } from '../src/index.js';
+import { enqueue } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const tsxLoader = join(dirname(createRequire(import.meta.url).resolve('tsx/package.json')), 'dist', 'loader.mjs');

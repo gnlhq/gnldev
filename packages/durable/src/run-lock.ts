@@ -15,7 +15,8 @@ import { runRecordKey } from './run-id-grammar.js';
 import { randomUUID } from 'node:crypto';
 import { claim } from './journal.js';
 import type { Journal } from './journal.js';
-import { holderAlive, procStampFor } from './process-liveness.js';
+import { bindOwnLiveness, giveBack, procStampFor } from './process-liveness.js';
+import { holderIsLive, journalNow, newHoldId, holdHere, releaseHold } from './liveness.js';
 
 export interface RunLock {
   runId: string;
@@ -50,11 +51,17 @@ interface LockRecord {
    * keeps it, a dead one loses it at once. A released lock carries no process and reads by `expires`.
    */
   proc?: string;
+  /**
+   * The acquisition holding it, in the holder's process (liveness.ts `hold`): held there from the
+   * acquisition until `release()` or a lost renewal. Its own process reads the lock as free once the
+   * acquisition is over, whether or not the release reached the store.
+   */
+  hold?: string;
 }
 
-/** Whether `cur` is held: by its holder's process when the store can answer for it, else by its age. */
+/** Whether `cur` is held: by its holder when it can be asked (liveness.ts `holderIsLive`), else by its age on the store's clock. */
 async function isHeld(journal: Journal, cur: LockRecord, at: number): Promise<boolean> {
-  return (await holderAlive(cur.proc, journal)) ?? cur.expires >= at;
+  return (await holderIsLive(cur, journal)) ?? cur.expires >= at;
 }
 
 const lockKey = (runId: string) => runRecordKey(runId, 'lock'); // ':lock' does not match parseJournalKey → invisible to the reader
@@ -68,38 +75,58 @@ const lockKey = (runId: string) => runRecordKey(runId, 'lock'); // ':lock' does 
  * done via CAS — even if two workers read the same expired record, only ONE can change it (NO
  * split-brain). If unsupported, falls back to the old best-effort get→put behavior (a documented
  * risk, the core-hardening review).
- * H2 (clock-skew): if `now` isn't given and the journal supports `now()`, the TTL decision is made
- * with the storage's own clock → wall-clock skew between workers can't disrupt takeover timing.
+ * H2 (clock-skew): the TTL is dated and judged on the storage's own clock (`journal.now()`), never a
+ * caller's: a lock dated by a process clock was born expired behind a long poll, or judged expired by a
+ * process whose clock ran ahead (k3: A4, Y1). There is no `now` to pass.
  */
 export async function acquireRunLock(
   journal: Journal,
   runId: string,
   owner: string,
   ttlMs: number,
-  now?: number,
 ): Promise<RunLock | null> {
   const key = lockKey(runId);
   const token = randomUUID();
-  const at = now ?? (journal.now ? await journal.now() : Date.now());
-  const rec: LockRecord = { owner, expires: at + ttlMs, token, ...procStampFor(journal) };
+  // A primitive called directly names its process, as durableTool and runDurable do (process-liveness.ts
+  // `bindOwnLiveness`): a lock that named none was judged by its age alone — a dead holder kept it for its
+  // whole TTL, a frozen one lost it at the TTL (k3: the waker's lock after a SIGKILL, the scheduler's A4).
+  await bindOwnLiveness(journal);
+  // The acquisition's hold travels with the process it names: it answers for THIS process's own lock,
+  // whose process alone says nothing (liveness.ts `holderIsLive`). A lock that names no process (no
+  // liveness for the store) carries none and is judged by its age, as a lease that is not renewed should be.
+  const proc = procStampFor(journal);
+  const hold = proc.proc !== undefined ? newHoldId() : undefined;
+  const at = await journalNow(journal);
+  const rec: LockRecord = { owner, expires: at + ttlMs, token, ...proc, ...(hold ? { hold } : {}) };
+  // Held here before it is written: a reader in this process never sees it written and not held.
+  holdHere(hold, journal);
+  const won = async (): Promise<RunLock | null> => {
+    if (await claim(journal, key, rec)) return mkLock(journal, runId, owner, token, hold);
 
-  if (await claim(journal, key, rec)) return mkLock(journal, runId, owner, token);
+    const cur = await journal.get<LockRecord>(key);
+    if (cur && (await isHeld(journal, cur, at))) return null; // a live lock belongs to someone else
 
-  const cur = await journal.get<LockRecord>(key);
-  if (cur && (await isHeld(journal, cur, at))) return null; // a live lock belongs to someone else
+    if (!cur) {
+      // The claim was lost but the record couldn't be read either (raced with purge/deletion) → try atomically once more.
+      return (await claim(journal, key, rec)) ? mkLock(journal, runId, owner, token, hold) : null;
+    }
 
-  if (!cur) {
-    // The claim was lost but the record couldn't be read either (raced with purge/deletion) → try atomically once more.
-    return (await claim(journal, key, rec)) ? mkLock(journal, runId, owner, token) : null;
+    // Not held (its holder is gone, or — nobody to ask — it expired) → take over. If putIfMatch is available it's ATOMIC: change it if the expired record we
+    // read is still in place; if another worker acted first, false → null (the loser doesn't run).
+    // A new token is written → the old owner's handle cannot release/write (see mkLock: no-op on token mismatch).
+    return (await journal.putIfMatch(key, cur, rec)) ? mkLock(journal, runId, owner, token, hold) : null;
+  };
+  try {
+    const lock = await won();
+    if (!lock) releaseHold(hold, journal);
+    return lock;
+  } catch (e) {
+    releaseHold(hold, journal);
+    throw e;
   }
-
-  // Not held (its process is dead, or — no process to ask — it expired) → take over. If putIfMatch is available it's ATOMIC: change it if the expired record we
-  // read is still in place; if another worker acted first, false → null (the loser doesn't run).
-  // A new token is written → the old owner's handle cannot release/write (see mkLock: no-op on token mismatch).
-  return (await journal.putIfMatch(key, cur, rec)) ? mkLock(journal, runId, owner, token) : null;
 }
 
-function mkLock(journal: Journal, runId: string, owner: string, token: string): RunLock {
+function mkLock(journal: Journal, runId: string, owner: string, token: string, hold: string | undefined): RunLock {
   const key = lockKey(runId);
   return {
     runId,
@@ -111,9 +138,9 @@ function mkLock(journal: Journal, runId: string, owner: string, token: string): 
     // split-brain). If it matches, moves `expires` to `now + ttlMs` — the token DOES NOT CHANGE (same acquisition, just the duration is extended).
     renew: async (ttlMs: number) => {
       const cur = await journal.get<LockRecord>(key);
-      if (!cur || cur.token !== token) return false; // stale owner → rejected, record is not renewed
-      const at = await journal.now();
-      const next: LockRecord = { owner, expires: at + ttlMs, token, ...procStampFor(journal) };
+      if (!cur || cur.token !== token) { releaseHold(hold, journal); return false; } // stale owner → rejected, record is not renewed; the acquisition is over
+      const at = await journalNow(journal);
+      const next: LockRecord = { owner, expires: at + ttlMs, token, ...procStampFor(journal), ...(hold ? { hold } : {}) };
       // SAME philosophy as the takeover CAS in acquireRunLock: atomic if putIfMatch is available
       // (change it if the record we read is still in place — if a takeover happened in between,
       // returns false, the record is not corrupted). Otherwise falls back to best-effort get→put
@@ -132,20 +159,22 @@ function mkLock(journal: Journal, runId: string, owner: string, token: string): 
       // between (the next get sees our token with a fresh `expires` → retry against the fresh record,
       // otherwise the lock we mean to free stays live until TTL). Bounded, so a hot takeover race can
       // never spin.
-      try {
+      // The acquisition is over the moment its holder releases it — in this process at once, whether or
+      // not the write below reaches the store (k3 S4: a release that failed once held the lock for the life
+      // of the process).
+      releaseHold(hold, journal);
+      // A storage error here never surfaces into the caller's cleanup path (queue's renew-failure tests
+      // measured it escaping through finally-release). The write is not dropped either: while this
+      // process lives, the others read a lock that names it as held — so it is retried until it lands
+      // (process-liveness.ts `giveBack`). Fenced by the token: a late retry never frees a later acquisition.
+      await giveBack(token, journal, async () => {
         for (let attempt = 0; attempt < 3; attempt++) {
           const cur = await journal.get<LockRecord>(key);
           if (!cur || cur.token !== token) return; // stale owner → rejected, silent no-op
           const dead: LockRecord = { owner, expires: 0, token };
           if (await journal.putIfMatch(key, cur, dead)) return;
         }
-      } catch {
-        // Release is BEST-EFFORT by contract (every caller's posture is "release; TTL reclaims on
-        // failure") — a storage error here must not surface into the caller's cleanup path. The old
-        // plain-put release could throw too, but only on `put`; the CAS rewrite added get/putIfMatch
-        // round-trips, and queue's renew-failure tests measured those errors ESCAPING through
-        // finally-release. The lock simply stays until TTL, which is exactly the documented fallback.
-      }
+      });
     },
   };
 }

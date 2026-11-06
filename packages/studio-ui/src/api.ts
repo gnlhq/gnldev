@@ -523,7 +523,7 @@ export interface SchedulerTrigger {
   maxAttempts: number;
   fireCount: number;
   status: 'pending' | 'done' | 'failed' | 'paused';
-  misfire: 'skip' | 'catchup';
+  misfire: 'latest' | 'earliest' | 'none' | 'catchup';
   /** The IANA zone a cron is read in; absent = UTC. */
   tz?: string;
   /**

@@ -34,7 +34,7 @@ import type { Journal, ToolJournalRecord } from './journal.js';
 import { stableStringify } from './hash.js';
 import { stampFormat, upgradeFormat } from './format.js';
 import { journalNow, stampIsLive, claimIsLive, holdHere, releaseHold } from './liveness.js';
-import { procStampFor, livenessFor } from './process-liveness.js';
+import { procStampFor, livenessFor, giveBack, sessionBack, LivenessUnavailableError } from './process-liveness.js';
 import { claimXidInFlight, renewXid, releaseXid, type XidHeld, type XidPlan, type XidRecord } from './xid.js';
 import { keepLateReport, type LateWriter } from './call-outcome.js';
 
@@ -221,10 +221,16 @@ export class Attempt {
       // new one) is not its own any more: the others read that id as dead.
       const proc = livenessFor(this.journal);
       const stampedBy = (this.stamp as { proc?: string }).proc;
-      if (proc && stampedBy !== undefined && (stampedBy !== proc.id || !(await proc.confirm()))) {
+      if (proc && stampedBy !== undefined && stampedBy !== proc.id) {
         this.state = 'lost';
         throw new AttemptLost(this.key);
       }
+      // A session that is gone for a moment (a proof answered late under load, a terminated backend) is not
+      // a call taken over: the others read this process as dead only a whole grace after its lock went, and
+      // it takes the lock back under the same id. The body waits for it. One that is not back in time starts
+      // nothing, and the claim stays this attempt's — the caller gives it back (the body never started) with
+      // the refusal that says why, not as a call another executor holds.
+      if (proc && stampedBy !== undefined && !(await sessionBack(proc))) throw new LivenessUnavailableError();
       if (performance.now() - this.datedAt < this.stamp.claimTtlMs / 2) return;
       if (!(await this.renew())) throw new AttemptLost(this.key);
     });
@@ -317,7 +323,9 @@ export class Attempt {
    * The call failed after its claim and before its body: nothing ran, so the record goes back to what
    * it was before this attempt claimed it — none (a 'released' marker stands for that), or an earlier
    * failed or crashed attempt with its counter. Only over its own stamp; the marker and id go back with
-   * it. A failure here leaves the claim as it was — it expires by its TTL, never a silent re-run.
+   * it. A write that fails is retried by this process until it lands (process-liveness.ts `giveBack`):
+   * while this process lives, the claim names it and every other process reads the call as busy. Fenced
+   * by this attempt's stamp, a late retry never touches a later claim of the same call.
    */
   async giveBack(): Promise<void> {
     // Once the body started there is nothing to give back — and a timed-out body still running keeps
@@ -326,15 +334,22 @@ export class Attempt {
     await this.serial(async () => {
       this.stop();
       if (this.state !== 'held') return;
-      try {
-        const back = this.prior !== undefined
-          ? this.prior
-          : stampFormat({ status: 'released', notStarted: true, releasedAt: await journalNow(this.journal), toolName: this.toolName } satisfies UnstartedRelease);
-        this.state = (await compareAndSet(this.journal, this.key, this.stamp, back)) ? 'settled' : 'lost';
-        if (this.state === 'settled') await this.releaseMarkers();
-      } catch (err) {
-        console.warn(`@gnldev/durable: '${this.toolName}' failed before it ran, and its claim (${this.key}) could not be given back — it expires by its TTL:`, err);
-      }
+      let said = false;
+      await giveBack(this.stamp.hold ?? `${this.key}#${this.stamp.attempts}`, this.journal, async () => {
+        try {
+          if (this.state === 'held') {
+            const back = this.prior !== undefined
+              ? this.prior
+              : stampFormat({ status: 'released', notStarted: true, releasedAt: await journalNow(this.journal), toolName: this.toolName } satisfies UnstartedRelease);
+            this.state = (await compareAndSet(this.journal, this.key, this.stamp, back)) ? 'settled' : 'lost';
+          }
+          if (this.state === 'settled') await this.releaseMarkers();
+        } catch (err) {
+          if (!said) console.warn(`@gnldev/durable: '${this.toolName}' failed before it ran, and its claim (${this.key}) could not be given back yet — retried until it lands:`, err);
+          said = true;
+          throw err;
+        }
+      });
     });
   }
 
@@ -423,9 +438,11 @@ export class Attempt {
   private async releaseHeldDup(): Promise<void> {
     if (!this.dup) return;
     const { key, toolCallId, claimed, gone } = this.dup;
+    if (!gone) {
+      const released: DupMarker = { firstToolCallId: toolCallId, at: await journalNow(this.journal), released: true };
+      await compareAndSet(this.journal, key, claimed, released);
+    }
+    // Forgotten once given back — a write that failed is tried again by the retry of the give-back.
     this.dup = undefined;
-    if (gone) return;
-    const released: DupMarker = { firstToolCallId: toolCallId, at: await journalNow(this.journal), released: true };
-    await compareAndSet(this.journal, key, claimed, released);
   }
 }

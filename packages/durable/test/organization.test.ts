@@ -1,6 +1,6 @@
 // withOrg: journal scoped to an organization — the same runId is independent across different
 // organizations, exactly-once guarantees are preserved per organization, the read surface (listRuns) is isolated.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { tool, stepCountIs } from 'ai';
 import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';
@@ -10,6 +10,13 @@ import { acquireRunLock } from '../src/run-lock.js';
 import { getOrgUsage, USAGE_KEY } from '../src/budget.js';
 import { runDurable } from '../src/run.js';
 import { createMockModel, toolCallResult, finalTextResult, countToolResults } from './mock.js';
+
+// k3: acquireRunLock dates and judges a lock on the store's clock only; a test moves that clock.
+async function atClock<T>(t: number, f: () => Promise<T>): Promise<T> {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(t);
+  try { return await f(); } finally { vi.useRealTimers(); }
+}
 
 function agentModel(text: string) {
   return createMockModel(async (options: any) =>
@@ -106,13 +113,13 @@ describe('withOrg: optional capability bridges (no capability loss)', () => {
   it('run-lock: of two workers racing to take over an expired lock in the org view, ONLY ONE succeeds (CAS)', async () => {
     const shared = new InMemoryJournal();
     const acme = withOrg(shared, 'acme');
-    const stale = await acquireRunLock(acme, 'r1', 'w-old', 10, 1_000);
+    const stale = await atClock(1_000, () => acquireRunLock(acme, 'r1', 'w-old', 10));
     expect(stale).not.toBeNull(); // acquired at t=1000, stale at t=1010
 
-    const [a, b] = await Promise.all([
-      acquireRunLock(acme, 'r1', 'w-a', 60_000, 5_000),
-      acquireRunLock(acme, 'r1', 'w-b', 60_000, 5_000),
-    ]);
+    const [a, b] = await atClock(5_000, () => Promise.all([
+      acquireRunLock(acme, 'r1', 'w-a', 60_000),
+      acquireRunLock(acme, 'r1', 'w-b', 60_000),
+    ]));
     const winners = [a, b].filter(Boolean);
     expect(winners).toHaveLength(1); // without the putIfMatch bridge, best-effort put → BOTH would "win"
   });

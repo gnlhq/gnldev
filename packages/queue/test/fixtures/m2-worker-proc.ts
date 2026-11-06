@@ -12,9 +12,11 @@ import { createQueue } from '../../src/index.js';
 const [kind, db, effects, go, name, runner, mode, maxAttempts, livenessId] = process.argv.slice(2) as [string, string, string, string, string, string, string, string, string | undefined];
 setInterval(() => { try { process.kill(Number(runner), 0); } catch { process.exit(1); } }, 500).unref();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// A configured liveness id (a pm2 slot, a hostname): a prefix — the process's id is its own. It is the store's liveness.
+const liveness = livenessId ? (kind === 'postgres' ? await postgresLiveness({ connectionString: db, id: livenessId }) : sqliteLiveness(db, livenessId)) : undefined;
 const storage: Storage = kind === 'postgres'
-  ? new (await import('@gnldev/durable/postgres')).PostgresStorage({ connectionString: db }) as unknown as Storage
-  : new SqliteStorage(db) as unknown as Storage;
+  ? new (await import('@gnldev/durable/postgres')).PostgresStorage({ connectionString: db, ...(liveness ? { liveness } : {}) }) as unknown as Storage
+  : new SqliteStorage(db, liveness ? { liveness } : {}) as unknown as Storage;
 await storage.init?.();
 drainOnSignal({ deadlineMs: 20_000, onDrained: async () => { await storage.close?.(); } });
 
@@ -40,8 +42,6 @@ createQueue(storage, {
   },
 }, {
   owner: name, ttlMs: 1_000, pollMs: 20, backoff: false, maxAttempts: Number(maxAttempts),
-  // A configured liveness id (a pm2 slot, a hostname): a prefix — the process's id is its own.
-  ...(livenessId ? { liveness: kind === 'postgres' ? await postgresLiveness({ connectionString: db, id: livenessId }) : sqliteLiveness(db, livenessId) } : {}),
 });
 appendFileSync(effects, `ready ${name}\n`);
 setInterval(() => {}, 1 << 30);

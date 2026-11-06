@@ -56,8 +56,8 @@ export async function freshDatabase(url: string): Promise<string> {
  * `[name, make]` for each configured server, `make` opening a MysqlStorage on a fresh database — the
  * shape every backend list in this suite has; spread it into one.
  */
-export function mysqlStores(label = ''): Array<[string, () => Promise<MysqlStorage>]> {
-  return MYSQL_SERVERS.map(({ name, url }) => [`${name}${label}`, async () => new MysqlStorage({ connectionString: await freshDatabase(url) })]);
+export function mysqlStores(label = '', extra: Omit<ConstructorParameters<typeof MysqlStorage>[0] & object, 'connectionString'> = {}): Array<[string, () => Promise<MysqlStorage>]> {
+  return MYSQL_SERVERS.map(({ name, url }) => [`${name}${label}`, async () => new MysqlStorage({ connectionString: await freshDatabase(url), ...extra })]);
 }
 
 type MongoAdmin = { db(name: string): { dropDatabase(): Promise<unknown> }; close(): Promise<void> };
@@ -81,6 +81,6 @@ export function freshMongoDatabase(url = MONGO_URL!): string {
 }
 
 /** `[name, make]` for the MongoDB server when GNL_MONGO_URL is set (see `mysqlStores`). */
-export function mongoStores(label = ''): Array<[string, () => Promise<MongoStorage>]> {
-  return MONGO_URL ? [[`MongoDB${label}`, async () => new MongoStorage({ connectionString: freshMongoDatabase() })]] : [];
+export function mongoStores(label = '', extra: Omit<ConstructorParameters<typeof MongoStorage>[0], 'connectionString'> = {}): Array<[string, () => Promise<MongoStorage>]> {
+  return MONGO_URL ? [[`MongoDB${label}`, async () => new MongoStorage({ connectionString: freshMongoDatabase(), ...extra })]] : [];
 }

@@ -10,7 +10,8 @@
 // third of it — so the stamp's own value is read first, everywhere, through this module.
 import { randomUUID } from 'node:crypto';
 import type { Journal } from './journal.js';
-import { holderAlive, storeOf } from './process-liveness.js';
+import { judgeAlive, livenessFor, storeOf } from './process-liveness.js';
+import type { ProcessLiveness } from './process-liveness.js';
 
 /** A stale 'running' claim (after a crash) can be taken over once it is older than this. */
 export const CLAIM_TTL_MS = 30_000;
@@ -65,15 +66,26 @@ function ownTtl(rec: { claimTtlMs?: unknown }, fallbackTtlMs: number): number {
 // past the TTL (a GC pause, a synchronous burst) could not renew it, and a twin of the call in the same
 // process judged it crashed and ran the effect beside it (audit 2026-10-16, a-stalled-holder-keeps-its-
 // claim.test.ts). So a holder stamp carries the id of the attempt that holds it (`hold`), and this
-// process keeps the ids it holds, by the store it holds them in (the store a journal belongs to, as the
-// process liveness is looked up), until the attempt ends. An id is never reused and never known to another
+// process keeps the ids it holds until the attempt ends. An id is never reused and never known to another
 // process, which reads it as nothing and asks the holder's process liveness, then the age.
+//
+// Besides, the process keeps every id it holds in any store (`heldAnywhere`): an id held nowhere in this
+// process names an attempt that has ENDED here — its outcome written, or its last write failed — and its
+// stamp is over, whatever its process (`holderIsLive` rule 2). One held through another object for the
+// store (a wrapper, a proxy) is not over: it is judged as before.
 
+/** Names this process lifetime in the attempt ids it gives out: an id of another process says nothing about an ending here. */
+const THIS_PROCESS = randomUUID();
 const heldHere = new WeakMap<object, Set<string>>();
+const heldAnywhere = new Set<string>();
 
 /** A new hold id, for the stamp of a claim this process is about to write. Held from `holdHere`. */
 export function newHoldId(): string {
-  return randomUUID();
+  // Not ended from the moment it exists: a reader in this process may see its stamp written before the
+  // writer is back to `holdHere` it. Whoever takes an id and does not write it gives it back (`releaseHold`).
+  const id = `${THIS_PROCESS}.${randomUUID()}`;
+  heldAnywhere.add(id);
+  return id;
 }
 
 /** This process holds the claim stamped `hold` in `journal`'s store: every reader of that store here reads it live. */
@@ -83,31 +95,52 @@ export function holdHere(hold: unknown, journal: unknown): void {
   let ids = heldHere.get(store);
   if (!ids) heldHere.set(store, (ids = new Set()));
   ids.add(hold);
+  heldAnywhere.add(hold);
 }
 
 /** The attempt that held `hold` has ended: its stamp is judged as any other's from here on. */
 export function releaseHold(hold: unknown, journal: unknown): void {
   const store = storeOf(journal);
   if (typeof hold === 'string' && store) heldHere.get(store)?.delete(hold);
+  if (typeof hold === 'string') heldAnywhere.delete(hold);
 }
+
+/** An attempt id this process gave out (`newHoldId`) and no longer holds anywhere: the attempt is over. */
+const endedHere = (hold: unknown): boolean => typeof hold === 'string' && hold.startsWith(`${THIS_PROCESS}.`) && !heldAnywhere.has(hold);
 
 /** Who a holder stamp names: the attempt (`hold`, this process's) and the process (`proc`, the store's liveness). */
 export interface StampHolder { proc?: unknown; hold?: unknown }
 
 /**
- * THE LIVENESS OF A HOLDER STAMP — the one rule. In order:
+ * WHETHER THE HOLDER OF A STAMP STILL HOLDS IT — asked of who wrote it, never of the stamp's age:
  *
- *   1. a stamp whose attempt this process holds in that store (`hold`) is live;
- *   2. a stamp that names the process holding it (`proc`) is live exactly while that process is: a
- *      frozen process — past its TTL by any clock — still holds what it holds, and a dead one holds
- *      nothing from the moment it is gone (process-liveness.ts);
- *   3. only a stamp neither can answer for is judged by its age (`isLiveStamp`).
+ *   1. a stamp whose attempt this process holds in that store (`hold`) is held;
+ *   2. a stamp naming an attempt THIS process started and has ended (`endedHere`) is not: being the
+ *      writer's process is not proof that the attempt is in flight. Its outcome was written, or its last
+ *      write failed — only this process can know it. Read as live because the process is, it stayed held
+ *      for the life of the process: a call answered busy forever, a lock never taken again (k3, A7);
+ *   3. a stamp another process wrote is held exactly while that process is alive: a frozen process —
+ *      past its TTL by any clock — still holds what it holds, a dead one holds nothing (process-liveness.ts).
  *
- * Every reader asks through here or `claimIsLive`.
+ * `undefined`: nobody can answer (no liveness for the store, no process on the stamp) — the caller
+ * judges the stamp by its age on the store's clock.
+ *
+ * `l`: the liveness that answers for the store, when the caller holds its own (an executor).
+ */
+export async function holderIsLive(holder: StampHolder, journal: unknown, l: ProcessLiveness | undefined = livenessFor(journal)): Promise<boolean | undefined> {
+  if (typeof holder.hold === 'string' && heldHere.get(storeOf(journal) ?? {})?.has(holder.hold)) return true;
+  if (endedHere(holder.hold)) return false;
+  if (!l || typeof holder.proc !== 'string') return undefined;
+  if (holder.proc === l.id) return true;
+  return judgeAlive(l, holder.proc);
+}
+
+/**
+ * THE LIVENESS OF A HOLDER STAMP — the one rule: its holder's answer (`holderIsLive`), and only when
+ * nobody can answer, its age (`isLiveStamp`). Every reader asks through here or `claimIsLive`.
  */
 export async function stampIsLive(at: unknown, ttlMs: number, now: number, holder: StampHolder, journal: unknown): Promise<boolean> {
-  if (typeof holder.hold === 'string' && heldHere.get(storeOf(journal) ?? {})?.has(holder.hold)) return true;
-  const alive = await holderAlive(holder.proc, journal);
+  const alive = await holderIsLive(holder, journal);
   if (alive !== undefined) return alive;
   return isLiveStamp(at, ttlMs, now);
 }

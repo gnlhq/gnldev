@@ -132,7 +132,8 @@ export { a, b, c, s, callerOption, worker, eraser, byEraser };
 // Nothing a user touches is `any`. The handler's payload is `any` by design (JobHandler), so it is
 // not in this list; everything the queue itself hands the handler or returns to the caller is.
 const NOTHING_IS_ANY = `
-import type { enqueue, createWorker, jobEraser, listJobs, retryJob, moveJob, JobCtx, JobHandler, EnqueueOptions, Worker, JobStatus } from '@gnldev/queue';
+import type { enqueue, enqueueMany, createWorker, jobEraser, listJobs, listAllJobs, retryJob, moveJob, moveLegacyJob, queueUpgrade, JobCtx, JobHandler, EnqueueOptions, EnqueueManyJob, ListAllJobsOptions, Worker, JobStatus } from '@gnldev/queue';
+import type { UpgradeStep, UpgradeStepFactory } from '@gnldev/durable';
 ${HELPERS}
 const ctx: IsAny<JobCtx> = false;
 const handlerCtx: IsAny<Parameters<JobHandler>[1]> = false;
@@ -150,11 +151,20 @@ const workerHandlers: IsAny<Parameters<typeof createWorker>[1]> = false;
 const worker: IsAny<Worker> = false;
 const eraser: IsAny<ReturnType<typeof jobEraser>> = false;
 const eraserArg: IsAny<Parameters<typeof jobEraser>[0]> = false;
-const jobs: IsAny<Awaited<ReturnType<typeof listJobs>>[number]> = false;
+const jobs: IsAny<Awaited<ReturnType<typeof listJobs>>['items'][number]> = false;
 const jobStatus: IsAny<JobStatus['status']> = false;
 const retry: IsAny<Awaited<ReturnType<typeof retryJob>>> = false;
 const move: IsAny<Parameters<typeof moveJob>[2]> = false;
-export { ctx, handlerCtx, caller, runArgs, runResult, journal, storage, ctxEnqueue, enqueueOptionsCaller, enqueueReturn, enqueueWork, workerStorage, workerHandlers, worker, eraser, eraserArg, jobs, jobStatus, retry, move };
+const many: IsAny<Awaited<ReturnType<typeof enqueueMany>>> = false;
+const manyJob: IsAny<EnqueueManyJob['options']> = false;
+const allJobs: IsAny<Awaited<ReturnType<typeof listAllJobs>>['items'][number]> = false;
+const allOpts: IsAny<ListAllJobsOptions['cursor']> = false;
+const legacy: IsAny<Awaited<ReturnType<typeof moveLegacyJob>>> = false;
+// The queue's upgrade steps are durable's public UpgradeStep, not a copy of its shape.
+const upgradeFactory: IsAny<typeof queueUpgrade> = false;
+const isDurableFactory: typeof queueUpgrade extends UpgradeStepFactory ? true : false = true;
+const stepOf: ReturnType<typeof queueUpgrade> extends UpgradeStep | readonly UpgradeStep[] ? true : false = true;
+export { ctx, handlerCtx, caller, runArgs, runResult, journal, storage, ctxEnqueue, enqueueOptionsCaller, enqueueReturn, enqueueWork, workerStorage, workerHandlers, worker, eraser, eraserArg, jobs, jobStatus, retry, move, many, manyJob, allJobs, allOpts, legacy, upgradeFactory, isDurableFactory, stepOf };
 `;
 
 describe('@gnldev/queue enqueue, createWorker and jobEraser', () => {

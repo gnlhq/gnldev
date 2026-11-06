@@ -1,12 +1,19 @@
 // M4 — Run-level lock end-to-end: same runId, two concurrent locked runDurable calls →
 // one gets RunBusyError, side-effect (charge) stays exactly-once.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { stepCountIs } from 'ai';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
 import { acquireRunLock } from '../src/run-lock.js';
 import { RunBusyError } from '../src/errors.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
+
+// k3: acquireRunLock dates and judges a lock on the store's clock only; a test moves that clock.
+async function atClock<T>(t: number, f: () => Promise<T>): Promise<T> {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(t);
+  try { return await f(); } finally { vi.useRealTimers(); }
+}
 
 describe('M4 run-lock', () => {
   it('2 concurrent locked runs → one gets RunBusyError, charge is exactly 1', async () => {
@@ -97,12 +104,12 @@ describe('M4.2 fencing token', () => {
 
     // A acquires the lock with a short TTL.
     const now0 = 1_000;
-    const lockA = await acquireRunLock(journal, runId, 'A', 100, now0);
+    const lockA = await atClock(now0, () => acquireRunLock(journal, runId, 'A', 100));
     expect(lockA).not.toBeNull();
 
     // TTL expired → B (new owner) takes over; a new fencing token is generated.
     const now1 = now0 + 200;
-    const lockB = await acquireRunLock(journal, runId, 'B', 5_000, now1);
+    const lockB = await atClock(now1, () => acquireRunLock(journal, runId, 'B', 5_000));
     expect(lockB).not.toBeNull();
     expect(lockB!.owner).toBe('B');
 
@@ -115,7 +122,7 @@ describe('M4.2 fencing token', () => {
     expect(afterStaleRelease).toEqual(afterTakeover); // A's release changed nothing
 
     // B (the new/real owner) can still work: someone else (C) cannot acquire the lock at the same time (B keeps it alive).
-    const lockC = await acquireRunLock(journal, runId, 'C', 5_000, now1 + 1);
+    const lockC = await atClock(now1 + 1, () => acquireRunLock(journal, runId, 'C', 5_000));
     expect(lockC).toBeNull();
 
     // When B releases its own lock it is genuinely freed (its own fencing token is valid → it writes).
@@ -124,7 +131,7 @@ describe('M4.2 fencing token', () => {
     expect(afterRealRelease?.expires).toBe(0);
 
     // The now-free lock can be acquired by someone else (D).
-    const lockD = await acquireRunLock(journal, runId, 'D', 5_000, now1 + 2);
+    const lockD = await atClock(now1 + 2, () => acquireRunLock(journal, runId, 'D', 5_000));
     expect(lockD).not.toBeNull();
     expect(lockD!.owner).toBe('D');
   });
@@ -168,11 +175,11 @@ describe('Y2 renew (heartbeat)', () => {
     const runId = 'r-renew-stale';
     const key = `${runId}:lock`;
     const t0 = 1_000;
-    const lockA = await acquireRunLock(journal, runId, 'A', 100, t0);
+    const lockA = await atClock(t0, () => acquireRunLock(journal, runId, 'A', 100));
     expect(lockA).not.toBeNull();
 
     // TTL expired → B takes over (new fencing token) — A is now stale.
-    const lockB = await acquireRunLock(journal, runId, 'B', 5_000, t0 + 200);
+    const lockB = await atClock(t0 + 200, () => acquireRunLock(journal, runId, 'B', 5_000));
     expect(lockB).not.toBeNull();
     const afterTakeover = await journal.get(key);
 

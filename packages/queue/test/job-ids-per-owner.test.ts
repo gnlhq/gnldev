@@ -5,7 +5,8 @@
 // organization filling `maxDepth` refused every other organization's work.
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, withOrgStorage, userIdOf } from '@gnldev/durable';
-import { enqueue, createWorker, listJobs, retryJob, QueueDepthExceededError } from '../src/index.js';
+import { enqueue, createWorker, retryJob, QueueDepthExceededError } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 describe('job ids belong to their owner', () => {
   it('two organizations with the same explicit id get two jobs, each run as its own', async () => {

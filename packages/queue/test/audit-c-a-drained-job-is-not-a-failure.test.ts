@@ -7,7 +7,8 @@
 // ("another process continues it") as its error, and nobody continues it.
 import { describe, it, expect, afterEach } from 'vitest';
 import { InMemoryStorage, beginDrain, endDrain, type Storage } from '@gnldev/durable';
-import { enqueue, createWorker, listJobs } from '../src/index.js';
+import { enqueue, createWorker } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 /** Turn 1: call `send`. Turn 2: answer. */

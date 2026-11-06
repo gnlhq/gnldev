@@ -3,7 +3,8 @@
 // with that user, and the user can see and approve it. A job without them is the system's, as before.
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, withOrgStorage, withSubjectJournal, user, UNKNOWN } from '@gnldev/durable';
-import { enqueue, createWorker, listJobs, retryJob, type JobCtx } from '../src/index.js';
+import { enqueue, createWorker, retryJob, type JobCtx } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 describe('a job enqueued on behalf of an end user', () => {
   it('reaches the handler with the user, the organization, and storage scoped to it', async () => {

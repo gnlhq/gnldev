@@ -5,7 +5,8 @@
 import { appendFileSync, existsSync } from 'node:fs';
 import type { Storage } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
-import { createWorker, listJobs } from '../../src/index.js';
+import { createWorker } from '../../src/index.js';
+import { listAllJobs as listJobs } from './k5-list-all.js';
 
 const [kind, db, effects, go, name, ttl, runner] = process.argv.slice(2) as [string, string, string, string, string, string, string];
 // Exits once the test runner that spawned it is gone (an interrupted run leaves no orphan behind).

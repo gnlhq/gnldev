@@ -13,7 +13,8 @@ import { join } from 'node:path';
 import { InMemoryStorage, acquireRunLock, type Storage } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
 import * as queue from '../src/index.js';
-import { enqueue, createWorker, listJobs, retryJob, cancelJob, type JobHandler } from '../src/index.js';
+import { enqueue, createWorker, retryJob, cancelJob, type JobHandler } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
 
 const T0 = Date.UTC(2026, 9, 2, 12, 0, 0);
 function frozenClock() {

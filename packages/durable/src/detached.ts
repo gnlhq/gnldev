@@ -33,10 +33,10 @@ import { interruptsFromSteps } from './agent-stream.js';
 import { LIMIT_ERROR_CODES, BLOCKED_ERROR_CODES, RunBusyError } from './errors.js';
 import { limitBreachFromSteps, blockedFromSteps } from './run.js';
 import { RUN_EVENT_VERSION, DELTA_KINDS, encodePart, errorData } from './event-codec.js';
-import { readRunOutcome } from './outcome.js';
+import { readRunOutcome, attemptEndOf } from './outcome.js';
 import { agentRunCanceled, cancelAgentRun } from './cancel.js';
 import {
-  beginDrain, bindLiveness, isDraining, isProcessLocal, livenessFor, inMemoryLiveness, LivenessUnavailableError, judgeAlive,
+  beginDrain, bindLiveness, giveBack, isDraining, isProcessLocal, livenessFor, inMemoryLiveness, LivenessUnavailableError,
   within, settledExceptOwn, outsideHeld, type ProcessLiveness,
 } from './process-liveness.js';
 import { appendRunEvent, endsFollow, lastRunEvent, readRunEvents, runEventPrefix, type RunEvent, type RunState } from './run-events.js';
@@ -46,6 +46,8 @@ import { settleErasedRun, deleteExactKey } from './model.js';
 import { runOwnerOf, type RawJournal } from './run-identity.js';
 import { erasureBaseline, runErasedSince, assertNotErased, type ErasureBaseline } from './erasure-fence.js';
 import { createHash } from 'node:crypto';
+import { holderIsLive, newHoldId, holdHere, releaseHold } from './liveness.js';
+import { executionGrant, continuesElsewhere, type ExecutionGrant } from './execution-grant.js';
 import { upgradeFormat } from './format.js';
 
 /** The execution record: which process executes a run, and what another process needs to continue it. */
@@ -56,6 +58,12 @@ export interface ExecRecord {
   scope?: string;
   /** The process executing it; `status: 'released'` / `'parked'`: none. */
   owner: string;
+  /**
+   * The execution holding it, in the owner's process (liveness.ts `hold`): held there from the claim
+   * until the execution settles. Its own process reads a 'running' record whose execution is no longer
+   * here as given up — not as live because the process is.
+   */
+  hold?: string;
   status: 'running' | 'parked' | 'released';
   at: number;
   /**
@@ -176,7 +184,8 @@ interface Local {
   key: string;
   runId: string;
   journal: Journal;
-  ctrl: AbortController;
+  /** This execution's right to run (execution-grant.ts): its launch's signal, and why it was stopped. */
+  grant: ExecutionGrant;
   next: number;
   /** Events this execution appended, for followers in this process (no store read). */
   log: RunEvent[];
@@ -254,9 +263,9 @@ export class DetachedRuns {
     }
   }
 
-  /** Whether the process holding a record is alive — asked of THIS executor's liveness (the store's). */
-  private alive(owner: string): Promise<boolean | undefined> {
-    return owner === this.liveness.id ? Promise.resolve(true) : judgeAlive(this.liveness, owner);
+  /** Whether a record's holder still holds it (liveness.ts `holderIsLive`) — asked of THIS executor's liveness (the store's). */
+  private alive(rec: Pick<ExecRecord, 'owner' | 'hold'>): Promise<boolean | undefined> {
+    return holderIsLive({ proc: rec.owner, hold: rec.hold }, this.opts.journal, this.liveness);
   }
 
   private journalOf(scope: string | undefined): Journal {
@@ -294,7 +303,8 @@ export class DetachedRuns {
     // now would be theirs to take over at once — executed twice. It starts and attaches nothing.
     if (!(await this.liveness.confirm())) throw new LivenessUnavailableError();
     const runJournal = this.journalOf(req.scope);
-    const mine = (from: number): ExecRecord => ({ v: 1, runId: req.runId, ...(req.scope !== undefined ? { scope: req.scope } : {}), owner: this.liveness.id, status: 'running', at: Date.now(), from, ...(req.meta ? { meta: req.meta } : {}) });
+    // Held here before it is written (liveness.ts): a reader in this process never sees it written and not held.
+    const mine = (from: number): ExecRecord => { const hold = newHoldId(); holdHere(hold, this.opts.journal); return { v: 1, runId: req.runId, ...(req.scope !== undefined ? { scope: req.scope } : {}), owner: this.liveness.id, hold, status: 'running', at: Date.now(), from, ...(req.meta ? { meta: req.meta } : {}) }; };
     const lastSeq = async () => (await lastRunEvent(runJournal, req.runId))?.seq ?? 0;
     // A run that is over (or waits on a human): its reader reads its last execution, whole.
     const before = () => lastExecutionStart(runJournal, req.runId);
@@ -313,10 +323,11 @@ export class DetachedRuns {
         const rec = mine(await lastSeq());
         this.stats.execWrites++;
         if (await claim(this.opts.journal, key, rec)) { await this.execute(key, rec, runJournal, req.launch); return { runId: req.runId, state: 'started', from: rec.from! }; }
+        releaseHold(rec.hold, this.opts.journal);
         continue;
       }
       if (cur.status === 'running') {
-        if (cur.owner === this.liveness.id || (await this.alive(cur.owner)) !== false) {
+        if ((await this.alive(cur)) !== false) {
           // An answer and an execution (here or in another process) whose ending is already in the log:
           // the same moment as above, seen through the store. Wait for its record to move, then read again.
           if (!req.resumeIntent || !(await endedSince(runJournal, req.runId, cur.from ?? 0))) return { runId: req.runId, state: 'attached', from: cur.from ?? 0 };
@@ -335,6 +346,7 @@ export class DetachedRuns {
         await this.execute(key, rec, runJournal, req.launch);
         return { runId: req.runId, state: cur.status === 'parked' ? 'resumed' : 'took-over', from: rec.from! };
       }
+      releaseHold(rec.hold, this.opts.journal);
     }
     return { runId: req.runId, state: 'attached', from: 0 };
   }
@@ -350,7 +362,7 @@ export class DetachedRuns {
       await new Promise((r) => setTimeout(r, wait));
       const now = await this.opts.journal.get<ExecRecord>(key);
       if (now?.status !== cur.status || now?.owner !== cur.owner || now?.at !== cur.at) return;
-      if (now.owner !== this.liveness.id && (await this.alive(now.owner)) === false) return;
+      if ((await this.alive(now)) === false) return;
     }
     throw new RunBusyError(`@gnldev/durable: run '${runId}' ended its last execution and has not given the run back yet — retry the answer shortly`);
   }
@@ -367,19 +379,22 @@ export class DetachedRuns {
       const recs = this.opts.journal.getMany ? await this.opts.journal.getMany<ExecRecord>(keys) : await Promise.all(keys.map((k) => this.opts.journal.get<ExecRecord>(k)));
       // One liveness question per process, not per run: a few processes hold every run.
       const alive = new Map<string, Promise<boolean | undefined>>();
-      const isAlive = (owner: string) => { let p = alive.get(owner); if (!p) alive.set(owner, (p = this.alive(owner))); return p; };
+      // (This process's own records are answered by the execution holding each, not by the process.)
+      const isAlive = (r: ExecRecord) => { if (r.owner === this.liveness.id) return this.alive(r); let p = alive.get(r.owner); if (!p) alive.set(r.owner, (p = this.alive(r))); return p; };
       let taken = 0;
       for (const [i, key] of keys.entries()) {
         const cur = recs[i];
         if (!cur) continue;
         if (cur.status === 'parked' && !(cur.awaits && (await this.outcomeMoves(cur)))) continue;
-        if (cur.status === 'running' && (cur.owner === this.liveness.id || (await isAlive(cur.owner)) !== false)) continue;
+        if (cur.status === 'running' && (await isAlive(cur)) !== false) continue;
         // An erased run is not continued: its record goes (the erasure model deletes it too; this covers
         // a record written back by an executor that died before it read the fence).
         if (await runErasedSince(this.journalOf(cur.scope), cur.runId, undefined)) { await this.opts.journal.deletePrefix(key); continue; }
-        const rec: ExecRecord = { ...cur, owner: this.liveness.id, status: 'running', at: Date.now(), from: (await lastRunEvent(this.journalOf(cur.scope), cur.runId))?.seq ?? 0 };
+        const hold = newHoldId();
+        holdHere(hold, this.opts.journal);
+        const rec: ExecRecord = { ...cur, owner: this.liveness.id, hold, status: 'running', at: Date.now(), from: (await lastRunEvent(this.journalOf(cur.scope), cur.runId))?.seq ?? 0 };
         this.stats.execWrites++;
-        if (!(await compareAndSet(this.opts.journal, key, cur, rec))) continue;
+        if (!(await compareAndSet(this.opts.journal, key, cur, rec))) { releaseHold(hold, this.opts.journal); continue; }
         const runJournal = this.journalOf(cur.scope);
         try {
           // Asking HOW to continue it is part of beginning the execution: a resume that throws (an agent this
@@ -517,7 +532,7 @@ export class DetachedRuns {
       }
       if (rec.status === 'parked') { out.push({ ...pick(rec), reason: 'waiting on a human (approval)' }); continue; }
       const last = await lastRunEvent(this.journalOf(rec.scope), rec.runId);
-      if (rec.status === 'running' && (await this.alive(rec.owner)) !== false && Date.now() - (last?.at ?? rec.at) > quietMs) {
+      if (rec.status === 'running' && (await this.alive(rec)) !== false && Date.now() - (last?.at ?? rec.at) > quietMs) {
         out.push({ ...pick(rec), reason: `its process is alive and wrote nothing for ${Math.round((Date.now() - (last?.at ?? rec.at)) / 1000)} s — not taken over (it may be one instruction from its effect); kill it to hand the run over` });
       }
     }
@@ -550,18 +565,19 @@ export class DetachedRuns {
    * unless `force`. The one place an executor learns of a cancel.
    */
   private async obeyCancel(loc: Local, force = false): Promise<boolean> {
-    if (loc.ctrl.signal.aborted) return true;
+    if (loc.grant.signal.aborted) return true;
     if (!force && Date.now() - loc.cancelAt < FENCE_EVERY_MS) return false;
     loc.cancelAt = Date.now();
     if ((await agentRunCanceled(loc.journal, loc.runId).catch(() => undefined)) === undefined) return false;
-    loc.ctrl.abort(new Error(`run '${loc.runId}' was canceled`));
+    loc.grant.revoke('canceled', `run '${loc.runId}' was canceled`);
     return true;
   }
 
   async close(): Promise<void> {
     if (this.sweeper) clearInterval(this.sweeper);
     const stopping = [...this.local.values()];
-    for (const l of stopping) l.ctrl.abort();
+    // Released, not ended: another process continues these runs from the journal (closeExecutorFor).
+    for (const l of stopping) l.grant.revoke('released');
     // Stopped, then settled, before the store under them closes: a settle reading a closed store was an
     // unhandled rejection, and a settle skipped could leave a write that landed after an erasure
     // (a-store-closed-under-a-finishing-run.test.ts).
@@ -575,15 +591,19 @@ export class DetachedRuns {
    * thrown to the caller, nothing written under the run), then executes it apart from the caller.
    */
   private async execute(key: string, rec: ExecRecord, journal: Journal, launch: Launch): Promise<void> {
-    const ctrl = new AbortController();
+    const grant = executionGrant(`run '${rec.runId}'`);
     // Where this execution starts in the log is what its record says (`from`, read before the record was
     // claimed): one place, so a caller attached before the execution reads anything is told the same
     // place as the caller that started it. It used to be read again later (executeBody), and a caller
     // attached in between was told 0 — and read an earlier execution's ending (release audit A5).
     const first = rec.from! + 1;
+    // The execution holds its record (rec.hold) until it leaves this process's table, however it ends.
+    const settled = () => { this.local.delete(key); releaseHold(rec.hold, this.opts.journal); };
+    let baseline: ErasureBaseline;
+    try { baseline = await erasureBaseline(journal, await recordedParent(journal, rec.runId)); } catch (e) { releaseHold(rec.hold, this.opts.journal); throw e; }
     const loc: Local = {
-      key, runId: rec.runId, journal, ctrl, next: first, log: [], firstSeq: first, wake: new Set(), done: Promise.resolve(),
-      baseline: await erasureBaseline(journal, await recordedParent(journal, rec.runId)), fenceAt: 0, erased: false, cancelAt: 0,
+      key, runId: rec.runId, journal, grant, next: first, log: [], firstSeq: first, wake: new Set(), done: Promise.resolve(),
+      baseline, fenceAt: 0, erased: false, cancelAt: 0,
     };
     // The execution is one unit from its launch to its settle: its launch and its body run as part of it
     // (`within`), so a wait from inside the run (a tool body that drains or closes) does not wait for it.
@@ -594,23 +614,27 @@ export class DetachedRuns {
     await this.ensureSubscribed().catch(() => undefined);
     let result: { fullStream: AsyncIterable<any>; steps?: unknown; end?: LaunchEnd };
     try {
-      result = (await within(loc.done, () => launch(ctrl.signal))) as typeof result;
+      result = (await within(loc.done, () => launch(grant.signal))) as typeof result;
       if (typeof result.end === 'function') loc.end = result.end;
     } catch (e) {
-      this.local.delete(key);
+      settled();
       ended(Promise.resolve());
       // Refused or failed before it ran: nothing of this execution was written under the run. A run that
       // has a past (taken over, resumed) waits for a person (`pending` names it) instead of being retried
       // by every sweep; a run that never started leaves no record at all, and neither does a deleted one
       // (the engine's refusal says so: nobody is to continue it).
-      const cur = await this.opts.journal.get<ExecRecord>(key);
-      if (cur && cur.owner === rec.owner && cur.at === rec.at) {
-        if ((e as { code?: unknown })?.code === 'run_erased' || (await readRunOutcome(journal, rec.runId)) === undefined) await this.opts.journal.deletePrefix(key);
-        else await compareAndSet(this.opts.journal, key, cur, {
-          ...cur, status: 'parked', reason: `could not be continued: ${errorData(e).message}`, at: Date.now(),
-          // Waiting on a call's outcome: the next ask backs off like any other, not every sweep.
-          ...(cur.awaits ? { awaits: { ...cur.awaits, asks: cur.awaits.asks + 1, nextAt: Date.now() + this.askDelay(cur.awaits.asks + 1) } } : {}),
-        });
+      try {
+        const cur = await this.opts.journal.get<ExecRecord>(key);
+        if (cur && cur.owner === rec.owner && cur.at === rec.at) {
+          if ((e as { code?: unknown })?.code === 'run_erased' || (await readRunOutcome(journal, rec.runId)) === undefined) await this.opts.journal.deletePrefix(key);
+          else await compareAndSet(this.opts.journal, key, cur, {
+            ...cur, status: 'parked', reason: `could not be continued: ${errorData(e).message}`, at: Date.now(),
+            // Waiting on a call's outcome: the next ask backs off like any other, not every sweep.
+            ...(cur.awaits ? { awaits: { ...cur.awaits, asks: cur.awaits.asks + 1, nextAt: Date.now() + this.askDelay(cur.awaits.asks + 1) } } : {}),
+          });
+        }
+      } finally {
+        await this.giveBackRecord(key, rec);
       }
       throw e;
     }
@@ -625,7 +649,22 @@ export class DetachedRuns {
       })
       // A settle that fails (a store error) is said, as a stopped body is — never an unhandled rejection.
       .catch((e) => console.warn(`@gnldev/durable: detached run '${rec.runId}' was not settled here:`, e))
-      .finally(() => { this.local.delete(key); this.wakeAll(loc); }));
+      .finally(async () => { void grant.dispose(); settled(); this.wakeAll(loc); await this.giveBackRecord(key, rec); }));
+  }
+
+  /**
+   * An execution that has ended here leaves no record naming it as running: its ending moved the record
+   * (parked, released, deleted) — or that write failed, and while this process lives the others read the
+   * record as held, so the run would wait for this process to die. It is released then (the next sweep,
+   * here or elsewhere, continues the run as it does a run whose process is gone), and retried until it
+   * lands (process-liveness.ts `giveBack`). Only THIS execution's record (its `hold`) is ever touched.
+   */
+  private async giveBackRecord(key: string, rec: ExecRecord): Promise<void> {
+    await giveBack(rec.hold!, this.opts.journal, async () => {
+      const cur = await this.opts.journal.get<ExecRecord>(key);
+      if (cur?.status !== 'running' || cur.hold !== rec.hold) return;
+      await compareAndSet(this.opts.journal, key, cur, { ...cur, status: 'released', at: Date.now() });
+    });
   }
 
   private async executeBody(loc: Local, rec: ExecRecord, result: { fullStream: AsyncIterable<any>; steps?: unknown }): Promise<void> {
@@ -694,11 +733,16 @@ export class DetachedRuns {
       void written.then(() => { if (loc.live?.data === p.data) loc.live = undefined; });
       return written;
     };
-    let ended: RunState = 'completed';
+    // HOW IT ENDED is read, never assumed: `completed` only when the stream said it finished (its `finish`
+    // part) — a stream that stops because this execution was stopped (a close, a cancel: the AI SDK ends
+    // it with an `abort` part and no error) ends as its revocation says (`endingOf`).
+    let ended: RunState | undefined;
+    let finished = false;
     let end: Record<string, unknown> = {};
     try {
       for await (const part of result.fullStream) {
         if (lost) break;
+        if (part?.type === 'finish') finished = true;
         if (part?.type === 'start-step') { step++; stepHadDelta = false; }
         if (step < skipBelow) continue;
         const ev = encodePart(part);
@@ -718,6 +762,12 @@ export class DetachedRuns {
         }
         void flush();
         if (ev.kind === 'tool-error' && isDraining()) continue; // a body the drain did not start — not an error of the run
+        // A call stopped because this process's own session is gone (LivenessUnavailableError): the model must not
+        // be told "the tool failed" and finish the run without it. The execution is released and the next sweep
+        // continues the run from its log, here once the session is back or in another process. A body that never
+        // started runs then, once; one told to stop after it started may have had its effect, so its call stays
+        // failed and the retry ladder asks (SideEffectRetryBlockedError), it does not run it again.
+        if (ev.kind === 'tool-error' && attemptEndOf(ev.data.error, runId) === 'released') { loc.grant.revoke('released'); continue; }
         if (ev.kind === 'error') {
           ended = isDraining() ? 'released' : 'failed';
           end = { error: ev.data.error };
@@ -727,6 +777,11 @@ export class DetachedRuns {
         if (ev.kind === 'tool-call') void write('status', { state: 'tool', tool: ev.data.toolName }, step);
       }
       await flush();
+      if (ended === undefined) {
+        const by = endingOf(loc.grant, finished);
+        if (by !== 'unfinished') ended = by;
+        else { ended = 'failed'; end = { error: { message: `the run's stream ended without finishing (no finish part, and nothing stopped it)`, code: 'run_unfinished' } }; }
+      }
       if (ended === 'completed') {
         // How the run ended is in its steps — the same reading the doors made of the in-request stream:
         // a limit, a refusal, or calls that wait on a human.
@@ -745,7 +800,8 @@ export class DetachedRuns {
       }
     } catch (e) {
       await flush();
-      ended = isDraining() ? 'released' : (await agentRunCanceled(journal, runId)) ? 'canceled' : 'failed';
+      const by = endingOf(loc.grant, false);
+      ended = isDraining() || by === 'released' ? 'released' : by === 'canceled' || (await agentRunCanceled(journal, runId)) ? 'canceled' : 'failed';
       end = ended === 'failed' ? { error: errorData(e) } : {};
     }
     if (ended === 'completed' && (await agentRunCanceled(journal, runId))) ended = 'canceled';
@@ -766,7 +822,7 @@ export class DetachedRuns {
     void this.obeyCancel(loc);
     const ev: RunEvent = { v: RUN_EVENT_VERSION, seq: loc.next, kind, data, step, at: Date.now() };
     this.stats.appends++;
-    if (!(await appendRunEvent(loc.journal, loc.runId, ev))) { loc.ctrl.abort(); return false; }
+    if (!(await appendRunEvent(loc.journal, loc.runId, ev))) { loc.grant.revoke('lease-lost'); return false; }
     loc.next++;
     loc.log.push(ev);
     this.wakeAll(loc);
@@ -801,7 +857,7 @@ export class DetachedRuns {
     // is not ended again: its record goes with it.
     if (loc.end && (state === 'completed' || state === 'failed')) {
       try {
-        await loc.end(state, loc.ctrl.signal);
+        await loc.end(state, loc.grant.signal);
       } catch (e) {
         if (await this.erasedRun(loc, true)) return;
         console.warn(`@gnldev/durable: the ending of '${loc.runId}' was not done (ended again by the next sweep):`, e);
@@ -844,7 +900,7 @@ export class DetachedRuns {
     loc.fenceAt = Date.now();
     if (!(await runErasedSince(loc.journal, loc.runId, loc.baseline))) return false;
     loc.erased = true;
-    loc.ctrl.abort();
+    loc.grant.revoke('lease-lost', `run '${loc.runId}' was erased`);
     loc.log.length = 0;
     // The run's own event families, as run-id-grammar.ts spells them: the event log is a listed family
     // (its prefix is the run's alone — the gate refuses `:ev` in a run id), the delivery mark is ONE key
@@ -903,6 +959,21 @@ export class DetachedRuns {
       signal?.addEventListener('abort', done, { once: true });
     });
   }
+}
+
+/**
+ * An execution's ending by its evidence: a revoked one by why it was revoked (released or its lease lost
+ * → `released`: another execution continues the run; canceled → `canceled`; a time limit → `failed`) — a
+ * stream that finished first is `completed` unless canceled; one not revoked by whether its stream said
+ * it finished (`unfinished`: it stopped without saying so — a failure, never a success by default).
+ */
+function endingOf(grant: ExecutionGrant, finished: boolean): RunState | 'unfinished' {
+  const why = grant.revoked;
+  if (why === 'canceled') return 'canceled';
+  if (finished) return 'completed';
+  if (continuesElsewhere(why)) return 'released';
+  if (why === 'timeout') return 'failed';
+  return 'unfinished';
 }
 
 const pick = (rec: ExecRecord) => ({ runId: rec.runId, ...(rec.scope !== undefined ? { scope: rec.scope } : {}), status: rec.status, owner: rec.owner });

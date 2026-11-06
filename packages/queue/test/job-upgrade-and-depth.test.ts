@@ -3,13 +3,18 @@
 // other organization's backlog (measured before: 40 pages read for an organization with 0 jobs).
 import { describe, it, expect } from 'vitest';
 import { InMemoryStorage, purgeOrganization, user } from '@gnldev/durable';
-import { enqueue, createWorker, listJobs, moveJob, QueueDepthExceededError } from '../src/index.js';
+import { enqueue, createWorker, moveJob, queueUpgrade, QueueDepthExceededError } from '../src/index.js';
+import { listAllJobs as listJobs } from './fixtures/k5-list-all.js';
+
+/** The queue's upgrade steps, run in order: what `gnl upgrade`, then `--only queue/lanes-cleanup`, do. */
+const upgraded = async (storage: Parameters<typeof queueUpgrade>[0]) => { for (const step of [queueUpgrade(storage)].flat()) await step.run(); };
 
 describe('moving a pre-upgrade job to its owner', () => {
   it('the post-upgrade enqueue finds the moved job: one job, run once, as the owner', async () => {
     const storage = new InMemoryStorage();
     const work = storage.work!;
     await work.append('qjob', { type: 'report', payload: 1 }, 'weekly-report'); // what an older release wrote
+    await upgraded(storage); // k5 E: the older release's log into this version's lanes, first
     const moved = await moveJob(work, 'weekly-report', { orgId: 'acme' });
     const after = await enqueue(work, 'report', 1, { id: 'weekly-report', orgId: 'acme' });
     expect(after).toBe(moved);
@@ -24,6 +29,7 @@ describe('moving a pre-upgrade job to its owner', () => {
     const storage = new InMemoryStorage();
     const work = storage.work!;
     await work.append('qjob', { type: 'report', payload: 1 }, 'weekly-report');
+    await upgraded(storage); // k5 E
     let runs = 0;
     await createWorker(storage, { report: async () => { runs++; } }).drain();
     await moveJob(work, 'weekly-report', { caller: user('ayse', 'acme') });
@@ -33,10 +39,12 @@ describe('moving a pre-upgrade job to its owner', () => {
   });
 
   it('refuses an owned job, an ownerless target, and answers null for no such job', async () => {
-    const work = new InMemoryStorage().work!;
+    const storage = new InMemoryStorage();
+    const work = storage.work!;
     const owned = await enqueue(work, 'r', 1, { id: 'x', orgId: 'acme' });
     await expect(moveJob(work, owned, { orgId: 'globex' })).rejects.toThrow(/already has an owner/);
     await work.append('qjob', { type: 'r', payload: 1 }, 'old');
+    await upgraded(storage); // k5 E
     await expect(moveJob(work, 'old', {})).rejects.toThrow(/needs an owner/);
     expect(await moveJob(work, 'missing', { orgId: 'acme' })).toBeNull();
   });

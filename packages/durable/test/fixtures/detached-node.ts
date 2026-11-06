@@ -5,7 +5,8 @@
 //   argv: <kind sqlite|postgres> <db path | url> <readyFile> <effectsFile>
 //   env:  DN_TOOL_MS (tool body), DN_CLAIM_TTL, DN_SIGNAL=notify, DN_RECOVER=1, DN_CONFIRM=1,
 //         DN_WORDS, DN_GAP_MS, DN_BASELINE=1 (no process liveness: today's claim-by-age), DN_SWEEP_MS,
-//         DN_IDEMPOTENT=1 (the tool declares a repeat harmless: the crash ladder may run it again)
+//         DN_IDEMPOTENT=1 (the tool declares a repeat harmless: the crash ladder may run it again),
+//         DN_FAIL_EXEC_DELETE=n (the first n execution-record deletions fail)
 import { createServer } from 'node:http';
 import { appendFileSync, readFileSync, existsSync } from 'node:fs';
 import { writeReady } from './write-ready.js';
@@ -18,6 +19,10 @@ import {
 } from '../../src/index.js';
 import { SqliteStorage } from '../../src/sqlite-storage.js';
 import { PostgresStorage } from '../../src/postgres-storage.js';
+import { MysqlStorage } from '../../src/mysql-storage.js';
+import { MongoStorage } from '../../src/mongo-storage.js';
+import { LibsqlStorage } from '../../src/libsql-storage.js';
+import { EXEC_PREFIX } from '../../src/exec-record.js';
 import { streamingModel } from '../detached/models.js';
 
 armFixtureWatchdog(Number(process.env.DN_DEADLINE_MS ?? 120_000));
@@ -28,7 +33,12 @@ const toolMs = Number(env.DN_TOOL_MS ?? 0);
 const words = (env.DN_WORDS ?? 'Hello from a detached run .').split(' ').map((w) => `${w} `);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-const storage = kind === 'sqlite' ? new SqliteStorage(where) : new PostgresStorage({ connectionString: where });
+// k3 verification kinds (mysql | mongo | libsql) ride the same fixture; their liveness is the store's own.
+const storage = kind === 'sqlite' ? new SqliteStorage(where)
+  : kind === 'mysql' ? new MysqlStorage({ connectionString: where })
+  : kind === 'mongo' ? new MongoStorage({ connectionString: where })
+  : kind === 'libsql' ? new LibsqlStorage(where)
+  : new PostgresStorage({ connectionString: where });
 if (kind === 'postgres') (storage as any).pool?.on?.('error', () => {});
 // Every statement the store sends (counted on each pooled connection: the pool routes through them).
 const counters = { statements: 0 };
@@ -39,11 +49,22 @@ if (kind === 'postgres') {
   });
 }
 const journal = storage.runs as unknown as Journal;
+// DN_FAIL_EXEC_DELETE=n: the store refuses the first n deletions of an execution record (the ending
+// write of a finished run) — a dropped connection at the moment a holder gives its record back.
+let execDeleteFailures = Number(env.DN_FAIL_EXEC_DELETE ?? 0);
+if (execDeleteFailures > 0) {
+  const del = journal.deletePrefix.bind(journal);
+  journal.deletePrefix = async (prefix: string) => {
+    if (prefix.startsWith(EXEC_PREFIX) && execDeleteFailures > 0) { execDeleteFailures--; throw new Error('injected: the store refuses the write'); }
+    return del(prefix);
+  };
+}
 
 let liveness: ProcessLiveness | undefined;
 let signal: RunSignal | undefined;
 if (env.DN_BASELINE !== '1' && env.DN_NO_LIVENESS !== '1') {
   if (kind === 'sqlite') liveness = sqliteLiveness(where);
+  else if (kind !== 'postgres') liveness = await (storage as any).processLiveness();
   else {
     const session = await postgresLiveness({ connectionString: where, heartbeatMs: 1_000 });
     liveness = session;

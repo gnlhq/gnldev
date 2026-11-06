@@ -21,8 +21,15 @@ const STORES: Array<[string, () => Promise<Storage>]> = [
 ];
 if (PG_URL) {
   STORES.push(['postgres (real)', async () => {
-    const s = new PostgresStorage({ connectionString: PG_URL });
-    ends.push(() => s.close());
+    // A database of its own: in-memory liveness reads every other process as dead, so `sweep()` below would take
+    // another file's runs, and another file's executor these (a session no store holds reads as dead there too).
+    const pg = (await import('pg')).default;
+    const admin = new pg.Client({ connectionString: PG_URL }); await admin.connect();
+    const db = `resume_${unique()}`;
+    await admin.query(`CREATE DATABASE ${db}`);
+    const url = new URL(PG_URL); url.pathname = `/${db}`;
+    const s = new PostgresStorage({ connectionString: url.toString() });
+    ends.push(async () => { await s.close(); await admin.query(`DROP DATABASE IF EXISTS ${db}`); await admin.end(); });
     return s;
   }]);
 }

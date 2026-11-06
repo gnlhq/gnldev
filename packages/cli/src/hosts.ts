@@ -102,6 +102,8 @@ export const app = createRestApi(config, {
   title: 'app',
   auth,
   surfaces: [chat],
+  // The per-run limits gnl.config declares (limits: { maxCostUsd: 0.5 }): the server-side bound; a request may only tighten them.
+  ...(config.limits ? { limits: config.limits } : {}),
   ...(process.env.APP_ORIGIN ? { cors: { origins: [process.env.APP_ORIGIN] } } : {}),
 });
 
