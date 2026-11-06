@@ -27,7 +27,7 @@
     "@gnldev/studio": "workspace:*",
     "@gnldev/workflow": "workspace:*",
     "@hono/node-server": "^1.19.17",
-    "ai": "^7.0.0",
+    "ai": "^7.0.149",
     "hono": "^4.13.2",
     "zod": "^3.25.0"
   },

@@ -12,9 +12,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ai-sdk/openai": "^4.0.0",
+    "@ai-sdk/openai": "^4.0.100",
     "@gnldev/durable": "workspace:*",
-    "ai": "^7.0.0",
+    "ai": "^7.0.149",
     "pg": "^8.0.0"
   },
   "devDependencies": {

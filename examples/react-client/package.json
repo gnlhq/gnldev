@@ -13,7 +13,7 @@
     "@gnldev/client": "workspace:*",
     "@gnldev/durable": "workspace:*",
     "@gnldev/server": "workspace:*",
-    "ai": "^7.0.0",
+    "ai": "^7.0.149",
     "react": "^18.3.0",
     "react-dom": "^18.3.0"
   },

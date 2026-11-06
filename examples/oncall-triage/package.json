@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ai-sdk/openai": "^4.0.0",
+    "@ai-sdk/openai": "^4.0.100",
     "@gnldev/a2a": "workspace:*",
     "@gnldev/auth": "workspace:*",
     "@gnldev/cache": "workspace:*",
@@ -29,7 +29,7 @@
     "@gnldev/tool-schema": "workspace:*",
     "@gnldev/workflow": "workspace:*",
     "@hono/node-server": "^1.19.17",
-    "ai": "^7.0.0",
+    "ai": "^7.0.149",
     "hono": "^4.13.2",
     "zod": "^3.25.0"
   },
