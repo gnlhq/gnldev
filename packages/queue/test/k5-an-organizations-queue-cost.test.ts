@@ -9,7 +9,7 @@
 // fairness (and only those) come from K5_WORKER_OPTS (JSON). Cost is counted in work-store PORT calls,
 // which is backend-neutral (a Postgres-only row count is measured separately by the bench script).
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, afterAll, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -25,6 +25,12 @@ const PG_URL = process.env.GNL_PG_URL;
 const WORKER_OPTS: Record<string, unknown> = JSON.parse(process.env.K5_WORKER_OPTS ?? '{}');
 const ends: Array<() => Promise<void>> = [];
 afterAll(async () => { for (const e of ends.reverse()) await e().catch(() => {}); });
+// A Postgres store of its own is closed when the test that opened it ends, not when the file does. Each one fills with
+// 50 appends in parallel, so its pool grows to the full 10 connections and, with its liveness session, keeps one for good:
+// the 15 the file opens held 97 of the server's 100 slots at once (measured), and any other file that ran beside it in the
+// shared group — three at a time — was refused with `too many clients`, this one included.
+const perTest: Array<() => Promise<void>> = [];
+afterEach(async () => { for (const e of perTest.splice(0).reverse()) await e().catch(() => {}); });
 
 const fromDurable = (m: string) => createRequire(join(here, '..', '..', 'durable', 'package.json'))(m);
 let pgAdmin: any;
@@ -43,7 +49,7 @@ async function pgStorage(): Promise<Storage> {
   const s = new PostgresStorage({ connectionString: u.toString() }) as unknown as Storage;
   await (s as any).init?.();
   pgUrlOf.set(s, u.toString());
-  ends.push(async () => { await (s as any).close?.().catch(() => {}); await pgAdmin.query(`DROP SCHEMA ${schema} CASCADE`); });
+  perTest.push(async () => { await (s as any).close?.().catch(() => {}); await pgAdmin.query(`DROP SCHEMA ${schema} CASCADE`); });
   return s;
 }
 type Mk = () => Promise<Storage>;
@@ -272,7 +278,7 @@ describe.skipIf(!PG_URL)('k5 — two workers on two pools (postgres)', () => {
     const { PostgresStorage } = await import('@gnldev/durable/postgres');
     const b = new PostgresStorage({ connectionString: pgUrlOf.get(a)! }) as unknown as Storage;
     await (b as any).init?.();
-    ends.push(async () => { await (b as any).close?.(); });
+    perTest.push(async () => { await (b as any).close?.(); });
     const ids: string[] = [];
     for (const org of ['o1', 'o2', 'o3']) ids.push(...await fill(a.work!, org, 40));
     const ran = new Map<string, number>();
