@@ -7,7 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.17.0] — 2026-11-06
+## [0.17.0] — 2026-11-07
 
 **A store's process liveness, a job's and a fire's right to run, and a store's upgrade are each one rule.**
 The queue takes jobs fairly across organizations from per-organization lanes; the scheduler decides a
