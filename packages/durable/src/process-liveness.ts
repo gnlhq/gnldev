@@ -791,11 +791,17 @@ export class RunDrainedError extends Error {
  * gone (a terminated backend, a failover, a partition) and a new one is not yet held. Never read as
  * "dead" — that would take a run or a call over beside a live holder — nor as "alive". Retryable: every
  * door answers 503 with `Retry-After`; the process is serving again once it holds a lock anew.
+ *
+ * Also how a tool call that this process could not finish over its session leaves the call (durable-tool):
+ * a body stopped by the session signal, however it said so, or an effect whose record could not be written
+ * when the store stopped answering. `message` then says what happened to the call; `cause` is what the body
+ * or the store threw. The detached executor reads the NAME (outcome.ts `attemptEndOf`): the execution is
+ * released and the run continues, the model is never told the call failed.
  */
 export class LivenessUnavailableError extends Error {
   readonly code = 'liveness_unavailable';
-  constructor() {
-    super('@gnldev/durable: this process has lost its liveness session and cannot judge other processes until it holds a new one — retry shortly');
+  constructor(message?: string, options?: { cause?: unknown }) {
+    super(message ?? '@gnldev/durable: this process has lost its liveness session and cannot judge other processes until it holds a new one — retry shortly', options);
     this.name = 'LivenessUnavailableError';
   }
 }

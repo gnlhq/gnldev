@@ -6,9 +6,11 @@
 //   env:  DN_TOOL_MS (tool body), DN_CLAIM_TTL, DN_SIGNAL=notify, DN_RECOVER=1, DN_CONFIRM=1,
 //         DN_WORDS, DN_GAP_MS, DN_BASELINE=1 (no process liveness: today's claim-by-age), DN_SWEEP_MS,
 //         DN_IDEMPOTENT=1 (the tool declares a repeat harmless: the crash ladder may run it again),
-//         DN_FAIL_EXEC_DELETE=n (the first n execution-record deletions fail)
+//         DN_FAIL_EXEC_DELETE=n (the first n execution-record deletions fail),
+//         DN_WINDOW=thread|cross-run + DN_THREAD=<id> (the call keyed by its order in that window)
 import { createServer } from 'node:http';
 import { appendFileSync, readFileSync, existsSync } from 'node:fs';
+import { setTimeout as sleepAbortable } from 'node:timers/promises';
 import { writeReady } from './write-ready.js';
 import { tool } from 'ai';
 import { z } from 'zod';
@@ -78,9 +80,21 @@ const effect = tool({
   description: 'a side effect',
   inputSchema: z.object({ order: z.string() }),
   execute: async ({ order }, opts: any) => {
-    appendFileSync(`${effectsFile}.started`, `${process.pid} ${order}\n`);
-    await sleep(toolMs);
-    appendFileSync(effectsFile, `${process.pid} ${opts?.idempotencyKey ?? order}\n`);
+    // DN_TS=1: each line also carries the time (ms), for a scenario that orders bodies against a freeze.
+    const ts = env.DN_TS === '1' ? ` ${Date.now()}` : '';
+    appendFileSync(`${effectsFile}.started`, `${process.pid} ${order}${ts}\n`);
+    // DN_HONOR: the body obeys its abortSignal (the session signal is part of it) — 'reason' rethrows the
+    // signal's reason, 'timers' waits with node:timers/promises (AbortError, reason as its cause), 'generic'
+    // throws an error of its own that says nothing of why. Unset: the body ignores the signal.
+    const honor = env.DN_HONOR;
+    if (honor === 'timers') await sleepAbortable(toolMs, undefined, { signal: opts?.abortSignal });
+    else if (honor === 'reason' || honor === 'generic') {
+      for (let left = toolMs; left > 0; left -= 20) {
+        if (opts?.abortSignal?.aborted) { appendFileSync(`${effectsFile}.aborted`, `${process.pid} ${honor} ${opts.abortSignal.reason?.name}\n`); if (honor === 'reason') opts.abortSignal.throwIfAborted(); throw new Error('the work was interrupted'); }
+        await sleep(Math.min(20, left));
+      }
+    } else await sleep(toolMs);
+    appendFileSync(effectsFile, `${process.pid} ${opts?.idempotencyKey ?? order}${env.DN_TS === '1' ? ` ${Date.now()}` : ''}\n`);
     await sleep(Number(env.DN_AFTER_MS ?? 0)); // the window between the effect and its record
     return `done ${order}`;
   },
@@ -97,12 +111,27 @@ if (env.DN_RECOVER === '1') {
 }
 if (env.DN_CONFIRM === '1') Object.assign(effect, { confirm: true });
 if (env.DN_IDEMPOTENT === '1') Object.assign(effect, { sideEffect: undefined, idempotent: true });
+// DN_WINDOW=thread|cross-run: the tool keys its call by the business key (`order`) in that window — a new run
+// (on the thread DN_THREAD names, for 'thread') meets the same call.
+if (env.DN_WINDOW) Object.assign(effect, { idempotencyKey: (a: { order: string }) => a.order, idempotencyWindow: env.DN_WINDOW });
 
 const tools = { effect };
-const model = streamingModel({ words, gapMs: Number(env.DN_GAP_MS ?? 10), ...(toolMs >= 0 && env.DN_NO_TOOL !== '1' ? { tool: { name: 'effect', input: { order: 'o-1' } } } : {}) });
+const scripted = streamingModel({ words, gapMs: Number(env.DN_GAP_MS ?? 10), ...(toolMs >= 0 && env.DN_NO_TOOL !== '1' ? { tool: { name: 'effect', input: { order: 'o-1' } } } : {}) });
+// DN_MODEL_MS: every model call takes this long before it answers (the provider thinking), and each call is
+// noted in `<effects>.model` (pid, tool turns so far, time) — a scenario times a moment inside a model call by it.
+const modelMs = Number(env.DN_MODEL_MS ?? 0);
+const model = modelMs > 0 || env.DN_MODEL_LOG === '1' ? {
+  ...scripted,
+  doStream: async (o: any) => {
+    const turns = (o.prompt ?? []).filter((m: any) => m.role === 'tool').length;
+    appendFileSync(`${effectsFile}.model`, `${process.pid} ${turns} ${Date.now()}\n`);
+    if (modelMs > 0) await sleep(modelMs);
+    return scripted.doStream(o);
+  },
+} : scripted;
 const timeouts = { claimTtlMs: Number(env.DN_CLAIM_TTL ?? 30_000) };
 const argsFor = (runId: string, approvals?: Record<string, boolean>, who = 'alice') =>
-  ({ journal, runId, model, tools, prompt: 'do it', resourceId: who, timeouts, ...(approvals ? { approvals } : {}) }) as any;
+  ({ journal, runId, model, tools, prompt: 'do it', resourceId: who, timeouts, ...(env.DN_THREAD ? { threadId: env.DN_THREAD, memory: false } : {}), ...(approvals ? { approvals } : {}) }) as any;
 const launchFor = (runId: string, approvals?: Record<string, boolean>, who = 'alice') => (abortSignal: AbortSignal) =>
   streamDurable({ ...argsFor(runId, approvals, who), abortSignal });
 
@@ -111,7 +140,7 @@ const runs = liveness || env.DN_NO_LIVENESS === '1'
   ? new DetachedRuns({
       journal, ...(liveness ? { liveness } : {}), ...(signal ? { signal } : {}), sweepMs: Number(env.DN_SWEEP_MS ?? 300), pollMs: Number(env.DN_POLL_MS ?? 100),
       resume: (rec) => launchFor(rec.runId),
-      onComplete: async (c) => { appendFileSync(`${effectsFile}.hooks`, `${process.pid} ${c.id} ${c.state}\n`); },
+      onComplete: async (c) => { appendFileSync(`${effectsFile}.hooks`, `${process.pid} ${c.id} ${c.state}${env.DN_TS === '1' ? ` ${Date.now()}` : ''}\n`); },
     })
   : undefined;
 
@@ -177,7 +206,7 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (req.method === 'GET' && url.pathname === '/pending') { res.writeHead(200).end(JSON.stringify(await runs!.pending(Number(url.searchParams.get('quiet') ?? 1000)))); return; }
-    if (req.method === 'GET' && url.pathname === '/stats') { res.writeHead(200).end(JSON.stringify({ ...runs?.stats, store: counters.statements, liveness: (liveness as any)?.statements })); return; }
+    if (req.method === 'GET' && url.pathname === '/stats') { res.writeHead(200).end(JSON.stringify({ ...runs?.stats, store: counters.statements, liveness: (liveness as any)?.statements, livenessId: liveness?.id })); return; }
     res.writeHead(404).end();
   } catch (e: any) {
     // A stream that already began (a follow whose store read failed mid-way) can only be cut short:
