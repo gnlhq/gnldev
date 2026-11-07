@@ -309,9 +309,13 @@ export type DurableResult = Awaited<ReturnType<typeof generateText>> & {
  * time, informed only while narrating.
  *
  * HONEST BOUNDS: (1) a replay consumed on the FINAL step gets no note — there is no following live
- * step to inject into; the envelope is the fallback there. (2) The note is a mid-list 'system'
- * message — the engine itself replays those (allowSystemInMessages: true), but a provider converter
- * that rejects mid-list system messages would surface it; measured fine on OpenAI-compatible.
+ * step to inject into; the envelope is the fallback there. (2) The note rides in the step's
+ * INSTRUCTIONS (the head `system` of the prompt), NOT as a message after the tool result. It was a
+ * mid-list `system` message first; measured against a real OpenAI-compatible endpoint (NVIDIA
+ * mistral-large-4) that answers 400 — Mistral-family servers (and some local ones) accept `system`
+ * only at the head — and the 400 landed exactly on the turn that deduplicated a charge, i.e. the one
+ * this note exists for. The head is accepted everywhere. The earlier comment here said "measured fine
+ * on OpenAI-compatible"; that was a statement about OpenAI's own endpoint, not the family.
  * (3) STREAM surface: the envelope is a LAZY property on the stream result — empty until the
  * stream is consumed, populated for finish-time readers (host onFinish). It is deliberately NOT
  * emitted on the SSE done frame: the SSE sequence is replay-deterministic (W3) and the envelope
@@ -332,15 +336,18 @@ function withReplayDisclosure(prev: ((step: any) => any) | undefined, ctx: Durab
     if (fresh.length === 0) return base;
     const names = [...new Set(fresh.map((f) => f.toolName ?? f.toolCallId))].join(', ');
     const note = {
-      role: 'system',
+      role: 'system' as const,
       content:
         `[gnl] The result(s) of ${names} above were NOT produced by this request — the same work was ` +
         `already completed earlier and the recorded outcome was returned (nothing executed now). ` +
         `Tell the user this explicitly, in their language: the operation was not performed again; ` +
         `what they see is the record of the earlier one.`,
     };
-    const msgs = (base as { messages?: unknown[] } | undefined)?.messages ?? step.messages;
-    return { ...(base ?? {}), messages: [...msgs, note] };
+    // The instructions this step would have gone out with (a prepareStep override wins over the call's own).
+    const b = (base ?? {}) as { instructions?: unknown; system?: unknown };
+    const cur = b.instructions ?? b.system ?? step.initialInstructions;
+    const head = cur === undefined ? [] : Array.isArray(cur) ? cur : [typeof cur === 'string' ? { role: 'system' as const, content: cur } : cur];
+    return { ...(base ?? {}), instructions: [...head, note] };
   };
 }
 
@@ -952,7 +959,7 @@ async function assertRunAdmissible(
   runId: string,
   frozen: FrozenInput | undefined,
   rawInputHash: string,
-  opts: { strictInput?: boolean; conflictLedger?: boolean; auditOnReject?: 'best-effort' | 'require'; tombstonePolicy?: 'ignore' | 'reject'; actor?: string; resourceId?: string; approvals?: Record<string, boolean> },
+  opts: { strictInput?: boolean; conflictLedger?: boolean; auditOnReject?: 'best-effort' | 'require'; tombstonePolicy?: 'ignore' | 'reject'; actor?: string; resourceId?: string; approvals?: Record<string, boolean>; continuesRecorded?: boolean },
 ): Promise<void> {
   // Computed once: three decisions below read it, and it is a regex over a short string either way.
   const derived = isDerivedRunId(runId);
@@ -1023,6 +1030,9 @@ async function assertRunAdmissible(
     );
   }
   if ((opts.strictInput || derived) && frozen?.hash !== undefined && frozen.hash !== rawInputHash) {
+    // ESCAPE 0 — the engine continuing its own run (CONTINUES_RECORDED_INPUT): a takeover brings no
+    // content of its own, it runs the recorded input (adoptFrozenInput), so there is nothing to compare.
+    if (opts.continuesRecorded) return;
     // ESCAPE 1 — driving the run with the frozen record's OWN stored content is by definition a
     // replay, not new content: resumeRun feeds `:input` back verbatim, and its messages are the
     // POST-prep view while `hash` fingerprints the PRE-prep raw input (see persistInput) — without
@@ -1411,7 +1421,7 @@ function makeEchoView(
   processors: Processor[] | undefined,
   journal: Journal,
   runId: string,
-): ((rows: any[], system?: unknown) => Promise<any[]>) | undefined {
+): ((rows: any[], system?: unknown) => Promise<any[] | undefined>) | undefined {
   const chain = (processors ?? []).filter((p) => typeof p.processInput === 'function');
   if (chain.length === 0) return undefined;
   // A PROXY, not `{...journal}`: a Journal is a class instance, so a spread copies its own fields and
@@ -1442,7 +1452,7 @@ function makeEchoView(
     ...createProcessorCtx(silent, runId),
     step: () => { throw new Error('gnl: echo view is a dry run — ctx.step is not available here'); },
   };
-  return async (rows: any[], system?: unknown): Promise<any[]> => {
+  return async (rows: any[], system?: unknown): Promise<any[] | undefined> => {
     try {
       let msgs = rows;
       for (const p of chain) {
@@ -1451,7 +1461,7 @@ function makeEchoView(
         // in the real pass, the comparison stopped matching, and the growth came back. Passed, not
         // used: whatever the chain returns for `system` is discarded.
         const out = await p.processInput!({ messages: msgs, ...(system !== undefined ? { system } : {}) } as never, ctx);
-        if (!Array.isArray(out?.messages) || out.messages.length !== rows.length) return rows;
+        if (!Array.isArray(out?.messages) || out.messages.length !== rows.length) return undefined;
         msgs = out.messages;
       }
       // ONLY the rows the INPUT chain is what stored them. A user row reaches the thread through
@@ -1464,7 +1474,7 @@ function makeEchoView(
       // as sent — with `on: 'both'` both sides are masked, with `on: 'input'` both are raw.
       return rows.map((m, i) => (m?.role === 'assistant' || m?.role === 'tool' ? m : msgs[i]));
     } catch {
-      return rows; // a processor that cannot answer is not evidence about the echo
+      return undefined; // a processor that cannot answer is not evidence about the echo (the comparison falls back to the raw rows — the title never does)
     }
   };
 }
@@ -1474,12 +1484,13 @@ async function prepareMemoryContext(
   threadId: string,
   resourceId: string | undefined,
   rest: PreparedInput,
-  echoView?: (rows: any[], system?: unknown) => Promise<any[]>,
+  echoView?: (rows: any[], system?: unknown) => Promise<any[] | undefined>,
 ): Promise<{ incoming: any[]; wmTool?: Record<string, any>; alreadyStored: boolean; provenance?: MemoryContextRecord; historyCount: number; adoptedResourceId?: string; layoutSeed?: LayoutSeed }> {
   const rawIncoming: any[] = rest.messages ?? (rest.prompt != null ? [{ role: 'user', content: rest.prompt }] : []);
   delete rest.prompt;
   const echoSystem = rest.system;
-  const echoCompare = echoView ? await echoView(rawIncoming, echoSystem) : rawIncoming;
+  const echoProcessed = echoView ? await echoView(rawIncoming, echoSystem) : rawIncoming;
+  const echoCompare = echoProcessed ?? rawIncoming;
   // Özne beyan edilmemişse thread'in sahibi BENİMSENİR (ve `:input`'a o yazılır — persistInput).
   // Uyuşmazlık KONTROLÜ burada DEĞİL: hiçbir şey yazılmadan önce, çağıranın erken kapısında
   // (runDurableInner/streamDurableInner). İki yerde kontrol iki gerçeklik demek olurdu; burada
@@ -1495,7 +1506,12 @@ async function prepareMemoryContext(
 
   if (typeof memory.loadContext === 'function') {
     // Rich path (Phase 14 AgentMemory): composes recall + WM + OM + tool in a single pass.
-    const mc = await memory.loadContext(threadId, { query: lastUserText(rawIncoming), resourceId: rid, incoming: rawIncoming });
+    // `titleIncoming` is what the thread title (and the title-generating model) may see: the input chain's
+    // OUTPUT. The stored message body is masked by `piiRedactor`; the title was cut from the raw text and
+    // written to `gnl_threads.title` — plain, listed in Studio, and left behind by a journal-only purge.
+    // When the chain's view cannot be computed (`echoProcessed` undefined) the thread is left untitled:
+    // an absent title costs a label, a raw one costs the redaction.
+    const mc = await memory.loadContext(threadId, { query: lastUserText(rawIncoming), resourceId: rid, incoming: rawIncoming, titleIncoming: echoProcessed ?? [] });
     const history = mc.messages ?? [];
     // F1: strip client-echoed history first (full-history POSTing clients), THEN the retry dedupe.
     const incoming = dropEchoedHistory(history, rawIncoming, echoCompare);
@@ -3009,6 +3025,19 @@ async function bornAs(journal: Journal, runId: string, owner: RunOwner, caller: 
 }
 
 /**
+ * The mark of a run the ENGINE continues from its recorded input: the detached executor's takeover
+ * (registry `resumeLaunch`), which has no call to rebuild the input from. The input fingerprint guards a
+ * CALLER's content — a workKey reused for different work — and a takeover has none: with any recorded
+ * input the run adopts it whatever the call carried (adoptFrozenInput). Without this mark a run with a
+ * derived id (every workKey run, the authenticated chat's turn) or a `strictInput` run was refused at
+ * takeover as "different work" and stayed parked for good (d25 U6). A symbol, so no request body, door
+ * or option name can carry it; it counts only on a call with no prompt and no messages.
+ *
+ * @internal — set by the registry's takeover launch only.
+ */
+export const CONTINUES_RECORDED_INPUT: unique symbol = Symbol('gnl.continuesRecordedInput');
+
+/**
  * THE ADMISSION of an agent run — every gate between "a caller names this run" and "the run is this
  * caller's to act in", in the order that keeps a refusal from writing anything (each gate's reason is
  * at its line). One function, so runDurable, streamDurable and the detached executor's attach
@@ -3066,7 +3095,9 @@ async function admitAgentEntry(journal: Journal, runId: string, args: RunDurable
   // FAZ-4: fingerprint the RAW caller input BEFORE memory prep mutates rest.messages (post-prep
   // content grows with the thread — hashing it would 409 every legitimate resume).
   const rawInputHash = rawInputFingerprint(rest);
-  await assertRunAdmissible(journal, runId, frozenInput, rawInputHash, { strictInput, conflictLedger, auditOnReject, tombstonePolicy, actor, resourceId, approvals });
+  // Only a call that brings NO content may say it continues the recorded input: the mark cannot carry new work past the check.
+  const continuesRecorded = (args as Record<symbol, unknown>)[CONTINUES_RECORDED_INPUT] === true && rest.prompt === undefined && rest.messages === undefined;
+  await assertRunAdmissible(journal, runId, frozenInput, rawInputHash, { strictInput, conflictLedger, auditOnReject, tombstonePolicy, actor, resourceId, approvals, continuesRecorded });
   if (entry.refusal) throw entry.refusal;
   await assertRecordedInputUsable(journal, runId, frozenInput, origin, trustRecordedInput);
   // The parent is recorded with the owner, at the birth: a run continued elsewhere before its input was

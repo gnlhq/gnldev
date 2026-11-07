@@ -248,6 +248,7 @@ import { createRestApi } from '@gnldev/server';
 import { serve } from '@hono/node-server';
 serve({ fetch: createRestApi(config).fetch, port: Number(process.env.PORT ?? 3000) });
 ```
+Install it as `@hono/node-server@1`: the CLI, server and Studio are built and tested against the 1.x line, and an unpinned install resolves 2.x, which npm then refuses next to `@gnldev/cli` (ERESOLVE).
 `createRestApi` returns a plain fetch handler, so it also mounts straight into an existing server —
 `toNodeHandler` from `@gnldev/server/node` bridges it to Express, Fastify, Koa, Nest or bare
 `node:http`, and on Deno, Bun or Workers the handler is already the shape those runtimes expect.

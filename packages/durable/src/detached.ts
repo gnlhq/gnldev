@@ -150,6 +150,24 @@ export interface DetachedRunsOptions {
  */
 export interface StartRequest { runId: string; scope?: string; launch: Launch; admit?: () => Promise<void>; meta?: Record<string, unknown>; resumeIntent?: boolean }
 
+/** The reason a failed launch parks a run with (`execute`); a run parked on a call's outcome keeps `awaits` and is retried. */
+const NOT_CONTINUED = 'could not be continued: ';
+const notContinued = (rec: ExecRecord): boolean => rec.status === 'parked' && !rec.awaits && typeof rec.reason === 'string' && rec.reason.startsWith(NOT_CONTINUED);
+/** The ending a follower of such a run reads (not in the log): a failure that says the run waits for an operator. */
+function notContinuedEnding(runId: string, seq: number): RunEvent {
+  return {
+    v: RUN_EVENT_VERSION, seq, kind: 'status', step: -1, at: Date.now(),
+    data: {
+      state: 'failed',
+      error: {
+        name: 'RunNotContinuedError', code: 'run_not_continued',
+        message: `@gnldev/durable: run '${runId}' stopped part-way and could not be continued — nothing was run again. ` +
+          'It waits for an operator (the server logged why); sending the same request again does not move it.',
+      },
+    },
+  };
+}
+
 export type StartState = 'started' | 'attached' | 'took-over' | 'resumed' | 'finished' | 'parked';
 
 /**
@@ -460,6 +478,8 @@ export class DetachedRuns {
     // says nobody executes it, the log is read again, and the follow ends on the first read that brings
     // nothing (release audit A4: a follower a store round trip away ended without the run's last events).
     let settled = false;
+    // A run parked because its takeover failed (`execute`'s failure path): nothing will move it on its own.
+    let stalled = false;
     while (!req.signal?.aborted) {
       const loc = this.local.get(key);
       if (loc?.erased) return;
@@ -482,7 +502,13 @@ export class DetachedRuns {
         continue;
       }
       if (batch.length) idleSince = Date.now();
-      else if (settled) return;
+      else if (settled) {
+        // ITS READER IS TOLD, not handed the last execution's replay and an end with no answer (d25 U6: a
+        // reconnect read `start, tool-call` and a 200 with nothing after it, the reason only in a server log).
+        // Not written to the log: the run did not fail — an operator may still continue it.
+        if (stalled) yield notContinuedEnding(req.runId, cursor);
+        return;
+      }
       // Nothing is executing it and nothing new came: a run that ended without a final event (a run that
       // finished before it was detached, or one whose record is gone) ends the follow — after the log
       // read that follows this answer (`settled`).
@@ -491,7 +517,7 @@ export class DetachedRuns {
         idleSince = Date.now();
         const rec = await this.opts.journal.get<ExecRecord>(key);
         if (await runErasedSince(journal, req.runId, undefined)) return;
-        if (!rec || (rec.status === 'parked' && req.untilPause)) { settled = true; continue; }
+        if (!rec || (rec.status === 'parked' && req.untilPause)) { settled = true; stalled = !!rec && notContinued(rec); continue; }
       }
       await this.waitForMore(key, req.scope, req.runId, req.signal);
     }
@@ -530,7 +556,7 @@ export class DetachedRuns {
           : `waiting for a call's outcome (${rec.awaits.key}): continued when it is recorded, the tool asked again ${new Date(rec.awaits.nextAt).toISOString()}` });
         continue;
       }
-      if (rec.status === 'parked') { out.push({ ...pick(rec), reason: 'waiting on a human (approval)' }); continue; }
+      if (rec.status === 'parked') { out.push({ ...pick(rec), reason: notContinued(rec) ? rec.reason! : 'waiting on a human (approval)' }); continue; }
       const last = await lastRunEvent(this.journalOf(rec.scope), rec.runId);
       if (rec.status === 'running' && (await this.alive(rec)) !== false && Date.now() - (last?.at ?? rec.at) > quietMs) {
         out.push({ ...pick(rec), reason: `its process is alive and wrote nothing for ${Math.round((Date.now() - (last?.at ?? rec.at)) / 1000)} s — not taken over (it may be one instruction from its effect); kill it to hand the run over` });
@@ -628,7 +654,7 @@ export class DetachedRuns {
         if (cur && cur.owner === rec.owner && cur.at === rec.at) {
           if ((e as { code?: unknown })?.code === 'run_erased' || (await readRunOutcome(journal, rec.runId)) === undefined) await this.opts.journal.deletePrefix(key);
           else await compareAndSet(this.opts.journal, key, cur, {
-            ...cur, status: 'parked', reason: `could not be continued: ${errorData(e).message}`, at: Date.now(),
+            ...cur, status: 'parked', reason: `${NOT_CONTINUED}${errorData(e).message}`, at: Date.now(),
             // Waiting on a call's outcome: the next ask backs off like any other, not every sweep.
             ...(cur.awaits ? { awaits: { ...cur.awaits, asks: cur.awaits.asks + 1, nextAt: Date.now() + this.askDelay(cur.awaits.asks + 1) } } : {}),
           });
@@ -766,7 +792,10 @@ export class DetachedRuns {
         // be told "the tool failed" and finish the run without it. The execution is released and the next sweep
         // continues the run from its log, here once the session is back or in another process. A body that never
         // started runs then, once; one told to stop after it started may have had its effect, so its call stays
-        // failed and the retry ladder asks (SideEffectRetryBlockedError), it does not run it again.
+        // failed and the retry ladder asks (idempotency key → recover() → SideEffectRetryBlockedError), it does
+        // not run it again. durable-tool leaves every such call under this one name — a body stopped by the
+        // session signal however it said so (its own error, Node's AbortError), an effect whose record the store
+        // did not take — because the event keeps a name, never a `cause` (event-codec.ts errorData).
         if (ev.kind === 'tool-error' && attemptEndOf(ev.data.error, runId) === 'released') { loc.grant.revoke('released'); continue; }
         if (ev.kind === 'error') {
           ended = isDraining() ? 'released' : 'failed';
@@ -792,9 +821,17 @@ export class DetachedRuns {
         if (breach) { ended = 'failed'; end = { error: { message: breach.message, name: 'RunLimitExceededError', code: breach.kind === 'loop' ? LIMIT_ERROR_CODES.toolLoopDetected : LIMIT_ERROR_CODES.runLimitExceeded, detail: breach.detail } }; }
         else if (blocked) {
           const code = BLOCKED_ERROR_CODES[blocked.code] ?? 'run_busy';
-          ended = ASKS_A_HUMAN.has(code) ? 'waiting-approval' : code === WAITS_FOR_OUTCOME ? 'waiting-outcome' : 'failed';
-          end = { error: { message: blocked.message, name: blocked.code, code, detail: blocked.detail } };
           const key = (blocked.detail as { key?: unknown } | undefined)?.key;
+          // A CALL ANOTHER LIVE ATTEMPT HOLDS (RunBusyError naming its key) is not a failure of the run: that
+          // attempt settles the call — a body still running elsewhere, a claim about to be given back, a success
+          // still being written (durable-tool settleSuccess). Ended `failed`, the run had no one to continue it:
+          // a process that lost only its liveness session past the grace was taken over, came back, gave its
+          // claim back, and the taker had already failed the run on it (liveness-audit D2: 10 of 10). It waits
+          // for the call like an unknown outcome: continued at once when the call's record answers it, else
+          // asked again on the doubling backoff (askDelay) — never a tight loop against a holder that stays.
+          const waitsOnCall = code === WAITS_FOR_OUTCOME || (blocked.code === 'RunBusyError' && typeof key === 'string');
+          ended = ASKS_A_HUMAN.has(code) ? 'waiting-approval' : waitsOnCall ? 'waiting-outcome' : 'failed';
+          end = { error: { message: blocked.message, name: blocked.code, code, detail: blocked.detail } };
           if (ended === 'waiting-outcome' && typeof key === 'string') loc.awaits = { key, toolCallId: blocked.toolCallId };
         } else if (interrupts.length) { ended = 'waiting-approval'; end = { interrupts }; }
       }
