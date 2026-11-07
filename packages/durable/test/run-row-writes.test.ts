@@ -332,20 +332,56 @@ for (const [name, make] of BACKENDS) {
       await b.storage.init?.();
       const run = 'dl';
       await b.storage.runs.put(`${run}:model:0`, { first: true }); // the run's row exists
+      // Which side Postgres aborts is not left to timing. A deadlock check is made once per wait, by the
+      // waiter whose `deadlock_timeout` runs out first, and it aborts ITSELF: with both sides at 50 ms
+      // the one that waited first is the victim, so this side only was one when it reached the run's row
+      // within a few milliseconds of the old side reaching the record — and under load (a 25 ms sleep
+      // stood in for that) the old side was the victim, and the old side's error is what failed the test.
+      // So the order is forced, and read from Postgres rather than waited for:
+      //  - the record's INSERT is held (a trigger, on this record only) after it is written, until another
+      //    backend waits for this transaction — the old side has reached the record, and waits there;
+      //  - only then does this side go on to the run's row, so the cycle closes with this side's wait,
+      //  - and the old side's own deadlock_timeout is long (it needs superuser, as the 50 ms above does),
+      //    so its check never comes first: the only one that does is this side's, 50 ms after.
+      // Nothing here is a sleep that has to be short enough or long enough; a hold that is never released
+      // ends at its own bound (5 s) and the assertions below fail.
+      await b.sql(`CREATE OR REPLACE FUNCTION e4_hold() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          FOR i IN 1..1000 LOOP
+            EXIT WHEN EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'transactionid' AND NOT granted AND transactionid = pg_current_xact_id()::xid);
+            PERFORM pg_sleep(0.005);
+          END LOOP;
+          RETURN NULL;
+        END $$`);
+      await b.sql(`CREATE TRIGGER e4_hold AFTER INSERT ON gnl_run_journal FOR EACH ROW WHEN (NEW.key = '${run}:model:1') EXECUTE FUNCTION e4_hold()`);
+      // Counts this side's attempts at the run's row: a sequence is not rolled back with the transaction
+      // that took a value, so the aborted attempt stays counted — one attempt is a write that was never
+      // aborted, two is one that was aborted and run again.
+      await b.sql('CREATE SEQUENCE e4_attempts');
+      await b.sql(`CREATE OR REPLACE FUNCTION e4_attempt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('e4_attempts'); RETURN NEW; END $$`);
+      await b.sql(`CREATE TRIGGER e4_attempt BEFORE INSERT ON gnl_runs FOR EACH ROW WHEN (NEW.run_id = '${run}') EXECUTE FUNCTION e4_attempt()`);
       const old = await b.oldConnect();
       try {
         // The other order — the run's row first, then the record — as 0.10 took it. 0.10's own statements
         // no longer run against this schema (no flag columns: run-status-columns.test.ts), so the run's
         // row is locked here by hand, and the record written with 0.10's journal statement.
         await old.query('BEGIN');
+        await old.query("SET LOCAL deadlock_timeout = '10s'");
         const now = Date.now();
         await old.query('SELECT 1 FROM gnl_runs WHERE run_id = $1 FOR UPDATE', [run]);
         // This version: the record first (a new key: its INSERT), then the run's row — which the old
-        // transaction holds, so it waits there, holding the record.
+        // transaction holds, so it waits there, holding the record. Held at the INSERT until the old
+        // transaction waits for it (above).
         const mine = b.storage.runs.put(`${run}:model:1`, { by: 'new' });
-        await new Promise((r) => setTimeout(r, 25));
-        // The old transaction now wants the record this one holds: a deadlock. This side has waited
-        // longer, so Postgres (deadlock_timeout 50 ms here) aborts IT — and it retries.
+        mine.catch(() => {}); // a failure is the awaited one's, below
+        for (let i = 0; ; i++) {
+          if ((await b.sql("SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event = 'PgSleep'")).length) break;
+          if (i > 1000) throw new Error('E4: this side never wrote the record');
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        // The old transaction now wants the record this one holds, and this one will want the run's row
+        // the old one holds: a deadlock. This side's deadlock_timeout (50 ms) runs out first, so Postgres
+        // aborts IT — and it retries. The old side's statements all complete.
         const prev = (await old.query('SELECT suspended FROM gnl_run_journal WHERE key = $1', [`${run}:model:1`])).rows[0];
         const { m, t, d } = delta(`${run}:model:1`, { by: 'old' }, prev);
         await old.query(OLD10.pgJournal, [`${run}:model:1`, run, 'model', false, serialize({ by: 'old' }), now]);
@@ -353,6 +389,8 @@ for (const [name, make] of BACKENDS) {
         await old.query('COMMIT');
         await mine; // retried after the abort: no error reaches the caller
       } finally { old.release(); }
+      // The abort happened, and was this side's: its second attempt is the retry.
+      expect(Number((await b.sql("SELECT last_value FROM e4_attempts"))[0].last_value)).toBe(2);
       const [row] = (await rows(b)).filter((r) => r[0] === run);
       expect(row!.slice(1, 3)).toEqual([2, 0]); // model:0 and model:1, each counted once
       expect(await b.storage.runs.get(`${run}:model:1`)).toEqual({ by: 'new' }); // the retried write landed last
