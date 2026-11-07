@@ -1,0 +1,19 @@
+{
+ "writtenBy": "packages/upgrade-tests/generate/0.16.0-runs.mjs",
+ "version": "0.16.0",
+ "clockStart": "2026-11-02T12:00:00.000Z",
+ "notes": {
+  "written": {
+   "r-done": "ok:ok",
+   "r-pending": "suspended",
+   "effects": [
+    "note:{\"n\":1}",
+    "note:{\"n\":2}",
+    "note:{\"n\":3}",
+    "charge:{\"amt\":9}",
+    "wire:{\"to\":\"acme\"}"
+   ],
+   "threadMessages": 4
+  }
+ }
+}

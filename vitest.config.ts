@@ -11,8 +11,8 @@ export default defineConfig({
     // `idempotencyKey` injection would have left the cited proof wrong with the suite still green.
     include: ['packages/*/test/**/*.test.{ts,tsx}', 'examples/*/test/**/*.test.{ts,tsx}', 'test/**/*.test.{ts,tsx}'],
     // The upgrade suite opens databases an earlier release wrote and runs on its own:
-    // `pnpm test:legacy` (packages/upgrade-tests/README.md). It is kept out of this run while it holds
-    // known failures that the next fixes turn green, so a red here always means a new regression.
+    // `pnpm test:legacy` (packages/upgrade-tests/README.md). It needs the published older releases and a
+    // Postgres to be complete, which CI's `upgrade-from-0-9-0` job provides and gates the release on.
     exclude: [...configDefaults.exclude, 'packages/upgrade-tests/**'],
     environment: 'node',
     // Every file runs under the birth witness: no record is written under a run id that was never born

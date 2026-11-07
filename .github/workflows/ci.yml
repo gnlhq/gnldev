@@ -360,14 +360,13 @@ jobs:
           GNL_PG_TXPOOL_URL: postgresql://postgres:postgres@127.0.0.1:${{ job.services.pgbouncer.ports['6432'] }}/postgres
 
   upgrade-from-0-9-0:
-    name: upgrade from 0.9.0 (known failures, not yet gating)
+    name: upgrade from 0.9.0, 0.10.0 and 0.16.0
     runs-on: ubuntu-latest
-    # Opens databases 0.9.0 wrote (packages/upgrade-tests/fixtures/0.9.0) with this code: SQLite files,
-    # a Postgres dump, plus a rolling deploy with the published 0.9.0 in a child process.
-    # It holds known failures that the fixes after it turn green, so for now a red here does not make the
-    # workflow red (and does not block the release, which `needs` every job of this file). Remove
-    # `continue-on-error` once it is green: from then on it guards the upgrade like any other gate.
-    continue-on-error: true
+    # Opens databases earlier releases wrote with this code: 0.9.0's SQLite files and Postgres dump, 0.10.0's
+    # runs, 0.16.0's queue and runs (packages/upgrade-tests/fixtures), plus two windows where the old code
+    # runs beside the new one on one database: the published 0.9.0 in a child process, and the published
+    # 0.16.0's worker and producer (the queue's deploy window). A red here makes the workflow red, and the
+    # release `needs` every job of this file (release.yml calls it as `gates`): it stops a publish.
     services:
       postgres:
         image: postgres:16
@@ -396,6 +395,13 @@ jobs:
           echo "GNL_090_ROOT=$RUNNER_TEMP/gnl-090" >> "$GITHUB_ENV"
           node packages/upgrade-tests/generate/load-0.9.0.mjs "$RUNNER_TEMP/gnl-090"
       - run: pnpm test:legacy --reporter=default --reporter=junit --outputFile.junit=upgrade-results.xml
+      # The published 0.16.0, installed outside the workspace for the same reason. The queue's upgrade test
+      # runs 0.16.0's own worker and producer beside this version's on SQLite and the Postgres service above
+      # (without GNL_016_ROOT it reads the committed fixtures only, and those run in the root `pnpm test`).
+      - run: |
+          echo "GNL_016_ROOT=$RUNNER_TEMP/gnl-016" >> "$GITHUB_ENV"
+          node packages/upgrade-tests/generate/load-0.16.0.mjs "$RUNNER_TEMP/gnl-016"
+      - run: pnpm exec vitest run packages/queue/test/k5-queue-upgrade.test.ts packages/queue/test/upgrade-due-notes.test.ts
       - uses: actions/upload-artifact@v6
         if: always()
         with:
