@@ -7,6 +7,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **A detached run no longer ends wrong when a healthy process briefly loses its database.** Affects
+  `DetachedRuns` (and `createGnl` / `@gnldev/server` detached runs) on Postgres, MySQL/MariaDB and MongoDB
+  with process liveness, when the database stops answering one process for a few seconds (a stalled
+  network, a restart, a failover):
+  - a tool body stopped by its lost session is no longer reported to the model as a failed tool, however
+    the body stops (Node's `AbortError` from `timers/promises` / `events.once`, or an error of its own).
+    The run used to end `completed` without the call's effect; now the execution is released and the run
+    continues, and a side effect that may have started goes through the crash ladder (idempotency key →
+    `recover()` → a person), never a blind re-run;
+  - an effect that happened while the database dropped every session is no longer told to the model as
+    failed (with the misleading "the pool given to PostgresStorage has no connect()"). Its success is
+    written once the database answers and the run continues from it. A `BEGIN` that fails on a live pool
+    now reports the driver's error (kept as `cause`, with its code). The same request sent again on
+    another process under an `idempotencyWindow: 'thread'` or `'cross-run'` tool no longer hangs in `tool`;
+  - a run whose call is held by another live attempt now waits for that call (`waiting-outcome`, asked
+    again on a backoff) instead of ending `failed` with `RunBusyError` and nobody continuing it;
+  - a process whose session was gone past half its reconnect grace no longer starts a tool body after it
+    is back: the others may have taken the call over meanwhile. The claim is given back and the run is
+    released.
+
+---
+
 ## [0.17.0] — 2026-11-07
 
 **A store's process liveness, a job's and a fire's right to run, and a store's upgrade are each one rule.**

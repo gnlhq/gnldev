@@ -766,7 +766,10 @@ export class DetachedRuns {
         // be told "the tool failed" and finish the run without it. The execution is released and the next sweep
         // continues the run from its log, here once the session is back or in another process. A body that never
         // started runs then, once; one told to stop after it started may have had its effect, so its call stays
-        // failed and the retry ladder asks (SideEffectRetryBlockedError), it does not run it again.
+        // failed and the retry ladder asks (idempotency key → recover() → SideEffectRetryBlockedError), it does
+        // not run it again. durable-tool leaves every such call under this one name — a body stopped by the
+        // session signal however it said so (its own error, Node's AbortError), an effect whose record the store
+        // did not take — because the event keeps a name, never a `cause` (event-codec.ts errorData).
         if (ev.kind === 'tool-error' && attemptEndOf(ev.data.error, runId) === 'released') { loc.grant.revoke('released'); continue; }
         if (ev.kind === 'error') {
           ended = isDraining() ? 'released' : 'failed';
@@ -792,9 +795,17 @@ export class DetachedRuns {
         if (breach) { ended = 'failed'; end = { error: { message: breach.message, name: 'RunLimitExceededError', code: breach.kind === 'loop' ? LIMIT_ERROR_CODES.toolLoopDetected : LIMIT_ERROR_CODES.runLimitExceeded, detail: breach.detail } }; }
         else if (blocked) {
           const code = BLOCKED_ERROR_CODES[blocked.code] ?? 'run_busy';
-          ended = ASKS_A_HUMAN.has(code) ? 'waiting-approval' : code === WAITS_FOR_OUTCOME ? 'waiting-outcome' : 'failed';
-          end = { error: { message: blocked.message, name: blocked.code, code, detail: blocked.detail } };
           const key = (blocked.detail as { key?: unknown } | undefined)?.key;
+          // A CALL ANOTHER LIVE ATTEMPT HOLDS (RunBusyError naming its key) is not a failure of the run: that
+          // attempt settles the call — a body still running elsewhere, a claim about to be given back, a success
+          // still being written (durable-tool settleSuccess). Ended `failed`, the run had no one to continue it:
+          // a process that lost only its liveness session past the grace was taken over, came back, gave its
+          // claim back, and the taker had already failed the run on it (liveness-audit D2: 10 of 10). It waits
+          // for the call like an unknown outcome: continued at once when the call's record answers it, else
+          // asked again on the doubling backoff (askDelay) — never a tight loop against a holder that stays.
+          const waitsOnCall = code === WAITS_FOR_OUTCOME || (blocked.code === 'RunBusyError' && typeof key === 'string');
+          ended = ASKS_A_HUMAN.has(code) ? 'waiting-approval' : waitsOnCall ? 'waiting-outcome' : 'failed';
+          end = { error: { message: blocked.message, name: blocked.code, code, detail: blocked.detail } };
           if (ended === 'waiting-outcome' && typeof key === 'string') loc.awaits = { key, toolCallId: blocked.toolCallId };
         } else if (interrupts.length) { ended = 'waiting-approval'; end = { interrupts }; }
       }

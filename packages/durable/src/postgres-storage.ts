@@ -571,7 +571,20 @@ export class PostgresStorage implements Storage {
       let inTx = false;
       let destroy = false;
       try {
-        try { await client.query(opts?.readCommitted ? 'BEGIN ISOLATION LEVEL READ COMMITTED' : 'BEGIN'); inTx = true; } catch (e) { if (opts?.atomic) throw new Error(NO_TX_MSG, { cause: e }); /* else: transaction not supported → proceed unwrapped */ }
+        // A `BEGIN` that fails on a pool that HAS connect() is not a pool without transactions: it is the
+        // connection (a backend the server ended, a restart, a failover). Said as NO_TX_MSG, a dropped
+        // connection read as a misconfigured pool — the message a tool's caller was shown (liveness-audit
+        // D3). The driver's error is kept as `cause`, with its code (57P01, ECONNRESET) on the error, and the
+        // client is not handed back to the pool.
+        try { await client.query(opts?.readCommitted ? 'BEGIN ISOLATION LEVEL READ COMMITTED' : 'BEGIN'); inTx = true; } catch (e) {
+          if (opts?.atomic) {
+            destroy = true;
+            const err = new Error(`@gnldev/durable: PostgresStorage could not begin a transaction: ${String((e as Error)?.message ?? e)}`, { cause: e });
+            (err as { code?: unknown }).code = (e as { code?: unknown })?.code;
+            throw err;
+          }
+          /* else: transaction not supported → proceed unwrapped */
+        }
         const out = await fn((s, p) => client.query(s, p));
         if (inTx) await client.query('COMMIT');
         return out;
