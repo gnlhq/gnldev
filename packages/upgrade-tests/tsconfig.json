@@ -9,5 +9,5 @@
     "checkJs": false,
     "types": ["node"]
   },
-  "include": ["test", "generate/shapes.mjs"]
+  "include": ["test", "generate/shapes.mjs", "generate/crash-runs.mjs"]
 }

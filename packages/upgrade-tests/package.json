@@ -10,7 +10,8 @@
     "typecheck": "tsc -p tsconfig.json",
     "generate:0.9.0": "node generate/0.9.0.mjs",
     "generate:0.10.0": "node generate/0.10.0.mjs",
-    "generate:0.16.0": "node generate/0.16.0.mjs"
+    "generate:0.16.0": "node generate/0.16.0.mjs",
+    "generate:0.16.0-runs": "node generate/0.16.0-runs.mjs"
   },
   "devDependencies": {
     "@gnldev/durable": "workspace:*",
