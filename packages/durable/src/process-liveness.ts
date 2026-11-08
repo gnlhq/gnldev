@@ -388,10 +388,11 @@ export async function holderAlive(proc: unknown, journal: unknown): Promise<bool
  * the same id (`reconnectGraceMs`), so a holder is dead only when its lock is found gone at looks that
  * span the grace, none of them more than one and a half graces after the one before. A dead process is
  * taken over that much later; the first look of a judgment waits out the rest of the grace, within the
- * call that asked. STATED LIMIT: looks cannot see a holder that came back and was cut again between them.
+ * call that asked (`onWait` tells that call's owner, once, that it is about to wait). STATED LIMIT: looks cannot see a holder that came back and was cut again between them.
  */
-export async function judgeAlive(l: ProcessLiveness, id: string): Promise<boolean | undefined> {
+export async function judgeAlive(l: ProcessLiveness, id: string, onWait?: () => void): Promise<boolean | undefined> {
   const grace = l.reconnectGraceMs ?? 0;
+  let told = false;
   for (;;) {
     const alive = await l.isAlive(id);
     if (alive !== false || !(grace > 0)) { if (alive !== false) absences.get(l)?.delete(id); return alive; }
@@ -404,6 +405,8 @@ export async function judgeAlive(l: ProcessLiveness, id: string): Promise<boolea
     const run = was && now - was.last <= grace * 1.5 ? { first: was.first, last: now } : { first: now, last: now };
     seen.set(id, run);
     if (run.last - run.first >= grace) return false;
+    // The holder's lock is gone and the grace has not run out: whoever asked is about to wait for it (`onWait`, once).
+    if (!told) { told = true; onWait?.(); }
     await new Promise((r) => setTimeout(r, run.first + grace - now));
   }
 }
@@ -791,11 +794,17 @@ export class RunDrainedError extends Error {
  * gone (a terminated backend, a failover, a partition) and a new one is not yet held. Never read as
  * "dead" — that would take a run or a call over beside a live holder — nor as "alive". Retryable: every
  * door answers 503 with `Retry-After`; the process is serving again once it holds a lock anew.
+ *
+ * Also how a tool call that this process could not finish over its session leaves the call (durable-tool):
+ * a body stopped by the session signal, however it said so, or an effect whose record could not be written
+ * when the store stopped answering. `message` then says what happened to the call; `cause` is what the body
+ * or the store threw. The detached executor reads the NAME (outcome.ts `attemptEndOf`): the execution is
+ * released and the run continues, the model is never told the call failed.
  */
 export class LivenessUnavailableError extends Error {
   readonly code = 'liveness_unavailable';
-  constructor() {
-    super('@gnldev/durable: this process has lost its liveness session and cannot judge other processes until it holds a new one — retry shortly');
+  constructor(message?: string, options?: { cause?: unknown }) {
+    super(message ?? '@gnldev/durable: this process has lost its liveness session and cannot judge other processes until it holds a new one — retry shortly', options);
     this.name = 'LivenessUnavailableError';
   }
 }

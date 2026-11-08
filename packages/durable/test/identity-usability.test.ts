@@ -126,7 +126,7 @@ describe("a broken identity declaration must not decorate a confirm question", (
 
     const reason = await suspendReason(journal, 'up1');
     expect(reason).toContain('requires explicit confirmation');
-    expect(reason).not.toContain('SAME business identity'); // the false claim about an unrelated job
+    expect(reason).not.toMatch(/same business identity/i); // the false claim about an unrelated job
   });
 
   /** Runs a confirm tool twice in one thread: first approved (writes the record), then a fresh call. */
@@ -146,12 +146,12 @@ describe("a broken identity declaration must not decorate a confirm question", (
   it('CONTROL: a sound declaration still decorates the question (the feature is not disabled)', async () => {
     const r = await confirmTwice(['userId'], { userId: 'u-7', note: 'a' }, { userId: 'u-7', note: 'b' }, 'ok-model');
     expect(r.executed).toBe(1);
-    expect(r.reason).toContain('SAME business identity');
+    expect(r.reason).toMatch(/same business identity/i); // d25 P5/16: wording lowercased by the one text producer
   });
 
   it('CONTROL: a legitimate PARTIAL-empty identity still decorates it (optional key absent on both sides)', async () => {
     const r = await confirmTwice(['sku', 'warehouse'], { sku: 'ABC', note: 'a' }, { sku: 'ABC', note: 'b' }, 'pk-model');
-    expect(r.reason).toContain('SAME business identity');
+    expect(r.reason).toMatch(/same business identity/i); // d25 P5/16: wording lowercased by the one text producer
   });
 });
 

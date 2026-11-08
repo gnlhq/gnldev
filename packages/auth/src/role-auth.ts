@@ -382,7 +382,7 @@ function roleAuthProvider(cfg: RoleAuthConfig): AuthProvider | undefined {
       return { allow: false, status: 403, reason: 'unauthorized (admin required)' };
     },
     capabilities() {
-      return { sso: false, rbac: false, audit: false, multiOrganization: false, users: false };
+      return { sso: false, rbac: false, audit: false, multiOrganization: false, users: false, endUsers: !!endUsers };
     },
   };
 }

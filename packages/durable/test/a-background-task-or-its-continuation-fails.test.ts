@@ -11,6 +11,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { mintCallId } from '../src/call-identity.js';
 import { newStore, startNode, post, waitFor, stopNode, sleep, linesOf, type Node, type Store } from './detached/harness.js';
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'deferred-node.ts');
@@ -32,9 +33,10 @@ describe('F1 a task whose call never ran ends failed and wakes the agent once', 
   it('F1: the store refuses the call record every time → one execution, one wake that says failed', { timeout: 60_000 }, async () => {
     const s = store();
     const a = await node(s, { DF_FAULT: 'task-call', DF_SWEEP_MS: '200' });
+    const callId = mintCallId('call-1', 'p7', 0, 0);
     const r = await (await post(a, '/chat', { runId: 'p7', threadId: 'T7', text: 'research sand' })).json();
-    expect(r.results).toEqual([{ status: 'started', taskId: 'task:p7:call-1' }]);
-    await waitFor(async () => (await outcome(a, 'cont:p7:call-1')) === 'completed', 20_000, 'the agent woken about the failed task');
+    expect(r.results).toEqual([{ status: 'started', taskId: `task:p7:${callId}` }]);
+    await waitFor(async () => (await outcome(a, `cont:p7:${callId}`)) === 'completed', 20_000, 'the agent woken about the failed task');
     const tries = linesOf(`${s.effects}.taskfault`).length;
     await sleep(2_000); // every sweep that could execute the task again
     expect(linesOf(`${s.effects}.taskfault`).length, 'the task executed again after it ended').toBe(tries);
@@ -50,17 +52,18 @@ describe('F2 a continuation that fails is a failed turn', () => {
   it('F2: its model call fails → ended failed, not executed again by itself; its owner retries it once, a stranger cannot', { timeout: 60_000 }, async () => {
     const s = store();
     const a = await node(s, { DF_CONT_FAIL: 'once', DF_TASK_MS: '200', DF_SWEEP_MS: '200' });
+    const cont = `cont:p8:${mintCallId('call-1', 'p8', 0, 0)}`;
     await post(a, '/chat', { runId: 'p8', threadId: 'T8', text: 'research rock' });
-    await waitFor(async () => (await outcome(a, 'cont:p8:call-1')) === 'failed', 20_000, 'the continuation to fail');
+    await waitFor(async () => (await outcome(a, cont)) === 'failed', 20_000, 'the continuation to fail');
     await sleep(2_000); // every sweep that could execute it again
     expect(contCalls(s).length, 'model calls of the continuation').toBe(1);
     expect(results(await thread(a, 'T8')).length, 'the result is in the thread once').toBe(1);
 
-    const stranger = await post(a, '/chat', { runId: 'cont:p8:call-1', threadId: 'T8', text: 'x', caller: 'mallory' });
+    const stranger = await post(a, '/chat', { runId: cont, threadId: 'T8', text: 'x', caller: 'mallory' });
     expect(stranger.status, 'a stranger naming the continuation').toBe(404);
-    const retried = await post(a, '/chat', { runId: 'cont:p8:call-1', threadId: 'T8', text: 'again' });
+    const retried = await post(a, '/chat', { runId: cont, threadId: 'T8', text: 'again' });
     expect(retried.status, await retried.clone().text()).toBe(200);
-    expect(await outcome(a, 'cont:p8:call-1')).toBe('completed');
+    expect(await outcome(a, cont)).toBe('completed');
     const msgs = await thread(a, 'T8');
     expect(results(msgs).length, 'the result is in the thread once').toBe(1);
     expect(msgs.filter((m) => m.role === 'assistant' && m.text.includes('noted:')).length, 'answers').toBe(1);

@@ -5,6 +5,7 @@ import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 import type { Guard } from '../src/guard.js';
+import { mintCallId } from '../src/call-identity.js';
 
 function makeModel() {
   return createMockModel(async ({ prompt }: any) => {
@@ -51,7 +52,7 @@ describe('suspend/resume — human approval', () => {
     expect(counter.charges).toBe(0); // the tool did NOT run
     expect(r1.interrupts.length).toBe(1);
     expect(r1.interrupts[0].toolName).toBe('chargeCard');
-    expect(r1.interrupts[0].toolCallId).toBe('call-c');
+    expect(r1.interrupts[0].toolCallId).toBe(mintCallId('call-c', 'o1', 0, 0));
 
     // Resume — approved
     const r2 = await runDurable({
@@ -60,7 +61,7 @@ describe('suspend/resume — human approval', () => {
       model: makeModel(),
       tools: makeTools(counter),
       guard: bigChargeGuard,
-      approvals: { 'call-c': true },
+      approvals: { [mintCallId('call-c', 'o1', 0, 0)]: true },
       prompt: 'charge 5000',
       stopWhen: stepCountIs(6),
     });
@@ -79,7 +80,7 @@ describe('suspend/resume — human approval', () => {
       model: makeModel(),
       tools: makeTools(counter),
       guard: bigChargeGuard,
-      approvals: { 'call-c': false },
+      approvals: { [mintCallId('call-c', 'o2', 0, 0)]: false },
       prompt: 'charge 5000',
       stopWhen: stepCountIs(6),
     });

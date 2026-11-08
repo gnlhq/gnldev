@@ -17,8 +17,10 @@
 > Install: `pnpm add @gnldev/agui` — or use it from a [repo clone](https://github.com/gnlhq/gnldev): `pnpm install && pnpm -r build`.
 
 ```bash
-npm i @gnldev/agui   # dep: @gnldev/auth, hono  ·  peer: @gnldev/durable  (no @gnldev/server)
+npm i @gnldev/agui @hono/node-server@1   # dep: @gnldev/auth, hono  ·  peer: @gnldev/durable  (no @gnldev/server)
 ```
+
+`@hono/node-server` is for the `serve(...)` example below; pin it to `1` (an unpinned install resolves 2.x, which npm refuses next to `@gnldev/cli`).
 
 ```ts
 import { createAguiRoute } from '@gnldev/agui';

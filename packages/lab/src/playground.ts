@@ -4,7 +4,7 @@
 // a call nothing answers stops the play, named, for the person to answer. Nothing is written either: the
 // definition and the conversation come with every request.
 import { generateText, jsonSchema, stepCountIs, tool, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
-import { argsHash, priceFor, type ModelPricing } from '@gnldev/durable';
+import { argsHash, restoreProviderIds, priceFor, type ModelPricing } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
 import { runTrials, wilson, newcombe, type Expectation, type Interval, type TracedCall, type TrialsProgress } from '@gnldev/experiment';
 import { judgePlay } from './judge.js';
@@ -94,7 +94,7 @@ export async function playAgent(opts: PlayAgentOptions): Promise<PlayAgentResult
   const calls: PlaygroundCall[] = [];
   let stopped: { toolName: string; args: unknown } | undefined;
   const r = await generateText({
-    model: opts.model, system: opts.agent.system, messages: opts.messages,
+    model: opts.model, system: opts.agent.system, messages: restoreProviderIds(opts.messages) as ModelMessage[],
     tools: toolsOf(opts.agent, calls, (c) => { stopped ??= c; }),
     stopWhen: [stepCountIs(opts.maxSteps ?? 10), () => stopped !== undefined],
   });

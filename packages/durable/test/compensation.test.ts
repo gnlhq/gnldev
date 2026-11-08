@@ -9,6 +9,7 @@ import { tool, stepCountIs } from 'ai';
 import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable, streamDurable } from '../src/run.js';
+import { mintCallId } from '../src/call-identity.js';
 import { compensateRun, CompensatedRunError } from '../src/compensation.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
@@ -58,7 +59,7 @@ describe('compensateRun — saga unwind', () => {
     // The hook got exactly what the ORIGINAL execution saw — args AND output (refunds need chargeId).
     expect(compCalls.map((c) => c.tool)).toEqual(['notify', 'reserve', 'charge']);
     expect(compCalls[2]).toMatchObject({ args: { id: 'A' }, output: { chargeId: 'charge-A' } });
-    expect(compCalls[2].idempotencyKey).toBe('saga-1:comp:call-1'); // stable downstream dedup key
+    expect(compCalls[2].idempotencyKey).toBe(`saga-1:comp:${mintCallId('call-1', 'saga-1', 0, 0)}`); // stable downstream dedup key
   });
 
   it("the compensations' OWN exactly-once: a re-run reports 'already-compensated' and calls NO hook again", async () => {

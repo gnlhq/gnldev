@@ -45,12 +45,14 @@ const SOURCES = [
   { dist: ['packages', 'durable', 'dist', 'errors.js'], build: '@gnldev/durable', status: 'WIRE_ERROR_STATUS', maps: {
     CALLER_CONFLICT_CODES: (cls) => `caller-conflict (${cls})`,
     BLOCKED_ERROR_CODES: (cls) => `blocked (${cls})`,
+    FINISHED_ERROR_CODES: (cls) => `finished (${cls})`,
     UPSTREAM_ERROR_CODES: (cls) => `upstream (${cls})`,
     LIMIT_ERROR_CODES: (cls) => `limit (${cls})`,
     RESERVED_ID_ERROR_CODES: (cls) => `reserved id (${cls})`,
     REQUEST_ERROR_CODES: (cls) => `request shape (${cls})`,
     ADOPTION_ERROR_CODES: (cls) => `adoption (${cls})`,
     DRAIN_ERROR_CODES: (cls) => `drain (${cls})`,
+    APPROVAL_ERROR_CODES: (cls) => `approval authority (${cls})`,
     VISIBILITY_ERROR_CODES: (cls) => `visibility (${cls})`,
   } },
   { dist: ['packages', 'server', 'dist', 'edge-errors.js'], build: '@gnldev/server', status: 'EDGE_ERROR_STATUS', maps: {

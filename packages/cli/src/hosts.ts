@@ -48,7 +48,7 @@ const APP_TS = `// The GNL surface, with no server attached.
 // not reach in here.
 import { createGnl, toJournal } from '@gnldev/durable';
 import { roleAuth } from '@gnldev/auth';
-import type { CreateGnlConfig } from '@gnldev/durable';
+import type { CreateGnlConfig, RunLimits } from '@gnldev/durable';
 import { createRestApi } from '@gnldev/server';
 import { createStudioApp, createStudioRunner } from '@gnldev/studio';
 import { aiToolSchema } from '@gnldev/studio/ai';
@@ -58,7 +58,9 @@ import raw from '../gnl.config.js';
 // Widened to the declared type on purpose. gnl.config.ts is written with \`satisfies\`, so its inferred
 // Type is the literal you wrote — a config with a storage has no \`journal\` PROPERTY at all, and
 // Reading one is a compile error rather than \`undefined\`. The contract is the interface.
-const config: CreateGnlConfig = raw;
+// \`limits\` is the project file's own name (PROJECT_CONFIG_NAMES: the engine reads none of them, the doors do),
+// so it is on the config's declared type here, or \`config.limits\` below does not compile.
+const config: CreateGnlConfig & { limits?: RunLimits } = raw;
 const gnl = createGnl(config);
 
 // A config carries EITHER a storage or a journal, and \`gnl dev\` resolves it the same way: the reader

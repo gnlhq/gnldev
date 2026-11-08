@@ -15,13 +15,25 @@ export interface RunTimeline {
   cost: RunCost;
   entries: JournalEntry[];
   state: ReconstructedState;
+  /**
+   * How a run with NO steps ended — present only then. A run that failed before its first model step (the
+   * provider refused the first call) has no entries to show, but it is listed by `gnl runs`; this is what
+   * its failure said, and the one thing worth opening it for.
+   */
+  outcome?: { status: string; error?: string; errorName?: string; errorStatus?: number };
 }
 
 /** Throws a clear "run not found" error if the runId has no trace in the journal. */
 export async function getRunCore(config: GnlDevConfig, d: typeof Durable, runId: string): Promise<RunTimeline> {
   const journal = getJournal(config, d);
   const entries = await journal.readRun(runId);
-  if (entries.length === 0) throw new Error(`run not found: '${runId}'`);
+  if (entries.length === 0) {
+    // `runs` lists a run that is recorded without steps, so `run` opens it too — by its outcome.
+    if (!(await d.isRunRecorded(journal, runId))) throw new Error(`run not found: '${runId}'`);
+    const outcome = await d.readRunOutcome(journal, runId);
+    const summary = d.summarizeRun(runId, entries, outcome as never);
+    return { summary, cost: await d.getRunCost(journal, runId), entries, state: d.reconstructState(entries), ...(outcome ? { outcome } : {}) };
+  }
   const summary = d.summarizeRun(runId, entries);
   const cost = await d.getRunCost(journal, runId);
   const state = d.reconstructState(entries);
@@ -65,7 +77,7 @@ export const runCommand: Command = {
     if (raw) {
       const journal = getJournal(config, d);
       const entries = await journal.readRun(runId);
-      if (entries.length === 0) throw new Error(`run not found: '${runId}'`);
+      if (entries.length === 0 && !(await d.isRunRecorded(journal, runId))) throw new Error(`run not found: '${runId}'`);
       if (json) {
         console.log(JSON.stringify(entries, null, 2));
         return;
@@ -79,13 +91,17 @@ export const runCommand: Command = {
 
     const timeline = await getRunCore(config, d, runId);
     if (json) {
-      console.log(JSON.stringify({ ...timeline.summary, cost: timeline.cost, messages: timeline.state.messages, pending: timeline.state.pending }, null, 2));
+      console.log(JSON.stringify({ ...timeline.summary, cost: timeline.cost, messages: timeline.state.messages, pending: timeline.state.pending, ...(timeline.outcome ? { outcome: timeline.outcome } : {}) }, null, 2));
       return;
     }
 
     console.log(`${bold(runId)}  ${colorStatus(timeline.summary.status)}`);
     console.log(`  model steps: ${timeline.summary.modelSteps}   tool calls: ${timeline.summary.toolCalls}   cost: $${timeline.cost.costUsd.toFixed(4)} (${timeline.cost.totalTokens} tokens)`);
     if (timeline.summary.threadId) console.log(`  thread: ${timeline.summary.threadId}`);
+    if (timeline.outcome?.error) {
+      const o = timeline.outcome;
+      console.log(`  ${o.status}: ${o.error}${o.errorName || o.errorStatus ? `  (${[o.errorName, o.errorStatus].filter(Boolean).join(', ')})` : ''}`);
+    }
     console.log('');
     for (const m of timeline.state.messages) printMessage(m);
     if (timeline.state.pending.length > 0) {

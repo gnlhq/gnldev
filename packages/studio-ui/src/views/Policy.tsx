@@ -10,7 +10,7 @@ import { toast, ConfirmDialog } from '../ui';
 import '../i18n';
 
 const ACTION_TONE: Record<PolicyRule['action'], 'success' | 'destructive' | 'warning'> = {
-  allow: 'success', deny: 'destructive', 'require-approval': 'warning',
+  allow: 'success', deny: 'destructive', confirm: 'warning', approve: 'warning', 'require-approval': 'warning',
 };
 
 /**
@@ -113,7 +113,7 @@ export function Policy() {
     setEmptyToolIdx((s) => new Set([...s].filter((x) => x !== i).map((x) => (x > i ? x - 1 : x))));
     setDirty(true);
   };
-  const add = () => { setRules((rs) => [...rs, { tool: '', action: 'require-approval' }]); setDirty(true); };
+  const add = () => { setRules((rs) => [...rs, { tool: '', action: 'approve' }]); setDirty(true); };
   const discard = () => { setRules(policy.data?.policy?.rules ?? []); setDirty(false); setEmptyToolIdx(new Set()); };
 
   const save = async () => {
@@ -218,6 +218,8 @@ export function Policy() {
               className={inputCls}
             >
               <option value="allow">{t('allowOption')}</option>
+              <option value="confirm">{t('confirmOption')}</option>
+              <option value="approve">{t('approveOption')}</option>
               <option value="require-approval">{t('requireApprovalOption')}</option>
               <option value="deny">{t('denyOption')}</option>
             </select>

@@ -3,6 +3,7 @@
 // fallback (resume and subsequent steps stick to the same model; in most model-fallback implementations the decision isn't persistent).
 import { claim, runKeys } from './journal.js';
 import type { Journal } from './journal.js';
+import { withUpstreamModel } from './errors.js';
 
 /**
  * Prefixes that map to a FIRST-PARTY `@ai-sdk/*` package, resolved lazily.
@@ -258,7 +259,7 @@ export function withModelFallback(candidates: FallbackCandidate[], journal: Jour
         await record(i);
         return r;
       } catch (e) {
-        lastErr = e;
+        lastErr = withUpstreamModel(e, m); // the candidate that failed — the proxy only names the one that is serving
       }
     }
     throw lastErr;
@@ -279,8 +280,44 @@ export function withModelFallback(candidates: FallbackCandidate[], journal: Jour
     /** Installed by run.ts when schemaCompat is on — see `shapeTools`. */
     setToolShaper: (fn: (tools: any[], model: any) => any[]): void => { shapeTools = fn; },
     doGenerate: (options: any) => attempt((m, shaped) => m.doGenerate(shaped(options))),
-    doStream: (options: any) => attempt((m, shaped) => m.doStream(shaped(options))),
+    doStream: (options: any) => attempt(async (m, shaped) => failoverBeforeContent(await m.doStream(shaped(options)))),
   };
+}
+
+/** Stream parts that carry no answer yet: what a provider sends before it has said anything. */
+const STREAM_PREAMBLE = new Set(['stream-start', 'response-metadata', 'raw']);
+
+/**
+ * A stream that OPENED is not yet a stream that WORKS: OpenAI-compatible servers often answer 200 and put the
+ * 429/503 inside the stream as an `error` part. Reads ahead to the first part that is not preamble; if that part
+ * is an error, throws it so the chain moves to the next candidate, exactly as a thrown call would. Once content
+ * has started nothing is judged any more (a half answer from one model must not be glued to another's), and the
+ * parts read ahead are handed back first, so the caller sees the stream unchanged.
+ */
+async function failoverBeforeContent<R extends { stream: ReadableStream<any> }>(res: R): Promise<R> {
+  const reader = res.stream.getReader();
+  const held: any[] = [];
+  let done = false;
+  for (;;) {
+    const r = await reader.read();
+    if (r.done) { done = true; break; }
+    if (r.value?.type === 'error') {
+      void reader.cancel().catch(() => {});
+      throw r.value.error;
+    }
+    held.push(r.value);
+    if (!STREAM_PREAMBLE.has(r.value?.type)) break;
+  }
+  const replay = new ReadableStream<any>({
+    pull: async (c) => {
+      if (held.length > 0) { c.enqueue(held.shift()); return; }
+      if (done) { c.close(); return; }
+      const r = await reader.read();
+      if (r.done) c.close(); else c.enqueue(r.value);
+    },
+    cancel: (reason) => reader.cancel(reason),
+  });
+  return { ...res, stream: replay };
 }
 
 

@@ -21,7 +21,7 @@ import pg from 'pg';
 import { durableTool } from '../src/durable-tool.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { installProcessLiveness } from '../src/process-liveness.js';
-import { RunBusyError } from '../src/index.js';
+import { RunBusyError, mintCallId } from '../src/index.js';
 import { spawnFixtureEnv } from './fixtures/watchdog.js';
 import type { DurableCtx } from '../src/journal.js';
 
@@ -67,7 +67,7 @@ describe.skipIf(!PG_URL)('one process, two databases', () => {
     let executions = 0;
     const tool = { idempotent: true, execute: async () => { executions++; return { ok: true }; } };
     const resumed = durableTool(tool as any, { journal: s2.runs, runId: 'tenant2-run' } as unknown as DurableCtx, 'sync')
-      .execute!({}, { toolCallId: 'c1' } as any).then(() => 'ran', (e) => e);
+      .execute!({}, { toolCallId: mintCallId('c1', 'tenant2-run', 0, 0) } as any).then(() => 'ran', (e) => e);
     const outcome = await resumed;
 
     expect(p.exitCode, 'P is alive').toBe(null);

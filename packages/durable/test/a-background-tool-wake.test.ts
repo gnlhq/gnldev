@@ -14,6 +14,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
+import { mintCallId } from '../src/call-identity.js';
 import { newStore, startNode, post, waitFor, stopNode, sleep, linesOf, effectCount, PG_BASE, type Node, type Store } from './detached/harness.js';
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'deferred-node.ts');
@@ -32,6 +33,9 @@ const calls = (s: Store) => linesOf(`${s.effects}.calls`).map((l) => l.split(' '
 const contCalls = (s: Store) => calls(s).filter((c) => c[1] === 'cont');
 const done = async (n: Node, runId: string) => (await get(n, `/outcome?runId=${encodeURIComponent(runId)}`))?.status === 'completed';
 
+/** The GNL id of the first (step 0) call `callId` of run `runId`: what the derived task/continuation runs are named after. */
+const gid = (runId: string, callId = 'call-1', index = 0) => mintCallId(callId, runId, 0, index);
+
 const kinds: Array<'sqlite' | 'postgres'> = PG_BASE ? ['sqlite', 'postgres'] : ['sqlite'];
 
 describe.each(kinds)('W1/W2 the agent is woken exactly once (%s)', (kind) => {
@@ -42,7 +46,7 @@ describe.each(kinds)('W1/W2 the agent is woken exactly once (%s)', (kind) => {
     const b = await node(s, env);
     await post(a, '/chat', { runId: 'w1', threadId: 'TW1', text: 'research tides' });
     await waitFor(() => existsSync(`${s.effects}.faulted`), 20_000, 'the injected store error');
-    await waitFor(() => done(b, 'cont:w1:call-1'), 20_000, 'the continuation after the store error');
+    await waitFor(() => done(b, `cont:w1:${gid('w1')}`), 20_000, 'the continuation after the store error');
     await sleep(1_500); // every sweep that could wake it again
     expect(effectCount(s), 'side effects').toBe(1);
     expect(results(await thread(b, 'TW1')).length, 'result messages').toBe(1);
@@ -57,7 +61,7 @@ describe.each(kinds)('W1/W2 the agent is woken exactly once (%s)', (kind) => {
     const c = await node(s, env);
     await post(a, '/chat', { runId: 'w2', threadId: 'TW2', text: 'research waves' }).catch(() => undefined);
     await waitFor(() => linesOf(`${s.effects}.killed`).length > 0, 20_000, 'the kill before the wake');
-    await waitFor(() => done(b, 'cont:w2:call-1'), 20_000, 'the continuation, elsewhere');
+    await waitFor(() => done(b, `cont:w2:${gid('w2')}`), 20_000, 'the continuation, elsewhere');
     await sleep(1_500);
     expect(effectCount(s), 'side effects').toBe(1);
     expect(results(await thread(b, 'TW2')).length, 'result messages').toBe(1);
@@ -67,7 +71,7 @@ describe.each(kinds)('W1/W2 the agent is woken exactly once (%s)', (kind) => {
 });
 
 describe('W3 a task stopped for a human is continued by the human', () => {
-  it('W3: SIGKILL mid-body, no recover() — the task waits; a stranger cannot answer it; its owner\'s approval runs it, once, and wakes the agent', { timeout: 60_000 }, async () => {
+  it('W3: SIGKILL mid-body, no recover() — the task waits; a stranger cannot answer it; its owner cannot either (a question over a call that may already have happened is permission, d25 step 2); staff\'s approval runs it, once, and wakes the agent', { timeout: 60_000 }, async () => {
     const s = store();
     const env = { DF_TASK_MS: '1500', DF_SWEEP_MS: '200' };
     const a = await node(s, env);
@@ -80,14 +84,22 @@ describe('W3 a task stopped for a human is continued by the human', () => {
     expect(effectCount(s), 'an effect ran without the human').toBe(0);
     expect(contCalls(s), 'the agent was woken before the task ended').toEqual([]);
 
-    const stranger = await post(b, '/chat', { runId: 'task:w3:call-1', threadId: 'TW3', caller: 'mallory', approvals: { 'call-1': true } });
+    const stranger = await post(b, '/chat', { runId: `task:w3:${gid('w3')}`, threadId: 'TW3', caller: 'mallory', approvals: { [gid('w3')]: true } });
     expect(stranger.status, 'a stranger answered somebody else\'s task').toBe(404);
     await sleep(1_000);
     expect(effectCount(s), 'the stranger\'s answer ran the effect').toBe(0);
 
-    const owner = await post(b, '/chat', { runId: 'task:w3:call-1', threadId: 'TW3', approvals: { 'call-1': true } });
-    expect(owner.status, await owner.clone().text()).toBe(200);
-    await waitFor(() => done(b, 'cont:w3:call-1'), 20_000, 'the continuation after the approval');
+    // The owner's own yes is refused: whether the effect already happened is not hers to say (approve, d25 step 2).
+    const owner = await post(b, '/chat', { runId: `task:w3:${gid('w3')}`, threadId: 'TW3', approvals: { [gid('w3')]: true } });
+    expect(owner.status, 'the owner approved a question over a call that may already have happened').not.toBe(200);
+    expect(await owner.clone().text()).toContain('ApprovalNotPermittedError');
+    await sleep(1_000);
+    expect(effectCount(s), 'the owner\'s refused answer ran the effect').toBe(0);
+
+    // An authorised person's yes continues the task (as its owner) and wakes the agent.
+    const staff = await post(b, '/chat', { runId: `task:w3:${gid('w3')}`, threadId: 'TW3', staff: true, approvals: { [gid('w3')]: true } });
+    expect(staff.status, await staff.clone().text()).toBe(200);
+    await waitFor(() => done(b, `cont:w3:${gid('w3')}`), 20_000, 'the continuation after the approval');
     await sleep(1_000);
     expect(effectCount(s), 'side effects').toBe(1);
     expect(results(await thread(b, 'TW3')).length, 'result messages').toBe(1);
@@ -104,9 +116,9 @@ describe('W4 two tasks of one thread that end together', () => {
     const a = await node(s, env);
     const b = await node(s, env);
     await post(a, '/chat', { runId: 'w4', threadId: 'TW4', text: 'twin tides' });
-    await waitFor(async () => (await done(a, 'cont:w4:call-1')) && (await done(a, 'cont:w4:call-2')), 30_000, 'both continuations');
+    await waitFor(async () => (await done(a, `cont:w4:${gid('w4', 'call-1', 0)}`)) && (await done(a, `cont:w4:${gid('w4', 'call-2', 1)}`)), 30_000, 'both continuations');
     const all = calls(s);
-    const windows = ['call-1', 'call-2'].map((c) => {
+    const windows = [gid('w4', 'call-1', 0), gid('w4', 'call-2', 1)].map((c) => {
       const tag = `task:w4:${c}`;
       const start = all.find((x) => x[1] === 'cont' && x.slice(3).join(' ').includes(tag));
       const end = all.find((x) => x[1] === 'cont-end' && x.slice(3).join(' ').includes(tag));
