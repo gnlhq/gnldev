@@ -5,7 +5,7 @@
 // the same principal is the same caller whichever door the request came in through.
 import { refuseUnknownNames, optionNames } from '@gnldev/options';
 import type { AuthProvider, Principal } from './types.js';
-import { callerKind, engineCallerOf, type EngineCaller, type Identify } from './scope.js';
+import { callerKind, engineCallerOf, answererOf, type EngineCaller, type EngineAnswerer, type Identify } from './scope.js';
 import { markRefusal, notePrincipal, noteVerdict, credentialRejected, CREDENTIAL_REJECTED } from './decision.js';
 import { permissionContext } from './gate.js';
 import { openSurfaceGuard } from './open-surface.js';
@@ -172,7 +172,10 @@ export interface DoorRefusal {
   body: { error: string; code?: string; host?: string };
 }
 
-export type DoorAdmission = { principal: Principal | undefined; caller: EngineCaller } | { refused: DoorRefusal };
+export type DoorAdmission =
+  /** `answerer`: who is answering any `approvals` of this request (`answererOf`) — absent for an anonymous request, which the engine reads from `caller`. */
+  | { principal: Principal | undefined; caller: EngineCaller; answerer?: EngineAnswerer }
+  | { refused: DoorRefusal };
 
 /**
  * The preamble every standalone door runs before it does anything — ONE copy, which the chat, AG-UI and
@@ -212,7 +215,8 @@ export function doorGate(opts: DoorGateOptions): (req: Request, ask?: { named?: 
     }
     const open = guard(req, who.principal);
     if (open) return { refused: { status: open.status, body: { error: open.error, code: open.code, ...(open.host !== undefined ? { host: open.host } : {}) } } };
-    return who;
+    const answerer = answererOf(who.principal);
+    return answerer ? { ...who, answerer } : who;
   };
 }
 

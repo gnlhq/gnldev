@@ -19,6 +19,7 @@ import { createUIMessageStreamResponse } from 'ai';
 import type { AsyncIterableStream, StreamTextResult, UIMessage, UIMessageChunk, UIMessageStreamOptions } from 'ai';
 import { maskSentinelOutput } from './sentinel-mask.js';
 import { refuseMisspelledNames, optionNames } from '@gnldev/options';
+import { endAnswerOf, endUserError, upstreamWire, clientFeedOf } from '@gnldev/durable';
 
 /** A `data-gnl-interrupt` chunk's payload — one entry per newly-masked suspend in this transform call.
  * FAZ-2: `runId` (when the caller provided one) is the approval ADDRESS — without it the client's
@@ -85,6 +86,30 @@ const UI_RESPONSE_NAMES = optionNames<ToUIMessageStreamResponseOptions<UIMessage
 ]);
 
 /**
+ * What the chat stream's error part says, and where its cause goes. EVERY error is written to the server log
+ * with its cause and the run it belongs to: the stream part is for the person, the log is for the developer.
+ * The part itself: a provider failure says so (its status always, and outside production the credential-free
+ * URL it called and a short masked excerpt of its body); an error gnl authored (`endUserError`: a busy run, a
+ * limit, a step timeout, a caller conflict) is named, with its code; every other error keeps the masked
+ * default — its text is never sent to an end user, it may hold a password or a hostname.
+ */
+function chatErrorText(error: unknown, runId?: string): string {
+  console.error(`@gnldev/chat-adapter: run '${runId ?? '?'}' ended with an error:`, error);
+  // Read from THE one mapping of how a run ended (`endAnswerOf`, @gnldev/durable) — the same one `/run`, `/stream` and AG-UI render.
+  const up = endAnswerOf(error)?.upstream;
+  if (up) {
+    const prod = typeof process !== 'undefined' && process.env?.NODE_ENV === 'production';
+    const all = upstreamWire(up);
+    const wire = prod ? {} : all;
+    // The model and provider are configuration, so production says them too (a URL often names neither).
+    const who = all.upstreamModel ? ` from ${all.upstreamProvider ? `${all.upstreamProvider} ` : ''}'${all.upstreamModel}'` : '';
+    return `Model provider error${up.upstreamStatus !== undefined ? ` (HTTP ${up.upstreamStatus})` : ''}${who}${wire.upstreamUrl ? ` at ${wire.upstreamUrl}` : ''}${wire.upstreamBody ? `: ${wire.upstreamBody}` : ''}`;
+  }
+  const ours = endUserError(error);
+  return ours ? `${ours.code ? `[${ours.code}] ` : ''}${ours.message}` : 'An error occurred.';
+}
+
+/**
  * Thin wrapper over `result.toUIMessageStream()` with the sentinel-masking transform ALWAYS applied.
  * `result` is whatever `gnl.stream()`/`streamDurable` returns (a real AI SDK `StreamTextResult` under a
  * method-binding Proxy — see run.ts's `guardStreamTerminalPromises`).
@@ -98,6 +123,13 @@ export function toUIMessageStream<UI_MESSAGE extends UIMessage = UIMessage>(
   // FAZ-2: `runId` is OURS (stamped onto interrupt chunks), not the AI SDK's — split it off before
   // handing the rest to the native stream builder.
   const { runId, ...native } = opts ?? {};
+  // The AI SDK masks every stream error as "An error occurred." — right for a bug in the host, but it
+  // hid the one fact a failing provider call carries (its status), and the URL that shows a wrong
+  // baseURL / model type. A provider failure says so, so does an error gnl authored; anything else keeps the
+  // masked default (and every error is logged — see chatErrorText).
+  if (native.onError === undefined) native.onError = (error) => chatErrorText(error, runId);
+  // Whether the model's reasoning goes to the client: @gnldev/durable's feed rule (off unless `stream: { reasoning: true }`); an explicit `sendReasoning` of the caller wins.
+  if (native.sendReasoning === undefined) native.sendReasoning = clientFeedOf(result).reasoning;
   const nativeStream = result.toUIMessageStream(native as UIMessageStreamOptions<UI_MESSAGE>);
   // PipeThrough on a WHATWG ReadableStream keeps async-iterability (verified: Node's native
   // ReadableStream implements Symbol.asyncIterator; ai's own AsyncIterableStream helper relies on the

@@ -126,13 +126,14 @@ export interface StampHolder { proc?: unknown; hold?: unknown }
  * judges the stamp by its age on the store's clock.
  *
  * `l`: the liveness that answers for the store, when the caller holds its own (an executor).
+ * `onWait`: called once when the answer has to wait out the reconnect grace of a holder whose lock is gone.
  */
-export async function holderIsLive(holder: StampHolder, journal: unknown, l: ProcessLiveness | undefined = livenessFor(journal)): Promise<boolean | undefined> {
+export async function holderIsLive(holder: StampHolder, journal: unknown, l: ProcessLiveness | undefined = livenessFor(journal), onWait?: () => void): Promise<boolean | undefined> {
   if (typeof holder.hold === 'string' && heldHere.get(storeOf(journal) ?? {})?.has(holder.hold)) return true;
   if (endedHere(holder.hold)) return false;
   if (!l || typeof holder.proc !== 'string') return undefined;
   if (holder.proc === l.id) return true;
-  return judgeAlive(l, holder.proc);
+  return judgeAlive(l, holder.proc, onWait);
 }
 
 /**

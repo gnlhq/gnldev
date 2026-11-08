@@ -9,11 +9,12 @@ import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { convertToModelMessages } from 'ai';
 import type { UIMessage } from 'ai';
-import { createGnl, scopeConfigToOrg, RunThreadMismatchError, blockedErrorCode, callerConflictAnswer, upstreamFailure, requestRefusal, sealRequestContext, sealFieldsOf, resolveWorkIdentity, readJsonObject } from '@gnldev/durable';
+import { createGnl, scopeConfigToOrg, endAnswerOf, requestRefusal, sealRequestContext, sealFieldsOf, resolveWorkIdentity, readJsonObject } from '@gnldev/durable';
 import type { CreateGnlConfig } from '@gnldev/durable';
 import { doorGate, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify, refuseMisplacedOptions, doorOptionKeys, REMOVED_IDENTITY_OPTIONS } from '@gnldev/auth';
 import { refuseUnknownNames } from '@gnldev/options';
 import { toUIMessageStreamResponse } from './ui-stream.js';
+import { chatBodyProblem } from './chat-body.js';
 
 /**
  * The request body as a JSON object (@gnldev/durable `readJsonObject`), or the 400 that says it is not
@@ -98,75 +99,18 @@ export interface CreateChatRouteOptions {
 let anonCounter = 0;
 
 /**
- * The caller's own name for the work, reflected back in a refusal (§8, rules 1-3) — the same
- * function @gnldev/server's route catch uses, rendered locally for the same reason the whole
- * taxonomy is: the dependency direction is chat-adapter → durable, never chat-adapter → server.
- *
- * FROM THE REQUEST, never from storage: a swept run keeps only a hash of its workKey (§10.3), so
- * reading the name back out would undo a deletion. The caller already knows what it sent.
- *
- * `detail` and not `error`: the sentence is the most casually logged field there is, and a workKey
- * is a business name.
- */
-function withWorkKey(detail: unknown, workKey?: string): unknown {
-  if (workKey === undefined) return detail;
-  return detail && typeof detail === 'object' ? { ...(detail as Record<string, unknown>), workKey } : { workKey };
-}
-
-/**
- * Typed error rendering — the SAME taxonomy as @gnldev/server's route catch (index.ts's
- * threadMismatchResponse / blockedErrorResponse / upstreamErrorResponse), rendered locally because the
- * dependency direction is chat-adapter → durable, never chat-adapter → server. Before this, the catch
- * collapsed EVERYTHING to a flat 400 `{error}` — so a concurrent duplicate of the same runId
- * (RunBusyError, "your run is already in flight — retry later and you'll get the replay") reached the
- * client as "your request was malformed", which tells a retrying client to stop retrying at the exact
- * moment retrying is the right move.
+ * A run's ending as the chat route answers it BEFORE the stream exists — rendered from
+ * @gnldev/durable#endAnswerOf, the one mapping @gnldev/server and AG-UI render too (the dependency
+ * direction is chat-adapter → durable, never → server). Before it, this catch collapsed everything it did
+ * not copy to a flat 400, so a concurrent duplicate of the same runId (`run_busy`, "retry later and you'll
+ * get the replay") read as "your request was malformed" — a retrying client told to stop at the moment
+ * retrying is right. Undefined: an error of the host's own.
  */
 function typedErrorResponse(c: Context, e: unknown, workKey?: string): Response | undefined {
-  if (e instanceof RunThreadMismatchError || (e as { name?: string })?.name === 'RunThreadMismatchError') {
-    const err = e as RunThreadMismatchError;
-    // 409 without `resumable`: same runId + this thread never succeeds — see server's rationale.
-    return c.json({ error: err.message, code: 'run_thread_mismatch', detail: withWorkKey(err.detail, workKey) }, 409);
-  }
-  // FAZ-4 caller-conflict family — same 409-without-resumable posture as thread mismatch above.
-  // K9: the map is durable's single CALLER_CONFLICT_CODES export (thread mismatch is answered by the
-  // dedicated branch above; its entry here is harmless duplication by design).
-  // Rendered as durable answers it: a "not your run" refusal reads exactly as an absent run (404
-  // `run_not_found`), the rest of the family as its 409.
-  const conflict = callerConflictAnswer(e, workKey);
-  if (conflict && conflict.code !== 'run_thread_mismatch') {
-    if (conflict.ownership) markRefusal(c.req.raw, 'ownership', { detail: conflict.code });
-    return c.json(conflict.body, conflict.status as 409);
-  }
-  const code = blockedErrorCode(e);
-  if (code) {
-    const err = e as { message?: string; detail?: unknown } | null | undefined;
-    const body = { error: err?.message ?? String(e), code, detail: err?.detail };
-    if (code === 'retry_limit_exceeded') return c.json(body, 422);
-    const res = c.json({ ...body, resumable: true }, 409);
-    // Run_busy: another worker holds this runId RIGHT NOW — a short client backoff then the same
-    // RunId lands on the journal replay. 5s is a hint, not a lease measurement (the route has no
-    // visibility into the holder's lock TTL).
-    if (code === 'run_busy') res.headers.set('Retry-After', '5');
-    return res;
-  }
-  // A request the engine refused before any work — durable's one answer for it (400 thread_id_reserved, 503 draining).
-  const reserved = requestRefusal(e);
-  if (reserved) return c.json(reserved.body, reserved.status, reserved.headers);
-  const up = upstreamFailure(e);
-  if (up) {
-    const err = e as { message?: string } | null | undefined;
-    const body = {
-      error: err?.message ?? String(e),
-      code: up.code,
-      ...(up.upstreamStatus !== undefined ? { upstreamStatus: up.upstreamStatus } : {}),
-      ...(up.retryAfter !== undefined ? { retryAfter: up.retryAfter } : {}),
-    };
-    const res = c.json(body, up.status);
-    if (up.retryAfter !== undefined) res.headers.set('Retry-After', String(up.retryAfter));
-    return res;
-  }
-  return undefined;
+  const a = endAnswerOf(e, workKey);
+  if (!a) return undefined;
+  if (a.ownership) markRefusal(c.req.raw, 'ownership', { detail: a.code });
+  return c.json(a.body, a.status as 409, a.headers);
 }
 
 /** Every option createChatRoute takes in its SECOND argument, held to `CreateChatRouteOptions` by `pnpm typecheck` below. */
@@ -284,7 +228,14 @@ export function createChatRoute(
           + 'organization gets its own partition.',
       }, 500);
     }
-    const gnl = gnlFor(org);
+    // The organization's instance. A config whose `memory` cannot be split for it is refused here by
+    // @gnldev/durable's one rule (`scopeConfigToOrg`), and answered as every door answers it.
+    let gnl: ReturnType<typeof createGnl>;
+    try { gnl = gnlFor(org); } catch (e) {
+      const refused = requestRefusal(e);
+      if (!refused) throw e;
+      return c.json(refused.body, refused.status, refused.headers);
+    }
     // A RAW id, when the caller is holding one. `body.runId` and `resolveRunId` both name an ID (the
     // second one says so in its name), so neither is promoted — a host that hands us an id has
     // already decided the addressing.
@@ -369,6 +320,16 @@ export function createChatRoute(
     // malformed-request path. In the catch it falls through typedErrorResponse (no match) to the
     // generic 400, which is what a malformed request is.
     let result: any;
+    {
+      // The body's shape, said before the converter: its own TypeError is not an answer a client can act on.
+      // The run id is already derived, so the header contract holds on this path too.
+      const problem = chatBodyProblem(body);
+      if (problem) {
+        const res = c.json({ error: `invalid chat request: ${problem}` }, 400);
+        res.headers.set('X-Gnl-Run-Id', runId);
+        return res;
+      }
+    }
     try {
       const messages = await convertToModelMessages(body.messages ?? []);
       result = await gnl.stream(name, {
@@ -379,6 +340,8 @@ export function createChatRoute(
         messages,
         threadId,
         approvals: body.approvals,
+        // WHO answers them — the one mapping (@gnldev/auth `answererOf`, via the door's admission); the engine decides what they may answer.
+        ...(who.answerer ? { answerer: who.answerer } : {}),
         // HER ZAMAN mühürlü — kimlik bilinmese bile. Ayrılmış anahtarlar motorun "bunu sunucu
         // doğruladı" kanalıdır; mühürsüz bir gövde o kanalın sahibi olur. Kimlik yoksa anahtarlar
         // silinir (fail-closed), çözücü varsa sunucunun değeri yazılır.

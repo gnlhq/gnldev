@@ -9,6 +9,7 @@ import { InMemoryJournal } from '../src/journal.js';
 import { durableTool } from '../src/durable-tool.js';
 import { runDurable } from '../src/run.js';
 import { DivergenceError } from '../src/errors.js';
+import { mintCallId } from '../src/call-identity.js';
 import { countToolResults, toolCallResult, finalTextResult, createMockModel } from './mock.js';
 
 describe('M2 determinism boundary', () => {
@@ -29,13 +30,13 @@ describe('M2 determinism boundary', () => {
       );
 
     await runDurable({ runId: 'r', journal, model: model(), tools, stopWhen: stepCountIs(6), prompt: 'x' });
-    const after1 = await journal.get('r:tool:call-now');
+    const after1 = await journal.get(`r:tool:${mintCallId('call-now', 'r', 0, 0)}`);
     expect(bodyCalls).toBe(1);
 
     // Repeat with the same runId (resume): the tool replays from the journal → the body does NOT run again, the value stays fixed.
     await runDurable({ runId: 'r', journal, model: model(), tools, stopWhen: stepCountIs(6), prompt: 'x' });
     expect(bodyCalls).toBe(1);
-    expect(await journal.get('r:tool:call-now')).toEqual(after1);
+    expect(await journal.get(`r:tool:${mintCallId('call-now', 'r', 0, 0)}`)).toEqual(after1);
   });
 
   it('(b) full resume: the live model is NOT CONSUMED; the tool-call chain replays from the journal', async () => {
@@ -53,7 +54,7 @@ describe('M2 determinism boundary', () => {
 
     const r1 = await runDurable({ runId: 'r', journal, model, tools, stopWhen: stepCountIs(6), prompt: 'x' });
     expect(gen).toBe(1); // live once in run1 (step0)
-    expect(await journal.get('r:tool:call-1')).toBeDefined();
+    expect(await journal.get(`r:tool:${mintCallId('call-1', 'r', 0, 0)}`)).toBeDefined();
 
     // Resume: SAME model instance. All steps replay from the journal → doGenerate is NEVER called → gen=1.
     const r2 = await runDurable({ runId: 'r', journal, model, tools, stopWhen: stepCountIs(6), prompt: 'x' });

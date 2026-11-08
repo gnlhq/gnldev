@@ -28,6 +28,7 @@ import type { Journal } from './journal.js';
 import { claim } from './journal.js';
 import { stampIsLive } from './liveness.js';
 import { procStampFor } from './process-liveness.js';
+import { sameCall } from './call-identity.js';
 
 export interface XidRecord {
   v: 1;
@@ -98,7 +99,7 @@ export async function writeXid(journal: Journal, plan: XidPlan, runId: string, t
     if (await claim(journal, key, rec)) return;
     const cur = await journal.get<XidRecord>(key);
     // A released slot, or this call's own in-flight id (a recovered attempt that holds none) — completed.
-    const mine = cur?.inFlight === true && cur.first?.runId === runId && cur.first?.toolCallId === toolCallId;
+    const mine = cur?.inFlight === true && cur.first !== undefined && sameCall(cur.first, { runId, toolCallId });
     if (cur && (cur.released === true || mine)) await casXid(journal, key, cur, rec);
   } catch { /* best-effort */ }
 }
@@ -146,7 +147,7 @@ export async function claimXidInFlight(
     const at = cur.first?.at ?? 0;
     const stale = cur.inFlight === true && !(await stampIsLive(at, cur.ttlMs ?? staleTtlMs, now, cur, journal));
     const windowExpired = windowTtlMs !== undefined && cur.released !== true && (cur.inFlight !== true || stale) && now - at > windowTtlMs;
-    const own = cur.first?.runId === runId && cur.first?.toolCallId === toolCallId;
+    const own = cur.first !== undefined && sameCall(cur.first, { runId, toolCallId });
     const takeable = cur.released === true || windowExpired || (stale && own);
     if (!takeable) return { won: false, cur };
     if (await casXid(journal, key, cur, claimed)) return { won: true, held: { key, claimed } };
@@ -187,7 +188,7 @@ export async function completeOwnXid(journal: Journal, plan: XidPlan, runId: str
   try {
     const key = xidKey(plan.resourceId, plan.toolName, plan.identity);
     const cur = await journal.get<XidRecord>(key);
-    if (!cur || cur.inFlight !== true || cur.first?.runId !== runId || cur.first?.toolCallId !== toolCallId) return;
+    if (!cur || cur.inFlight !== true || cur.first === undefined || !sameCall(cur.first, { runId, toolCallId })) return;
     await writeXid(journal, plan, runId, toolCallId, { key, claimed: cur });
   } catch { /* best-effort */ }
 }
@@ -215,8 +216,12 @@ export function amountsDifferOf(rec: XidRecord, args: unknown): string[] {
 
 /** Soru/rapor metinleri için insan-okur özet: "5 dk önce, sohbetten". */
 export function xidWhen(rec: XidRecord, nowMs: number): string {
-  const ageMs = Math.max(0, nowMs - rec.first.at);
-  const mins = Math.round(ageMs / 60_000);
-  const age = mins < 1 ? 'just now' : mins < 60 ? `${mins} min ago` : mins < 1440 ? `${Math.round(mins / 60)} h ago` : `${Math.round(mins / 1440)} d ago`;
+  const age = agoText(nowMs - rec.first.at);
   return rec.first.channel ? `${age}, via ${rec.first.channel}` : age;
+}
+
+/** "5 min ago" for an age in ms — one wording for every question that says when something happened. */
+export function agoText(ageMs: number): string {
+  const mins = Math.round(Math.max(0, ageMs) / 60_000);
+  return mins < 1 ? 'just now' : mins < 60 ? `${mins} min ago` : mins < 1440 ? `${Math.round(mins / 60)} h ago` : `${Math.round(mins / 1440)} d ago`;
 }

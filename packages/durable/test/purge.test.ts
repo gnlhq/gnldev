@@ -1,7 +1,7 @@
 // Retention/GDPR purge: ALL trace of the target run is deleted, NEIGHBORING runs are untouched.
 // Since deletion is destructive, boundaries are specifically tested (prefix neighboring: r-1 vs r-10).
 import { describe, it, expect } from 'vitest';
-import { InMemoryJournal, runKeys, purgeRun, purgeThread, sweepRuns, createGnl, netKeys } from '../src/index.js';
+import { InMemoryJournal, runKeys, purgeRun, purgeThread, sweepRuns, createGnl, netKeys, mintCallId } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { createMockModel, finalTextResult } from './mock.js';
 
@@ -196,12 +196,13 @@ describe('purgeRun agent-tool cascade (H5)', () => {
     await gnl.run('main', { runId: 'p1', prompt: 'task' });
 
     // Nested journal really got created (agent:<parentRunId>:<toolCallId>).
-    expect((await journal.readRun('agent:p1:call-uz1')).length).toBeGreaterThan(0);
+    const nested = `agent:p1:${mintCallId('call-uz1', 'p1', 0, 0)}`; // the call id is the GNL id minted at the model boundary
+    expect((await journal.readRun(nested)).length).toBeGreaterThan(0);
 
     await purgeRun(journal, 'p1');
     expect(await journal.readRun('p1')).toEqual([]);
-    expect(await journal.readRun('agent:p1:call-uz1')).toEqual([]); // cascade: no orphaned PII
-    expect(await journal.listKeys('agent:p1:call-uz1:')).toEqual([]);
+    expect(await journal.readRun(nested)).toEqual([]); // cascade: no orphaned PII
+    expect(await journal.listKeys(`${nested}:`)).toEqual([]);
   });
 
   it('deep chain: parent → agent → agent (grandchild) all deleted; neighboring agent run REMAINS', async () => {
@@ -277,16 +278,16 @@ describe('purgeRun workflow-as-tool cascade', () => {
       agents: { clerk: { model: parentModel, workflows: ['onboarding'] } },
     });
     // NEIGHBORS in the same namespace: an unrelated parent's workflow child, and a runId that merely
-    // EXTENDS the child's (`call-w1` vs `call-w10`) — the registry key has no terminator after the
+    // EXTENDS the child's (the child's id with a `0` after it) — the registry key has no terminator after the
     // runId, so a prefix delete of the child's record would take this one with it.
+    const child = `wf:p-wf:${mintCallId('call-w1', 'p-wf', 0, 0)}`;
     await journal.put('wf:p-other:call-w1:wf:collect', { keep: true });
     await journal.put('wfrun:wf:p-other:call-w1', { runId: 'wf:p-other:call-w1', status: 'completed' });
-    await journal.put('wfrun:wf:p-wf:call-w10', { runId: 'wf:p-wf:call-w10', status: 'completed' });
+    await journal.put(`wfrun:${child}0`, { runId: `${child}0`, status: 'completed' });
 
     await gnl.run('clerk', { runId: 'p-wf', prompt: 'onboard order 8812' });
 
     // Precondition: the workflow really ran durably under the parent-scoped nested id.
-    const child = 'wf:p-wf:call-w1';
     expect(await journal.get(`${child}:wf:collect`)).toBeDefined();
     expect(await journal.get(`wfrun:${child}`)).toBeDefined();
 
@@ -297,7 +298,7 @@ describe('purgeRun workflow-as-tool cascade', () => {
     expect(await journal.get(`wfrun:${child}`)).toBeUndefined(); // and it stops advertising itself
     expect(await journal.get('wf:p-other:call-w1:wf:collect')).toBeDefined();
     expect(await journal.get('wfrun:wf:p-other:call-w1')).toBeDefined();
-    expect(await journal.get('wfrun:wf:p-wf:call-w10')).toBeDefined(); // r-1 did not take r-10
+    expect(await journal.get(`wfrun:${child}0`)).toBeDefined(); // r-1 did not take r-10
   });
 
   it('legacy bare `wf:<toolCallId>` children are cascaded too; another parent\'s child REMAINS', async () => {

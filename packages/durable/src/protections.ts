@@ -17,6 +17,7 @@
 import type { CreateGnlConfig } from './registry.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { FORMAT_PROTECTIONS_NAMES, PROTECTION_CONTEXT_NAMES, refuseConfigNames } from './option-names.js';
+import { memoryRefusedUnderOrganizations } from './org-storage.js';
 
 /**
  * ✓ on · ○ off · ─ dev-only.
@@ -94,6 +95,13 @@ export interface ProtectionContext {
   devOnly?: { memory?: boolean };
   /** Names the process in the dev-only note, e.g. 'gnl dev'. */
   surface?: string;
+  /**
+   * Can a request reach this config as an ORGANIZATION's? `true` when the surface is configured to serve
+   * organizations, `'possible'` when an identity it admits may carry one (an auth provider whose
+   * credentials the surface cannot read). Left out: no. A `memory` object that cannot be split by
+   * organization (`scopeConfigToOrg` refuses it) is then not marked on.
+   */
+  organizations?: boolean | 'possible';
 }
 
 const MARKS: Record<ProtectionMark, string> = { on: '✓', off: '○', 'dev-only': '─', unknown: '?' };
@@ -155,7 +163,7 @@ export function describeProtections(config: CreateGnlConfig, ctx: ProtectionCont
           id: 'dedup',
           label: 'dedup profile',
           mark: 'off',
-          value: 'none — declarations inert',
+          value: 'none — effectClass inert',
           from: 'default',
           // The exact failure this row exists to make visible: a tool can declare `effectClass` and
           // have that declaration do nothing at all, because nothing reads it without a profile.
@@ -237,8 +245,20 @@ export function describeProtections(config: CreateGnlConfig, ctx: ProtectionCont
 
   const memoryOff = config.memory === false;
   const memoryHere = !!(config.memory || config.memoryFactory);
+  // The refusal every organization-bound request would get — asked of the one rule (org-storage.ts),
+  // never re-derived here.
+  const refusedForOrgs = ctx.organizations ? memoryRefusedUnderOrganizations(config) : undefined;
   rows.push(
-    ctx.devOnly?.memory && !memoryHere
+    refusedForOrgs
+      ? {
+          id: 'threadGate',
+          label: 'thread gate',
+          mark: ctx.organizations === true ? 'off' : 'unknown',
+          value: 'memory (object) — refused for organization-bound requests',
+          from: 'explicit',
+          note: 'this object cannot be split by organization, so an organization\'s turn is refused (500 memory_not_splittable) — pass `memoryFactory`',
+        }
+      : ctx.devOnly?.memory && !memoryHere
       ? {
           id: 'threadGate',
           label: 'thread gate',

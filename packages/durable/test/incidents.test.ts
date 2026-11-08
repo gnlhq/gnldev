@@ -9,9 +9,13 @@ import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
 import { readIncidents } from '../src/incidents.js';
 import { DuplicateSideEffectError, ToolLoopDetectedError } from '../src/limits.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
 afterEach(() => vi.restoreAllMocks());
+
+// `call-<n>` is the mock's id for the call of model step n-1; GNL's id for it is what the incidents carry.
+const callN = (run: string, n: number) => mintCallId(`call-${n}`, run, n - 1, 0);
 
 const sawNudge = (prompt: any[]) => JSON.stringify(prompt ?? []).includes('__gnl_reflected');
 
@@ -44,7 +48,7 @@ describe('incident journaling', () => {
 
     const incidents = await readIncidents(journal, 'inc-1');
     expect(incidents).toHaveLength(1);
-    expect(incidents[0]).toMatchObject({ source: 'duplicate-guard', action: 'warn', toolName: 'charge', toolCallId: 'call-2' });
+    expect(incidents[0]).toMatchObject({ source: 'duplicate-guard', action: 'warn', toolName: 'charge', toolCallId: callN('inc-1', 2) });
     expect(incidents[0].message).toContain('EXECUTE AGAIN'); // the SAME console message, queryable now
 
     // Replay of the completed run: fast-path short-circuits → incident count is stable.
@@ -67,7 +71,7 @@ describe('incident journaling', () => {
 
     const incidents = await readIncidents(journal, 'inc-2');
     expect(incidents).toHaveLength(1); // three identical decisions → one record (idempotent key)
-    expect(incidents[0]).toMatchObject({ source: 'duplicate-guard', action: 'block', toolCallId: 'call-2' });
+    expect(incidents[0]).toMatchObject({ source: 'duplicate-guard', action: 'block', toolCallId: callN('inc-2', 2) });
   });
 
   it('loop-reflect then ignored-nudge block → TWO distinct incidents telling the full story in order', async () => {
@@ -83,8 +87,8 @@ describe('incident journaling', () => {
 
     const incidents = await readIncidents(journal, 'inc-3');
     expect(incidents.map((i) => [i.source, i.action, i.toolCallId])).toEqual([
-      ['loop-detection', 'reflect', 'call-3'], // the nudge
-      ['loop-detection', 'block', 'call-4'], // the ignored-nudge stop
+      ['loop-detection', 'reflect', callN('inc-3', 3)], // the nudge
+      ['loop-detection', 'block', callN('inc-3', 4)], // the ignored-nudge stop
     ]);
     expect(incidents[1].message).toContain('reconsider nudge');
   });

@@ -2,7 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { refuseConfigNames, type CreateGnlConfig } from '@gnldev/durable';
 import { enqueue, createWorker, type JobCtx, type Worker, type QueueWorkerOptions } from '@gnldev/queue';
 import { refuseUnknownNames, optionNames } from '@gnldev/options';
-import { channelRuntime, runFor, postOnce, type ReplyTool } from './core.js';
+import { channelRuntime, runFor, postOnce, approvalRefusalNotice, type ReplyTool } from './core.js';
 
 export interface TelegramChannelOptions {
   /** The bot's token from @BotFather (`123456:ABC…`). Telegram puts it in every call's URL; it is never in an error message. */
@@ -108,13 +108,24 @@ export function telegramChannel(config: CreateGnlConfig, opts: TelegramChannelOp
   });
 
   async function runAndAnswer(job: TelegramJob, ctx: JobCtx, approvals?: Record<string, boolean>): Promise<unknown> {
-    const result = await runFor(rt, opts.agent, {
-      workKey: workKeyOf(job.chatId, job.messageId),
-      threadId: `telegram:${botId}:${job.chatId}:${job.threadId ?? 0}:${job.userId}`,
-      subject: `telegram:${botId}:${job.userId}`,
-      ...(job.orgId ? { org: job.orgId } : {}),
-      ...(approvals ? { approvals } : { prompt: job.text }),
-    });
+    let result: Awaited<ReturnType<typeof runFor>>;
+    try {
+      // Only the person who asked can press, so the press is the requester's answer (`telegram:<bot>:<user>`, the channel's
+      // spelling of a person — the same as the run's subject, which `runFor` says by default).
+      result = await runFor(rt, opts.agent, {
+        workKey: workKeyOf(job.chatId, job.messageId),
+        threadId: `telegram:${botId}:${job.chatId}:${job.threadId ?? 0}:${job.userId}`,
+        subject: `telegram:${botId}:${job.userId}`,
+        ...(job.orgId ? { org: job.orgId } : {}),
+        ...(approvals ? { approvals } : { prompt: job.text }),
+      });
+    } catch (e) {
+      // The engine refused a yes that was not theirs to give: said in the chat, not retried (it cannot change).
+      const notice = approvalRefusalNotice(e);
+      if (notice === undefined) throw e;
+      await postOnce(ctx, replyTool(job), `telegram-refused:${workKeyOf(job.chatId, job.messageId)}`, { text: notice });
+      return { refused: 'approval_not_permitted' };
+    }
     if (result.interrupts.length === 0) {
       await postOnce(ctx, replyTool(job), `telegram-reply:${result.runId}`, { text: result.text?.trim() || '(no answer)' });
       return { runId: result.runId };

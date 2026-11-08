@@ -16,7 +16,7 @@
 import { revokedWhy, continuesElsewhere } from './execution-grant.js';
 import { runKeys } from './journal.js';
 import type { Journal, RunOutcomeRecord } from './journal.js';
-import { RunBusyError, CALLER_CONFLICT_CODES } from './errors.js';
+import { RunBusyError, CALLER_CONFLICT_CODES, safeUpstreamUrl, safeUpstreamBody } from './errors.js';
 
 /**
  * Errors that mean "this run did not run", not "this run failed".
@@ -155,7 +155,7 @@ function messageOf(err: unknown): string {
  * week") without parsing prose. `name` when the class set one, else the constructor's — a subclass
  * that forgot `this.name = ...` still reads as itself rather than as 'Error'. Absent for a non-Error throw.
  */
-function errorNameOf(err: unknown): { errorName?: string; errorCode?: string; errorStatus?: number } {
+function errorNameOf(err: unknown): { errorName?: string; errorCode?: string; errorStatus?: number; errorUrl?: string; errorBody?: string; errorModel?: string; errorProvider?: string } {
   if (!(err instanceof Error)) return {};
   const ctor = (err as { constructor?: { name?: unknown } }).constructor?.name;
   const name = err.name && err.name !== 'Error' ? err.name : typeof ctor === 'string' && ctor ? ctor : err.name;
@@ -166,10 +166,21 @@ function errorNameOf(err: unknown): { errorName?: string; errorCode?: string; er
   const last = (err as { lastError?: unknown }).lastError as { statusCode?: unknown; code?: unknown } | undefined;
   const code = (err as { code?: unknown }).code ?? last?.code;
   const status = (err as { statusCode?: unknown }).statusCode ?? last?.statusCode;
+  // Only an HTTP failure has these (an `APICallError`'s url / responseBody): masked and bounded before they are stored.
+  const src = (typeof (err as { statusCode?: unknown }).statusCode === 'number' ? err : last) as { url?: unknown; responseBody?: unknown } | undefined;
+  const url = typeof status === 'number' ? safeUpstreamUrl(src?.url) : undefined;
+  const body = typeof status === 'number' ? safeUpstreamBody(src?.responseBody) : undefined;
+  const mark = (err as { upstreamModel?: unknown; upstreamProvider?: unknown }).upstreamModel !== undefined ? err : last;
+  const model = (mark as { upstreamModel?: unknown } | undefined)?.upstreamModel;
+  const provider = (mark as { upstreamProvider?: unknown } | undefined)?.upstreamProvider;
   return {
     ...(name ? { errorName: String(name).slice(0, 120) } : {}),
     ...(typeof code === 'string' && /^[\w.-]{1,40}$/.test(code) ? { errorCode: code } : {}),
     ...(typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599 ? { errorStatus: status } : {}),
+    ...(url !== undefined ? { errorUrl: url } : {}),
+    ...(body !== undefined ? { errorBody: body } : {}),
+    ...(typeof model === 'string' ? { errorModel: model } : {}),
+    ...(typeof provider === 'string' ? { errorProvider: provider } : {}),
   };
 }
 

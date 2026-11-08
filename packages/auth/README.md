@@ -122,6 +122,13 @@ last 15 minutes by default. Use `publicKey` instead of `secret` if you sign with
 `sub` follows the same rules as a `resourceId` (1–200 characters, no control characters) and may not
 start with `operator:`, `application:`, `role:` or `token:`, which name staff and synthetic ids.
 
+**An end user can start every registered workflow and agent.** `workflow:run` and `agents:run` are one
+permission each and cover everything registered, so a user holding their own token can also start the
+back-office workflow (a monthly billing run) or agent. `@gnldev/server` prints a warning at startup when it
+sees `endUsers` next to registered workflows or agents. To keep one out of their reach today, pass a
+`resourceAuth` hook to `createRestApi` (`@gnldev/server`): it is asked per workflow/agent name and may answer
+`false` for an end user. A per-definition `access` field, with a typed 403, is planned for 0.18.
+
 **How long a token may live.** At most 1 hour (`maxTtlSec`, default 3600). A token claiming a later
 `exp` is refused. If you can take tokens back, pass `isRevoked` and you may allow up to 30 days: for a
 credential pasted into an MCP client's config, or a link in an email.

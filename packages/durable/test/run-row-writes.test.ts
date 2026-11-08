@@ -33,7 +33,7 @@ import pg from 'pg';
 import { tool } from 'ai';
 import { z } from 'zod';
 import {
-  runDurable, cancelAgentRun, forkRun, rolloverRun, createGnl, gnlTool, STAFF, stampFormat, type Storage, inMemoryLiveness,
+  runDurable, cancelAgentRun, forkRun, rolloverRun, createGnl, gnlTool, STAFF, mintCallId, stampFormat, type Storage, inMemoryLiveness,
 } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { claimRunOwner } from '../src/run-identity.js';
@@ -230,11 +230,14 @@ async function fromJournal(b: Backend): Promise<Row[]> {
  * — the flags' outcome (`storedOutcomeOf`) and the status 282311f2's reads decoded from them — so a
  * value changed by the `run-status` work shows here as a difference, not as a new expectation.
  */
-const BEFORE: Row[] = [
+// The sub-agents' run ids carry the GNL ids the parent's model boundary minted for p0..p2 (one step, three
+// provider ids: index 0..2); `rows` is in byte order, so they are put in it here.
+const child = (i: number) => `agent:h-parent:${mintCallId(`p${i}`, 'h-parent', 0, i)}`;
+const BEFORE: Row[] = ([
   // run_id, model_steps, tool_calls, suspended_count, outcome, status, resource_id, thread_id   (282311f2's flags)
-  ['agent:h-parent:p0', 5, 4, 0, null, 'completed', '', null], // none
-  ['agent:h-parent:p1', 5, 4, 0, null, 'completed', '', null], // none
-  ['agent:h-parent:p2', 5, 4, 0, null, 'completed', '', null], // none
+  [child(0), 5, 4, 0, null, 'completed', '', null], // none
+  [child(1), 5, 4, 0, null, 'completed', '', null], // none
+  [child(2), 5, 4, 0, null, 'completed', '', null], // none
   ['h-canceled', 1, 1, 1, 'canceled', 'canceled', '', null], // suspended + canceled
   ['h-done', 3, 2, 0, null, 'completed', 'ayse', 'th-1'], // none
   ['h-failed', 0, 0, 0, 'failed', 'failed', 'ayse', null], // failed
@@ -244,7 +247,7 @@ const BEFORE: Row[] = [
   ['h-parent', 2, 3, 0, null, 'completed', '', null], // none
   ['h-resumed', 2, 1, 0, null, 'completed', 'bob', null], // none
   ['h-waiting', 1, 1, 1, 'running', 'suspended', '', null], // suspended + running
-];
+] as Row[]).sort((a, c) => (a[0] < c[0] ? -1 : a[0] > c[0] ? 1 : 0));
 
 for (const [name, make] of BACKENDS) {
   describe(`a run's row, written once per journal write — ${name}`, () => {

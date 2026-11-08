@@ -11,7 +11,7 @@
 // run, say) is kept under the agent. Nothing here runs a tool: every call is answered from the copy, and
 // a call it does not hold stops the play, which is then judged only where what it did already settles it.
 import { generateText, stepCountIs, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
-import { argsHash, personRecordKey, runKeys, threadOwnerKey, priceFor, type ModelPricing } from '@gnldev/durable';
+import { argsHash, restoreProviderIds, personRecordKey, runKeys, threadOwnerKey, priceFor, type ModelPricing } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
 import { recordedResults, runTrials, wilson, readerOf, type Expectation, type Interval, type JournalSource, type ToolAnswer, type TracedCall, type TrialsProgress } from '@gnldev/experiment';
 import { judgePlay } from './judge.js';
@@ -243,7 +243,7 @@ export async function runScenarios(opts: RunScenariosOptions): Promise<RunScenar
     }
     const systemInMessages = s.messages.some((m) => m.role === 'system');
     const r = await generateText({
-      model: opts.model, system: opts.system ?? s.system, messages: s.messages, tools: tools as ToolSet,
+      model: opts.model, system: opts.system ?? s.system, messages: restoreProviderIds(s.messages) as typeof s.messages, tools: tools as ToolSet,
       ...(systemInMessages ? { allowSystemInMessages: true } : {}),
       stopWhen: [stepCountIs(opts.maxSteps ?? 10), () => stopped !== undefined],
     } as never) as Awaited<ReturnType<typeof generateText>>;

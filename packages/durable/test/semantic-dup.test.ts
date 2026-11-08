@@ -19,7 +19,11 @@ import { durableTools } from '../src/durable-tool.js';
 import { readIncidents } from '../src/incidents.js';
 import { semKey, semTombKey } from '../src/semantic-dup.js';
 import type { SemDupRecord } from '../src/semantic-dup.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
+
+/** The GNL id of the provider id `pid` the mock model gives at step 0 of run `runId` (what the journal keys by). */
+const gid = (pid: string, runId: string) => mintCallId(pid, runId, 0, 0);
 
 /** Deterministic fake embedder: text → a one-hot-ish vector. Identical text scores 1.0, different
  *  text 0.0 — so a test builds similarity by giving both calls the SAME canonical sentence (a
@@ -89,7 +93,7 @@ describe('FAZ-6 end-to-end flow', () => {
     const semKeys = await journal.listKeys('xthr:th-A:sem-');
     expect(semKeys).toHaveLength(1);
     const rec = await journal.get<SemDupRecord>(semKeys[0]!);
-    expect(rec).toMatchObject({ v: 1, toolName: 'createProduct', embedModelId: 'e2e-model', identity: { sku: 'abc' }, firstToolCallId: 'call-1' });
+    expect(rec).toMatchObject({ v: 1, toolName: 'createProduct', embedModelId: 'e2e-model', identity: { sku: 'abc' }, firstToolCallId: gid('call-1', 'r1') });
     expect(rec!.vecB64).toBeTruthy();
     expect(rec!.canonical).toBe('createProduct: abc');
     expect(rec!.canonical).not.toContain('first'); // beyan edilmeyen alan embedder'a SIZMAZ
@@ -98,9 +102,10 @@ describe('FAZ-6 end-to-end flow', () => {
     const r2model = model('createProduct', 'call-2', { sku: ' abc ', note: 'forgot, again' }); // proof of trim + case-fold normalization
     await runDurable(base(journal, 'r2', { model: r2model(), tools, threadId: 'th-A', limits }) as any);
     expect(counter.n).toBe(1); // NOT fired — a question was asked instead
-    const susRec = await journal.get<any>('r2:tool:call-2');
+    const susRec = await journal.get<any>(`r2:tool:${gid('call-2', 'r2')}`);
     expect(susRec.status).toBe('suspended');
-    expect(susRec.output.__gnl_suspend.reason).toContain('call-1'); // ilk sonucun adresi soruda
+    expect(susRec.output.__gnl_suspend.reason).toContain('earlier in this conversation'); // d25 P5/16: the question names where, not an internal call id
+    expect(susRec.output.__gnl_suspend.reason).not.toContain('call-1');
     expect(susRec.output.__gnl_suspend.reason).toContain('% match');
     const incidents = await readIncidents(journal, 'r2');
     expect(incidents.some((i) => i.source === 'semantic-guard' && i.action === 'suspend')).toBe(true);
@@ -115,7 +120,7 @@ describe('FAZ-6 end-to-end flow', () => {
     // beats probabilistic: the semantic gate is never reached, the question belongs to layer 3):
     await runDurable(base(journal, 'r3', { model: model('createProduct', 'call-3', { sku: ' abc ', note: 'forgot, again' })(), tools, threadId: 'th-A', limits }) as any);
     expect(counter.n).toBe(2);
-    const r3rec = await journal.get<any>('r3:tool:call-3');
+    const r3rec = await journal.get<any>(`r3:tool:${gid('call-3', 'r3')}`);
     expect(r3rec.status).toBe('suspended');
     expect(r3rec.output.__gnl_suspend.reason).toContain('identical arguments'); // the exact layer's voice, not the semantic one's
 
@@ -141,7 +146,7 @@ describe('FAZ-6 end-to-end flow', () => {
     // A third variant with no tombstone is still asked about (a tombstone covers a PAIR, not a blanket):
     await runDurable(base(journal, 't3', { model: model('createProduct', 'c3', { sku: 'T-1', note: 'third' })(), tools, threadId: 'th-T', limits }) as any);
     expect(counter.n).toBe(2);
-    expect((await journal.get<any>('t3:tool:c3')).status).toBe('suspended');
+    expect((await journal.get<any>(`t3:tool:${gid('c3', 't3')}`)).status).toBe('suspended');
   });
 
   it('replaying the same runId never reaches the semantic gate, so the embedding is not paid for twice', async () => {
@@ -250,7 +255,7 @@ describe('FAZ-6 decision gates (score alone never decides)', () => {
     // cancel:false + the same orderId (different hash) = a real duplicate candidate → suspend
     await runDurable(base(journal, 'd3', { model: model('refund', 'c3', { orderId: 'O-1', cancel: false, note: 'w' })(), tools, threadId: 'th-D', limits }) as any);
     expect(counter.n).toBe(2);
-    expect((await journal.get<any>('d3:tool:c3')).status).toBe('suspended');
+    expect((await journal.get<any>(`d3:tool:${gid('c3', 'd3')}`)).status).toBe('suspended');
   });
 
   it('the magnitude gate: identity equal + amount different → a suspend that says "amounts differ"', async () => {
@@ -267,7 +272,7 @@ describe('FAZ-6 decision gates (score alone never decides)', () => {
     await runDurable(base(journal, 'a1', { model: model('charge', 'c1', { orderId: 'O-9', amount: 99.9 })(), tools, threadId: 'th-M', limits }) as any);
     await runDurable(base(journal, 'a2', { model: model('charge', 'c2', { orderId: 'O-9', amount: 9990 })(), tools, threadId: 'th-M', limits }) as any);
     expect(counter.n).toBe(1);
-    const rec = await journal.get<any>('a2:tool:c2');
+    const rec = await journal.get<any>(`a2:tool:${gid('c2', 'a2')}`);
     expect(rec.status).toBe('suspended');
     expect(rec.output.__gnl_suspend.reason).toContain('amounts differ');
   });
@@ -350,25 +355,22 @@ describe('FAZ-6 fail-open, stamps and lifecycle', () => {
     const unusable = (r: { inc: Awaited<ReturnType<typeof readIncidents>> }) =>
       r.inc.some((i) => i.source === 'semantic-guard' && (i.detail as any)?.reason === 'identity-unusable');
 
-    // An object-valued key: every payload stringifies to the same thing.
+    // An object-valued key — d25 item 20: it IDENTIFIES now (type-preserving canonical form); two
+    // different payloads are two different jobs, and nothing stands down (was: unusable === true).
     const obj = await run('uo', { keys: ['payload'] }, { payload: { sku: 'A-1' } }, { payload: { sku: 'Z-9' } });
     expect(obj.ran).toBe(2);
-    expect(unusable(obj)).toBe(true);
+    expect(unusable(obj)).toBe(false);
 
     // A misspelled key ('userID' vs the actual 'userId'): every identity is ''.
     const typo = await run('ut', { keys: ['userID'] }, { userId: 'u-7' }, { userId: 'u-99' });
     expect(typo.ran).toBe(2);
     expect(unusable(typo)).toBe(true);
 
-    // An array-valued key: [1,2] and ['1','2'] both stringify to '1,2'.
+    // An array-valued key — d25 item 20: [1,2] and ['1','2'] are different jobs (types are kept) and
+    // the layer does not stand down (was: unusable === true with an 'element types flatten' message).
     const arr = await run('ua', { keys: ['items'] }, { items: [1, 2] }, { items: ['1', '2'] });
     expect(arr.ran).toBe(2);
-    expect(unusable(arr)).toBe(true);
-    // ...and it says WHY. An array is not the object case: `['a','b']` and `['c','d']` genuinely
-    // differ, so "every call would compare equal" is false here. An operator who reads that and then
-    // watches calls not compare equal stops believing the next diagnostic too.
-    expect(arr.inc.find((i) => i.source === 'semantic-guard')?.message ?? '')
-      .toMatch(/element types flatten/);
+    expect(unusable(arr)).toBe(false);
 
     // THE LINE THIS MUST NOT CROSS — the rule is "EVERY key empty", not "any key empty". An optional
     // field absent on both sides is a legitimate identity, and the question still gets asked.
@@ -405,13 +407,12 @@ describe('FAZ-6 fail-open, stamps and lifecycle', () => {
     }
     expect(reason(['sku'], { sku: 'A-1' })).toBeUndefined();
 
-    // A plain object does not. Every one of them is '[object Object]'.
-    expect(reason(['payload'], { payload: { sku: 'A' } })).toMatch(/carries no identity/);
-
-    // An array does not either, but for a DIFFERENT reason, and the message has to carry the real
-    // one: `['a','b']` and `['c','d']` do differ, so "every call would compare equal" is false here.
-    // What actually breaks is that element types flatten — [1,2] and ['1','2'] both become '1,2'.
-    expect(reason(['items'], { items: [1, 2] })).toMatch(/element types flatten/);
+    // d25 item 20 (decision changed on purpose): a plain object and an array DO identify now —
+    // normalizeId reads them as a type-preserving, unordered canonical form (it used to be '[object
+    // Object]' / a flattened '1,2'). What still cannot identify is a LEAF inside them.
+    expect(reason(['payload'], { payload: { sku: 'A' } })).toBeUndefined();
+    expect(reason(['items'], { items: [1, 2] })).toBeUndefined();
+    expect(reason(['items'], { items: [{ sku: () => 1 }] })).toMatch(/holds a function/);
 
     // THE GUARD'S OWN TARGET, which it used to miss. `constructor` resolves to Object and `toString`
     // to a function through the PROTOTYPE: both are non-null, both sailed past a bare
@@ -480,14 +481,14 @@ describe('FAZ-6 audit fixes', () => {
     // There IS a similar past success (it will produce a semantic candidate):
     await runDurable(base(journal, 'k1', { model: model('charge', 'c1', { orderId: 'O-7', note: 'first' })(), tools, threadId: 'th-K', limits }) as any).catch(() => {});
     expect(counter.n).toBe(1); // the first attempt fired and crashed → the record is 'failed'
-    expect((await journal.get<any>('k1:tool:c1')).status).toBe('failed');
+    expect((await journal.get<any>(`k1:tool:${gid('c1', 'k1')}`)).status).toBe('failed');
     explode = false;
     // Resume without approval: the old code found a semantic candidate and overwrote 'failed' with
     // 'suspended' ("similar work — shall I run it?"), hiding that THIS attempt may already have
     // fired. Now the record stands, the reclaim ladder answers (side-effect + unapproved → blocked),
     // and the effect is never re-fired.
     await runDurable(base(journal, 'k1', { model: model('charge', 'c1', { orderId: 'O-7', note: 'first' })(), tools, threadId: 'th-K', limits }) as any).catch(() => {});
-    const rec = await journal.get<any>('k1:tool:c1');
+    const rec = await journal.get<any>(`k1:tool:${gid('c1', 'k1')}`);
     expect(rec.status).toBe('failed'); // ezilmedi
     expect(counter.n).toBe(1); // not re-fired
   });

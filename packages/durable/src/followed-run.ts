@@ -14,6 +14,7 @@ import type { DetachedRuns } from './detached.js';
 import { readRunEvents, formatCursor, readCursor, type RunCursor, type RunEvent, type RunState } from './run-events.js';
 import { decodeEvent, errorOf, type ErrorData } from './event-codec.js';
 import type { Journal } from './journal.js';
+import { RunCanceledError } from './cancel.js';
 
 /** How a run ended for its reader: its last state, and what that state carries. */
 export interface RunEnding { state: RunState; interrupts?: unknown[]; error?: ErrorData }
@@ -96,11 +97,11 @@ export function endingOf(events: RunEvent[]): RunEnding | undefined {
  *
  * @internal — the registry and the doors build it from a run they admitted; a host reads `gnl.follow`.
  */
-export function followedRun(runs: DetachedRuns, req: { runId: string; scope?: string; journal: Journal; after: RunCursor | number; signal?: AbortSignal; state: string }): FollowedRun {
+export function followedRun(runs: DetachedRuns, req: { runId: string; scope?: string; journal: Journal; after?: RunCursor | number; signal?: AbortSignal; state: string; pending?: Promise<{ from: number }> }): FollowedRun {
   // A caller's cursor is read by `readCursor` (run-events.ts) where it arrived — refused there, before a
   // run was started or joined, when it is not one. A plain `seq` (where `start` said to read from) is read
   // by the same grammar here.
-  const start = typeof req.after === 'number' ? readCursor(req.after) : req.after;
+  const start = typeof req.after === 'number' ? readCursor(req.after) : req.after ?? readCursor(0);
   let cursor = start.seq;
   let offset = start.offset;
   let ending: RunEnding | undefined;
@@ -109,13 +110,22 @@ export function followedRun(runs: DetachedRuns, req: { runId: string; scope?: st
   let resolveStreamed!: () => void;
   const streamOver = new Promise<void>((r) => { resolveStreamed = r; });
   const scope = req.scope !== undefined ? { scope: req.scope } : {};
+  // THE START IS STILL WAITING (`pending`): the run's holder is gone and its takeover waits out a grace. The
+  // reader exists already and is TOLD so first (`waiting-takeover`), instead of reading nothing until the
+  // answer; where it reads from is known when the start settles (its own cursor, when it brought one).
+  let ready: Promise<void> | undefined;
+  const settled = (): Promise<void> => (ready ??= req.pending ? req.pending.then((s) => { if (req.after === undefined) { cursor = s.from; offset = 0; } }) : Promise.resolve());
+  let told = req.pending === undefined;
 
   const makeStream = (): ReadableStream<any> => {
     streamed = true;
-    const it = runs.follow({ runId: req.runId, ...scope, after: cursor, ...(offset ? { afterOffset: offset } : {}), ...(req.signal ? { signal: req.signal } : {}), untilPause: true });
+    let it: AsyncGenerator<RunEvent> | undefined;
     return new ReadableStream<any>({
       async pull(c) {
         try {
+          if (!told) { told = true; c.enqueue({ type: 'gnl-status', state: 'waiting-takeover' }); return; }
+          await settled();
+          it ??= runs.follow({ runId: req.runId, ...scope, after: cursor, ...(offset ? { afterOffset: offset } : {}), ...(req.signal ? { signal: req.signal } : {}), untilPause: true });
           for (;;) {
             const { value: ev, done } = await it.next();
             if (done) { c.close(); resolveStreamed(); return; }
@@ -128,6 +138,9 @@ export function followedRun(runs: DetachedRuns, req: { runId: string; scope?: st
                 // An ending its stream never carried (a limit, a refusal read from the steps) ends the stream
                 // with it, the way the in-request stream's reader learnt it.
                 if (st.state === 'failed' && st.error && !finishPart) { c.enqueue({ type: 'error', error: errorOf(st.error) }); return; }
+                // A canceled run is told the same way: the reader of a run that was canceled mid-flight is
+                // not left with a bare `done` (the ending it reads is the one `run()` throws for).
+                if (st.state === 'canceled') { c.enqueue({ type: 'error', error: st.error ? errorOf(st.error) : new RunCanceledError(req.runId) }); return; }
               }
               continue;
             }
@@ -142,7 +155,7 @@ export function followedRun(runs: DetachedRuns, req: { runId: string; scope?: st
           c.error(e);
         }
       },
-      async cancel() { await it.return(undefined); resolveStreamed(); },
+      async cancel() { await it?.return(undefined); resolveStreamed(); },
     // Nothing read ahead: `cursor()` is the place of the part the reader holds, not of one queued behind it
     // (a door stamps it on the event it writes — a reconnect must resume after THAT event).
     }, { highWaterMark: 0 });
@@ -152,7 +165,13 @@ export function followedRun(runs: DetachedRuns, req: { runId: string; scope?: st
   let summary: Promise<{ steps: any[]; finish: any }> | undefined;
   const summarize = () => (summary ??= (async () => {
     if (streamed) await streamOver;
-    else for await (const _ of runs.follow({ runId: req.runId, ...scope, after: cursor, ...(req.signal ? { signal: req.signal } : {}), untilPause: true })) { /* to its end */ }
+    else {
+      await settled();
+      for await (const ev of runs.follow({ runId: req.runId, ...scope, after: cursor, ...(req.signal ? { signal: req.signal } : {}), untilPause: true })) {
+        // The follow's own ending too (a run whose takeover failed, detached.ts): it is not in the log read below.
+        if (ev.kind === 'status' && ENDINGS.has((ev.data as RunEnding).state)) ending = ev.data as RunEnding;
+      }
+    }
     const events = await allRunEvents(req.journal, req.runId);
     ending ??= endingOf(events);
     const finish = [...events].reverse().find((e) => e.kind === 'finish');
@@ -176,7 +195,19 @@ export function followedRun(runs: DetachedRuns, req: { runId: string; scope?: st
     get usage() { return summarize().then((s) => s.finish?.totalUsage); },
     get totalUsage() { return summarize().then((s) => s.finish?.totalUsage); },
     get ended() { return summarize().then(() => ending); },
-    toUIMessageStream(opts = {}) { return toUIMessageStream({ stream: makeStream(), ...opts } as any) as ReadableStream<any>; },
+    toUIMessageStream(opts = {}) {
+      // The AI SDK's converter knows no `gnl-status` part: it is taken out of the parts and written as a
+      // transient data chunk (`data-gnl-status`, never kept in the message) the moment it arrives — before
+      // the converter has anything to say, which is the whole point of telling a waiting reader.
+      let note: ((state: unknown) => void) | undefined;
+      const parts = makeStream().pipeThrough(new TransformStream<any, any>({ transform(p, c) { if (p?.type === 'gnl-status') note?.(p.state); else c.enqueue(p); } }));
+      const reader = (toUIMessageStream({ stream: parts, ...opts } as any) as ReadableStream<any>).getReader();
+      return new ReadableStream<any>({
+        start(c) { note = (state) => c.enqueue({ type: 'data-gnl-status', data: { state }, transient: true }); },
+        async pull(c) { const { done, value } = await reader.read(); if (done) c.close(); else c.enqueue(value); },
+        cancel(reason) { return reader.cancel(reason); },
+      });
+    },
     toUIMessageStreamResponse(opts = {}) {
       const { headers, status, ...rest } = opts;
       return createUIMessageStreamResponse({ stream: result.toUIMessageStream(rest), ...(headers ? { headers } : {}), ...(status ? { status } : {}) } as any);

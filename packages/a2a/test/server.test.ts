@@ -1,7 +1,7 @@
 // The A2A door's siblings of the evidence test: every way a task maps onto a GNL run.
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { InMemoryJournal } from '@gnldev/durable';
+import { InMemoryJournal, mintCallId } from '@gnldev/durable';
 import { createA2AServer, A2A_ERROR_CODES } from '../src/server.js';
 import { textModel, chargeModel } from './models.js';
 
@@ -74,12 +74,12 @@ describe('A2A door: message/send is a GNL run', () => {
     const task = first.body.result;
     expect(task.status.state).toBe('input-required');
     const data = task.status.message.parts.find((p: any) => p.kind === 'data').data;
-    expect(data.interrupts[0]).toMatchObject({ toolCallId: 'c1', toolName: 'charge' });
+    expect(data.interrupts[0]).toMatchObject({ toolCallId: mintCallId('c1', task.id, 0, 0), toolName: 'charge' });
     expect(executed).toEqual([]);
 
     const got = await rpc(serve, 'pay', 'tasks/get', { id: task.id });
     expect(got.body.result.status.state).toBe('input-required');
-    expect(got.body.result.status.message.parts[1].data.interrupts[0]).toMatchObject({ toolCallId: 'c1', toolName: 'charge', args: { amount: 5000 } });
+    expect(got.body.result.status.message.parts[1].data.interrupts[0]).toMatchObject({ toolCallId: mintCallId('c1', task.id, 0, 0), toolName: 'charge', args: { amount: 5000 } });
 
     const done = await approve(serve, 'pay', task.id, true);
     expect(done.body.result).toMatchObject({ id: task.id, status: { state: 'completed' } });

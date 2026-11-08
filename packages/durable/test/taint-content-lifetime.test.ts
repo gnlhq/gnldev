@@ -16,6 +16,7 @@ import { tool, stepCountIs } from 'ai';
 import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
+import { mintCallId } from '../src/call-identity.js';
 import { readRunTaint, readThreadTaint, readTaintProvenance } from '../src/taint.js';
 import { TaintedSideEffectError } from '../src/limits.js';
 import type { Memory } from '../src/memory.js';
@@ -121,7 +122,7 @@ describe('content-lifetime taint (taintLifetime: "content-window")', () => {
     // Turn 1: untrusted fetch taints the thread; its appended messages are stamped as provenance.
     const t1 = await turn({ runId: 'cw-1', model: fetchModel(), prompt: 'summarize the page' });
     expect(t1.text).toBe('Fetched.');
-    expect(await readThreadTaint(journal, 'T')).toMatchObject({ toolCallId: 'call-fetch', source: 'tool' });
+    expect(await readThreadTaint(journal, 'T')).toMatchObject({ toolCallId: mintCallId('call-fetch', 'cw-1', 0, 0), source: 'tool' });
     const prov = await readTaintProvenance(journal, 'T');
     expect(prov?.hashes.length).toBeGreaterThan(0);
 

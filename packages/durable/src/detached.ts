@@ -41,7 +41,7 @@ import {
 } from './process-liveness.js';
 import { appendRunEvent, endsFollow, lastRunEvent, readRunEvents, runEventPrefix, type RunEvent, type RunState } from './run-events.js';
 import { EXEC_PREFIX, execKey } from './exec-record.js';
-import { runRecordKey, runRecordPrefix } from './run-id-grammar.js';
+import { runRecordKey, runRecordPrefix, REPLAYED_RUN_RECORD_FAMILIES } from './run-id-grammar.js';
 import { settleErasedRun, deleteExactKey } from './model.js';
 import { runOwnerOf, type RawJournal } from './run-identity.js';
 import { erasureBaseline, runErasedSince, assertNotErased, type ErasureBaseline } from './erasure-fence.js';
@@ -148,7 +148,46 @@ export interface DetachedRunsOptions {
  * that rule (the engine's admission, `admitAgentRun`) EVERY time, before a run is executed, taken over,
  * resumed or attached to. This module keeps no rule of its own about whose a run is.
  */
-export interface StartRequest { runId: string; scope?: string; launch: Launch; admit?: () => Promise<void>; meta?: Record<string, unknown>; resumeIntent?: boolean }
+export interface StartRequest { runId: string; scope?: string; launch: Launch; admit?: () => Promise<void>; meta?: Record<string, unknown>; resumeIntent?: boolean; onWaiting?: () => void }
+
+/** Whether the run's last event is its `canceled` ending (`executeBody` writes it, then the record goes). */
+async function endedCanceled(journal: Journal, runId: string): Promise<boolean> {
+  const last = await lastRunEvent(journal, runId);
+  return last?.kind === 'status' && (last.data as { state?: unknown }).state === 'canceled';
+}
+
+/**
+ * Whether the run has a PAST: its event log has an event, or a model step or tool call of it is recorded. A
+ * run's `outcome` record says nothing of that — it is written when the run is begun, before its first step —
+ * so "no step ever ran" is read from the steps themselves. The one exception goes to the SAFE side: an
+ * outcome with no recorded input is a run this engine did not begin (the engine writes the input first), so
+ * nothing says it never ran, and it counts as having a past — parked for a person, never silently dropped.
+ */
+async function runHasPast(journal: Journal, runId: string): Promise<boolean> {
+  if (await lastRunEvent(journal, runId)) return true;
+  for (const family of REPLAYED_RUN_RECORD_FAMILIES) {
+    if ((await journal.listKeys(runRecordPrefix(runId, family as 'model' | 'tool'), { limit: 1 })).length > 0) return true;
+  }
+  return (await readRunOutcome(journal, runId)) !== undefined && (await journal.get(runKeys.input(runId))) === undefined;
+}
+
+/** The reason a failed launch parks a run with (`execute`); a run parked on a call's outcome keeps `awaits` and is retried. */
+const NOT_CONTINUED = 'could not be continued: ';
+const notContinued = (rec: ExecRecord): boolean => rec.status === 'parked' && !rec.awaits && typeof rec.reason === 'string' && rec.reason.startsWith(NOT_CONTINUED);
+/** The ending a follower of such a run reads (not in the log): a failure that says the run waits for an operator. */
+function notContinuedEnding(runId: string, seq: number): RunEvent {
+  return {
+    v: RUN_EVENT_VERSION, seq, kind: 'status', step: -1, at: Date.now(),
+    data: {
+      state: 'failed',
+      error: {
+        name: 'RunNotContinuedError', code: 'run_not_continued',
+        message: `@gnldev/durable: run '${runId}' stopped part-way and could not be continued — nothing was run again. ` +
+          'It waits for an operator (the server logged why); sending the same request again does not move it.',
+      },
+    },
+  };
+}
 
 export type StartState = 'started' | 'attached' | 'took-over' | 'resumed' | 'finished' | 'parked';
 
@@ -226,7 +265,7 @@ const WAITS_FOR_OUTCOME = 'outcome_unknown';
 const OUTCOME_ASKS = 12;
 const OUTCOME_ASK_MAX_MS = 300_000;
 /** A call's record that answers it (durable-tool.ts `isDone`, or a question asked since). */
-const ANSWERED = new Set(['succeeded', 'denied', 'reflected', 'suspended']);
+const ANSWERED = new Set(['succeeded', 'denied', 'reflected', 'refused', 'suspended']);
 // The cross-process signal is one channel every process of every organization shares: it carries a
 // hash of the run, never its organization or its id (a run id can carry a person's name).
 const wakeKey = (scope: string | undefined, runId: string) => createHash('sha256').update(`${scope ?? ''}/${runId}`).digest('hex').slice(0, 32);
@@ -264,8 +303,8 @@ export class DetachedRuns {
   }
 
   /** Whether a record's holder still holds it (liveness.ts `holderIsLive`) — asked of THIS executor's liveness (the store's). */
-  private alive(rec: Pick<ExecRecord, 'owner' | 'hold'>): Promise<boolean | undefined> {
-    return holderIsLive({ proc: rec.owner, hold: rec.hold }, this.opts.journal, this.liveness);
+  private alive(rec: Pick<ExecRecord, 'owner' | 'hold'>, onWait?: () => void): Promise<boolean | undefined> {
+    return holderIsLive({ proc: rec.owner, hold: rec.hold }, this.opts.journal, this.liveness, onWait);
   }
 
   private journalOf(scope: string | undefined): Journal {
@@ -308,18 +347,24 @@ export class DetachedRuns {
     const lastSeq = async () => (await lastRunEvent(runJournal, req.runId))?.seq ?? 0;
     // A run that is over (or waits on a human): its reader reads its last execution, whole.
     const before = () => lastExecutionStart(runJournal, req.runId);
+    // Over: completed or canceled. An answer (resumeIntent) sent to an over run is an answer already used:
+    // there is no question left to release, so it starts nothing and its reader reads the last execution,
+    // whole (the final answer again). A FAILED run is not over — its retry does fresh work (the engine's rule,
+    // runResumeGates): a new call starts it again.
+    const isOver = async () => { const o = await readRunOutcome(runJournal, req.runId); return o?.status === 'completed' || o?.status === 'canceled'; };
     for (let round = 0; round < 8; round++) {
       const cur = await this.opts.journal.get<ExecRecord>(key);
       if (cur === undefined) {
         // A deleted run is never started again, whoever names it (an `admit` says so too; without one
         // this is the only check).
         await assertNotErased(runJournal, req.runId, undefined);
-        const outcome = await readRunOutcome(runJournal, req.runId);
-        // Over: completed or canceled. A FAILED run is not over — its retry does fresh work (the engine's
-        // rule, runResumeGates): a new call starts it again.
-        if ((outcome?.status === 'completed' || outcome?.status === 'canceled') && !req.resumeIntent) {
+        if (await isOver()) {
           return { runId: req.runId, state: 'finished', from: await before() };
         }
+        // A run that ENDED canceled is over, answered or not: its reader reads that ending (the same
+        // `run_canceled` a follower of it was told), not a refusal thrown before there is a stream to put
+        // it in. A canceled run never resumes, so an answer for it reads the same ending.
+        if (await endedCanceled(runJournal, req.runId)) return { runId: req.runId, state: 'finished', from: await before() };
         const rec = mine(await lastSeq());
         this.stats.execWrites++;
         if (await claim(this.opts.journal, key, rec)) { await this.execute(key, rec, runJournal, req.launch); return { runId: req.runId, state: 'started', from: rec.from! }; }
@@ -327,7 +372,8 @@ export class DetachedRuns {
         continue;
       }
       if (cur.status === 'running') {
-        if ((await this.alive(cur)) !== false) {
+        // `onWaiting`: the holder's lock is gone and its grace runs — the caller can tell its reader it is waiting for a takeover.
+        if ((await this.alive(cur, req.onWaiting)) !== false) {
           // An answer and an execution (here or in another process) whose ending is already in the log:
           // the same moment as above, seen through the store. Wait for its record to move, then read again.
           if (!req.resumeIntent || !(await endedSince(runJournal, req.runId, cur.from ?? 0))) return { runId: req.runId, state: 'attached', from: cur.from ?? 0 };
@@ -335,10 +381,15 @@ export class DetachedRuns {
           round--;
           continue;
         }
-      } else if (cur.status === 'parked' && !req.resumeIntent) {
+      } else if (cur.status === 'parked' && !req.resumeIntent && (cur.awaits || notContinued(cur))) {
+        // Parked on a call's outcome (the sweep asks the tool again) or on a launch that failed: nothing a
+        // caller's repeat would change. A run parked on a QUESTION is different — see below.
         return { runId: req.runId, state: 'parked', from: await before() };
       }
-      // Its process is gone, it was released by a draining process, or a human's answer arrived.
+      // Its process is gone, it was released by a draining process, a human's answer arrived, or a question
+      // is asked again: a run parked on a question answers a repeat by evaluating it NOW (the replay runs no
+      // model and no tool; the question is built from today's journal, not read back from the day it was
+      // first asked — it may have been settled by another run's work since, and the question must say so).
       if (await runErasedSince(runJournal, req.runId, undefined)) { await this.opts.journal.deletePrefix(key); continue; }
       const rec = mine(await lastSeq());
       this.stats.execWrites++;
@@ -405,7 +456,10 @@ export class DetachedRuns {
           await this.execute(key, rec, runJournal, async (signal) => (await this.opts.resume(rec, runJournal))(signal));
           taken++;
         } catch (e) {
-          console.warn(`@gnldev/durable: run '${rec.runId}' could not be continued here:`, e);
+          // ONE line for the operator: which run, why (the error's own message, first line) and where to look. The Error
+          // object printed here used to arrive as a multi-line stack trace, which says nothing an operator can act on.
+          const why = String((e as Error)?.message ?? e).split('\n')[0]!.trim();
+          console.warn(`@gnldev/durable: run '${rec.runId}' could not be continued here: ${why} (parked; see \`gnl pending\`)`);
         }
       }
       return taken;
@@ -460,6 +514,8 @@ export class DetachedRuns {
     // says nobody executes it, the log is read again, and the follow ends on the first read that brings
     // nothing (release audit A4: a follower a store round trip away ended without the run's last events).
     let settled = false;
+    // A run parked because its takeover failed (`execute`'s failure path): nothing will move it on its own.
+    let stalled = false;
     while (!req.signal?.aborted) {
       const loc = this.local.get(key);
       if (loc?.erased) return;
@@ -482,7 +538,13 @@ export class DetachedRuns {
         continue;
       }
       if (batch.length) idleSince = Date.now();
-      else if (settled) return;
+      else if (settled) {
+        // ITS READER IS TOLD, not handed the last execution's replay and an end with no answer (d25 U6: a
+        // reconnect read `start, tool-call` and a 200 with nothing after it, the reason only in a server log).
+        // Not written to the log: the run did not fail — an operator may still continue it.
+        if (stalled) yield notContinuedEnding(req.runId, cursor);
+        return;
+      }
       // Nothing is executing it and nothing new came: a run that ended without a final event (a run that
       // finished before it was detached, or one whose record is gone) ends the follow — after the log
       // read that follows this answer (`settled`).
@@ -491,7 +553,7 @@ export class DetachedRuns {
         idleSince = Date.now();
         const rec = await this.opts.journal.get<ExecRecord>(key);
         if (await runErasedSince(journal, req.runId, undefined)) return;
-        if (!rec || (rec.status === 'parked' && req.untilPause)) { settled = true; continue; }
+        if (!rec || (rec.status === 'parked' && req.untilPause)) { settled = true; stalled = !!rec && notContinued(rec); continue; }
       }
       await this.waitForMore(key, req.scope, req.runId, req.signal);
     }
@@ -530,7 +592,7 @@ export class DetachedRuns {
           : `waiting for a call's outcome (${rec.awaits.key}): continued when it is recorded, the tool asked again ${new Date(rec.awaits.nextAt).toISOString()}` });
         continue;
       }
-      if (rec.status === 'parked') { out.push({ ...pick(rec), reason: 'waiting on a human (approval)' }); continue; }
+      if (rec.status === 'parked') { out.push({ ...pick(rec), reason: notContinued(rec) ? rec.reason! : 'waiting on a human (approval)' }); continue; }
       const last = await lastRunEvent(this.journalOf(rec.scope), rec.runId);
       if (rec.status === 'running' && (await this.alive(rec)) !== false && Date.now() - (last?.at ?? rec.at) > quietMs) {
         out.push({ ...pick(rec), reason: `its process is alive and wrote nothing for ${Math.round((Date.now() - (last?.at ?? rec.at)) / 1000)} s — not taken over (it may be one instruction from its effect); kill it to hand the run over` });
@@ -621,14 +683,19 @@ export class DetachedRuns {
       ended(Promise.resolve());
       // Refused or failed before it ran: nothing of this execution was written under the run. A run that
       // has a past (taken over, resumed) waits for a person (`pending` names it) instead of being retried
-      // by every sweep; a run that never started leaves no record at all, and neither does a deleted one
-      // (the engine's refusal says so: nobody is to continue it).
+      // by every sweep; a run that never started leaves no record at all, and neither does one that is over
+      // (deleted, canceled: the engine's refusal says so — nobody is to continue it).
       try {
         const cur = await this.opts.journal.get<ExecRecord>(key);
         if (cur && cur.owner === rec.owner && cur.at === rec.at) {
-          if ((e as { code?: unknown })?.code === 'run_erased' || (await readRunOutcome(journal, rec.runId)) === undefined) await this.opts.journal.deletePrefix(key);
+          // THE ONE DECISION for a launch that did not run, by WHAT was refused: a run that is FINISHED (canceled,
+          // erased) has nothing to wait for; a run that never ran a step has nothing to protect (the same request
+          // starts it from the beginning); only a run with a past that this process cannot continue waits for a
+          // person — its last step's effect is uncertain.
+          const code = (e as { code?: unknown })?.code;
+          if (code === 'run_erased' || code === 'run_canceled' || !(await runHasPast(journal, rec.runId))) await this.opts.journal.deletePrefix(key);
           else await compareAndSet(this.opts.journal, key, cur, {
-            ...cur, status: 'parked', reason: `could not be continued: ${errorData(e).message}`, at: Date.now(),
+            ...cur, status: 'parked', reason: `${NOT_CONTINUED}${errorData(e).message}`, at: Date.now(),
             // Waiting on a call's outcome: the next ask backs off like any other, not every sweep.
             ...(cur.awaits ? { awaits: { ...cur.awaits, asks: cur.awaits.asks + 1, nextAt: Date.now() + this.askDelay(cur.awaits.asks + 1) } } : {}),
           });
@@ -702,6 +769,13 @@ export class DetachedRuns {
 
     let chain: Promise<boolean> = Promise.resolve(true);
     let lost = false;
+    // A STORE ERROR on one of the chained appends (a connection cut mid-query). The chain is started with
+    // `void` from the stream loop, so a rejection there had no handler: an unhandled rejection, and Node
+    // ended the process — a healthy process killed by a database failover, its runs read dead by the others
+    // (a-store-error-on-an-event-write-releases-the-run.test.ts). Kept here instead: it stops every later
+    // write like a lost number does, and is thrown where this execution is awaited (below), so the
+    // executor's failure path says it and gives the run back for the next sweep (`giveBackRecord`).
+    let writeFailed: { error: unknown } | undefined;
     // Appends run in order; the first that finds its number taken (or its run erased) stops every later one.
     // Writes queued and not yet in the log: a live segment's event comes after all of them.
     let queued = 0;
@@ -711,6 +785,10 @@ export class DetachedRuns {
         try {
           if (!ok || lost) return false;
           if (await this.emit(loc, kind, data, s)) return true;
+          lost = true;
+          return false;
+        } catch (e) {
+          writeFailed ??= { error: e };
           lost = true;
           return false;
         } finally { queued--; }
@@ -766,7 +844,10 @@ export class DetachedRuns {
         // be told "the tool failed" and finish the run without it. The execution is released and the next sweep
         // continues the run from its log, here once the session is back or in another process. A body that never
         // started runs then, once; one told to stop after it started may have had its effect, so its call stays
-        // failed and the retry ladder asks (SideEffectRetryBlockedError), it does not run it again.
+        // failed and the retry ladder asks (idempotency key → recover() → SideEffectRetryBlockedError), it does
+        // not run it again. durable-tool leaves every such call under this one name — a body stopped by the
+        // session signal however it said so (its own error, Node's AbortError), an effect whose record the store
+        // did not take — because the event keeps a name, never a `cause` (event-codec.ts errorData).
         if (ev.kind === 'tool-error' && attemptEndOf(ev.data.error, runId) === 'released') { loc.grant.revoke('released'); continue; }
         if (ev.kind === 'error') {
           ended = isDraining() ? 'released' : 'failed';
@@ -792,9 +873,17 @@ export class DetachedRuns {
         if (breach) { ended = 'failed'; end = { error: { message: breach.message, name: 'RunLimitExceededError', code: breach.kind === 'loop' ? LIMIT_ERROR_CODES.toolLoopDetected : LIMIT_ERROR_CODES.runLimitExceeded, detail: breach.detail } }; }
         else if (blocked) {
           const code = BLOCKED_ERROR_CODES[blocked.code] ?? 'run_busy';
-          ended = ASKS_A_HUMAN.has(code) ? 'waiting-approval' : code === WAITS_FOR_OUTCOME ? 'waiting-outcome' : 'failed';
-          end = { error: { message: blocked.message, name: blocked.code, code, detail: blocked.detail } };
           const key = (blocked.detail as { key?: unknown } | undefined)?.key;
+          // A CALL ANOTHER LIVE ATTEMPT HOLDS (RunBusyError naming its key) is not a failure of the run: that
+          // attempt settles the call — a body still running elsewhere, a claim about to be given back, a success
+          // still being written (durable-tool settleSuccess). Ended `failed`, the run had no one to continue it:
+          // a process that lost only its liveness session past the grace was taken over, came back, gave its
+          // claim back, and the taker had already failed the run on it (liveness-audit D2: 10 of 10). It waits
+          // for the call like an unknown outcome: continued at once when the call's record answers it, else
+          // asked again on the doubling backoff (askDelay) — never a tight loop against a holder that stays.
+          const waitsOnCall = code === WAITS_FOR_OUTCOME || (blocked.code === 'RunBusyError' && typeof key === 'string');
+          ended = ASKS_A_HUMAN.has(code) ? 'waiting-approval' : waitsOnCall ? 'waiting-outcome' : 'failed';
+          end = { error: { message: blocked.message, name: blocked.code, code, detail: blocked.detail } };
           if (ended === 'waiting-outcome' && typeof key === 'string') loc.awaits = { key, toolCallId: blocked.toolCallId };
         } else if (interrupts.length) { ended = 'waiting-approval'; end = { interrupts }; }
       }
@@ -805,7 +894,10 @@ export class DetachedRuns {
       end = ended === 'failed' ? { error: errorData(e) } : {};
     }
     if (ended === 'completed' && (await agentRunCanceled(journal, runId))) ended = 'canceled';
-    if (!(await chain) || lost) return; // another executor owns the run now (or it was erased): write nothing more
+    // A write the store failed: this execution ends here, through the executor's failure path (see `writeFailed`).
+    const wrote = await chain;
+    if (writeFailed) throw writeFailed.error;
+    if (!wrote || lost) return; // another executor owns the run now (or it was erased): write nothing more
     if (ended === 'completed') {
       const o = await readRunOutcome(journal, runId);
       if (o?.status === 'failed') ended = 'failed';

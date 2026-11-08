@@ -6,6 +6,7 @@ import { describe, it, expect } from 'vitest';
 import { tool } from 'ai';
 import { z } from 'zod';
 import { InMemoryStorage, BasicMemory, createGnl, gnlTool } from '../../src/index.js';
+import { mintCallId } from '../../src/call-identity.js';
 import { model, turn, until, sleep } from '../audit-b/helpers.js';
 
 function appWithWorkflow() {
@@ -24,8 +25,10 @@ function appWithWorkflow() {
 describe('derived run ids cannot be taken first through the workflow door (sibling of B1)', () => {
   it("a stranger's workflow run named task:<parent>:<call> is refused and the owner's background call still runs", async () => {
     const { gnl, storage, effects } = appWithWorkflow();
+    // the engine's derived name carries the gnl call id (model step 0, first provider id of run h2)
+    const taskId = `task:h2:${mintCallId('call-1', 'h2', 0, 0)}`;
     let strangerRefused = false;
-    try { await gnl.runWorkflow('w', {}, { runId: 'task:h2:call-1', resourceId: 'mallory' }); }
+    try { await gnl.runWorkflow('w', {}, { runId: taskId, resourceId: 'mallory' }); }
     catch { strangerRefused = true; }
     const r = await turn(gnl, { runId: 'h2', threadId: 'T', prompt: 'research', resourceId: 'alice' });
     const results = (await r.steps).flatMap((s: any) => [...s.toolResults.map((x: any) => x.output), ...(s.content ?? []).filter((p: any) => p.type === 'tool-error').map((p: any) => ({ error: String(p.error?.message ?? p.error) }))]);
@@ -34,7 +37,7 @@ describe('derived run ids cannot be taken first through the workflow door (sibli
       strangerRefused,
       launcherResult: results,
       effects: effects.length,
-      taskOwnedByStranger: JSON.stringify((await storage.runs.get('task:h2:call-1:input')) ?? null).includes('mallory'),
-    }).toEqual({ strangerRefused: true, launcherResult: [{ status: 'started', taskId: 'task:h2:call-1' }], effects: 1, taskOwnedByStranger: false });
+      taskOwnedByStranger: JSON.stringify((await storage.runs.get(`${taskId}:input`)) ?? null).includes('mallory'),
+    }).toEqual({ strangerRefused: true, launcherResult: [{ status: 'started', taskId }], effects: 1, taskOwnedByStranger: false });
   });
 });

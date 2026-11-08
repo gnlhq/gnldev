@@ -500,7 +500,7 @@ import { toJournal } from '@gnldev/durable';`,
     install: `import { createGnl, compensateRun, CompensatedRunError, toJournal } from '@gnldev/durable';`,
     apis: [
       `compensateRun(runId, { journal, tools?, dryRun? }) — reverse-order unwind of already-executed side effects; returns CompensationReport`,
-      `AnyTool.compensate(input, output, { idempotencyKey, toolCallId, runId }) — per-tool rollback hook; called ONLY by compensateRun, never automatically on failure`,
+      `AnyTool.compensate(input, output, { idempotencyKey (the refund's), callIdempotencyKey (the undone operation's), toolCallId, runId, gnl }) — per-tool rollback hook; called ONLY by compensateRun, never automatically on failure`,
       `CompensationReport — { runId, dryRun, condemned, entries[] }; entry.status: compensated | already-compensated | would-compensate | skipped-* | failed | not-attempted`,
       `CompensatedRunError — a condemned run refuses resume; detail { runId }`,
     ],

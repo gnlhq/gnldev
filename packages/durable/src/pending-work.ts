@@ -29,6 +29,7 @@ import { callsFromModelSteps } from './compensation.js';
 import { windowClaimPointerKey } from './model.js';
 import { idempotencyKeyOf } from './durable-tool.js';
 import { cancelAgentRun } from './cancel.js';
+import { withCallContext, recordedIdentityOf, type GnlToolContext } from './run-identity.js';
 import { readCallOutcome } from './call-outcome.js';
 
 /** A side-effecting call that started, has no outcome, and has no live process holding it. */
@@ -135,6 +136,17 @@ async function toolRecordsOf(view: Journal, runId: string): Promise<Array<{ key:
   return out.filter((e) => (seen.has(e.key) ? false : (seen.add(e.key), true)));
 }
 
+/**
+ * Whether any tool call of this run has COMPLETED (its record says `succeeded`). The one reading behind a
+ * provider-failure answer's `effectsRan`: a person told only "the model is rate limited" would ask again for
+ * a payment that already went through. gnl cannot tell an undeclared tool's effect from a read, so a
+ * completed read-only call counts too — the answer is "something ran", never "nothing did" by guess.
+ * `view` is the journal the run lives in (an organization's view, for an organization's run).
+ */
+export async function effectsRanIn(view: Journal, runId: string): Promise<boolean> {
+  return (await toolRecordsOf(view, runId)).some((t) => t.rec.status === 'succeeded');
+}
+
 /** Lists what the store still has in hand (see the head of this file). Reads; writes nothing. */
 export async function pendingWork(journal: Journal): Promise<PendingWork> {
   const out: PendingWork = { inDoubt: [], running: [], awaitingApproval: [], blocking: false };
@@ -239,19 +251,19 @@ async function overTheSame(journal: Journal, call: InDoubtCall, next: ToolJourna
 export async function recoverInDoubt(
   journal: Journal,
   call: InDoubtCall,
-  tool: { recover?: (input: unknown, opts: { idempotencyKey: string; toolCallId: string }) => Promise<unknown> } | undefined,
+  tool: { recover?: (input: unknown, opts: { idempotencyKey: string; toolCallId: string; gnl: GnlToolContext }) => Promise<unknown> } | undefined,
 ): Promise<'happened' | 'not-happened' | 'unknown' | 'moved'> {
   if (typeof tool?.recover !== 'function' || !call.idempotencyKey) return 'unknown';
   let probe: unknown;
   try {
-    probe = await tool.recover(call.input, { idempotencyKey: call.idempotencyKey, toolCallId: call.toolCallId ?? '' });
+    probe = await tool.recover(call.input, withCallContext(await recordedIdentityOf(journal, call.runId), { idempotencyKey: call.idempotencyKey, toolCallId: call.toolCallId ?? '' }));
   } catch {
     return 'unknown';
   }
   const p = probe as { done?: unknown; output?: unknown } | null | undefined;
   if (p?.done === false) return 'not-happened';
   if (p?.done !== true || !('output' in p)) return 'unknown';
-  const ok = await overTheSame(journal, call, { status: 'succeeded', output: p.output, ...(call.toolName ? { toolName: call.toolName } : {}), ...(call.toolCallId ? { resolvedToolCallIds: [call.toolCallId] } : {}) });
+  const ok = await overTheSame(journal, call, { status: 'succeeded', output: p.output, ...(call.toolName ? { toolName: call.toolName } : {}), ...(call.toolCallId ? { resolvedToolCallIds: [call.toolCallId], resolvedBy: [{ runId: call.runId, toolCallId: call.toolCallId }] } : {}) });
   return ok ? 'happened' : 'moved';
 }
 
@@ -271,7 +283,7 @@ export async function declareInDoubtDone(
   const output = declaration.output ?? { declaredDone: true, by: declaration.by, ...(declaration.note ? { note: declaration.note } : {}) };
   return overTheSame(journal, call, {
     status: 'succeeded', output, ...(call.toolName ? { toolName: call.toolName } : {}),
-    ...(call.toolCallId ? { resolvedToolCallIds: [call.toolCallId] } : {}),
+    ...(call.toolCallId ? { resolvedToolCallIds: [call.toolCallId], resolvedBy: [{ runId: call.runId, toolCallId: call.toolCallId }] } : {}),
     declaredBy: { by: declaration.by, at, ...(declaration.note ? { note: declaration.note } : {}) },
   } as ToolJournalRecord);
 }
