@@ -26,6 +26,7 @@ import { runRecordKey, isBookkeepingRest, isRunRecordRest, isComposedRunId, admi
 import { claim, runKeys, isVersionedRecord, type Journal, type JournalBatch } from './journal.js';
 import { stampFormat } from './format.js';
 import { RunOwnerMismatchError, RunTargetMismatchError, RunNotFoundError } from './errors.js';
+import { orgScopeOf } from './organization.js';
 import { erasureBaseline, assertNotErased, runErasedSince, RunErasedError } from './erasure-fence.js';
 
 import type { Caller, RunIdentity, GnlToolContext, StaffCaller, UnknownCaller, UserCaller } from './identity-types.js';
@@ -151,8 +152,31 @@ export function childIdentity(parent: RunIdentity, childRunId: string, threadId?
  * The tool-execution context the engine passes for a run (`options.gnl`).
  * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
  */
-export function toolContextFor(identity: RunIdentity): GnlToolContext {
-  return { identity, runId: identity.runId, ...(identity.parentRunId ? { parentRunId: identity.parentRunId } : {}) };
+export function toolContextFor(identity: RunIdentity, call: { approved?: boolean } = {}): GnlToolContext {
+  return { identity, runId: identity.runId, ...(identity.parentRunId ? { parentRunId: identity.parentRunId } : {}), ...(call.approved === true ? { approved: true as const } : {}) };
+}
+
+/**
+ * THE CALL CONTEXT OF A HOOK. A tool's `execute` gets `options.gnl` (`toolContextFor`); its hooks —
+ * `idempotencyKey`, `lookup`, `recover`, `compensate` — get the SAME value the same way, next to the fields
+ * each one already had, so `identityOf(opts)` reads who the call runs for in every one of them. One
+ * constructor, not a field per hook: a hook added later takes the context by passing its fields here.
+ * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
+ */
+export function withCallContext<T extends object>(identity: RunIdentity, fields: T, call: { approved?: boolean } = {}): T & { gnl: GnlToolContext } {
+  return { ...fields, gnl: toolContextFor(identity, call) };
+}
+
+/**
+ * The identity a hook runs under when the call is not live in this process — an unwind (`compensateRun`) or a
+ * recovered background call reading its provider long after the run: the run's RECORDED owner (who the work
+ * was for), never the operator who started the unwind. A run whose record cannot be read is `unknown`, which
+ * is closed.
+ * @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it.
+ */
+export async function recordedIdentityOf(journal: RawJournal, runId: string): Promise<RunIdentity> {
+  const owner = await runOwnerOf(journal, runId);
+  return runIdentity(owner.state === 'owned' ? owner.owner : UNKNOWN, runId);
 }
 
 /**
@@ -532,7 +556,7 @@ export async function beginRunIn(journal: Journal, runId: string, ctx?: { identi
 export async function existingRun(journal: Journal, runId: string): Promise<Extract<RunOwner, { state: 'owned' }>> {
   const owner = await runOwnerOf(journal as RawJournal, runId);
   if (owner.state === 'unreadable') throw owner.error;
-  if (owner.state === 'missing') throw new RunNotFoundError(runId);
+  if (owner.state === 'missing') throw new RunNotFoundError(runId, { orgScoped: orgScopeOf(journal) !== undefined });
   return owner;
 }
 

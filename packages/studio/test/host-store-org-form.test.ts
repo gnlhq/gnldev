@@ -66,12 +66,14 @@ describe('the measured leak: one memory object declared `orgScoped: true`', () =
     const read = await send(api, 'globex', 'GET', '/threads/acme-t/messages');
     const readBody = await read.text();
     expect(readBody, 'globex read acme\'s messages').not.toContain('ACME-SECRET');
-    expect(read.status).toBe(403);
-    expect(JSON.parse(readBody).code).toBe('org_scope_refused');
-    expect(JSON.parse(readBody).error, 'the refusal names the way through').toMatch(/\(\{ orgId \}\) =>/);
+    // d25/26a+26c: was 403 `org_scope_refused` naming `({ orgId }) =>`; now the same typed 500 every door
+    // gives, with a generic body (the fix sentence is in the server log).
+    expect(read.status).toBe(500);
+    expect(JSON.parse(readBody).code).toBe('memory_not_splittable');
+    expect(JSON.parse(readBody).error, 'the end user is handed no configuration fix').not.toMatch(/memoryFactory|\(\{ orgId \}\) =>/);
 
     const del = await send(api, 'globex', 'DELETE', '/threads/acme-t');
-    expect(del.status).toBe(403);
+    expect(del.status).toBe(500);
     expect(shared.threads.has('acme-t'), 'globex deleted acme\'s thread').toBe(true);
   });
 });
@@ -164,8 +166,11 @@ describe('a plain memory object at the root / single tenant', () => {
     const api = createStudioApi({ reader: new InMemoryJournal(), auth: auth as never, org: {}, memory: s.memory }) as unknown as Api;
     expect((await send(api, 'root', 'GET', '/threads')).status).toBe(200);
     const r = await send(api, 'acme', 'GET', '/threads');
-    expect(r.status).toBe(403);
-    expect((await r.json() as { error: string }).error).toMatch(/\(\{ orgId \}\) =>/);
+    // d25/26a+26c: was 403 naming `({ orgId }) =>`; now a typed 500 with a generic body.
+    expect(r.status).toBe(500);
+    const body = await r.json() as { code: string; error: string };
+    expect(body.code).toBe('memory_not_splittable');
+    expect(body.error).not.toMatch(/memoryFactory|\(\{ orgId \}\) =>/);
   });
 });
 

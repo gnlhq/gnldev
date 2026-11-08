@@ -59,8 +59,11 @@ describe('threads when the host passes `memory` directly', () => {
     const app = createStudioApi({ reader: new InMemoryJournal(), memory, org: {} } as never);
 
     const res = await asOrg(app, path);
-    expect(res.status, `${path} served another tenant's threads`).toBe(403);
-    expect((await res.json()).error).toMatch(/memoryFactory/);
+    // d25/26a+26c: was 403 with `memoryFactory` in the body; now a typed 500 with a generic body.
+    expect(res.status, `${path} served another tenant's threads`).toBe(500);
+    const body = await res.json();
+    expect(body.code).toBe('memory_not_splittable');
+    expect(body.error).not.toMatch(/memoryFactory/);
   });
 
   it('still serves the unscoped operator — they run the platform', async () => {
@@ -97,7 +100,7 @@ describe('threads when the host passes `memory` directly', () => {
       method: 'POST',
       body: JSON.stringify({ runId: 'r1', prompt: 'hi', threadId: 'globex-thread' }),
     });
-    expect(res.status, `${path} reached another tenant's conversation store`).toBe(403);
+    expect(res.status, `${path} reached another tenant's conversation store`).toBe(500); // d25/26a: was 403
     expect(seen, 'the run was started before anything checked the thread').toEqual([]);
   });
 

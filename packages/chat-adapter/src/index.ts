@@ -4,7 +4,7 @@
 export { toUIMessageStream, toUIMessageStreamResponse } from './ui-stream.js';
 export type { GnlInterruptData, ToUIMessageStreamResponseOptions } from './ui-stream.js';
 
-export { toUIMessages } from './messages.js';
+export { toUIMessages, readUIMessages } from './messages.js';
 export type { ToUIMessagesOptions, Interrupt } from './messages.js';
 
 export { createChatRoute } from './chat-route.js';

@@ -4,7 +4,11 @@
 // doubt (siblings of release audit B5).
 import { describe, it, expect, beforeAll, vi } from 'vitest';
 import { compensateRun, readRunOutcome, runCompensated, runKeys } from '../../src/index.js';
+import { mintCallId } from '../../src/call-identity.js';
 import { app, turn, until, sleep } from '../audit-b/helpers.js';
+
+// The model's `call-1` is a GNL id by the time it is journaled (step 0, index 0 of the run).
+const cidOf = (runId: string) => mintCallId('call-1', runId, 0, 0);
 
 beforeAll(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
 
@@ -21,7 +25,7 @@ function research(compensated: Comp[]) {
 
 async function finished(gnl: any, storage: any, runId: string) {
   await turn(gnl, { runId, threadId: `T-${runId}`, prompt: 'research', resourceId: 'alice' });
-  expect(await until(async () => (await readRunOutcome(storage.runs as any, `cont:${runId}:call-1`))?.status === 'completed')).toBe(true);
+  expect(await until(async () => (await readRunOutcome(storage.runs as any, `cont:${runId}:${cidOf(runId)}`))?.status === 'completed')).toBe(true);
   await sleep(50);
 }
 
@@ -31,7 +35,7 @@ describe('unwinding a background call', () => {
     const { gnl, storage } = app({ bodyMs: 20, toolOpts: { compensate: research(compensated).compensate } });
     await finished(gnl, storage, 'k2');
     const tools = { research: research(compensated) };
-    const task = await compensateRun('task:k2:call-1', { journal: storage.runs as any, tools });
+    const task = await compensateRun(`task:k2:${cidOf('k2')}`, { journal: storage.runs as any, tools });
     const parent = await compensateRun('k2', { journal: storage.runs as any, tools });
     expect({ outputs: compensated.map((c) => c.output), task: task.entries.map((e) => e.status), parent: parent.entries.map((e) => e.status) })
       .toEqual({ outputs: ['report on tides'], task: ['compensated'], parent: ['already-compensated'] });
@@ -43,11 +47,11 @@ describe('unwinding a background call', () => {
     await finished(gnl, storage, 'k3');
     const tools = { research: research(compensated) };
     const dry = await compensateRun('k3', { journal: storage.runs as any, tools, dryRun: true });
-    expect({ dry: dry.entries.map((e) => e.status), condemned: await runCompensated(storage.runs as any, 'task:k3:call-1') })
+    expect({ dry: dry.entries.map((e) => e.status), condemned: await runCompensated(storage.runs as any, `task:k3:${cidOf('k3')}`) })
       .toEqual({ dry: ['would-compensate'], condemned: false });
     await compensateRun('k3', { journal: storage.runs as any, tools });
-    await compensateRun('task:k3:call-1', { journal: storage.runs as any, tools });
-    expect(compensated.map((c) => [c.key, c.runId])).toEqual([['task:k3:call-1:comp:call-1', 'task:k3:call-1']]);
+    await compensateRun(`task:k3:${cidOf('k3')}`, { journal: storage.runs as any, tools });
+    expect(compensated.map((c) => [c.key, c.runId])).toEqual([[`task:k3:${cidOf('k3')}:comp:${cidOf('k3')}`, `task:k3:${cidOf('k3')}`]]);
   });
 
   it("the parent unwound while the task's call is in its body: nothing is undone on a guess, the task is condemned, and a re-run undoes the effect once it is recorded", async () => {
@@ -63,12 +67,12 @@ describe('unwinding a background call', () => {
     expect(await until(() => entered)).toBe(true);
     const tools = { research: research(compensated) };
     const first = await compensateRun('k4', { journal: storage.runs as any, tools });
-    expect({ outputs: compensated.length, first: first.entries.map((e) => e.status), condemned: await runCompensated(storage.runs as any, 'task:k4:call-1') })
+    expect({ outputs: compensated.length, first: first.entries.map((e) => e.status), condemned: await runCompensated(storage.runs as any, `task:k4:${cidOf('k4')}`) })
       .toEqual({ outputs: 0, first: ['uncertain'], condemned: true });
     release();
-    expect(await until(async () => (await storage.runs.get<any>(runKeys.tool('task:k4:call-1', 'call-1')))?.status === 'succeeded')).toBe(true);
+    expect(await until(async () => (await storage.runs.get<any>(runKeys.tool(`task:k4:${cidOf('k4')}`, cidOf('k4'))))?.status === 'succeeded')).toBe(true);
     const again = await compensateRun('k4', { journal: storage.runs as any, tools });
-    const third = await compensateRun('task:k4:call-1', { journal: storage.runs as any, tools });
+    const third = await compensateRun(`task:k4:${cidOf('k4')}`, { journal: storage.runs as any, tools });
     expect({ effects, outputs: compensated.map((c) => c.output), again: again.entries.map((e) => e.status), third: third.entries.map((e) => e.status) })
       .toEqual({ effects: ['tides'], outputs: ['report on tides'], again: ['compensated'], third: ['already-compensated'] });
   });

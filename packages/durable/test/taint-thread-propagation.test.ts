@@ -14,6 +14,7 @@ import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
 import { readRunTaint, readThreadTaint } from '../src/taint.js';
 import { TaintedSideEffectError } from '../src/limits.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
 afterEach(() => vi.restoreAllMocks());
@@ -69,7 +70,7 @@ describe('thread-scoped taint propagation (taintScope: "thread")', () => {
     expect(t1.text).toBe('Fetched.');
     expect(counters.fetches).toBe(1);
     // The thread key carries the ORIGINAL provenance.
-    expect(await readThreadTaint(journal, 'T')).toMatchObject({ toolCallId: 'call-t1-fetch', toolName: 'fetchPage', source: 'tool' });
+    expect(await readThreadTaint(journal, 'T')).toMatchObject({ toolCallId: mintCallId('call-t1-fetch', 'thr-a', 0, 0), toolName: 'fetchPage', source: 'tool' });
 
     // Turn 2 — run B: NEW runId, SAME thread. The side effect must be gated by the INHERITED taint.
     await expect(
@@ -82,7 +83,7 @@ describe('thread-scoped taint propagation (taintScope: "thread")', () => {
 
     // Inherited provenance: run B is tainted BEFORE its tools ran, pointing back at turn 1's source.
     const inherited = await readRunTaint(journal, 'thr-b');
-    expect(inherited).toMatchObject({ toolCallId: 'call-t1-fetch', toolName: 'fetchPage', source: 'inherited' });
+    expect(inherited).toMatchObject({ toolCallId: mintCallId('call-t1-fetch', 'thr-a', 0, 0), toolName: 'fetchPage', source: 'inherited' });
     expect(String(inherited?.reason)).toContain("thread 'T'");
   });
 
@@ -144,7 +145,7 @@ describe('thread-scoped taint propagation (taintScope: "thread")', () => {
       runId: 'fw-b', threadId: 'T', journal, model: again,
       tools: makeTools(counters, { untrusted: true }), prompt: 'go again', stopWhen: stepCountIs(10), limits,
     });
-    expect(await readThreadTaint(journal, 'T')).toMatchObject({ toolCallId: 'call-t1-fetch' });
+    expect(await readThreadTaint(journal, 'T')).toMatchObject({ toolCallId: mintCallId('call-t1-fetch', 'fw-a', 0, 0) });
   });
 
   it('a run WITHOUT a threadId under taintScope "thread" behaves exactly like run scope (nothing to propagate to)', async () => {

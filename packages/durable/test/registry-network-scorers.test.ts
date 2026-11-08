@@ -4,6 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { InMemoryJournal } from '../src/journal.js';
 import { createGnl } from '../src/registry.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, toolCallResult, finalTextResult, countToolResults } from './mock.js';
 
 describe('registry: runtime scorers (C4)', () => {
@@ -58,13 +59,14 @@ describe('registry: first-class agent network (C5)', () => {
       },
     });
 
+    const cid = mintCallId('call-r1', 'net-1', 0, 0);
     const r1: any = await gnl.run('router', { runId: 'net-1', prompt: 'research and report' });
     expect(r1.text).toBe('Report ready.');
     expect(subCalls.n).toBe(1);
     // Nested run in its own journal namespace, scoped to the parent: agent:<parentRunId>:<toolCallId>
-    expect(await journal.get('agent:net-1:call-r1:model:0')).toBeDefined();
+    expect(await journal.get(`agent:net-1:${cid}:model:0`)).toBeDefined();
     // Parent's tool record memoized the handoff output
-    const toolRec: any = await journal.get('net-1:tool:call-r1');
+    const toolRec: any = await journal.get(`net-1:tool:${cid}`);
     expect(toolRec?.status).toBe('succeeded');
     expect(toolRec?.output?.text).toBe('RESEARCH RESULT');
 

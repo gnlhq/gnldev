@@ -75,6 +75,7 @@ export const PII_VALIDATORS: Partial<Record<PiiType, (match: string) => boolean>
  * over the neighbouring phone number, so nothing is swallowed and released.
  */
 export function looksLikePhone(s: string): boolean {
+  if (calendarDateLength(s) > 0) return false; // `09.11.2026 06` is a day and an hour, not a number
   const groups = s.match(/\d+/g) ?? [];
   const digits = groups.reduce((n, g) => n + g.length, 0);
   if (digits < 7 || digits > 15) return false;
@@ -86,6 +87,24 @@ export function looksLikePhone(s: string): boolean {
   // turn its masking off. Measured against 24 real formats rather than a set chosen to fit the rule.
   return groups.slice(0, -1).every((g) => g.length <= 4);
 }
+
+/**
+ * Length of a written day.month.year at the start of the candidate (`09.11.2026`, `9.11.2026 14`), 0 if none.
+ * The phone pattern shares its shape with this date, and the date is by far the commoner text; a real calendar
+ * date (day 1-31, month 1-12, four-digit year) is not a phone number. Ruled on here, in the validator that
+ * already owns "is this really a phone", and the scan steps OVER the date whole (`PII_SKIPS`) instead of
+ * re-entering it, so no piece of the date is offered as a number and the pattern itself is not loosened.
+ */
+function calendarDateLength(s: string): number {
+  const m = /^(\d{1,2})\.(\d{1,2})\.(\d{4})(?!\d)/.exec(s);
+  if (!m) return 0;
+  const day = Number(m[1]);
+  const month = Number(m[2]);
+  return day >= 1 && day <= 31 && month >= 1 && month <= 12 ? m[0].length : 0;
+}
+
+/** For a rejected candidate, how much of its start the scan steps over before looking again (default: one character). */
+const PII_SKIPS: Partial<Record<PiiType, (match: string) => number>> = { phone: calendarDateLength };
 
 /** Card check digit (Luhn). Rejects runs too short to be a card so a stray 12-digit id cannot pass. */
 export function luhn(s: string): boolean {
@@ -191,6 +210,7 @@ function scan(
   g: RegExp,
   replacement: string,
   test?: (match: string) => boolean,
+  skip?: (match: string) => number,
 ): { text: string; count: number } {
   g.lastIndex = 0; // shared across calls: a scan that threw half-way must not leave the next one mid-text
   let out = '';
@@ -199,7 +219,7 @@ function scan(
   let m: RegExpExecArray | null;
   while ((m = g.exec(s)) !== null) {
     if (m[0] === '') { g.lastIndex++; continue; } // a zero-width match would spin forever
-    if (test && !test(m[0])) { g.lastIndex = m.index + 1; continue; }
+    if (test && !test(m[0])) { g.lastIndex = m.index + Math.max(1, skip?.(m[0]) ?? 1); continue; }
     out += s.slice(last, m.index) + replacement;
     last = m.index + m[0].length;
     count++;
@@ -249,7 +269,7 @@ export function compileRedactions(
   opts: RedactOptions = {},
 ): (s: string) => RedactResult {
   const validate = opts.validate !== false;
-  type Step = { name: string; re: RegExp; replacement: string; test?: (m: string) => boolean };
+  type Step = { name: string; re: RegExp; replacement: string; test?: (m: string) => boolean; skip?: (m: string) => number };
   // Custom patterns run FIRST, and that order is load-bearing rather than cosmetic: the built-in
   // `phone` is greedy enough to swallow a national id or an ISO date (measured), so a caller-supplied
   // pattern that ran after it would find its text already masked — under the wrong name.
@@ -258,11 +278,11 @@ export function compileRedactions(
   }));
   // iban first, then creditCard/ssn/ip BEFORE phone (the phone pattern can also catch them).
   const builtin: Step[] = ORDER.filter((t) => types.includes(t)).map((t) => ({
-    name: t, re: globalize(PII_PATTERNS[t]), replacement: mask(t), test: validate ? PII_VALIDATORS[t] : undefined,
+    name: t, re: globalize(PII_PATTERNS[t]), replacement: mask(t), test: validate ? PII_VALIDATORS[t] : undefined, skip: validate ? PII_SKIPS[t] : undefined,
   }));
   const run = (steps: Step[], acc: RedactResult) => {
     for (const st of steps) {
-      const { text, count } = scan(acc.text, st.re, st.replacement, st.test);
+      const { text, count } = scan(acc.text, st.re, st.replacement, st.test, st.skip);
       acc.text = text;
       if (count > 0) { acc.types.push(st.name); acc.total += count; }
     }

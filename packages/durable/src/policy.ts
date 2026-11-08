@@ -9,7 +9,8 @@ import { POLICY_GUARD_NAMES } from './option-names.js';
 export interface PolicyRule {
   /** Tool name (exact match) or '*' (all). Exact match is evaluated BEFORE the wildcard. */
   tool: string;
-  action: 'allow' | 'deny' | 'require-approval';
+  /** `confirm` asks consent (the requester answers), `approve` asks permission (only an authorised person says yes); `require-approval` is the older name of `approve`. */
+  action: 'allow' | 'deny' | 'confirm' | 'approve' | 'require-approval';
   reason?: string;
 }
 

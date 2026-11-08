@@ -5,17 +5,21 @@
 // refused, the whole network run failed, and the owner's erasure — which re-derives these ids from its
 // own records — deleted the stranger's run. Each test asserts the harmless outcome.
 // Postgres runs when GNL_PG_URL is set.
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
   InMemoryStorage, InMemoryJournal, createGnl, eraseSubject, purgeRun, runNetwork, runDurable, resumeRun, forkRun, type Storage,
 } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { user, runOwnerOf } from '../src/run-identity.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, toolCallResult, finalTextResult } from './mock.js';
 
-const ends: Array<() => Promise<unknown>> = [];
-afterAll(async () => { for (const e of ends.reverse()) await e(); });
+// A Postgres store of its own is closed when the test that opened it ends, not when the file does: each test opens one, each keeps up to
+// 10 pool connections plus its liveness session, and the file's stores together held 44 of the server's slots at once (measured, pg-budget-audit) — more than the test
+// budget (test/pg-connection-budget.setup.ts) gives a file, and the shared group's share of `max_connections` besides.
+const perTest: Array<() => Promise<unknown>> = [];
+afterEach(async () => { for (const e of perTest.splice(0).reverse()) await e(); });
 
 const PG_URL = process.env.GNL_PG_URL;
 const STORES: Array<[string, () => Promise<Storage>]> = [
@@ -25,7 +29,7 @@ const STORES: Array<[string, () => Promise<Storage>]> = [
 if (PG_URL) {
   STORES.push(['postgres (real)', async () => {
     const s = new PostgresStorage({ connectionString: PG_URL });
-    ends.push(() => s.close());
+    perTest.push(() => s.close());
     return s;
   }]);
 }
@@ -41,6 +45,9 @@ const lastUserText = (prompt: any[]): string => {
   return '';
 };
 const toolOutputs = (prompt: any[]): string => JSON.stringify(prompt.filter((m: any) => m.role === 'tool'));
+
+// The model answers `tc1` in its first step; GNL's id for it is what the engine composes the child's run id from.
+const tc1 = (parent: string) => mintCallId('tc1', parent, 0, 0);
 
 type Stranger = 'mallory' | 'anonymous';
 const strangerOpts = (s: Stranger, u: string) => (s === 'mallory' ? { caller: user(`mallory-${u}`) } : {});
@@ -71,14 +78,14 @@ describe.each(STORES)('a derived run is born by the engine, %s', (_n, make) => {
       });
       const gnl: any = createGnl({ storage, agents: { parent: { model: parent, agents: ['w'] }, w: { model: worker } } } as any);
       let strangerRefused = false;
-      try { await gnl.run('w', { runId: `agent:${P}:tc1`, prompt: 'MALLORY-SECRET', ...strangerOpts(stranger, u) }); } catch { strangerRefused = true; }
+      try { await gnl.run('w', { runId: `agent:${P}:${tc1(P)}`, prompt: 'MALLORY-SECRET', ...strangerOpts(stranger, u) }); } catch { strangerRefused = true; }
       const before = workerCalls;
       let ownerError = '';
       try { await gnl.run('parent', { runId: P, prompt: 'go', caller: user(alice) }); } catch (e: any) { ownerError = String(e?.message ?? e).slice(0, 160); }
       const outcome = {
         strangerRefused,
         ownerError,
-        childOwner: await ownerLabel(storage, `agent:${P}:tc1`),
+        childOwner: await ownerLabel(storage, `agent:${P}:${tc1(P)}`),
         workerRanForAlice: workerCalls - before,
         aliceGotStrangersText: parentSaw.includes('MALLORY-SECRET'),
         aliceGotOwnAnswer: parentSaw.includes('echo ALICE-TASK'),
@@ -99,14 +106,14 @@ describe.each(STORES)('a derived run is born by the engine, %s', (_n, make) => {
       });
       const gnl: any = createGnl({ storage, workflows: { w: wf }, agents: { parent: { model: parent, workflows: ['w'] } } } as any);
       let strangerRefused = false;
-      try { await gnl.runWorkflow('w', { who: 'MALLORY-SECRET' }, { runId: `wf:${P}:tc1`, ...(stranger === 'mallory' ? { resourceId: `mallory-${u}`, caller: user(`mallory-${u}`) } : {}) }); } catch { strangerRefused = true; }
+      try { await gnl.runWorkflow('w', { who: 'MALLORY-SECRET' }, { runId: `wf:${P}:${tc1(P)}`, ...(stranger === 'mallory' ? { resourceId: `mallory-${u}`, caller: user(`mallory-${u}`) } : {}) }); } catch { strangerRefused = true; }
       const before = ran.length;
       let ownerError = '';
       try { await gnl.run('parent', { runId: P, prompt: 'go', caller: user(alice) }); } catch (e: any) { ownerError = String(e?.message ?? e).slice(0, 160); }
       const outcome = {
         strangerRefused,
         ownerError,
-        childOwner: await ownerLabel(storage, `wf:${P}:tc1`),
+        childOwner: await ownerLabel(storage, `wf:${P}:${tc1(P)}`),
         workflowRanForAlice: ran.length - before,
         aliceGotStrangersOutput: parentSaw.includes('MALLORY-SECRET'),
         aliceGotOwnOutput: parentSaw.includes('ALICE-INPUT'),
@@ -153,7 +160,7 @@ describe.each(STORES)('a derived run is born by the engine, erasure, %s', (_n, m
   for (const how of ['eraseSubject(alice)', 'purgeRun(P)'] as const) {
     it(`agent: — mallory cannot begin agent:P:tc1, so ${how} reaches alice's child only`, async () => {
       const storage: any = await make();
-      const u = unique(); const P = `P-${u}`; const alice = `alice-${u}`; const child = `agent:${P}:tc1`;
+      const u = unique(); const P = `P-${u}`; const alice = `alice-${u}`; const child = `agent:${P}:${tc1(P)}`;
       const worker = createMockModel(async () => finalTextResult('w'));
       const parent = createMockModel(async ({ prompt }: any) => prompt.some((m: any) => m.role === 'tool') ? finalTextResult('done') : toolCallResult('agent_w', 'tc1', { task: 'x' }));
       const gnl: any = createGnl({ storage, agents: { parent: { model: parent, agents: ['w'] }, w: { model: worker } } } as any);
@@ -168,7 +175,7 @@ describe.each(STORES)('a derived run is born by the engine, erasure, %s', (_n, m
 
     it(`wf: — mallory cannot begin wf:P:tc1, so ${how} reaches alice's child only`, async () => {
       const storage: any = await make();
-      const u = unique(); const P = `P-${u}`; const alice = `alice-${u}`; const child = `wf:${P}:tc1`;
+      const u = unique(); const P = `P-${u}`; const alice = `alice-${u}`; const child = `wf:${P}:${tc1(P)}`;
       const wf = { build: () => [{ id: 's1' }], run: async (input: any) => ({ got: input }) };
       const parent = createMockModel(async ({ prompt }: any) => prompt.some((m: any) => m.role === 'tool') ? finalTextResult('done') : toolCallResult('workflow_w', 'tc1', { input: {} }));
       const gnl: any = createGnl({ storage, workflows: { w: wf }, agents: { parent: { model: parent, workflows: ['w'] } } } as any);
@@ -246,12 +253,12 @@ describe('a derived run is born by the engine: the ways through', () => {
     const parent = createMockModel(async ({ prompt }: any) => prompt.some((m: any) => m.role === 'tool') ? finalTextResult('done') : toolCallResult('agent_w', 'tc1', { task: 'x' }));
     const gnl: any = createGnl({ storage, agents: { parent: { model: parent, agents: ['w'] }, w: { model: worker } } } as any);
     await gnl.run('parent', { runId: 'P', prompt: 'go', caller: user('alice') });
-    const fork = await forkRun(storage.runs, 'agent:P:tc1', 0);
-    expect(fork.newRunId.startsWith('agent:P:tc1:fork:')).toBe(true);
+    const fork = await forkRun(storage.runs, `agent:P:${tc1('P')}`, 0);
+    expect(fork.newRunId.startsWith(`agent:P:${tc1('P')}:fork:`)).toBe(true);
     expect(await ownerLabel(storage, fork.newRunId)).toBe('user:alice');
     const resumed = await resumeRun(fork.newRunId, { journal: storage.runs, model: worker, caller: user('alice') } as any);
     expect(resumed.text).toBe('w');
-    await expect(forkRun(storage.runs, 'agent:P:tc1', 0, 'agent:Q:tc9')).rejects.toThrow(/composed by/);
+    await expect(forkRun(storage.runs, `agent:P:${tc1('P')}`, 0, 'agent:Q:tc9')).rejects.toThrow(/composed by/);
     expect(await storage.runs.listKeys('agent:Q:')).toEqual([]);
   });
 });

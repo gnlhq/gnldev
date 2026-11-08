@@ -142,8 +142,8 @@ describe('@gnldev/server SSE', () => {
 
   // P0.1 (AUDIT-R2): reasoning/source/file used to be SILENTLY DROPPED (a switch with only
   // 4 cases and no default) — a reasoning model's whole thinking trace vanished with no error.
-  it('P0.1: reasoning-delta + source + file events are emitted (no silent drop)', async () => {
-    const api = createRestApi({ journal: new InMemoryJournal(), agents: { think: { model: reasoningMock(), maxSteps: 4 } } });
+  it('P0.1: reasoning-delta + source + file events are emitted (no silent drop; reasoning with stream.reasoning on, d25 P5/15)', async () => {
+    const api = createRestApi({ journal: new InMemoryJournal(), stream: { reasoning: true }, agents: { think: { model: reasoningMock(), maxSteps: 4 } } });
     const res = await call(api, '/agents/think/stream', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

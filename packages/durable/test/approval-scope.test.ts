@@ -16,9 +16,12 @@ import { runDurable, InMemoryStorage, SideEffectRetryBlockedError, runKeys } fro
 import { tool } from 'ai';
 import { z } from 'zod';
 import { streamFromGenerate } from './mock.js';
+import { mintCallId } from '../src/call-identity.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const CALL = 'call-charge';
+/** The GNL id of the model's single call in step 0 of `runId`. */
+const callOf = (runId: string) => mintCallId(CALL, runId, 0, 0);
 
 /** Charges, then throws — the gateway timed out on the way back, so the effect DID land. */
 function chargeThenTimeout() {
@@ -57,6 +60,7 @@ function runner(runId: string, limits?: any) {
 describe('limits.approvalScope', () => {
   it("'attempt': the approval is spent by the attempt it unblocks, so the next one asks again", async () => {
     const { run, charges } = runner('scope-attempt', { approvalScope: 'attempt' });
+    const CALL = callOf('scope-attempt');
 
     await run();                                   // charges, then throws
     expect(charges()).toBe(1);
@@ -73,6 +77,7 @@ describe('limits.approvalScope', () => {
 
   it("the default keeps the journaled approval, which is what survives a crash", async () => {
     const { run, charges } = runner('scope-default');
+    const CALL = callOf('scope-default');
 
     await run();
     expect(charges()).toBe(1);
@@ -99,7 +104,7 @@ describe('limits.approvalScope', () => {
       description: 'charge',
       inputSchema: z.object({ amount: z.number() }),
       execute: async () => {
-        reads.push(await journal.get(runKeys.approval('scope-kill', CALL)));
+        reads.push(await journal.get(runKeys.approval('scope-kill', callOf('scope-kill'))));
         charges++;
         // First attempt: the gateway times out on the way back — side-effect uncertainty, a human is asked.
         if (charges === 1) throw new Error('ETIMEDOUT after the charge posted');
@@ -112,7 +117,7 @@ describe('limits.approvalScope', () => {
       runDurable({ runId: 'scope-kill', journal, model: model(), tools: { chargeCard: t as any }, prompt: 'charge', limits: { approvalScope: 'attempt' }, ...(approvals ? { approvals } : {}) } as any).catch((e) => e);
 
     await run();                 // attempt 1: charges, throws → blocked, a human is asked
-    await run({ [CALL]: true }); // attempt 2: the human approved → executes
+    await run({ [callOf('scope-kill')]: true }); // attempt 2: the human approved → executes
     expect(charges).toBe(2);
 
     const duringApproved = reads[1] as { __gnl_approval_spent?: boolean } | boolean | undefined;
@@ -123,6 +128,7 @@ describe('limits.approvalScope', () => {
 
   it("a denial is not spent under 'attempt' either — it keeps denying without re-asking", async () => {
     const { run, charges } = runner('scope-deny', { approvalScope: 'attempt' });
+    const CALL = callOf('scope-deny');
 
     await run();
     expect(charges()).toBe(1);

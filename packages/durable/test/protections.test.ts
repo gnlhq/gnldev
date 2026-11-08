@@ -19,7 +19,7 @@ describe('describeProtections — what the config actually turned on', () => {
     const rows = describeProtections({ journal: journal() });
     const dedup = row(rows, 'dedup');
     expect(dedup.mark).toBe('off');
-    expect(dedup.value).toBe('none — declarations inert');
+    expect(dedup.value).toBe('none — effectClass inert');
     expect(dedup.from).toBe('default');
     expect(dedup.note).toContain("preset: 'assistant'");
   });

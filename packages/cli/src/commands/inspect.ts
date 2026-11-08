@@ -19,7 +19,7 @@ export interface InspectResult {
 export async function inspectRunCore(config: GnlDevConfig, d: typeof Durable, runId: string, step: number): Promise<InspectResult> {
   const journal = getJournal(config, d);
   const entries = await journal.readRun(runId);
-  if (entries.length === 0) throw new Error(`run not found: '${runId}'`);
+  if (entries.length === 0 && !(await d.isRunRecorded(journal, runId))) throw new Error(`run not found: '${runId}'`);
   if (!Number.isInteger(step) || step < 0 || step > entries.length) {
     throw new Error(`--step out of range: ${step} (valid: 0..${entries.length} for run '${runId}')`);
   }
