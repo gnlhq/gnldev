@@ -90,6 +90,14 @@ function withCallerOrg<T>(runOpts: T, ctx?: StudioCallbackCtx): T {
   } as T;
 }
 
+/**
+ * WHO answers the `approvals` of an agent run: the operator who clicked, from the request (`ctx.answerer`). A run is
+ * continued as its OWNER, so the run's `caller` cannot say who answered. Agent runs only — a workflow run takes none.
+ */
+function withAnswerer<T>(runOpts: T, ctx?: StudioCallbackCtx): T {
+  return ctx?.answerer ? ({ ...(runOpts ?? {}), answerer: ctx.answerer } as T) : runOpts;
+}
+
 /** Playground/Tools runner options. */
 export interface MakeRunnerOptions {
   /**
@@ -204,8 +212,8 @@ export function createStudioRunner(
 
   const runner: StudioAgentRunner = {
     listAgents: () => meta,
-    run: (name, runOpts, ctx) => gnl.run(name, withCallerOrg(runOpts, ctx), ctx).then((r) => ({ text: r.text, interrupts: r.interrupts ?? [] })),
-    ...(gnl.stream ? { stream: (name: string, runOpts: any, ctx?: StudioCallbackCtx) => gnl.stream!(name, withCallerOrg(runOpts, ctx), ctx) } : {}),
+    run: (name, runOpts, ctx) => gnl.run(name, withAnswerer(withCallerOrg(runOpts, ctx), ctx), ctx).then((r) => ({ text: r.text, interrupts: r.interrupts ?? [] })),
+    ...(gnl.stream ? { stream: (name: string, runOpts: any, ctx?: StudioCallbackCtx) => gnl.stream!(name, withAnswerer(withCallerOrg(runOpts, ctx), ctx), ctx) } : {}),
   };
 
   if (hasAnyTool) runner.listTools = listTools;
@@ -270,7 +278,7 @@ export function createStudioRunner(
         try {
           const d = await guard({ toolName: name, args: input, toolCallId, runId: toolCallId });
           if (d.action === 'deny') return { error: `guard denied${d.reason ? ': ' + d.reason : ''}`, blocked: 'deny' };
-          if (d.action === 'require-approval')
+          if (d.action === 'require-approval' || d.action === 'approve' || d.action === 'confirm')
             return { error: `this tool requires approval (test-run does not support the approval flow)${d.reason ? ': ' + d.reason : ''}`, blocked: 'approval' };
         } catch (e: any) {
           return { error: `guard error: ${String(e?.message ?? e)}` };

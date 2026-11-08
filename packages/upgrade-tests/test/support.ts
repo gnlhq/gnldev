@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { afterEach, expect, it } from 'vitest';
+import { providerIdOf } from '@gnldev/durable';
 import { SqliteStorage } from '@gnldev/durable/sqlite';
 
 /** The `schema` step of `storage.upgrade()`: whether it ran, and the statements it applied (or, dry, would apply). */
@@ -130,4 +131,16 @@ export function itMigrates(file: string): void {
     expect(cols).toContain('seq');
     expect(rawQuery(f.path, "SELECT name FROM sqlite_master WHERE name = 'gnl_work_seq'")).toHaveLength(1);
   });
+}
+
+/**
+ * `value` with every string in it put back to the id the provider issued (`providerIdOf`): a tool-call id
+ * this version writes carries a `.gnl-…` suffix that a store written by an older version does not have, and
+ * what the two stores are compared on is the call, not that suffix. Old records are not rewritten.
+ */
+export function providerIds<T>(value: T): T {
+  if (typeof value === 'string') return providerIdOf(value) as T;
+  if (Array.isArray(value)) return value.map(providerIds) as T;
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [providerIdOf(k), providerIds(v)])) as T;
+  return value;
 }

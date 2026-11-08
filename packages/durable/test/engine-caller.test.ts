@@ -61,7 +61,7 @@ describe('R5: resuming through the engine directly', () => {
     const journal = new InMemoryJournal();
     const model = createMockModel(async ({ prompt }: any) => (countToolResults(prompt) === 0 ? toolCallResult('pay', 'c1', {}) : finalTextResult('paid')));
     const pay = tool({ description: 'p', inputSchema: z.object({}), execute: async () => 'ok' });
-    const guard = async () => ({ action: 'require-approval' as const });
+    const guard = async () => ({ action: 'confirm' as const }); // consent: the owner may answer it (approve is for staff, d25 step 2)
     await runDurable({ runId: 'rr', journal, model, tools: { pay }, guard, prompt: 'x', stopWhen: stepCountIs(4), resourceId: 'ayse' });
     await expect(resumeRun('rr', { journal, model, tools: { pay }, guard, approvals: { c1: true } } as never)).rejects.toMatchObject({ name: 'RunOwnerMismatchError' });
     await expect(resumeRun('rr', { journal, model, tools: { pay }, guard, approvals: { c1: true }, resourceId: 'mallory' } as never)).rejects.toMatchObject({ name: 'RunOwnerMismatchError' });

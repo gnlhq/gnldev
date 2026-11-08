@@ -95,20 +95,22 @@ describe('H7 crash window (stale running) — safe default', () => {
       },
     });
     let charges = 0;
-    const mk = () => durableTool(
+    const mk = (j: any) => durableTool(
       { execute: async () => { charges++; return { charged: 20 }; } },
-      { journal, runId: 'r5' },
+      { journal: j, runId: 'r5' },
       'chargeCard',
     );
-    // First run: the body runs (charge=1), the succeeded write is swallowed by the "crash".
-    await expect(mk().execute!({ amount: 20 }, { toolCallId: 'call-1' })).rejects.toThrow('CRASH');
+    // First run: the body runs (charge=1), the succeeded write is swallowed by the "crash". A process that
+    // lives on keeps writing it (durable-tool settleSuccess); this one is dead, so every write it makes fails.
+    const err = await mk(journal).execute!({ amount: 20 }, { toolCallId: 'call-1' }).then(() => undefined, (e: any) => e);
+    expect(err?.name).toBe('LivenessUnavailableError');
+    expect(String(err?.cause?.message)).toContain('CRASH');
     expect(charges).toBe(1);
     expect((await inner.get(runKeys.tool('r5', 'call-1')) as any).status).toBe('running'); // proof of the window
 
-    // Stale it out + resume ("new process"): the H7 gate is active — NO double charge.
+    // Stale it out + resume ("new process", on the store itself): the H7 gate is active — NO double charge.
     await inner.put(runKeys.tool('r5', 'call-1'), { status: 'running', startedAt: Date.now() - STALE_MS });
-    dying = false;
-    await expect(mk().execute!({ amount: 20 }, { toolCallId: 'call-1' })).rejects.toThrow(SideEffectRetryBlockedError);
+    await expect(mk(inner).execute!({ amount: 20 }, { toolCallId: 'call-1' })).rejects.toThrow(SideEffectRetryBlockedError);
     expect(charges).toBe(1); // ✅ total charges across the window: EXACTLY 1
   });
 });

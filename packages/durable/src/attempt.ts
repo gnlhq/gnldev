@@ -37,6 +37,7 @@ import { journalNow, stampIsLive, claimIsLive, holdHere, releaseHold } from './l
 import { procStampFor, livenessFor, giveBack, sessionBack, LivenessUnavailableError } from './process-liveness.js';
 import { claimXidInFlight, renewXid, releaseXid, type XidHeld, type XidPlan, type XidRecord } from './xid.js';
 import { keepLateReport, type LateWriter } from './call-outcome.js';
+import { markerIsMine, stampOf, type AttemptStamp } from './call-identity.js';
 
 /** Compare-and-set: `expected === undefined` means "no record" (first writer wins). */
 export async function compareAndSet(journal: Journal, key: string, expected: unknown, next: unknown): Promise<boolean> {
@@ -61,6 +62,12 @@ export const isUnstartedRelease = (v: unknown): boolean =>
 /** Per-(tool,args) duplicate marker — see the duplicate guard in durable-tool.ts. */
 export interface DupMarker {
   firstToolCallId: string;
+  /**
+   * The run that wrote the marker. A marker is shared between runs (a thread's), and a tool-call id is
+   * not unique across them — "this marker is my call's" is `sameCall` (call-identity.ts), never the id
+   * alone. Absent on a marker written before this field: see `ownsLegacyMarker`.
+   */
+  firstRunId?: string;
   at: number;
   nudged?: boolean;
   /** Set while the first caller is still executing; finalized on success, released on failure. */
@@ -87,10 +94,19 @@ export interface DupMarker {
  * (a failed attempt gave it back) → taken over by CAS. In-flight but STALE by the shared clock and its
  * holder's own TTL (its writer crashed without releasing) → taken over only by the call that left it.
  * A live marker — someone genuinely executing right now — loses. `cur` is what stands there when lost.
+ * `stale`: the marker's writer is gone. @internal — exported for the identity-rule tests; the engine reaches it through `Attempt.claimDup`.
  */
-async function claimDupMarker(journal: Journal, dupKey: string, next: DupMarker, staleTtlMs: number, windowTtlMs?: number): Promise<{ won: boolean; cur?: DupMarker }> {
+export async function claimDupMarker(
+  journal: Journal,
+  dupKey: string,
+  next: DupMarker & { firstRunId: string },
+  staleTtlMs: number,
+  windowTtlMs: number | undefined,
+  /** The call's own record before this claim (its earlier attempt's stamp): the proof for a marker with no run named. */
+  own: AttemptStamp | undefined,
+): Promise<{ won: boolean; cur?: DupMarker; stale: boolean }> {
   const raw = await journal.get<DupMarker>(dupKey);
-  if (raw === undefined) return (await claim(journal, dupKey, next)) ? { won: true } : { won: false, cur: await journal.get<DupMarker>(dupKey) };
+  if (raw === undefined) return (await claim(journal, dupKey, next)) ? { won: true, stale: false } : { won: false, cur: await journal.get<DupMarker>(dupKey), stale: false };
   const cur = raw as DupMarker;
   const now = await journalNow(journal);
   const stale = cur.inFlight === true && !(await stampIsLive(cur.at, cur.ttlMs ?? staleTtlMs, now, cur, journal));
@@ -105,12 +121,22 @@ async function claimDupMarker(journal: Journal, dupKey: string, next: DupMarker,
   // finish left exactly that). Taking it over ran the repeat with no block and no question (measured:
   // 2 executions under 'block' and under the default 'suspend'); the call that left it resumes through
   // its own crash ladder (recover, approval), and this one is a duplicate of something that may have run.
-  const takeable = cur.released === true || windowExpired || (stale && cur.firstToolCallId === next.firstToolCallId);
-  if (takeable && (await compareAndSet(journal, dupKey, raw, next))) return { won: true };
-  return { won: false, cur: takeable ? await journal.get<DupMarker>(dupKey) : cur };
+  const takeable = cur.released === true || windowExpired || (stale && markerIsMine(cur, { runId: next.firstRunId, toolCallId: next.firstToolCallId }, own));
+  if (takeable && (await compareAndSet(journal, dupKey, raw, next))) return { won: true, stale };
+  // `stale`: the marker's writer is gone — what stands here is what a dead attempt left, not a live twin.
+  return { won: false, cur: takeable ? await journal.get<DupMarker>(dupKey) : cur, stale };
 }
 
-interface HeldDup { key: string; toolCallId: string; claimed: DupMarker }
+/**
+ * Does a SUCCESS replace the marker standing there? A released slot, and ANY in-flight claim — this
+ * call's own, or another call's: an in-flight marker says "may have happened", and this success is work
+ * that did, which every later question (another run's, a resumed dead run's) must read. Left in flight
+ * under another call's name, a stale one named nobody as having completed it (the dead run's later
+ * question could not say another run had paid). A completed marker of another call stays: first success wins.
+ */
+export const successReplacesMarker = (cur: DupMarker): boolean => cur.released === true || cur.inFlight === true;
+
+interface HeldDup { key: string; runId: string; toolCallId: string; claimed: DupMarker }
 
 /** Writes the call's terminal record over `expected` (compare-and-set) with every side write of the choke point. */
 export type TerminalWriter = (record: ToolJournalRecord, expected: unknown, xid: XidHeld | undefined) => Promise<boolean>;
@@ -149,17 +175,27 @@ export class Attempt {
     private readonly writeTerminal: TerminalWriter,
     /** The run whose attempt this is: a success that finds the call answered is kept as its late report (see the head of this file). */
     private readonly writer?: LateWriter,
+    /**
+     * This process's session signal (process-liveness.ts `sessionSignal`) as it stood BEFORE the stamp was
+     * dated. Aborted by the time the body is to start: the session went unproven past half its grace since
+     * then — see `assertHeld`.
+     */
+    private readonly session?: AbortSignal,
   ) {
     this.datedAt = datedAt;
     // From here until `end()` this process holds the claim: its stamp reads live here at any age (liveness.ts).
     holdHere(stamp.hold, journal);
   }
 
+  /** The stamp (hold, proc) of the call's own record this claim replaced: what proves a legacy marker its own (call-identity.ts). */
+  get priorStamp(): AttemptStamp | undefined { return stampOf(this.prior); }
   /** The attempt counter its stamp carries. */
   get attempts(): number { return this.stamp.attempts; }
   /** The call's idempotency key, as its claim carries it (durable-tool.ts idempotencyKeyOf). */
   get idempotencyKey(): string { return this.stamp.idempotencyKey; }
   get held(): boolean { return this.state === 'held'; }
+  /** The call is another attempt's now. */
+  private get lost(): boolean { return this.state === 'lost'; }
   /** Holds a duplicate marker or a cross-channel id in flight. */
   get holdsMarkers(): boolean { return this.dup !== undefined || this.xid !== undefined; }
   /** The in-flight cross-channel id this attempt holds (completed by its success write). */
@@ -204,12 +240,22 @@ export class Attempt {
   /**
    * Proves the attempt still owns the call, immediately before its body. Throws `AttemptLost` if not.
    *
-   * A claim can only be taken over once it is stale by its own TTL on the shared clock. This process
-   * knows how old its stamp is on its OWN monotonic clock (taken before the shared clock dated the
-   * stamp, so it never under-counts): younger than half its TTL, no takeover can have happened yet and
-   * the proof costs no I/O — the common case. Older (a slow gate, a long lookup, a stalled process), it
-   * re-dates its own stamp by compare-and-set: winning proves ownership and restarts the lease for the
-   * body; losing means it was taken over.
+   * Two ways a claim is taken over, two proofs:
+   *   · by its PROCESS (a stamp naming a process liveness): the others read this process as dead a whole
+   *     grace after its lock went (`judgeAlive`, 5 s by default) — far sooner than the stamp's TTL. Half a
+   *     grace after its last proof the session signal is aborted. So a signal taken before the stamp was
+   *     dated (`session`) and aborted now means the session went unproven long enough for the others to
+   *     have taken the call — or the whole run — over, even if it is back now: nothing starts, the body is
+   *     refused with LivenessUnavailableError, the claim is given back and the run is released (the
+   *     executor continues it from its log, here or elsewhere). Measured before (liveness-audit D4): a
+   *     session back after the grace passed `sessionBack`, the young stamp skipped the CAS below, and the
+   *     body started ~4 s after another process had taken the run over (6 of 20 trials).
+   *   · by its AGE (no liveness answers for the store): only once stale by its own TTL on the shared
+   *     clock. This process knows how old its stamp is on its OWN monotonic clock (taken before the shared
+   *     clock dated the stamp, so it never under-counts): younger than half its TTL, no such takeover can
+   *     have happened yet and the proof costs no I/O — the common case. Older (a slow gate, a long lookup,
+   *     a stalled process), it re-dates its own stamp by compare-and-set: winning proves ownership and
+   *     restarts the lease for the body; losing means it was taken over.
    */
   async assertHeld(): Promise<void> {
     await this.serial(async () => {
@@ -231,6 +277,7 @@ export class Attempt {
       // nothing, and the claim stays this attempt's — the caller gives it back (the body never started) with
       // the refusal that says why, not as a call another executor holds.
       if (proc && stampedBy !== undefined && !(await sessionBack(proc))) throw new LivenessUnavailableError();
+      if (proc && stampedBy !== undefined && this.session?.aborted) throw new LivenessUnavailableError();
       if (performance.now() - this.datedAt < this.stamp.claimTtlMs / 2) return;
       if (!(await this.renew())) throw new AttemptLost(this.key);
     });
@@ -285,7 +332,7 @@ export class Attempt {
         const raw = await this.journal.get<ToolJournalRecord>(this.key);
         const cur = upgradeFormat(raw, this.key);
         if (raw === undefined) return false;
-        if (cur?.status === 'succeeded' || cur?.status === 'denied' || cur?.status === 'reflected') { await this.keepLate(record, cur); return false; }
+        if (cur?.status === 'succeeded' || cur?.status === 'denied' || cur?.status === 'reflected' || cur?.status === 'refused') { await this.keepLate(record, cur); return false; }
         // A live claim: that attempt is executing and settles its own record. This success is still a
         // fact — kept as evidence, which the crash ladder reads before it runs the call again or gives up.
         if (cur?.status === 'running' && (await claimIsLive(cur, await journalNow(this.journal), this.stamp.claimTtlMs, this.journal))) { await this.keepLate(record, undefined); return false; }
@@ -331,6 +378,20 @@ export class Attempt {
     // Once the body started there is nothing to give back — and a timed-out body still running keeps
     // its claim fresh until it settles (`outlived`).
     if (this.started) return;
+    // A claim already lost is another attempt's now: nothing of this one to give back.
+    await this.release().catch((err) => { if (!(err instanceof AttemptLost)) throw err; });
+  }
+
+  /** The record before this attempt claimed it was none (a given-back claim stands for none): the claim goes back to NO record. */
+  get priorIsAbsent(): boolean { return this.prior === undefined || isUnstartedRelease(this.prior); }
+
+  /**
+   * Gives the claim back as `giveBack` does — the record to what it was, the marker and id with it — for a
+   * body that RAN and said nothing was done (`refused()`, call-outcome.ts): the work stays free. Throws
+   * `AttemptLost` when the claim is no longer this attempt's (it was taken over: that attempt's call now).
+   */
+  async release(): Promise<void> {
+    if (this.lost) throw new AttemptLost(this.key);
     await this.serial(async () => {
       this.stop();
       if (this.state !== 'held') return;
@@ -345,12 +406,13 @@ export class Attempt {
           }
           if (this.state === 'settled') await this.releaseMarkers();
         } catch (err) {
-          if (!said) console.warn(`@gnldev/durable: '${this.toolName}' failed before it ran, and its claim (${this.key}) could not be given back yet — retried until it lands:`, err);
+          if (!said) console.warn(`@gnldev/durable: '${this.toolName}' did nothing, and its claim (${this.key}) could not be given back yet — retried until it lands:`, err);
           said = true;
           throw err;
         }
       });
     });
+    if (this.lost) throw new AttemptLost(this.key);
   }
 
   /**
@@ -358,12 +420,12 @@ export class Attempt {
    * in durable-tool.ts). Stamped with this attempt's TTL so every reader judges its liveness the same
    * way. Lost: `cur` is what stands there. Throws `AttemptLost` when the call is no longer its own.
    */
-  async claimDup(dupKey: string, toolCallId: string, windowTtlMs: number | undefined): Promise<{ won: boolean; cur?: DupMarker }> {
+  async claimDup(dupKey: string, runId: string, toolCallId: string, windowTtlMs: number | undefined): Promise<{ won: boolean; cur?: DupMarker; stale: boolean }> {
     return this.serial(async () => {
       if (this.state !== 'held') throw new AttemptLost(this.key);
-      const claimed: DupMarker = { firstToolCallId: toolCallId, at: await journalNow(this.journal), inFlight: true, ttlMs: this.stamp.claimTtlMs, ...procStampFor(this.journal), ...(this.stamp.hold ? { hold: this.stamp.hold } : {}) };
-      const got = await claimDupMarker(this.journal, dupKey, claimed, this.stamp.claimTtlMs, windowTtlMs);
-      if (got.won) this.dup = { key: dupKey, toolCallId, claimed, gone: false };
+      const claimed: DupMarker & { firstRunId: string } = { firstToolCallId: toolCallId, firstRunId: runId, at: await journalNow(this.journal), inFlight: true, ttlMs: this.stamp.claimTtlMs, ...procStampFor(this.journal), ...(this.stamp.hold ? { hold: this.stamp.hold } : {}) };
+      const got = await claimDupMarker(this.journal, dupKey, claimed, this.stamp.claimTtlMs, windowTtlMs, stampOf(this.prior));
+      if (got.won) this.dup = { key: dupKey, runId, toolCallId, claimed, gone: false };
       return got;
     });
   }
@@ -437,9 +499,9 @@ export class Attempt {
    */
   private async releaseHeldDup(): Promise<void> {
     if (!this.dup) return;
-    const { key, toolCallId, claimed, gone } = this.dup;
+    const { key, runId, toolCallId, claimed, gone } = this.dup;
     if (!gone) {
-      const released: DupMarker = { firstToolCallId: toolCallId, at: await journalNow(this.journal), released: true };
+      const released: DupMarker = { firstToolCallId: toolCallId, firstRunId: runId, at: await journalNow(this.journal), released: true };
       await compareAndSet(this.journal, key, claimed, released);
     }
     // Forgotten once given back — a write that failed is tried again by the retry of the give-back.

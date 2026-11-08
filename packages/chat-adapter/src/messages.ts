@@ -14,8 +14,8 @@
 // instead of relying on reconstructState's simplified content. Files/sources ARE dropped for v1 (no
 // `file`/`source` UIMessage parts are produced) — a real limitation, called out here rather than papered
 // over.
-import { reconstructState, settleModelContent } from '@gnldev/durable';
-import type { Interrupt, JournalEntry, ReconstructSeed } from '@gnldev/durable';
+import { reconstructState, settleModelContent, runKeys } from '@gnldev/durable';
+import type { Interrupt, Journal, JournalEntry, JournalReader, ReconstructSeed } from '@gnldev/durable';
 import type { UIMessage } from 'ai';
 import { maskSentinelOutput } from './sentinel-mask.js';
 import { refuseUnknownNames, optionNames } from '@gnldev/options';
@@ -27,7 +27,10 @@ export interface ToUIMessagesOptions {
    * `reconstructState`'s own `seed` parameter.
    */
   seed?: ReconstructSeed;
-  /** Prefix for deterministic UIMessage ids (`${runId}:msg:${i}`). Defaults to `'run'`. */
+  /**
+   * Prefix for deterministic UIMessage ids (`${runId}:msg:${i}`). Defaults to the run the entries belong to
+   * (`entries[0].runId`), so two runs never share ids; `'run'` only when there are no entries at all.
+   */
   runId?: string;
 }
 
@@ -61,7 +64,7 @@ function textFromContent(content: unknown): string {
  */
 export function toUIMessages(entries: JournalEntry[], opts: ToUIMessagesOptions = {}): UIMessage[] {
   refuseUnknownNames('toUIMessages', opts, optionNames<ToUIMessagesOptions>()(['seed', 'runId']));
-  const runId = opts.runId ?? 'run';
+  const runId = opts.runId ?? entries[0]?.runId ?? 'run';
   const { messages } = reconstructState(entries, entries.length, opts.seed);
 
   // Mirrors reconstructState's OWN seed-prepend rule (time-travel.ts) so we know which leading slice of
@@ -125,6 +128,22 @@ export function toUIMessages(entries: JournalEntry[], opts: ToUIMessagesOptions 
   });
 
   return out;
+}
+
+/**
+ * The conversation of ONE run as `useChat` messages, user bubble included — what a page reload needs.
+ *
+ * `toUIMessages(readRun(runId))` alone cannot show what the user wrote: that text lives in the run's
+ * invisible `:input` record, which `readRun` does not return. This reads both from the journal and
+ * hands the input to `toUIMessages` as its seed, so the caller does not have to know the record exists.
+ * Ids are prefixed with `runId`, so the messages of several runs of one thread can be concatenated.
+ */
+export async function readUIMessages(journal: Pick<JournalReader, 'readRun'> & Pick<Journal, 'get'>, runId: string): Promise<UIMessage[]> {
+  const [entries, input] = await Promise.all([
+    journal.readRun(runId),
+    journal.get<ReconstructSeed>(runKeys.input(runId)),
+  ]);
+  return toUIMessages(entries, { runId, seed: input ?? undefined });
 }
 
 // Re-exported for callers who want to inspect a raw Interrupt shape alongside toUIMessages' output

@@ -14,6 +14,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeFileSync } from 'node:fs';
+import { mintCallId } from '../src/call-identity.js';
 import { newStore, startNode, post, waitFor, stopNode, sleep, linesOf, effectCount, PG_BASE, type Node, type Store } from './detached/harness.js';
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'deferred-node.ts');
@@ -30,6 +31,8 @@ const chat = async (n: Node, body: Record<string, unknown>) => (await post(n, '/
 const thread = (n: Node, threadId: string): Promise<Array<{ role: string; text: string }>> => get(n, `/thread?threadId=${encodeURIComponent(threadId)}`);
 const results = (msgs: Array<{ role: string; text: string }>) => msgs.filter((m) => m.role === 'user' && m.text.startsWith('Background task'));
 const contCalls = (s: Store) => linesOf(`${s.effects}.calls`).filter((l) => l.split(' ')[1] === 'cont');
+// The model's first answer of a run is step 0 and names its call `call-1`; GNL's id for it:
+const gid = (runId: string): string => mintCallId('call-1', runId, 0, 0);
 const done = async (n: Node, runId: string) => (await get(n, `/outcome?runId=${encodeURIComponent(runId)}`))?.status === 'completed';
 
 describe('D1/D2 the result is written once and the agent woken once (Sqlite file, real processes)', () => {
@@ -37,9 +40,9 @@ describe('D1/D2 the result is written once and the agent woken once (Sqlite file
     const s = store();
     const a = await node(s, { DF_TASK_MS: '1500' });
     const r = await chat(a, { runId: 'p1', threadId: 'T1', text: 'research tides' });
-    expect(r.results, 'what the model was answered').toEqual([{ status: 'started', taskId: 'task:p1:call-1' }]);
+    expect(r.results, 'what the model was answered').toEqual([{ status: 'started', taskId: `task:p1:${gid('p1')}` }]);
     expect(effectCount(s), 'the turn waited for the body').toBe(0);
-    await waitFor(() => done(a, 'cont:p1:call-1'), 20_000, 'the continuation');
+    await waitFor(() => done(a, `cont:p1:${gid('p1')}`), 20_000, 'the continuation');
     const msgs = await thread(a, 'T1');
     expect(results(msgs).length, 'result messages in the thread').toBe(1);
     expect(msgs[msgs.length - 1]).toMatchObject({ role: 'assistant' });
@@ -58,7 +61,7 @@ describe('D1/D2 the result is written once and the agent woken once (Sqlite file
       const c = await node(s, env);
       await post(a, '/chat', { runId: 'p2', threadId: 'T2', text: 'research waves' }).catch(() => undefined);
       await waitFor(() => linesOf(`${s.effects}.killed`).length > 0, 20_000, `the kill at ${point}`);
-      await waitFor(() => done(b, 'cont:p2:call-1'), 30_000, 'the continuation, elsewhere');
+      await waitFor(() => done(b, `cont:p2:${gid('p2')}`), 30_000, 'the continuation, elsewhere');
       await sleep(1_500); // every sweep that could still wake it again
       const msgs = await thread(b, 'T2');
       expect(effectCount(s), 'side effects').toBe(1);
@@ -78,7 +81,7 @@ describe('D1/D2 the result is written once and the agent woken once (Sqlite file
       const b = await node(s, env);
       await chat(a, { runId: 'p7', threadId: 'T7', text: 'research currents' });
       await waitFor(() => linesOf(`${s.effects}.killed`).length > 0, 20_000, 'the kill mid-answer');
-      await waitFor(() => done(b, 'cont:p7:call-1'), 30_000, 'the continuation, elsewhere');
+      await waitFor(() => done(b, `cont:p7:${gid('p7')}`), 30_000, 'the continuation, elsewhere');
       await sleep(1_500); // every sweep that could still wake it again
       const msgs = await thread(b, 'T7');
       expect(effectCount(s), 'side effects').toBe(1);
@@ -101,7 +104,7 @@ describe('D3 the side effect runs once', () => {
     await chat(a, { runId: 'p3', threadId: 'T3', text: 'research reefs' });
     await waitFor(() => linesOf(`${s.effects}.started`).length === 1, 10_000, 'the body to start');
     a.kill('SIGKILL');
-    await waitFor(() => done(b, 'cont:p3:call-1'), 30_000, 'the continuation');
+    await waitFor(() => done(b, `cont:p3:${gid('p3')}`), 30_000, 'the continuation');
     expect(effectCount(s)).toBe(1);
     expect(results(await thread(b, 'T3')).length).toBe(1);
     expect(contCalls(s).length).toBe(1);
@@ -118,7 +121,7 @@ describe('D3 the side effect runs once', () => {
     await sleep(3_000);
     expect(linesOf(`${s.effects}.started`).length, 'a second body started beside the frozen one').toBe(1);
     a.kill('SIGCONT');
-    await waitFor(() => done(b, 'cont:p4:call-1'), 30_000, 'the continuation');
+    await waitFor(() => done(b, `cont:p4:${gid('p4')}`), 30_000, 'the continuation');
     expect(effectCount(s)).toBe(1);
     expect(results(await thread(b, 'T4')).length).toBe(1);
     expect(contCalls(s).length).toBe(1);
@@ -163,7 +166,7 @@ describe('D5 the user keeps writing while the task runs', () => {
     await waitFor(() => linesOf(`${s.effects}.calls`).some((l) => l.includes('long story')), 20_000, 'the long turn');
     writeFileSync(gate, '');
     await long;
-    await waitFor(() => done(a, 'cont:p6:call-1'), 20_000, 'the continuation');
+    await waitFor(() => done(a, `cont:p6:${gid('p6')}`), 20_000, 'the continuation');
     const calls = linesOf(`${s.effects}.calls`).map((l) => l.split(' '));
     const contAt = Number(calls.find((c) => c[1] === 'cont')![2]);
     const lastLongCall = Math.max(...calls.filter((c) => c[3]?.includes('long story')).map((c) => Number(c[2])));

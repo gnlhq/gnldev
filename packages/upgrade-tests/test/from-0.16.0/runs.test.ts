@@ -206,9 +206,9 @@ for (const b of [sqlite, ...(RUN_PG ? [postgres] : [])]) {
       const s = (await b.old()).open();
       const p = process_(s);
       expect(await p.run('twohuman', RUNS.midHuman, 'bob', 't-bob-1')).toBe('error:SideEffectRetryBlockedError');
-      expect(await p.run('twohuman', RUNS.midHuman, 'bob', 't-bob-1', { approvals: { call_wire: true } })).toBe('ok:ok');
+      expect(await p.run('twohuman', RUNS.midHuman, 'bob', 't-bob-1', { approvals: { call_wire: true }, caller: durable.STAFF })).toBe('ok:ok');
       expect(p.env.effects).toEqual(['wire:{"to":"acme"}']);
-      expect(await p.run('twohuman', RUNS.midHuman, 'bob', 't-bob-1', { approvals: { call_wire: true } })).toBe('ok:ok');
+      expect(await p.run('twohuman', RUNS.midHuman, 'bob', 't-bob-1', { approvals: { call_wire: true }, caller: durable.STAFF })).toBe('ok:ok');
       expect(p.env.effects).toEqual(['wire:{"to":"acme"}']);
       expect(await inDoubt(p.journal, RUNS.midHuman)).toEqual([]);
     });
@@ -236,8 +236,8 @@ for (const b of [sqlite, ...(RUN_PG ? [postgres] : [])]) {
       await p.run('payer', RUNS.pending, 'alice', THREAD.pending, { approvals: { call_pay: true } });
       const after = await records(p.journal);
       expect(Object.keys(before).filter((k) => !(k in after))).toEqual([]);
-      // What 0.16.0 recorded as a result stays that result.
-      for (const k of Object.keys(before).filter((k) => /:(model|tool):/.test(k) && (before[k] as any)?.status === 'succeeded')) expect(after[k]).toEqual(before[k]);
+      // What 0.16.0 recorded as a result stays that result: every old field the same; the first replay may add `resolvedBy` (once).
+      for (const k of Object.keys(before).filter((k) => /:(model|tool):/.test(k) && (before[k] as any)?.status === 'succeeded')) { const { resolvedBy, ...rest } = after[k] as any; expect(rest).toEqual(before[k]); if (resolvedBy !== undefined) expect(Array.isArray(resolvedBy)).toBe(true); }
       expect(await records(process_(old.open()).journal)).toEqual(after);
     });
 

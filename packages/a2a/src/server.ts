@@ -14,7 +14,7 @@
 //   cancel     → @gnldev/durable `cancelAgentRun` (durable, terminal) + this process's in-flight abort
 import {
   createGnl, scopeConfigToOrg, resolveWorkIdentity, sealRequestContext, sealFieldsOf, runOwnerOf, decideDoorRunAccess,
-  cancelAgentRun, readRunOutcome, summarizeRun, settleModelContent, surfacedInterrupts, callerConflictAnswer, agentVisibleToOrg, readJsonObject, assertRunTarget,
+  cancelAgentRun, readRunOutcome, summarizeRun, settleModelContent, surfacedInterrupts, callerConflictAnswer, requestRefusal, agentVisibleToOrg, readJsonObject, assertRunTarget,
 } from '@gnldev/durable';
 import type { CreateGnlConfig, Journal, JournalReader, RawJournal, Caller, Interrupt, RunOwner } from '@gnldev/durable';
 import { doorGate, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify, refuseMisplacedOptions, doorOptionKeys } from '@gnldev/auth';
@@ -274,7 +274,15 @@ export function createA2AServer(config: CreateGnlConfig, opts: A2AServerOptions 
     const org = caller.kind === 'unknown' ? undefined : caller.orgId;
     // An agent this org cannot see is an agent that does not exist (the REST `agentGate` rule).
     if (!agents[name] || !agentVisibleToOrg(agents[name]!, org)) return rpcError(id, A2A_ERROR_CODES.invalidRequest, `agent '${name}' not found`, { code: 'agent_not_found' }, 404);
-    const { gnl, journal } = scopeFor(org);
+    // The organization's instance — refused, as every door refuses it, when the config's `memory`
+    // cannot be split for it (@gnldev/durable `scopeConfigToOrg`, answered by `requestRefusal`).
+    let scoped: { gnl: ReturnType<typeof createGnl>; journal: Journal };
+    try { scoped = scopeFor(org); } catch (e) {
+      const refused = requestRefusal(e);
+      if (!refused) throw e;
+      return rpcError(id, A2A_ERROR_CODES.internalError, refused.body.error, { code: refused.body.code, status: refused.status }, refused.status);
+    }
+    const { gnl, journal } = scoped;
 
     if (method === 'tasks/get' || method === 'tasks/cancel') {
       if (typeof params.id !== 'string' || params.id === '') return rpcError(id, A2A_ERROR_CODES.invalidParams, 'Invalid params: id (the task id) is required');
@@ -348,6 +356,8 @@ export function createA2AServer(config: CreateGnlConfig, opts: A2AServerOptions 
         ...(input.prompt !== undefined ? { prompt: input.prompt } : {}),
         ...(threadId ? { threadId } : {}),
         ...(approvals ? { approvals } : {}),
+        // WHO answers them: the request's principal (a reply on a task is continued as the task's owner, so `caller` cannot say).
+        ...(who.answerer ? { answerer: who.answerer } : {}),
         context: sealRequestContext({}, sealFieldsOf(runAs, org)),
         caller: runAs,
         // Only an explicit tasks/cancel (ctrl) stops the run: it executes apart from this request
@@ -366,6 +376,10 @@ export function createA2AServer(config: CreateGnlConfig, opts: A2AServerOptions 
       }
       // The rest of the family is the caller's own mistake about its own work: say which.
       if (conflict) return rpcError(id, A2A_ERROR_CODES.invalidParams, conflict.error, { code: conflict.code, detail: conflict.detail });
+      // The engine refused a request before any work, with the answer every door gives it (a yes the answerer
+      // may not give is 403 `approval_not_permitted`): the same code and status, here in JSON-RPC's data.
+      const refusal = requestRefusal(e);
+      if (refusal) return rpcError(id, A2A_ERROR_CODES.refused, refusal.body.error, { status: refusal.status, code: refusal.body.code }, refusal.status);
       return rpcError(id, A2A_ERROR_CODES.internalError, String(e?.message ?? e), e?.code ? { code: e.code } : undefined);
     } finally {
       set.delete(ctrl);

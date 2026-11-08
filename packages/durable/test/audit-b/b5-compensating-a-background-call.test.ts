@@ -5,6 +5,7 @@
 // report the effect as compensated twice when the task is unwound as well.
 import { describe, it, expect } from 'vitest';
 import { compensateRun, readRunOutcome } from '../../src/index.js';
+import { mintCallId } from '../../src/call-identity.js';
 import { app, turn, until, sleep } from './helpers.js';
 
 describe('B5 compensating a background call', () => {
@@ -12,14 +13,15 @@ describe('B5 compensating a background call', () => {
     const compensated: Array<{ input: unknown; output: unknown }> = [];
     const compensate = async (input: unknown, output: unknown) => { compensated.push({ input, output }); return 'undone'; };
     const { gnl, storage, effects } = app({ bodyMs: 20, toolOpts: { compensate } });
+    const cid = mintCallId('call-1', 'k1', 0, 0);
     await turn(gnl, { runId: 'k1', threadId: 'TK1', prompt: 'research', resourceId: 'alice' });
-    expect(await until(async () => (await readRunOutcome(storage.runs as any, 'cont:k1:call-1'))?.status === 'completed')).toBe(true);
+    expect(await until(async () => (await readRunOutcome(storage.runs as any, `cont:k1:${cid}`))?.status === 'completed')).toBe(true);
     await sleep(100);
     expect(effects).toEqual(['tides']);
     // The application's tools, as it passes them to compensateRun (the tool it declared: background + compensate).
     const research = { background: true, sideEffect: true, compensate };
     const report = await compensateRun('k1', { journal: storage.runs as any, tools: { research: research as any } });
-    const reportTask = await compensateRun('task:k1:call-1', { journal: storage.runs as any, tools: { research: research as any } });
+    const reportTask = await compensateRun(`task:k1:${cid}`, { journal: storage.runs as any, tools: { research: research as any } });
     expect({
       outputs: compensated.map((c) => c.output),
       parent: report.entries.map((e) => e.status),

@@ -53,7 +53,11 @@ const run = (api: any, org: string, runId: string, prompt: string) =>
   });
 
 describe('two organizations naming the same thread', () => {
-  it('write into their own stores, never into a conversation store carried through the shared config', async () => {
+  // KARAR-1 (user decision, 8 Nov 2026) changed the expected outcome of this artificial path: a `memory`
+  // object that reaches an organization's registry is no longer DROPPED in silence (that drop is what
+  // hid the roleAuth `orgId` case), it is REFUSED loudly. What still must hold: nothing is ever written
+  // into the shared object, and nothing runs for the organization as if memory were on.
+  it('refuse a conversation store carried through the shared config, and never write into it', async () => {
     const perOrg: ReturnType<typeof store>[] = [];
     const shared = store();
     const config: Record<string, unknown> = {
@@ -70,17 +74,11 @@ describe('two organizations naming the same thread', () => {
 
     const acme = await run(api, 'acme', 'r-acme', 'ACME-SECRET-REVENUE');
     const globex = await run(api, 'globex', 'r-globex', 'globex asks a question');
-    expect(acme.status, await acme.text()).toBe(200);
-    expect(globex.status).toBe(200);
+    expect(acme.status, 'the shared object was dropped in silence and the run served').toBeGreaterThanOrEqual(500);
+    expect(globex.status).toBeGreaterThanOrEqual(500);
 
     expect(shared.appends, 'both organizations wrote into one store handed over by the host').toBe(0);
-    expect(perOrg.length - madeAtBoot, 'the per-organization factory was never called — the shared object won')
-      .toBe(2);
-
-    const [acmeStore, globexStore] = perOrg.slice(madeAtBoot);
-    expect(JSON.stringify([...acmeStore!.threads.values()])).toContain('ACME-SECRET-REVENUE');
-    expect(JSON.stringify([...globexStore!.threads.values()]),
-      'naming another tenant\'s thread was enough to read it').not.toContain('ACME-SECRET-REVENUE');
+    expect(JSON.stringify([...shared.threads.values()])).not.toContain('ACME-SECRET-REVENUE');
   });
 
   it('are given DIFFERENT journals to build their stores over', async () => {

@@ -3,7 +3,7 @@
 // Requires the `deletePrefix` port (InMemory/Sqlite/Postgres adapters provide it); otherwise
 // throws a clear error.
 import { runRecordKey } from './run-id-grammar.js';
-import { runKeys, summarizeRun, runIdOfKey, listRunsWhere, assertJournalGuarantees } from './journal.js';
+import { runKeys, summarizeRun, runIdOfKey, listRunsWhere, assertJournalGuarantees, operatorJournal, type OperatorJournal } from './journal.js';
 import { identityOnlyInput } from './run.js';
 import { workKeyHash } from './hash.js';
 import { memKey, readJournalLogDated, semanticLogKey, SEMANTIC_LOG_PREFIX } from './memory.js';
@@ -101,7 +101,7 @@ async function threadIsTheirs(journal: Journal, threadId: string, resourceId: st
 }
 
 export async function purgeRun(
-  journal: Journal & Partial<JournalReader>,
+  journalArg: OperatorJournal,
   runId: string,
   seen: Set<string> = new Set(),
   opts: {
@@ -122,6 +122,7 @@ export async function purgeRun(
   } = {},
 ): Promise<number> {
   refuseUnknownNames('purgeRun', opts, PURGE_RUN_NAMES);
+  const journal = operatorJournal(journalArg);
   requireDelete(journal);
   return purgeRunPlan(journal, runId, seen, opts.ownershipTrace === true, true);
 }
@@ -633,8 +634,9 @@ export async function isRealRun(journal: Journal, runId: string): Promise<boolea
  * Safety defaults: suspended runs and runs without a timestamp are NOT deleted.
  * Requires a reader (listRuns/readRun) + deletePrefix.
  */
-export async function sweepRuns(journal: Journal & Partial<JournalReader>, opts: SweepOptions): Promise<SweepResult> {
+export async function sweepRuns(journalArg: OperatorJournal, opts: SweepOptions): Promise<SweepResult> {
   refuseUnknownNames('sweepRuns', opts, SWEEP_RUNS_NAMES);
+  const journal = operatorJournal(journalArg);
   requireDelete(journal);
   if (typeof journal.listRuns !== 'function' || typeof journal.readRun !== 'function') {
     throw new Error("@gnldev/durable: sweepRuns requires a journal read surface (listRuns/readRun)");
@@ -1086,9 +1088,10 @@ export interface RetentionSweeper extends PollLoop {
  * object's `start()` is called.
  */
 export function createRetentionSweeper(
-  journal: Journal & Partial<JournalReader>,
+  journalArg: OperatorJournal,
   opts: RetentionSweeperOptions,
 ): RetentionSweeper {
+  const journal = operatorJournal(journalArg);
   refuseUnknownNames('createRetentionSweeper', opts, RETENTION_SWEEPER_NAMES);
   refuseUnknownNames('createRetentionSweeper: sweep', opts.sweep, SWEEP_RUNS_NAMES);
   for (const t of [opts.logSweep ?? []].flat()) refuseUnknownNames('createRetentionSweeper: logSweep', t, LOG_SWEEP_TARGET_NAMES);

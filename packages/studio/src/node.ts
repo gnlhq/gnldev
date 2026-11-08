@@ -17,6 +17,7 @@
 import { getRequestListener } from '@hono/node-server';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { FetchHandler } from './handler.js';
+import { fetchFunctionOf } from '@gnldev/options';
 
 const CARRIES_BODY = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -72,7 +73,8 @@ function bodyAlreadyConsumed(req: IncomingMessage): boolean {
  * before parsing and works, with the host's own routes keeping their parsed bodies.
  */
 export function toNodeHandler(handler: FetchHandler) {
-  const listener = getRequestListener(handler.fetch as any);
+  // A function is a fetch handler; anything that is not one is refused here, by name (one rule: @gnldev/options).
+  const listener = getRequestListener(fetchFunctionOf(handler, 'toNodeHandler', 'what createStudioApi() returns') as any);
   return (req: IncomingMessage, res: ServerResponse) => {
     // Say what actually happened, instead of letting the endpoint guess.
     //

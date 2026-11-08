@@ -101,7 +101,7 @@ export async function taskOutcome(journal: Journal, taskRunId: string, toolCallI
   const { record: rec, effect } = await readCallOutcome(journal, runKeys.tool(taskRunId, toolCallId));
   if (rec?.status === 'succeeded') return { state: 'completed', output: rec.output };
   // Not executed: refused by a person, or answered by a "reconsider" nudge instead.
-  if (rec?.status === 'denied' || rec?.status === 'reflected') return { state: 'denied', output: rec.output };
+  if (rec?.status === 'denied' || rec?.status === 'reflected' || rec?.status === 'refused') return { state: 'denied', output: rec.output };
   // A failure beside a late report: an attempt that lost the call ran it — the effect happened, with
   // that result. (A claim beside one is not decided here: its attempt settles its own record.)
   if (rec?.status === 'failed') return effect.state === 'happened' ? { state: 'completed', output: effect.output } : { state: 'failed', error: rec.error };

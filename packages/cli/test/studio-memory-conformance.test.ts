@@ -113,9 +113,13 @@ describe('organizations: memory as a function of the calling organization', () =
     expect(await acme.getMessages('t1')).toHaveLength(4);
   });
 
-  it('a memory OBJECT without a claim is still refused to an organization', async () => {
+  // d25/26a (was: 'a memory OBJECT without a claim is still refused to an organization' → 403): an
+  // AgentMemory object is split per organization by the one durable rule, like in REST — not refused.
+  it('a memory OBJECT (AgentMemory) is served to an organization from its own partition, not refused', async () => {
     const api = createStudioApi({ reader: new InMemoryJournal(), memory: memoryPreset(new InMemoryStorage(), 'chat'), auth, org: {} } as never) as Api;
-    expect((await del(api, 't1', 0, AS.acme)).status).toBe(403);
+    const r = await del(api, 't1', 0, AS.acme);
+    expect(r.status).not.toBe(403);
+    expect(r.status).toBeLessThan(500);
   });
 });
 

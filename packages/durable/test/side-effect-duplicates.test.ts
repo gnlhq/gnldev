@@ -10,10 +10,14 @@ import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable, resumeRun } from '../src/run.js';
 import { DuplicateSideEffectError, ToolLoopDetectedError } from '../src/limits.js';
+import { mintCallId } from '../src/call-identity.js';
 import { readIncidents } from '../src/incidents.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
 afterEach(() => vi.restoreAllMocks());
+
+/** The GNL id the journal carries for the mock's `call-<n>` (each `call-<n>` is model step n-1, the step's first provider id). */
+const gid = (n: number, runId: string): string => mintCallId(`call-${n}`, runId, n - 1, 0);
 
 const sawNudge = (prompt: any[]) => JSON.stringify(prompt ?? []).includes('__gnl_reflected');
 
@@ -50,12 +54,12 @@ describe('side-effect duplicate guard (sideEffectDuplicates)', () => {
     });
     expect(counter.runs).toBe(1); // the identical keyless repeat did not run
     expect(res.interrupts).toHaveLength(1);
-    expect(res.interrupts[0]).toMatchObject({ toolName: 'charge', toolCallId: 'call-2' });
+    expect(res.interrupts[0]).toMatchObject({ toolName: 'charge', toolCallId: gid(2, 'dw-1') });
     const reason = String(res.interrupts[0]!.reason);
     expect(reason).toContain("'charge'");
     expect(reason).toContain('sideEffect: false'); // an undeclared tool is told how to say it changes nothing
     const incidents = await readIncidents(journal, 'dw-1');
-    expect(incidents).toEqual([expect.objectContaining({ source: 'duplicate-guard', action: 'suspend', toolName: 'charge', toolCallId: 'call-2' })]);
+    expect(incidents).toEqual([expect.objectContaining({ source: 'duplicate-guard', action: 'suspend', toolName: 'charge', toolCallId: gid(2, 'dw-1') })]);
   });
 
   it("'warn' (asked for): the duplicate still EXECUTES but the incident is NAMED with both exits", async () => {
@@ -162,10 +166,10 @@ describe('side-effect duplicate guard (sideEffectDuplicates)', () => {
       throw new Error('expected error did not throw');
     } catch (e) {
       expect(e).toBeInstanceOf(DuplicateSideEffectError);
-      expect((e as DuplicateSideEffectError).detail).toMatchObject({ toolName: 'charge', firstToolCallId: 'call-1', toolCallId: 'call-3' });
+      expect((e as DuplicateSideEffectError).detail).toMatchObject({ toolName: 'charge', firstToolCallId: gid(1, 'aba-dup'), toolCallId: gid(3, 'aba-dup') });
     }
     expect(c2.runs).toBe(2); // A + B; the A-duplicate never executed
-    expect(await j2.get('aba-dup:tool:call-3')).toBeUndefined(); // block writes nothing (re-evaluable)
+    expect(await j2.get(`aba-dup:tool:${gid(3, 'aba-dup')}`)).toBeUndefined(); // block writes nothing (re-evaluable)
   });
 
   it("'reflect': nudge (not executed) → model self-corrects → completes; the journaled record carries the anti-fabrication wording", async () => {
@@ -183,7 +187,7 @@ describe('side-effect duplicate guard (sideEffectDuplicates)', () => {
     });
     expect(res.text).toBe('Recovered.');
     expect(counter.runs).toBe(1); // ONLY the original — the duplicate was reflected, not executed
-    const rec = await journal.get<any>('dr-1:tool:call-2');
+    const rec = await journal.get<any>(`dr-1:tool:${gid(2, 'dr-1')}`);
     expect(rec).toMatchObject({ status: 'reflected' });
     expect(rec.output.guidance).toContain('Do NOT invent or alter identifiers');
   });
@@ -203,8 +207,8 @@ describe('side-effect duplicate guard (sideEffectDuplicates)', () => {
       expect((e as DuplicateSideEffectError).message).toContain('reconsider nudge');
     }
     expect(counter.runs).toBe(1); // one real execution; nudge + block never executed
-    expect(await journal.get('dr-2:tool:call-2')).toMatchObject({ status: 'reflected' });
-    expect(await journal.get('dr-2:tool:call-3')).toBeUndefined();
+    expect(await journal.get(`dr-2:tool:${gid(2, 'dr-2')}`)).toMatchObject({ status: 'reflected' });
+    expect(await journal.get(`dr-2:tool:${gid(3, 'dr-2')}`)).toBeUndefined();
   });
 
   it("'suspend': the duplicate lands in the approvals flow — a HUMAN approves → it executes exactly once more", async () => {
@@ -220,13 +224,13 @@ describe('side-effect duplicate guard (sideEffectDuplicates)', () => {
     // The duplicate (call-2) suspended the run with the standard interrupt shape + an honest reason.
     expect(counter.runs).toBe(1);
     expect(first.interrupts).toHaveLength(1);
-    expect(first.interrupts[0]).toMatchObject({ toolCallId: 'call-2', toolName: 'charge' });
+    expect(first.interrupts[0]).toMatchObject({ toolCallId: gid(2, 'ds-1'), toolName: 'charge' });
     expect(String(first.interrupts[0].reason)).toContain('Duplicate side effect');
 
     // Human approval for exactly that toolCallId → the duplicate executes ONCE, the run completes.
     const resumed = await resumeRun('ds-1', {
       journal, model: model(), tools: { charge: makeCharge(counter) }, limits,
-      approvals: { 'call-2': true },
+      approvals: { [gid(2, 'ds-1')]: true },
     });
     expect(resumed.text).toBe('Done.');
     expect(counter.runs).toBe(2); // original + the explicitly-approved repeat — nothing else
