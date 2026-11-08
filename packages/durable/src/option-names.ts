@@ -19,7 +19,7 @@ import type { SuggestionsConfig } from './suggestions.js';
 
 export const CREATE_GNL_NAMES = optionNames<CreateGnlConfig>()([
   'storage', 'journal', 'agents', 'tools', 'memory', 'memoryFactory', 'processors', 'workflows', 'networks',
-  'checkSuiteConsistency', 'schemaCompat', 'preset', 'suggestions', 'replayDisclosure', 'liveness', 'detached',
+  'checkSuiteConsistency', 'schemaCompat', 'preset', 'suggestions', 'replayDisclosure', 'liveness', 'detached', 'timeouts', 'approvers',
 ]);
 export const AGENT_NAMES = optionNames<AgentConfig>()([
   'description', 'model', 'tools', 'system', 'guard', 'maxSteps', 'processors', 'agents', 'workflows', 'scorers',
@@ -36,7 +36,7 @@ export const RUN_NAMES = optionNames<RunOptions>()([
   'runId', 'workKey', 'prompt', 'messages', 'threadId', 'resourceId', 'caller', 'approvals', 'context', 'model',
   'temperature', 'topP', 'system', 'tools', 'limits', 'toolPolicy', 'strictInput', 'trustRecordedInput',
   'conflictLedger', 'auditOnReject', 'replayDisclosure', 'channel', 'tombstonePolicy', 'actor', 'replay', 'timeouts',
-  'exclusiveModelStep', 'onBlocked', 'abortSignal', 'after',
+  'exclusiveModelStep', 'onBlocked', 'abortSignal', 'after', 'answerer',
 ]);
 const TIMEOUT_NAMES = optionNames<NonNullable<RunOptions['timeouts']>>()(['modelStepMs', 'toolMs', 'claimTtlMs']);
 const LOCK_NAMES = ['owner', 'ttlMs', 'maxHoldMs'] as const;
@@ -66,7 +66,7 @@ const DURABLE_OWN_NAMES = optionNames<Record<DurableOwnName, unknown>>()([
   'journal', 'runId', 'trustRecordedInput', 'origin', 'guard', 'approvals', 'memory', 'threadId', 'resourceId', 'caller',
   'channel', 'agentName', 'workKey', 'workScope', 'replay', 'lock', 'exclusiveModelStep', 'replayCacheMaxBytes', 'toolPolicy',
   'strictInput', 'conflictLedger', 'auditOnReject', 'replayDisclosure', 'tombstonePolicy', 'actor', 'processors', 'schemaCompat',
-  'limits', 'timeouts', 'onBlocked',
+  'limits', 'timeouts', 'onBlocked', 'answerer', 'approvers',
 ]);
 /**
  * The AI SDK's names, as this build knows them. A newer AI SDK's option close to none of these passes
@@ -95,7 +95,7 @@ export const RESUME_NAMES = [
     'lock', 'timeouts', 'exclusiveModelStep', 'schemaCompat', 'toolPolicy', 'strictInput', 'conflictLedger', 'auditOnReject',
     'tombstonePolicy', 'actor',
   ]),
-  'journal', 'approvals', 'caller', 'trustRecordedInput',
+  'journal', 'approvals', 'caller', 'trustRecordedInput', 'answerer', 'approvers',
 ] as const;
 export const REPLAY_RUN_NAMES = optionNames<ReplayRunConfig>()([
   'journal', 'runId', 'newRunId', 'model', 'tools', 'system', 'guard', 'approvals', 'stopWhen', 'replay', 'stripMemoryContext', 'trustRecordedInput',
@@ -122,6 +122,7 @@ export function refuseConfigNames(where: string, config: unknown): void {
 /** createGnl's config, and every agent, network and run-level option bag inside it. */
 export function refuseCreateGnlNames(config: CreateGnlConfig): void {
   refuseConfigNames('createGnl', config);
+  refuseUnknownNames('createGnl: timeouts', config.timeouts, TIMEOUT_NAMES);
   for (const [name, a] of Object.entries(config.agents ?? {})) {
     refuseUnknownNames(`createGnl: agents.${name}`, a, AGENT_NAMES, AGENT_NAME_NOTES);
     refuseUnknownNames(`createGnl: agents.${name}.scorerSampling`, a?.scorerSampling, SCORER_SAMPLING_NAMES);
@@ -208,8 +209,9 @@ export const SUBJECT_MEMORY_NAMES = optionNames<NonNullable<Parameters<typeof im
 export const POLL_LOOP_NAMES = optionNames<NonNullable<Parameters<typeof import('./polling.js').createPollLoop>[1]>>()(['pollMs', 'backoff', 'maxPollMs']);
 export const FORMAT_PROTECTIONS_NAMES = optionNames<NonNullable<Parameters<typeof import('./protections.js').formatProtections>[1]>>()(['title']);
 export const PROTECTION_CONTEXT_NAMES = optionNames<NonNullable<Parameters<typeof import('./protections.js').describeProtections>[1]>>()(['identity', 'devOnly', 'surface']);
-export const TOOL_DURABILITY_NAMES = optionNames<NonNullable<Parameters<typeof import('./types.js').gnlTool>[1]>>()(['sideEffect', 'idempotent', 'idempotency', 'idempotencyKey', 'idempotencyWindow', 'untrusted', 'maxRetries', 'timeoutMs', 'claimTtlMs', 'recover', 'compensate', 'confirm', 'semanticIdentity', 'lookup', 'effectClass', 'background']);
+export const TOOL_DURABILITY_NAMES = optionNames<NonNullable<Parameters<typeof import('./types.js').gnlTool>[1]>>()(['sideEffect', 'idempotent', 'idempotency', 'idempotencyKey', 'idempotencyWindow', 'untrusted', 'maxRetries', 'timeoutMs', 'claimTtlMs', 'recover', 'compensate', 'confirm', 'approve', 'semanticIdentity', 'lookup', 'effectClass', 'background']);
 export const LIST_LOG_NAMES = optionNames<NonNullable<Parameters<typeof import('./durable-log.js').listLog>[2]>>()(['limit']);
+export const TAINT_GUARDIAN_NAMES = optionNames<Parameters<typeof import('./guard.js').taintGuardian>[0]>()(['sensitiveTools', 'onTainted', 'otherwise']);
 export const POLICY_GUARD_NAMES = optionNames<NonNullable<Parameters<typeof import('./policy.js').policyGuard>[1]>>()(['key', 'fallback']);
 export const ROLLOVER_NAMES = optionNames<NonNullable<Parameters<typeof import('./rollover.js').rolloverRun>[2]>>()(['newRunId', 'carry']);
 export const ERASE_SUBJECT_NAMES = optionNames<NonNullable<Parameters<typeof import('./erase.js').eraseSubject>[2]>>()(['orgId', 'erasers', 'memory']);
@@ -220,7 +222,7 @@ export const SUITE_CONSISTENCY_NAMES = optionNames<NonNullable<Parameters<typeof
 export const COMPOSITE_NAMES = optionNames<NonNullable<Parameters<typeof import('./storage.js').composite>[0]>>()(['default', 'overrides']);
 export const TOOL_CALLING_MODEL_NAMES = optionNames<NonNullable<Parameters<typeof import('./mock-model.js').toolCallingModel>[0]>>()(['toolName', 'input', 'calls', 'doneText']);
 export const SEMANTIC_IDENTITY_NAMES = optionNames<NonNullable<import('./types.js').ToolDurability['semanticIdentity']>>()(['keys', 'describe', 'amountFields', 'discriminatorFields']);
-export const CONFIRM_NAMES = optionNames<Extract<NonNullable<import('./types.js').ToolDurability['confirm']>, object>>()(['reason']);
+export const CONFIRM_NAMES = optionNames<Exclude<Extract<NonNullable<import('./types.js').ToolDurability['confirm']>, object>, (...a: never[]) => unknown>>()(['reason']);
 export const LOG_SWEEP_TARGET_NAMES = optionNames<import('./retention.js').LogSweepTarget>()(['ns', 'olderThanMs', 'markerFor', 'now']);
 export const PROCESSOR_RETRY_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./processor.js').ProcessorRetry>[2]>>()(['maxRetries']);
 export const POSTGRES_STORAGE_NAMES = optionNames<NonNullable<ConstructorParameters<typeof import('./postgres-storage.js').PostgresStorage>[0]>>()(['connectionString', 'pool', 'liveness']);

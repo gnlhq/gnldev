@@ -1,6 +1,6 @@
 // Approval webhook: ONE POST per pending tool approval (the __alert__ first-write-wins marker).
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { InMemoryJournal } from '@gnldev/durable';
+import { InMemoryJournal, mintCallId } from '@gnldev/durable';
 import { createStudioApi } from '../src/server.js';
 import { call } from './call.js';
 
@@ -145,7 +145,7 @@ describe('the inbox and cross-run tools', () => {
     expect(items, 'two runs are parked on an approval and the inbox is empty').toHaveLength(2);
     // Each row must carry the id that THAT run's approvals map is keyed by — the stored sentinel holds
     // run A's id, so run B listing run A's would be a button that resolves to nothing.
-    expect(items.find((i) => i.runId === 'runA')?.toolCallId).toBe('call-A');
-    expect(items.find((i) => i.runId === 'runB')?.toolCallId).toBe('call-B');
+    expect(items.find((i) => i.runId === 'runA')?.toolCallId).toBe(mintCallId('call-A', 'runA', 0, 0));
+    expect(items.find((i) => i.runId === 'runB')?.toolCallId).toBe(mintCallId('call-B', 'runB', 0, 0));
   });
 });

@@ -7,6 +7,233 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Security
+
+- **A yes for a failed side effect no longer releases the repeat of the same work.**
+  Affects agents whose side-effect tool (`sideEffect: true`, `idempotency: 'args'` or a business key) was
+  approved, ran, and failed after the request may have left (a provider 502 after the charge went out), and
+  whose model then asked for the same work again under a new call id. The repeat is asked about as "its
+  effect MAY already have happened"; that question belongs to a person. Before, the old yes (given for the
+  first attempt) was still standing on the first call, so a plain resume that carried no answer ran the
+  side effect a second time — a second refund with nobody asked, on `runDurable` and (since the registry
+  door stopped answering a repeat from the parked state) on `gnl.run`. Now a call whose failed attempt
+  sits under a claim that a question holds is superseded by that question: a resume with no answer replays
+  how the attempt ended and runs nothing, and the run offers only the question that was asked for an
+  answer. A tool that failed and was approved with nobody else asking still retries on its standing yes
+  (`approvalScope: 'call'`, unchanged).
+
+- **A yes now answers a question that was asked, and an end user can no longer approve her own approval gate.**
+  Affects every agent that stops for a human (`guard` `require-approval`, a tool's `confirm`, the taint and
+  duplicate gates, the "it may have already happened" question after a crash) and every door that carries
+  `approvals` (REST `/run` `/stream` `/resume`, the chat and AG-UI surfaces and routes, A2A, Slack, Telegram,
+  Studio, batch). Two holes, one cause: any `approvals` map was written to the journal without asking whether
+  the run had a question waiting, and anyone the door let in could send it.
+  (1) **A yes sent before the question existed ran the call unasked.** Tool-call ids are predictable
+  (`call_0` on providers that number them; GNL's own id adds a tag but the provider-id answer binds), so a
+  caller could send, in the request that starts a run, the answer to the question it was about to ask — the
+  refund ran and nobody was asked (measured: 200, refund executed, on every door). Now an approval is written
+  only for a question that is waiting; a yes for any other call is ignored (said once in the log), written
+  nowhere, and cannot release the question later. A **no** is kept: it only ever prevents the effect.
+  (2) **The approval record named the wrong person.** It said "the run's owner approved" — an employee
+  approving a customer's refund was recorded as the customer. `ApprovalRecord` now carries `answeredBy` (the
+  verified identity: an end user's own id, `operator:<id>`, `application:<id>`, `slack:<team>:<user>`,
+  `telegram:<bot>:<user>`) and `answeredAs` (`'staff'` | `'requester'`) next to the unchanged `actor`; every
+  door passes the answerer through one mapping (`@gnldev/auth` `answererOf`, beside `engineCallerOf`).
+  (3) **Two questions, two people.** A gate now asks either **confirm** ("are you sure?" — consent: the person
+  who asked answers, an authorised person may too) or **approve** ("may this happen?" — permission: only an
+  authorised person says yes). The requester's own yes on an approve question is refused with the typed
+  `ApprovalNotPermittedError` — code `approval_not_permitted`, HTTP 403 on every door (a JSON-RPC error with the
+  same code on A2A), nothing journaled, the question still open for staff; anybody's **no** goes through. With no
+  rule, nobody is asked. Declare them: a guard returns `{ action: 'confirm' | 'approve' | 'allow' | 'deny' }`
+  (`'require-approval'` keeps working and means approve); a tool takes `confirm` and the new `approve`, each
+  `true`, `{ reason }` or `(args) => false | string | true` (`approve: (a) => a.amount > 1000 && 'over the limit'`).
+  Order: the agent's guard first (a `deny` ends it), then the tool's own rule; a call can carry a consent and a
+  permission question, put one after the other (an authorised yes answers both). Ready-made guards: `taintGuardian`
+  defaults to approve, `policyGuard` rules accept `confirm` / `approve` (Studio's policy editor too), `mcpFirewall`'s
+  per-run call limit is approve, `limits.taintedSideEffects: 'suspend'` = approve (and a new `'confirm'` rung puts the
+  question to the requester, an opt-in), the duplicate / semantic questions are confirm, and the question after a crash
+  ("this may already have happened") is approve whatever gate first asked.
+  Who is authorised: staff (an operator, Studio) and the application's own server (client token) by default;
+  the new `approvers` option of `createGnl` replaces that default (`(ctx) => boolean`, or the ready-made
+  `fourEyes()`: the approver must not be the person who started the work) and applies to approve only.
+  - **Kırılan davranış / behaviour that changes:** (a) in a chat where the end user answers through her own token, a
+    guard's `require-approval` can no longer be approved by her: it answers 403 `approval_not_permitted` and
+    nothing runs. If you want her to answer it, ask with `confirm` (the guard returns `{ action: 'confirm' }`), or let
+    an operator answer. (b) **Slack:** the channel's click rule ("only the requester, or your `approvers`") is unchanged for who may
+    click, but the requester's click now only answers a confirm question; a guard's approve needs the channel's
+    `approvers` (counted as authorised) or the instance's `approvers`. **Telegram** has no `approvers`: an approve
+    question is answered in Studio. Both channels now say so in the thread instead of failing the job.
+    (c) **Your own code** that answers with `resourceId: 'ayse'` is the requester and is refused on an approve
+    question; pass `caller: STAFF` (the refusal says so). A direct call that names no caller at all is read as
+    authorised, and says so once in the log. (d) **An `approvals` map sent with the request that starts a run is
+    ignored** (it used to skip the gate; durable README said "a pre-supplied approval skips the gate" — that
+    sentence is gone). Answer the interrupt the run returned. (e) Studio's Approve/Deny are live on a customer's
+    row (they were greyed out: "the answer goes through their own channel"). The engine's actor lock (`run_actor_mismatch`) stands aside
+    for exactly that answer: an authorised answerer carrying only `approvals` (no new content, or the recorded content) continues the user's
+    run; new content under the same `runId`, or an end user on somebody else's run, is refused as before. (f) The batch `run()` takes an item's
+    answer as its own caller's (staff by default); a batch declared with only `resourceId` is the requester.
+
+### Fixed
+
+- **Follow-ups of the call-id change: nothing leaks to the provider, old clients' answers still bind, a dead run's question is current.**
+  (1) Five tools that call a model directly — experiment replay (and `explainRun`/`diagnoseTurn` through
+  it), lab `playAgent`, `runScenarios`, `checkPrune`, `sampledToolChoice` — and thread-diagnose's guesser
+  prompt handed the provider a history holding GNL ids (`call_0.gnl-…`); a strict provider (Mistral's 9
+  characters) would have refused it. They now pass the history through the one boundary function
+  (`restoreProviderIds`). (2) The "it MAY have already run" question (a side-effect call left `running` or
+  `failed`) can be answered with the provider's own id (`approvals: { call_0: true }`, what pre-0.17.1
+  clients send) when exactly one call is in doubt; several answer the typed `approval_key_ambiguous`
+  (409), nothing recorded. (3) A dead run's question asked again after another run had done the same work
+  still said "it may have run" and approving it paid a third time with no warning: a run parked on a
+  question is now evaluated when the request is repeated (replay, no model or tool call), so the question
+  names the other run. Approving it anyway still runs the work: that is a person's informed decision.
+
+- **A tool call keeps its own identity when a provider repeats `call_0`.** Affects every agent whose
+  provider numbers its tool calls per answer (Kimi `functions.x:0`, fixed-id proxies, mocks, some local
+  servers) — OpenAI and Anthropic ids are random and were never affected. A call was known only by the id
+  the provider gave, and that id is unique inside ONE answer, not across two steps of a run or two runs.
+  What went wrong: (1) a process died inside a payment and a new message of the same conversation, whose
+  call was also `call_0`, took the dead run's duplicate marker over — the second payment ran with no
+  question (measured 105/105 on SQLite, Postgres and MongoDB); (2) two steps of one run that both said
+  `call_0` were one call: the second payment (7) was never made and the model was told the first one's
+  result (5); (3) one approval for the first `call_0` let the second run unasked; (4) two sub-agent tasks
+  got the same answer, a second conversation's calls vanished from the AG-UI stream, and a cross-run
+  replay was not told as earlier work. Now GNL gives every tool call its own id, `<providerId>.gnl-<run
+  tag>-<step>-<index>`, the moment the model's answer enters it (`withDurableModel`), before it is
+  journaled; the provider is always handed back the id it issued (the request it receives is byte for byte
+  what it was). "Is this my call?" is decided by (run, id) everywhere (`sameCall`, one module:
+  `call-identity.ts`): a marker or a resolved-call list names its run (`firstRunId`, `resolvedBy`), and one
+  written by an older version proves nothing — it is taken over only when its attempt stamp matches the
+  call's own record, otherwise a person is asked (the safe direction).
+  - A dead run's later question now says "another run (<id>, 3 min ago) already completed the same work",
+    so approving it is an informed second payment, not a third one by accident. A dead marker's question no
+    longer says the call "is already executing": it says the earlier attempt stopped mid-way and its effect
+    may have happened.
+  - An approval keyed by the provider's id (`approvals: { call_0: true }`) is bound to the one open question
+    that carries it. Two open questions with that id: the answer is refused whole (409
+    `approval_key_ambiguous`, `AmbiguousApprovalKeyError`, the candidates named) — answer with the
+    interrupt's own `toolCallId`.
+  - A run that was suspended or crashed under an older version continues under this one: its old steps keep
+    their old ids (replay returns a record as it stands), new steps get the new ones, and the effect count
+    is the same as without the upgrade.
+  - **Kırılan davranış / behaviour that changes:** (a) the `toolCallId` you read in an interrupt, an
+    approval card, the AG-UI/UI stream, `GET /runs` and the journal key (`<run>:tool:<id>`) is now the GNL
+    id, `call_abc.gnl-1a2b3c4d-2-0`, about 18 characters longer (a Telegram `a:<id>` button is still
+    ≤ 64 bytes for OpenAI/Anthropic-shaped ids; each level of a nested sub-agent's run id grows by the
+    same). Code or tests that spell a journal key or an approval key with the provider's id must read it
+    from the interrupt (`approvals` keyed by the provider's id still works while one question carries it).
+    (b) A cross-run replay now discloses itself as earlier work even when the two calls share an id.
+    (c) Every record of a succeeded call carries `resolvedBy` (run + id) beside `resolvedToolCallIds`, and a
+    marker carries `firstRunId`: about 45 more bytes per call with an engine-made run id.
+    (d) Running an old and a new process on one database at once is not supported for this change: an old
+    process does not strip the GNL suffix before it calls the provider.
+- **A detached run no longer ends wrong when a healthy process briefly loses its database.** Affects
+  `DetachedRuns` (and `createGnl` / `@gnldev/server` detached runs) on Postgres, MySQL/MariaDB and MongoDB
+  with process liveness, when the database stops answering one process for a few seconds (a stalled
+  network, a restart, a failover):
+  - a tool body stopped by its lost session is no longer reported to the model as a failed tool, however
+    the body stops (Node's `AbortError` from `timers/promises` / `events.once`, or an error of its own).
+    The run used to end `completed` without the call's effect; now the execution is released and the run
+    continues, and a side effect that may have started goes through the crash ladder (idempotency key →
+    `recover()` → a person), never a blind re-run;
+  - an effect that happened while the database dropped every session is no longer told to the model as
+    failed (with the misleading "the pool given to PostgresStorage has no connect()"). Its success is
+    written once the database answers and the run continues from it. A `BEGIN` that fails on a live pool
+    now reports the driver's error (kept as `cause`, with its code). The same request sent again on
+    another process under an `idempotencyWindow: 'thread'` or `'cross-run'` tool no longer hangs in `tool`;
+  - a run whose call is held by another live attempt now waits for that call (`waiting-outcome`, asked
+    again on a backoff) instead of ending `failed` with `RunBusyError` and nobody continuing it;
+  - a process whose session was gone past half its reconnect grace no longer starts a tool body after it
+    is back: the others may have taken the call over meanwhile. The claim is given back and the run is
+    released.
+- **A database cut no longer kills a process that is running a detached run.** Affects `DetachedRuns`
+  (and `createGnl` / `@gnldev/server` detached runs) on every store, most visibly Postgres during a
+  failover or restart. When the store failed one of the run's event writes (`Connection terminated
+  unexpectedly`), the error escaped as an unhandled promise rejection and Node ended the whole process;
+  the other processes then read it as dead and a side effect it had already made was parked for a person
+  instead of the run completing. Now the execution stops writing, logs the error, gives the run back, and
+  the next sweep continues it from its journal — the effect still happens once.
+- **`PostgresStorage.close()` resolves only once its connections have ended.** It used to resolve as soon
+  as the pool had asked its connections to end, so a `DROP DATABASE` (or a connection count) right after
+  `await storage.close()` could still find one (measured under load: 7 of 40 closes).
+  A connection whose goodbye is not answered within 5 s (a server gone silent) is destroyed rather than
+  waited for, so `close()` never hangs on it.
+- **A run started from a `workKey` is continued after its process dies.** Affects every run whose id the
+  engine derives (`run1_…`): a `workKey` on `gnl.run` / `gnl.stream` / REST, and every turn of the chat
+  route once it knows the user (`identify`). The process that took such a run over refused it as "this
+  workKey already names DIFFERENT work" (only a `console.warn`), the run stayed parked for good and the
+  client sending the same turn again got a 200 with no answer. Now the takeover continues it from its
+  recorded input — the same path a plain `runId` took — under the same rules (owner, crash ladder): the
+  effect happens once. The same refusal hit a `preset: 'critical'` run (`strictInput`) with a plain
+  `runId`; it is gone too.
+- **A run that could not be continued tells its client so.** When a takeover does fail (an agent missing
+  from this deployment, an unreadable owner), the client following the run now gets an error
+  (`code: 'run_not_continued'`) saying it waits for an operator, instead of the earlier execution's events
+  and an end with no answer (`docs/errors/run_not_continued.md`). `DetachedRuns.pending()` lists it with
+  the reason it was parked with, not "waiting on a human (approval)".
+- **`preset: 'critical'` / `'assistant'` / `'headless'` now catch a repeat of an `idempotency: 'args'` tool
+  in a new message.** A side-effect tool keyed by its arguments (`idempotency: 'args'`, or `idempotencyKey`
+  in the default `'run'` window) skipped the duplicate ladder: the same transfer asked for again in the
+  next message of the conversation (a new run, so a new key) ran again with no question. It now meets the
+  profile's cell like a tool keyed by its call: `critical` / `assistant` ask a person (a yes runs it again,
+  a no does not), `headless` refuses it with `RunLimitExceededError`. A repeat inside one run is still
+  answered from the record, and a `'thread'` / `'cross-run'` window still answers it from the record as
+  before. Without a preset nothing changes.
+- **A tool with `confirm` meets its guard.** The `confirm` question used to come before the guard, and the
+  approved call then skipped the guard altogether: a guard that denies was never asked, and the call ran
+  on a person's yes. The guard is now asked before the question — a caller it denies is not shown the
+  question (an owner check in the guard keeps a stranger from seeing "29.90 TL will be charged") — and
+  again after the yes; what it denies does not run.
+- **A conversation's title is masked like its messages.** With `piiRedactor` (or any input processor) the
+  thread title was still cut from the raw first message and stored plain in `gnl_threads.title` (listed in
+  Studio), and a `generateTitle` model was handed the raw text. The title and the title model now see what
+  the input processors returned; if that cannot be computed the thread is left untitled. The internal
+  GDPR brief's deletion runbook now says `purgeThread(journal, id, { memory })` — without `memory` the
+  thread row stays.
+- **`recentN` memory windows no longer start on an orphaned tool result.** A window cut between a tool
+  call and its result sent the provider a result with no call (OpenAI-shaped providers answer 400, on that
+  turn and on every retry and resume). The window now opens back over the call (it can be a few rows
+  longer than `recentN`).
+- **`createGnl({ replayDisclosure })` is honoured, and the replay note no longer breaks strict providers.**
+  The `assistant` preset overwrote the config value with `'explain'`. The note was a `system` message
+  after the tool result, which Mistral-family servers (NVIDIA) reject with 400 on exactly the turn that
+  deduplicated a call; it now rides in the step's instructions (head `system`).
+- **`maxTokens` / `maxCostUsd` say so when the provider reports no usage.** A step with no token usage
+  adds nothing, so neither ceiling can fire; the only warning blamed a missing price (and `maxTokens` got
+  none). It now warns once, naming the real cause (an error under `limits.strict`).
+- **Model-step time limit for chat and REST: `createGnl({ timeouts })`.** `timeouts` was per call only
+  (`createGnl` refused it), so the chat and REST surfaces had no way to set one. The config value is the
+  instance default (per-call fields win); a timed-out step fails the run with `StepTimeoutError`. No
+  built-in default; the limit covers a step until its first byte.
+- **`gnl runs` (and every one-shot command) exits.** The store was never closed: the process hung on
+  MySQL and MongoDB and for ~10 s on Postgres. The CLI now closes it after any command other than
+  `dev`/`studio`.
+- **A listed run always opens.** A run that failed before its first model step showed in `gnl runs` and
+  `GET /runs` but answered "not found" to `gnl run`, `gnl inspect` and `GET /runs/:id`. They now open it
+  (REST: an empty journal; `gnl run`: its outcome, status and error); an id with no record is still 404.
+- **A provider failure says where it failed.** The error event, `/run`, the `/stream` error frame, the
+  chat error part and the run outcome now carry the HTTP status and the URL that was called (origin +
+  path; a query is never kept), plus a short secret-masked body excerpt outside production — so a bare
+  `Not Found` from `/v1/responses` on a host that only serves chat completions is diagnosable. The chat
+  error text shows the status (production) or status + URL + excerpt (otherwise) for provider failures;
+  other errors stay masked.
+- **Errors keep their own stack.** An error thrown in your model, tool or processor reached the
+  `gnl.run()` caller rebuilt, with a stack pointing into `event-codec`; the event now keeps a bounded
+  stack and the caller sees the throwing line.
+- **A chat body in the wrong shape gets a clear 400.** `{role, content}` messages answered 400 with the AI
+  SDK's `Cannot read properties of undefined (reading 'some')`, and a `{prompt}` body answered 200 with an
+  error frame. The chat route and surface now check the shape and name the right one (`messages` with
+  `parts`; `POST /agents/:name/run` for a single prompt).
+- **`gnl init --serving own` scaffolds a project that typechecks.** `src/app.ts` read `config.limits`,
+  which the declared config type lacked (TS2339). A new test scaffolds every `--serving` answer and every
+  host and typechecks them.
+- **Install `@hono/node-server@1`.** An unpinned install resolves 2.x and `npm i -D @gnldev/cli` then
+  fails with ERESOLVE (the CLI, server and Studio target 1.x); the READMEs and guides now pin it.
+
+---
+
 ## [0.17.0] — 2026-11-07
 
 **A store's process liveness, a job's and a fire's right to run, and a store's upgrade are each one rule.**

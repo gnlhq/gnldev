@@ -14,7 +14,7 @@
 // Now a read position is never carried (`resetPositions` names it); the organization keeps its own,
 // or reads from the head and skips finished records by their markers. Any other key both sides hold
 // refuses the adoption before anything moves, in every store, with the same message.
-import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
 import { newDb } from 'pg-mem';
 import { InMemoryStorage, withOrgStorage, inMemoryLiveness, type Storage } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
@@ -22,8 +22,10 @@ import { PostgresStorage } from '../src/postgres-storage.js';
 import { enqueue, createWorker, jobEraser } from '../../queue/src/index.js';
 
 beforeAll(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
+// Closed with the test, not the file: each real-Postgres test opens a database, a store and an admin session, and left open until the
+// file ends they pile up past a file's share of the test connection budget (test/pg-connection-budget.setup.ts).
 const ends: Array<() => Promise<unknown>> = [];
-afterAll(async () => { for (const e of ends.reverse()) await e(); });
+afterEach(async () => { for (const e of ends.splice(0).reverse()) await e(); });
 
 const PG_URL = process.env.GNL_PG_URL;
 const STORES: Array<[string, () => Promise<Storage>]> = [

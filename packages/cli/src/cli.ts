@@ -106,6 +106,12 @@ async function main(): Promise<void> {
   } catch (e: any) {
     console.error(`gnl: ${e?.message ?? e}`);
     process.exitCode = 1;
+  } finally {
+    // One-shot commands only: `dev` and `studio` keep serving after `run` returns, on the same store.
+    if (command.group !== 'project') {
+      const { closeLoadedStores } = await import('./config.js');
+      await closeLoadedStores();
+    }
   }
 }
 

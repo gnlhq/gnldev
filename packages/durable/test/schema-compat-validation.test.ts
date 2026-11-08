@@ -14,6 +14,7 @@ import { tool, stepCountIs } from 'ai';
 import { runDurable } from '../src/run.js';
 import { InMemoryJournal } from '../src/journal.js';
 import { withModelFallback } from '../src/model-router.js';
+import { mintCallId } from '../src/call-identity.js';
 import { countToolResults, streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
@@ -49,7 +50,7 @@ async function run(model: any, schemaCompat: boolean, runId = `sc-${Math.random(
   const seen: unknown[] = [];
   const journal = new InMemoryJournal();
   await runDurable({ runId, journal, prompt: 'send', model, tools: { sendMail: mailTool(seen) }, schemaCompat, stopWhen: stepCountIs(3) } as any);
-  const rec: any = await journal.get(`${runId}:tool:call-1`);
+  const rec: any = await journal.get(`${runId}:tool:${mintCallId('call-1', runId, 0, 0)}`);
   return { seen, rec };
 }
 

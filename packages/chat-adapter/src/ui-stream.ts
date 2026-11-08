@@ -19,6 +19,7 @@ import { createUIMessageStreamResponse } from 'ai';
 import type { AsyncIterableStream, StreamTextResult, UIMessage, UIMessageChunk, UIMessageStreamOptions } from 'ai';
 import { maskSentinelOutput } from './sentinel-mask.js';
 import { refuseMisspelledNames, optionNames } from '@gnldev/options';
+import { upstreamFailure, upstreamWire } from '@gnldev/durable';
 
 /** A `data-gnl-interrupt` chunk's payload — one entry per newly-masked suspend in this transform call.
  * FAZ-2: `runId` (when the caller provided one) is the approval ADDRESS — without it the client's
@@ -85,6 +86,19 @@ const UI_RESPONSE_NAMES = optionNames<ToUIMessageStreamResponseOptions<UIMessage
 ]);
 
 /**
+ * What the chat stream's error part says. A provider failure: its status always, and outside production the
+ * (credential-free) URL it called and a short masked excerpt of its body — a deployment's own error text is
+ * a developer's clue, not something to show an end user. Every other error: the SDK's masked default.
+ */
+function providerErrorText(error: unknown): string {
+  const up = upstreamFailure(error);
+  if (!up) return 'An error occurred.';
+  const prod = typeof process !== 'undefined' && process.env?.NODE_ENV === 'production';
+  const wire = prod ? {} : upstreamWire(up);
+  return `Model provider error${up.upstreamStatus !== undefined ? ` (HTTP ${up.upstreamStatus})` : ''}${wire.upstreamUrl ? ` at ${wire.upstreamUrl}` : ''}${wire.upstreamBody ? `: ${wire.upstreamBody}` : ''}`;
+}
+
+/**
  * Thin wrapper over `result.toUIMessageStream()` with the sentinel-masking transform ALWAYS applied.
  * `result` is whatever `gnl.stream()`/`streamDurable` returns (a real AI SDK `StreamTextResult` under a
  * method-binding Proxy — see run.ts's `guardStreamTerminalPromises`).
@@ -98,6 +112,10 @@ export function toUIMessageStream<UI_MESSAGE extends UIMessage = UIMessage>(
   // FAZ-2: `runId` is OURS (stamped onto interrupt chunks), not the AI SDK's — split it off before
   // handing the rest to the native stream builder.
   const { runId, ...native } = opts ?? {};
+  // The AI SDK masks every stream error as "An error occurred." — right for a bug in the host, but it
+  // hid the one fact a failing provider call carries (its status), and the URL that shows a wrong
+  // baseURL / model type. A provider failure says so; anything else keeps the SDK's masked default.
+  if (native.onError === undefined) native.onError = providerErrorText;
   const nativeStream = result.toUIMessageStream(native as UIMessageStreamOptions<UI_MESSAGE>);
   // PipeThrough on a WHATWG ReadableStream keeps async-iterability (verified: Node's native
   // ReadableStream implements Symbol.asyncIterator; ai's own AsyncIterableStream helper relies on the

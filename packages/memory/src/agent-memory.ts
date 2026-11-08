@@ -334,6 +334,22 @@ export class AgentMemory implements Required<Memory> {
   }
 
   /**
+   * The last `recentN` messages, opened back to where they do not split a tool call from its result.
+   *
+   * The window is cut by COUNT, and a tool-using turn is several rows (user, assistant+call, tool
+   * result, assistant). A cut that lands on the result leaves the window opening with an answer to a
+   * call the model was never shown; behind a system prompt every OpenAI-shaped provider rejects it
+   * (measured on NVIDIA: 400 on the turn after the cut, and again on every retry and resume, since the
+   * frozen `:input` carries the same head). Same repair, same reasoning as `windowFromTurnBoundary`:
+   * pull the call in rather than hide the outcome — so the window can be a few rows longer than
+   * `recentN`, never shorter. A window that already starts on a boundary is returned untouched.
+   */
+  protected recentWindow(all: MessageRecord[]): MessageRecord[] {
+    if (all.length <= this.recentN) return all;
+    return this.windowFromTurnBoundary(all, all[all.length - this.recentN - 1]!.seq);
+  }
+
+  /**
    * `append`, but at most once for a given `batchKey` — present only when the store can write the
    * batch identity in the same transaction as the rows. Absent stores leave run.ts on its marker.
    *
@@ -395,7 +411,7 @@ export class AgentMemory implements Required<Memory> {
     opts?: { query?: string; resourceId?: string; scope?: 'thread' | 'resource' },
   ): Promise<{ messages: any[]; recalled: RecalledMessageRef[]; recent: RecalledMessageRef[]; recentCount: number; dropped?: RecalledMessageRef[]; droppedCount?: number }> {
     const all = await this.allMessages(threadId);
-    const recent = all.slice(-this.recentN);
+    const recent = this.recentWindow(all);
     // The "it all fits in the recent window, so there is nothing left to recall" short-circuit is
     // sound for thread scope and WRONG for resource scope: `all` is THIS thread's history, while a
     // resource-scoped recall reaches the user's OTHER threads. Applying it to both meant cross-thread
@@ -404,7 +420,7 @@ export class AgentMemory implements Required<Memory> {
     const effectiveScope = opts?.scope ?? this.recallDefaults.scope;
     const fitsInWindow = all.length <= this.recentN && effectiveScope !== 'resource';
     if (!opts?.query || !this.embed || fitsInWindow) {
-      const window = all.length <= this.recentN ? all : recent;
+      const window = recent;
       return {
         messages: window.map((e) => e.message),
         recalled: [],
@@ -482,7 +498,7 @@ export class AgentMemory implements Required<Memory> {
     if (afterIndex !== -1) {
       if (!Number.isInteger(afterIndex) || afterIndex < -1) return 0;
       const all = await this.allMessages(threadId);
-      const displayed = all.length <= this.recentN ? all : all.slice(-this.recentN);
+      const displayed = this.recentWindow(all);
       if (afterIndex >= displayed.length) return 0;
       cut = displayed[afterIndex]!.seq;
     }
@@ -516,14 +532,17 @@ export class AgentMemory implements Required<Memory> {
   }
 
   /** Rich context hook (run.ts feature-detects it). */
-  async loadContext(threadId: string, opts: { query?: string; resourceId?: string; incoming?: any[] }): Promise<LoadedContext> {
+  async loadContext(threadId: string, opts: { query?: string; resourceId?: string; incoming?: any[]; titleIncoming?: any[] }): Promise<LoadedContext> {
     refuseUnknownNames('loadContext', opts, LOAD_CONTEXT_NAMES);
     this.scoped(threadId);
     // Every thread a run touches is indexed, so it is listed (Studio's thread list). A run with no
     // resource indexes it with resourceId '' — the column is NOT NULL — and '' names nobody
     // (`threadRecordOwner`), so ownership reads exactly as if the entry did not exist.
     {
-      const fu = (opts.incoming ?? []).find((m: any) => m?.role === 'user');
+      // The title comes from `titleIncoming` when the caller gives it: a run passes the input chain's
+      // OUTPUT so a redactor's masking reaches the title too (and the title-generating model). Absent, the
+      // title is cut from `incoming` — right for a caller with no processors.
+      const fu = (opts.titleIncoming ?? opts.incoming ?? []).find((m: any) => m?.role === 'user');
       await this.ensureThreadIndexed(threadId, opts.resourceId ?? '', fu ? messageText(fu) : undefined);
     }
     let messages: any[];

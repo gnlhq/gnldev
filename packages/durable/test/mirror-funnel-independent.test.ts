@@ -19,6 +19,7 @@ import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
 import { withIdempotency } from '../src/idempotent-tools.js';
+import { mintCallId } from '../src/call-identity.js';
 import { gnlTool } from '../src/types.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
@@ -61,6 +62,9 @@ async function authoritative(journal: InMemoryJournal): Promise<{ key: string; v
   return { key, value: await journal.get(key) };
 }
 
+/** The GNL id of a run's single tool call (model step 0, first provider id) — what the journal and the resolved list carry. */
+const gid = (providerId: string, runId: string): string => mintCallId(providerId, runId, 0, 0);
+
 const mirror = (journal: InMemoryJournal, runId: string, toolCallId: string): Promise<any> =>
   journal.get(`${runId}:tool:${toolCallId}`);
 
@@ -77,10 +81,10 @@ describe('the mirror and the authoritative record', () => {
     await runDurable({ runId: 'runB', journal, model: model('call-B'), tools: { charge }, prompt: 'go' } as never);
 
     const auth = await authoritative(journal);
-    const shadowB = await mirror(journal, 'runB', 'call-B');
+    const shadowB = await mirror(journal, 'runB', gid('call-B', 'runB'));
 
     expect(auth.value.resolvedToolCallIds, 'the authoritative record did not record both calls')
-      .toEqual(['call-A', 'call-B']);
+      .toEqual([gid('call-A', 'runA'), gid('call-B', 'runB')]);
     expect(shadowB, 'the deduping run got no history at all').toBeTruthy();
     expect(shadowB.resolvedToolCallIds, 'the mirror disagrees with the record it is a copy of — a human is offered an approval for a charge that already went through')
       .toEqual(auth.value.resolvedToolCallIds);
@@ -93,7 +97,7 @@ describe('the mirror and the authoritative record', () => {
     await runDurable({ runId: 'runA', journal, model: model('call-A'), tools: { charge }, prompt: 'go' } as never);
 
     const auth = await authoritative(journal);
-    const shadow = await mirror(journal, 'runA', 'call-A');
+    const shadow = await mirror(journal, 'runA', gid('call-A', 'runA'));
     expect(shadow?.mirrorOf, 'an unmarked shadow is indistinguishable from a real tool record').toBe(auth.key);
   });
 });
@@ -111,14 +115,14 @@ describe('a mirror lost to a transient failure', () => {
 
     await runDurable({ runId: 'runA', journal, model: model('call-A'), tools: { charge }, prompt: 'go' } as never);
     expect(journal.attempts, 'the mirror was never attempted — this test proves nothing').toBe(1);
-    expect(await mirror(journal, 'runA', 'call-A'), 'the injected failure did not take effect').toBeUndefined();
+    expect(await mirror(journal, 'runA', gid('call-A', 'runA')), 'the injected failure did not take effect').toBeUndefined();
 
     // The same run, replayed. Nothing new to execute; the record is consumed again.
     await runDurable({ runId: 'runA', journal, model: model('call-A'), tools: { charge }, prompt: 'go' } as never);
 
     expect(executed, 'the replay re-executed the side effect').toBe(1);
     expect(journal.attempts, 'the mirror write was not retried on the next consume').toBeGreaterThan(1);
-    expect(await mirror(journal, 'runA', 'call-A'), 'the run has no timeline entry and the operator has nothing to click, permanently')
+    expect(await mirror(journal, 'runA', gid('call-A', 'runA')), 'the run has no timeline entry and the operator has nothing to click, permanently')
       .toBeTruthy();
   });
 
@@ -131,16 +135,16 @@ describe('a mirror lost to a transient failure', () => {
 
     // Suspends. The mirror write is the one that fails.
     await runDurable({ runId: 'runA', journal, model: model('call-A'), tools: { charge }, guard: needsApproval, prompt: 'go' } as never);
-    expect(await mirror(journal, 'runA', 'call-A'), 'the injected failure did not take effect').toBeUndefined();
+    expect(await mirror(journal, 'runA', gid('call-A', 'runA')), 'the injected failure did not take effect').toBeUndefined();
     const auth = await authoritative(journal);
     expect(auth.value.status, 'the fixture did not suspend').toBe('suspended');
     expect(auth.value.output?.__gnl_suspend?.toolCallId, 'the sentinel does not carry runA\'s own id — the branch under test is not the one being taken')
-      .toBe('call-A');
+      .toBe(gid('call-A', 'runA'));
 
     // Replay, still unapproved: the suspended record is consumed with sus.toolCallId === toolCallId.
     await runDurable({ runId: 'runA', journal, model: model('call-A'), tools: { charge }, guard: needsApproval, prompt: 'go' } as never);
 
-    const shadow = await mirror(journal, 'runA', 'call-A');
+    const shadow = await mirror(journal, 'runA', gid('call-A', 'runA'));
     expect(shadow, 'the suspend branch returned without mirroring, so this run stays invisible to the approvals inbox').toBeTruthy();
     expect(shadow.status).toBe('suspended');
   });
@@ -159,17 +163,17 @@ describe('a run that consumed a record which has since moved on', () => {
 
     await runDurable({ runId: 'runA', model: model('call-A'), ...opts } as never);
     const b1 = await runDurable({ runId: 'runB', model: model('call-B'), ...opts } as never);
-    expect(b1.interrupts?.[0]?.toolCallId, 'run B was not offered its own id').toBe('call-B');
+    expect(b1.interrupts?.[0]?.toolCallId, 'run B was not offered its own id').toBe(gid('call-B', 'runB'));
 
     // The operator approves in run B. The charge runs; the authoritative record becomes succeeded.
-    await runDurable({ runId: 'runB', model: model('call-B'), approvals: { 'call-B': true }, ...opts } as never);
+    await runDurable({ runId: 'runB', model: model('call-B'), approvals: { [gid('call-B', 'runB')]: true }, ...opts } as never);
     expect(executed, 'the approval did not run the tool').toBe(1);
     expect((await authoritative(journal)).value.status).toBe('succeeded');
 
     // Run A replays and completes. Its shadow must not still say `suspended`.
     await runDurable({ runId: 'runA', model: model('call-A'), ...opts } as never);
 
-    const shadowA = await mirror(journal, 'runA', 'call-A');
+    const shadowA = await mirror(journal, 'runA', gid('call-A', 'runA'));
     expect(shadowA.status, 'run A advertises an approval for a charge that already went through')
       .toBe('succeeded');
     const runs = await journal.listRuns();
@@ -194,7 +198,7 @@ describe('a failing mirror on the DEDUPING run', () => {
     expect(b.text, 'the run did not finish').toBe('done');
     const auth = await authoritative(journal);
     expect(auth.value.status, 'a failed CONVENIENCE write damaged the record that decides whether the side effect happened').toBe('succeeded');
-    expect(auth.value.resolvedToolCallIds, 'the authoritative write was lost along with the mirror').toEqual(['call-A', 'call-B']);
+    expect(auth.value.resolvedToolCallIds, 'the authoritative write was lost along with the mirror').toEqual([gid('call-A', 'runA'), gid('call-B', 'runB')]);
     expect(warn.mock.calls.flat().join(' '), 'the loss was swallowed silently').toContain('could not mirror');
   });
 });

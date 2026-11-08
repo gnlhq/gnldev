@@ -75,8 +75,10 @@ const res = await runDurable({ runId: 'order-123', journal, model, tools, prompt
 >   await runDurable({ runId: 'order-123', journal, model, tools, prompt });
 > } catch (e) {
 >   if (e instanceof SideEffectRetryBlockedError) {
->     // e.detail.key names the tool call that is in doubt. Ask an operator, then re-run with
->     // approvals: { [toolCallId]: true } — or give the tool a recover() so this resolves itself.
+>     // e.detail.key names the tool call that is in doubt. Ask an authorised person (this is an
+>     // approve question: the end user whose work it is cannot answer it), then re-run as staff
+>     // (`caller: STAFF`) with approvals: { [toolCallId]: true } — a yes sent before this error
+>     // existed answers nothing — or give the tool a recover() so this resolves itself.
 >   } else throw e;
 > }
 > ```
@@ -423,10 +425,68 @@ gnlTool(tool({ inputSchema: z.object({ amount: z.number() }), execute: async () 
 ```
 
 The fresh call suspends with the standard sentinel into the SAME approvals flow (Studio inbox, the
-chat `approve()` helper); deny writes a terminal denied record; a pre-supplied approval skips the
-gate and still meets the guard. Scope: per toolCallId — a model issuing a new call asks again. A
+chat `approve()` helper); deny writes a terminal denied record. An approval answers a question that
+was **asked**: a yes sent before the question exists (the id of the next call is predictable) is
+ignored and written nowhere, so it cannot skip the gate — answer the interrupt the run returned. A
+no is kept. Scope: per toolCallId — a model issuing a new call asks again. A
 crashed (`failed`/`running`) attempt is NOT re-asked "confirm before it runs" — that state belongs to
 the recover/reclaim ladder, which knows the effect may already have fired.
+
+### Two questions, two people: `confirm` and `approve`
+
+A gate asks one of two different things, and they are answered by different people:
+
+| | asks | who says yes |
+|---|---|---|
+| **confirm** | "are you sure?" — consent | the person who asked for the work; an authorised person may too |
+| **approve** | "may this happen?" — permission | only an authorised person (staff: an operator, Studio; the application's own server) |
+
+The requester's own yes on an approve question is refused with `ApprovalNotPermittedError` (code
+`approval_not_permitted`, HTTP 403 on every door), nothing is journaled and the question stays open;
+anybody's **no** goes through. With no rule, nobody is asked. Declare them where they belong:
+
+```ts
+import { tool } from 'ai';
+import { z } from 'zod';
+import { gnlTool, type Guard } from '@gnldev/durable';
+
+// The agent's general rule: a guard returns allow | deny | confirm | approve
+// ('require-approval' is the older name of approve and means exactly that).
+const guard: Guard = ({ args }) => ((args as { amount: number }).amount > 1000 ? { action: 'approve', reason: 'over the limit' } : { action: 'allow' });
+
+// The tool's own rule: true, { reason }, or (args) => false | string | true.
+const refund = gnlTool(tool({ description: 'refund an order', inputSchema: z.object({ amount: z.number() }), execute: async () => ({ ok: true }) }), {
+  sideEffect: true,
+  confirm: (a: { amount: number }) => a.amount > 100 && `refund ${a.amount}?`,
+  approve: (a: { amount: number }) => a.amount > 1000 && 'over the limit',
+});
+```
+
+Order: the agent's guard first (a `deny` ends it), then the tool's `confirm`, then its `approve` — a call can
+carry both, one question after the other, and runs only when both are yes (an authorised yes answers both).
+`taintGuardian` defaults to approve (the requester may be the one who planted the content), `policyGuard`
+rules take `confirm` / `approve`, `mcpFirewall`'s per-run call limit is approve, `limits.taintedSideEffects:
+'suspend'` is approve (`'confirm'` puts that question to the requester), the duplicate and semantic
+questions are confirm, and the question after a crash ("it MAY have already happened") is approve whichever
+gate asked first.
+
+Who is authorised is `createGnl({ approvers })`: absent, staff and the application's own server;
+set, **your rule replaces that default** (it may narrow it, or name an end-user token) and applies to approve
+only. `fourEyes()` is the ready-made one: the approver must not be the person who started the work.
+
+```ts
+import { createGnl, fourEyes } from '@gnldev/durable';
+
+declare const agents: Parameters<typeof createGnl>[0]['agents'];
+createGnl({ approvers: fourEyes(), agents });                       // not the one who started it
+createGnl({ approvers: ({ answeredBy }) => answeredBy === 'operator:head-of-finance', agents });
+```
+
+Calling the engine from your own code: a call that names only `resourceId` is the requester; pass
+`caller: STAFF` for a staff answer. A call that names nobody is read as authorised and says so once in the
+log. Do not forward a browser's `approvals` to the engine blindly from your application server: your server
+is authorised, so what it forwards is a yes from staff. Each approval record names who answered
+(`answeredBy`, `answeredAs: 'staff' | 'requester'`).
 
 ## Streaming: catching blocked/limit protections
 

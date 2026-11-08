@@ -445,6 +445,47 @@ export class ThreadRunsInFlightError extends Error {
   }
 }
 
+/**
+ * An approval named a tool call by the PROVIDER's id (`call_0`), and more than one question of the run
+ * waits under that id (two steps, or two sub-agents, each answered with `call_0`). Which one the person
+ * meant is not guessable: nothing is written, and the answer names the candidates — approve one of them
+ * by its GNL id (the `toolCallId` of the interrupt).
+ */
+export class AmbiguousApprovalKeyError extends Error {
+  constructor(
+    public readonly detail: { runId: string; key: string; candidates: string[] },
+  ) {
+    super(teachingError({
+      error: `the approval for '${detail.key}' is ambiguous: ${detail.candidates.length} open questions of run '${detail.runId}' carry that provider id (${detail.candidates.join(', ')})`,
+      note: 'a provider may reuse a tool-call id from one model answer to the next, so its own id does not say which question a yes belongs to; nothing was recorded',
+      help: "answer with the interrupt's own `toolCallId` (the GNL id), one per question",
+    }));
+    this.name = 'AmbiguousApprovalKeyError';
+  }
+}
+
+/**
+ * A yes to an APPROVE question from somebody who may not give it (approval-authority.ts): the requester's
+ * own yes on a permission question, or a yes the developer's `approvers` rule refused. Nothing was
+ * recorded and nothing ran — the question stays open for an authorised person. Answered 403 on every door,
+ * code `approval_not_permitted` (`requestRefusal`).
+ */
+export class ApprovalNotPermittedError extends Error {
+  readonly code = APPROVAL_ERROR_CODES.ApprovalNotPermittedError;
+  constructor(
+    public readonly detail: { runId: string; toolCallId: string; toolName?: string; answeredAs: 'staff' | 'requester'; rule?: 'approvers' },
+  ) {
+    super(teachingError({
+      error: `the yes for '${detail.toolName ?? detail.toolCallId}' (run '${detail.runId}') was refused: this question needs an authorised person's approval${detail.rule ? ", and the `approvers` rule did not name this answerer" : `, and it came from the ${detail.answeredAs === 'requester' ? 'person the work is for' : 'answerer'}`}`,
+      note: 'a question asked with approve is permission, not consent: the person who asked for the work cannot grant it to themselves; nothing was recorded and nothing ran, the question is still open',
+      help: detail.answeredAs === 'requester' && !detail.rule
+        ? 'answer it as staff (an operator token, or the application server). From your own code: pass `caller: STAFF` (not just `resourceId`); name who may approve with the `approvers` option of createGnl. A no is always accepted.'
+        : 'name who may approve with the `approvers` option of createGnl (fourEyes() is the ready-made rule). A no is always accepted.',
+    }));
+    this.name = 'ApprovalNotPermittedError';
+  }
+}
+
 const CALLER_CONFLICT_BY_NAME = {
   RunThreadMismatchError: 'run_thread_mismatch',
   RunTargetMismatchError: 'run_target_mismatch',
@@ -454,6 +495,7 @@ const CALLER_CONFLICT_BY_NAME = {
   ThreadOwnerMismatchError: 'thread_owner_mismatch',
   RunSweptError: 'run_swept',
   BatchPlanMismatchError: 'batch_plan_mismatch',
+  AmbiguousApprovalKeyError: 'approval_key_ambiguous',
 } as const;
 /** A code `callerConflictCode` can return — the closed set above, not any string. */
 export type CallerConflictCode = (typeof CALLER_CONFLICT_BY_NAME)[keyof typeof CALLER_CONFLICT_BY_NAME];
@@ -593,6 +635,9 @@ const BLOCKED_BY_NAME = {
   // workflow step surfacing through runWorkflow → server/agui/studio still renders a typed code
   // instead of falling through to the generic 400.
   StepRetryBlockedError: 'step_retry_blocked',
+  // A detached run whose takeover failed waits for an operator (detached.ts `notContinuedEnding`): what its
+  // follower is told instead of an end with no answer. Not a class — the reader's ending carries the name.
+  RunNotContinuedError: 'run_not_continued',
 } as const;
 /** A code `blockedErrorCode` can return. */
 export type BlockedErrorCode = (typeof BLOCKED_BY_NAME)[keyof typeof BLOCKED_BY_NAME];
@@ -690,6 +735,11 @@ export const ADOPTION_ERROR_CODES = {
   AdoptionConflictError: 'adoption_conflict',
 } as const;
 
+/** A yes the answerer may not give (`ApprovalNotPermittedError`, approval-authority.ts): 403, on every door. */
+export const APPROVAL_ERROR_CODES = {
+  ApprovalNotPermittedError: 'approval_not_permitted',
+} as const;
+
 /** A request whose shape is wrong before anything reads its fields (request-body.ts readJsonObject). */
 export const REQUEST_ERROR_CODES = {
   invalidJson: 'invalid_json',
@@ -727,11 +777,16 @@ const DRAINING_RETRY_AFTER_S = 1;
 export function requestRefusal(err: unknown):
   | { status: 400; body: { error: string; code: 'thread_id_reserved' | 'caller_system_message' | 'invalid_cursor'; detail?: { threadId: string } }; headers?: undefined }
   | { status: 503; body: { error: string; code: (typeof DRAIN_ERROR_CODES)[keyof typeof DRAIN_ERROR_CODES] }; headers: { 'Retry-After': string } }
+  | { status: 403; body: { error: string; code: (typeof APPROVAL_ERROR_CODES)[keyof typeof APPROVAL_ERROR_CODES]; detail?: unknown }; headers?: undefined }
   | undefined {
   const e = err as { name?: unknown; message?: unknown; threadId?: unknown } | null | undefined;
   if (e?.name === 'DrainingError' || e?.name === 'LivenessUnavailableError') {
     const code = DRAIN_ERROR_CODES[e.name as keyof typeof DRAIN_ERROR_CODES];
     return { status: 503, body: { error: String(e.message), code }, headers: { 'Retry-After': String(DRAINING_RETRY_AFTER_S) } };
+  }
+  if (e?.name === 'ApprovalNotPermittedError') {
+    const d = (err as { detail?: { toolCallId?: unknown; toolName?: unknown } }).detail;
+    return { status: 403, body: { error: String(e.message), code: APPROVAL_ERROR_CODES.ApprovalNotPermittedError, detail: { toolCallId: d?.toolCallId, ...(d?.toolName !== undefined ? { toolName: d.toolName } : {}) } } };
   }
   if (e?.name === 'CallerSystemMessageError') return { status: 400, body: { error: String(e.message), code: REQUEST_ERROR_CODES.callerSystemMessage } };
   if (e?.name === 'InvalidCursorError') return { status: 400, body: { error: String(e.message), code: REQUEST_ERROR_CODES.invalidCursor } };
@@ -750,6 +805,61 @@ export interface UpstreamFailure {
   retryAfter?: number;
   /** The upstream's own status, when it had one — for logs and for the error body, not for the wire. */
   upstreamStatus?: number;
+  /**
+   * The URL the provider call went to — origin and path only (never a query, which is where some providers
+   * keep the key). The one clue a `404 Not Found` carries: `…/v1/responses` on a host that only serves
+   * `…/v1/chat/completions` reads as "wrong model type", and without it the message is just "Not Found".
+   */
+  upstreamUrl?: string;
+  /** A short excerpt of the provider's response body, secrets masked — see `safeUpstreamBody`. */
+  upstreamBody?: string;
+}
+
+/**
+ * A provider URL as it may be shown and stored: origin + path. The query goes (Gemini-style `?key=`), so
+ * does userinfo and the fragment. Anything that does not parse as an http(s) URL is dropped, not echoed.
+ */
+export function safeUpstreamUrl(raw: unknown): string | undefined {
+  if (typeof raw !== 'string' || raw === '' || raw.length > 2048) return undefined;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return undefined;
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The first part of a provider's response body — enough to read "404 page not found" or "Incorrect API key
+ * provided: sk-…1234" — as one line, at most 240 characters, with anything credential-shaped masked
+ * (bearer tokens, `sk-`/`nvapi-`/… keys, `api_key: …` fields). A bounded, masked excerpt, not a copy: the
+ * run's event log already keeps the conversation itself, so this is the same class of data, and the cap is
+ * what keeps a provider that echoes the request from filling it.
+ */
+export function safeUpstreamBody(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  let t = raw.replace(/\s+/g, ' ').trim();
+  if (!t) return undefined;
+  t = t
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, '$1 [redacted]')
+    .replace(/\b(?:sk|pk|rk|gsk|xai|nvapi|hf|ghp|AIza)[-_][A-Za-z0-9_-]{8,}/g, '[redacted]')
+    .replace(/((?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|password|token)["']?\s*[:=]\s*["']?)[^"'\s,}&]{4,}/gi, '$1[redacted]');
+  return t.length > 240 ? `${t.slice(0, 240)}…` : t;
+}
+
+/**
+ * What a door adds to an upstream failure's wire body beyond `upstreamStatus`: the (credential-free) URL
+ * always, the response excerpt everywhere but production — a deployment's own error body is a developer's
+ * clue, not something to hand an end user.
+ */
+export function upstreamWire(up: UpstreamFailure | undefined): { upstreamUrl?: string; upstreamBody?: string } {
+  if (!up) return {};
+  const prod = typeof process !== 'undefined' && process.env?.NODE_ENV === 'production';
+  return {
+    ...(up.upstreamUrl !== undefined ? { upstreamUrl: up.upstreamUrl } : {}),
+    ...(!prod && up.upstreamBody !== undefined ? { upstreamBody: up.upstreamBody } : {}),
+  };
 }
 
 /** `AI_RetryError` wraps the failure that actually happened; the wrapper's own shape says nothing. */
@@ -785,10 +895,18 @@ function retryAfterSeconds(headers: unknown): number | undefined {
  */
 export function upstreamFailure(err: unknown): UpstreamFailure | undefined {
   const e = unwrapRetry(err) as
-    | { name?: string; statusCode?: number; responseHeaders?: unknown; message?: string; cause?: unknown }
+    | { name?: string; statusCode?: number; responseHeaders?: unknown; message?: string; cause?: unknown; url?: unknown; responseBody?: unknown }
     | null
     | undefined;
   if (!e || typeof e !== 'object') return undefined;
+  const found = upstreamFailureOf(e);
+  if (!found) return undefined;
+  const upstreamUrl = safeUpstreamUrl(e.url);
+  const upstreamBody = safeUpstreamBody(e.responseBody);
+  return { ...found, ...(upstreamUrl !== undefined ? { upstreamUrl } : {}), ...(upstreamBody !== undefined ? { upstreamBody } : {}) };
+}
+
+function upstreamFailureOf(e: { name?: string; statusCode?: number; responseHeaders?: unknown; message?: string; cause?: unknown }): UpstreamFailure | undefined {
 
   // A run that ended without finishing, read back from its ending (errorOf keeps the code).
   if ((e as { code?: unknown }).code === UPSTREAM_ERROR_CODES.unfinished) return { status: 502, code: UPSTREAM_ERROR_CODES.unfinished };
@@ -832,6 +950,7 @@ const WIRE_STATUS_BY_CODE = {
   thread_owner_mismatch: 409,
   run_swept: 409,
   batch_plan_mismatch: 409,
+  approval_key_ambiguous: 409,
   // blocked — the run is waiting on a decision; the same id succeeds once it clears
   side_effect_retry_blocked: 409,
   retry_limit_exceeded: 422,
@@ -839,6 +958,7 @@ const WIRE_STATUS_BY_CODE = {
   outcome_unknown: 409,
   run_busy: 409,
   step_retry_blocked: 409,
+  run_not_continued: 409,
   // limit — resumable: raise the ceiling (or fix the loop) and re-drive the same runId
   run_limit_exceeded: 422,
   tool_loop_detected: 422,
@@ -853,6 +973,8 @@ const WIRE_STATUS_BY_CODE = {
   // request shape — the body is not a JSON object (readJsonObject); fix the request
   invalid_json: 400,
   caller_system_message: 400,
+  // approval authority — a yes the answerer may not give (approval-authority.ts); answer as an authorised person, or no
+  approval_not_permitted: 403,
   invalid_cursor: 400,
   // adoption — the organization already holds what the root would move onto; decide, then adopt again
   adoption_conflict: 409,

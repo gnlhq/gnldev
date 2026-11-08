@@ -4,7 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { tool } from 'ai';
 import { z } from 'zod';
-import { InMemoryJournal, BasicMemory, inMemoryLiveness } from '@gnldev/durable';
+import { InMemoryJournal, BasicMemory, inMemoryLiveness, mintCallId } from '@gnldev/durable';
 import { createChatRoute } from '../src/index.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
@@ -278,7 +278,7 @@ describe('@gnldev/chat-adapter createChatRoute', () => {
     const interruptChunk = chunks.find((c) => c.type === 'data-gnl-interrupt');
     expect(interruptChunk).toBeTruthy();
     expect(interruptChunk.data.interrupts).toHaveLength(1);
-    expect(interruptChunk.data.interrupts[0]).toMatchObject({ toolCallId: 'call-c', toolName: 'chargeCard' });
+    expect(interruptChunk.data.interrupts[0]).toMatchObject({ toolCallId: mintCallId('call-c', res.headers.get('X-Gnl-Run-Id')!, 0, 0), toolName: 'chargeCard' });
 
     // 3) The tool-output-available chunk shows the masked pending-approval shape, not the raw sentinel.
     const toolOut = chunks.find((c) => c.type === 'tool-output-available');
