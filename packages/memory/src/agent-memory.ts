@@ -127,10 +127,14 @@ export class AgentMemory implements Required<Memory> {
   protected om?: ObservationalMemoryConfig;
   protected titleGen?: (firstUserText: string) => Promise<string | undefined>;
 
+  /** What this memory was built with — `forOrganization` builds the same memory over another storage. */
+  private readonly config: MemoryConfig;
+
   constructor(config: MemoryConfig) {
     refuseUnknownNames('AgentMemory', config, MEMORY_CONFIG_NAMES);
     refuseMemoryBagNames('AgentMemory', config);
     requireCapability(config.storage, 'memory');
+    this.config = config;
     this.storage = config.storage;
     this.runs = config.storage.runs;
     this.store = config.storage.memory!;
@@ -142,6 +146,27 @@ export class AgentMemory implements Required<Memory> {
     this.titleGen = config.generateTitle;
     this.omVectorNs = omVectorNamespace(config.storage, this.om?.omVectors?.store);
     this.rootScope = orgStorageScopeOf(config.storage) === undefined;
+  }
+
+  /**
+   * The same memory — same options, same embed, same title generator — over `view`, an organization's
+   * view of the storage it was built over (`Memory.forOrganization`, called by @gnldev/durable's
+   * `scopeConfigToOrg`). What lets `createGnl({ storage, memory: new AgentMemory({ storage }) })` serve a
+   * deployment that binds requests to organizations: each organization's threads, recall and working
+   * memory live in its own partition, and the developer changes nothing.
+   *
+   * `undefined` (the config is then refused, naming `memoryFactory`) when:
+   * - this memory was built over a storage other than `root`: its threads live where the organization
+   *   boundary does not reach, and quietly moving them under the config's storage would be a guess;
+   * - it is already an organization's (its storage is a view): scoping it again would nest partitions;
+   * - it is a SUBCLASS: its constructor may take other arguments or keep its own storage-bound state, so
+   *   rebuilding it as a plain AgentMemory would drop what the subclass adds. A subclass that can be
+   *   rebuilt overrides this method.
+   */
+  forOrganization(view: Storage, root: Storage): Memory | undefined {
+    if (this.storage !== root || !this.rootScope) return undefined;
+    if (Object.getPrototypeOf(this) !== AgentMemory.prototype) return undefined;
+    return new AgentMemory({ ...this.config, storage: view });
   }
 
   /**
@@ -299,38 +324,79 @@ export class AgentMemory implements Required<Memory> {
   }
 
   /**
-   * The observed/unobserved cut moved back to where it does not split a turn.
+   * THE WINDOW RULE — the one owner of what a prompt window may hold. Every path that builds one
+   * (`recentN`, `getMessages`, `loadContext`, the recall path's recent part, the observational tail)
+   * goes through here, so providers' pairing law lives in one place:
    *
-   * `observedSeq` is a high-water mark that compaction advances by message count or token budget, and
-   * neither of those knows what a turn is. Land the cut on the assistant message that made a call and
-   * the window opens with the ANSWER to a call the model was never shown — which Anthropic and OpenAI
-   * both reject, the same way they reject the mirror-image case recall used to produce.
+   *   1. A window never OPENS on a tool result whose call is outside it.
+   *   2. A window never CONTAINS a tool call whose result is outside it.
    *
-   * Moving the boundary back rather than dropping the orphan: the result is worth nothing without the
-   * call, and the call is one message away. Extending is cheap and preserves what compaction was
-   * summarising around; dropping would hide a turn's outcome from the model while its question stayed
-   * visible. Only the messages actually needed are pulled in — a window that already starts on a
-   * boundary is returned untouched.
+   * Providers answer 400 (`MissingToolResultsError`) to either, and the same frozen head is re-sent on
+   * every retry and resume, so a thread that holds one stays broken until someone erases it.
+   *
+   * (1) is repaired by pulling the call in: the result is worth nothing without it and the call is one
+   * message away, so the window can be a few rows longer than asked, never shorter. `observedSeq` is a
+   * high-water mark compaction advances by count or token budget, and a recent-N cut is by count; neither
+   * knows what a turn is.
+   *
+   * (2) is repaired by leaving the unanswered call out (the rest of its message, and every other row,
+   * stays). A call nobody answered mid-history is a turn that died, or an approval that was never
+   * granted before the user wrote again; the model cannot use it and the provider refuses it. It is
+   * reported in `dropped` with the reason `unanswered-tool-call`, never silently.
+   *
+   * ONE EXCEPTION, by design: a call at the very END of the thread (nothing after it but tool results) is
+   * not a broken turn but a PENDING one — a run suspended on an approval or a tool still in flight. It
+   * is kept; the run that owns it resumes it, and the next user message that arrives after it turns it
+   * into case (2).
    */
-  protected windowFromTurnBoundary(all: MessageRecord[], observedSeq: number): MessageRecord[] {
+  protected applyWindowRule(all: MessageRecord[], afterSeq: number): { window: MessageRecord[]; dropped: MessageRecord[] } {
     const idsIn = (m: any, type: string): string[] =>
       (Array.isArray(m?.content) ? m.content : [])
         .filter((p: any) => p?.type === type).map((p: any) => String(p.toolCallId));
 
-    const window = all.filter((m) => m.seq > observedSeq);
-    if (window.length === 0) return window;
+    let window = all.filter((m) => m.seq > afterSeq);
+    if (window.length === 0) return { window, dropped: [] };
 
+    // (1) no result without its call
     const shown = new Set(window.flatMap((m) => idsIn(m.message, 'tool-call')));
     const orphans = new Set(window.flatMap((m) => idsIn(m.message, 'tool-result')).filter((id) => !shown.has(id)));
-    if (orphans.size === 0) return window;
-
-    // The call sits before the cut. Take the earliest one that is needed and start there.
-    let start = observedSeq;
-    for (const m of all) {
-      if (m.seq > observedSeq) break;
-      if (idsIn(m.message, 'tool-call').some((id) => orphans.has(id))) { start = m.seq - 1; break; }
+    if (orphans.size > 0) {
+      // The call sits before the cut. Take the earliest one that is needed and start there.
+      let start = afterSeq;
+      for (const m of all) {
+        if (m.seq > afterSeq) break;
+        if (idsIn(m.message, 'tool-call').some((id) => orphans.has(id))) { start = m.seq - 1; break; }
+      }
+      window = all.filter((m) => m.seq > start);
     }
-    return all.filter((m) => m.seq > start);
+
+    // (2) no call without its result — except the pending turn at the end of the thread
+    const answered = new Set(window.flatMap((m) => idsIn(m.message, 'tool-result')));
+    let tail = all.length - 1;
+    while (tail >= 0 && all[tail]!.role === 'tool') tail--;
+    const pendingSeq = tail >= 0 && all[tail]!.role === 'assistant' ? all[tail]!.seq : undefined;
+    if (window.every((m) => m.seq === pendingSeq || idsIn(m.message, 'tool-call').every((id) => answered.has(id)))) {
+      return { window, dropped: [] };
+    }
+    const kept: MessageRecord[] = [];
+    const dropped: MessageRecord[] = [];
+    for (const m of window) {
+      const unanswered = m.seq === pendingSeq ? [] : idsIn(m.message, 'tool-call').filter((id) => !answered.has(id));
+      if (unanswered.length === 0) { kept.push(m); continue; }
+      const content = (m.message as any).content.filter((p: any) => !(p?.type === 'tool-call' && unanswered.includes(String(p.toolCallId))));
+      dropped.push({ ...m, reason: 'unanswered-tool-call' } as MessageRecord & { reason: string });
+      if (content.length > 0) kept.push({ ...m, message: { ...(m.message as any), content } });
+    }
+    return { window: kept, dropped };
+  }
+
+  /** The last `recentN` messages, under the window rule — the window is never shorter than `recentN` for (1), may lose a dead call for (2). */
+  protected recentWindow(all: MessageRecord[]): MessageRecord[] {
+    return this.recentWindowWithDrops(all).window;
+  }
+
+  protected recentWindowWithDrops(all: MessageRecord[]): { window: MessageRecord[]; dropped: MessageRecord[] } {
+    return this.applyWindowRule(all, all.length <= this.recentN ? -1 : all[all.length - this.recentN - 1]!.seq);
   }
 
   /**
@@ -395,7 +461,10 @@ export class AgentMemory implements Required<Memory> {
     opts?: { query?: string; resourceId?: string; scope?: 'thread' | 'resource' },
   ): Promise<{ messages: any[]; recalled: RecalledMessageRef[]; recent: RecalledMessageRef[]; recentCount: number; dropped?: RecalledMessageRef[]; droppedCount?: number }> {
     const all = await this.allMessages(threadId);
-    const recent = all.slice(-this.recentN);
+    const { window: recent, dropped: windowDropped } = this.recentWindowWithDrops(all);
+    const droppedRefs = (rows: MessageRecord[]) => rows.length
+      ? rows.slice(0, PROVENANCE_RECENT_CAP).map((r) => ({ ...AgentMemory.toRef(r), reason: (r as MessageRecord & { reason?: string }).reason as any }))
+      : undefined;
     // The "it all fits in the recent window, so there is nothing left to recall" short-circuit is
     // sound for thread scope and WRONG for resource scope: `all` is THIS thread's history, while a
     // resource-scoped recall reaches the user's OTHER threads. Applying it to both meant cross-thread
@@ -404,12 +473,14 @@ export class AgentMemory implements Required<Memory> {
     const effectiveScope = opts?.scope ?? this.recallDefaults.scope;
     const fitsInWindow = all.length <= this.recentN && effectiveScope !== 'resource';
     if (!opts?.query || !this.embed || fitsInWindow) {
-      const window = all.length <= this.recentN ? all : recent;
+      const window = recent;
       return {
         messages: window.map((e) => e.message),
         recalled: [],
         recent: window.slice(-PROVENANCE_RECENT_CAP).map((e) => AgentMemory.toRef(e)),
         recentCount: window.length,
+        dropped: droppedRefs(windowDropped),
+        droppedCount: windowDropped.length || undefined,
       };
     }
     const qEmb = await this.embed(opts.query);
@@ -430,13 +501,8 @@ export class AgentMemory implements Required<Memory> {
         const ref = AgentMemory.toRef(r);
         return chosen.has(`${r.threadId}:${r.seq}`) ? ref : { ...ref, origin: 'repair' as const };
       }),
-      dropped: paired.dropped.length
-        ? paired.dropped.slice(0, PROVENANCE_RECENT_CAP).map((r) => ({
-          ...AgentMemory.toRef(r),
-          ...(({ reason: (r as MessageRecord & { reason?: string }).reason }) as { reason?: any }),
-        }))
-        : undefined,
-      droppedCount: paired.dropped.length || undefined,
+      dropped: droppedRefs([...paired.dropped, ...windowDropped]),
+      droppedCount: paired.dropped.length + windowDropped.length || undefined,
       recent: recent.slice(-PROVENANCE_RECENT_CAP).map((e) => AgentMemory.toRef(e)),
       recentCount: recent.length,
     };
@@ -482,7 +548,7 @@ export class AgentMemory implements Required<Memory> {
     if (afterIndex !== -1) {
       if (!Number.isInteger(afterIndex) || afterIndex < -1) return 0;
       const all = await this.allMessages(threadId);
-      const displayed = all.length <= this.recentN ? all : all.slice(-this.recentN);
+      const displayed = this.recentWindow(all);
       if (afterIndex >= displayed.length) return 0;
       cut = displayed[afterIndex]!.seq;
     }
@@ -516,14 +582,17 @@ export class AgentMemory implements Required<Memory> {
   }
 
   /** Rich context hook (run.ts feature-detects it). */
-  async loadContext(threadId: string, opts: { query?: string; resourceId?: string; incoming?: any[] }): Promise<LoadedContext> {
+  async loadContext(threadId: string, opts: { query?: string; resourceId?: string; incoming?: any[]; titleIncoming?: any[] }): Promise<LoadedContext> {
     refuseUnknownNames('loadContext', opts, LOAD_CONTEXT_NAMES);
     this.scoped(threadId);
     // Every thread a run touches is indexed, so it is listed (Studio's thread list). A run with no
     // resource indexes it with resourceId '' — the column is NOT NULL — and '' names nobody
     // (`threadRecordOwner`), so ownership reads exactly as if the entry did not exist.
     {
-      const fu = (opts.incoming ?? []).find((m: any) => m?.role === 'user');
+      // The title comes from `titleIncoming` when the caller gives it: a run passes the input chain's
+      // OUTPUT so a redactor's masking reaches the title too (and the title-generating model). Absent, the
+      // title is cut from `incoming` — right for a caller with no processors.
+      const fu = (opts.titleIncoming ?? opts.incoming ?? []).find((m: any) => m?.role === 'user');
       await this.ensureThreadIndexed(threadId, opts.resourceId ?? '', fu ? messageText(fu) : undefined);
     }
     let messages: any[];
@@ -536,7 +605,7 @@ export class AgentMemory implements Required<Memory> {
       }
       const obs = (await this.store.getObservations(threadId)).filter((o) => !o.condensed);
       const observedSeq = (await this.runs.get<number>(omKey(threadId, 'observedSeq'))) ?? -1;
-      const unobservedRecs = this.windowFromTurnBoundary(await this.allMessages(threadId), observedSeq);
+      const { window: unobservedRecs, dropped: unobservedDropped } = this.applyWindowRule(await this.allMessages(threadId), observedSeq);
       const unobserved = unobservedRecs.map((m) => m.message);
       messages = obs.length
         ? [{ role: 'system', content: `# Observations\n${obs.map((o) => o.text).join('\n')}` }, ...unobserved]
@@ -544,6 +613,10 @@ export class AgentMemory implements Required<Memory> {
       provenance.recentCount = unobserved.length;
       provenance.recent = unobservedRecs.slice(-PROVENANCE_RECENT_CAP).map((m) => AgentMemory.toRef(m));
       provenance.observationCount = obs.length;
+      if (unobservedDropped.length) {
+        provenance.droppedCount = unobservedDropped.length;
+        provenance.dropped = unobservedDropped.slice(0, PROVENANCE_RECENT_CAP).map((r) => ({ ...AgentMemory.toRef(r), reason: 'unanswered-tool-call' as const }));
+      }
     } else {
       const t1 = await this.composeTrack1(threadId, { query: opts.query, resourceId: opts.resourceId });
       messages = t1.messages;

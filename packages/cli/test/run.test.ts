@@ -27,4 +27,15 @@ describe('getRunCore', () => {
   it('throws a clear error for a runId with no trace', async () => {
     await expect(getRunCore({ journal: new InMemoryJournal() } as any, Durable, 'ghost')).rejects.toThrow(/run not found/);
   });
+
+  it('opens a run that is recorded with no steps (its first model call was refused) — by its outcome', async () => {
+    const journal = new InMemoryJournal();
+    const refused: any = { specificationVersion: 'v2', provider: 'mock', modelId: 'm', supportedUrls: {}, doGenerate: async () => { throw Object.assign(new Error('Not Found'), { statusCode: 404 }); } };
+    await runDurable({ runId: 'zero', journal, model: refused, prompt: 'go' }).catch(() => {});
+    expect(await journal.readRun('zero')).toHaveLength(0);
+    const timeline = await getRunCore({ journal } as any, Durable, 'zero');
+    expect(timeline.summary.status).toBe('failed');
+    expect(timeline.summary.modelSteps).toBe(0);
+    expect(timeline.outcome).toMatchObject({ status: 'failed', error: 'Not Found', errorStatus: 404 });
+  });
 });

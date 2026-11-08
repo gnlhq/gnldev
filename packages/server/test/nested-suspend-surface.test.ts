@@ -7,7 +7,7 @@
 // id'siyle anahtarlı. Yani ekranda onaylayan insan, motorun yok saydığı kimliği gönderiyordu:
 // sessiz no-op. Kapı çalışıyor, soru görünüyor, cevap hiçbir yere varmıyor.
 import { describe, it, expect } from 'vitest';
-import { InMemoryJournal } from '@gnldev/durable';
+import { InMemoryJournal, mintCallId } from '@gnldev/durable';
 import { createRestApi } from '../src/index.js';
 import { call } from './call.js';
 
@@ -95,9 +95,12 @@ describe('SSE: iç içe askıda çocuğun kimliği yüzeye çıkar', () => {
     const interrupt = events.find((e) => e.event === 'interrupt');
     expect(interrupt, 'askı hiç yüzeye çıkmadı').toBeDefined();
     const ids = (interrupt!.data.interrupts as Array<{ toolCallId?: string }>).map((i) => i.toolCallId);
-    // The child's question, addressed from the parent: `<delegation call>/<child call>`.
-    expect(ids, 'ekranda vekil id gösteriliyor — onay sessiz no-op\'a düşer').toEqual([`${PROXY_TCID}/${CHILD_TCID}`]);
-    expect(ids).not.toContain(PROXY_TCID);
+    // The child's question, addressed from the parent: `<delegation call>/<child call>` — both GNL ids:
+    // the delegation call is minted in the parent's run, the child's call in the child's own run.
+    const proxyId = mintCallId(PROXY_TCID, 'nss-1', 0, 0);
+    const childId = mintCallId(CHILD_TCID, `agent:nss-1:${proxyId}`, 0, 0);
+    expect(ids, 'ekranda vekil id gösteriliyor — onay sessiz no-op\'a düşer').toEqual([`${proxyId}/${childId}`]);
+    expect(ids).not.toContain(proxyId);
     expect(charges.n).toBe(0);
   });
 
@@ -138,7 +141,7 @@ describe('SSE: iç içe askıda çocuğun kimliği yüzeye çıkar', () => {
     }));
     const interrupts = events.find((e) => e.event === 'interrupt')!.data.interrupts as Array<Record<string, unknown>>;
     expect(interrupts.length).toBe(1);
-    expect(interrupts[0]!.toolCallId).toBe('call-1');
+    expect(interrupts[0]!.toolCallId).toBe(mintCallId('call-1', 'nss-2', 0, 0));
     expect(interrupts[0]!.toolName).toBe('paraGonder');
     expect(interrupts[0]!.args).toEqual({ tutar: 500 });
     expect(charges.n).toBe(0);

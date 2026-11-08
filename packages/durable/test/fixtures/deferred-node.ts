@@ -30,7 +30,7 @@ import { writeReady } from './write-ready.js';
 import { tool } from 'ai';
 import { z } from 'zod';
 import { armFixtureWatchdog } from './watchdog.js';
-import { createGnl, gnlTool, eraseSubject, purgeThread, purgeRun, readRunOutcome, asReaderJournal, type Journal, type Memory } from '../../src/index.js';
+import { createGnl, gnlTool, STAFF, eraseSubject, purgeThread, purgeRun, readRunOutcome, asReaderJournal, type Journal, type Memory } from '../../src/index.js';
 import { SqliteStorage } from '../../src/sqlite-storage.js';
 import { PostgresStorage } from '../../src/postgres-storage.js';
 
@@ -209,7 +209,7 @@ const server = createServer(async (req, res) => {
       const t0 = Date.now();
       let r: any;
       try {
-        r = await gnl.stream('a', { runId: b.runId, threadId: b.threadId, prompt: b.text, resourceId: b.caller ?? 'alice', ...(b.approvals ? { approvals: b.approvals } : {}) } as any);
+        r = await gnl.stream('a', { runId: b.runId, threadId: b.threadId, prompt: b.text, ...(b.staff ? { caller: STAFF } : { resourceId: b.caller ?? 'alice' }), ...(b.approvals ? { approvals: b.approvals } : {}) } as any);
       } catch (e: any) {
         return json(res, ['RunOwnerMismatchError', 'RunActorMismatchError', 'RunThreadMismatchError', 'ThreadOwnerMismatchError'].includes(e?.name) ? 404 : 409, { error: String(e?.message ?? e), name: e?.name });
       }

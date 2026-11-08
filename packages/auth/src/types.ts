@@ -81,6 +81,11 @@ export interface AuthCapabilities {
   audit: boolean;
   multiOrganization: boolean;
   users: boolean;
+  /**
+   * The deployment gives END USERS a credential of their own (`roleAuth({ endUsers })`). Hosts read it to
+   * warn that `workflow:run` / `agents:run` then reach every registered workflow and agent.
+   */
+  endUsers?: boolean;
   /** EE: license plan name ('pro'/'enterprise'/'dev') — UI badge. Not present in the free tier. */
   plan?: string;
   /** EE: license expiry (epoch ms) — UI expiry warning. Not present when unlimited/free. */

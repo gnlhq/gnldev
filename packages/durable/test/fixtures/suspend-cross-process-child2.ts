@@ -7,6 +7,7 @@ import { tool, stepCountIs } from 'ai';
 import { z } from 'zod';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { runDurable } from '../../src/run.js';
+import { STAFF } from '../../src/run-identity.js';
 import { SqliteStorage } from '../../src/sqlite-storage.js';
 import type { Guard } from '../../src/guard.js';
 import { armFixtureWatchdog } from './watchdog.js';
@@ -68,6 +69,7 @@ const res = await runDurable({
   model,
   tools: { chargeCard },
   guard,
+  caller: STAFF, // the host answering its own gate: staff (a direct call that names nobody is read as staff and says so on stderr)
   approvals: { 'call-charge': true }, // resume: approval DIRECTLY via the parameter (independent of journal-approvals)
   prompt: 'charge 5000',
   stopWhen: stepCountIs(6),

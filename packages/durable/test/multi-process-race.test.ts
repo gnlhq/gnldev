@@ -15,6 +15,7 @@ import { z } from 'zod';
 import { runDurable } from '../src/run.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { BasicMemory } from '../src/memory.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 import { spawnFixtureEnv } from './fixtures/watchdog.js';
 
@@ -75,7 +76,7 @@ async function assertCleanReplay(dir: string): Promise<void> {
     countToolResults(prompt) === 0 ? toolCallResult('chargeCard', 'call-charge', { amount: 20 }) : finalTextResult('Charged.'));
   const s = new SqliteStorage(join(dir, 'runs.db'));
   const res = await runDurable({ runId: 'race-charge', journal: s.runs, model, tools: { chargeCard }, prompt: 'charge', stopWhen: stepCountIs(6) });
-  const rec = await s.runs.get<any>('race-charge:tool:call-charge');
+  const rec = await s.runs.get<any>(`race-charge:tool:${mintCallId('call-charge', 'race-charge', 0, 0)}`);
   await s.close();
   expect(res.text).toContain('Charged');
   expect(rec).toMatchObject({ status: 'succeeded' });
@@ -188,7 +189,7 @@ describe('REAL multi-process races (same SQLite journal, two OS processes)', () 
       const byCall = new Map<string, number>();
       for (const l of lines) byCall.set(l.split(':')[1], (byCall.get(l.split(':')[1]) ?? 0) + 1);
       expect([...byCall.values()]).toEqual([1, 1, 1]); // no double-refund anywhere
-      expect(new Set(byCall.keys())).toEqual(new Set(['call-1', 'call-2', 'call-3']));
+      expect(new Set(byCall.keys())).toEqual(new Set([1, 2, 3].map((n) => mintCallId(`call-${n}`, 'race-saga', n - 1, 0))));
       // And the combined reports account for every entry as compensated/already/busy/not-attempted —
       // never a 'failed' invented by contention.
       for (const r of [a, b]) for (const [, status] of r.entries) {

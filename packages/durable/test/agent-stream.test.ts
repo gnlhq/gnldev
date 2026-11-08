@@ -13,7 +13,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { agentStreamEvents, interruptsFromSteps } from '../src/agent-stream.js';
+import { agentStreamEvents, attachStreamFacts, interruptsFromSteps } from '../src/agent-stream.js';
 
 const CODES = { runLimitExceeded: 'run_limit_exceeded', toolLoopDetected: 'tool_loop_detected' };
 
@@ -21,13 +21,14 @@ const CODES = { runLimitExceeded: 'run_limit_exceeded', toolLoopDetected: 'tool_
 const QUIET = ['start', 'finish', 'text-start', 'text-end', 'abort', 'raw'];
 
 /** Drives the generator over `parts`, with `steps` as the finished step list. */
-async function events(parts: any[], steps: any[] = []): Promise<{ event: string; data: any }[]> {
-  const result = {
+async function events(parts: any[], steps: any[] = [], feed?: { reasoning: boolean }): Promise<{ event: string; data: any }[]> {
+  const result: any = {
     fullStream: (async function* () { yield* parts; })(),
     steps: Promise.resolve(steps),
     finishReason: Promise.resolve('stop'),
     usage: Promise.resolve({ totalTokens: 7 }),
   };
+  if (feed) attachStreamFacts(result, { effectsRan: async () => false, feed });
   const out: any[] = [];
   for await (const e of agentStreamEvents(result, 'r1', CODES)) out.push(e);
   return out;
@@ -53,6 +54,17 @@ describe('agentStreamEvents — every part type', () => {
     expect(e).toEqual([{ event: 'tool-result', data: { toolCallId: 'c1', toolName: 'charge', output: { ok: 1 } } }]);
   });
 
+  it("gnl-status (a reader told what it waits for) is the `status` event, with its state", async () => {
+    const e = body(await events([{ type: 'gnl-status', state: 'waiting-takeover' }]));
+    expect(e).toEqual([{ event: 'status', data: { state: 'waiting-takeover' } }]);
+  });
+
+  it('an error part carries the code of THE one run-end mapping — a canceled run says run_canceled, a host error only its text', async () => {
+    const canceled = Object.assign(new Error("run 'r' was canceled"), { name: 'RunCanceledError' });
+    expect(await events([{ type: 'error', error: canceled }])).toContainEqual({ event: 'error', data: { error: "run 'r' was canceled", code: 'run_canceled' } });
+    expect(await events([{ type: 'error', error: new Error('boom') }])).toContainEqual({ event: 'error', data: { error: 'boom' } });
+  });
+
   // The three internal sentinels. Each is carried by another event; none may reach a client.
   for (const sentinel of ['__gnl_suspend', '__gnl_limit_exceeded', '__gnl_blocked']) {
     it(`tool-result withholds the ${sentinel} sentinel`, async () => {
@@ -62,16 +74,20 @@ describe('agentStreamEvents — every part type', () => {
     });
   }
 
-  it('reasoning start / delta / end — the thinking trace is not dropped', async () => {
+  it('reasoning start / delta / end — with the feed opened (d25 P5/15: off by default) the thinking trace is not dropped', async () => {
     const e = body(await events([
       { type: 'reasoning-start', id: 'r' },
       { type: 'reasoning-delta', id: 'r', text: 'hmm' },
       { type: 'reasoning-delta', id: 'r', delta: 'more' },
       { type: 'reasoning-delta', id: 'r', text: '' },
       { type: 'reasoning-end', id: 'r' },
-    ]));
+    ], [], { reasoning: true }));
     expect(names(e)).toEqual(['reasoning-start', 'reasoning-delta', 'reasoning-delta', 'reasoning-end']);
     expect(e[1].data).toEqual({ id: 'r', text: 'hmm' });
+  });
+  it('reasoning parts are not events by default (the feed rule has one owner)', async () => {
+    const e = body(await events([{ type: 'reasoning-start', id: 'r' }, { type: 'reasoning-delta', id: 'r', text: 'hmm' }, { type: 'reasoning-end', id: 'r' }]));
+    expect(names(e)).toEqual([]);
   });
 
   it('tool-input start / delta / end, with `id` as the fallback for toolCallId', async () => {

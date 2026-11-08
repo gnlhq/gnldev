@@ -4,9 +4,9 @@ import { runRecordKey, runRecordPrefix } from '@gnldev/durable';
 import { Hono, type Context } from 'hono';
 import { toFetchHandler, type FetchHandler } from './handler.js';
 import { verifyA2ARequest } from '@gnldev/a2a';
-import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, callerConflictAnswer, upstreamFailure, requestRefusal, assertRootThreadId, orgPrefix, withRootScope, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, decideDoorRunAccess, runNotFound, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
+import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, assertMemorySplitsByOrganization, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, endAnswerOf, withRunHandle, type RunEndAnswer, effectsRanIn, requestRefusal, assertRootThreadId, orgPrefix, withRootScope, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, decideDoorRunAccess, runNotFound, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext, readJsonObject, isRunCursor, pageRunsFromArray, isRunRecorded } from '@gnldev/durable';
 import type { CreateGnlConfig, Journal, JournalReader, BudgetLimit, UsageCostCache, RunLimits, ResolvedWorkIdentity, WorkScopeKind, StreamSurface as DurableStreamSurface, StreamSurfaceInput } from '@gnldev/durable';
-import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, callerKind, subjectIdProblem, actorIdOf, engineCallerOf, markRefusal, settleDecision, decisionNotRecorded, type AuthProvider, type ReadWriteAuth, type Principal, type PrincipalKind, type RefusalReason, refuseMisplacedOptions, doorOptionKeys, printProtections } from '@gnldev/auth';
+import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, callerKind, subjectIdProblem, actorIdOf, engineCallerOf, answererOf, markRefusal, settleDecision, decisionNotRecorded, type AuthProvider, type ReadWriteAuth, type Principal, type PrincipalKind, type RefusalReason, refuseMisplacedOptions, doorOptionKeys, printProtections } from '@gnldev/auth';
 // P0.4 @gnldev/workflow is zero-dependency (see its package.json) — depending on it
 // from @gnldev/server is a clean one-way edge (server→workflow), NOT circular: @gnldev/durable's registry.ts
 // deliberately stays workflow-agnostic (WorkflowLike is a structural type, no import) to avoid a
@@ -15,7 +15,7 @@ import { listWorkflowRuns, getWorkflowRunStatus, cancelWorkflowRun } from '@gnld
 import type { WorkflowRunStatus } from '@gnldev/workflow';
 import { buildOpenApi } from './openapi.js';
 import { EDGE_ERROR_CODES } from './edge-errors.js';
-import { LIMIT_ERROR_CODES, refuseRunLimitNames, refuseBudgetLimitNames } from '@gnldev/durable';
+import { refuseRunLimitNames, refuseBudgetLimitNames } from '@gnldev/durable';
 import { refuseUnknownNames, optionNames } from '@gnldev/options';
 import { pipeAgentStream, sseResponse } from './sse.js';
 import { drainProcess, type DrainOptions } from '@gnldev/durable';
@@ -501,6 +501,40 @@ const LIMIT_MERGE = {
 } as const satisfies Record<keyof RunLimits, 'stricter' | 'server'>;
 const REQUEST_LIMITS = Object.keys(LIMIT_MERGE).filter((k) => LIMIT_MERGE[k as keyof RunLimits] === 'stricter');
 
+/**
+ * Every field a request body may carry, per route — the ONE list. A name outside it is not ignored in
+ * silence: the call still runs (this release warns; a later one may refuse) and the log names the field, so a
+ * misspelled `strcitInput` is seen instead of quietly turning a protection off. Warned once per route and
+ * field, so a client sending the same stray field on every call does not fill the log.
+ */
+const BODY_FIELDS = {
+  run: ['runId', 'workKey', 'prompt', 'messages', 'threadId', 'approvals', 'context', 'limits', 'resourceId', 'strictInput', 'stream'],
+  stream: ['runId', 'workKey', 'prompt', 'messages', 'threadId', 'approvals', 'context', 'limits', 'resourceId', 'strictInput', 'stream', 'lastEventId', 'turnKey'],
+  resume: ['runId', 'approvals', 'limits', 'resourceId'],
+} as const;
+const warnedBodyFields = new Set<string>();
+
+/**
+ * What a request body asks for, read once: the limits (`requestLimits`), `strictInput` (the same run id with
+ * a different input is refused, as the config's `strictInput` does for every call) and `stream`
+ * (`{ reasoning }`, see @gnldev/durable `StreamFeed`), plus the warning for a field nobody reads.
+ */
+function requestBody(route: keyof typeof BODY_FIELDS, body: Record<string, unknown>, server: RunLimits | undefined):
+  { value: RunLimits | undefined; strictInput?: boolean; stream?: { reasoning?: boolean } } | { error: string } {
+  const known: readonly string[] = BODY_FIELDS[route];
+  for (const k of Object.keys(body)) {
+    const id = `${route}:${k}`;
+    if (known.includes(k) || warnedBodyFields.has(id)) continue;
+    warnedBodyFields.add(id);
+    console.warn(`@gnldev/server: the ${route} body has a field '${k}' that nothing reads, so it was ignored. A misspelled option would be ignored the same way. Fields read here: ${known.join(', ')}.`);
+  }
+  const limits = requestLimits(server, body.limits);
+  if ('error' in limits) return limits;
+  if (body.strictInput !== undefined && typeof body.strictInput !== 'boolean') return { error: '`strictInput` must be true or false' };
+  if (body.stream !== undefined && (body.stream === null || typeof body.stream !== 'object' || Array.isArray(body.stream))) return { error: '`stream` must be an object like { reasoning: true }' };
+  return { value: limits.value, ...(body.strictInput !== undefined ? { strictInput: body.strictInput } : {}), ...(body.stream !== undefined ? { stream: body.stream as { reasoning?: boolean } } : {}) };
+}
+
 /** The limits a run gets: the server's, tightened by the request's. A request naming anything else is refused. */
 function requestLimits(server: RunLimits | undefined, client: unknown): { value: RunLimits | undefined } | { error: string } {
   if (client != null) {
@@ -577,135 +611,23 @@ function listAgentMeta(config: CreateGnlConfig, callerOrgId?: string): AgentMeta
  * GET  /openapi.json           generated schema (agent + workflow)
  */
 /**
- * Decision #1: run-limit errors return 422 (Unprocessable Content) with a machine-readable body — the
- * request is valid but couldn't be processed under the given `limits` instruction. NOT 429 (SDKs
- * auto-retry 429, whereas the error is deterministic; Retry-After can't be computed), NOT 402 (402 is
- * specific to ORGANIZATION budget — remediation differs: raise budget ≠ raise limits + resume with the
- * SAME runId). If it doesn't match, returns undefined → the caller falls through to the generic 400 path.
+ * A run's ending as the REST door answers it — rendered from @gnldev/durable#endAnswerOf, THE one mapping
+ * from "how this run ended" to status, code and body (limits 422, caller conflicts 409 / "not your run" 404,
+ * blocked and waiting-for-an-operator runs 409, a canceled run 409 `run_canceled`, request refusals 400/503,
+ * provider failures 429/502/504). This door only writes it. Undefined: an error of the host's own — the
+ * caller falls through to the generic 400.
  */
-function limitErrorResponse(c: Context, e: unknown): Response | undefined {
-  if (e instanceof RunLimitExceededError || (e as any)?.name === 'RunLimitExceededError') {
-    const err = e as RunLimitExceededError;
-    return c.json({ error: err.message, code: LIMIT_ERROR_CODES.runLimitExceeded, detail: err.detail, resumable: true }, 422);
-  }
-  if (e instanceof ToolLoopDetectedError || (e as any)?.name === 'ToolLoopDetectedError') {
-    const err = e as ToolLoopDetectedError;
-    return c.json({ error: err.message, code: LIMIT_ERROR_CODES.toolLoopDetected, detail: err.detail, resumable: true }, 422);
-  }
-  return undefined;
+async function endResponse(c: Context, e: unknown, workKey?: string, run?: { runId: string; journal: Journal }): Promise<Response | undefined> {
+  const raw = endAnswerOf(e, workKey);
+  if (!raw) return undefined;
+  // A provider failure also names the run it ended and whether a tool call of it already completed (one shape, @gnldev/durable `withRunHandle`).
+  return writeEnd(c, run ? await withRunHandle(raw, run.runId, () => effectsRanIn(run.journal, run.runId)) : raw);
 }
 
-/**
- * K1: makes SideEffectRetryBlockedError/RunBusyError/RetryLimitExceededError thrown by runDurable
- * (see errorFromBlocked, run.ts) consistent with the `BLOCKED_CODES` mapping on the SSE path (sse.ts).
- * The code comes from @gnldev/durable#blockedErrorCode (the ONE source of truth, based on err.name); the
- * HTTP status/`resumable` choice is IDENTICAL to the `onError` in examples/app/src/server.ts:
- * side_effect_retry_blocked/run_busy → 409 + resumable:true (resolved via approval/retry);
- * retry_limit_exceeded → 422, NO resumable (a permanent 'failed' is left in the journal, the same runId
- * won't resume). If it doesn't match, returns undefined → the caller falls through to the generic 400
- * path.
- */
-/**
- * The caller re-used a `runId` that belongs to a different conversation.
- *
- * 409 and NOT the generic 400: the request is well-formed and collides with something that already
- * exists, which is what Conflict means; 400 would tell the caller to fix the request when what needs
- * fixing is the id. `resumable` is ABSENT rather than false — the three blocked errors below carry
- * `resumable: true` because the same runId succeeds once the block clears, and this one never will for
- * this thread, so advertising it as retryable would put a client in a loop.
- *
- * Kept out of `blockedErrorCode`'s map for that same reason: those are runs blocked pending a
- * resolution, this is a caller mistake with no resolution path. Without this branch it fell through to
- * the generic 400, which serialises `message` ALONE — measured on both routes: no `code`, and the
- * `detail` naming the two threads was built and then dropped, leaving a consumer to parse the sentence.
- * That is the practice the typed error was added to end.
- */
-function threadMismatchResponse(c: Context, e: unknown, workKey?: string): Response | undefined {
-  if (!(e instanceof RunThreadMismatchError) && (e as { name?: string })?.name !== 'RunThreadMismatchError') return undefined;
-  const err = e as RunThreadMismatchError;
-  // Redacted: see `publicConflictDetail` (durable/errors.ts) for what is withheld and why.
-  return c.json({ error: err.message, code: 'run_thread_mismatch', detail: withWorkKey(publicConflictDetail(err.detail), workKey) }, 409);
-}
-
-/**
- * The caller's own name for the work, put back into the refusal (§8, rules 1-3).
- *
- * FROM THE REQUEST, never from storage. The distinction is the tombstone rule (§10.3): a swept run
- * keeps only a HASH of its workKey, on purpose, so a refusal that read the name back out of the
- * journal would be resurrecting something a deletion was supposed to have removed. Reflecting what
- * the caller just sent gives up nothing — they already know it — and keeps "deleted stays deleted"
- * true while the error still speaks.
- *
- * `detail` and not `error`: the sentence is the single most casually logged field in any HTTP
- * client, and a workKey is a business name ("the invoice being issued", "device 7742"). Rule 1 keeps
- * it out of the prose; rule 2 puts it where a program looks.
- *
- * A non-object `detail` is replaced rather than merged — there is nothing to merge into, and losing
- * a bare string here has no consumer: every typed error in the family carries an object.
- */
-function withWorkKey(detail: unknown, workKey?: string): unknown {
-  if (workKey === undefined) return detail;
-  return detail && typeof detail === 'object' ? { ...(detail as Record<string, unknown>), workKey } : { workKey };
-}
-
-/**
- * FAZ-4 caller-conflict family — same 409-without-resumable contract as threadMismatchResponse
- * above (the id/content/actor is what needs fixing, not the request shape; none clears on retry).
- */
-function callerConflictResponse(c: Context, e: unknown, workKey?: string): Response | undefined {
-  // K9: the code map is durable's CALLER_CONFLICT_CODES export — one source, three consumers
-  // (server, chat-adapter, agui); a literal copy per consumer is exactly the drift that left one
-  // route unmapped. threadMismatchResponse still answers first in every chain, so its entry here is
-  // unreachable duplication, kept for consumers that skip the dedicated renderer.
-  // The status and body are durable's: a "not your run" refusal is answered exactly as an absent run
-  // (`runNotFound`), every other member as its 409 with the caller's own name for the work put back.
-  const a = callerConflictAnswer(e, workKey);
-  if (!a) return undefined;
+function writeEnd(c: Context, a: RunEndAnswer): Response {
   // The engine's ownership refusal is a refusal, whatever status carries it (see onDecision).
   if (a.ownership) markRefusal(c.req.raw, 'ownership', { detail: a.code });
-  return c.json(a.body, a.status as 409);
-}
-
-function blockedErrorResponse(c: Context, e: unknown): Response | undefined {
-  const code = blockedErrorCode(e);
-  if (!code) return undefined;
-  const err = e as { message?: string; detail?: unknown } | null | undefined;
-  const body = { error: err?.message ?? String(e), code, detail: err?.detail };
-  const res = code === 'retry_limit_exceeded' ? c.json(body, 422) : c.json({ ...body, resumable: true }, 409);
-  // The docs promise Retry-After on run_busy ("the same request is correct; it is only early") —
-  // same fixed delay chat-route stamps; the lock heartbeat makes any small number honest.
-  if (code === 'run_busy') res.headers.set('Retry-After', '5');
-  return res;
-}
-
-/**
- * A failure that came from the model provider, answered as one.
- *
- * Without this the provider's failure fell through to the generic 400 — measured, a free endpoint
- * answering 429 reached the caller as `400 "Failed after 3 attempts. Last error: Too Many Requests"`,
- * which tells a retrying client to stop retrying at the exact moment it should wait. The status
- * choices and their reasoning live in @gnldev/durable#upstreamFailure; this only renders them, plus
- * `Retry-After` when the upstream named a delay.
- */
-/** A reserved-id refusal (`ReservedThreadIdError`), as every door answers it — see @gnldev/durable#requestRefusal. */
-function reservedIdResponse(c: Context, e: unknown): Response | undefined {
-  const f = requestRefusal(e);
-  return f ? c.json(f.body, f.status, f.headers) : undefined;
-}
-
-function upstreamErrorResponse(c: Context, e: unknown): Response | undefined {
-  const up = upstreamFailure(e);
-  if (!up) return undefined;
-  const err = e as { message?: string } | null | undefined;
-  const body = {
-    error: err?.message ?? String(e),
-    code: up.code,
-    ...(up.upstreamStatus !== undefined ? { upstreamStatus: up.upstreamStatus } : {}),
-    ...(up.retryAfter !== undefined ? { retryAfter: up.retryAfter } : {}),
-  };
-  const res = c.json(body, up.status);
-  if (up.retryAfter !== undefined) res.headers.set('Retry-After', String(up.retryAfter));
-  return res;
+  return c.json(a.body, a.status as 409, a.headers);
 }
 
 function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
@@ -717,32 +639,34 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
   // so GET /runs?limit= died on `all.filter is not a function` and the bare GET /runs returned a page
   // Object where its documented contract promises an array. asReaderJournal presents one shape for both.
   const baseJournal = (config.storage ? toJournal(config.storage.runs) : asReaderJournal(config.journal as object)) as Journal & JournalReader;
-  // A conversation store handed over as an OBJECT has no organization boundary, and this host had no
-  // guard for it. Refused at setup rather than at the first leak.
-  //
-  // `orgInstance` below builds a per-organization registry with `{ ...config, journal: scoped }` — but
-  // the spread carried `config.memory` through untouched, and `createGnl` resolves memory as
-  // `config.memory ?? memoryFactory(...)` (registry.ts), so the object won and the factory was never
-  // called. Every organization therefore shared ONE `Memory`: threads, messages, working memory and
-  // observations are keyed by a caller-chosen `threadId` alone, so naming another organization's thread was
-  // enough to read it. Studio refuses exactly this shape and says so at boot; this host served it.
-  //
-  // `memory: false` stays valid — that is the host saying "no conversation store", which needs no
-  // boundary. A factory is fine: it is called per organization with that organization's journal.
-  if (opts.org && config.memory) { // `false` is falsy here — an explicit "no store" needs no boundary
-    throw new Error(
-      'createRestApi: `memory` was passed as an object while `org` is configured. That object owns its ' +
-      'own store and cannot be given an organization boundary, so every organization would share one ' +
-      'set of threads. Pass `memoryFactory` instead — it is called per organization with that ' +
-      "organization's journal — or set `memory: false`.",
-    );
-  }
+  // A conversation store handed over as an OBJECT is split per organization, or refused, by ONE rule in
+  // @gnldev/durable (`scopeConfigToOrg` → `memoryForOrganization`): an AgentMemory is rebuilt over each
+  // organization's partition; an object that cannot be split is a `MemoryNotSplittableError`. With `org`
+  // configured this host KNOWS it serves organizations, so it asks that rule now rather than at the first
+  // organization's request. An organization learnt only from a credential (`roleAuth` `orgId`) cannot
+  // be known here: that request gets the same error, rendered as a 500 by `app.onError` below.
+  if (opts.org) assertMemorySplitsByOrganization(config);
   // The ROOT scope reads through `withRootScope`: every organization's runs are hidden from it (ADR-0001),
   // as its memory store already hides their threads. Platform-level records keep `baseJournal`, raw.
   const defaultInstance = { gnl: createGnl(config), journal: withRootScope(baseJournal), orgId: undefined as string | undefined };
   const names = Object.keys(config.agents ?? {});
   const workflowNames = Object.keys(config.workflows ?? {});
   const app = new Hono();
+  // A refusal the engine names that escapes a route — today a conversation store that cannot be split
+  // for the organization this request was bound to (`MemoryNotSplittableError`, thrown by
+  // `scopeConfigToOrg`) — answered as every door answers it (@gnldev/durable `requestRefusal`: status,
+  // code, the sentence that names the fix). Anything else keeps Hono's own answer.
+  app.onError((e, c) => {
+    const refused = requestRefusal(e);
+    if (refused) return c.json(refused.body, refused.status, refused.headers);
+    // Hono's default handler, unchanged for everything else.
+    if ('getResponse' in e) {
+      const res = (e as { getResponse: () => Response }).getResponse();
+      return c.newResponse(res.body, res);
+    }
+    console.error(e);
+    return c.text('Internal Server Error', 500);
+  });
 
   /**
    * Agent approval registry: every `config.agents` entry is recorded into `baseJournal` ONCE at
@@ -790,10 +714,23 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
   // to print `✓ bound via the authenticated principal` for that deployment — the claim measured false,
   // on the shape the scaffold itself writes. `gnl doctor` and `gnl dev` read the config's credentials
   // and can answer it; this surface cannot, so it says `unknown` and names where the answer lives.
+  // END USERS CAN START REGISTERED WORK. `workflow:run` / `agents:run` are one permission each and cover EVERY
+  // registered workflow and agent, so an end user holding their own credential can start the back-office one
+  // too (a monthly billing run, an admin agent). 0.17.1 does not change that; it says so, once per built API,
+  // and independently of the protections banner (a deployment that silences the banner is not unwarned).
+  // The way out today is `resourceAuth`; a per-definition `access` field is planned for 0.18.
+  if (authProvider?.capabilities?.().endUsers === true && (names.length > 0 || workflowNames.length > 0)) {
+    const kinds = [workflowNames.length > 0 ? 'workflow' : '', names.length > 0 ? 'agent' : ''].filter(Boolean).join(' and ');
+    console.warn(`@gnldev/server: end users hold their own credential here, and they can start EVERY registered ${kinds} (${[...workflowNames, ...names].join(', ')}) — including back-office ones; restrict it per ${kinds} with \`resourceAuth\`.`);
+  }
+
   if (opts.protectionsBanner !== false) printProtections(
     formatProtections(
       describeProtections(config, {
         surface: 'createRestApi',
+        // Whether a request can arrive as an organization's: configured (`org`), or possible through an
+        // identity the provider may bind to one (`roleAuth` `orgId` — invisible from here).
+        organizations: opts.org ? true : authProvider && authProvider.bindsIdentity !== false ? 'possible' : false,
         identity: authProvider
           ? {
               bound: 'unknown',
@@ -891,17 +828,14 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     let inst = orgs.get(id);
     if (inst) orgs.delete(id); // re-inserted below, moving it to the most-recently-used end
     if (!inst) {
-      // `memory` is dropped explicitly, not left to the spread. The guard at construction already
-      // refuses an object here, so this only removes a value that cannot exist — but stating it means
-      // the next field added to `CreateGnlConfig` cannot silently ride the spread into every
-      // organization the way this one did. `memoryFactory` receives the scoped source, so each
-      // organization gets its own store over its own keys.
-      const { memory: _sharedMemory, ...perOrg } = config;
       // Storage: all six ports via `withOrgStorage` (a `Storage` has six, and an earlier version kept
       // one — every organization's threads, corpus, queue, cache and metadata then shared keys);
-      // journal-only: `withOrg`. Built in @gnldev/durable (`scopeConfigToOrg`) so the chat and AG-UI
-      // routes and @gnldev/mcp scope an organization's work the same way.
-      const scopedOrg = scopeConfigToOrg(perOrg, id);
+      // journal-only: `withOrg`. A `memory` object is split for the organization or refused there
+      // (`MemoryNotSplittableError`) — never carried through the spread, never dropped in silence (this
+      // line used to strip it, which is how a `roleAuth` `orgId` deployment ran with memory quietly off).
+      // Built in @gnldev/durable (`scopeConfigToOrg`) so the chat, AG-UI and A2A doors scope an
+      // organization's work the same way.
+      const scopedOrg = scopeConfigToOrg(config, id);
       inst = { gnl: createGnl(scopedOrg.config), journal: scopedOrg.journal, orgId: id };
     }
     orgs.set(id, inst);
@@ -1023,8 +957,8 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       assertRootThreadId(threadId);
       return undefined;
     } catch (e) {
-      const r = reservedIdResponse(c, e);
-      if (r) return r;
+      const a = endAnswerOf(e);
+      if (a) return writeEnd(c, a);
       throw e;
     }
   }
@@ -1093,6 +1027,15 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     const p = principalFor(c);
     const name = typeof named === 'string' && named !== '' ? named : undefined;
     return engineCallerOf(p, name);
+  }
+  /**
+   * WHO answers the `approvals` this request carries — through the one mapping every door uses, @gnldev/auth
+   * `answererOf`, beside `callerOf`: `callerOf` is whose RUN it is (a staff member resuming Ayşe's run is
+   * Ayşe's), this is who is clicking. A door never decides what an answerer may answer; the engine does.
+   */
+  function answererOfRequest(c: Context) {
+    const a = answererOf(principalFor(c));
+    return a ? { answerer: a } : {};
   }
   /** The user a read names: its own for a subject, `?resourceId=` for anyone else. */
   const namedOnRead = (c: Context): string | undefined => c.req.query('resourceId') || undefined;
@@ -1307,6 +1250,10 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     try {
       return orgInstance(id);
     } catch (e: any) {
+      // A refusal the engine names (a conversation store that cannot be split by organization) is the
+      // deployment's fault, not the caller's: it goes to `app.onError`, which answers it as every door
+      // does (`requestRefusal`). What remains is an organization id that cannot be one — the caller's.
+      if (requestRefusal(e)) throw e;
       return { error: String(e?.message ?? e), status: 400 };
     }
   }
@@ -1516,7 +1463,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     const body = parsed.body as any;
     adoptIdempotencyKey(c, body);
     if (!body.runId && !body.workKey) return c.json({ error: NO_IDENTITY }, 400);
-    const limits = requestLimits(opts.limits, body.limits);
+    const limits = requestBody('run', body, opts.limits);
     if ('error' in limits) return c.json({ error: limits.error }, 400);
     const s = await scope(c);
     if ('error' in s) return c.json({ error: s.error }, s.status);
@@ -1583,6 +1530,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
         messages: body.messages,
         threadId: body.threadId,
         approvals: body.approvals,
+        ...answererOfRequest(c),
         context: sealFor(
           // Not merged here, because sealRequestContext writes `org` itself from the server-derived
           // value. This is a simplification, NOT a fix: measured over 21 body shapes × 4 server states
@@ -1595,6 +1543,8 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
           s.orgId ?? principal?.orgId,
         ),
         limits: limits.value,
+        ...(limits.strictInput !== undefined ? { strictInput: limits.strictInput } : {}),
+        ...(limits.stream ? { stream: limits.stream } : {}),
         // The run executes apart from this request (@gnldev/durable, design decision D2): a client that
         // disconnects leaves it running, and its answer is there when it comes back. The request's own
         // signal is therefore NOT wired here — an abort would be a cancellation. Only an explicit cancel
@@ -1618,8 +1568,8 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       // The correlation handle rides on refusals too: a caller who named work and got a 409 has no
       // other way to learn which run it collided with. Not on `run_not_found`: there is no run to
       // correlate, and the gate's answer for the same case carries none.
-      const res = limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400);
-      return callerConflictAnswer(e)?.hidden ? res : stampRunHeaders(res, runId);
+      const res = await endResponse(c, e, declared, { runId, journal: rawOf(s).journal as Journal }) ?? c.json({ error: String(e?.message ?? e) }, 400);
+      return endAnswerOf(e)?.hidden ? res : stampRunHeaders(res, runId);
     }
   });
 
@@ -1630,7 +1580,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     if ('denied' in parsed) return parsed.denied;
     const body = parsed.body as any;
     if (!body.runId) return c.json({ error: 'runId required' }, 400);
-    const limits = requestLimits(opts.limits, body.limits);
+    const limits = requestBody('resume', body, opts.limits);
     if ('error' in limits) return c.json({ error: limits.error }, 400);
     const s = await scope(c);
     if ('error' in s) return c.json({ error: s.error }, s.status);
@@ -1680,6 +1630,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       const r = await s.gnl.run(name, {
         runId: body.runId,
         approvals: body.approvals,
+        ...answererOfRequest(c),
         // Sealed like run and stream. This path built the context by hand and therefore carried
         // neither `__gnl_resourceId` nor `__gnl_threadId`, so a dynamic `system`/`model`/`tools`
         // function saw an identity on a fresh run and none on the resume of that same run — the two
@@ -1710,7 +1661,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       // wants to badge it should not have to infer it from prose. Additive; absent on fresh work.
       return c.json({ ok: true, runId: body.runId, text: r.text, interrupts: r.interrupts, finishReason: r.finishReason, ...((r as { replayedToolCalls?: unknown[] }).replayedToolCalls?.length ? { replayedToolCalls: (r as { replayedToolCalls?: unknown[] }).replayedToolCalls } : {}) });
     } catch (e: any) {
-      return limitErrorResponse(c, e) ?? threadMismatchResponse(c, e) ?? callerConflictResponse(c, e) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400);
+      return await endResponse(c, e, undefined, { runId: String(body.runId), journal: rawOf(s).journal as Journal }) ?? c.json({ error: String(e?.message ?? e) }, 400);
     }
   });
 
@@ -1882,7 +1833,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     try {
       followed = await s.gnl.follow(runId, after !== undefined ? { after } : {});
     } catch (e) {
-      const r = reservedIdResponse(c, e);
+      const r = await endResponse(c, e);
       if (r) return r;
       throw e;
     }
@@ -1924,7 +1875,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
   ): Promise<Response> {
     adoptIdempotencyKey(c, body);
     if (!body.runId && !body.workKey && !body.turnKey) return c.json({ error: NO_IDENTITY }, 400);
-    const limits = requestLimits(opts.limits, body.limits);
+    const limits = requestBody('stream', body, opts.limits);
     if ('error' in limits) return c.json({ error: limits.error }, 400);
     const s = await scope(c);
     if ('error' in s) return c.json({ error: s.error }, s.status);
@@ -1990,6 +1941,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
         messages: body.messages,
         threadId: body.threadId,
         approvals: body.approvals,
+        ...answererOfRequest(c),
         context: sealFor(
           // Not merged here, because sealRequestContext writes `org` itself from the server-derived
           // value. This is a simplification, NOT a fix: measured over 21 body shapes × 4 server states
@@ -2002,14 +1954,16 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
           s.orgId ?? principal?.orgId,
         ),
         limits: limits.value,
+        ...(limits.strictInput !== undefined ? { strictInput: limits.strictInput } : {}),
+        ...(limits.stream ? { stream: limits.stream } : {}),
         // Same as /agents/:name/run: a disconnect ends this response's reading, not the run; only an
         // explicit cancel stops it. A reconnecting client sends its cursor and reads on from it.
         ...(cursorOf(c, body) !== undefined ? { after: cursorOf(c, body) } : {}),
       });
     } catch (e: any) {
       // As on `/run`: `run_not_found` names no run, so it carries no correlation header.
-      const res = limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400);
-      return callerConflictAnswer(e)?.hidden ? res : stampRunHeaders(res, runId);
+      const res = await endResponse(c, e, declared, { runId, journal: rawOf(s).journal as Journal }) ?? c.json({ error: String(e?.message ?? e) }, 400);
+      return endAnswerOf(e)?.hidden ? res : stampRunHeaders(res, runId);
     }
     // `__gnlPriorRun` is streamDurable's own answer to the replay question (run.ts), so the streamed
     // path uses it rather than the pre-read: same question, asked by the code that already knows.
@@ -2143,8 +2097,8 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       const effective = (result as { runId?: string }).runId ?? runId;
       return effective ? stampRunHeaders(res, effective) : res;
     } catch (e: any) {
-      const res = limitErrorResponse(c, e) ?? threadMismatchResponse(c, e, declared) ?? callerConflictResponse(c, e, declared) ?? blockedErrorResponse(c, e) ?? reservedIdResponse(c, e) ?? upstreamErrorResponse(c, e) ?? c.json({ error: String(e?.message ?? e) }, 400);
-      return runId && !callerConflictAnswer(e)?.hidden ? stampRunHeaders(res, runId) : res;
+      const res = await endResponse(c, e, declared) ?? c.json({ error: String(e?.message ?? e) }, 400);
+      return runId && !endAnswerOf(e)?.hidden ? stampRunHeaders(res, runId) : res;
     } finally {
       if (wfKey) unregisterInflight(wfKey, ctrl);
     }
@@ -2509,6 +2463,10 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     if (!viewSubjectOf(c) && (await runDecision(c, s, runId)) === 'deny') return notFound();
     const entries = await s.journal.readRun(runId);
     if (entries.length) return c.json(entries);
+    // A run recorded WITHOUT steps (its first model call was refused) is listed by GET /runs, so it opens:
+    // an empty list is its truthful journal. (A subject's view hides records that are not theirs, so this
+    // read is the same ownership answer as above.)
+    if (await isRunRecorded(s.journal, runId)) return c.json([]);
     // The view hid it, or there is nothing: the caller gets the same 404, and the record asks the raw
     // run which one it was (runAccess records a `deny` as the ownership refusal it is).
     if (viewSubjectOf(c)) await runDecision(c, s, runId);
@@ -2530,7 +2488,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     const s = await scope(c);
     if ('error' in s) return c.json({ error: s.error }, s.status);
     const visible = names.filter((n) => agentVisibleToOrg(config.agents?.[n] ?? {}, s.orgId));
-    return c.json(buildOpenApi(visible, workflowNames, opts.title));
+    return c.json(buildOpenApi(visible, workflowNames, opts.title, (opts.surfaces ?? []).map((surface) => surface.path)));
   });
 
   return app;

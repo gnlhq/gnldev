@@ -18,6 +18,7 @@ import {
   RunBusyError,
 } from '../src/index.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
+import { mintCallId } from '../src/call-identity.js';
 import { claimRunOwner, UNKNOWN as NOBODY } from '../src/run-identity.js';
 
 const STALE_MS = 60_000; // above CLAIM_TTL_MS (30s) — definitely stale
@@ -45,7 +46,7 @@ describe('K1 — blocked sentinel: the model cannot bypass the protection', () =
   it('stale running + stubborn model: the loop STOPS, call-2 is never produced, a typed error is thrown', async () => {
     const journal = new InMemoryJournal();
     let charges = 1; // the card was charged BEFORE the crash (the essence of the window)
-    await crashWindow(journal, 'k1', 'call-1');
+    await crashWindow(journal, 'k1', mintCallId('call-1', 'k1', 0, 0));
     const gen = { calls: 0 };
 
     await expect(
@@ -63,14 +64,14 @@ describe('K1 — blocked sentinel: the model cannot bypass the protection', () =
     expect(charges).toBe(1); // ✅ NO double charge — the promise itself
     expect(gen.calls).toBe(1); // the model never made it to the SECOND turn (composeStopWhen stopped it)
     // the bypass key never came into existence: there's neither a record nor a claim for call-2
-    expect(await journal.get(runKeys.tool('k1', 'call-2'))).toBeUndefined();
+    expect(await journal.get(runKeys.tool('k1', mintCallId('call-2', 'k1', 1, 0)))).toBeUndefined();
   });
 
   it('failed record (side-effecting, unapproved): runDurable throws SideEffectRetryBlockedError', async () => {
     const journal = new InMemoryJournal();
     let charges = 0;
     await claimRunOwner(journal, 'k2', NOBODY);
-    await journal.put(runKeys.tool('k2', 'call-1'), { status: 'failed', error: 'timeout', attempts: 1 });
+    await journal.put(runKeys.tool('k2', mintCallId('call-1', 'k2', 0, 0)), { status: 'failed', error: 'timeout', attempts: 1 });
     const gen = { calls: 0 };
 
     await expect(
@@ -91,7 +92,7 @@ describe('K1 — blocked sentinel: the model cannot bypass the protection', () =
   it('idempotent tool with maxRetries exhausted: throws with type RetryLimitExceededError', async () => {
     const journal = new InMemoryJournal();
     await claimRunOwner(journal, 'k3', NOBODY);
-    await journal.put(runKeys.tool('k3', 'call-1'), { status: 'failed', error: 'boom', attempts: 3 });
+    await journal.put(runKeys.tool('k3', mintCallId('call-1', 'k3', 0, 0)), { status: 'failed', error: 'boom', attempts: 3 });
     const gen = { calls: 0 };
 
     await expect(
@@ -112,7 +113,7 @@ describe('K1 — blocked sentinel: the model cannot bypass the protection', () =
     const journal = new InMemoryJournal();
     let charges = 0;
     await claimRunOwner(journal, 'k4', NOBODY);
-    await journal.put(runKeys.tool('k4', 'call-1'), { status: 'running', startedAt: Date.now() });
+    await journal.put(runKeys.tool('k4', mintCallId('call-1', 'k4', 0, 0)), { status: 'running', startedAt: Date.now() });
     const gen = { calls: 0 };
 
     await expect(
@@ -133,7 +134,7 @@ describe('K1 — blocked sentinel: the model cannot bypass the protection', () =
   it('resume with approvals flows AS BEFORE: deliberate re-run + final answer', async () => {
     const journal = new InMemoryJournal();
     let charges = 1;
-    await crashWindow(journal, 'k5', 'call-1');
+    await crashWindow(journal, 'k5', mintCallId('call-1', 'k5', 0, 0));
     const gen = { calls: 0 };
     const model = createMockModel(async ({ prompt }: any) => {
       gen.calls++;
@@ -146,7 +147,7 @@ describe('K1 — blocked sentinel: the model cannot bypass the protection', () =
       journal,
       runId: 'k5',
       prompt: 'issue a refund',
-      approvals: { 'call-1': true },
+      approvals: { [mintCallId('call-1', 'k5', 0, 0)]: true },
       tools: {
         chargeCard: { execute: async () => { charges++; return { charged: 20 }; } } as any,
       },

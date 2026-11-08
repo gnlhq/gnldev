@@ -135,9 +135,6 @@ export interface Recipe {
    * and that nothing ever created, so the exception described a file that never existed.
    */
   env?: string[];
-  /** When the wired field lives on the dev-server config (GnlDevConfig) rather than CreateGnlConfig,
-   *  the generated `satisfies` clause must be widened with this type literal (e.g. auth). */
-  configTypeExt?: string;
 }
 
 /**
@@ -360,9 +357,6 @@ export const auth: { admin?: Cred; viewer?: Cred } = {
       place: 'configField',
       code: 'auth',
     },
-    // The real type, not a copy of its shape: the copy had admin and viewer only, so the `endUsers` block
-    // src/identity.ts tells you to paste landed as TS2353. A class added to the CLI widens this with it.
-    configTypeExt: "{ auth?: import('@gnldev/cli').GnlDevConfig['auth'] }",
     humanWire: `import { auth } from './src/auth.js';
 // …then add to the config object (top level):
   auth,   // { admin: { token }, viewer: { token } } — omit to keep the API open`,
@@ -391,12 +385,15 @@ import config from '../../gnl.config.js';
 const gnl = createGnl(config);
 const journal = config.storage!.runs;
 
-// REGISTERING IS IDEMPOTENT: the same id updates the definition instead of adding a second trigger,
-// so this file can run on every deploy. \`name\` is a workflow in gnl.config.ts (\`gnl add workflow\`).
+// RE-REGISTERING IS SAFE: the same id with the same definition does nothing, so this file can run on
+// every deploy. \`ifExists: 'replace'\` makes a CHANGED definition (say, a new cron) take effect on the
+// next deploy; without it the library refuses and the boot stops with "already scheduled with a
+// different spec". \`name\` is a workflow in gnl.config.ts (\`gnl add workflow\`).
 await scheduleWorkflow(journal, {
   id: 'nightly-report',
   cron: '0 3 * * *',        // 5-field cron, UTC, minute resolution
   name: 'checkout',         // ← the workflow to run
+  ifExists: 'replace',      // a changed cron/name above is applied on deploy (library default: 'refuse')
   // every: 60 * 60_000,    // …or an interval, in ms
   // at: Date.now() + 60_000, // …or a one-shot
 });
@@ -506,7 +503,6 @@ export const chat = chatSurface(); // POST /agents/:name/chat
       place: 'configField',
       code: 'surfaces: [chat]',
     },
-    configTypeExt: "{ surfaces?: import('@gnldev/cli').GnlDevConfig['surfaces'] }",
     humanWire: `Pass it to the REST API as a surface:
   import { chat } from './routes/chat.js';
   createRestApi(config, { auth, surfaces: [chat] })

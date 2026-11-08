@@ -86,7 +86,7 @@
 //    regenerates the same toolCallId) — no approval is REQUIRED (DIFFERENT from guard's require-approval).
 import { runRecordPrefix, composeRunId } from './run-id-grammar.js';
 import { claim, runKeys, nestedAgentRunId, executedHere } from './journal.js';
-import { usageAndCostFromModelValue, type RunCostOptions } from './cost.js';
+import { usageAndCostFromModelValue, modelRecordFacts, type RunCostOptions } from './cost.js';
 import { effectivePricingTable } from './pricing.js';
 import type { Journal, JournalReader, ToolJournalRecord } from './journal.js';
 import type { SemanticDupConfig } from './semantic-dup.js';
@@ -298,14 +298,18 @@ export interface RunLimits {
    *    repeats the injected instruction after one warning — use 'block'/'suspend' when that is the risk.
    * `'block'`: stop via the TaintedSideEffectError sentinel.
    * `'suspend'` (default): standard approvals flow — a human decides (sees the taint source in the reason);
-   *    an approval for that toolCallId executes it exactly once.
+   *    an approval for that toolCallId executes it exactly once. It is an APPROVE question (permission): only
+   *    an authorised person's yes runs it, because the requester may be the one who planted the content.
+   *    `'approve'` is the same rung under the name the guards use.
+   * `'confirm'`: the same question put as CONSENT — the requester answers it too (a deliberate opt-in, for an
+   *    agent whose users are trusted with what they read).
    *
    * HONEST BOUNDS: (1) conservative over-approximation = friction — the default 'suspend' asks a
    * person; a deployment where that friction costs more than the risk relaxes to 'warn'; (2) the APPROVER judges the action's CONTENT (an approved
    * transfer to an attacker's IBAN is still an approved transfer — the runtime surfaces provenance,
    * a human owns the judgment); (3) taint is monotonic per run, by design.
    */
-  taintedSideEffects?: 'off' | 'warn' | 'reflect' | 'block' | 'suspend';
+  taintedSideEffects?: 'off' | 'warn' | 'reflect' | 'block' | 'suspend' | 'approve' | 'confirm';
   /**
    * (opt-in, DEFAULT `'run'`): how far a taint mark REACHES. `'run'` (or unset) is exactly
    * today's behavior — taint lives and dies with the runId. `'thread'` additionally propagates it
@@ -717,14 +721,32 @@ async function writeChainCas(
 }
 
 /** Adds a model-step record to the counter DELTA (O(1), the pricing logic is SHARED with cost.ts). */
-function applyModelStepDelta(delta: LimitCounters, value: unknown, opts: RunCostOptions, unpriced?: Set<string>): void {
+function applyModelStepDelta(delta: LimitCounters, value: unknown, opts: RunCostOptions, unpriced?: Set<string>, noUsage?: Set<string>): void {
   const u = usageAndCostFromModelValue(value, opts);
   if (u) {
     delta.totalTokens += u.totalTokens;
     delta.costUsd += u.costUsd;
-    if (!u.priced) unpriced?.add(u.modelId);
+    // A step that reported nothing is not an 'unpriced' one: a price would not change it (see noteNoUsage).
+    if (!u.priced && usageReported(u)) unpriced?.add(u.modelId);
   }
+  noteNoUsage(value, u, noUsage);
   delta.modelStepsSeen++;
+}
+
+/**
+ * A model step whose provider reported NO token usage (no `usage` at all, or one whose counts are all
+ * empty — what an upstream that omits it hands over). Such a step adds 0 tokens and $0 whatever it
+ * really cost, so `maxTokens` and `maxCostUsd` read green precisely when they are doing nothing — and
+ * a price table does not change that (it multiplies the tokens that were never reported).
+ */
+function usageReported(u: { totalTokens: number; inputTokens: number; outputTokens: number } | undefined): boolean {
+  return !!u && (u.totalTokens > 0 || u.inputTokens > 0 || u.outputTokens > 0);
+}
+function noteNoUsage(value: unknown, u: { totalTokens: number; inputTokens: number; outputTokens: number; modelId: string } | undefined, noUsage?: Set<string>): void {
+  if (!noUsage) return;
+  if (usageReported(u)) return;
+  const f = modelRecordFacts(value);
+  noUsage.add(u?.modelId ?? f.modelId ?? f.configuredModelId ?? 'unknown');
 }
 
 /**
@@ -783,6 +805,7 @@ async function seedFromHistory(
   runId: string,
   opts: RunCostOptions,
   unpriced?: Set<string>,
+  noUsage?: Set<string>,
 ): Promise<{ counters: LimitCounters; chain: LimitChain }> {
   const entries = await reader.readRun(runId);
   const counters = emptyCounters();
@@ -790,7 +813,7 @@ async function seedFromHistory(
   const prefix = runRecordPrefix(runId, 'tool');
   for (const e of entries) {
     if (e.kind === 'model') {
-      applyModelStepDelta(counters, e.value, opts, unpriced);
+      applyModelStepDelta(counters, e.value, opts, unpriced, noUsage);
       continue;
     }
     if (e.kind !== 'tool') continue;
@@ -894,10 +917,11 @@ async function ensureSeeded(
   opts: RunCostOptions,
   unpriced?: Set<string>,
   requestRunId?: string,
+  noUsage?: Set<string>,
 ): Promise<boolean> {
   if ((await readChain(store, runId)) !== undefined) return false; // already seeded
   if (typeof reader.readRun !== 'function') return false; // fail-open
-  const seeded = await seedFromHistory(reader, runId, opts, unpriced);
+  const seeded = await seedFromHistory(reader, runId, opts, unpriced, noUsage);
   const key = chainKey(runId);
   const won = await store.putIfAbsent(key, seeded.chain);
   if (!won) return false; // another call already seeded it — fall through to the normal increment path
@@ -1016,6 +1040,7 @@ async function computeModelStepsDelta(
   opts: RunCostOptions,
   /** Model ids this delta could not price — collected so the caller can refuse to claim a $ ceiling. */
   unpriced: Set<string> = new Set(),
+  noUsage?: Set<string>,
 ): Promise<Partial<LimitCounters> | undefined> {
   if (typeof store.get !== 'function') return undefined;
   let seen = modelStepsSeen;
@@ -1029,8 +1054,9 @@ async function computeModelStepsDelta(
     if (u) {
       totalTokens += u.totalTokens;
       costUsd += u.costUsd;
-      if (!u.priced) unpriced.add(u.modelId);
+      if (!u.priced && usageReported(u)) unpriced.add(u.modelId);
     }
+    noteNoUsage(rec, u, noUsage);
     seen++;
     stepsAdded++;
   }
@@ -1062,6 +1088,8 @@ function unenforceableProtections(limits: RunLimits): string[] {
 // C4: warn ONCE per store (same pattern as journal.ts's claimFallbackWarned) — a fail-open on a
 // readRun-less journal must be LOUD but not spam every step/tool call.
 const limitsFailOpenWarned = new WeakSet<object>();
+/** Once per store, like the warnings above: a run makes many steps and each would repeat the line. */
+const usageMissingWarned = new WeakSet<object>();
 
 /**
  * C4 enforcement-point guard: called where a limit CANNOT be enforced because the journal lacks
@@ -1116,9 +1144,10 @@ export async function enforceStepLimits(
   if (!opts.pricing) opts = { ...opts, pricing: await effectivePricingTable(reader as never) };
 
   const unpriced = new Set<string>();
-  await ensureSeeded(reader, store, runId, opts, unpriced, requestRunId); // seeds with a SINGLE readRun on first encounter (no-op afterward)
+  const noUsage = new Set<string>();
+  await ensureSeeded(reader, store, runId, opts, unpriced, requestRunId, noUsage); // seeds with a SINGLE readRun on first encounter (no-op afterward)
   let counters = (await readCounters(store, runId)) ?? emptyCounters();
-  const delta = await computeModelStepsDelta(store, runId, counters.modelStepsSeen, opts, unpriced); // O(1) targeted get — no readRun
+  const delta = await computeModelStepsDelta(store, runId, counters.modelStepsSeen, opts, unpriced, noUsage); // O(1) targeted get — no readRun
   if (delta) {
     await incrCounters(store, runId, delta, requestRunId);
     counters = {
@@ -1143,6 +1172,29 @@ export async function enforceStepLimits(
   // because nothing could price them, so `costUsd > maxCostUsd` stays false no matter how much the
   // run actually spends -- the guard reads as green precisely when it is doing nothing. Same shape
   // as the readRun-less case above, so it takes the same route: loud under `strict`, warn otherwise.
+  // The other way a ceiling does nothing, and the one a price table cannot fix: the provider never said
+  // how much a step used. Measured on NVIDIA (`usage` empty on the response): neither ceiling can fire.
+  if (noUsage.size > 0) {
+    const which = [limits.maxTokens != null ? 'maxTokens' : '', limits.maxCostUsd != null ? 'maxCostUsd' : ''].filter(Boolean).join(' and ');
+    const names = [...noUsage].join(', ');
+    if (limits.strict) {
+      throw new Error(
+        `@gnldev/durable: run '${runId}' sets ${which}, but ${names} reported no token usage — ` +
+          'there is nothing to count, so the ceiling CANNOT be enforced (adding a price does not help). ' +
+          'Use a provider/setting that returns usage (for a streamed OpenAI-compatible endpoint: ' +
+          '`createOpenAICompatible({ includeUsage: true })`), or remove `strict` to fail open with a warning.',
+      );
+    }
+    if (!usageMissingWarned.has(store)) {
+      usageMissingWarned.add(store);
+      console.warn(
+        `@gnldev/durable: ${which} is set but ${names} reported no token usage — there is nothing to ` +
+          'count, so the ceiling is NOT capping this run (a pricing entry would not change that: the ' +
+          'provider must report usage; for a streamed OpenAI-compatible endpoint, ' +
+          '`createOpenAICompatible({ includeUsage: true })`). Set `limits.strict: true` to fail loudly instead.',
+      );
+    }
+  }
   if (limits.maxCostUsd != null && unpriced.size > 0) {
     const names = [...unpriced].join(', ');
     if (limits.strict) {

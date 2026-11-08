@@ -4,6 +4,7 @@
 import type { Guard } from './guard.js';
 import type { RunLimits, ToolSeat } from './limits.js';
 import type { Processor } from './processor.js';
+import type { RunJournal } from './storage.js';
 import { stableStringify } from './hash.js';
 import { copyValue } from './serialize.js';
 import { pageRunsFromArray, compareRunKey, decodeChangeCursor, encodeChangeCursor, type RunOrder } from './run-cursor.js';
@@ -11,6 +12,14 @@ import { isVersionedKey, upgradeFormat } from './format.js';
 import { runRecordKey, RECORD_KEY_RE, REPLAYED_SEGMENT_RE, leafSuffix, composeRunId, RUN_KEYED_FAMILIES } from './run-id-grammar.js';
 import { PROCESS_LOCAL } from './process-liveness.js';
 import { withBirth } from './run-identity.js';
+
+/**
+ * A call that this record answered, with its run: a tool-call id is unique only inside one run's step
+ * (call-identity.ts), so "was it answered for ME" needs both (`sameCall`). `resolvedToolCallIds` stays
+ * written beside it (every reader of the bare ids — time-travel, compensation — keeps working); an entry
+ * there with no `resolvedBy` twin is a record of an older version and proves no ownership.
+ */
+export interface ResolvedBy { runId: string; toolCallId: string }
 
 export type ToolJournalRecord = (
   // ToolName — carried so loop detection (checkToolLoop) can match SUCCEEDED records by
@@ -31,7 +40,7 @@ export type ToolJournalRecord = (
   // a `compensate` hook (opt-in journal cost): the unwind needs the original args (e.g. which
   // reservation to release), and the hash alone can't reproduce them. Absent on other/older records →
   // compensateRun falls back to recovering args from the model steps' tool-call parts.
-  | { status: 'succeeded'; output: unknown; argsHash?: string; toolName?: string; input?: unknown; resolvedToolCallIds?: string[] }
+  | { status: 'succeeded'; output: unknown; argsHash?: string; toolName?: string; input?: unknown; resolvedToolCallIds?: string[]; resolvedBy?: ResolvedBy[] }
   // `toolName` on the NON-success statuses too. A denial is the entry an auditor
   // most needs to identify — a human refused a tool — and it used to be the one carrying the least:
   // the key holds the toolCallId, the output holds `{__denied, reason}`, and the name appeared
@@ -39,14 +48,18 @@ export type ToolJournalRecord = (
   // away with it only because its sentinel repeats the name inside the output. Stamped at the single
   // choke point (writeToolTerminal) rather than per call site, so a new terminal path cannot forget.
   // Inert for loop detection: applyToolOutcomeToChain reads toolName only for succeeded/reflected.
-  | { status: 'denied'; output: unknown; toolName?: string; resolvedToolCallIds?: string[] }
+  | { status: 'denied'; output: unknown; toolName?: string; resolvedToolCallIds?: string[]; resolvedBy?: ResolvedBy[] }
   // The call was NOT executed; instead a
   // "reconsider" nudge was returned to the model as this call's tool result (see limits.ts / durable-tool.ts).
   // Terminal like 'denied' (time-travel treats it as resolved: status !== suspended/running), and the
   // nudge output must replay IDENTICALLY on resume → hence a journaled terminal record, not a transient.
   // argsHash/toolName are stamped like on 'succeeded' — seedFromHistory needs them to re-arm the chain's
   // `reflected` flag on the MATCHING chain after an internal-state loss (match-only, see limits.ts).
-  | { status: 'reflected'; output: unknown; argsHash?: string; toolName?: string; resolvedToolCallIds?: string[] }
+  | { status: 'reflected'; output: unknown; argsHash?: string; toolName?: string; resolvedToolCallIds?: string[]; resolvedBy?: ResolvedBy[] }
+  // The tool answered `refused(value)` — "nothing was done in this call" (call-outcome.ts: the rule). The
+  // answer to ITS OWN call only: replayed for that call (a resume), and no window reads it — the work key
+  // it was reached under was given back, so it holds no effect. Terminal for time-travel, like 'denied'.
+  | { status: 'refused'; output: unknown; argsHash?: string; toolName?: string; resolvedToolCallIds?: string[]; resolvedBy?: ResolvedBy[] }
   // `attempts` — set when the question was asked over a 'failed' or stale 'running' attempt: the counter
   // of that attempt, kept so the approved resume continues it (maxRetries) and meets the crash ladder
   // (recover) instead of starting as a first call. Absent: the question came before the call ever ran.
@@ -92,12 +105,15 @@ export type ToolJournalRecord = (
    */
   mirrorOf?: string;
   /**
-   * The call that EXECUTED it, on a request-window record (`runKeys.toolRequest`): which run, and which
-   * of that run's calls. The record is the request's — every call under it dedups against it — but the
-   * action was this one call's: that call's mirror is what its run unwinds (compensateRun), counts
-   * (limits seed) and erases (purgeRun). A mirror written for a deduplicated call carries the same
-   * stamp and is told apart by its own toolCallId — three calls, one execution, one unwind (measured:
-   * keyed by run alone, all three mirrors were unwound).
+   * The call that EXECUTED it, on a window record (`runKeys.toolWindowOf`: request, thread, cross-run):
+   * which run, and which of that run's calls. The record is the window's — every call under it dedups
+   * against it — but the action was this one call's. On a REQUEST-window record that call's mirror is
+   * what its run unwinds (compensateRun), counts (limits seed) and erases (purgeRun). On a thread /
+   * cross-run record it is what tells a run's unwind report "this run executed the shared action"
+   * from "this run answered from another run's" (compensateRun reports both, unwinds neither). A
+   * mirror written for a deduplicated call carries the same stamp and is told apart by its own
+   * toolCallId — three calls, one execution, one unwind (measured: keyed by run alone, all three
+   * mirrors were unwound). Records written before 0.17.2 carry it on request-window records only.
    */
   ranBy?: { runId: string; toolCallId: string };
   /**
@@ -405,6 +421,14 @@ export const runKeys = {
   toolRequestPrefix: (requestRunId: string) => RUN_KEYED_FAMILIES['request-window'].prefix(requestRunId),
   /** Whether a key is a request-window record (`toolRequest`). */
   isToolRequest: (key: string) => key.startsWith('xreq:'),
+  /**
+   * Which idempotency WINDOW a tool call's record key belongs to — `undefined` for a run's own key
+   * (`<runId>:tool:…`). The one reading of the three window families (`toolRequest`, `toolThread`,
+   * `toolCrossRun`): who signs an execution (`ranBy`, durable-tool.ts) and what a single run's unwind
+   * may touch (compensation.ts) both decide on it.
+   */
+  toolWindowOf: (key: string): 'request' | 'thread' | 'cross-run' | undefined =>
+    key.startsWith('xreq:') ? 'request' : key.startsWith('xthr:') ? 'thread' : key.startsWith('xrun:') ? 'cross-run' : undefined,
   /** The same request-window record, in another request's window (a fork is a request of its own). */
   toolRequestIn: (key: string, requestRunId: string): string | undefined => {
     const m = /^xreq:.*:(args-[^:]*)$/.exec(key);
@@ -562,6 +586,12 @@ export interface RunOutcomeRecord {
   errorCode?: string;
   /** The failing error's HTTP `statusCode` (a retry wrapper's: its last error's), when it carries one. */
   errorStatus?: number;
+  /** A provider failure's URL (origin + path, no query) and a short secret-masked body excerpt — see `safeUpstreamUrl`/`safeUpstreamBody`. */
+  errorUrl?: string;
+  errorBody?: string;
+  /** The model and provider that raised a provider failure (`withUpstreamModel`) — a URL often names neither. */
+  errorModel?: string;
+  errorProvider?: string;
 }
 
 
@@ -638,6 +668,15 @@ export interface DurableCtx {
   /** require-approval decisions: toolCallId → whether approved (passed on resume). */
   approvals?: Record<string, boolean>;
   /**
+   * What each recorded yes in `approvals` COVERS: `'approve'` — an authorised person's yes, which answers a
+   * confirm question too; `'confirm'` — the requester's consent only, which does not answer an approve
+   * question (the gate then asks that second question). Absent for an id: a row from before this was
+   * recorded, read as `'approve'`. @internal
+   */
+  approvalGrants?: Record<string, 'confirm' | 'approve'>;
+  /** WHO answers this call's `approvals` (the engine's `Answerer`); a delegation hands it down to its child run. @internal */
+  answerer?: import('./approval-authority.js').Answerer;
+  /**
    * Replay determinism mode (M2). 'lenient' (default): on drift, only warns, returns the recorded output.
    * 'strict': throws `DivergenceError` if tool-args drift is detected during replay.
    */
@@ -673,6 +712,8 @@ export interface DurableCtx {
    * the attempt compares against it. Set by runDurable/streamDurable. @internal
    */
   erasure?: ErasureBaseline;
+  /** The developer's sentence for a repeat question (`createGnl({ questionText })`); see question-text.ts. */
+  questionText?: import('./question-text.js').QuestionTextHook;
   /** Y1 (opt-in): default tool execute timeout (ms) — tool.timeoutMs overrides per tool. */
   toolTimeoutMs?: number;
   /** Y3 (opt-in): default 'running' claim staleness threshold (ms) — tool.claimTtlMs overrides per tool. */
@@ -1024,6 +1065,21 @@ export async function* runPages(journal: Journal, limit: number): AsyncGenerator
 }
 
 /**
+ * Whether the run is RECORDED, steps or none: it has a frozen `:input` or a recorded outcome — the two
+ * records, beside the steps, that put a run in `listRuns`. `readRun` answers only the steps, so a run that
+ * died before its first model step (the provider refused the first call) reads as an empty list there while
+ * it is listed; "not found" for such a run hid exactly the one an operator opens to see why it failed.
+ * Reads through whatever view the journal is (a subject view hides another user's records, so a run that is
+ * not theirs is "not recorded" to them, same as one that does not exist).
+ */
+export async function isRunRecorded(journal: Pick<Journal, 'get'>, runId: string): Promise<boolean> {
+  for (const key of [runKeys.input(runId), runKeys.outcome(runId)]) {
+    if ((await journal.get(key)) !== undefined) return true;
+  }
+  return false;
+}
+
+/**
  * Read EVERY run as an array, from a view whose `listRuns` may return either shape.
  *
  * `JournalReader.listRuns()` is declared as an array, but every first-party adapter's RunJournal
@@ -1087,6 +1143,19 @@ export function asReaderJournal<T extends object>(journal: T): T {
       return prop === 'listRunsPaged' || Reflect.has(target, prop);
     },
   });
+}
+
+/**
+ * The journal an operator function (`compensateRun`, `sweepRuns`, `purgeRun`, `createRetentionSweeper`,
+ * `recordRunUsage`) accepts: the older journal, or the port every storage hands out — `storage.runs`, whose
+ * `listRuns` returns a page where the older journal's returns an array. One type for all of them, so the
+ * documented `compensateRun(id, { journal: storage.runs })` compiles and no operator function is left behind.
+ */
+export type OperatorJournal = (Journal & Partial<JournalReader>) | RunJournal;
+
+/** An operator function's journal, normalized ONCE at its entry to the one shape its body reads (`asReaderJournal`). */
+export function operatorJournal(journal: OperatorJournal): Journal & Partial<JournalReader> {
+  return asReaderJournal(journal as object) as Journal & Partial<JournalReader>;
 }
 
 /** Parse a `<runId>:model:<step>` / `<runId>:tool:<toolCallId>` key (runId may contain colons). */

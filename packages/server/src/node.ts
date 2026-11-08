@@ -12,13 +12,15 @@
 // the package failed on `JSON.parse('')`. This file follows the convention sse.ts already set here.
 //
 // KEEP IN SYNC with packages/studio/src/node.ts. If they drift, the two packages answer the same
-// misconfiguration differently, which is worse than either answer.
+// misconfiguration differently, which is worse than either answer. (What counts as a fetch handler — a function or an
+// object with `.fetch`, anything else refused by name — is one rule, `fetchFunctionOf` in @gnldev/options.)
 //
 // Kept on a subpath so the root export stays runtime-neutral: importing the package must not drag
 // Node's types into a Workers or Deno build.
 import { getRequestListener } from '@hono/node-server';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { FetchHandler } from './handler.js';
+import { fetchFunctionOf } from '@gnldev/options';
 import { EDGE_ERROR_CODES } from './edge-errors.js';
 
 const CARRIES_BODY = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
@@ -75,7 +77,8 @@ function bodyAlreadyConsumed(req: IncomingMessage): boolean {
  * before parsing and works, with the host's own routes keeping their parsed bodies.
  */
 export function toNodeHandler(handler: FetchHandler) {
-  const listener = getRequestListener(handler.fetch as any);
+  // A function is a fetch handler; anything that is not one is refused here, by name (one rule: @gnldev/options).
+  const listener = getRequestListener(fetchFunctionOf(handler, 'toNodeHandler', 'what createRestApi() returns') as any);
   return (req: IncomingMessage, res: ServerResponse) => {
     // Deliberately NOT re-serialising `req.body` back into a stream. It would make the common case
     // work and quietly change the bytes — key order, unicode escaping, and nothing at all for

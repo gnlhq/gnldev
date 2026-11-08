@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 // Gelen kutusu KİMİN işi olduğunu söyler, ve söylediğiyle tutarlı davranır.
 //
+// [d25 Adım 2 notu: aşağıdaki kilit anlatımı eskidi — operatör artık kullanıcı işini cevaplayabilir; ilk test ters çevrildi.]
 // Motorun sahiplik kilidi son kullanıcının damgasını taşıyan bir koşumu operatöre kapatıyor (409
 // run_actor_mismatch). Ekran bunu bilmiyordu: her satırın Onayla/Reddet çifti açıktı, operatör
 // kullanıcı işini basıp-409-okuyarak keşfediyordu. Satır GİZLENMİYOR — görünürlük adminde kalır —
@@ -41,18 +42,18 @@ const show = (items: unknown[]) => {
 const btn = (name: string) => screen.getByRole('button', { name: new RegExp(name) }) as HTMLButtonElement;
 
 describe('Approvals: sahiplik rozeti ve kilitli eylem', () => {
-  it('damgalı kullanıcı işi işaretlenir ve Onayla/Reddet kapanır — sebebi de yazılı', async () => {
+  it('damgalı kullanıcı işi işaretlenir ve Onayla/Reddet AÇIK kalır — kilit cümlesi yok (d25 Adım 2)', async () => {
+    // Eski şart: kullanıcı işinde düğmeler kapalıydı ("karar sahibinde"). KARAR-1 Adım 2 bunu tersine
+    // çevirdi: onay (approve) sorusunu yetkili cevaplar — operatör Studio'dan cevaplar; rıza (confirm)
+    // sorusunu da yetkili cevaplayabilir. Rozet kalır: satır hâlâ kimin işi olduğunu söyler.
     show([{ runId: 'sus-1', toolCallId: 'call-1', toolName: 'chargeCard', owner: 'u-ayse', ownerActor: 'ayse' }]);
     await waitFor(() => expect(screen.getByText('chargeCard')).toBeTruthy());
 
     expect(screen.getByText('user work · u-ayse'), 'satır kimin işi olduğunu söylemiyor').toBeTruthy();
-    expect(btn(en.approve).disabled, 'kullanıcı işinde Onayla hâlâ basılabilir').toBe(true);
-    expect(btn(en.deny).disabled).toBe(true);
-    // Açıklama SATIR İÇİNDE de var: `title` yalnız fare ile gelir — klavye ve dokunmatik için hiçbir şey.
-    // İki ölü düğmenin sebebini yalnız hover'la anlatmak, kullanıcıların yarısına hiç anlatmamaktır.
+    expect(btn(en.approve).disabled, 'kullanıcı işinde Onayla hâlâ kilitli').toBe(false);
+    expect(btn(en.deny).disabled).toBe(false);
     const why = en.ownerLockedTitle.replace('{{owner}}', 'u-ayse');
-    expect(screen.getByText(why)).toBeTruthy();
-    expect(btn(en.approve).getAttribute('title')).toBe(why);
+    expect(screen.queryByText(why), 'satır hâlâ "cevap senin değil" diyor').toBeNull();
   });
 
   it('SAHİPLİ AMA DAMGASIZ: rozet var, düğmeler AÇIK (kilit ateşlemiyor, 409 gelmeyecek)', async () => {

@@ -7,8 +7,10 @@ Exposes the `createGnl` registry as **auto-REST + OpenAPI + SSE**. Every endpoin
 > Install: `pnpm add @gnldev/server` — or use it from a [repo clone](https://github.com/gnlhq/gnldev): `pnpm install && pnpm -r build`.
 
 ```bash
-npm i @gnldev/server   # peer: @gnldev/durable  ·  dep: hono
+npm i @gnldev/server @hono/node-server@1   # peer: @gnldev/durable  ·  dep: hono
 ```
+
+`@hono/node-server` is only for the `serve(...)` example below; pin it to `1` — the CLI, server and Studio are built and tested against the 1.x line, and an unpinned install resolves 2.x, which npm then refuses next to `@gnldev/cli` (ERESOLVE).
 
 ```ts
 import { createRestApi } from '@gnldev/server';
@@ -125,7 +127,18 @@ readinessProbe: { httpGet: { path: /ready,  port: 3000 } }
 ```
 
 ### SSE schema (`/stream`)
-`event` + JSON `data`: `text-delta {text}` · `tool-call {toolCallId,toolName,input}` · `tool-result {...}` · `error {error}` · `interrupt {interrupts[]}` (when the stream ends) · `done {runId,finishReason,usage}`. The same schema is also used in the `@gnldev/studio` playground → [`@gnldev/client`](../client) connects to both ends.
+`event` + JSON `data` (the schema is `agentStreamEvents` in `@gnldev/durable`):
+
+- `text-delta {text}` · `tool-call {toolCallId,toolName,input}` · `tool-result {toolCallId,toolName,output}` ·
+  `tool-progress {toolCallId,toolName,progress}` (a streaming tool's earlier output) ·
+  `tool-error {toolCallId,toolName,error}` (not terminal: the run carries on)
+- `reasoning-start {id}` · `reasoning-delta {id,text}` · `reasoning-end {id}` — the model's reasoning text, when it returns any
+- `tool-input-start {toolCallId,toolName}` · `tool-input-delta {toolCallId,delta}` · `tool-input-end {toolCallId}` — the model writing a call's arguments, before `tool-call`
+- `step-start {}` · `step-finish {finishReason,usage}` · `source {sourceType,id,url,title}` · `file {mediaType,base64}`
+- `interrupt {interrupts[]}` (when the stream ends; each `{toolCallId,toolName,args,reason?}`) · `error {error,code?,…}` (terminal) · `done {runId,finishReason,usage}`
+- `raw {type}` — a part this list does not know: its type only, never its payload
+
+A suspended tool, a limit stop and a blocked call are never a `tool-result`: they arrive as `interrupt` or `error`. The run's id is in the `X-Gnl-Run-Id` response header from the first byte. Approvals go to `/stream` as well as `/resume` (same `runId` + `approvals`). The same schema is also used in the `@gnldev/studio` playground → [`@gnldev/client`](../client) connects to both ends.
 
 ### A run outlives its connection; a reader resumes where it left off
 A run executes apart from the request that started it, on the process's executor. A closed tab, a

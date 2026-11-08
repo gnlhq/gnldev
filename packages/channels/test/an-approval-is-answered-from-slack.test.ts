@@ -2,6 +2,11 @@
 // person who asked (or an `approvers` yes) continues the same run, and its answer is posted once. A
 // button's value is signed: a changed one decides nothing. A second click, or Slack redelivering one,
 // is the same decision.
+//
+// d25 step 2 (KARAR-1 "ADIM 2 / POLİTİKA"): the requester answers a CONFIRM (consent) question; an APPROVE
+// question (a guard's require-approval) takes an authorised person. These tests are about the channel's
+// mechanics with the requester answering, so the question is the tool's `confirm` (it was a guard's
+// require-approval). The approve side is in d25-a2-slack-who-may-click.test.ts.
 import { describe, it, expect, afterEach } from 'vitest';
 import { createHmac } from 'node:crypto';
 import { InMemoryStorage } from '@gnldev/durable';
@@ -20,7 +25,7 @@ function setup(over: Record<string, unknown> = {}) {
     return Response.json({ ok: true, ts: `${posts.length}.0` });
   }) as unknown as typeof globalThis.fetch;
   const state = { executed: 0 };
-  const refund = { description: 'refund an order', inputSchema: jsonSchema({ type: 'object' }), execute: async () => { state.executed++; return { refunded: true }; } };
+  const refund = { description: 'refund an order', inputSchema: jsonSchema({ type: 'object' }), confirm: true, execute: async () => { state.executed++; return { refunded: true }; } };
   const model: any = {
     specificationVersion: 'v2', provider: 'm', modelId: 'm', supportedUrls: {},
     doGenerate: async (o: any) => {
@@ -30,7 +35,7 @@ function setup(over: Record<string, unknown> = {}) {
       return { content: [{ type: 'text', text: denied ? 'Not refunded.' : 'Refunded.' }], finishReason: 'stop', usage, warnings: [] };
     },
   };
-  const ch = slackChannel({ storage: new InMemoryStorage(), agents: { support: { model, system: 's', maxSteps: 3, tools: { refund }, guard: () => ({ action: 'require-approval' }) } } } as any, {
+  const ch = slackChannel({ storage: new InMemoryStorage(), agents: { support: { model, system: 's', maxSteps: 3, tools: { refund } } } } as any, {
     signingSecret: SECRET, botToken: 'test-bot-token-123', agent: 'support', workspaces: { T1: { orgId: 'acme' } }, worker: false,
     workerOptions: { retryDelayMs: 0 }, apiUrl: 'https://slack.test/api', fetch, ...over,
   });

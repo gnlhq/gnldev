@@ -19,8 +19,8 @@ async function suspendThenApprove(way: Way) {
     if (!c && t.length) othersSaw = JSON.stringify(t.at(-1).content[0].output);
     return c ? toolCallResult(c[0], `c${t.length}`, c[1]) : finalTextResult('done');
   });
-  const cfg = { agents: { a: { model: m, tools: { dose, fetchPage }, ...(way === 'guard' ? { guard: async (call: any) => (call.toolName === 'dose' ? { action: 'require-approval', reason: 'check' } : { action: 'allow' }) } : {}) } } };
-  const limits = way === 'taint' ? { taintedSideEffects: 'suspend' } : undefined;
+  const cfg = { agents: { a: { model: m, tools: { dose, fetchPage }, ...(way === 'guard' ? { guard: async (call: any) => (call.toolName === 'dose' ? { action: 'confirm', reason: 'check' } : { action: 'allow' }) } : {}) } } };
+  const limits = way === 'taint' ? { taintedSideEffects: 'confirm' } : undefined; // consent: the owner answers it (an approve question is staff's since d25)
   const storage = new InMemoryStorage();
   const ayse = user('ayse', 'acme');
   const r1: any = await createGnl({ storage, ...cfg } as any).run('a', { runId: 'r1', prompt: 'go', caller: ayse, ...(limits ? { limits } : {}) } as any);

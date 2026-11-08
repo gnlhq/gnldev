@@ -16,6 +16,7 @@ import { sweepRuns } from '../src/retention.js';
 import { readIdemLedger } from '../src/idem-ledger.js';
 import { RunInputMismatchError, RunActorMismatchError, RunSweptError } from '../src/errors.js';
 import { createGnl } from '../src/registry.js';
+import { mintCallId } from '../src/index.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
 const textModel = (text = 'done') => createMockModel(async () => finalTextResult(text));
@@ -50,7 +51,7 @@ describe('FAZ-4 strictInput fingerprint', () => {
     // The approval re-POST carries DIFFERENT input (a grown chat history) + the approval for the
     // toolCallId whose journal record is genuinely 'suspended' → admitted, not 409'd.
     await runDurable(base(journal, 'si2', {
-      model: model(), tools, prompt: 'charge it (history grew)', strictInput: true, approvals: { 'call-c': true },
+      model: model(), tools, prompt: 'charge it (history grew)', strictInput: true, approvals: { [mintCallId('call-c', 'si2', 0, 0)]: true },
     }) as any);
     expect(counter.n).toBe(1);
     // An approval naming NO suspended record earns nothing:
@@ -177,7 +178,7 @@ describe('FAZ-4 audit fixes', () => {
       countToolResults(prompt) === 0 ? toolCallResult('charge', 'call-c', { amount: 5 }) : finalTextResult('done'));
     await runDurable(base(journal, 'rt1', { model: model(), tools, prompt: 'v1', strictInput: true }) as any); // suspends
     const approvalCall = () => runDurable(base(journal, 'rt1', {
-      model: model(), tools, prompt: 'v2-grown-history', strictInput: true, approvals: { 'call-c': true },
+      model: model(), tools, prompt: 'v2-grown-history', strictInput: true, approvals: { [mintCallId('call-c', 'rt1', 0, 0)]: true },
     }) as any);
     await approvalCall(); // approval lands, record → succeeded
     expect(counter.n).toBe(1);

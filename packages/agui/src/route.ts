@@ -12,7 +12,7 @@
 import type { Context } from 'hono';
 import { toFetchHandler, type FetchHandler } from './handler.js';
 import { Hono } from 'hono';
-import { limitBreachFromSteps, blockedFromSteps, BLOCKED_ERROR_CODES, blockedErrorCode, callerConflictAnswer, requestRefusal, sealRequestContext, sealFieldsOf, resolveWorkIdentity, readJsonObject } from '@gnldev/durable';
+import { limitBreachFromSteps, blockedFromSteps, BLOCKED_ERROR_CODES, endAnswerOf, requestRefusal, sealRequestContext, sealFieldsOf, resolveWorkIdentity, readJsonObject } from '@gnldev/durable';
 import type { CreateGnlConfig, ResolvedWorkIdentity } from '@gnldev/durable';
 import { createGnl, scopeConfigToOrg } from '@gnldev/durable';
 import { doorGate, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify, refuseMisplacedOptions, doorOptionKeys, REMOVED_IDENTITY_OPTIONS } from '@gnldev/auth';
@@ -22,7 +22,7 @@ import { streamSSE } from 'hono/streaming';
 // here. The event/data SHAPE is deliberately a copy (see the note above), but a code is not a shape:
 // it is the string a caller matches on. The codes, `interruptsFromSteps` and the surface contract all
 // come from durable, never from @gnldev/server: this package runs standalone (ADR-0002 point 0).
-import { interruptsFromSteps, LIMIT_ERROR_CODES } from '@gnldev/durable';
+import { interruptsFromSteps, LIMIT_ERROR_CODES, reachesClient, clientFeedOf } from '@gnldev/durable';
 import type { StreamSurface } from '@gnldev/durable';
 import { toAguiEvents, initialAguiConvertState, type GnlSseEvent } from './convert.js';
 import { EventType, type AguiEvent, type RunStartedEvent } from './types.js';
@@ -40,6 +40,9 @@ export interface PipeAguiStreamOptions {
   /** AG-UI threadId. If not given, runId is used (single-thread default). */
   threadId?: string;
 }
+
+/** The `error` event for a failure: the body of THE one mapping (`endAnswerOf`, @gnldev/durable) — code and all — or just its text when the error is the host's own. */
+const errorEvent = (e: unknown): GnlSseEvent => ({ event: 'error', data: endAnswerOf(e)?.body ?? { error: String((e as { message?: unknown })?.message ?? e) } });
 
 /** Stream fullStream as AG-UI SSE events (starts with RUN_STARTED, ends with RUN_FINISHED/RUN_ERROR). */
 export function pipeAguiStream(c: Context, runId: string, result: any, opts?: PipeAguiStreamOptions) {
@@ -73,8 +76,11 @@ export function pipeAguiStream(c: Context, runId: string, result: any, opts?: Pi
     const started: RunStartedEvent = { type: EventType.RUN_STARTED, threadId, runId };
     await write(started);
     try {
+      // Which events reach the client is @gnldev/durable's rule (`reachesClient`), not restated here.
+      const feed = clientFeedOf(result);
       for await (const part of result.fullStream) {
         if (stream.aborted) break;
+        if (!reachesClient(part.type, feed)) continue;
         switch (part.type) {
           case 'text-delta': {
             const text = part.text ?? part.delta ?? '';
@@ -128,7 +134,10 @@ export function pipeAguiStream(c: Context, runId: string, result: any, opts?: Pi
             await emit({ event: 'tool-error', data: { toolCallId: part.toolCallId, toolName: part.toolName, error: String((part as any).error?.message ?? (part as any).error) } });
             break;
           case 'error':
-            await emit({ event: 'error', data: { error: String((part as any).error?.message ?? (part as any).error) } });
+            await emit(errorEvent(part.error));
+            break;
+          case 'gnl-status': // the reader is told what it waits for (a takeover) — same frame as /stream's `status`
+            await emit({ event: 'status', data: { state: part.state } });
             break;
           case 'start': case 'finish': case 'text-start': case 'text-end': case 'abort': case 'raw':
             break; // deliberately no event — same list and reasons as sse.ts
@@ -167,27 +176,12 @@ export function pipeAguiStream(c: Context, runId: string, result: any, opts?: Pi
       const usage = await Promise.resolve(result.usage).catch(() => undefined);
       await emit({ event: 'done', data: { runId, finishReason, usage } });
     } catch (e: any) {
-      await emit({ event: 'error', data: { error: String(e?.message ?? e) } });
+      await emit(errorEvent(e));
     }
   });
   res.headers.set('Cache-Control', 'no-cache, no-transform');
   res.headers.set('X-Accel-Buffering', 'no');
   return res;
-}
-
-/**
- * The caller's own name for the work, reflected back in a refusal (§8, rules 1-3).
- *
- * FROM THE REQUEST, never from storage: a swept run keeps only a hash of its workKey (§10.3), so
- * reading the name back would undo a deletion. The caller already knows what it sent.
- *
- * `detail` and not `error`: the sentence is the most casually logged field in any HTTP client, and a
- * workKey is a business name. Same three lines as @gnldev/server's and @gnldev/chat-adapter's — the
- * dependency direction forbids sharing one (agui → durable, never agui → server for a renderer).
- */
-function withWorkKey(detail: unknown, workKey?: string): unknown {
-  if (workKey === undefined) return detail;
-  return detail && typeof detail === 'object' ? { ...(detail as Record<string, unknown>), workKey } : { workKey };
 }
 
 export interface CreateAguiRouteOptions {
@@ -316,7 +310,14 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
     // WHICH ORGANIZATION — the principal's, never the body's. Same rule and same reason as the sibling
     // route: an org is an isolation boundary, and `sealRequestContext` strips any the caller asserted.
     const org = caller.kind === 'unknown' ? undefined : caller.orgId;
-    const gnl = gnlFor(org);
+    // The organization's instance — refused, as every door refuses it, when the config's `memory`
+    // cannot be split for it (@gnldev/durable `scopeConfigToOrg`).
+    let gnl: ReturnType<typeof createGnl>;
+    try { gnl = gnlFor(org); } catch (e) {
+      const refused = requestRefusal(e);
+      if (!refused) throw e;
+      return c.json(refused.body, refused.status, refused.headers);
+    }
     // WHICH RUN (package #5, §7). Two names can arrive, and they follow different rules:
     //
     //   `body.workKey` — DECLARED. Always a workKey, always fail-closed: without an address the
@@ -375,6 +376,8 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
         // etkilemiyordu; host "düzelttim" sanıyordu.
         threadId,
         approvals: body.approvals,
+        // WHO answers them — the one mapping (@gnldev/auth `answererOf`, via the door's admission); the engine decides what they may answer.
+        ...(who.answerer ? { answerer: who.answerer } : {}),
         // HER ZAMAN mühürlü — kimlik bilinmese bile. Ayrılmış anahtarlar motorun "bunu sunucu
         // doğruladı" kanalıdır; mühürsüz bir gövde o kanalın sahibi olur.
         // The org goes into the seal too, so the record and the dynamic `system`/`tools` see the same
@@ -395,34 +398,12 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
       // Errors raised MID-stream are a different contract and are untouched: once frames are flowing
       // they surface as an SSE `error` event (see pipeAguiStream), because a response already committed to
       // 200 cannot become a 409.
-      const name = (e as { name?: string })?.name;
-      if (name === 'RunThreadMismatchError') {
-        return c.json({ error: e.message, code: 'run_thread_mismatch', detail: withWorkKey(e.detail, declared) }, 409);
-      }
-      // FAZ-4 caller-conflict family (K9: durable's single map — this route was the consumer the
-      // first cut forgot; a critical-profile input/actor/swept refusal must not collapse to a bare 400).
-      // Rendered as durable answers it: "not your run" reads exactly as an absent run (404 `run_not_found`).
-      const conflict = callerConflictAnswer(e, declared);
-      if (conflict) {
-        if (conflict.ownership) markRefusal(c.req.raw, 'ownership', { detail: conflict.code });
-        return c.json(conflict.body, conflict.status as 409);
-      }
-      const blocked = blockedErrorCode(e);
-      if (blocked) {
-        const body = { error: e?.message ?? String(e), code: blocked, detail: e?.detail };
-        const res = blocked === 'retry_limit_exceeded'
-          ? c.json(body, 422)
-          : c.json({ ...body, resumable: true }, 409);
-        // Same Retry-After contract as @gnldev/server and chat-adapter: run_busy is "correct, only early".
-        if (blocked === 'run_busy') res.headers.set('Retry-After', '5');
-        return res;
-      }
-      // A request the engine refused before any work — durable's one answer for it (400 thread_id_reserved, 503 draining).
-      const reserved = requestRefusal(e);
-      if (reserved) return c.json(reserved.body, reserved.status, reserved.headers);
-      if (name === 'RunLimitExceededError' || name === 'ToolLoopDetectedError') {
-        const code = name === 'RunLimitExceededError' ? LIMIT_ERROR_CODES.runLimitExceeded : LIMIT_ERROR_CODES.toolLoopDetected;
-        return c.json({ error: e.message, code, detail: e.detail, resumable: true }, 422);
+      // The answer is durable's one mapping of how a run ended (`endAnswerOf`): limits, caller conflicts
+      // ("not your run" reads as an absent run), blocked and canceled runs, request refusals, provider failures.
+      const end = endAnswerOf(e, declared);
+      if (end) {
+        if (end.ownership) markRefusal(c.req.raw, 'ownership', { detail: end.code });
+        return c.json(end.body, end.status as 409, end.headers);
       }
       return c.json({ error: String(e?.message ?? e) }, 400);
     }

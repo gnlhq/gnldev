@@ -262,7 +262,8 @@ export function createBatch(journal: Journal, cfg: BatchConfig) {
       const resolved = await resolveApprovals(
         journal, runId,
         opts.approvals?.[tcid] !== undefined ? { [tcid]: opts.approvals[tcid]! } : undefined,
-        { hasRun: hasRunProbe(journal, runId) },
+        // The answer is the host's (`batch.run(…, { approvals })`), made as the batch's own caller: staff, unless it says otherwise.
+        { hasRun: hasRunProbe(journal, runId), caller: batchCaller },
       );
       // SAHİP KAYDI — bellekteki ctx yetmiyordu. `cfg.resourceId` yalnız burada, süreç içinde
       // yaşıyordu; journal onu HİÇ öğrenmiyordu çünkü item koşumları `run()`'dan geçmiyor

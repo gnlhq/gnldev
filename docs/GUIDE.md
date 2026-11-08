@@ -653,6 +653,8 @@ await client.run('assistant', { runId: 'order-42', prompt: '...' });
 // organization/budget management, network tree, dead-letter, playground...
 ```
 
+Install `@hono/node-server@1`, not the unpinned latest: the CLI, server and Studio are built and tested against the 1.x line, and 2.x makes `npm i -D @gnldev/cli` fail with ERESOLVE.
+
 ### 7.9 Deployment and observability
 
 **No deployment step is required**, and that is the design: `createRestApi()` returns a web-standard

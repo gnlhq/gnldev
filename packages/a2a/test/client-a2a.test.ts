@@ -2,7 +2,7 @@
 // createA2AServer and against a hand-written non-GNL A2A agent.
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { InMemoryJournal } from '@gnldev/durable';
+import { InMemoryJournal, mintCallId } from '@gnldev/durable';
 import { createA2ATool } from '../src/index.js';
 import { createA2AServer } from '../src/server.js';
 import { textModel, chargeModel } from './models.js';
@@ -44,7 +44,7 @@ describe("createA2ATool({ protocol: 'a2a' })", () => {
     const t = createA2ATool({ protocol: 'a2a', endpoint: 'http://remote/agents/pay', agentName: 'pay', fetchImpl: ((u: string, i?: RequestInit) => gnlAgents({ n: 0 })(new Request(u, i))) as typeof fetch });
     const r = await exec(t, 'charge', 'call-2');
     expect(r.text).toBe('');
-    expect(r.interrupts[0]).toMatchObject({ toolCallId: 'c1', toolName: 'charge' });
+    expect(r.interrupts[0]).toMatchObject({ toolCallId: mintCallId('c1', r.runId, 0, 0), toolName: 'charge' });
   });
 
   it('talks to a non-GNL A2A agent: agent-card.json fallback, a Message result, a JSON-RPC error', async () => {

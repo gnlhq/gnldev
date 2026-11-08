@@ -163,6 +163,35 @@ export type Identify = (req: Request) => Principal | null | undefined | Promise<
 export type EngineCaller = { kind: 'user'; id: string; orgId?: string } | { kind: 'staff'; orgId?: string } | { kind: 'unknown' };
 
 /**
+ * WHO answers, as the engine reads it (@gnldev/durable `Answerer`), written structurally like `EngineCaller`.
+ * `answeredBy` is the name every identity comparison uses (`actorIdOf`); `answeredAs` is the class the rule reads.
+ */
+export type EngineAnswerer = { answeredBy?: string; answeredAs: 'staff' | 'requester' };
+
+/**
+ * A principal as the engine's answerer — the ONE mapping every door uses for "who is answering this
+ * question" (the sibling of `engineCallerOf`, which says whose RUN it is):
+ *
+ *   subject      → the requester, by its own id
+ *   operator     → staff, as `operator:<id>`
+ *   application  → staff: the application's own server speaks for its users and is trusted to forward
+ *                  only what they said (an application that forwards a browser's `approvals` blindly
+ *                  opens the hole itself — see the approvals chapter)
+ *   unnamed      → undefined: nobody is named; the engine derives the answerer from the call's `caller`
+ *
+ * What a given answerer MAY answer is decided once, in the engine (`resolveApprovals`); a door only says who.
+ */
+export function answererOf(principal: Principal | null | undefined): EngineAnswerer | undefined {
+  const by = actorIdOf(principal);
+  switch (callerKind(principal)) {
+    case 'subject': return { ...(by !== undefined ? { answeredBy: by } : {}), answeredAs: 'requester' };
+    case 'operator':
+    case 'application': return { ...(by !== undefined ? { answeredBy: by } : {}), answeredAs: 'staff' };
+    default: return undefined;
+  }
+}
+
+/**
  * A principal as the engine's caller — the one mapping every door uses (ADR-0002).
  *
  *   subject      → user, its own id; `named` is ignored (a user speaks only for itself)

@@ -2,11 +2,21 @@
 // reasoning (it sees all tools); it only gates the side effect.
 
 import type { RunTaint } from './taint.js';
+import { refuseUnknownNames } from '@gnldev/options';
+import { TAINT_GUARDIAN_NAMES } from './option-names.js';
 
+/**
+ * What a guard decides about a call. `confirm` and `approve` stop the call and ask a person:
+ *   confirm — consent ("are you sure?"): the person who asked for the work answers, an authorised person may too;
+ *   approve — permission ("may this happen?"): only an authorised person says yes (approval-authority.ts).
+ * `require-approval` is the older name of `approve` and means exactly that.
+ */
 export type GuardDecision =
   | { action: 'allow' }
   | { action: 'deny'; reason?: string }
-  | { action: 'require-approval'; reason?: string }; // Phase 3b: suspend/resume
+  | { action: 'confirm'; reason?: string }
+  | { action: 'approve'; reason?: string }
+  | { action: 'require-approval'; reason?: string }; // = approve (the original name)
 
 export interface GuardCall {
   toolName: string;
@@ -25,6 +35,8 @@ export interface Interrupt {
   toolName: string;
   args: unknown;
   reason?: string;
+  /** Which question this is: `confirm` (consent — the requester answers) or `approve` (permission — only an authorised person says yes). */
+  needs?: 'confirm' | 'approve';
   /** FAZ-6: set when the suspension came from the semantic dup gate — the approval writes the 'different work' tombstone from this. */
   semPair?: { priorHash: string };
   /**
@@ -76,16 +88,17 @@ export type Guard = (call: GuardCall) => GuardDecision | Promise<GuardDecision>;
 export function taintGuardian(opts: {
   /** Which tools are sensitive — an explicit list, or a predicate over the tool name. */
   sensitiveTools: string[] | ((toolName: string) => boolean);
-  /** Decides the intersection case. `call.tainted` is guaranteed set (narrowed) here. */
-  onTainted: (call: GuardCall & { tainted: RunTaint }) => GuardDecision | Promise<GuardDecision>;
+  /** Decides the intersection case. Default: `{ action: 'approve' }` — permission, which the requester (who may be the one who planted the content) cannot grant herself. */
+  onTainted?: (call: GuardCall & { tainted: RunTaint }) => GuardDecision | Promise<GuardDecision>;
   /** Policy for everything else (clean OR non-sensitive) — compose an existing Guard. Default: allow. */
   otherwise?: Guard;
 }): Guard {
+  refuseUnknownNames('taintGuardian', opts, TAINT_GUARDIAN_NAMES);
   const sel = opts.sensitiveTools;
   const isSensitive = typeof sel === 'function' ? sel : (name: string) => sel.includes(name);
   return async (call) => {
     if (call.tainted !== undefined && isSensitive(call.toolName)) {
-      return opts.onTainted(call as GuardCall & { tainted: RunTaint });
+      return opts.onTainted ? opts.onTainted(call as GuardCall & { tainted: RunTaint }) : { action: 'approve' };
     }
     return opts.otherwise ? opts.otherwise(call) : { action: 'allow' };
   };

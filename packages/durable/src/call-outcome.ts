@@ -16,7 +16,16 @@
 //        success is never written over it, attempt.ts), and the report says the effect happened anyway;
 //     3. a claim ('running') or a failure: in doubt — the provider (`recover`) or a person decides (a
 //        failure written before records said whether the call was a side effect cannot say it was not);
-//     4. anything else (an answer, a question, no record): no effect.
+//     4. anything else (an answer, a question, no record): no effect — and so a REFUSED call (below).
+//
+//   A REFUSAL — `refused()`: the tool author says "nothing was done in this call" by returning
+//   `refused(value)`. The one rule: ONLY AN EFFECT THAT HAPPENED HOLDS A WORK KEY. A refusal is the answer
+//   to its own call and to no other: it is read back for that call (a resume asks the same question and
+//   gets the same answer, the body not run again), and the work key, the ownership of a cross-run record
+//   and the duplicate marker it claimed are given back, so the next real attempt — anyone's — is a first
+//   call. The engine never guesses it: `{ ok: false }` and `{ error }` stay what they were (the body may
+//   have done half of it); only the author knows. Classified once, where the body's result is settled
+//   (durable-tool.ts settleSuccess) — nothing else reads the value's shape.
 //
 //   A BACKGROUND CALL — `callRecordKey`: the call `<runId>`/`<toolCallId>` whose launcher recorded a task
 //   spec (`runKeys.taskSpec`) is its TASK's call. The parent's own record is the launcher's answer
@@ -50,6 +59,36 @@ import { randomUUID } from 'node:crypto';
  */
 export interface LateReport { id?: string; attempt?: number; at?: number; output?: unknown; sameAsSettled?: boolean }
 
+/**
+ * The values their author marked as refusals. Identity, not a property: the value the model sees, the
+ * journal stores and `JSON.stringify` prints stays exactly what was returned (a marker key would travel in
+ * every one of them, or be dropped by any copy). Held on `globalThis` so two copies of this package in one
+ * process agree on it.
+ */
+const REFUSALS_KEY = Symbol.for('@gnldev/durable.refusals');
+const refusals = (): WeakSet<object> => {
+  const g = globalThis as { [REFUSALS_KEY]?: WeakSet<object> };
+  return (g[REFUSALS_KEY] ??= new WeakSet<object>());
+};
+
+/**
+ * `return refused({ ok: false, reason: 'out of stock' })` — "nothing was done in this call". The same
+ * value comes back (the model, the journal and the JSON see no marker); the engine reads the mark once,
+ * when the body's result is settled, and treats the call as answered WITHOUT an effect: it frees the work
+ * key (see the head of this file). Use it only where nothing was done: a refusal that hid half an effect
+ * would let it be done twice. Needs an object or an array: a primitive carries no mark.
+ */
+export function refused<T extends object>(value: T): T {
+  if (value === null || typeof value !== 'object') {
+    throw new TypeError('@gnldev/durable: refused() takes the tool result object itself (an object or an array), e.g. refused({ ok: false, reason: \'out of stock\' }) — a primitive cannot carry the mark');
+  }
+  refusals().add(value);
+  return value;
+}
+
+/** Was this body result returned through `refused()`. The ONE reader of the mark. */
+export const isRefusal = (value: unknown): boolean => typeof value === 'object' && value !== null && refusals().has(value);
+
 /** What a call's records say about its effect. */
 export type CallEffect =
   | { state: 'happened'; output: unknown; by: 'record' | 'late-report' }
@@ -73,6 +112,8 @@ export async function lateReportsOf(journal: Journal, recordKey: string): Promis
 export function callEffect(record: ToolJournalRecord | undefined, late: LateReport[]): CallEffect {
   if (record?.status === 'succeeded') return { state: 'happened', output: record.output, by: 'record' };
   if (late.length > 0) return { state: 'happened', output: late[0]!.output, by: 'late-report' };
+  // A refusal is an answer without an effect: nothing to unwind.
+  if (record?.status === 'refused') return { state: 'none' };
   if (record?.status === 'running' || record?.status === 'failed') return { state: 'in-doubt' };
   return { state: 'none' };
 }

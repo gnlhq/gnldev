@@ -103,6 +103,8 @@ describe('an agent run that names no thread', () => {
     const res = await call(app as never, '/agents/bot/run', {
       method: 'POST', headers: H('acme-adm'), body: JSON.stringify({ runId: 'r3', prompt: 'hi', threadId: 'globex-thread' }),
     });
-    expect(res.status).toBe(403);
+    // d25/26a: the conversation store's refusal is the one rule every door gives — a typed 500, no longer a 403.
+    expect(res.status).toBe(500);
+    expect((await res.json()).code).toBe('memory_not_splittable');
   });
 });
