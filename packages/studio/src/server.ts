@@ -6,10 +6,10 @@ import { Hono, type Context } from 'hono';
 import { sseResponse } from './sse.js';
 
 import { STUDIO_ERROR_CODES } from './error-codes.js';
-import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, beginFork, settleModelContent, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, regressionReport, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, LIMIT_ERROR_CODES, requestRefusal, eraseSubject, subjectRuns, toJournal, decodeStepRecord, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
+import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, beginFork, settleModelContent, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, regressionReport, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, upstreamWire, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, LIMIT_ERROR_CODES, requestRefusal, eraseSubject, subjectRuns, toJournal, decodeStepRecord, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
 import type { JournalReader, Journal, Memory, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser, RunSummary, RunChange } from '@gnldev/durable';
-import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
+import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, answererOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason, type EngineAnswerer } from '@gnldev/auth';
 import { listTriggers } from '@gnldev/scheduler';
 import { mountSpa, notBuiltHtml } from './spa.js';
 import { openapiSpec, swaggerHtml } from './swagger.js';
@@ -126,6 +126,14 @@ export interface StudioCallbackCtx {
    * Host bu alanı yok sayarsa davranış bugünküyle birebir aynı kalır (eklemeli).
    */
   actor?: string;
+  /**
+   * WHO is answering — the request's principal as the engine's `Answerer` (@gnldev/auth `answererOf`):
+   * an operator answers as staff, named `operator:<id>`. `caller` is whose work it is; this is who clicked,
+   * and it is what the engine reads to decide whether the answer may be given (`approve` is for staff only)
+   * and what the approval record names. Forward it to the engine as the run's `answerer`
+   * (`createStudioRunner` does). A bridge that ignores it is read as its `caller`.
+   */
+  answerer?: EngineAnswerer;
 }
 
 export type StudioResume = (
@@ -3682,9 +3690,12 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       //       davet etmeye devam ediyordu — hem de kayıt hâlâ askıdayken, yani iş HENÜZ YAPILMAMIŞKEN.
       // Sonda motorun KENDİ yardımcısı (hasRunProbe), kopyası değil: "terminal" sözlüğü ve taze
       // 'running' inceliği orada yaşıyor, ve bir kuralın iki tanımı iki farklı karar demektir.
+      const answerer = callbackCtx(c).answerer;
       const recorded = await dResolveApprovals(rw as never, id, body.approvals, {
         actor: verifiedActorOf(c),
         hasRun: hasRunProbe(rw as never, id),
+        // Who clicked, from the request's principal — the engine decides whether they may (an operator may).
+        ...(answerer ? { answerer } : {}),
       });
       const anyOk = Object.values(recorded ?? {}).some((v) => v === true);
       await audit(c, anyOk ? 'approve' : 'deny', id, { approvals: recorded, batch: true });
@@ -4612,10 +4623,10 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
     const body = parsedBody.value as { rules?: PolicyRule[]; ifVersion?: number } | null;
     if (!Array.isArray(body?.rules)) return c.json({ error: 'a rules array is required' }, 400);
-    const ACTIONS = new Set(['allow', 'deny', 'require-approval']);
+    const ACTIONS = new Set(['allow', 'deny', 'confirm', 'approve', 'require-approval']);
     for (const r of body.rules) {
       if (!r || typeof r.tool !== 'string' || !r.tool.trim() || !ACTIONS.has(r.action)) {
-        return c.json({ error: "every rule must be { tool: string, action: 'allow'|'deny'|'require-approval', reason? }" }, 400);
+        return c.json({ error: "every rule must be { tool: string, action: 'allow'|'deny'|'confirm'|'approve'|'require-approval', reason? }" }, 400);
       }
     }
     const prev = (await rw.get!(POLICY_KEY)) as PolicyDoc | undefined;
@@ -4848,6 +4859,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
         error: eu?.message ?? String(e),
         code: up.code,
         ...(up.upstreamStatus !== undefined ? { upstreamStatus: up.upstreamStatus } : {}),
+        ...upstreamWire(up),
         ...(up.retryAfter !== undefined ? { retryAfter: up.retryAfter } : {}),
       }, up.status);
       if (up.retryAfter !== undefined) res.headers.set('Retry-After', String(up.retryAfter));
@@ -4877,7 +4889,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const p: Principal | null = authProvider && bindsIdentity(authProvider) ? principalOf(c.req.raw) : SINGLE_OPERATOR;
     const name = typeof named === 'string' && named !== '' ? named : undefined;
     const caller = engineCallerOf(p, name);
-    return { orgId: callerOrg(c), caller };
+    const answerer = answererOf(p);
+    return { orgId: callerOrg(c), caller, ...(answerer ? { answerer } : {}) };
   };
   /**
    * An org-invisible CODE-DEFINED agent → 404 (does NOT LEAK that it exists, same body as unknown-agent).

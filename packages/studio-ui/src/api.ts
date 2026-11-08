@@ -805,7 +805,7 @@ export interface PermissionCatalog {
 export interface AuditFilters { limit?: number; action?: string; q?: string; }
 export interface AgentVersion { version: number; model: string; system?: string; maxSteps?: number; note?: string; createdAt: number; }
 export interface ManagedAgentRecord { name: string; active: number | null; versions: AgentVersion[]; }
-export interface PolicyRule { tool: string; action: 'allow' | 'deny' | 'require-approval'; reason?: string; }
+export interface PolicyRule { tool: string; action: 'allow' | 'deny' | 'confirm' | 'approve' | 'require-approval'; reason?: string; }
 export interface PolicyDoc { version: number; rules: PolicyRule[]; updatedAt?: number; }
 /** USD per 1M tokens. `cachedInputPer1M` is the cache-READ rate; cache writes are not modelled. */
 export interface ModelPrice { inputPer1M: number; outputPer1M: number; cachedInputPer1M?: number; }

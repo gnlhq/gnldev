@@ -11,7 +11,7 @@
 // objects). A tool call's arguments (`lookup({ email })`) reached thread memory and
 // `response.messages` raw, because `redactMessages` masks only text parts.
 import { describe, it, expect } from 'vitest';
-import { InMemoryJournal, BasicMemory, runDurable, streamDurable } from '@gnldev/durable';
+import { InMemoryJournal, BasicMemory, runDurable, streamDurable, mintCallId } from '@gnldev/durable';
 import { toolCallingModel } from '@gnldev/durable/mock';
 import { piiRedactor } from '../src/pii.js';
 
@@ -34,7 +34,7 @@ async function run(thrown: () => unknown) {
     tools: { lookup: { execute: async () => { throw thrown(); } } },
     processors: [piiRedactor({ redactToolResults: true })],
   } as any);
-  const record = await journal.get<any>('r1:tool:call-1');
+  const record = await journal.get<any>(`r1:tool:${mintCallId('call-1', 'r1', 0, 0)}`); // the GNL id of the model's call-1
   return {
     text: r.text,
     record,

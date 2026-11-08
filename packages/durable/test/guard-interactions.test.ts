@@ -14,9 +14,13 @@ import { reconstructState } from '../src/time-travel.js';
 import { readRunTaint } from '../src/taint.js';
 import { readIncidents } from '../src/incidents.js';
 import { DuplicateSideEffectError, TaintedSideEffectError } from '../src/limits.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
 afterEach(() => vi.restoreAllMocks());
+
+/** The GNL id of `call-<n>` of `runId`: the n-th model step (0-based n-1) of these scripts issues it. */
+const cid = (n: number, runId: string) => mintCallId(`call-${n}`, runId, n - 1, 0);
 
 const sawNudge = (prompt: any[]) => JSON.stringify(prompt ?? []).includes('__gnl_reflected');
 
@@ -52,7 +56,7 @@ describe('two-phase deny (suspend first → deny on RESUME) — real bug #3', ()
     const r2 = await resumeRun('dd-g', { journal, ...mk(), approvals: { 'call-1': false } });
     expect(counter.runs).toBe(0); // never executed
     expect(r2.interrupts).toHaveLength(0); // NOT re-suspended — this was the bug
-    const rec = await journal.get<any>('dd-g:tool:call-1');
+    const rec = await journal.get<any>(`dd-g:tool:${cid(1, 'dd-g')}`);
     expect(rec).toMatchObject({ status: 'denied' });
     // The original suspend reason still carries into the denial — but QUOTED, behind the outcome.
     // Verbatim it read as a live request ("needs a human"), and a model handed that alongside
@@ -78,7 +82,7 @@ describe('two-phase deny (suspend first → deny on RESUME) — real bug #3', ()
     const r2 = await resumeRun('dd-d', { journal, ...mk(), approvals: { 'call-2': false } });
     expect(counter.runs).toBe(1); // the duplicate stayed un-executed
     expect(r2.interrupts).toHaveLength(0);
-    const rec = await journal.get<any>('dd-d:tool:call-2');
+    const rec = await journal.get<any>(`dd-d:tool:${cid(2, 'dd-d')}`);
     expect(rec).toMatchObject({ status: 'denied' });
     expect(rec.output.reason).toContain('Duplicate side effect'); // provenance survives into the denial
     expect(r2.text).toContain('Done');
@@ -111,9 +115,9 @@ describe('two-phase deny (suspend first → deny on RESUME) — real bug #3', ()
     const r2 = await resumeRun('dd-t', { journal, model: model(), tools: { fetchPage, sendMoney }, limits, approvals: { 'call-2': false } });
     expect(counters.sends).toBe(0); // the injected action never ran
     expect(r2.interrupts).toHaveLength(0);
-    const rec = await journal.get<any>('dd-t:tool:call-2');
+    const rec = await journal.get<any>(`dd-t:tool:${cid(2, 'dd-t')}`);
     expect(rec).toMatchObject({ status: 'denied' });
-    expect(rec.output.reason).toContain("'fetchPage' (call-1)"); // the approver's provenance carries into the denial
+    expect(rec.output.reason).toContain(`'fetchPage' (${cid(1, 'dd-t')})`); // the approver's provenance carries into the denial
     expect(r2.text).toContain('Done');
   });
 });
@@ -143,7 +147,7 @@ describe('taint source hardening', () => {
       limits: { taintedSideEffects: 'block' },
     }).catch((e) => expect(e).toBeInstanceOf(TaintedSideEffectError));
     expect(sends).toBe(0); // gated even though the fetch FAILED
-    expect(await readRunTaint(journal, 'tf-1')).toMatchObject({ toolCallId: 'call-1', source: 'tool' });
+    expect(await readRunTaint(journal, 'tf-1')).toMatchObject({ toolCallId: cid(1, 'tf-1'), source: 'tool' });
   });
 
   it('first-wins provenance: a SECOND untrusted success never overwrites the original taint source', async () => {
@@ -165,7 +169,7 @@ describe('taint source hardening', () => {
     });
     await runDurable({ runId: 'fw-1', journal, model, tools: { fetchA: mkFetch('fetchA'), fetchB: mkFetch('fetchB') }, prompt: 'x', stopWhen: stepCountIs(6) });
     // The mark points at the EARLIEST untrusted entry — the point after which nothing can be assumed clean.
-    expect(await readRunTaint(journal, 'fw-1')).toMatchObject({ toolCallId: 'call-1', toolName: 'fetchA' });
+    expect(await readRunTaint(journal, 'fw-1')).toMatchObject({ toolCallId: cid(1, 'fw-1'), toolName: 'fetchA' });
   });
 });
 
@@ -194,9 +198,9 @@ describe('duplicate-guard × taint-guard composition', () => {
     const res = await runDurable({ runId: 'cb-0', journal, model: comboModel(), tools: comboTools(counter), prompt: 'x', stopWhen: stepCountIs(10) });
     expect(counter.runs).toBe(0);
     expect(res.interrupts).toHaveLength(1);
-    expect(res.interrupts[0]).toMatchObject({ toolCallId: 'call-2' });
+    expect(res.interrupts[0]).toMatchObject({ toolCallId: cid(2, 'cb-0') });
     const incidents = await readIncidents(journal, 'cb-0');
-    expect(incidents.map((i) => [i.source, i.action, i.toolCallId])).toEqual([['taint-guard', 'suspend', 'call-2']]);
+    expect(incidents.map((i) => [i.source, i.action, i.toolCallId])).toEqual([['taint-guard', 'suspend', cid(2, 'cb-0')]]);
   });
 
   it("both at 'warn' (asked for): the tainted duplicate executes ONCE more with BOTH incidents journaled (nothing masks anything)", async () => {
@@ -208,11 +212,11 @@ describe('duplicate-guard × taint-guard composition', () => {
       limits: { sideEffectDuplicates: 'warn', taintedSideEffects: 'warn' },
     });
     expect(counter.runs).toBe(2); // warn mode: both sends executed
-    const call3 = (await readIncidents(journal, 'cb-1')).filter((i) => i.toolCallId === 'call-3');
+    const call3 = (await readIncidents(journal, 'cb-1')).filter((i) => i.toolCallId === cid(3, 'cb-1'));
     // The SAME call drew BOTH observations — the guards are orthogonal, neither swallows the other.
     expect(call3.map((i) => i.source).sort()).toEqual(['duplicate-guard', 'taint-guard']);
     // call-2 (first send, post-taint but NOT a duplicate) drew only the taint warn.
-    const call2 = (await readIncidents(journal, 'cb-1')).filter((i) => i.toolCallId === 'call-2');
+    const call2 = (await readIncidents(journal, 'cb-1')).filter((i) => i.toolCallId === cid(2, 'cb-1'));
     expect(call2.map((i) => i.source)).toEqual(['taint-guard']);
   });
 
@@ -236,8 +240,8 @@ describe('duplicate-guard × taint-guard composition', () => {
     expect(counter.runs).toBe(1); // call-2 executed (taint-warned); call-3 blocked as duplicate
     const incidents = await readIncidents(journal, 'cb-2');
     expect(incidents.map((i) => [i.source, i.action, i.toolCallId])).toEqual([
-      ['taint-guard', 'warn', 'call-2'],
-      ['duplicate-guard', 'block', 'call-3'],
+      ['taint-guard', 'warn', cid(2, 'cb-2')],
+      ['duplicate-guard', 'block', cid(3, 'cb-2')],
       // NO ['taint-guard', *, 'call-3'] entry: the dup guard returned BEFORE the taint check — the
       // absence of that incident is the ordering proof.
     ]);
@@ -283,6 +287,6 @@ describe('streaming parity', () => {
     });
     expect(await res.text).toBe('Refused.');
     expect(sends).toBe(0); // the injected action never executed, mid-stream
-    expect(await journal.get('st-1:tool:call-2')).toMatchObject({ status: 'reflected' });
+    expect(await journal.get(`st-1:tool:${cid(2, 'st-1')}`)).toMatchObject({ status: 'reflected' });
   });
 });

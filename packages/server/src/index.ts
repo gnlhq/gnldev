@@ -4,9 +4,9 @@ import { runRecordKey, runRecordPrefix } from '@gnldev/durable';
 import { Hono, type Context } from 'hono';
 import { toFetchHandler, type FetchHandler } from './handler.js';
 import { verifyA2ARequest } from '@gnldev/a2a';
-import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, callerConflictAnswer, upstreamFailure, requestRefusal, assertRootThreadId, orgPrefix, withRootScope, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, decideDoorRunAccess, runNotFound, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
+import { createGnl, agentVisibleToOrg, withOrg, withOrgStorage, scopeConfigToOrg, withSubjectJournal, withSubjectMemory, threadOwnerOf, type ThreadOwnership, ORG_RECORD_PRE, checkBudget, getOrgUsage, budgetsEnforceable, toJournal, asReaderJournal, appendLog, RunLimitExceededError, ToolLoopDetectedError, RunThreadMismatchError, blockedErrorCode, callerConflictAnswer, upstreamFailure, upstreamWire, requestRefusal, assertRootThreadId, orgPrefix, withRootScope, sealRequestContext, sealFieldsOf, fingerprintAgent, recordAgent, approveAgent, blockAgent, isAgentServable, listAgentRegistry, publicConflictDetail, describeProtections, formatProtections, teachingError, resolveWorkIdentity, runOwnerOf, decideRunAccess, decideDoorRunAccess, runNotFound, userIdOf, type Caller, type RunDecision, type RunOwner, type RawJournal, type RequestContext, readJsonObject, isRunCursor, pageRunsFromArray, isRunRecorded } from '@gnldev/durable';
 import type { CreateGnlConfig, Journal, JournalReader, BudgetLimit, UsageCostCache, RunLimits, ResolvedWorkIdentity, WorkScopeKind, StreamSurface as DurableStreamSurface, StreamSurfaceInput } from '@gnldev/durable';
-import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, callerKind, subjectIdProblem, actorIdOf, engineCallerOf, markRefusal, settleDecision, decisionNotRecorded, type AuthProvider, type ReadWriteAuth, type Principal, type PrincipalKind, type RefusalReason, refuseMisplacedOptions, doorOptionKeys, printProtections } from '@gnldev/auth';
+import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, callerKind, subjectIdProblem, actorIdOf, engineCallerOf, answererOf, markRefusal, settleDecision, decisionNotRecorded, type AuthProvider, type ReadWriteAuth, type Principal, type PrincipalKind, type RefusalReason, refuseMisplacedOptions, doorOptionKeys, printProtections } from '@gnldev/auth';
 // P0.4 @gnldev/workflow is zero-dependency (see its package.json) — depending on it
 // from @gnldev/server is a clean one-way edge (server→workflow), NOT circular: @gnldev/durable's registry.ts
 // deliberately stays workflow-agnostic (WorkflowLike is a structural type, no import) to avoid a
@@ -701,6 +701,7 @@ function upstreamErrorResponse(c: Context, e: unknown): Response | undefined {
     error: err?.message ?? String(e),
     code: up.code,
     ...(up.upstreamStatus !== undefined ? { upstreamStatus: up.upstreamStatus } : {}),
+    ...upstreamWire(up),
     ...(up.retryAfter !== undefined ? { retryAfter: up.retryAfter } : {}),
   };
   const res = c.json(body, up.status);
@@ -1093,6 +1094,15 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     const p = principalFor(c);
     const name = typeof named === 'string' && named !== '' ? named : undefined;
     return engineCallerOf(p, name);
+  }
+  /**
+   * WHO answers the `approvals` this request carries — through the one mapping every door uses, @gnldev/auth
+   * `answererOf`, beside `callerOf`: `callerOf` is whose RUN it is (a staff member resuming Ayşe's run is
+   * Ayşe's), this is who is clicking. A door never decides what an answerer may answer; the engine does.
+   */
+  function answererOfRequest(c: Context) {
+    const a = answererOf(principalFor(c));
+    return a ? { answerer: a } : {};
   }
   /** The user a read names: its own for a subject, `?resourceId=` for anyone else. */
   const namedOnRead = (c: Context): string | undefined => c.req.query('resourceId') || undefined;
@@ -1583,6 +1593,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
         messages: body.messages,
         threadId: body.threadId,
         approvals: body.approvals,
+        ...answererOfRequest(c),
         context: sealFor(
           // Not merged here, because sealRequestContext writes `org` itself from the server-derived
           // value. This is a simplification, NOT a fix: measured over 21 body shapes × 4 server states
@@ -1680,6 +1691,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
       const r = await s.gnl.run(name, {
         runId: body.runId,
         approvals: body.approvals,
+        ...answererOfRequest(c),
         // Sealed like run and stream. This path built the context by hand and therefore carried
         // neither `__gnl_resourceId` nor `__gnl_threadId`, so a dynamic `system`/`model`/`tools`
         // function saw an identity on a fresh run and none on the resume of that same run — the two
@@ -1990,6 +2002,7 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
         messages: body.messages,
         threadId: body.threadId,
         approvals: body.approvals,
+        ...answererOfRequest(c),
         context: sealFor(
           // Not merged here, because sealRequestContext writes `org` itself from the server-derived
           // value. This is a simplification, NOT a fix: measured over 21 body shapes × 4 server states
@@ -2509,6 +2522,10 @@ function restApiApp(config: CreateGnlConfig, opts: RestApiOptions = {}): Hono {
     if (!viewSubjectOf(c) && (await runDecision(c, s, runId)) === 'deny') return notFound();
     const entries = await s.journal.readRun(runId);
     if (entries.length) return c.json(entries);
+    // A run recorded WITHOUT steps (its first model call was refused) is listed by GET /runs, so it opens:
+    // an empty list is its truthful journal. (A subject's view hides records that are not theirs, so this
+    // read is the same ownership answer as above.)
+    if (await isRunRecorded(s.journal, runId)) return c.json([]);
     // The view hid it, or there is nothing: the caller gets the same 404, and the record asks the raw
     // run which one it was (runAccess records a `deny` as the ownership refusal it is).
     if (viewSubjectOf(c)) await runDecision(c, s, runId);

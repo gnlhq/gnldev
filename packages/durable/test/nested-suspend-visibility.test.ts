@@ -18,12 +18,23 @@ import { InMemoryJournal, nestedAgentRunId } from '../src/journal.js';
 import { createGnl } from '../src/registry.js';
 import { derivedRunId } from '../src/hash.js';
 import { RunInputMismatchError } from '../src/errors.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, finalTextResult, toolCallResult, countToolResults } from './mock.js';
 
 const TCID = 'call-devret';
 const CHILD_TCID = 'alt-call-1';
-/** The child's question, addressed from the parent: `<delegation call>/<child call>` (guard.ts addressedInterrupt). */
-const ASKED = `${TCID}/${CHILD_TCID}`;
+/**
+ * The ids of one run, as GNL holds them: the model's ids are minted at the model boundary (step 0, first of
+ * the answer). The parent's delegation call, the child run that call starts, the child's own call (minted
+ * in the child's run) and the child's question addressed from the parent: `<delegation call>/<child call>`
+ * (guard.ts addressedInterrupt).
+ */
+function idsOf(runId: string, childTcid = CHILD_TCID) {
+  const parent = mintCallId(TCID, runId, 0, 0);
+  const childRun = nestedAgentRunId(runId, parent);
+  const child = mintCallId(childTcid, childRun, 0, 0);
+  return { parent, childRun, child, asked: `${parent}/${child}` };
+}
 
 /** Ana ajan bir kez alt ajanı çağırır; alt ajan onay isteyen bir aracı çağırır. */
 function setup(journal: InMemoryJournal, counter?: { n: number }, childTcid = CHILD_TCID) {
@@ -59,8 +70,8 @@ describe('alt ajanın askısı görünür', () => {
     const r = await setup(journal).run('ana', { runId: 'ns-1', prompt: 'devret' } as never);
     expect(r.interrupts.length, 'ebeveyn askıya girmedi — soru insana hiç ulaşmadı').toBeGreaterThan(0);
     // Çocuğun koşumu da gerçekten askıda (ikisi tutarlı olmalı, biri diğerini gizlememeli).
-    const child = nestedAgentRunId('ns-1', TCID);
-    expect((await journal.get<{ status?: string }>(`${child}:tool:${CHILD_TCID}`))?.status).toBe('suspended');
+    const id = idsOf('ns-1');
+    expect((await journal.get<{ status?: string }>(`${id.childRun}:tool:${id.child}`))?.status).toBe('suspended');
   });
 
   it('soru SORANIN kimliğiyle yüzeye çıkar — ebeveynin vekil id\'siyle değil', async () => {
@@ -71,13 +82,14 @@ describe('alt ajanın askısı görünür', () => {
     const journal = new InMemoryJournal();
     const r = await setup(journal).run('ana', { runId: 'ns-2', prompt: 'devret' } as never);
     const it0 = r.interrupts[0] as any;
-    expect(it0?.toolCallId, 'yüzeydeki kimlik cevaplanabilir değil').toBe(ASKED);
+    const id = idsOf('ns-2');
+    expect(it0?.toolCallId, 'yüzeydeki kimlik cevaplanabilir değil').toBe(id.asked);
     expect(it0?.toolName).toBe('paraGonder');
     // Bağlam kaybolmasın: insan bunun bir alt ajandan geldiğini okuyabilmeli.
     expect(String(it0?.reason)).toContain('sub-agent');
     expect(String(it0?.reason)).toContain('confirmation');
     // Vekil kimliği yüzeyde HİÇ görünmez.
-    expect(r.interrupts.map((i: any) => i.toolCallId)).not.toContain(TCID);
+    expect(r.interrupts.map((i: any) => i.toolCallId)).not.toContain(id.parent);
   });
 
   it('ONAY çocuğa iner ve iş tamamlanır — yüzeydeki kimlikle', async () => {
@@ -91,8 +103,8 @@ describe('alt ajanın askısı görünür', () => {
     const asked = (r1.interrupts[0] as any).toolCallId;
     const r2 = await setup(journal, counter).run('ana', { runId: 'ns-3', prompt: 'devret', approvals: { [asked]: true } } as never);
     expect(r2.interrupts.length, 'onaydan sonra hâlâ askıda').toBe(0);
-    const child = nestedAgentRunId('ns-3', TCID);
-    expect((await journal.get<{ status?: string }>(`${child}:tool:${CHILD_TCID}`))?.status).toBe('succeeded');
+    const id = idsOf('ns-3');
+    expect((await journal.get<{ status?: string }>(`${id.childRun}:tool:${id.child}`))?.status).toBe('succeeded');
     expect(counter.n).toBe(1);
   });
 
@@ -103,12 +115,12 @@ describe('alt ajanın askısı görünür', () => {
     const journal = new InMemoryJournal();
     const counter = { n: 0 };
     await setup(journal, counter).run('ana', { runId: 'ns-5', prompt: 'devret' } as never);
-    const r2 = await setup(journal, counter).run('ana', { runId: 'ns-5', prompt: 'devret', approvals: { [TCID]: true } } as never);
+    const r2 = await setup(journal, counter).run('ana', { runId: 'ns-5', prompt: 'devret', approvals: { [idsOf('ns-5').parent]: true } } as never);
     expect(r2.interrupts.length, 'vekil onayı askıyı çözmüş — soru hâlâ cevaplanmamışken').toBeGreaterThan(0);
-    expect(r2.interrupts[0]!.toolCallId).toBe(ASKED);
+    expect(r2.interrupts[0]!.toolCallId).toBe(idsOf('ns-5').asked);
     expect(counter.n, 'vekil onayı yan etkiyi çalıştırdı').toBe(0);
-    const child = nestedAgentRunId('ns-5', TCID);
-    expect((await journal.get<{ status?: string }>(`${child}:tool:${CHILD_TCID}`))?.status).toBe('suspended');
+    const id5 = idsOf('ns-5');
+    expect((await journal.get<{ status?: string }>(`${id5.childRun}:tool:${id5.child}`))?.status).toBe('suspended');
     // Sahte iz yazılmadı: vekile verilen cevap bir "bilerek tekrar" kararı değildir.
     expect(await journal.listKeys(`ns-5:proc:override-`)).toEqual([]);
   });
@@ -119,10 +131,10 @@ describe('alt ajanın askısı görünür', () => {
     const journal = new InMemoryJournal();
     const counter = { n: 0 };
     await setup(journal, counter).run('ana', { runId: 'ns-6', prompt: 'devret' } as never);
-    const r2 = await setup(journal, counter).run('ana', { runId: 'ns-6', prompt: 'devret', approvals: { [TCID]: false } } as never);
+    const r2 = await setup(journal, counter).run('ana', { runId: 'ns-6', prompt: 'devret', approvals: { [idsOf('ns-6').parent]: false } } as never);
     expect(r2.interrupts.length, 'vekil reddi soruyu yuttu').toBeGreaterThan(0);
-    expect(r2.interrupts[0]!.toolCallId).toBe(ASKED);
-    expect((await journal.get<{ status?: string }>(`ns-6:tool:${TCID}`))?.status)
+    expect(r2.interrupts[0]!.toolCallId).toBe(idsOf('ns-6').asked);
+    expect((await journal.get<{ status?: string }>(`ns-6:tool:${idsOf('ns-6').parent}`))?.status)
       .toBe('suspended'); // 'denied' DEĞİL — vekile verilen ret ebeveyni kapatmaz
     expect(counter.n).toBe(0);
   });
@@ -134,11 +146,11 @@ describe('alt ajanın askısı görünür', () => {
     const asked = (r1.interrupts[0] as any).toolCallId;
     const r2 = await setup(journal, counter).run('ana', { runId: 'ns-7', prompt: 'devret', approvals: { [asked]: false } } as never);
     expect(counter.n, 'reddedilen iş yine de koştu').toBe(0);
-    const child = nestedAgentRunId('ns-7', TCID);
-    expect((await journal.get<{ status?: string }>(`${child}:tool:${CHILD_TCID}`))?.status).toBe('denied');
+    const id = idsOf('ns-7');
+    expect((await journal.get<{ status?: string }>(`${id.childRun}:tool:${id.child}`))?.status).toBe('denied');
     // Ret de bir cevaptır: ebeveyn serbest kalır ve çocuğun nihai sözünü alır.
     expect(r2.interrupts.length, 'ret sonrası ebeveyn hâlâ askıda — koşum hiç bitmiyor').toBe(0);
-    expect((await journal.get<{ status?: string }>(`ns-7:tool:${TCID}`))?.status).toBe('succeeded');
+    expect((await journal.get<{ status?: string }>(`ns-7:tool:${id.parent}`))?.status).toBe('succeeded');
   });
 
   it('ebeveynin onay haritası çocuğa OLDUĞU GİBİ inmez — aynı adlı id sızmaz', async () => {
@@ -152,8 +164,8 @@ describe('alt ajanın askısı görünür', () => {
     );
     expect(counter.n, 'ebeveynin alakasız onayı çocuğun kapısını açtı').toBe(0);
     expect(r.interrupts.length, 'çocuk soru sormadan onaylandı').toBeGreaterThan(0);
-    const child = nestedAgentRunId('ns-8', TCID);
-    expect((await journal.get<{ status?: string }>(`${child}:tool:call_0`))?.status).toBe('suspended');
+    const id = idsOf('ns-8', 'call_0');
+    expect((await journal.get<{ status?: string }>(`${id.childRun}:tool:${id.child}`))?.status).toBe('suspended');
   });
 
   it('askı YOKKEN davranış değişmez — sentinel uydurulmaz', async () => {
@@ -203,7 +215,7 @@ describe('iç içe askı: onayın re-POST\'u büyümüş gövdeyle', () => {
     const counter = { n: 0 };
     const r1 = await setup(journal, counter).run('ana', { runId: parentRunId, messages: ilkGovde } as never);
     const asked = (r1.interrupts[0] as any).toolCallId;
-    expect(asked).toBe(ASKED);
+    expect(asked).toBe(idsOf(parentRunId).asked);
 
     const r2 = await setup(journal, counter).run(
       'ana',
@@ -211,8 +223,8 @@ describe('iç içe askı: onayın re-POST\'u büyümüş gövdeyle', () => {
     );
     expect(r2.interrupts.length, 'onaydan sonra hâlâ askıda').toBe(0);
     expect(counter.n, 'yan etki hiç çalışmadı — onay reddedilmiş').toBe(1);
-    const child = nestedAgentRunId(parentRunId, TCID);
-    expect((await journal.get<{ status?: string }>(`${child}:tool:${CHILD_TCID}`))?.status).toBe('succeeded');
+    const id = idsOf(parentRunId);
+    expect((await journal.get<{ status?: string }>(`${id.childRun}:tool:${id.child}`))?.status).toBe('succeeded');
   });
 
   it('UYDURMA bir id büyümüş gövdeyi geçirmez — kaçış izi ister, alan varlığını değil', async () => {

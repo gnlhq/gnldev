@@ -34,7 +34,7 @@ export function refuseMemoryBagNames(where: string, cfg: { recall?: unknown; wor
 }
 type M = import('./agent-memory.js').AgentMemory;
 export const GET_MESSAGES_NAMES = optionNames<NonNullable<Parameters<M['getMessages']>[1]>>()(['query', 'resourceId', 'scope']);
-export const LOAD_CONTEXT_NAMES = optionNames<NonNullable<Parameters<M['loadContext']>[1]>>()(['query', 'resourceId', 'incoming']);
+export const LOAD_CONTEXT_NAMES = optionNames<NonNullable<Parameters<M['loadContext']>[1]>>()(['query', 'resourceId', 'incoming', 'titleIncoming']);
 export const RECALL_OBSERVATIONS_NAMES = optionNames<NonNullable<Parameters<M['recallObservationsSemantic']>[2]>>()(['topK', 'threshold']);
 export const CREATE_THREAD_NAMES = optionNames<NonNullable<Parameters<M['createThread']>[0]>>()(['id', 'resourceId', 'title', 'metadata']);
 export const UPDATE_THREAD_NAMES = optionNames<NonNullable<Parameters<M['updateThread']>[1]>>()(['title', 'metadata']);

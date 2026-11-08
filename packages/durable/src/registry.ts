@@ -6,7 +6,7 @@ let wfAnonCounter = 0; // runWorkflow's anon-fallback uniqueness within a proces
 import type { ToolSchemaRuleLike } from './types.js';
 import { decodeStepRecord } from './step-record.js';
 import { stepCountIs, tool as aiTool, jsonSchema } from 'ai';
-import { runDurable, streamDurable } from './run.js';
+import { runDurable, streamDurable, CONTINUES_RECORDED_INPUT } from './run.js';
 import type { StreamBreach } from './run.js';
 import { resolveModel, withModelFallback, type FallbackCandidate } from './model-router.js';
 import { delegationTool, runDelegated, type ChildFrame, childOutcome } from './agent-tool.js';
@@ -18,6 +18,7 @@ import { argsHash, derivedRunId, DEPLOYMENT_SCOPE, type WorkScope, type WorkScop
 import { RunBusyError, runBusyMessage, RunSweptError, RunInputMismatchError, RunOwnerMismatchError, ThreadOwnerMismatchError } from './errors.js';
 import { admitThreadRun } from './thread-owner.js';
 import { user, staff, callerOf, callerFromResourceId, userIdOf, resolveCaller, identityOf, runIdentity, admitRun, childIdentity, requestOf, type Caller, type RunIdentity } from './run-identity.js';
+import type { Answerer, Approvers } from './approval-authority.js';
 import { recordIdemConflict } from './idem-ledger.js';
 import { runScoreSample, assertDistinctScorerNames, scoreRunMemoized } from './scoring.js';
 import { recordRunScores } from './metrics.js';
@@ -578,7 +579,8 @@ export interface CreateGnlConfig {
    * 'assistant' ve 'headless' (heyet matrisi, 7 Eyl 2026): critical'ın sertlik paketini AÇMADAN,
    * yalnız sınıf-bazlı tekrar politikasını basarlar (policy-matrix.ts):
    *   assistant → para/bildirim sorar, delete "zaten yapılmıştı" notu, upsert sessiz;
-   *               replayDisclosure default 'explain' (ekranda insan var, dürüst anlatım açık).
+   *               replayDisclosure default 'explain' (ekranda insan var, dürüst anlatım açık);
+   *               `config.replayDisclosure` bunu geçersiz kılar (çağrı başına değer hepsinden üstün).
    *   headless  → soracak insan yok: para tekrarı typed-RED (DLQ'ya düşer), bildirim/delete atlar
    *               + iz; hiçbir hücre suspend üretmez. Zarf/iz her hücrede tam (görünmezlik yasağı).
    * Workflow/lock/strictInput kapıları bu ikisine GELMEZ — onlar critical'ın kimliğidir.
@@ -602,6 +604,23 @@ export interface CreateGnlConfig {
    * persists. Default 'silent' (existing behavior). See RunDurableArgs.replayDisclosure.
    */
   replayDisclosure?: 'explain' | 'silent';
+  /**
+   * Who may say YES to an approve question (a guard's `approve`, a tool's `approve`, a call that may
+   * already have happened). Default: staff — an operator, the application's own server — and never the end
+   * user whose work it is. When set it REPLACES that default: whoever the function names is authorised
+   * (it can narrow as well as widen). `fourEyes()` is the ready-made rule: the approver must not be the
+   * person who started the work. A confirm question and anybody's NO are not asked of it.
+   */
+  approvers?: Approvers;
+  /**
+   * Time limits for every run()/stream() of this instance (per-call `RunOptions.timeouts` wins, field by
+   * field). `modelStepMs` is the one that matters most: without it a provider connection that goes quiet
+   * leaves the run `running` until the HTTP client gives up (minutes, or never, depending on the runtime).
+   * It bounds a model step until its FIRST byte (a streamed answer that stalls mid-way is not covered).
+   * A step that times out fails the run with `StepTimeoutError`, which counts as the run's own failure.
+   * No default: a limit that fits a chat turn would cut a long non-streamed generation.
+   */
+  timeouts?: { modelStepMs?: number; toolMs?: number; claimTtlMs?: number };
 }
 
 /**
@@ -712,6 +731,12 @@ export interface RunOptions {
    */
   caller?: Caller;
   approvals?: Record<string, boolean>;
+  /**
+   * WHO answers `approvals` in this call — set by a door from its verified principal (@gnldev/auth
+   * `answererOf`), because `caller` is the run's OWNER and so cannot say who is answering. Absent:
+   * derived from `caller` (see RunDurableArgs.answerer). Also recorded as who started the run.
+   */
+  answerer?: Answerer;
   /** Request context: passed to dynamic model/system/tools functions (organization/role/user…). */
   context?: RequestContext;
   /** Playground session overrides (agent definition is used if not given). */
@@ -904,7 +929,7 @@ function toolsDeclaringEffectClass(config: CreateGnlConfig): string[] {
 const CHILD_RUN_POLICY = {
   runId: 'own', workKey: 'own', prompt: 'own', messages: 'own', model: 'own', temperature: 'own', topP: 'own',
   system: 'own', tools: 'own', replay: 'own', trustRecordedInput: 'own',
-  threadId: 'frame', resourceId: 'frame', caller: 'frame', approvals: 'frame', abortSignal: 'frame',
+  threadId: 'frame', resourceId: 'frame', caller: 'frame', approvals: 'frame', answerer: 'frame', abortSignal: 'frame',
   context: 'inherit', limits: 'inherit', toolPolicy: 'inherit', strictInput: 'inherit', conflictLedger: 'inherit',
   auditOnReject: 'inherit', replayDisclosure: 'inherit', channel: 'inherit', tombstonePolicy: 'inherit', actor: 'inherit',
   timeouts: 'inherit', exclusiveModelStep: 'inherit', onBlocked: 'inherit', after: 'own',
@@ -1219,7 +1244,9 @@ export function createGnl(config: CreateGnlConfig) {
     }
     const threadId = (owner.record as { threadId?: unknown } | undefined)?.threadId;
     const args = await streamArgs(agentName, { runId: rec.runId, caller: owner.owner, ...(typeof threadId === 'string' ? { threadId } : {}) });
-    return (signal) => streamDurable({ ...args, abortSignal: signal });
+    // From its recorded input, said as such (run.ts CONTINUES_RECORDED_INPUT): this call has no content
+    // of its own, and a workKey run's input check refused it as "different work" (d25 U6).
+    return (signal) => streamDurable({ ...args, [CONTINUES_RECORDED_INPUT]: true, abortSignal: signal });
   }
 
   // ── BACKGROUND TOOLS (types.ts `background`, deferred.ts) ─────────────────────────────────────────
@@ -1250,6 +1277,7 @@ export function createGnl(config: CreateGnlConfig) {
       Object.assign(launcher, {
         idempotent: true,
         ...((t as AnyTool).confirm !== undefined ? { confirm: (t as AnyTool).confirm } : {}),
+        ...((t as AnyTool).approve !== undefined ? { approve: (t as AnyTool).approve } : {}),
         execute: async (input: unknown, options: { toolCallId?: string; gnl?: GnlToolContext }) =>
           ({ status: 'started', taskId: await startTask(name, toolName, input, options) }),
         [BACKGROUND_BODY]: t,
@@ -1297,7 +1325,7 @@ export function createGnl(config: CreateGnlConfig) {
     const launcher = base.tools?.[spec.tool] as Record<symbol, unknown> | undefined;
     const t = launcher?.[BACKGROUND_BODY] as AnyTool | undefined;
     if (!t) throw new Error(`@gnldev/durable: agent '${name}' has no background tool '${spec.tool}' to run task '${runId}' with`);
-    const { background: _b, confirm: _c, ...body } = t;
+    const { background: _b, confirm: _c, approve: _ap, ...body } = t;
     // Built by the engine from the parent's recorded call: the one place a task's run is begun from.
     return minted({
       ...base,
@@ -1502,7 +1530,7 @@ export function createGnl(config: CreateGnlConfig) {
       opts = {
         ...opts,
         limits: { sideEffectDuplicates: { byClass: PRESET_MATRIX[config.preset], default: PRESET_DEFAULT[config.preset] }, ...(opts.limits ?? {}) },
-        ...(config.preset === 'assistant' ? { replayDisclosure: opts.replayDisclosure ?? 'explain' } : {}),
+        ...(config.preset === 'assistant' ? { replayDisclosure: opts.replayDisclosure ?? config.replayDisclosure ?? 'explain' } : {}),
       };
     }
     const a = agent(name);
@@ -1579,6 +1607,8 @@ export function createGnl(config: CreateGnlConfig) {
       // uygulamalar, CLI, testler) için tek kimlik kanalı odur — ama yalnız mühürlü kimlik YOKKEN.
       ...((serverIdentity.resourceId ?? opts.actor) ? { actor: serverIdentity.resourceId ?? opts.actor } : {}),
       approvals: frame?.approvals ?? opts.approvals,
+      ...((frame?.answerer ?? opts.answerer) ? { answerer: frame?.answerer ?? opts.answerer } : {}),
+      ...(config.approvers ? { approvers: config.approvers } : {}),
       stopWhen: stepCountIs(a.maxSteps ?? 12),
       ...(opts.temperature != null ? { temperature: opts.temperature } : {}),
       ...(opts.topP != null ? { topP: opts.topP } : {}),
@@ -1595,7 +1625,7 @@ export function createGnl(config: CreateGnlConfig) {
       ...(opts.tombstonePolicy ? { tombstonePolicy: opts.tombstonePolicy } : {}),
       ...(config.schemaCompat ? { schemaCompat: config.schemaCompat } : {}),
       ...(opts.replay ? { replay: opts.replay } : {}),
-      ...(opts.timeouts ? { timeouts: opts.timeouts } : {}),
+      ...((opts.timeouts || config.timeouts) ? { timeouts: { ...config.timeouts, ...opts.timeouts } } : {}),
       ...(opts.exclusiveModelStep ? { exclusiveModelStep: opts.exclusiveModelStep } : {}),
       ...((frame?.abortSignal ?? opts.abortSignal) ? { abortSignal: frame?.abortSignal ?? opts.abortSignal } : {}), // P0.2: see RunOptions.abortSignal; a child stops with its parent
       // The declaration travels with the run so package #2's writer can freeze it into `:input`:
@@ -1643,7 +1673,7 @@ export function createGnl(config: CreateGnlConfig) {
       opts = {
         ...opts,
         limits: { sideEffectDuplicates: { byClass: PRESET_MATRIX[config.preset], default: PRESET_DEFAULT[config.preset] }, ...(opts.limits ?? {}) },
-        ...(config.preset === 'assistant' ? { replayDisclosure: opts.replayDisclosure ?? 'explain' } : {}),
+        ...(config.preset === 'assistant' ? { replayDisclosure: opts.replayDisclosure ?? config.replayDisclosure ?? 'explain' } : {}),
       };
     }
     const a = agent(name);
@@ -1710,6 +1740,8 @@ export function createGnl(config: CreateGnlConfig) {
       // uygulamalar, CLI, testler) için tek kimlik kanalı odur — ama yalnız mühürlü kimlik YOKKEN.
       ...((serverIdentity.resourceId ?? opts.actor) ? { actor: serverIdentity.resourceId ?? opts.actor } : {}),
       approvals: opts.approvals,
+      ...(opts.answerer ? { answerer: opts.answerer } : {}),
+      ...(config.approvers ? { approvers: config.approvers } : {}),
       stopWhen: stepCountIs(a.maxSteps ?? 12),
       ...(opts.temperature != null ? { temperature: opts.temperature } : {}),
       ...(opts.topP != null ? { topP: opts.topP } : {}),
@@ -1729,7 +1761,7 @@ export function createGnl(config: CreateGnlConfig) {
       // to a streamed (now: every registry) run.
       ...(config.schemaCompat ? { schemaCompat: config.schemaCompat } : {}),
       ...(opts.replay ? { replay: opts.replay } : {}),
-      ...(opts.timeouts ? { timeouts: opts.timeouts } : {}),
+      ...((opts.timeouts || config.timeouts) ? { timeouts: { ...config.timeouts, ...opts.timeouts } } : {}),
       ...(opts.exclusiveModelStep ? { exclusiveModelStep: opts.exclusiveModelStep } : {}),
       // (b): stream-only visibility callback (run() throws instead — see RunOptions.onBlocked).
       ...(opts.onBlocked ? { onBlocked: opts.onBlocked } : {}),

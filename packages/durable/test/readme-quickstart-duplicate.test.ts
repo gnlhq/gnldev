@@ -12,6 +12,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { runDurable, InMemoryStorage } from '../src/index.js';
 import { tool } from 'ai';
 import { z } from 'zod';
+import { mintCallId } from '../src/call-identity.js';
 import { streamFromGenerate } from './mock.js';
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
@@ -61,7 +62,7 @@ describe("the README quickstart's own headline scenario", () => {
     });
     expect(charges()).toBe(1);                       // the documented default, made visible
     expect(res.interrupts).toHaveLength(1);          // the repeat waits for a human
-    expect(res.interrupts[0]).toMatchObject({ toolCallId: 'call-B', toolName: 'chargeCard' });
+    expect(res.interrupts[0]).toMatchObject({ toolCallId: mintCallId('call-B', 'dup-suspend', 1, 0), toolName: 'chargeCard' });
   });
 
   it("'warn' (asked for) is the old permissive answer — it warns and charges again", async () => {

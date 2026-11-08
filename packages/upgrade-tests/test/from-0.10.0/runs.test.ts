@@ -28,6 +28,7 @@ import { SqliteStorage } from '@gnldev/durable/sqlite';
 import { PostgresStorage } from '@gnldev/durable/postgres';
 import { AgentMemory } from '@gnldev/memory';
 import { z } from 'zod';
+import { providerIds } from '../support.js';
 import { writeRuns, probeRuns, continueRuns } from '../../generate/runs.mjs';
 
 const FIXTURES = fileURLToPath(new URL('../../fixtures/0.10.0/', import.meta.url));
@@ -172,7 +173,7 @@ for (const b of [sqlite, ...(RUN_PG ? [postgres] : [])]) {
       expect(steps(ran, 'ran')).toEqual(['run-status', 'schema', 'thread-records', 'relations']);
       const fresh = await freshWith(b);
       const upgraded = old.open();
-      expect(await probeRuns(m, upgraded)).toEqual(await probeRuns(m, fresh));
+      expect(providerIds(await probeRuns(m, upgraded))).toEqual(providerIds(await probeRuns(m, fresh)));
       expect(steps(await old.open().upgrade!({ dryRun: true }), 'pending')).toEqual([]);
     });
 
@@ -182,11 +183,11 @@ for (const b of [sqlite, ...(RUN_PG ? [postgres] : [])]) {
       expect(steps(first, 'ran')).toEqual(['run-status', 'schema']);
       const fresh = await freshWith(b);
       const serving = old.open();
-      expect(await probeRuns(m, serving)).toEqual(await probeRuns(m, fresh));
+      expect(providerIds(await probeRuns(m, serving))).toEqual(providerIds(await probeRuns(m, fresh)));
       const rest = await old.open().upgrade!();
       expect(steps(rest, 'ran')).toEqual(expect.arrayContaining(['relations']));
       expect(steps(await old.open().upgrade!({ dryRun: true }), 'pending')).toEqual([]);
-      expect(await probeRuns(m, serving)).toEqual(await probeRuns(m, fresh));
+      expect(providerIds(await probeRuns(m, serving))).toEqual(providerIds(await probeRuns(m, fresh)));
     });
 
     it('U4: what a user does next does on the upgraded store what it does on the new one — every side effect once', async () => {

@@ -251,7 +251,7 @@ export async function recoverInDoubt(
   const p = probe as { done?: unknown; output?: unknown } | null | undefined;
   if (p?.done === false) return 'not-happened';
   if (p?.done !== true || !('output' in p)) return 'unknown';
-  const ok = await overTheSame(journal, call, { status: 'succeeded', output: p.output, ...(call.toolName ? { toolName: call.toolName } : {}), ...(call.toolCallId ? { resolvedToolCallIds: [call.toolCallId] } : {}) });
+  const ok = await overTheSame(journal, call, { status: 'succeeded', output: p.output, ...(call.toolName ? { toolName: call.toolName } : {}), ...(call.toolCallId ? { resolvedToolCallIds: [call.toolCallId], resolvedBy: [{ runId: call.runId, toolCallId: call.toolCallId }] } : {}) });
   return ok ? 'happened' : 'moved';
 }
 
@@ -271,7 +271,7 @@ export async function declareInDoubtDone(
   const output = declaration.output ?? { declaredDone: true, by: declaration.by, ...(declaration.note ? { note: declaration.note } : {}) };
   return overTheSame(journal, call, {
     status: 'succeeded', output, ...(call.toolName ? { toolName: call.toolName } : {}),
-    ...(call.toolCallId ? { resolvedToolCallIds: [call.toolCallId] } : {}),
+    ...(call.toolCallId ? { resolvedToolCallIds: [call.toolCallId], resolvedBy: [{ runId: call.runId, toolCallId: call.toolCallId }] } : {}),
     declaredBy: { by: declaration.by, at, ...(declaration.note ? { note: declaration.note } : {}) },
   } as ToolJournalRecord);
 }

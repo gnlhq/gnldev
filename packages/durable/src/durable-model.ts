@@ -2,6 +2,7 @@ import { wrapLanguageModel, simulateReadableStream } from 'ai';
 import { requestOf, bornOnFirstWrite } from './run-identity.js';
 import type { LanguageModelV4, LanguageModelV4CallOptions, LanguageModelV4Middleware } from '@ai-sdk/provider';
 import { argsHash, stableStringify } from './hash.js';
+import { stepMinter, renameAnswerPart, restoreProviderIds } from './call-identity.js';
 import { ctxGet, runKeys } from './journal.js';
 import { AttemptLost, compareAndSet } from './attempt.js';
 import { stampFormat } from './format.js';
@@ -440,6 +441,15 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
   bornOnFirstWrite(ctx);
   const middleware: LanguageModelV4Middleware = {
     specificationVersion: 'v4',
+    // REQUEST SIDE of the call identity (call-identity.ts). The ids in the history GNL holds are its own
+    // (`<providerId>.gnl-…`, minted when the answer came in, below); the provider is handed the id IT
+    // issued. Runs before wrapGenerate/wrapStream, so the request hash and the provider both see the
+    // provider's ids: what goes over the wire is what it was before GNL named the calls, and a step
+    // journaled by an older version (raw ids) hashes the same as it did.
+    transformParams: async ({ params }) => {
+      const prompt = restoreProviderIds(params.prompt);
+      return prompt === params.prompt ? params : { ...params, prompt: prompt as typeof params.prompt };
+    },
     wrapGenerate: async ({ doGenerate, params }) => {
       const key = runKeys.model(ctx.runId, step);
       // Invisible to parseJournalKey (runKeys.proc) → does NOT AFFECT reader/time-travel/forkRun;
@@ -486,9 +496,14 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       let result: Awaited<ReturnType<typeof doGenerate>>;
       try {
         // Y1: opt-in step timeout — a timeout falls into the catch, claim becomes 'failed' (retry key does not shift).
-        const generated = opts?.stepTimeoutMs
+        const raw = opts?.stepTimeoutMs
           ? await withTimeout(doGenerate(), opts.stepTimeoutMs, `model step ${step}`)
           : await doGenerate();
+        // The answer enters GNL here: every tool call gets its GNL id BEFORE the step is journaled (the
+        // record carries it, a replay returns the record as it stands and renames nothing — records of
+        // an older version keep the ids they were written with).
+        const mint = stepMinter(ctx.runId, step);
+        const generated = Array.isArray(raw.content) ? { ...raw, content: raw.content.map((part) => renameAnswerPart(part, mint)) } : raw;
         // H13: format stamp (a copy — _v does not leak into result). The step is answered once: an
         // answer recorded meanwhile is this step's, and this attempt returns it instead of its own.
         const answered = await answerStep(ctx, key, [], stampFormat({ ...(generated as object), ...configuredModelId }));
@@ -597,9 +612,13 @@ export function withDurableModel(model: LanguageModelV4, ctx: DurableCtx, opts?:
       let sourceFailure: { error: unknown } | undefined;
       let cutReported = false;
       let carriedError = false;
+      // The stream's tool calls are renamed BEFORE `parts.push`: the write-ahead copy below, the final
+      // record and what flows on to the reader all carry the same GNL id (same run, step and order).
+      const mint = stepMinter(ctx.runId, myStep);
       const recorder = new TransformStream<any, any>({
-        async transform(chunk, controller) {
-          if (chunk?.type === SOURCE_FAILED) { sourceFailure = { error: chunk.error }; return; }
+        async transform(rawChunk, controller) {
+          if (rawChunk?.type === SOURCE_FAILED) { sourceFailure = { error: rawChunk.error }; return; }
+          const chunk = renameAnswerPart(rawChunk, mint);
           parts.push(chunk);
           if (chunk?.type === 'tool-call') {
             try {

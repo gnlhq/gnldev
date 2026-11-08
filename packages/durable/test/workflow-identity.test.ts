@@ -15,6 +15,7 @@
 import { describe, it, expect } from 'vitest';
 import { InMemoryJournal, nestedAgentRunId } from '../src/journal.js';
 import { createGnl, sealRequestContext } from '../src/registry.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, finalTextResult, toolCallResult, countToolResults } from './mock.js';
 
 const wf = { build: () => [{ id: 's1' }], run: async () => ({ ok: true }) };
@@ -69,7 +70,8 @@ describe('iş akışı kimliği', () => {
       },
     } as never);
     await gnl.run('ana', { runId: 'wf-4', prompt: 'çalıştır', context: sealRequestContext({}, { resourceId: 'u-mehmet' }) } as never);
-    const child = nestedAgentRunId('wf-4', tcid, 'wf');
+    // the nested run is named by the GNL id of the call (what the model boundary minted), not the provider's
+    const child = nestedAgentRunId('wf-4', mintCallId(tcid, 'wf-4', 0, 0), 'wf');
     expect((await journal.get<{ resourceId?: string }>(`${child}:input`))?.resourceId).toBe('u-mehmet');
   });
 });

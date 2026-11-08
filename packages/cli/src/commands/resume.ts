@@ -34,7 +34,8 @@ export async function resumeRunCore(
   }
   const journal = getJournal(config, d);
   const { model, tools, guard, maxSteps } = await resolveAgentForResume(d, agentCfg, runId, journal);
-  const result = await d.resumeRun(runId, { journal, model: model as any, tools, guard, stopWhen: stepCountIs(maxSteps), approvals: opts.approvals });
+  // The terminal's operator is staff: the one who may answer an approve question (and says so, instead of being read as nobody).
+  const result = await d.resumeRun(runId, { journal, model: model as any, tools, guard, stopWhen: stepCountIs(maxSteps), approvals: opts.approvals, caller: d.STAFF });
   return {
     runId,
     agent: agentName,

@@ -14,7 +14,7 @@ import { describe, it, expect } from 'vitest';
 import { workflow, step, type StepCtx } from '@gnldev/workflow';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
-import { createMockModel, toolCallResult, finalTextResult } from './mock.js';
+import { createMockModel, toolCallResult, finalTextResult, countToolResults } from './mock.js';
 
 const usage = { inputTokens: 10, outputTokens: 5, totalTokens: 15 };
 
@@ -96,16 +96,15 @@ describe('an agent as a workflow step', () => {
     const journal = new InMemoryJournal();
     let charges = 0;
     let pass = 0;
-    const model = () => {
-      let call = 0;
-      return createMockModel(async () => {
-        call++;
-        if (call === 1) return toolCallResult('charge', 'c-1', { amount: 40 });
-        // First pass: die AFTER the tool ran, BEFORE the turn could finish. Second pass: finish.
-        if (pass === 1) throw new Error('process died mid-turn');
-        return finalTextResult('charged');
-      });
-    };
+    // Decided by the PROMPT (is the tool's result in it yet?), not by a per-instance call counter: the
+    // resume builds a fresh model whose counter restarts, and a fresh `c-1` at step 0 of the resumed
+    // pass is — under the call-identity rule — a different call from the one at step 1.
+    const model = () => createMockModel(async ({ prompt }: any) => {
+      if (countToolResults(prompt) === 0) return toolCallResult('charge', 'c-1', { amount: 40 });
+      // First pass: die AFTER the tool ran, BEFORE the turn could finish. Second pass: finish.
+      if (pass === 1) throw new Error('process died mid-turn');
+      return finalTextResult('charged');
+    });
     const tools = { charge: { execute: async () => { charges++; return { ok: true }; } } };
     const build = () => workflow<{ order: string }>()
       .then(agentStep('bill', { model, tools, prompt: 'charge the order' }));

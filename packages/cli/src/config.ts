@@ -167,6 +167,23 @@ function loadDotEnv(): void {
   }
 }
 
+/** Every config this process has loaded: the stores it opened are the process's to close (`closeLoadedStores`). */
+const loadedConfigs = new Set<GnlDevConfig>();
+
+/**
+ * Closes the storage of every config this process loaded. A one-shot command (`runs`, `run`, `inspect`,
+ * `sweep`, …) is finished when it has answered, but a store it opened keeps the process alive on its own:
+ * measured on `gnl runs` — Postgres held it for the pool's idle timeout (10 s), MySQL and MongoDB for
+ * good. Closing in each command is what `pending` and `upgrade` did, and what the others did not; the
+ * dispatcher does it once for all of them. Safe to call twice and never throws: a store that fails to
+ * close must not turn an answer already printed into an error.
+ */
+export async function closeLoadedStores(): Promise<void> {
+  const cfgs = [...loadedConfigs];
+  loadedConfigs.clear();
+  for (const c of cfgs) await (c.storage as { close?: () => Promise<void> } | undefined)?.close?.().catch(() => {});
+}
+
 /** Dynamically load gnl.config (also works with .ts under tsx). Accepts default | config | module. */
 export async function loadConfig(path: string): Promise<GnlDevConfig> {
   const { pathToFileURL } = await import('node:url');
@@ -204,5 +221,6 @@ export async function loadConfig(path: string): Promise<GnlDevConfig> {
   // names are checked where the file is read as well — for the exported config object only: a module
   // read as a whole may carry other named exports of its own.
   if (mod.default ?? mod.config) refuseUnknownNames(`gnl.config (${path})`, cfg, DEFINE_CONFIG_NAMES);
+  loadedConfigs.add(cfg as GnlDevConfig);
   return cfg as GnlDevConfig;
 }

@@ -22,6 +22,7 @@ import { PostgresStorage } from '../src/postgres-storage.js';
 import { runDurable, streamDurable } from '../src/run.js';
 import { runFenceKey } from '../src/erasure-fence.js';
 import type { Journal } from '../src/journal.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
 beforeAll(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
@@ -177,7 +178,7 @@ describe.each(STORES)('an erased run stays erased — %s', (_name, make) => {
       countToolResults(prompt) < 1 ? toolCallResult('pay', 'c-0', { iban: secret }) : finalTextResult('done'));
     // Held where the call reads its record — after the model step, before its claim: it holds nothing.
     const h = holdingJournal(root);
-    h.arm((k) => k === `r-${id}:tool:c-0`);
+    h.arm((k) => k === `r-${id}:tool:${mintCallId('c-0', `r-${id}`, 0, 0)}`);
     const r = runDurable({ runId: `r-${id}`, journal: h.journal, model, tools, prompt: `pay ${secret}`, threadId: `T-${id}`, resourceId: who, stopWhen: stepCountIs(3) } as any)
       .then((v) => ({ ok: v }), (e: unknown) => ({ err: e }));
     await h.reached;
