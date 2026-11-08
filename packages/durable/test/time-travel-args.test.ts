@@ -11,6 +11,7 @@ import { SqliteStorage } from '../src/sqlite-storage.js';
 import { runDurable, resumeRun } from '../src/run.js';
 import { reconstructState, forkRun } from '../src/time-travel.js';
 import { argsHash } from '../src/hash.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
 const usage = { inputTokens: 10, outputTokens: 5, totalTokens: 15 };
@@ -29,14 +30,15 @@ describe('reconstructState — args-mode tool, single completed call', () => {
     // Before the model's tool-call step is followed by the tool record: the call is still pending
     // (mirrors the pre-existing reconstructState test's step-by-step shape).
     const atStep1 = reconstructState(entries, 1);
-    expect(atStep1.pending).toEqual([{ toolCallId: 'call-only', toolName: 'charge' }]);
+    const onlyId = mintCallId('call-only', 'rt-args-1', 0, 0); // the GNL id the journal carries
+    expect(atStep1.pending).toEqual([{ toolCallId: onlyId, toolName: 'charge' }]);
 
     // Full replay: the args-keyed tool record must resolve the SAME pending entry (bug: it never did).
     const full = reconstructState(entries);
     expect(full.pending).toHaveLength(0);
     const toolMsg = full.messages.find((m) => m.role === 'tool');
     expect(toolMsg).toBeDefined();
-    expect(toolMsg.content[0].toolCallId).toBe('call-only'); // the REAL toolCallId, not the args- dedupe id
+    expect(toolMsg.content[0].toolCallId).toBe(onlyId); // the REAL toolCallId, not the args- dedupe id
     expect(toolMsg.content[0].output).toEqual({ charged: 20 });
   });
 });
@@ -78,7 +80,8 @@ describe('reconstructState — documented same-turn duplicate (5 distinct toolCa
     const toolMsgs = state.messages.filter((m) => m.role === 'tool');
     expect(toolMsgs).toHaveLength(5);
     const ids = toolMsgs.map((m) => m.content[0].toolCallId).sort();
-    expect(ids).toEqual(['call-1', 'call-2', 'call-3', 'call-4', 'call-5']);
+    // five distinct provider ids in one answer: indexes 0..4 of model step 0
+    expect(ids).toEqual([1, 2, 3, 4, 5].map((n) => mintCallId(`call-${n}`, 'rt-args-5', 0, n - 1)).sort());
     for (const m of toolMsgs) expect(m.content[0].output).toEqual({ charged: 20, seq: 1 }); // same output, all 5
   });
 });
@@ -117,7 +120,7 @@ describe('reconstructState — args-mode tool with a CUSTOM idempotencyKey (char
     const final = reconstructState(entries); // uptoStep defaults to entries.length — the "gnl run" view
     expect(final.pending).toHaveLength(0); // must NOT show a phantom pending on a completed run
     const toolMsg = final.messages.find((m) => m.role === 'tool');
-    expect(toolMsg?.content[0]).toMatchObject({ toolCallId: 'call-1', output: { charged: 20, orderId: 'o1', receipt: 'rcpt_o1' } });
+    expect(toolMsg?.content[0]).toMatchObject({ toolCallId: mintCallId('call-1', 'order-1', 0, 0), output: { charged: 20, orderId: 'o1', receipt: 'rcpt_o1' } });
   });
 
   it('two calls with the SAME orderId across different turns (different toolCallIds) both resolve; the tool runs once', async () => {
@@ -140,7 +143,7 @@ describe('reconstructState — args-mode tool with a CUSTOM idempotencyKey (char
     expect(final.pending).toHaveLength(0); // BOTH call-1 and call-2 must clear
     const toolMsgs = final.messages.filter((m) => m.role === 'tool');
     expect(toolMsgs).toHaveLength(2);
-    expect(toolMsgs.map((m) => m.content[0].toolCallId).sort()).toEqual(['call-1', 'call-2']);
+    expect(toolMsgs.map((m) => m.content[0].toolCallId).sort()).toEqual([mintCallId('call-1', 'order-2', 0, 0), mintCallId('call-2', 'order-2', 1, 0)].sort());
   });
 });
 
@@ -167,11 +170,12 @@ describe.each([
     // carries the RAW JSON-string form) — argsHash must be computed over the parsed object to match
     // the key durable-tool.ts actually wrote.
     const hash = argsHash({ amount: 20 });
+    // The copied model record still carries the SOURCE run's GNL id (minted for 'ra'), so the mirror is keyed by it.
     // The record is the REQUEST's (`xreq:<runId>:args-…`, journal.ts runKeys.toolRequest); the run keeps a
     // mirror under its own toolCallId. A fork is a request of its own: it gets its own window record,
     // and its mirror points there.
     expect(await journal.get(`xreq:fork-args-1:args-charge-${hash}`)).toBeDefined();
-    expect((await journal.get('fork-args-1:tool:call-c'))?.mirrorOf).toBe(`xreq:fork-args-1:args-charge-${hash}`);
+    expect((await journal.get(`fork-args-1:tool:${mintCallId('call-c', 'ra', 0, 0)}`))?.mirrorOf).toBe(`xreq:fork-args-1:args-charge-${hash}`);
     expect(await journal.get('fork-args-1:model:0')).toBeDefined();
     expect(await journal.get('fork-args-1:model:1')).toBeUndefined();
 

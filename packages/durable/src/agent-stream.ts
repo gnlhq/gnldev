@@ -16,7 +16,7 @@
 // transport-internal), and anything else becomes `raw {type}`: type only, payload withheld, so an
 // unknown part can neither vanish nor leak an internal payload.
 import { limitBreachFromSteps, blockedFromSteps, surfacedInterrupts } from './run.js';
-import { BLOCKED_ERROR_CODES, upstreamFailure } from './errors.js';
+import { BLOCKED_ERROR_CODES, upstreamFailure, upstreamWire } from './errors.js';
 import type { Interrupt } from './guard.js';
 
 export interface AgentStreamEvent { event: string; data: unknown }
@@ -60,7 +60,7 @@ export async function* agentStreamEvents(result: any, runId: string, codes: Agen
         case 'start-step': yield { event: 'step-start', data: {} }; break;
         case 'finish-step': yield { event: 'step-finish', data: { finishReason: part.finishReason, usage: part.usage } }; break;
         case 'tool-error': yield { event: 'tool-error', data: { toolCallId: part.toolCallId, toolName: part.toolName, error: errText(part.error) } }; break;
-        case 'error': { const up = upstreamFailure(part.error); yield { event: 'error', data: { error: errText(part.error), ...(up ? { code: up.code } : {}) } }; break; }
+        case 'error': { const up = upstreamFailure(part.error); yield { event: 'error', data: { error: errText(part.error), ...(up ? { code: up.code } : {}), ...(up?.upstreamStatus !== undefined ? { upstreamStatus: up.upstreamStatus } : {}), ...upstreamWire(up) } }; break; }
         // Deliberately no event: covered by done / delta-only framing / transport-internal.
         case 'start': case 'finish': case 'text-start': case 'text-end': case 'abort': case 'raw': break;
         default: yield { event: 'raw', data: { type: part.type } }; // never silent, never the payload

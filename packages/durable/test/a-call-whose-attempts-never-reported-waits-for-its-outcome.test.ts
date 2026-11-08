@@ -12,11 +12,11 @@
 // recorded result whenever one arrives — written by a late attempt, by a later recover(), or by an
 // operator. One path settles the call: its record. No attempt is started again (the ceiling holds).
 // Postgres runs when GNL_PG_URL is set.
-import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
 import { tool } from 'ai';
 import { z } from 'zod';
 import {
-  InMemoryStorage, DetachedRuns, streamDurable, installProcessLiveness, eraseSubject, pendingWork, runKeys, claimRunOwner, user, readRunEvents,
+  InMemoryStorage, DetachedRuns, streamDurable, installProcessLiveness, eraseSubject, mintCallId, pendingWork, runKeys, claimRunOwner, user, readRunEvents,
   type Storage, type ProcessLiveness, type Journal,
 } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
@@ -27,8 +27,6 @@ import { execKey } from '../src/exec-record.js';
 import { textOf } from './detached/models.js';
 
 beforeAll(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
-const ends: Array<() => Promise<unknown>> = [];
-afterAll(async () => { for (const e of ends.reverse()) await e(); });
 // Each test's executor stops with it: on a shared store (Postgres) another test's sweep would continue
 // this test's runs with its own tool.
 const perTest: Array<() => Promise<unknown>> = [];
@@ -52,7 +50,10 @@ if (PG_URL) {
     await admin.query(`CREATE DATABASE ${db}`);
     const url = new URL(PG_URL); url.pathname = `/${db}`;
     const s = new PostgresStorage({ connectionString: url.toString() });
-    ends.push(async () => { await s.close(); await admin.query(`DROP DATABASE IF EXISTS ${db}`); await admin.end(); });
+    // Closed with the test, not the file: each test opens a database, a store (pool of up to 10 + liveness) and an admin session, and left
+    // open until afterAll they held ~35 of the server's slots (measured, pg-budget-audit) — past a file's share of the test budget
+    // (test/pg-connection-budget.setup.ts), where the file waited on its own idle connections and an 8 s `until` timed out.
+    perTest.push(async () => { await s.close(); await admin.query(`DROP DATABASE IF EXISTS ${db}`); await admin.end(); });
     return s;
   }]);
 }
@@ -63,6 +64,8 @@ const until = async (what: string, ok: () => Promise<boolean>, ms = 8_000) => {
   while (!(await ok())) { if (Date.now() > end) throw new Error(`timed out: ${what}`); await sleep(20); }
 };
 
+/** The call's GNL id: what the model boundary mints for the provider's `call-1` (first answer of the run). */
+const callId = (runId: string) => mintCallId('call-1', runId, 0, 0);
 const MAX = 3;
 const TTL = 60_000;
 const usage = { inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 1, text: 1, reasoning: undefined } };
@@ -120,17 +123,17 @@ function effectTool(p: ReturnType<typeof provider>, kind: 'recover' | 'idempoten
 /** The call at its ceiling: attempt 3, held by 'C' (gone), started its body and never reported. */
 async function callAtCeiling(journal: Journal, runId: string) {
   await claimRunOwner(journal as any, runId, user('alice'));
-  const key = runKeys.tool(runId, 'call-1');
+  const key = runKeys.tool(runId, callId(runId));
   const at = journal.now ? await journal.now() : Date.now();
-  const stampC = stampFormat({ status: 'running', startedAt: at, attempts: MAX, claimTtlMs: TTL, idempotencyKey: `${runId}:call-1`, proc: 'C' });
+  const stampC = stampFormat({ status: 'running', startedAt: at, attempts: MAX, claimTtlMs: TTL, idempotencyKey: `${runId}:${callId(runId)}`, proc: 'C' });
   await journal.put(key, stampC);
   return { key, stampC, at };
 }
 
 /** A late attempt (held by `proc`) that finished its body: what Attempt.succeed writes for it. */
 function lateAttempt(journal: Journal, runId: string, key: string, proc: string, attempts: number, at: number) {
-  const stamp = stampFormat({ status: 'running', startedAt: at, attempts, claimTtlMs: TTL, idempotencyKey: `${runId}:call-1`, proc }) as any;
-  const write = (rec: any, expected: unknown) => compareAndSet(journal, key, expected, stampFormat({ ...rec, idempotencyKey: `${runId}:call-1` }));
+  const stamp = stampFormat({ status: 'running', startedAt: at, attempts, claimTtlMs: TTL, idempotencyKey: `${runId}:${callId(runId)}`, proc }) as any;
+  const write = (rec: any, expected: unknown) => compareAndSet(journal, key, expected, stampFormat({ ...rec, idempotencyKey: `${runId}:${callId(runId)}` }));
   return new Attempt(journal, key, undefined, stamp, performance.now(), 'effect', write, { runId });
 }
 
@@ -217,7 +220,7 @@ describe.each(STORES)('a call at its retry ceiling whose attempts never reported
     expect(await lateAttempt(journal, runId, key, 'B', 2, at).succeed({ status: 'succeeded', output: 'by B', toolName: 'effect' } as any)).toBe(false);
     await until('completes', async () => (await state()).last?.state === 'completed');
     expect((await state()).text).toContain('by A');
-    expect(await journal.get<any>(runKeys.proc(runId, 'late-call-1'))).toMatchObject({ late: [{ attempt: 2, output: 'by B', sameAsSettled: false }] });
+    expect(await journal.get<any>(runKeys.proc(runId, `late-${callId(runId)}`))).toMatchObject({ late: [{ attempt: 2, output: 'by B', sameAsSettled: false }] });
   });
 
   it('a live claim is never written over by a late report — it is kept as evidence; when that attempt is gone too, the call settles from it (not run again, not given up)', async () => {
@@ -226,14 +229,14 @@ describe.each(STORES)('a call at its retry ceiling whose attempts never reported
     const runId = `r-out-${unique()}`;
     const d = processD();
     await claimRunOwner(journal as any, runId, user('alice'));
-    const key = runKeys.tool(runId, 'call-1');
+    const key = runKeys.tool(runId, callId(runId));
     const at = journal.now ? await journal.now() : Date.now();
     // Attempt 2 is held by a live process (this one); attempt 1 (A) finishes late.
-    const live = stampFormat({ status: 'running', startedAt: at, attempts: 2, claimTtlMs: TTL, idempotencyKey: `${runId}:call-1`, proc: d.id });
+    const live = stampFormat({ status: 'running', startedAt: at, attempts: 2, claimTtlMs: TTL, idempotencyKey: `${runId}:${callId(runId)}`, proc: d.id });
     await journal.put(key, live);
     expect(await lateAttempt(journal, runId, key, 'A', 1, at).succeed({ status: 'succeeded', output: 'by A', toolName: 'effect' } as any)).toBe(false);
     expect(await journal.get<any>(key), 'the live claim stands').toMatchObject({ status: 'running', proc: d.id });
-    expect(await journal.get<any>(runKeys.proc(runId, 'late-call-1')), 'the late success is kept').toMatchObject({ late: [{ attempt: 1, output: 'by A' }] });
+    expect(await journal.get<any>(runKeys.proc(runId, `late-${callId(runId)}`)), 'the late success is kept').toMatchObject({ late: [{ attempt: 1, output: 'by A' }] });
     // Attempt 2's process dies before it reports (below the ceiling: the ladder would run the call again).
     await journal.put(key, { ...(live as any), proc: 'gone' });
     const p = provider();
@@ -262,11 +265,11 @@ describe.each(STORES)('a call at its retry ceiling whose attempts never reported
     const p = provider();
     const { journal, state } = await startRun(storage, runId, effectTool(p, 'recover'), d);
     await until('the run parks', async () => (await state()).last?.state === 'waiting-outcome');
-    await journal.put(runKeys.proc(runId, 'late-call-1'), { late: [{ attempt: 9, output: 'x' }] });
+    await journal.put(runKeys.proc(runId, `late-${callId(runId)}`), { late: [{ attempt: 9, output: 'x' }] });
     await eraseSubject(storage, 'alice');
     expect(await journal.get(execKey(undefined, runId)), 'execution record').toBeUndefined();
     expect(await journal.get(key), 'the call').toBeUndefined();
-    expect(await journal.get(runKeys.proc(runId, 'late-call-1')), 'the evidence').toBeUndefined();
+    expect(await journal.get(runKeys.proc(runId, `late-${callId(runId)}`)), 'the evidence').toBeUndefined();
     expect(await lateAttempt(journal, runId, key, 'A', 1, at).succeed({ status: 'succeeded', output: 'by A', toolName: 'effect' } as any), 'nothing written into an erased run').toBe(false);
     await sleep(200);
     expect(await journal.get(key)).toBeUndefined();

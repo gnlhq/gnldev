@@ -51,6 +51,7 @@ const SOURCES = [
     REQUEST_ERROR_CODES: (cls) => `request shape (${cls})`,
     ADOPTION_ERROR_CODES: (cls) => `adoption (${cls})`,
     DRAIN_ERROR_CODES: (cls) => `drain (${cls})`,
+    APPROVAL_ERROR_CODES: (cls) => `approval authority (${cls})`,
     VISIBILITY_ERROR_CODES: (cls) => `visibility (${cls})`,
   } },
   { dist: ['packages', 'server', 'dist', 'edge-errors.js'], build: '@gnldev/server', status: 'EDGE_ERROR_STATUS', maps: {

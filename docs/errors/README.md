@@ -59,6 +59,7 @@ them.
 | [`run_swept`](./run_swept.md) | Retention deleted this run; a late retry would repeat its effects. |
 | [`run_target_mismatch`](./run_target_mismatch.md) | This runId was started for another agent, workflow, network or batch. |
 | [`batch_plan_mismatch`](./batch_plan_mismatch.md) | The items do not match the plan that was approved. |
+| [`approval_key_ambiguous`](./approval_key_ambiguous.md) | An approval named a provider's tool-call id that more than one open question carries. |
 
 ## Blocked — the run is waiting on you
 
@@ -71,6 +72,7 @@ The same runId succeeds once the block clears.
 | [`step_retry_blocked`](./step_retry_blocked.md) | 409 | The workflow form of the above. |
 | [`retry_limit_exceeded`](./retry_limit_exceeded.md) | 422 | A tool hit `maxRetries` and is permanently failed. |
 | [`outcome_unknown`](./outcome_unknown.md) | 409 | A tool hit `maxRetries` without ever reporting; the run waits for what happened. |
+| [`run_not_continued`](./run_not_continued.md) | 409 | Its process died and the one that took it over could not continue it; it waits for an operator. |
 
 ## The model provider failed
 
@@ -108,6 +110,12 @@ the error is thrown. Every door (REST, Studio, chat, AG-UI) answers it through `
 | [`invalid_json`](./invalid_json.md) | 400 | The request body is not a JSON object. |
 | [`caller_system_message`](./caller_system_message.md) | 400 | A request's `messages` included a `system` one. |
 | [`invalid_cursor`](./invalid_cursor.md) | 400 | A reader's cursor (`Last-Event-ID`, `after`) is not one a run's stream gave. |
+
+## Who may answer a question
+
+| Code | Status | When |
+| --- | --- | --- |
+| [`approval_not_permitted`](./approval_not_permitted.md) | 403 | A yes to an approve question from somebody who may not give it: the requester's own yes, or one the `approvers` rule refused. |
 
 ## Adopting the root's data into an organization
 

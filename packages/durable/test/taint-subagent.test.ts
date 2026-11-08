@@ -13,6 +13,7 @@ import { runDurable } from '../src/run.js';
 import { createAgentTool } from '../src/agent-tool.js';
 import { readRunTaint } from '../src/taint.js';
 import { TaintedSideEffectError } from '../src/limits.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
 /** fetchPage (untrusted read-only source) lives on the PARENT; sendMoney (side effect) lives on the SUB-AGENT. */
@@ -54,6 +55,9 @@ const parentModel = () =>
     return finalTextResult('parent done');
   });
 
+// The parent's mock ids, as GNL names them: `p-call-1` is its first model step, `p-call-2` its second.
+const pCall = (run: string, n: number) => mintCallId(`p-call-${n}`, run, n - 1, 0);
+
 describe('taint crosses the sub-agent boundary (AUDIT A4)', () => {
   it("a TAINTED parent's sub-agent side effect is BLOCKED under taintedSideEffects:'block'", async () => {
     const journal = new InMemoryJournal();
@@ -75,8 +79,8 @@ describe('taint crosses the sub-agent boundary (AUDIT A4)', () => {
     // The sub-agent's side effect must NOT execute — the parent's taint reached the nested run.
     expect(counters.sends).toBe(0);
     // The nested run carries an INHERITED taint mark (provenance preserved from the parent source).
-    const nestedTaint = await readRunTaint(journal, 'agent:a4-parent:p-call-2');
-    expect(nestedTaint).toMatchObject({ toolName: 'fetchPage', toolCallId: 'p-call-1' });
+    const nestedTaint = await readRunTaint(journal, `agent:a4-parent:${pCall('a4-parent', 2)}`);
+    expect(nestedTaint).toMatchObject({ toolName: 'fetchPage', toolCallId: pCall('a4-parent', 1) });
     expect(String(nestedTaint?.reason ?? '')).toContain('inherited');
   });
 
@@ -98,6 +102,6 @@ describe('taint crosses the sub-agent boundary (AUDIT A4)', () => {
     });
 
     expect(counters.sends).toBe(1); // no taint anywhere → the sub-agent proceeds normally
-    expect(await readRunTaint(journal, 'agent:a4-clean:p-call-2')).toBeUndefined();
+    expect(await readRunTaint(journal, `agent:a4-clean:${pCall('a4-clean', 2)}`)).toBeUndefined();
   });
 });

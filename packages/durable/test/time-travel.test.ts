@@ -4,6 +4,7 @@ import { stepCountIs } from 'ai';
 import { InMemoryJournal } from '../src/journal.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { runDurable, resumeRun } from '../src/run.js';
+import { mintCallId } from '../src/call-identity.js';
 import { reconstructState, forkRun } from '../src/time-travel.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
@@ -51,7 +52,7 @@ describe.each([
     const fork = await forkRun(journal, 'r', 1, 'fork1');
     expect(fork).toMatchObject({ newRunId: 'fork1', copiedModel: 1, copiedTool: 1 });
     expect(await journal.get('fork1:model:0')).toBeDefined();
-    expect(await journal.get('fork1:tool:call-c')).toBeDefined();
+    expect(await journal.get(`fork1:tool:${mintCallId('call-c', 'r', 0, 0)}`)).toBeDefined();
     expect(await journal.get('fork1:model:1')).toBeUndefined();
     expect(await journal.get('fork1:input')).toBeDefined();
 

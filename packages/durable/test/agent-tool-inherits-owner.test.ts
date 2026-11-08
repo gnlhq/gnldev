@@ -6,6 +6,7 @@ import { describe, it, expect } from 'vitest';
 import { stepCountIs } from 'ai';
 import { InMemoryVectorStore, indexDocuments, createRagTool } from '../../rag/src/index.js';
 import { InMemoryJournal } from '../src/journal.js';
+import { mintCallId } from '../src/call-identity.js';
 import { runDurable } from '../src/run.js';
 import { createAgentTool } from '../src/agent-tool.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
@@ -32,7 +33,7 @@ async function delegate(parentResourceId: string | undefined, configResourceId?:
     return finalTextResult('parent done');
   });
   await runDurable({ runId: 'rp', journal, model: parentModel, tools: { expert }, prompt: 'x', stopWhen: stepCountIs(4), ...(parentResourceId ? { resourceId: parentResourceId } : {}) } as never);
-  const childInput = await journal.get<{ resourceId?: string }>('agent:rp:p1:input');
+  const childInput = await journal.get<{ resourceId?: string }>(`agent:rp:${mintCallId('p1', 'rp', 0, 0)}:input`);
   return { childSaw, childOwner: childInput?.resourceId };
 }
 

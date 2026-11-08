@@ -1,6 +1,6 @@
 import {
-  createGnl, scopeConfigToOrg, sealRequestContext, sealFieldsOf, user, withIdempotency,
-  type CreateGnlConfig, type Storage, type Interrupt,
+  createGnl, scopeConfigToOrg, sealRequestContext, sealFieldsOf, user, withIdempotency, requestRefusal,
+  type CreateGnlConfig, type Storage, type Interrupt, type Answerer,
 } from '@gnldev/durable';
 import type { JobCtx } from '@gnldev/queue';
 
@@ -44,6 +44,8 @@ export function channelRuntime(where: string, config: CreateGnlConfig, agent: st
  */
 export async function runFor(rt: ChannelRuntime, agent: string, m: {
   workKey: string; threadId: string; subject: string; org?: string; prompt?: string; approvals?: Record<string, boolean>;
+  /** WHO is answering `approvals` (the person who clicked), in the channel's own spelling of a person. Absent: the run's subject, as the requester. */
+  answerer?: Answerer;
 }): Promise<{ runId: string; text?: string; interrupts: Interrupt[] }> {
   const caller = user(m.subject, m.org);
   const result = await rt.gnlFor(m.org).run(agent, {
@@ -53,8 +55,22 @@ export async function runFor(rt: ChannelRuntime, agent: string, m: {
     caller,
     context: sealRequestContext({}, sealFieldsOf(caller, m.org)),
     ...(m.approvals ? { approvals: m.approvals } : {}),
+    // Every call says who is speaking: the sender (a message starts the run: `startedBy`) or whoever clicked. The engine decides what that may answer.
+    answerer: m.answerer ?? { answeredBy: m.subject, answeredAs: 'requester' },
   }) as { runId: string; text?: string; interrupts?: Interrupt[] };
   return { runId: result.runId, text: result.text, interrupts: result.interrupts ?? [] };
+}
+
+/**
+ * What a channel tells the person whose click the engine refused as not theirs to give (a yes to an approve
+ * question from somebody who is not authorised): the engine's own answer (`approval_not_permitted`), said in
+ * the thread instead of failing the job — a retry could not change it. `undefined` for any other error.
+ * @internal — channel plumbing.
+ */
+export function approvalRefusalNotice(e: unknown): string | undefined {
+  const refusal = requestRefusal(e);
+  if (refusal?.status !== 403) return undefined;
+  return "That needs an authorised person's approval, and it cannot be given from here: approve it in Studio, or ask an authorised person. (A no is always accepted.)";
 }
 
 /**

@@ -3,7 +3,7 @@
 // {code,resumable} body (consistent with BLOCKED_CODES on the SSE path (sse.ts) — see review finding A).
 // Previously these errors fell through to a generic 400 (no code/detail/resumable).
 import { describe, it, expect } from 'vitest';
-import { InMemoryJournal, runKeys } from '@gnldev/durable';
+import { InMemoryJournal, runKeys, mintCallId } from '@gnldev/durable';
 import { createRestApi } from '../src/index.js';
 import { call } from './call.js';
 
@@ -29,7 +29,7 @@ describe('@gnldev/server — K1 blocked errors (side_effect_retry_blocked/run_bu
   it('/run: unapproved side-effect retry (failed record) → 409 + code=side_effect_retry_blocked + resumable:true', async () => {
     const journal = new InMemoryJournal();
     // chargeCard has a side effect (NOT idempotent): a prior 'failed' record is NOT auto-retried without approval.
-    await journal.put(runKeys.tool('r1', 'call-1'), { status: 'failed', error: 'timeout', attempts: 1 });
+    await journal.put(runKeys.tool('r1', mintCallId('call-1', 'r1', 0, 0)), { status: 'failed', error: 'timeout', attempts: 1 });
     let charges = 0;
     const api = createRestApi({
       journal,
@@ -58,7 +58,7 @@ describe('@gnldev/server — K1 blocked errors (side_effect_retry_blocked/run_bu
     // /resume reads the input from the journal → :input must be seeded first (server/src/index.ts resume route).
     await journal.put(runKeys.input('r2'), { prompt: 'process a refund' });
     // Fresh 'running' record (within the claim TTL) → treated as another executor still running.
-    await journal.put(runKeys.tool('r2', 'call-1'), { status: 'running', startedAt: Date.now() });
+    await journal.put(runKeys.tool('r2', mintCallId('call-1', 'r2', 0, 0)), { status: 'running', startedAt: Date.now() });
     const api = createRestApi({
       journal,
       agents: {

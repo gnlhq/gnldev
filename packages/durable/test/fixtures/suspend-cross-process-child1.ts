@@ -7,6 +7,7 @@ import { tool, stepCountIs } from 'ai';
 import { z } from 'zod';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { runDurable } from '../../src/run.js';
+import { mintCallId } from '../../src/call-identity.js';
 import { SqliteStorage } from '../../src/sqlite-storage.js';
 import type { Guard } from '../../src/guard.js';
 import { armFixtureWatchdog } from './watchdog.js';
@@ -72,7 +73,7 @@ const res = await runDurable({
 });
 await storage.close();
 
-if (res.interrupts.length !== 1 || res.interrupts[0]?.toolCallId !== 'call-charge') {
+if (res.interrupts.length !== 1 || res.interrupts[0]?.toolCallId !== mintCallId('call-charge', runId, 0, 0)) {
   console.error('unexpected result — interrupts:', JSON.stringify(res.interrupts));
   process.exit(2);
 }

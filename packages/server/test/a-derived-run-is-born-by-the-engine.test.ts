@@ -4,7 +4,7 @@
 // background call's `task:` id is — and as someone else's run is: 404 `run_not_found`
 // (no-existence-oracle.test.ts) — and nothing is written under it. The owner's run then makes it as its own.
 import { describe, it, expect } from 'vitest';
-import { InMemoryStorage, createGnl, user } from '@gnldev/durable';
+import { InMemoryStorage, createGnl, user, mintCallId } from '@gnldev/durable';
 import { createRestApi } from '../src/index.js';
 
 const textModel = (fn: (prompt: any[]) => any) => ({
@@ -16,6 +16,8 @@ const textModel = (fn: (prompt: any[]) => any) => ({
   }),
 });
 const text = (t: string) => ({ content: [{ type: 'text' as const, text: t }], finishReason: { unified: 'stop' as const, raw: 'stop' } });
+// The parent's model answers `tc1`; the child's run id is composed from GNL's id for that call.
+const CHILD = `agent:P:${mintCallId('tc1', 'P', 0, 0)}`;
 const PRINCIPALS: Record<string, unknown> = {
   alice: { kind: 'subject', id: 'alice', roles: ['admin'] },
   mallory: { kind: 'subject', id: 'mallory', roles: ['admin'] },
@@ -42,7 +44,7 @@ function setup() {
 }
 
 describe('a derived run is born by the engine, through the HTTP door', () => {
-  it.each(['agent:P:tc1', 'wf:P:tc1', 'net:P:0', 'net:P:7'])('a stranger naming %s is refused as a task: id is and writes nothing; the owner\'s run is unharmed', async (runId) => {
+  it.each([CHILD, 'wf:P:tc1', 'net:P:0', 'net:P:7'])('a stranger naming %s is refused as a task: id is and writes nothing; the owner\'s run is unharmed', async (runId) => {
     const { config, call, storage, workerCalls } = setup();
     const task = await call('mallory', '/agents/w/run', { runId: 'task:P:tc1', prompt: 'x' });
     const res = await call('mallory', '/agents/w/run', { runId, prompt: 'MALLORY-SECRET' });
@@ -52,22 +54,22 @@ describe('a derived run is born by the engine, through the HTTP door', () => {
     expect(res.body).not.toContain('MALLORY-SECRET');
     expect(await (storage.runs as any).listKeys(runId)).toEqual([]);
     expect(workerCalls()).toBe(0);
-    if (runId === 'agent:P:tc1') {
+    if (runId === CHILD) {
       const r = await createGnl(config).run('parent', { runId: 'P', prompt: 'go', caller: user('alice') });
       expect(r.text).toBe('done');
       expect(workerCalls()).toBe(1);
-      expect((await (storage.runs as any).get('agent:P:tc1:input'))?.resourceId).toBe('alice');
+      expect((await (storage.runs as any).get(`${CHILD}:input`))?.resourceId).toBe('alice');
     }
   });
 
   it('the owner continues the child her run made, through the same door', async () => {
     const { config, call, storage } = setup();
     await createGnl(config).run('parent', { runId: 'P', prompt: 'go', caller: user('alice') });
-    expect((await call('alice', '/agents/w/run', { runId: 'agent:P:tc1', prompt: 'ALICE-TASK' })).status).toBe(200);
+    expect((await call('alice', '/agents/w/run', { runId: CHILD, prompt: 'ALICE-TASK' })).status).toBe(200);
     // …and the stranger gets the bytes an absent id gets: the child's existence is not his to learn.
-    const foreign = await call('mallory', '/agents/w/run', { runId: 'agent:P:tc1', prompt: 'x' });
+    const foreign = await call('mallory', '/agents/w/run', { runId: CHILD, prompt: 'x' });
     expect(foreign).toEqual(await call('mallory', '/agents/w/run', { runId: 'agent:P:tc2', prompt: 'x' }));
     expect(foreign.status).toBe(404);
-    expect((await (storage.runs as any).get('agent:P:tc1:input'))?.resourceId).toBe('alice');
+    expect((await (storage.runs as any).get(`${CHILD}:input`))?.resourceId).toBe('alice');
   });
 });

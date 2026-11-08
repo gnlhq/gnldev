@@ -1,6 +1,6 @@
 import { argsHash } from './hash.js';
 import { refuseKeyWithoutWindow } from './types.js';
-import { approvalsForChild, addressedId } from './guard.js';
+import { approvalsForChild, addressedId, type GuardDecision } from './guard.js';
 import { assertThreadId } from './journal.js';
 import { withTimeout, StepTimeoutError } from './timeout.js';
 import { stampFormat, upgradeFormat } from './format.js';
@@ -18,14 +18,17 @@ import { checkToolGate, recordToolOutcome, takeToolSeat, releaseToolSeat, takeCo
 import { validateSemanticConfig, assertSemanticIdentity, identityUnusableReason, extractSemFields, canonicalTextOf, findSemanticCandidate, writeSemRecord, semTombKey } from './semantic-dup.js';
 import { SEM_RULESET_VERSION } from './semantic-rules.js';
 import { judgeGrayPair } from './semantic-judge.js';
-import { xidPlanOf, readXid, xidWhen, amountsDifferOf, completeOwnXid, writeXid, type XidPlan, type XidHeld } from './xid.js';
-import { Attempt, AttemptLost, compareAndSet, isUnstartedRelease, type DupMarker, type TerminalWriter } from './attempt.js';
+import { xidPlanOf, readXid, xidWhen, agoText, amountsDifferOf, completeOwnXid, writeXid, type XidPlan, type XidHeld } from './xid.js';
+import { markerIsMine, sameCall } from './call-identity.js';
+import { Attempt, AttemptLost, compareAndSet, isUnstartedRelease, successReplacesMarker, type DupMarker, type TerminalWriter } from './attempt.js';
 import { claimTtlFor, claimTimeLeft, claimIsLive, journalNow, newHoldId, releaseHold } from './liveness.js';
-import { procStampFor, bindOwnLiveness, isDraining, RunDrainedError, livenessFor } from './process-liveness.js';
+import { procStampFor, bindOwnLiveness, isDraining, RunDrainedError, livenessFor, giveBack, LivenessUnavailableError } from './process-liveness.js';
 import type { SemPlan } from './semantic-dup.js';
 import type { RunLimits, ToolSeat } from './limits.js';
 import { createProcessorCtx } from './processor.js';
-import type { DurableCtx, Journal, ToolJournalRecord } from './journal.js';
+import type { DurableCtx, Journal, ResolvedBy, ToolJournalRecord } from './journal.js';
+import type { QuestionNeeds } from './approval-authority.js';
+import { needsOfSuspend, isSupersededFailure } from './approval-authority.js';
 import type { JournalReader } from './journal.js';
 import type { AnyTool } from './types.js';
 
@@ -112,6 +115,28 @@ export const idempotencyKeyOf = (rec: unknown): string | undefined => {
 function suspendKindOf(rec: ToolJournalRecord | undefined): string | undefined {
   return rec?.status === 'suspended' ? (rec.output as { __gnl_suspend?: { kind?: string } } | undefined)?.__gnl_suspend?.kind : undefined;
 }
+
+/**
+ * What a tool's OWN `confirm` / `approve` rule asks for one call: nothing, or a question (with the rule's own
+ * reason when it gave one). A rule is `true`, `{ reason }`, or `(args) => false | string | true`.
+ */
+function ruleAsk(rule: unknown, args: unknown): { reason?: string } | undefined {
+  if (rule === undefined || rule === false || rule === null) return undefined;
+  if (rule === true) return {};
+  if (typeof rule === 'function') {
+    const r = (rule as (a: unknown) => unknown)(args);
+    return r === true ? {} : typeof r === 'string' ? { reason: r } : undefined;
+  }
+  if (typeof rule === 'object') {
+    const f = (rule as { reason?: unknown }).reason;
+    const r = typeof f === 'function' ? (f as (a: unknown) => unknown)(args) : undefined;
+    return typeof r === 'string' ? { reason: r } : {};
+  }
+  return undefined;
+}
+
+/** One human question a call must have answered before it runs. `guard` asked it (the agent's rule) or the tool's own `confirm` / `approve`. */
+interface Stage { need: QuestionNeeds; kind: 'guard' | 'confirm' | 'approve'; reason?: string }
 
 const isAsyncIterable = (v: unknown): v is AsyncIterable<unknown> =>
   v !== null && typeof v === 'object' && typeof (v as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === 'function';
@@ -388,6 +413,18 @@ async function claimCrossRunOwner(ctx: DurableCtx, toolName: string, hash: strin
   await claim(ctx.journal, runKeys.toolCrossRunOwner(toolName, hash), ownerFields(ctx.identity));
 }
 
+/**
+ * "Another run already did this" for a question about a call whose same work stands completed under a
+ * DIFFERENT run's name (a thread's marker is shared by every run of the conversation). Without it a dead
+ * run's later question read as if nothing had happened, and approving it paid a third time. Empty when
+ * the marker is this run's own, is not completed, or is of an older version that names no run.
+ */
+async function otherRunDid(ctx: DurableCtx, marker: DupMarker | undefined): Promise<{ runId: string; text: string } | undefined> {
+  if (!marker || marker.firstRunId === undefined || marker.firstRunId === ctx.runId || marker.inFlight === true || marker.released === true) return undefined;
+  const now = await journalNow(ctx.journal);
+  return { runId: marker.firstRunId, text: `another run (${marker.firstRunId}, ${agoText(now - marker.at)}) already completed the same work` };
+}
+
 async function writeToolTerminal(
   ctx: DurableCtx,
   key: string,
@@ -441,7 +478,7 @@ async function writeToolTerminal(
   const labelled: ToolJournalRecord = decidedKey !== undefined ? { ...named, idempotencyKey: decidedKey } : named;
   const stamped: ToolJournalRecord =
     labelled.status === 'succeeded' || labelled.status === 'denied' || labelled.status === 'reflected'
-      ? { ...labelled, resolvedToolCallIds: [toolCallId] }
+      ? { ...labelled, resolvedToolCallIds: [toolCallId], resolvedBy: [{ runId: ctx.runId, toolCallId }] }
       : labelled;
   const value = stampFormat(stamped);
   if (!(await compareAndSet(ctx.journal, key, over.expected, value))) return false;
@@ -451,17 +488,18 @@ async function writeToolTerminal(
     // Journal clock for the stamp (K2, BOTH ends): windowExpired/ttl decisions read `at` with the
     // storage clock — a wall-clock stamp from a writer whose clock lags the storage makes a
     // long-lived thread marker expire EARLY (the unsafe direction: a duplicate fires).
-    const success: DupMarker = { firstToolCallId: toolCallId, at: await journalNow(ctx.journal) };
+    const success: DupMarker = { firstToolCallId: toolCallId, firstRunId: ctx.runId, at: await journalNow(ctx.journal) };
     const won = await claim(ctx.journal, dupKey, success);
     if (!won) {
-      // The row exists. Two of the shapes it can hold are OURS to overwrite, and leaving either in
+      // The row exists. Three shapes it can hold are overwritten by this success, and leaving any in
       // place is a live defect: our own in-flight claim from just before execute (never finalized,
-      // it would later read as stale and be taken over — re-running a SUCCEEDED side effect), or a
+      // it would later read as stale and be taken over — re-running a SUCCEEDED side effect), a
       // released slot from an earlier failed attempt (a later duplicate would take it over and run
-      // again). A FOREIGN completed marker stays — first success wins, as before.
+      // again), and ANOTHER call's in-flight claim (`successReplacesMarker`: it only says "may have
+      // happened"; this is the work that did). A FOREIGN completed marker stays — first success wins.
       const raw = await ctx.journal.get<DupMarker>(dupKey);
       const cur = raw as DupMarker | undefined;
-      if (cur && (cur.released === true || (cur.inFlight === true && cur.firstToolCallId === toolCallId))) {
+      if (cur && successReplacesMarker(cur)) {
         await compareAndSet(ctx.journal, dupKey, raw, success);
       }
     }
@@ -508,7 +546,8 @@ async function writeToolTerminal(
 /** Returns the record as it now stands — updated when this call added an id, otherwise the original. */
 async function trackResolvedToolCallId<T extends ToolJournalRecord>(ctx: DurableCtx, key: string, record: T, toolCallId: string): Promise<T> {
   if (record.status !== 'succeeded' && record.status !== 'denied' && record.status !== 'reflected') return record;
-  if ((record.resolvedToolCallIds ?? []).includes(toolCallId)) return record;
+  const me = { runId: ctx.runId, toolCallId };
+  if ((record.resolvedBy ?? []).some((r) => sameCall(r, me))) return record;
   // Compare-and-set over the record as it is NOW, not a put of the copy in hand. Two calls answered by
   // the same record at once (a model step asking twice — its tools run in parallel) both read the list,
   // and the second put dropped the first one's id: the resumed request then narrated its own call as
@@ -519,9 +558,10 @@ async function trackResolvedToolCallId<T extends ToolJournalRecord>(ctx: Durable
     const raw = await ctx.journal.get<T>(key);
     const cur = upgradeFormat(raw, key);
     if (!cur || (cur.status !== 'succeeded' && cur.status !== 'denied' && cur.status !== 'reflected')) return record;
+    if ((cur.resolvedBy ?? []).some((r) => sameCall(r, me))) return cur;
     const ids = cur.resolvedToolCallIds ?? [];
-    if (ids.includes(toolCallId)) return cur;
-    updated = { ...cur, resolvedToolCallIds: [...ids, toolCallId] } as T;
+    // Both lists: the bare ids for every reader that matches on them, `resolvedBy` for ownership.
+    updated = { ...cur, resolvedToolCallIds: ids.includes(toolCallId) ? ids : [...ids, toolCallId], resolvedBy: [...(cur.resolvedBy ?? []), me] } as T;
     if (await ctx.journal.putIfMatch(key, raw, stampFormat(updated))) break;
   }
   // Returned, not mirrored here. The caller mirrors what this returns — writing the updated list to the
@@ -580,7 +620,9 @@ async function consumeExistingRecord(
   // replays the model steps and re-emits the SAME toolCallId, so a record that already lists this id
   // among its resolvers is this call's own past. 'self' entries ride the envelope for observability
   // but never enter the model note.
-  const isSelf = key.startsWith(`${ctx.runId}:`) || ((record as { resolvedToolCallIds?: string[] }).resolvedToolCallIds ?? []).includes(toolCallId);
+  // A bare id in `resolvedToolCallIds` (a record of an older version, or another run's) is not proof of
+  // "my own past": the id is unique only inside a run. Only an entry that names this run is (`sameCall`).
+  const isSelf = key.startsWith(`${ctx.runId}:`) || ((record as { resolvedBy?: ResolvedBy[] }).resolvedBy ?? []).some((r) => sameCall(r, { runId: ctx.runId, toolCallId }));
   ctx.replayLog?.push({ toolCallId, toolName: (latest as { toolName?: string }).toolName, status: latest.status, origin: isSelf ? 'self' : 'window' });
   // Written on EVERY consume, not only when this call added an id.
   //
@@ -865,8 +907,10 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // (liveness.ts) — the reader's value only for a claim written before claims carried one.
       const claimTtl = claimTtlFor(tool, ctx);
       const readRecord = (raw: unknown): ToolJournalRecord | undefined => isUnstartedRelease(raw) ? undefined : upgradeFormat(raw as ToolJournalRecord, key);
+      // `detail.key`: the call another attempt holds. A detached run that meets it waits for that call's record
+      // (detached.ts: parked like an unknown outcome) instead of ending failed while the holder settles it.
       const busy = (): unknown => blockedOrThrow(ctx, toolCallId, toolName,
-        new RunBusyError(`'${toolName}' (${key}) is being executed by another executor`));
+        Object.assign(new RunBusyError(`'${toolName}' (${key}) is being executed by another executor`), { detail: { key } }));
       // A BODY THAT LOST ITS CALL ANSWERS WITH THE CALL'S RECORD. When its success could not be the call's
       // record (Attempt.succeed: the call was taken over while the body ran — a stall past the TTL, a
       // liveness session cut), its caller gets what a fresh call gets: the record that answers the call, or
@@ -933,12 +977,14 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       const decide: Decide = async (asked) => {
         let rec = asked;
         if (doubtOfDecided !== undefined && rec.status === 'suspended') {
-          const sus = (rec.output as { __gnl_suspend?: { reason?: string; inDoubt?: unknown } } | undefined)?.__gnl_suspend;
+          const sus = (rec.output as { __gnl_suspend?: { reason?: string; inDoubt?: unknown; needs?: string } } | undefined)?.__gnl_suspend;
           if (sus && sideEffect) {
             // The sentinel object itself: the caller returns the same one it handed over here.
             const what = decidedOn!.status === 'failed' ? 'failed' : 'stopped mid-execution';
             sus.reason = [sus.reason, `⚠ An earlier attempt of this call ${what} without a result — its effect MAY already have happened.`].filter(Boolean).join(' ');
             sus.inDoubt = { status: decidedOn!.status, attempts: doubtOfDecided };
+            // Whether the effect already happened is not the requester's to say: whatever gate asked, the question is now permission.
+            (sus as { needs?: string }).needs = 'approve';
           }
           rec = { ...rec, attempts: doubtOfDecided };
         }
@@ -1032,6 +1078,66 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // yüzeye de zaten çocuğun kimliği çıkıyor (run.ts `surfacedInterrupts`), yani standart
       // istemci sözleşmesi doğru id'yi kendiliğinden taşır.
       const approved = isProxySuspend ? undefined : ctx.approvals?.[toolCallId];
+      // A QUESTION OVER THE SHARED CLAIM SUPERSEDES THIS CALL'S FAILED ATTEMPT. A yes given for this call's
+      // first attempt (`approved`) answered that question, not "its effect MAY already have happened" —
+      // which a later call of the same work asked over the claim, and which only an answer to it releases.
+      // So the call neither retries on the old yes nor asks afresh (it is not the one asked): it says how
+      // its attempt ended, as the model was told, and a resume that carries no answer runs nothing.
+      // The call's OWN record is read: under a window the claim holds the question.
+      if (mode === 'args' && sideEffect) {
+        const ownKey = runKeys.tool(ctx.runId, toolCallId);
+        const own = upgradeFormat(await ctx.journal.get<ToolJournalRecord>(ownKey), ownKey) as { status?: string; sideEffect?: boolean; error?: unknown; mirrorOf?: string } | undefined;
+        if (own?.status === 'failed' && typeof own.error === 'string' && typeof own.mirrorOf === 'string'
+          && isSupersededFailure(own, await ctx.journal.get<{ status?: string }>(own.mirrorOf))) {
+          throw maskedToolError(undefined, own.error);
+        }
+      }
+      // THE GUARD, asked the same way wherever it is asked. TAINT PHASE 2 (taint-aware guard): the guard
+      // sees the run's taint mark (undefined = clean) so policies like `taintGuardian` can gate SENSITIVE
+      // tools only when untrusted content has entered. The read happens ONLY when a guard is asked.
+      const askGuard = async () => ctx.guard!({ toolName, args: input, toolCallId, runId: ctx.runId, tainted: await readRunTaint(ctx.journal, ctx.runId) });
+      // A guard's `deny` on a tool with `confirm` (d25 U8). Its `confirm` question used to come first and the
+      // approved call then skipped the guard (it meets the suspended-record arm, never the guard arm), so a
+      // deny-everything guard was asked 0 times and the call ran on a human's yes. Now it is asked before
+      // the question — a caller it refuses is not shown the question at all — and again after the yes.
+      const guardDenial = async (): Promise<{ __denied: true; reason: string } | undefined> => {
+        if (!ctx.guard) return undefined;
+        const decision = await askGuard();
+        return decision.action === 'deny' ? { __denied: true, reason: decision.reason ?? 'Denied by policy.' } : undefined;
+      };
+      // THE QUESTIONS A CALL MUST HAVE ANSWERED, in the order they are put. A guard's decision and the tool's
+      // own `confirm` / `approve` rule each may ask (`confirm` = consent, `approve` = permission: see
+      // approval-authority.ts); the agent's guard comes first and a guard `deny` ends it before any question.
+      // Consent is put before permission, so one call can carry TWO questions, one after the other, and the
+      // call runs only when both are yes. A yes from an authorised person covers both (`grant`).
+      // The rule functions run only when a question could still be put (never after a guard `deny`).
+      const hasRule = Boolean(tool.confirm) || Boolean((tool as { approve?: unknown }).approve);
+      let rulesAsk: { confirm: { reason?: string } | undefined; approve: { reason?: string } | undefined } | undefined;
+      const rules = () => (rulesAsk ??= { confirm: ruleAsk(tool.confirm, input), approve: ruleAsk((tool as { approve?: unknown }).approve, input) });
+      const grant = ctx.approvalGrants?.[toolCallId] ?? 'approve';
+      /** Is `need` already answered yes for this call? (An authorised yes answers either; a requester's only consent.) */
+      const satisfied = (need: QuestionNeeds): boolean => approved === true && (need === 'confirm' || grant === 'approve');
+      const stagesOf = (decision: GuardDecision | undefined): Stage[] => {
+        const out: Stage[] = [];
+        if (decision && (decision.action === 'confirm' || decision.action === 'approve' || decision.action === 'require-approval')) {
+          out.push({ need: decision.action === 'confirm' ? 'confirm' : 'approve', kind: 'guard', ...(decision.reason !== undefined ? { reason: decision.reason } : {}) });
+        }
+        const { confirm: confirmAsk, approve: approveAsk } = rules();
+        if (confirmAsk) out.push({ need: 'confirm', kind: 'confirm', reason: confirmAsk.reason ?? `'${toolName}' requires explicit confirmation before it runs.` });
+        if (approveAsk) out.push({ need: 'approve', kind: 'approve', reason: approveAsk.reason ?? `'${toolName}' requires an authorised person's approval before it runs.` });
+        return out.sort((a, b) => Number(a.need === 'approve') - Number(b.need === 'approve'));
+      };
+      const sentinelOf = (st: Stage, reason: string | undefined = st.reason) => ({ __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: st.kind, needs: st.need } });
+      // The guard is asked ONCE per attempt on the fresh path, whichever arm reads it.
+      let guardSaid: GuardDecision | undefined;
+      const guardOnce = async (): Promise<GuardDecision> => (guardSaid ??= await askGuard());
+      // A FRESH call of a tool with its own rule: the guard first (a deny ends it), then the questions owed. A
+      // guard that allows and rules that ask nothing leave no question, and the call goes on to run.
+      let fresh: { denied?: { __denied: true; reason: string }; stages: Stage[] } | undefined;
+      if (record === undefined && hasRule && approved === undefined) {
+        const said = ctx.guard ? await guardOnce() : undefined;
+        fresh = said?.action === 'deny' ? { denied: { __denied: true, reason: said.reason ?? 'Denied by policy.' }, stages: [] } : { stages: stagesOf(said) };
+      }
 
       // 2) Suspended call: if it was previously suspended and there's no approval, return the sentinel again (still suspended).
       if (record && record.status === 'suspended') {
@@ -1095,7 +1201,31 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           // another run's id from there long after this branch was fixed.
           return await consumeExistingRecord(ctx, key, record, toolCallId);
         }
-        // Approved === true → run below.
+        // Approved === true → run below — past the guard, which a `confirm` question was asked before
+        // and is asked again now (guardDenial above): what it refuses, a human's yes does not run.
+        if (!isProxySuspend) {
+          // After a tool-rule question the guard is asked again: what it refuses, a human's yes does not run,
+          // and it may now put a question of its own. After the guard's own question it is not (it just asked).
+          const askedKind = suspendKindOf(record);
+          let decision: GuardDecision | undefined;
+          if ((askedKind === 'confirm' || askedKind === 'approve') && ctx.guard) {
+            decision = await askGuard();
+            if (decision.action === 'deny') {
+              const denied = { __denied: true as const, reason: decision.reason ?? 'Denied by policy.' };
+              { const moved = await decide({ status: 'denied', output: denied }); if (moved) return moved.answered; }
+              return denied;
+            }
+          }
+          // A second question over the same call: the one answered was consent and permission is still owed.
+          const pending = stagesOf(decision).find((st) => !satisfied(st.need));
+          if (pending) {
+            const sus = (record.output as { __gnl_suspend?: { kind?: string; needs?: unknown } } | undefined)?.__gnl_suspend;
+            if (sus?.kind === pending.kind && needsOfSuspend(sus) === pending.need) return await consumeExistingRecord(ctx, key, record, toolCallId);
+            const sentinel = sentinelOf(pending);
+            { const moved = await decide({ status: 'suspended', output: sentinel }); if (moved) return moved.answered; }
+            return sentinel;
+          }
+        }
         //
         // Aşağıdaki iki iz de SORUYU SORMUŞ bir kayda aittir: 'bilerek tekrar' izi ve semantik mezar
         // taşı, ikisi de "insan bu SORUYA evet dedi" cümlesini kaydeder. Vekil kayıt hiç soru
@@ -1140,7 +1270,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
             } catch { /* re-asking is the safe failure */ }
           }
         }
-      } else if (record === undefined && tool.confirm && approved !== true) {
+      } else if (record === undefined && hasRule && approved !== true && (approved === false || fresh?.denied !== undefined || (fresh?.stages.length ?? 0) > 0)) {
         // FAZ-3 `confirm` — the tool's OWN first-call human gate, handled by the runtime directly
         // (no guard factory: a two-step ceremony where forgetting the factory leaves the flag
         // silently unenforced is exactly the failure class this replaces). Denial is terminal;
@@ -1157,10 +1287,16 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           { const moved = await decide({ status: 'denied', output }); if (moved) return moved.answered; }
           return output;
         }
-        let reason =
-          (typeof tool.confirm === 'object' && typeof tool.confirm.reason === 'function'
-            ? tool.confirm.reason(input)
-            : undefined) ?? `'${toolName}' requires explicit confirmation before it runs.`;
+        // The guard before the question: a call it refuses is never put to a human, and a question of its own
+        // (`confirm` / `approve`) is put in its turn (stagesOf).
+        if (fresh?.denied) {
+          const denied = fresh.denied;
+          { const moved = await decide({ status: 'denied', output: denied }); if (moved) return moved.answered; }
+          return denied;
+        }
+        // The first question owed: consent before permission (stagesOf). Its text is the rule's own.
+        const first = fresh!.stages[0]!;
+        let reason = first.reason ?? `'${toolName}' requires explicit confirmation before it runs.`;
         // REPEAT CONTEXT on the confirm question: confirm fires BEFORE the duplicate ladder, so
         // when both would trigger, the human only ever saw confirm's generic text — approving a
         // DELIBERATE second identical job and approving a fresh one looked the same. A completed
@@ -1175,11 +1311,10 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         let repeatSignal: { source: 'duplicate-guard' | 'semantic-guard'; origin: string; keys?: string[]; firstToolCallId?: string; score?: number } | undefined;
         if (ctx.threadId) {
           try {
-            const prior = await ctx.journal.get<{ at?: number; inFlight?: boolean; released?: boolean; firstToolCallId?: string }>(
-              threadDupMarkerKey(ctx.threadId, toolName, hash),
-            );
+            const prior = await ctx.journal.get<DupMarker>(threadDupMarkerKey(ctx.threadId, toolName, hash));
             if (prior && prior.inFlight !== true && prior.released !== true) {
-              reason += ` ⚠ Identical work was ALREADY COMPLETED earlier in this conversation${prior.firstToolCallId ? ` (first result: ${prior.firstToolCallId})` : ''} — approve only if you intend a deliberate repeat.`;
+              const other = await otherRunDid(ctx, prior);
+              reason += ` ⚠ Identical work was ALREADY COMPLETED earlier in this conversation${prior.firstToolCallId ? ` (first result: ${prior.firstToolCallId})` : ''}${other ? `: ${other.text}` : ''} — approve only if you intend a deliberate repeat.`;
               // Byte-identical args: deterministic and certain. Recorded so the answer is not lost,
               // but under the DUPLICATE source — precision@suspend measures whether the SIMILARITY
               // chain was worth asking, and an exact-hash hit was never in doubt.
@@ -1256,38 +1391,35 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
               // Structural, and the reason this is not just `origin`: a reader must be able to tell
               // a question the confirm gate asked from one the dedup ladder asked on its own. The
               // wording differs, the ladder rung differs, and the human's click means the same thing.
-              askedBy: 'confirm',
+              askedBy: first.kind,
               ...(repeatSignal.firstToolCallId ? { firstToolCallId: repeatSignal.firstToolCallId } : {}),
               ...(repeatSignal.score !== undefined ? { score: repeatSignal.score } : {}),
               ...(repeatSignal.keys ? { identityKeys: repeatSignal.keys } : {}),
             },
           });
         }
-        const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'confirm' } };
+        const sentinel = sentinelOf(first, reason);
         { const moved = await decide({ status: 'suspended', output: sentinel }); if (moved) return moved.answered; }
         return sentinel;
       } else if (ctx.guard) {
-        // 3) General policy: check at the gate before execute (gate the side effect).
-        // TAINT PHASE 2 (taint-aware guard): the guard sees the run's taint mark (undefined = clean)
-        // so policies like `taintGuardian` can gate SENSITIVE tools only when untrusted content has
-        // entered. The read happens ONLY when a guard is present — guard-less runs pay nothing.
-        const tainted = await readRunTaint(ctx.journal, ctx.runId);
-        const decision = await ctx.guard({ toolName, args: input, toolCallId, runId: ctx.runId, tainted });
+        // 3) General policy: check at the gate before execute (gate the side effect) — `askGuard` above.
+        const decision = await guardOnce();
         if (decision.action === 'deny') {
           const output = { __denied: true, reason: decision.reason ?? 'Denied by policy.' };
           { const moved = await decide({ status: 'denied', output }); if (moved) return moved.answered; }
           return output; // the model sees this result and can correct itself
         }
-        if (decision.action === 'require-approval') {
+        if (decision.action === 'require-approval' || decision.action === 'approve' || decision.action === 'confirm') {
+          const need: QuestionNeeds = decision.action === 'confirm' ? 'confirm' : 'approve';
           if (approved === false) {
             const output = { __denied: true, reason: decision.reason ?? 'Approval denied.' };
             { const moved = await decide({ status: 'denied', output }); if (moved) return moved.answered; }
             return output;
           }
-          if (approved !== true) {
+          if (!satisfied(need)) {
             // No approval → suspend: the real tool does NOT run; a sentinel is returned, the loop stops via stopWhen.
             const sentinel = {
-              __gnl_suspend: { toolCallId, toolName, args: input, reason: decision.reason, kind: 'guard' },
+              __gnl_suspend: { toolCallId, toolName, args: input, reason: decision.reason, kind: 'guard', needs: need },
             };
             { const moved = await decide({ status: 'suspended', output: sentinel }); if (moved) return moved.answered; }
             return sentinel;
@@ -1318,9 +1450,14 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // In default 'call' mode that duplicate would silently re-execute (double charge) unless the
       // developer remembered `idempotency: 'args'` — the journal KNOWS it's a duplicate, so the
       // runtime must at minimum SAY so (default 'warn'), and can steer/stop/escalate on request.
-      // Scope guards: 'args' mode dedups on its own (fast-path above); an EXPLICIT approval for this
-      // toolCallId means a human already blessed this exact repeat (stand down); replay never gets
-      // here (the fast-path returns the journaled record first).
+      // Scope guards: 'args' mode dedups on its own (fast-path above) — but only INSIDE its window: in the
+      // 'run' window (the default) a new run is a new key, so a chat's next message repeating the same
+      // transfer met neither the record nor this ladder and ran again, no question asked (d25 U2: the
+      // 'critical' profile's "every repeat is a human question" broken by the stricter declaration). So the
+      // ladder runs for 'args' in the 'run' window too; a wider window ('thread', 'cross-run') still answers
+      // a repeat from its record, before this. An EXPLICIT approval for this toolCallId means a human
+      // already blessed this exact repeat (stand down); replay never gets here (the fast-path returns the
+      // journaled record first).
       const dupCfg = dupConfigOf(ctx.limits?.sideEffectDuplicates, tool.effectClass);
       const dupAction = dupCfg.action;
       // FAZ-3 scope: 'thread' widens the marker to the conversation (xthr:<threadId>:dup-…) — the
@@ -1331,7 +1468,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         dupScope = 'run';
       }
       let dupWhere = dupScope === 'thread' ? `thread '${ctx.threadId}'` : `run '${ctx.runId}'`;
-      const dupKey = mode === 'call' && sideEffect && dupAction !== 'off'
+      const dupKey = (mode === 'call' || effWindow === 'run') && sideEffect && dupAction !== 'off'
         ? dupScope === 'thread'
           ? threadDupMarkerKey(ctx.threadId!, toolName, hash)
           : dupMarkerKey(requestOf(ctx.identity), toolName, hash)
@@ -1427,13 +1564,14 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
             // suspensions (Studio Approvals, resumeRun approvals[toolCallId]) — a human decides the
             // ambiguous case; an approval executes it exactly once (see `approved !== true` above).
             const nowS = ctx.journal.now ? await ctx.journal.now() : Date.now();
+            const other = crossOrigin ? undefined : await otherRunDid(ctx, marker);
             const reason =
               `Duplicate side effect: '${toolName}' already succeeded with identical arguments in ` +
-              `${dupWhere} (first: ${marker.firstToolCallId}). A human must approve executing it again.` +
+              `${dupWhere} (first: ${marker.firstToolCallId}${other ? `; ${other.text}` : ''}). A human must approve executing it again.` +
               undeclaredHint(tool, toolName);
             // Zengin payload (heyet v1 #5): bilgisiz onay onay degildir — UI yas/kaynak gosterebilsin.
-            const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'duplicate',
-              prior: { toolCallId: marker.firstToolCallId, at: marker.at, ageMs: Math.max(0, nowS - marker.at), ...(crossOrigin ? { origin: crossOrigin } : {}) } } };
+            const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'duplicate', needs: 'confirm',
+              prior: { toolCallId: marker.firstToolCallId, ...(other ? { runId: other.runId } : {}), at: marker.at, ageMs: Math.max(0, nowS - marker.at), ...(crossOrigin ? { origin: crossOrigin } : {}) } } };
             await recordIncident(ctx.journal, ctx.runId, {
               at: Date.now(), source: 'duplicate-guard', action: 'suspend', toolName, toolCallId,
               message: reason, detail: { toolName, argsHash: hash, firstToolCallId: marker.firstToolCallId, toolCallId },
@@ -1572,7 +1710,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
               `but the amounts differ (${verdict.amountsDiffer.join(', ')}). A human must decide: new job, or a duplicate with a typo?`
             : `Semantically similar work already succeeded in this thread (${pct}% match, first: ${verdict.firstToolCallId}): ` +
               `"${verdict.priorCanonical}". A human must approve executing it again.`;
-          const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'semantic', semPair: { priorHash: verdict.priorHash } } };
+          const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'semantic', needs: 'confirm', semPair: { priorHash: verdict.priorHash } } };
           await recordIncident(ctx.journal, ctx.runId, {
             at: Date.now(), source: 'semantic-guard', action: 'suspend', toolName, toolCallId, message: reason,
             detail: {
@@ -1621,7 +1759,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
               `Similar work already succeeded in this thread (${pct}% match, first: ${gray.rec.firstToolCallId}): ` +
               `"${gray.rec.canonical}". The identity fields differ, so this may be the same job written differently. ` +
               `A human must approve executing it again.`;
-            const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'semantic', semPair: { priorHash: gray.rec.argsHash } } };
+            const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'semantic', needs: 'confirm', semPair: { priorHash: gray.rec.argsHash } } };
             await recordIncident(ctx.journal, ctx.runId, {
               at: Date.now(), source: 'semantic-judge', action: 'suspend', toolName, toolCallId, message: reason,
               detail: {
@@ -1692,7 +1830,10 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         }
       }
       const taintAction = ctx.limits?.taintedSideEffects ?? DEFAULT_TAINT_ACTION;
-      if (sideEffect && approved !== true && taintAction !== 'off') {
+      // Asking rungs name who answers: 'suspend' (= 'approve') is permission, 'confirm' is consent. A yes the
+      // requester gave to an earlier consent question does not answer an approve one.
+      const taintNeed: QuestionNeeds | undefined = taintAction === 'confirm' ? 'confirm' : taintAction === 'suspend' || taintAction === 'approve' ? 'approve' : undefined;
+      if (sideEffect && (approved !== true || (taintNeed !== undefined && !satisfied(taintNeed))) && taintAction !== 'off') {
         const taint = await readRunTaint(ctx.journal, ctx.runId);
         if (taint) {
           const src = `'${taint.toolName}' (${taint.toolCallId})`;
@@ -1704,12 +1845,12 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
             await recordIncident(ctx.journal, ctx.runId, { at: Date.now(), source: 'taint-guard', action: 'block', toolName, toolCallId, message, detail: taintDetail });
             return { __gnl_limit_exceeded: { toolCallId, toolName, kind: 'taintedSideEffect', message, detail: taintDetail } };
           }
-          if (taintAction === 'suspend') {
+          if (taintNeed !== undefined) {
             const reason =
               `Tainted context: untrusted external content from ${src} entered this run before this ` +
               `'${toolName}' call. A human must verify the action serves the user's request (not the fetched content) and approve it.` +
               undeclaredHint(tool, toolName);
-            const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'taint' } };
+            const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'taint', needs: taintNeed } };
             await recordIncident(ctx.journal, ctx.runId, { at: Date.now(), source: 'taint-guard', action: 'suspend', toolName, toolCallId, message: reason, detail: taintDetail });
             { const moved = await decide({ status: 'suspended', output: sentinel }); if (moved) return moved.answered; }
             return sentinel;
@@ -1857,8 +1998,9 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // (attempt.ts): by compare-and-set over its own stamp, with every side write of the choke point.
       const writeAsAttempt: TerminalWriter = (rec, expected, xidHeld) =>
         writeToolTerminal(ctx, key, rec, { expected }, toolCallId, toolName, hash, { dupKey, semPlan, xidPlan, xidHeld, idempotencyKey: derivedKey });
-      const own = (prior: unknown, stamp: ReturnType<typeof runningStamp>, datedAt: number): Attempt =>
-        (seat.attempt = new Attempt(ctx.journal, key, prior, stamp, datedAt, toolName, writeAsAttempt, { runId: ctx.runId, ...(ctx.erasure ? { baseline: ctx.erasure } : {}) }));
+      // `session`: this process's session signal as it stood BEFORE the stamp was dated (Attempt.assertHeld).
+      const own = (prior: unknown, stamp: ReturnType<typeof runningStamp>, datedAt: number, session: AbortSignal | undefined): Attempt =>
+        (seat.attempt = new Attempt(ctx.journal, key, prior, stamp, datedAt, toolName, writeAsAttempt, { runId: ctx.runId, ...(ctx.erasure ? { baseline: ctx.erasure } : {}) }, session));
       let attempt: Attempt;
       claimLoop: for (;;) {
         // The journal's clock, not this process's — run-lock.ts has always done it this way and
@@ -1868,6 +2010,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // `datedAt` (this process's monotonic clock, read first) is how old the attempt knows its
         // own stamp to be — see Attempt.assertHeld.
         const datedAt = performance.now();
+        const session = livenessFor(ctx.journal)?.sessionSignal?.();
         const nowTs = await journalNow(ctx.journal);
         if (record === undefined) {
           // `attempts: 1` from the very first claim: the crash ladder below counts takeovers, and a
@@ -1879,7 +2022,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           const won = await claim(ctx.journal, key, stamp);
           const raw = won ? undefined : await ctx.journal.get<ToolJournalRecord>(key);
           if (won || (isUnstartedRelease(raw) && (await compareAndSet(ctx.journal, key, raw, stamp)))) {
-            attempt = own(raw, stamp, datedAt);
+            attempt = own(raw, stamp, datedAt, session);
             if (ownerKey) await claimCrossRunOwner(ctx, toolName, hash);
             break claimLoop;
           }
@@ -2084,9 +2227,12 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           // risking a double side effect).
           const attempts = record.attempts ?? 1;
           if (sideEffect && approved !== true && !recovered) {
+            // The same work may stand completed under ANOTHER run's name (a thread's marker): say so, or a
+            // person approving this run's call pays for it again.
+            const other = dupKey ? await otherRunDid(ctx, await ctx.journal.get<DupMarker>(dupKey)) : undefined;
             return blockedOrThrow(ctx, toolCallId, toolName, new SideEffectRetryBlockedError(
               `@gnldev/durable: '${toolName}' (${key}) crashed mid-execution (stale 'running') and has side ` +
-                `effects — it MAY have already run. Provide a recover() hook to resolve automatically, ` +
+                `effects — it MAY have already run${other ? ` (and ${other.text})` : ''}. Provide a recover() hook to resolve automatically, ` +
                 `mark idempotent: true, or approve with approvals['${toolCallId}']=true`,
               { key, attempts },
             ));
@@ -2174,6 +2320,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // gate above), so a takeover stamped with a fast local clock would look instantly stale to
         // every other worker — the exact skew class the clock fix removed, re-entering here.
         const takeoverDatedAt = performance.now();
+        const takeoverSession = livenessFor(ctx.journal)?.sessionSignal?.();
         const nowTakeover = await journalNow(ctx.journal);
         // A FRESH 'running' claim at the re-read is a live executor, whatever the ladder judged. Two
         // workers resuming with the same approval both judged the 'suspended' record; the first took it
@@ -2200,7 +2347,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           if (mode !== 'args') return busy();
           continue claimLoop;
         }
-        attempt = own(rawBefore, takeover, takeoverDatedAt);
+        attempt = own(rawBefore, takeover, takeoverDatedAt, takeoverSession);
         break claimLoop; // reclaim complete → execute below
       }
 
@@ -2237,16 +2384,21 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // `gnl`: who the tool runs for — THE channel (`identityOf(options)`). The old `resourceId` key
       // throws when read (closeLegacyResourceId): a tool that still reads it must fail loudly, not
       // serve "nobody" (which a knowledge-base tool used to read as "everything").
-      const execOpts: any = closeLegacyResourceId({ ...(options ?? {}), idempotencyKey: attempt.idempotencyKey, parentRunId: ctx.runId, gnlApprovals: nestedApprovalsFor(record, ctx.approvals, toolCallId), gnl: toolContextFor(ctx.identity) });
+      const execOpts: any = closeLegacyResourceId({ ...(options ?? {}), idempotencyKey: attempt.idempotencyKey, parentRunId: ctx.runId, gnlApprovals: nestedApprovalsFor(record, ctx.approvals, toolCallId), ...(ctx.answerer ? { gnlAnswerer: ctx.answerer } : {}), gnl: toolContextFor(ctx.identity) });
       if (timeoutMs) {
         const tSignal = AbortSignal.timeout(timeoutMs);
         execOpts.abortSignal = execOpts.abortSignal ? AbortSignal.any([execOpts.abortSignal, tSignal]) : tSignal;
       }
       // THE PROCESS'S SESSION, AS A SIGNAL. A process whose liveness session is gone and not back within
       // half its reconnect grace may soon be read as dead by the others, and this call taken over: the body
-      // is told to stop (process-liveness.ts `sessionSignal`). A body that honours it ends its attempt like
-      // any failed one; one that does not keeps running — its effect may then happen twice, and the
-      // provider's idempotencyKey is what folds the two.
+      // is told to stop (process-liveness.ts `sessionSignal`). A body that honours it — however it says so:
+      // the signal's reason rethrown, Node's AbortError (timers/promises, events.once, stream.pipeline), or
+      // an error of its own — has its attempt journaled 'failed' (its effect may have happened), but the
+      // call leaves as LivenessUnavailableError (see the body's catch below): the model is NOT told the tool
+      // failed. The detached executor releases the execution and the run continues from its log, here once
+      // the session is back or in another process; the failed attempt then meets the crash ladder
+      // (idempotency key → recover() → a person), never a blind re-run. One that does not honour it keeps
+      // running — its effect may then happen twice, and the provider's idempotencyKey is what folds the two.
       const sSignal = livenessFor(ctx.journal)?.sessionSignal?.();
       if (sSignal) execOpts.abortSignal = execOpts.abortSignal ? AbortSignal.any([execOpts.abortSignal, sSignal]) : sSignal;
       // SAME-STEP DUPLICATE RACE — claimed HERE, after every gate that can stop this call.
@@ -2286,8 +2438,8 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // marker held by a call that never ran, and the NEXT legitimate call was reported as its
       // duplicate — which is how this landed on taint-guard.test.ts rather than staying theoretical.
       if (dupKey && !answeredRepeat) {
-        const got = await attempt.claimDup(dupKey, toolCallId, dupCfg.ttlMs);
-        const twinInFlight = got.cur?.inFlight === true && got.cur.firstToolCallId !== toolCallId;
+        const got = await attempt.claimDup(dupKey, ctx.runId, toolCallId, dupCfg.ttlMs);
+        const twinInFlight = got.cur?.inFlight === true && !markerIsMine(got.cur, { runId: ctx.runId, toolCallId }, attempt.priorStamp);
         if (!got.won && (approved !== true || twinInFlight)) {
           // A twin got here first. 'warn' is documented as permissive and stays that way; every
           // stricter policy means this call must not run.
@@ -2307,18 +2459,24 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           if (dupAction === 'suspend') {
             const already = await declinedRepeat(ctx, toolCallId, toolName, hash, settleAs);
             if (already !== undefined) return already;
+            // A STALE marker is what a dead attempt left: nothing is executing now, and the effect may have
+            // happened. Saying "is already executing" there sent the person looking for a live run.
+            const running = got.stale
+              ? `was being executed with identical arguments in ${dupWhere} when an earlier attempt stopped mid-way — its effect may have happened.`
+              : `is already executing with identical arguments in ${dupWhere}.`;
             const reason =
-              `Duplicate side effect: '${toolName}' is already executing with identical arguments in ` +
-              `${dupWhere}. A human must approve executing it a second time.` + undeclaredHint(tool, toolName);
-            const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'duplicate' } };
+              `Duplicate side effect: '${toolName}' ${running} A human must approve executing it ${got.stale ? 'again' : 'a second time'}.` + undeclaredHint(tool, toolName);
+            const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'duplicate', needs: 'confirm' } };
             await recordIncident(ctx.journal, ctx.runId, { at: Date.now(), source: 'duplicate-guard', action: 'suspend', toolName, toolCallId, message: reason, detail });
             await attempt.settle({ status: 'suspended', output: sentinel });
             return sentinel;
           }
           if (dupAction !== 'warn') {
-            const message =
-              `@gnldev/durable: side-effect tool '${toolName}' is already executing with identical ` +
-              `arguments in ${dupWhere} — this concurrent duplicate was NOT EXECUTED`;
+            const message = got.stale
+              ? `@gnldev/durable: side-effect tool '${toolName}' was being executed with identical arguments in ${dupWhere} ` +
+                'when an earlier attempt stopped mid-way (its effect may have happened) — this duplicate was NOT EXECUTED'
+              : `@gnldev/durable: side-effect tool '${toolName}' is already executing with identical ` +
+                `arguments in ${dupWhere} — this concurrent duplicate was NOT EXECUTED`;
             await recordIncident(ctx.journal, ctx.runId, { at: Date.now(), source: 'duplicate-guard', action: 'block', toolName, toolCallId, message, detail });
             // Blocked AFTER this call claimed its record: the body never starts, so the claim is given
             // back. Left 'running', a replay of this call (a resume) met "being executed elsewhere" and
@@ -2364,7 +2522,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
             const reason =
               `Duplicate side effect: '${toolName}' with the same business identity ${state} in another channel ` +
               `(first: ${x.first.toolCallId}). A human must approve executing it again.` + undeclaredHint(tool, toolName);
-            const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'duplicate',
+            const sentinel = { __gnl_suspend: { toolCallId, toolName, args: input, reason, kind: 'duplicate', needs: 'confirm',
               prior: { toolCallId: x.first.toolCallId, at: x.first.at, ageMs: Math.max(0, nowX - x.first.at), origin: xidWhen(x, nowX), ...(x.inFlight ? { inFlight: true } : {}) } } };
             await recordIncident(ctx.journal, ctx.runId, { at: Date.now(), source: 'duplicate-guard', action: 'suspend', toolName, toolCallId, message: reason, detail });
             await attempt.settle({ status: 'suspended', output: sentinel });
@@ -2425,6 +2583,31 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         }
       }
       let output: unknown;
+      // ITS RECORD IS STILL BEING WRITTEN, in the background: the body ran, and the store did not take the
+      // outcome (settleSuccess, or a body stopped by its session below). The attempt ends when that write
+      // lands, not before: its stamp reads live meanwhile (a twin waits for the record rather than run the
+      // call). Ended with its stamp still the record, the call read as in flight to every other process for as
+      // long as this one lived (liveness.ts `holderIsLive` rule 3: its process answers) — a retry of the same
+      // work on another process under a 'thread' or 'cross-run' window waited on it with no end (D3 retry
+      // audit: >70 s, no answer); only this process could read it as over (rule 2).
+      let successPending = false;
+      const keepWriting = (what: string, write: () => Promise<unknown>): void => {
+        attempt.outlived = true;
+        successPending = true;
+        seat.late = seat.held !== undefined || seat.slot !== undefined;
+        let said = false;
+        void giveBack(`${key}#${what}#${attempt.attempts}`, ctx.journal, async () => {
+          try {
+            await write();
+          } catch (err) {
+            if (!said) console.warn(`@gnldev/durable: '${toolName}' ran its body, and its ${what} record (${key}) could not be written yet — retried until it lands:`, err);
+            said = true;
+            throw err;
+          }
+          attempt.end();
+          if (seat.late) await releaseSeat(seat).catch(() => undefined);
+        });
+      };
       // The value the call settles with: the processed output, journaled. A closure because a timed-out
       // attempt is still alive and settles LATER — through the same path (see the catch below).
       const settleSuccess = async (raw: unknown): Promise<unknown> => {
@@ -2460,12 +2643,35 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         }
         // The effect happened: recorded over this attempt's claim, or — when the call was taken over
         // while the body ran (a stall past the TTL, the lease's residual) — as the fact it is (Attempt.succeed).
-        const written = await attempt.succeed({
+        const success: ToolJournalRecord = {
           status: 'succeeded', output, argsHash: hash, toolName,
           // A compensate-bearing tool's success stores the RAW args — the unwind needs them.
           ...(typeof tool.compensate === 'function' ? { input } : {}),
           ...(tool.delegation === true ? { delegation: true as const } : {}),
-        });
+        };
+        let written: boolean;
+        try {
+          written = await attempt.succeed(success);
+        } catch (writeErr) {
+          // THE EFFECT HAPPENED AND ITS RECORD COULD NOT BE WRITTEN (the store stopped answering: a restart,
+          // a failover, a dropped session). That is not a failed call: told "the tool failed", the model
+          // answered without it and the person was shown a done effect as failed — an invitation to do it a
+          // second time by hand (liveness-audit D3: 10 of 10 trials, the run `completed`, the record left
+          // `running`). The success is a fact, so it is kept being written, in the background, until it
+          // lands (process-liveness.ts `giveBack`: backoff, dropped only when the store closes); the attempt
+          // stays held meanwhile (its stamp reads live: a twin waits for its record rather than run it). The
+          // call leaves as LivenessUnavailableError: the detached executor releases the execution, and the
+          // run continues once the record is there (detached.ts waits on the busy call) — or, if this
+          // process dies first, through the crash ladder (recover() → a person), never a blind re-run.
+          // A run deleted or canceled meanwhile is not a store that did not answer: that error leaves as it is.
+          const named = (writeErr as { name?: unknown } | null)?.name;
+          if (named === 'RunErasedError' || named === 'RunCanceledError') throw writeErr;
+          keepWriting('succeeded', () => attempt.succeed(success));
+          throw new LivenessUnavailableError(
+            `@gnldev/durable: '${toolName}' ran its body, but its record could not be written (the store did not answer) — the run is released and continues from the call's result once it is written`,
+            { cause: writeErr },
+          );
+        }
         // NOTE: taint for `untrusted` tools is now marked at INVOCATION (see above), not here —
         // marking after execute lost the same-step parallel race against a side-effect tool's taint read.
         return written ? output : answerLost(output);
@@ -2566,10 +2772,33 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
             (late) => settleSuccess(late).then(() => undefined),
             (lateErr) => settleFailure(lateErr).then(() => undefined),
           ).finally(async () => {
+            if (successPending) return; // ended by its success write, once it lands
             attempt.end();
             if (seat.late) await releaseSeat(seat);
           }).catch((e) => console.warn(`@gnldev/durable: '${toolName}' finished after its timeout and its outcome could not be journaled:`, e));
           throw error;
+        }
+        // STOPPED BY ITS SESSION (the signal above), however the body said so: the attempt is journaled
+        // 'failed' as any other (its effect may have happened), but the call is RELEASED, not failed — the
+        // model is not told (process-liveness.ts LivenessUnavailableError; detached.ts releases on its name).
+        // The event the detached executor reads keeps the error's name and message only (event-codec.ts
+        // errorData), so a body that answered with Node's AbortError (its `cause` the reason) or an error of
+        // its own was read as a failed tool: the model answered without the call and the run `completed`
+        // with its effect never done (liveness-audit D1: 10 of 10). A failure that cannot even be written
+        // (the store gone with the session) leaves the same way, its record kept being written until it lands
+        // (keepWriting); the continuation meets it on the crash ladder.
+        if (sSignal?.aborted) {
+          let failed: unknown;
+          try { failed = await settleFailure(error); } catch (writeErr) {
+            failed = writeErr;
+            const named = (writeErr as { name?: unknown } | null)?.name;
+            if (named !== 'RunErasedError' && named !== 'RunCanceledError') keepWriting('failed', () => settleFailure(error));
+          }
+          if ((failed as { name?: unknown } | null)?.name === 'LivenessUnavailableError') throw failed;
+          throw new LivenessUnavailableError(
+            `@gnldev/durable: '${toolName}' was stopped because this process lost its liveness session — the run is released and continues from its log`,
+            { cause: failed },
+          );
         }
         throw await settleFailure(error);
       }

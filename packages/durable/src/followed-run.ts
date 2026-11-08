@@ -152,7 +152,12 @@ export function followedRun(runs: DetachedRuns, req: { runId: string; scope?: st
   let summary: Promise<{ steps: any[]; finish: any }> | undefined;
   const summarize = () => (summary ??= (async () => {
     if (streamed) await streamOver;
-    else for await (const _ of runs.follow({ runId: req.runId, ...scope, after: cursor, ...(req.signal ? { signal: req.signal } : {}), untilPause: true })) { /* to its end */ }
+    else {
+      for await (const ev of runs.follow({ runId: req.runId, ...scope, after: cursor, ...(req.signal ? { signal: req.signal } : {}), untilPause: true })) {
+        // The follow's own ending too (a run whose takeover failed, detached.ts): it is not in the log read below.
+        if (ev.kind === 'status' && ENDINGS.has((ev.data as RunEnding).state)) ending = ev.data as RunEnding;
+      }
+    }
     const events = await allRunEvents(req.journal, req.runId);
     ending ??= endingOf(events);
     const finish = [...events].reverse().find((e) => e.kind === 'finish');

@@ -13,6 +13,7 @@
 import { describe, it, expect } from 'vitest';
 import { InMemoryJournal, runKeys, nestedAgentRunId } from '../src/journal.js';
 import { createGnl, sealRequestContext } from '../src/registry.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, finalTextResult, toolCallResult, countToolResults } from './mock.js';
 
 /** Ana ajan bir kez alt ajanı çağırır, sonra bitirir. */
@@ -43,7 +44,7 @@ describe('delegasyon kimliği taşır', () => {
       context: sealRequestContext({}, { resourceId: 'u-ayse' }),
     } as never);
 
-    const child = nestedAgentRunId('dg-1', tcid);
+    const child = nestedAgentRunId('dg-1', mintCallId(tcid, 'dg-1', 0, 0));
     const childInput = await journal.get<{ resourceId?: string; threadId?: string; actor?: string }>(runKeys.input(child));
     expect(childInput, 'alt koşumun :input kaydı hiç yazılmamış').toBeDefined();
     expect(childInput?.resourceId).toBe('u-ayse');
@@ -56,7 +57,7 @@ describe('delegasyon kimliği taşır', () => {
     const journal = new InMemoryJournal();
     const tcid = 'call-devret-2';
     await gnlOf(journal, tcid).run('ana', { runId: 'dg-2', prompt: 'devret' } as never);
-    const child = nestedAgentRunId('dg-2', tcid);
+    const child = nestedAgentRunId('dg-2', mintCallId(tcid, 'dg-2', 0, 0));
     const childInput = await journal.get<Record<string, unknown>>(runKeys.input(child));
     expect('resourceId' in (childInput ?? {})).toBe(false);
     expect('actor' in (childInput ?? {})).toBe(false);
@@ -73,6 +74,6 @@ describe('delegasyon kimliği taşır', () => {
     const runs = await journal.listRunsPaged!({ resourceId: 'u-mehmet', limit: 50 });
     const ids = runs.items.map((r) => r.runId);
     expect(ids).toContain('dg-3');
-    expect(ids, 'alt koşum kişinin koşum listesinde yok — silme onu bulamaz').toContain(nestedAgentRunId('dg-3', tcid));
+    expect(ids, 'alt koşum kişinin koşum listesinde yok — silme onu bulamaz').toContain(nestedAgentRunId('dg-3', mintCallId(tcid, 'dg-3', 0, 0)));
   });
 });
