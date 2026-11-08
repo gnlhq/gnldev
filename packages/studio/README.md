@@ -10,8 +10,10 @@ The UI is @gnldev/studio-ui — a React + Vite build, served as prebuilt static 
 > Install: `pnpm add @gnldev/studio` — it ships with the prebuilt UI bundle the inspector serves. (Or build both from a [repo clone](https://github.com/gnlhq/gnldev): `pnpm install && pnpm -r build`.)
 
 ```bash
-npm i @gnldev/studio   # peer/dep: @gnldev/durable, hono, @hono/node-server
+npm i @gnldev/studio @hono/node-server@1   # peer/dep: @gnldev/durable, hono, @hono/node-server
 ```
+
+Pin `@hono/node-server` to `1`: Studio is built and tested against the 1.x line, and an unpinned install resolves 2.x, which npm then refuses next to `@gnldev/cli` (ERESOLVE).
 
 ```ts
 import { createStudioApp, createStudioRunner } from '@gnldev/studio';

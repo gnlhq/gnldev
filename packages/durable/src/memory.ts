@@ -185,10 +185,13 @@ export interface Memory {
    * observational memory + the WM tool in ONE call. If defined, runDurable/streamDurable use this
    * instead of `getMessages`/`getWorkingMemory`. `provenance` (optional, additive) is the memory-side
    * half of the `:memctx` record — see MemoryContextProvenance above.
+   *
+   * `titleIncoming`: the rows a thread TITLE may be cut from (and a title-generating model may see) — the
+   * input processors' output, so a redactor reaches the title. Absent, `incoming` is used.
    */
   loadContext?(
     threadId: string,
-    opts: { query?: string; resourceId?: string; incoming?: any[] },
+    opts: { query?: string; resourceId?: string; incoming?: any[]; titleIncoming?: any[] },
   ): Promise<{ messages?: any[]; system?: string; tools?: Record<string, any>; provenance?: MemoryContextProvenance }>;
 }
 

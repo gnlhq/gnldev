@@ -7,6 +7,115 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **A detached run no longer ends wrong when a healthy process briefly loses its database.** Affects
+  `DetachedRuns` (and `createGnl` / `@gnldev/server` detached runs) on Postgres, MySQL/MariaDB and MongoDB
+  with process liveness, when the database stops answering one process for a few seconds (a stalled
+  network, a restart, a failover):
+  - a tool body stopped by its lost session is no longer reported to the model as a failed tool, however
+    the body stops (Node's `AbortError` from `timers/promises` / `events.once`, or an error of its own).
+    The run used to end `completed` without the call's effect; now the execution is released and the run
+    continues, and a side effect that may have started goes through the crash ladder (idempotency key →
+    `recover()` → a person), never a blind re-run;
+  - an effect that happened while the database dropped every session is no longer told to the model as
+    failed (with the misleading "the pool given to PostgresStorage has no connect()"). Its success is
+    written once the database answers and the run continues from it. A `BEGIN` that fails on a live pool
+    now reports the driver's error (kept as `cause`, with its code). The same request sent again on
+    another process under an `idempotencyWindow: 'thread'` or `'cross-run'` tool no longer hangs in `tool`;
+  - a run whose call is held by another live attempt now waits for that call (`waiting-outcome`, asked
+    again on a backoff) instead of ending `failed` with `RunBusyError` and nobody continuing it;
+  - a process whose session was gone past half its reconnect grace no longer starts a tool body after it
+    is back: the others may have taken the call over meanwhile. The claim is given back and the run is
+    released.
+- **A database cut no longer kills a process that is running a detached run.** Affects `DetachedRuns`
+  (and `createGnl` / `@gnldev/server` detached runs) on every store, most visibly Postgres during a
+  failover or restart. When the store failed one of the run's event writes (`Connection terminated
+  unexpectedly`), the error escaped as an unhandled promise rejection and Node ended the whole process;
+  the other processes then read it as dead and a side effect it had already made was parked for a person
+  instead of the run completing. Now the execution stops writing, logs the error, gives the run back, and
+  the next sweep continues it from its journal — the effect still happens once.
+- **`PostgresStorage.close()` resolves only once its connections have ended.** It used to resolve as soon
+  as the pool had asked its connections to end, so a `DROP DATABASE` (or a connection count) right after
+  `await storage.close()` could still find one (measured under load: 7 of 40 closes).
+  A connection whose goodbye is not answered within 5 s (a server gone silent) is destroyed rather than
+  waited for, so `close()` never hangs on it.
+- **A run started from a `workKey` is continued after its process dies.** Affects every run whose id the
+  engine derives (`run1_…`): a `workKey` on `gnl.run` / `gnl.stream` / REST, and every turn of the chat
+  route once it knows the user (`identify`). The process that took such a run over refused it as "this
+  workKey already names DIFFERENT work" (only a `console.warn`), the run stayed parked for good and the
+  client sending the same turn again got a 200 with no answer. Now the takeover continues it from its
+  recorded input — the same path a plain `runId` took — under the same rules (owner, crash ladder): the
+  effect happens once. The same refusal hit a `preset: 'critical'` run (`strictInput`) with a plain
+  `runId`; it is gone too.
+- **A run that could not be continued tells its client so.** When a takeover does fail (an agent missing
+  from this deployment, an unreadable owner), the client following the run now gets an error
+  (`code: 'run_not_continued'`) saying it waits for an operator, instead of the earlier execution's events
+  and an end with no answer (`docs/errors/run_not_continued.md`). `DetachedRuns.pending()` lists it with
+  the reason it was parked with, not "waiting on a human (approval)".
+- **`preset: 'critical'` / `'assistant'` / `'headless'` now catch a repeat of an `idempotency: 'args'` tool
+  in a new message.** A side-effect tool keyed by its arguments (`idempotency: 'args'`, or `idempotencyKey`
+  in the default `'run'` window) skipped the duplicate ladder: the same transfer asked for again in the
+  next message of the conversation (a new run, so a new key) ran again with no question. It now meets the
+  profile's cell like a tool keyed by its call: `critical` / `assistant` ask a person (a yes runs it again,
+  a no does not), `headless` refuses it with `RunLimitExceededError`. A repeat inside one run is still
+  answered from the record, and a `'thread'` / `'cross-run'` window still answers it from the record as
+  before. Without a preset nothing changes.
+- **A tool with `confirm` meets its guard.** The `confirm` question used to come before the guard, and the
+  approved call then skipped the guard altogether: a guard that denies was never asked, and the call ran
+  on a person's yes. The guard is now asked before the question — a caller it denies is not shown the
+  question (an owner check in the guard keeps a stranger from seeing "29.90 TL will be charged") — and
+  again after the yes; what it denies does not run.
+- **A conversation's title is masked like its messages.** With `piiRedactor` (or any input processor) the
+  thread title was still cut from the raw first message and stored plain in `gnl_threads.title` (listed in
+  Studio), and a `generateTitle` model was handed the raw text. The title and the title model now see what
+  the input processors returned; if that cannot be computed the thread is left untitled. The internal
+  GDPR brief's deletion runbook now says `purgeThread(journal, id, { memory })` — without `memory` the
+  thread row stays.
+- **`recentN` memory windows no longer start on an orphaned tool result.** A window cut between a tool
+  call and its result sent the provider a result with no call (OpenAI-shaped providers answer 400, on that
+  turn and on every retry and resume). The window now opens back over the call (it can be a few rows
+  longer than `recentN`).
+- **`createGnl({ replayDisclosure })` is honoured, and the replay note no longer breaks strict providers.**
+  The `assistant` preset overwrote the config value with `'explain'`. The note was a `system` message
+  after the tool result, which Mistral-family servers (NVIDIA) reject with 400 on exactly the turn that
+  deduplicated a call; it now rides in the step's instructions (head `system`).
+- **`maxTokens` / `maxCostUsd` say so when the provider reports no usage.** A step with no token usage
+  adds nothing, so neither ceiling can fire; the only warning blamed a missing price (and `maxTokens` got
+  none). It now warns once, naming the real cause (an error under `limits.strict`).
+- **Model-step time limit for chat and REST: `createGnl({ timeouts })`.** `timeouts` was per call only
+  (`createGnl` refused it), so the chat and REST surfaces had no way to set one. The config value is the
+  instance default (per-call fields win); a timed-out step fails the run with `StepTimeoutError`. No
+  built-in default; the limit covers a step until its first byte.
+- **`gnl runs` (and every one-shot command) exits.** The store was never closed: the process hung on
+  MySQL and MongoDB and for ~10 s on Postgres. The CLI now closes it after any command other than
+  `dev`/`studio`.
+- **A listed run always opens.** A run that failed before its first model step showed in `gnl runs` and
+  `GET /runs` but answered "not found" to `gnl run`, `gnl inspect` and `GET /runs/:id`. They now open it
+  (REST: an empty journal; `gnl run`: its outcome, status and error); an id with no record is still 404.
+- **A provider failure says where it failed.** The error event, `/run`, the `/stream` error frame, the
+  chat error part and the run outcome now carry the HTTP status and the URL that was called (origin +
+  path; a query is never kept), plus a short secret-masked body excerpt outside production — so a bare
+  `Not Found` from `/v1/responses` on a host that only serves chat completions is diagnosable. The chat
+  error text shows the status (production) or status + URL + excerpt (otherwise) for provider failures;
+  other errors stay masked.
+- **Errors keep their own stack.** An error thrown in your model, tool or processor reached the
+  `gnl.run()` caller rebuilt, with a stack pointing into `event-codec`; the event now keeps a bounded
+  stack and the caller sees the throwing line.
+- **A chat body in the wrong shape gets a clear 400.** `{role, content}` messages answered 400 with the AI
+  SDK's `Cannot read properties of undefined (reading 'some')`, and a `{prompt}` body answered 200 with an
+  error frame. The chat route and surface now check the shape and name the right one (`messages` with
+  `parts`; `POST /agents/:name/run` for a single prompt).
+- **`gnl init --serving own` scaffolds a project that typechecks.** `src/app.ts` read `config.limits`,
+  which the declared config type lacked (TS2339). A new test scaffolds every `--serving` answer and every
+  host and typechecks them.
+- **Install `@hono/node-server@1`.** An unpinned install resolves 2.x and `npm i -D @gnldev/cli` then
+  fails with ERESOLVE (the CLI, server and Studio target 1.x); the READMEs and guides now pin it.
+
+---
+
 ## [0.17.0] — 2026-11-07
 
 **A store's process liveness, a job's and a fire's right to run, and a store's upgrade are each one rule.**

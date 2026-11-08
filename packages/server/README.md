@@ -7,8 +7,10 @@ Exposes the `createGnl` registry as **auto-REST + OpenAPI + SSE**. Every endpoin
 > Install: `pnpm add @gnldev/server` — or use it from a [repo clone](https://github.com/gnlhq/gnldev): `pnpm install && pnpm -r build`.
 
 ```bash
-npm i @gnldev/server   # peer: @gnldev/durable  ·  dep: hono
+npm i @gnldev/server @hono/node-server@1   # peer: @gnldev/durable  ·  dep: hono
 ```
+
+`@hono/node-server` is only for the `serve(...)` example below; pin it to `1` — the CLI, server and Studio are built and tested against the 1.x line, and an unpinned install resolves 2.x, which npm then refuses next to `@gnldev/cli` (ERESOLVE).
 
 ```ts
 import { createRestApi } from '@gnldev/server';

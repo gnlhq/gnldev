@@ -9,11 +9,12 @@ import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { convertToModelMessages } from 'ai';
 import type { UIMessage } from 'ai';
-import { createGnl, scopeConfigToOrg, RunThreadMismatchError, blockedErrorCode, callerConflictAnswer, upstreamFailure, requestRefusal, sealRequestContext, sealFieldsOf, resolveWorkIdentity, readJsonObject } from '@gnldev/durable';
+import { createGnl, scopeConfigToOrg, RunThreadMismatchError, blockedErrorCode, callerConflictAnswer, upstreamFailure, upstreamWire, requestRefusal, sealRequestContext, sealFieldsOf, resolveWorkIdentity, readJsonObject } from '@gnldev/durable';
 import type { CreateGnlConfig } from '@gnldev/durable';
 import { doorGate, AGENTS_RUN, markRefusal, settleDecision, decisionNotRecorded, type AccessDecision, type Authorize, type Identify, refuseMisplacedOptions, doorOptionKeys, REMOVED_IDENTITY_OPTIONS } from '@gnldev/auth';
 import { refuseUnknownNames } from '@gnldev/options';
 import { toUIMessageStreamResponse } from './ui-stream.js';
+import { chatBodyProblem } from './chat-body.js';
 
 /**
  * The request body as a JSON object (@gnldev/durable `readJsonObject`), or the 400 that says it is not
@@ -160,6 +161,7 @@ function typedErrorResponse(c: Context, e: unknown, workKey?: string): Response 
       error: err?.message ?? String(e),
       code: up.code,
       ...(up.upstreamStatus !== undefined ? { upstreamStatus: up.upstreamStatus } : {}),
+      ...upstreamWire(up),
       ...(up.retryAfter !== undefined ? { retryAfter: up.retryAfter } : {}),
     };
     const res = c.json(body, up.status);
@@ -369,6 +371,16 @@ export function createChatRoute(
     // malformed-request path. In the catch it falls through typedErrorResponse (no match) to the
     // generic 400, which is what a malformed request is.
     let result: any;
+    {
+      // The body's shape, said before the converter: its own TypeError is not an answer a client can act on.
+      // The run id is already derived, so the header contract holds on this path too.
+      const problem = chatBodyProblem(body);
+      if (problem) {
+        const res = c.json({ error: `invalid chat request: ${problem}` }, 400);
+        res.headers.set('X-Gnl-Run-Id', runId);
+        return res;
+      }
+    }
     try {
       const messages = await convertToModelMessages(body.messages ?? []);
       result = await gnl.stream(name, {

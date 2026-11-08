@@ -149,6 +149,12 @@ export class Attempt {
     private readonly writeTerminal: TerminalWriter,
     /** The run whose attempt this is: a success that finds the call answered is kept as its late report (see the head of this file). */
     private readonly writer?: LateWriter,
+    /**
+     * This process's session signal (process-liveness.ts `sessionSignal`) as it stood BEFORE the stamp was
+     * dated. Aborted by the time the body is to start: the session went unproven past half its grace since
+     * then — see `assertHeld`.
+     */
+    private readonly session?: AbortSignal,
   ) {
     this.datedAt = datedAt;
     // From here until `end()` this process holds the claim: its stamp reads live here at any age (liveness.ts).
@@ -204,12 +210,22 @@ export class Attempt {
   /**
    * Proves the attempt still owns the call, immediately before its body. Throws `AttemptLost` if not.
    *
-   * A claim can only be taken over once it is stale by its own TTL on the shared clock. This process
-   * knows how old its stamp is on its OWN monotonic clock (taken before the shared clock dated the
-   * stamp, so it never under-counts): younger than half its TTL, no takeover can have happened yet and
-   * the proof costs no I/O — the common case. Older (a slow gate, a long lookup, a stalled process), it
-   * re-dates its own stamp by compare-and-set: winning proves ownership and restarts the lease for the
-   * body; losing means it was taken over.
+   * Two ways a claim is taken over, two proofs:
+   *   · by its PROCESS (a stamp naming a process liveness): the others read this process as dead a whole
+   *     grace after its lock went (`judgeAlive`, 5 s by default) — far sooner than the stamp's TTL. Half a
+   *     grace after its last proof the session signal is aborted. So a signal taken before the stamp was
+   *     dated (`session`) and aborted now means the session went unproven long enough for the others to
+   *     have taken the call — or the whole run — over, even if it is back now: nothing starts, the body is
+   *     refused with LivenessUnavailableError, the claim is given back and the run is released (the
+   *     executor continues it from its log, here or elsewhere). Measured before (liveness-audit D4): a
+   *     session back after the grace passed `sessionBack`, the young stamp skipped the CAS below, and the
+   *     body started ~4 s after another process had taken the run over (6 of 20 trials).
+   *   · by its AGE (no liveness answers for the store): only once stale by its own TTL on the shared
+   *     clock. This process knows how old its stamp is on its OWN monotonic clock (taken before the shared
+   *     clock dated the stamp, so it never under-counts): younger than half its TTL, no such takeover can
+   *     have happened yet and the proof costs no I/O — the common case. Older (a slow gate, a long lookup,
+   *     a stalled process), it re-dates its own stamp by compare-and-set: winning proves ownership and
+   *     restarts the lease for the body; losing means it was taken over.
    */
   async assertHeld(): Promise<void> {
     await this.serial(async () => {
@@ -231,6 +247,7 @@ export class Attempt {
       // nothing, and the claim stays this attempt's — the caller gives it back (the body never started) with
       // the refusal that says why, not as a call another executor holds.
       if (proc && stampedBy !== undefined && !(await sessionBack(proc))) throw new LivenessUnavailableError();
+      if (proc && stampedBy !== undefined && this.session?.aborted) throw new LivenessUnavailableError();
       if (performance.now() - this.datedAt < this.stamp.claimTtlMs / 2) return;
       if (!(await this.renew())) throw new AttemptLost(this.key);
     });

@@ -12,7 +12,7 @@
 // recorded result whenever one arrives — written by a late attempt, by a later recover(), or by an
 // operator. One path settles the call: its record. No attempt is started again (the ceiling holds).
 // Postgres runs when GNL_PG_URL is set.
-import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest';
 import { tool } from 'ai';
 import { z } from 'zod';
 import {
@@ -27,8 +27,6 @@ import { execKey } from '../src/exec-record.js';
 import { textOf } from './detached/models.js';
 
 beforeAll(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
-const ends: Array<() => Promise<unknown>> = [];
-afterAll(async () => { for (const e of ends.reverse()) await e(); });
 // Each test's executor stops with it: on a shared store (Postgres) another test's sweep would continue
 // this test's runs with its own tool.
 const perTest: Array<() => Promise<unknown>> = [];
@@ -52,7 +50,10 @@ if (PG_URL) {
     await admin.query(`CREATE DATABASE ${db}`);
     const url = new URL(PG_URL); url.pathname = `/${db}`;
     const s = new PostgresStorage({ connectionString: url.toString() });
-    ends.push(async () => { await s.close(); await admin.query(`DROP DATABASE IF EXISTS ${db}`); await admin.end(); });
+    // Closed with the test, not the file: each test opens a database, a store (pool of up to 10 + liveness) and an admin session, and left
+    // open until afterAll they held ~35 of the server's slots (measured, pg-budget-audit) — past a file's share of the test budget
+    // (test/pg-connection-budget.setup.ts), where the file waited on its own idle connections and an 8 s `until` timed out.
+    perTest.push(async () => { await s.close(); await admin.query(`DROP DATABASE IF EXISTS ${db}`); await admin.end(); });
     return s;
   }]);
 }

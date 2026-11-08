@@ -593,6 +593,9 @@ const BLOCKED_BY_NAME = {
   // workflow step surfacing through runWorkflow → server/agui/studio still renders a typed code
   // instead of falling through to the generic 400.
   StepRetryBlockedError: 'step_retry_blocked',
+  // A detached run whose takeover failed waits for an operator (detached.ts `notContinuedEnding`): what its
+  // follower is told instead of an end with no answer. Not a class — the reader's ending carries the name.
+  RunNotContinuedError: 'run_not_continued',
 } as const;
 /** A code `blockedErrorCode` can return. */
 export type BlockedErrorCode = (typeof BLOCKED_BY_NAME)[keyof typeof BLOCKED_BY_NAME];
@@ -750,6 +753,61 @@ export interface UpstreamFailure {
   retryAfter?: number;
   /** The upstream's own status, when it had one — for logs and for the error body, not for the wire. */
   upstreamStatus?: number;
+  /**
+   * The URL the provider call went to — origin and path only (never a query, which is where some providers
+   * keep the key). The one clue a `404 Not Found` carries: `…/v1/responses` on a host that only serves
+   * `…/v1/chat/completions` reads as "wrong model type", and without it the message is just "Not Found".
+   */
+  upstreamUrl?: string;
+  /** A short excerpt of the provider's response body, secrets masked — see `safeUpstreamBody`. */
+  upstreamBody?: string;
+}
+
+/**
+ * A provider URL as it may be shown and stored: origin + path. The query goes (Gemini-style `?key=`), so
+ * does userinfo and the fragment. Anything that does not parse as an http(s) URL is dropped, not echoed.
+ */
+export function safeUpstreamUrl(raw: unknown): string | undefined {
+  if (typeof raw !== 'string' || raw === '' || raw.length > 2048) return undefined;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return undefined;
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The first part of a provider's response body — enough to read "404 page not found" or "Incorrect API key
+ * provided: sk-…1234" — as one line, at most 240 characters, with anything credential-shaped masked
+ * (bearer tokens, `sk-`/`nvapi-`/… keys, `api_key: …` fields). A bounded, masked excerpt, not a copy: the
+ * run's event log already keeps the conversation itself, so this is the same class of data, and the cap is
+ * what keeps a provider that echoes the request from filling it.
+ */
+export function safeUpstreamBody(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  let t = raw.replace(/\s+/g, ' ').trim();
+  if (!t) return undefined;
+  t = t
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, '$1 [redacted]')
+    .replace(/\b(?:sk|pk|rk|gsk|xai|nvapi|hf|ghp|AIza)[-_][A-Za-z0-9_-]{8,}/g, '[redacted]')
+    .replace(/((?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|password|token)["']?\s*[:=]\s*["']?)[^"'\s,}&]{4,}/gi, '$1[redacted]');
+  return t.length > 240 ? `${t.slice(0, 240)}…` : t;
+}
+
+/**
+ * What a door adds to an upstream failure's wire body beyond `upstreamStatus`: the (credential-free) URL
+ * always, the response excerpt everywhere but production — a deployment's own error body is a developer's
+ * clue, not something to hand an end user.
+ */
+export function upstreamWire(up: UpstreamFailure | undefined): { upstreamUrl?: string; upstreamBody?: string } {
+  if (!up) return {};
+  const prod = typeof process !== 'undefined' && process.env?.NODE_ENV === 'production';
+  return {
+    ...(up.upstreamUrl !== undefined ? { upstreamUrl: up.upstreamUrl } : {}),
+    ...(!prod && up.upstreamBody !== undefined ? { upstreamBody: up.upstreamBody } : {}),
+  };
 }
 
 /** `AI_RetryError` wraps the failure that actually happened; the wrapper's own shape says nothing. */
@@ -785,10 +843,18 @@ function retryAfterSeconds(headers: unknown): number | undefined {
  */
 export function upstreamFailure(err: unknown): UpstreamFailure | undefined {
   const e = unwrapRetry(err) as
-    | { name?: string; statusCode?: number; responseHeaders?: unknown; message?: string; cause?: unknown }
+    | { name?: string; statusCode?: number; responseHeaders?: unknown; message?: string; cause?: unknown; url?: unknown; responseBody?: unknown }
     | null
     | undefined;
   if (!e || typeof e !== 'object') return undefined;
+  const found = upstreamFailureOf(e);
+  if (!found) return undefined;
+  const upstreamUrl = safeUpstreamUrl(e.url);
+  const upstreamBody = safeUpstreamBody(e.responseBody);
+  return { ...found, ...(upstreamUrl !== undefined ? { upstreamUrl } : {}), ...(upstreamBody !== undefined ? { upstreamBody } : {}) };
+}
+
+function upstreamFailureOf(e: { name?: string; statusCode?: number; responseHeaders?: unknown; message?: string; cause?: unknown }): UpstreamFailure | undefined {
 
   // A run that ended without finishing, read back from its ending (errorOf keeps the code).
   if ((e as { code?: unknown }).code === UPSTREAM_ERROR_CODES.unfinished) return { status: 502, code: UPSTREAM_ERROR_CODES.unfinished };
@@ -839,6 +905,7 @@ const WIRE_STATUS_BY_CODE = {
   outcome_unknown: 409,
   run_busy: 409,
   step_retry_blocked: 409,
+  run_not_continued: 409,
   // limit — resumable: raise the ceiling (or fix the loop) and re-drive the same runId
   run_limit_exceeded: 422,
   tool_loop_detected: 422,

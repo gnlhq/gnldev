@@ -1,7 +1,7 @@
 // @gnldev/durable — an exactly-once + deterministic-replay layer for Vercel AI SDK agents.
 // Drop-in: generateText -> runDurable. Composable: withDurableModel + durableTools.
 
-export { InMemoryJournal, JOURNAL_GUARANTEES, missingGuarantees, assertJournalGuarantees, type JournalGuarantee, parseJournalKey, assertThreadId, summarizeRun, claim, frozenGet, runKeys, deriveRunStatus, nestedAgentRunId, listRunsArray, asReaderJournal, runIdOfKey, outcomeStatusOf, runRecordOf } from './journal.js';
+export { InMemoryJournal, JOURNAL_GUARANTEES, missingGuarantees, assertJournalGuarantees, type JournalGuarantee, parseJournalKey, assertThreadId, summarizeRun, claim, frozenGet, runKeys, deriveRunStatus, nestedAgentRunId, listRunsArray, asReaderJournal, runIdOfKey, outcomeStatusOf, runRecordOf, isRunRecorded } from './journal.js';
 export { isRunCursor, pageRunsFromArray, type RunOrder } from './run-cursor.js';
 // H13 — journal format versioning: an API that keeps old records readable across SDK-major transitions.
 export { JOURNAL_FORMAT_VERSION, JournalFormatError, registerFormatUpgrade, stampFormat, upgradeFormat, isVersionedKey } from './format.js';
@@ -43,7 +43,7 @@ export {
   SuiteVersionMismatchError, RunThreadMismatchError, RunTargetMismatchError, ThreadRunsInFlightError,
   RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunNotFoundError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, VectorFilterError, VectorDimensionError, RunSweptError, RunUnfinishedError, BatchPlanMismatchError, AdoptionConflictError,
   CALLER_CONFLICT_CODES, callerConflictCode, callerConflictAnswer, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, FOREIGN_PARTY_DETAIL_FIELDS,
-  BLOCKED_ERROR_CODES, blockedErrorCode, upstreamFailure, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES,
+  BLOCKED_ERROR_CODES, blockedErrorCode, upstreamFailure, upstreamWire, safeUpstreamUrl, safeUpstreamBody, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES,
   RESERVED_ID_ERROR_CODES, VISIBILITY_ERROR_CODES, runNotFound, REQUEST_ERROR_CODES, ADOPTION_ERROR_CODES, DRAIN_ERROR_CODES, requestRefusal,
   // The HTTP status of every wire code, for a client or a door that maps a code to a response.
   WIRE_ERROR_STATUS,
