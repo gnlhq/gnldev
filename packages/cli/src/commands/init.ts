@@ -25,7 +25,7 @@ import { TEMPLATES, RETIRED_TEMPLATES, recipeDeps, writtenConfigFields, type Tem
 import { FEATURE_IDS, RECIPES, recipeContents, type Recipe } from '../recipes.js';
 import { HOST_IDS, HOSTS } from '../hosts.js';
 import {
-  DEFAULT_ANSWERS, QUESTIONS, resolveAnswers, readLastAnswers, writeLastAnswers,
+  DEFAULT_ANSWERS, QUESTIONS, STORE_BACKENDS, resolveAnswers, readLastAnswers, writeLastAnswers,
   type InitAnswers, type ResolvedAnswers, type ServingAnswer,
 } from '../init-answers.js';
 import { bold, cyan, dim, green } from '../ansi.js';
@@ -133,12 +133,12 @@ function describeAnswers(a: InitAnswers): string {
   // meets for the first time on this screen, offered as the summary of a choice they are making now.
   const repeat = a.preset === 'assistant' ? 'repeats ask' : a.preset === 'headless' ? 'repeats refused' : 'repeats refused + locked';
   const owner = a.identity === 'end-users' ? 'per-user' : 'no owner';
-  const store = a.store === 'pg' ? 'Postgres' : 'file';
+  const store = STORE_BACKENDS[a.store].label;
   const serving = a.serving === 'own' ? 'own server' : a.serving === 'mount' ? 'mounted' : 'gnl dev';
   return `${repeat} · ${owner} · ${store} · ${serving}`;
 }
 
-const INIT_USAGE = 'gnl init [dir] [--preset assistant|headless|critical] [--identity internal|end-users] [--store sqlite|pg] [--serving dev|own|mount] [--features a,b,c] [--host hono|node|express|fastify|koa|nest] [--template minimal] [--e2e] [--yes]';
+const INIT_USAGE = 'gnl init [dir] [--preset assistant|headless|critical] [--identity internal|end-users] [--store sqlite|pg|mysql|mongo] [--serving dev|own|mount] [--features a,b,c] [--host hono|node|express|fastify|koa|nest] [--template minimal] [--e2e] [--yes]';
 
 // Every flag this command reads. A flag outside this set is refused, not skipped: `--fetures x`
 // silently scaffolding the default project is how a caller learns weeks later that their flag never
@@ -298,9 +298,10 @@ export const initCommand: Command = {
       // prints is the reader's to run, and `pnpm add` picks the range. `pg` rides along for the same
       // reason it does in a fresh scaffold — the config written two lines up imports PostgresStorage,
       // and the driver is an optional peer that nobody would think to ask for.
+      const storeBackend = STORE_BACKENDS[resolved.answers.store];
       const deps = ['@gnldev/durable', '@gnldev/server', '@gnldev/studio', '@gnldev/memory', '@gnldev/auth', 'ai', 'zod',
         ...recipes.flatMap((r) => Object.keys(recipeDeps(r))),
-        ...(resolved.answers.store === 'pg' ? ['pg'] : [])];
+        ...(storeBackend.driver ? [storeBackend.driver.name] : [])];
       console.log(`\n${cyan('Add the dependencies (package.json is yours — nothing was edited):')}`);
       console.log(`  pnpm add ${[...new Set(deps)].join(' ')}`);
       console.log(`  pnpm add -D @gnldev/cli tsx typescript @types/node`);
@@ -411,9 +412,8 @@ async function summarize(resolved: ResolvedAnswers, recipes: Recipe[]): Promise<
   try {
     // Named classes, so the journal row prints the adapter the config actually names rather than a
     // generic word. The only thing describeProtections reads off a storage is its constructor name.
-    const Adapter = resolved.answers.store === 'pg'
-      ? class PostgresStorage {}
-      : class SqliteStorage {};
+    const className = STORE_BACKENDS[resolved.answers.store].cls;
+    const Adapter = { [className]: class {} }[className]!;
     // Every top-level field the written config has, from the function that wrote it — the value stands
     // in for an import the summary cannot load; describeProtections asks only whether the field is there.
     const fields = Object.fromEntries(writtenConfigFields(recipes).map((f) => [/^[A-Za-z_$][\w$]*/.exec(f)![0], {}]));

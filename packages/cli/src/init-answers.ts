@@ -24,7 +24,7 @@
 //               declaration in the project is inert, silently.
 //   identity  — whether runs are born with an owner. Retrofitting a subject onto a live journal means
 //               backfilling ownership for records that never had one.
-//   store     — sqlite and postgres are one line apart on day one and a migration on day ninety.
+//   store     — sqlite, postgres, mysql and mongodb are one line apart on day one and a migration on day ninety.
 //
 // Features are NOT here, on purpose. They are additive (`gnl add <feature>`), a project that skipped
 // them loses nothing, and asking about them at minute zero asks people to choose between names they
@@ -43,7 +43,7 @@ import { dirname, join } from 'node:path';
 
 export type PresetAnswer = 'assistant' | 'headless' | 'critical';
 export type IdentityAnswer = 'internal' | 'end-users';
-export type StoreAnswer = 'sqlite' | 'pg';
+export type StoreAnswer = 'sqlite' | 'pg' | 'mysql' | 'mongo';
 export type ServingAnswer = 'dev' | 'own' | 'mount';
 
 export interface InitAnswers {
@@ -124,7 +124,37 @@ export const STORE_QUESTION: Question<StoreAnswer> = {
   options: [
     { id: 'sqlite', label: 'In a file here', hint: 'runs.db — nothing to install' },
     { id: 'pg', label: 'In Postgres', hint: 'reads DATABASE_URL' },
+    { id: 'mysql', label: 'In MySQL / MariaDB', hint: 'reads DATABASE_URL' },
+    { id: 'mongo', label: 'In MongoDB', hint: 'reads DATABASE_URL (a replica set, naming the database)' },
   ],
+};
+
+/**
+ * What each store answer MEANS in code — the one table every consumer reads (the config generator, the
+ * package.json writer, the printed `pnpm add` line, the summary's protections row), so a fifth store is one
+ * row here and an option above, not an edit in four files.
+ *
+ * `driver` is the database client the class imports. It is an OPTIONAL peer of @gnldev/durable — right for
+ * the engine, wrong for a project that has already answered the question — so a store answer brings its own
+ * driver; the range is durable's own peer range (pinned to it by recipe-deps.test.ts). A URL-reading store
+ * reads `DATABASE_URL`, the name the first store (Postgres) already used and the one hosts (Neon, Fly,
+ * Cloud Run, Render) inject, so moving a project between hosts never renames the variable.
+ */
+export interface StoreBackend {
+  /** The storage class the generated config constructs. */
+  cls: string;
+  /** The `@gnldev/durable` subpath it comes from. */
+  subpath: string;
+  /** The client library it needs installed, at durable's own peer range; absent when the store needs none. */
+  driver?: { name: string; range: string };
+  /** What the summary line calls it. */
+  label: string;
+}
+export const STORE_BACKENDS: Record<StoreAnswer, StoreBackend> = {
+  sqlite: { cls: 'SqliteStorage', subpath: '@gnldev/durable/sqlite', label: 'file' },
+  pg: { cls: 'PostgresStorage', subpath: '@gnldev/durable/postgres', driver: { name: 'pg', range: '^8.0.0' }, label: 'Postgres' },
+  mysql: { cls: 'MysqlStorage', subpath: '@gnldev/durable/mysql', driver: { name: 'mysql2', range: '^3.11.0' }, label: 'MySQL' },
+  mongo: { cls: 'MongoStorage', subpath: '@gnldev/durable/mongo', driver: { name: 'mongodb', range: '^6.10.0' }, label: 'MongoDB' },
 };
 
 /**

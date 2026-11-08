@@ -1,7 +1,7 @@
 // @gnldev/durable — an exactly-once + deterministic-replay layer for Vercel AI SDK agents.
 // Drop-in: generateText -> runDurable. Composable: withDurableModel + durableTools.
 
-export { InMemoryJournal, JOURNAL_GUARANTEES, missingGuarantees, assertJournalGuarantees, type JournalGuarantee, parseJournalKey, assertThreadId, summarizeRun, claim, frozenGet, runKeys, deriveRunStatus, nestedAgentRunId, listRunsArray, asReaderJournal, runIdOfKey, outcomeStatusOf, runRecordOf } from './journal.js';
+export { InMemoryJournal, JOURNAL_GUARANTEES, missingGuarantees, assertJournalGuarantees, type JournalGuarantee, parseJournalKey, assertThreadId, summarizeRun, claim, frozenGet, runKeys, deriveRunStatus, nestedAgentRunId, listRunsArray, asReaderJournal, runIdOfKey, outcomeStatusOf, runRecordOf, isRunRecorded } from './journal.js';
 export { isRunCursor, pageRunsFromArray, type RunOrder } from './run-cursor.js';
 // H13 — journal format versioning: an API that keeps old records readable across SDK-major transitions.
 export { JOURNAL_FORMAT_VERSION, JournalFormatError, registerFormatUpgrade, stampFormat, upgradeFormat, isVersionedKey } from './format.js';
@@ -14,6 +14,7 @@ export type { ReconstructedState, ReconstructSeed, ForkResult } from './time-tra
 export type {
   Journal,
   JournalReader,
+  OperatorJournal,
   JournalEntry,
   JournalEntryKind,
   RunSummary,
@@ -41,10 +42,10 @@ export type { ModelPricing, PricingDoc } from './pricing.js';
 export {
   DivergenceError, RunBusyError, SideEffectRetryBlockedError, RetryLimitExceededError, OutcomeUnknownError,
   SuiteVersionMismatchError, RunThreadMismatchError, RunTargetMismatchError, ThreadRunsInFlightError,
-  RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunNotFoundError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, VectorFilterError, VectorDimensionError, RunSweptError, RunUnfinishedError, BatchPlanMismatchError, AdoptionConflictError,
+  RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunNotFoundError, ThreadOwnerMismatchError, IdempotencyOwnerMismatchError, VectorOwnerConflictError, VectorFilterError, VectorDimensionError, RunSweptError, RunUnfinishedError, BatchPlanMismatchError, AmbiguousApprovalKeyError, ApprovalNotPermittedError, AdoptionConflictError, MemoryNotSplittableError,
   CALLER_CONFLICT_CODES, callerConflictCode, callerConflictAnswer, OWNERSHIP_CONFLICT_CODES, publicConflictDetail, FOREIGN_PARTY_DETAIL_FIELDS,
-  BLOCKED_ERROR_CODES, blockedErrorCode, upstreamFailure, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES,
-  RESERVED_ID_ERROR_CODES, VISIBILITY_ERROR_CODES, runNotFound, REQUEST_ERROR_CODES, ADOPTION_ERROR_CODES, DRAIN_ERROR_CODES, requestRefusal,
+  BLOCKED_ERROR_CODES, FINISHED_ERROR_CODES, blockedErrorCode, endAnswerOf, withRunHandle, endUserError, upstreamRunHandle, type RunEndAnswer, upstreamFailure, upstreamWire, safeUpstreamUrl, safeUpstreamBody, UPSTREAM_ERROR_CODES, LIMIT_ERROR_CODES,
+  RESERVED_ID_ERROR_CODES, VISIBILITY_ERROR_CODES, APPROVAL_ERROR_CODES, runNotFound, REQUEST_ERROR_CODES, ADOPTION_ERROR_CODES, DRAIN_ERROR_CODES, requestRefusal,
   // The HTTP status of every wire code, for a client or a door that maps a code to a response.
   WIRE_ERROR_STATUS,
   // The error→note→help formatter. Exported because the refusals a user actually meets are split
@@ -58,6 +59,7 @@ export { assertSuiteConsistent, versionsEqual } from './suite-consistency.js';
 export type { AssertSuiteConsistentOptions } from './suite-consistency.js';
 export { StepTimeoutError, withTimeout } from './timeout.js';
 export { argsHash, stableStringify } from './hash.js';
+export { mintCallId, providerIdOf, isGnlCallId, sameCall, restoreProviderIds } from './call-identity.js';
 export { scoreSample, runScoreSample, scorerFingerprint, scoreRunMemoized, inputText, assertDistinctScorerNames, memoizeScoring } from './scoring.js';
 export type { FingerprintedScorer } from './scoring.js';
 export type { ScoreSampleFields } from './scoring.js';
@@ -100,6 +102,7 @@ export { gnlTool } from './types.js';
 // must resolve to nothing rather than to a stringified function.
 export { toolDescriptionText } from './types.js';
 export type { ToolDurability } from './types.js';
+export { fourEyes, answererOfCaller, needsOfSuspend, type Answerer, type AnsweredAs, type Approvers, type ApproverContext, type QuestionNeeds } from './approval-authority.js';
 export { runDurable, resumeRun, streamDurable, admitAgentRun, limitBreachFromSteps, blockedFromSteps, surfacedInterrupts, resolveApprovals, decisionOf, hasRunProbe, assertRunIdSafe, type ApprovalRecord } from './run.js';
 export type { RunDurableArgs, StreamDurableArgs, DurableResult, ResumeAgentConfig, StreamBreach, MemoryContextRecord } from './run.js';
 export { readMemoryLayout, readRunMemoryLayout, memoryRowsOf, cutWorkingMemory } from './memory-layout.js';
@@ -164,7 +167,7 @@ export { runNetwork, getNetworkTrace, netKeys } from './network.js';
 export type { NetworkResult, NetworkStep, NetworkTarget, NetworkChildRun, RouteDecision, RunNetworkOptions } from './network.js';
 export { withOrg, withRootScope, orgScopeOf, orgPrefix, isOrganizationKey, parseOrganizationKey, orgSpaceSql, ORG_KEY_PREFIX, isPlatformKey, assertOrgRegistered, ORG_RECORD_PRE, ADOPTABLE_RESERVED_PREFIXES, ENGINE_META_KEYS } from './organization.js';
 export { assertNoRunsInFlight, personRecordKey, personRecordPrefix } from './model.js';
-export { withOrgStorage, orgStorageScopeOf, scopeConfigToOrg } from './org-storage.js';
+export { withOrgStorage, orgStorageScopeOf, scopeConfigToOrg, splitMemoryForOrganization, assertMemorySplitsByOrganization } from './org-storage.js';
 export { MEMORY_PARTITION, memoryPartitionOf, inMemoryPartition, assertRootThreadId, ReservedThreadIdError, type MemoryPartition, type MemoryPartitionOption } from './storage.js';
 export { withSubjectJournal, withSubjectMemory, type SubjectViewOptions, type SubjectMemoryOptions } from './subject-view.js';
 export { threadOwnerOf, admitThreadRun, threadOwnerKey, threadSeenKey, THREAD_RECORDS_KEY, copyThreadOwnership, assignThreadOwner, recordThreadCreated, type ThreadOwnership } from './thread-owner.js';
@@ -231,8 +234,10 @@ export type { SweepOptions, SweepResult, LogSweepOptions, LogSweepResult, Thread
 export { DuplicateSideEffectError, RunLimitExceededError, TaintedSideEffectError, ToolLoopDetectedError } from './limits.js';
 export { markRunTainted, readRunTaint, readThreadTaint, readTaintProvenance } from './taint.js';
 export type { RunTaint, TaintProvenance } from './taint.js';
+// `return refused(value)`: "nothing was done in this call" — the answer to that call only, the work key stays free.
+export { refused } from './call-outcome.js';
 export { compensateRun, assertNotCompensated, runCompensated, CompensatedRunError } from './compensation.js';
-export type { CompensationEntry, CompensationReport } from './compensation.js';
+export type { CompensationEntry, CompensationReport, SharedEffect } from './compensation.js';
 // P2-cancel durable cross-worker agent-run cancel — see cancel.ts.
 export { cancelAgentRun, agentRunCanceled, assertNotCanceled, RunCanceledError } from './cancel.js';
 export { RunErasedError } from './erasure-fence.js';
@@ -260,7 +265,7 @@ export type {
 export { runMigrationCheck, tablesFromDDL } from './migrate.js';
 export { UPGRADE_STEPS, FORMAT_STEPS, registerUpgradeSteps, isPackageStep, markUpgradeDue, clearUpgradeDue, UpgradeFailedError, type UpgradeStep, type UpgradeStepFactory, type UpgradeDue, type UpgradeDueTarget, type UpgradeStepName, type UpgradeOptions, type UpgradeReport, type UpgradeStepReport } from './upgrade.js';
 export type { SchemaCheckResult, SchemaMigrationResult, MissingColumn, MigratableStorage, MigrationCheckResult } from './migrate.js';
-export { agentStreamEvents, interruptsFromSteps, type AgentStreamEvent, type AgentStreamCodes } from './agent-stream.js';
+export { agentStreamEvents, attachStreamFacts, reachesClient, clientFeedOf, interruptsFromSteps, type AgentStreamEvent, type AgentStreamCodes } from './agent-stream.js';
 export type { StreamSurface, StreamSurfaceInput } from './stream-surface.js';
 // The one reading of a request body as a JSON object, for every door.
 export { readJsonObject, callerMessagesProblem, CallerSystemMessageError, type JsonObjectBody } from './request-body.js';
@@ -271,7 +276,7 @@ export { formatCursor, parseCursor, readCursor, InvalidCursorError, type RunCurs
 export { RUN_EVENT_VERSION, encodePart, decodeEvent, errorData, errorOf, type ErrorData } from './event-codec.js';
 export { executorFor, drainExecutors } from './executors.js';
 export { drainProcess, drainOnSignal, DRAIN_DEADLINE_MS, type DrainOptions, type DrainOnSignalOptions } from './drain.js';
-export { pendingWork, recoverInDoubt, declareInDoubtDone, cancelPendingRun, type PendingWork, type InDoubtCall, type RunningWork, type AwaitingApproval } from './pending-work.js';
+export { pendingWork, effectsRanIn, recoverInDoubt, declareInDoubtDone, cancelPendingRun, type PendingWork, type InDoubtCall, type RunningWork, type AwaitingApproval } from './pending-work.js';
 export { followedRun, type FollowedRun, type RunEnding } from './followed-run.js';
 export { appendRunEvent, readRunEvents, lastRunEvent, endsFollow, runEventKey, type RunEvent, type RunState } from './run-events.js';
 export {

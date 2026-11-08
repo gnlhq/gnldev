@@ -10,6 +10,7 @@
 // @ai-sdk/openai-compatible 3.0.62, @ai-sdk/openai 2.0.140). No provider package is needed to replay them.
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import { tool, wrapLanguageModel, jsonSchema } from 'ai';
+import { mintCallId } from '../src/call-identity.js';
 import { streamDurable, InMemoryStorage, RunUnfinishedError, runKeys } from '../src/index.js';
 
 beforeAll(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
@@ -217,7 +218,7 @@ describe('a step cut after its tool call', () => {
     expect(second.errors).toEqual([]);
     expect(second.text).toBe('whole answer');
     expect(counter.runs).toBe(1);
-    expect(await journal.get(runKeys.tool('tc', 'call-A'))).toMatchObject({ status: 'succeeded' });
+    expect(await journal.get(runKeys.tool('tc', mintCallId('call-A', 'tc', 0, 0)))).toMatchObject({ status: 'succeeded' });
     expect(model.calls, 'the cut call, then the step after the tool').toBe(2);
   });
 

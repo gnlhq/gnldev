@@ -13,7 +13,7 @@
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import { stepCountIs } from 'ai';
 import { z } from 'zod';
-import { InMemoryStorage, gnlTool, toJournal, type Storage } from '../src/index.js';
+import { InMemoryStorage, gnlTool, toJournal, mintCallId, type Storage } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { runDurable } from '../src/run.js';
@@ -68,17 +68,18 @@ describe.each(STORES)('a long call keeps the answer it runs on — %s', (_name, 
       runDurable({ runId, journal, model, tools: { ship }, prompt: 'ship it', stopWhen: stepCountIs(4), ...(approvals ? { approvals } : {}) } as any);
 
     const asked: any = await run();
-    expect(asked.interrupts?.[0]?.toolCallId).toBe('c1');
-    const approved = run({ c1: true });
+    const c1 = mintCallId('c1', runId, 0, 0); // the call's GNL id: the model boundary mints it
+    expect(asked.interrupts?.[0]?.toolCallId).toBe(c1);
+    const approved = run({ [c1]: true });
     await inBody.p;
     advance(40_000); // 40 s into a call that may take 120 s
-    await run({ c1: false }).then((v) => v, (e) => e); // the operator's late "deny"
+    await run({ [c1]: false }).then((v) => v, (e) => e); // the operator's late "deny"
     finish.open();
     await approved;
 
     expect(executions).toBe(1);
-    expect((await journal.get<{ status?: string }>(runKeys.tool(runId, 'c1')))?.status).toBe('succeeded');
-    expect((await journal.get<{ decision?: boolean }>(runKeys.approval(runId, 'c1')))?.decision).toBe(true);
+    expect((await journal.get<{ status?: string }>(runKeys.tool(runId, c1)))?.status).toBe('succeeded');
+    expect((await journal.get<{ decision?: boolean }>(runKeys.approval(runId, c1)))?.decision).toBe(true);
   });
 
   it('past its own threshold the claim reads as crashed, and the human may still change the answer', async () => {

@@ -17,6 +17,7 @@ import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { runDurable } from '../src/run.js';
 import type { Journal } from '../src/journal.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, finalTextResult } from './mock.js';
 
 beforeAll(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
@@ -89,19 +90,22 @@ describe.each(STORES)('a record lists every call it answered — %s', (_name, ma
     const r2Model = model('b', [[call('pay', 'b-0', { order: 'O-1' }), call('pay', 'b-1', { order: 'O-1' })], [call('ship', 'b-2', {})]]);
     const recordKey = (k: string) => k.startsWith(`xthr:${thread}:args-pay-`);
     const first: any = await runDurable({ runId: `r2-${id}`, journal: together(root, recordKey, 2), model: r2Model, tools, ...opts } as any);
-    expect(first.interrupts?.[0]?.toolCallId).toBe('b-2');
+    // The ids the record and the interrupt carry are GNL's: r1 asked `a-0` in step 0; r2 asked `b-0`,`b-1` in step 0, `b-2` in step 1.
+    const r1c = (p: string) => mintCallId(p, `r1-${id}`, 0, 0);
+    const r2c = (p: string, st: number, ix: number) => mintCallId(p, `r2-${id}`, st, ix);
+    expect(first.interrupts?.[0]?.toolCallId).toBe(r2c('b-2', 1, 0));
     expect(paid).toBe(1);
 
     const recordKeys = (await root.listKeys!(`xthr:${thread}:args-pay-`)).filter(recordKey);
     expect(recordKeys).toHaveLength(1);
     const record = await root.get<{ resolvedToolCallIds?: string[] }>(recordKeys[0]!);
-    expect.soft([...(record?.resolvedToolCallIds ?? [])].sort()).toEqual(['a-0', 'b-0', 'b-1']);
+    expect.soft([...(record?.resolvedToolCallIds ?? [])].sort()).toEqual([r1c('a-0'), r2c('b-0', 0, 0), r2c('b-1', 0, 1)].sort());
 
     // The approval resumes r2: step 0 replays, and both of its calls are r2's own past.
     const resumed: any = await runDurable({ runId: `r2-${id}`, journal: root, model: r2Model, tools, approvals: { 'b-2': true }, ...opts } as any);
     expect(shipped).toBe(1);
     expect(paid).toBe(1);
     const origins = Object.fromEntries((resumed.replayedToolCalls ?? []).filter((e: any) => e.toolName === 'pay').map((e: any) => [e.toolCallId, e.origin]));
-    expect(origins).toEqual({ 'b-0': 'self', 'b-1': 'self' });
+    expect(origins).toEqual({ [r2c('b-0', 0, 0)]: 'self', [r2c('b-1', 0, 1)]: 'self' });
   });
 }, 60_000);

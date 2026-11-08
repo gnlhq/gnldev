@@ -132,8 +132,9 @@ const gnl = createGnl({
 ```
 
 Read the organization with `serverIdentityOf(ctx)`: the server writes it from the credential, and a
-request body cannot set it. A call to `gnl.run` from your own code has no sealed organization, so it
-gets no tool here.
+request body cannot set it. A call to `gnl.run` from your own code has no organization (the engine binds the
+`resourceId` and `threadId` it resolved, but never invents an organization), so it gets no tool here.
+When a door sealed the request, the seal is passed through as it is.
 
 ### Qdrant
 

@@ -1414,7 +1414,8 @@ describe('the conversation store is served per organization, never on a claim', 
       for (const key of THREAD_ROUTES) {
         const [method, ...rest] = key.split(' ');
         const { status } = await drive(api, { method: method!, path: rest.join(' ') }, AS.acme);
-        expect(status, `${key} served an unscopeable conversation store to an org-bound caller`).toBe(403);
+        // d25/26a: was 403 `org_scope_refused`; the conversation store is refused by the one rule, as a typed 500.
+        expect(status, `${key} served an unscopeable conversation store to an org-bound caller`).toBe(500);
       }
     }
   }, 30_000);

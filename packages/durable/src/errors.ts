@@ -271,6 +271,25 @@ export class AdoptionConflictError extends Error {
 }
 
 /**
+ * A conversation store that cannot be split by organization was handed to a deployment that serves
+ * organizations — a `memory` OBJECT with no `forOrganization` (a hand-written `Memory`), one built over a
+ * different storage than the config's, or a config with no `storage` to split.
+ *
+ * Thrown by `scopeConfigToOrg` (org-storage.ts), the one place a config becomes an organization's, and by
+ * `assertMemorySplitsByOrganization`, which asks the same question at a door's construction. Every door
+ * therefore refuses the same mistake with the same error: a 500 `memory_not_splittable` on the wire
+ * (`requestRefusal`) — the deployment is misconfigured, the caller did nothing wrong. Serving the turn
+ * instead would either drop the memory without a word or share one set of threads across organizations.
+ */
+export class MemoryNotSplittableError extends Error {
+  readonly code = 'memory_not_splittable' as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'MemoryNotSplittableError';
+  }
+}
+
+/**
  * A `cross-run` dedup record — keyed by a business key such as an order id — was reached by a user it
  * does not belong to. It is refused: neither the recorded output (it is someone else's result) nor a
  * second execution (the key promises one). The detail names the tool, never the owner.
@@ -328,8 +347,20 @@ export class RunActorMismatchError extends Error {
  */
 export class RunNotFoundError extends Error {
   readonly code = VISIBILITY_ERROR_CODES.runNotFound;
-  constructor(readonly runId: string) {
-    super(`@gnldev/durable: run '${runId.slice(0, 80)}' does not exist — this operation continues a run and does not begin one.`);
+  /**
+   * `orgScoped: false` says the journal the call was given is the root one. A run started under an organization
+   * lives under that organization's prefix, so on the root journal it reads as absent — the message then names the
+   * way in. It is the same text whether or not such a run exists somewhere (no lookup, so no existence oracle), and
+   * it is left out when the caller did not say or the journal already is an organization's (it would point the
+   * wrong way).
+   */
+  constructor(readonly runId: string, opts: { orgScoped?: boolean } = {}) {
+    super(
+      `@gnldev/durable: run '${runId.slice(0, 80)}' does not exist — this operation continues a run and does not begin one.` +
+        (opts.orgScoped === false
+          ? " If the run was started under an organization (a request with an orgId), it lives under that organization: pass `withOrg(journal, orgId)` instead of the root journal."
+          : ''),
+    );
     this.name = 'RunNotFoundError';
   }
 }
@@ -445,6 +476,47 @@ export class ThreadRunsInFlightError extends Error {
   }
 }
 
+/**
+ * An approval named a tool call by the PROVIDER's id (`call_0`), and more than one question of the run
+ * waits under that id (two steps, or two sub-agents, each answered with `call_0`). Which one the person
+ * meant is not guessable: nothing is written, and the answer names the candidates — approve one of them
+ * by its GNL id (the `toolCallId` of the interrupt).
+ */
+export class AmbiguousApprovalKeyError extends Error {
+  constructor(
+    public readonly detail: { runId: string; key: string; candidates: string[] },
+  ) {
+    super(teachingError({
+      error: `the approval for '${detail.key}' is ambiguous: ${detail.candidates.length} open questions of run '${detail.runId}' carry that provider id (${detail.candidates.join(', ')})`,
+      note: 'a provider may reuse a tool-call id from one model answer to the next, so its own id does not say which question a yes belongs to; nothing was recorded',
+      help: "answer with the interrupt's own `toolCallId` (the GNL id), one per question",
+    }));
+    this.name = 'AmbiguousApprovalKeyError';
+  }
+}
+
+/**
+ * A yes to an APPROVE question from somebody who may not give it (approval-authority.ts): the requester's
+ * own yes on a permission question, or a yes the developer's `approvers` rule refused. Nothing was
+ * recorded and nothing ran — the question stays open for an authorised person. Answered 403 on every door,
+ * code `approval_not_permitted` (`requestRefusal`).
+ */
+export class ApprovalNotPermittedError extends Error {
+  readonly code = APPROVAL_ERROR_CODES.ApprovalNotPermittedError;
+  constructor(
+    public readonly detail: { runId: string; toolCallId: string; toolName?: string; answeredAs: 'staff' | 'requester'; rule?: 'approvers' },
+  ) {
+    super(teachingError({
+      error: `the yes for '${detail.toolName ?? detail.toolCallId}' (run '${detail.runId}') was refused: this question needs an authorised person's approval${detail.rule ? ", and the `approvers` rule did not name this answerer" : `, and it came from the ${detail.answeredAs === 'requester' ? 'person the work is for' : 'answerer'}`}`,
+      note: 'a question asked with approve is permission, not consent: the person who asked for the work cannot grant it to themselves; nothing was recorded and nothing ran, the question is still open',
+      help: detail.answeredAs === 'requester' && !detail.rule
+        ? 'answer it as staff (an operator token, or the application server). From your own code: pass `caller: STAFF` (not just `resourceId`); name who may approve with the `approvers` option of createGnl. A no is always accepted.'
+        : 'name who may approve with the `approvers` option of createGnl (fourEyes() is the ready-made rule). A no is always accepted.',
+    }));
+    this.name = 'ApprovalNotPermittedError';
+  }
+}
+
 const CALLER_CONFLICT_BY_NAME = {
   RunThreadMismatchError: 'run_thread_mismatch',
   RunTargetMismatchError: 'run_target_mismatch',
@@ -454,6 +526,7 @@ const CALLER_CONFLICT_BY_NAME = {
   ThreadOwnerMismatchError: 'thread_owner_mismatch',
   RunSweptError: 'run_swept',
   BatchPlanMismatchError: 'batch_plan_mismatch',
+  AmbiguousApprovalKeyError: 'approval_key_ambiguous',
 } as const;
 /** A code `callerConflictCode` can return — the closed set above, not any string. */
 export type CallerConflictCode = (typeof CALLER_CONFLICT_BY_NAME)[keyof typeof CALLER_CONFLICT_BY_NAME];
@@ -593,6 +666,9 @@ const BLOCKED_BY_NAME = {
   // workflow step surfacing through runWorkflow → server/agui/studio still renders a typed code
   // instead of falling through to the generic 400.
   StepRetryBlockedError: 'step_retry_blocked',
+  // A detached run whose takeover failed waits for an operator (detached.ts `notContinuedEnding`): what its
+  // follower is told instead of an end with no answer. Not a class — the reader's ending carries the name.
+  RunNotContinuedError: 'run_not_continued',
 } as const;
 /** A code `blockedErrorCode` can return. */
 export type BlockedErrorCode = (typeof BLOCKED_BY_NAME)[keyof typeof BLOCKED_BY_NAME];
@@ -690,13 +766,32 @@ export const ADOPTION_ERROR_CODES = {
   AdoptionConflictError: 'adoption_conflict',
 } as const;
 
+/** A yes the answerer may not give (`ApprovalNotPermittedError`, approval-authority.ts): 403, on every door. */
+export const APPROVAL_ERROR_CODES = {
+  ApprovalNotPermittedError: 'approval_not_permitted',
+} as const;
+
 /** A request whose shape is wrong before anything reads its fields (request-body.ts readJsonObject). */
 export const REQUEST_ERROR_CODES = {
   invalidJson: 'invalid_json',
   callerSystemMessage: 'caller_system_message',
   /** A reader's cursor (`Last-Event-ID`, `?after=`, `after`) that is not one a run's stream gave (`InvalidCursorError`, run-events.ts). */
   invalidCursor: 'invalid_cursor',
+  /**
+   * The deployment's conversation store cannot be split for the organization this request was bound to
+   * (`MemoryNotSplittableError`, org-storage.ts): 500 — the host's config needs `memoryFactory`.
+   */
+  memoryNotSplittable: 'memory_not_splittable',
 } as const;
+
+/**
+ * What an END USER is told when `MemoryNotSplittableError` refuses their request. The fix sentence the
+ * error's own `message` carries (`memoryFactory`, ...) is for the operator and goes to the server log
+ * (`scopeConfigToOrg`, `splitMemoryForOrganization`); a caller cannot act on a configuration fix, and
+ * handing it one tells an outsider how the deployment is built.
+ */
+export const MEMORY_NOT_SPLITTABLE_PUBLIC_MESSAGE =
+  'the conversation store of this deployment is not set up to serve this request; the operator can find the reason in the server log';
 
 /**
  * A process shutting down refused a new run (`DrainingError`, detached.ts): 503 with `Retry-After`.
@@ -721,17 +816,26 @@ const DRAINING_RETRY_AFTER_S = 1;
  * `run()`/`stream()` for a call that came through a door — request-body.ts) or a reader's cursor that is
  * not one (`InvalidCursorError`) — 400, for what it
  * carried; or a process that is shutting down (`DrainingError`) or has lost its liveness session
- * (`LivenessUnavailableError`) — 503 and `Retry-After`, for where it arrived. Name-matched like `blockedErrorCode`, so it reads an error from any copy of the package.
+ * (`LivenessUnavailableError`) — 503 and `Retry-After`, for where it arrived; or a deployment whose
+ * conversation store cannot be split by organization (`MemoryNotSplittableError`) — 500, because the
+ * fix is the host's config, not the request. Name-matched like `blockedErrorCode`, so it reads an error from any copy of the package.
  * A door renders `body` with `status` and sets `headers`.
  */
 export function requestRefusal(err: unknown):
   | { status: 400; body: { error: string; code: 'thread_id_reserved' | 'caller_system_message' | 'invalid_cursor'; detail?: { threadId: string } }; headers?: undefined }
   | { status: 503; body: { error: string; code: (typeof DRAIN_ERROR_CODES)[keyof typeof DRAIN_ERROR_CODES] }; headers: { 'Retry-After': string } }
+  | { status: 403; body: { error: string; code: (typeof APPROVAL_ERROR_CODES)[keyof typeof APPROVAL_ERROR_CODES]; detail?: unknown }; headers?: undefined }
+  | { status: 500; body: { error: string; code: typeof REQUEST_ERROR_CODES.memoryNotSplittable }; headers?: undefined }
   | undefined {
   const e = err as { name?: unknown; message?: unknown; threadId?: unknown } | null | undefined;
+  if (e?.name === 'MemoryNotSplittableError') return { status: 500, body: { error: MEMORY_NOT_SPLITTABLE_PUBLIC_MESSAGE, code: REQUEST_ERROR_CODES.memoryNotSplittable } };
   if (e?.name === 'DrainingError' || e?.name === 'LivenessUnavailableError') {
     const code = DRAIN_ERROR_CODES[e.name as keyof typeof DRAIN_ERROR_CODES];
     return { status: 503, body: { error: String(e.message), code }, headers: { 'Retry-After': String(DRAINING_RETRY_AFTER_S) } };
+  }
+  if (e?.name === 'ApprovalNotPermittedError') {
+    const d = (err as { detail?: { toolCallId?: unknown; toolName?: unknown } }).detail;
+    return { status: 403, body: { error: String(e.message), code: APPROVAL_ERROR_CODES.ApprovalNotPermittedError, detail: { toolCallId: d?.toolCallId, ...(d?.toolName !== undefined ? { toolName: d.toolName } : {}) } } };
   }
   if (e?.name === 'CallerSystemMessageError') return { status: 400, body: { error: String(e.message), code: REQUEST_ERROR_CODES.callerSystemMessage } };
   if (e?.name === 'InvalidCursorError') return { status: 400, body: { error: String(e.message), code: REQUEST_ERROR_CODES.invalidCursor } };
@@ -750,6 +854,98 @@ export interface UpstreamFailure {
   retryAfter?: number;
   /** The upstream's own status, when it had one — for logs and for the error body, not for the wire. */
   upstreamStatus?: number;
+  /**
+   * The URL the provider call went to — origin and path only (never a query, which is where some providers
+   * keep the key). The one clue a `404 Not Found` carries: `…/v1/responses` on a host that only serves
+   * `…/v1/chat/completions` reads as "wrong model type", and without it the message is just "Not Found".
+   */
+  upstreamUrl?: string;
+  /** A short excerpt of the provider's response body, secrets masked — see `safeUpstreamBody`. */
+  upstreamBody?: string;
+  /**
+   * The model that failed and its provider, as the model itself names them (`modelId`, `provider`). A URL often
+   * carries neither (`…/v1/responses`), and on a `model: [a, b]` chain it is the only way to tell which of the
+   * two answered 404. Configuration, not user input, so it is shown in production too. See `withUpstreamModel`.
+   */
+  upstreamModel?: string;
+  upstreamProvider?: string;
+}
+
+/**
+ * A provider failure carrying WHICH model raised it: whoever called the model knows and nobody downstream does (a
+ * chain's proxy only names the candidate that is serving). Returns a copy — same prototype, same own properties —
+ * rather than writing onto the error it was given: that object belongs to the caller's model (a test fixture, a
+ * shared error value) and is not this engine's to annotate. First mark wins, so the chain's own candidate is not
+ * overwritten by the wrapper around it. An error the taxonomy does not know as a provider failure comes back as it
+ * is.
+ */
+export function withUpstreamModel<E>(err: E, model: { modelId?: unknown; provider?: unknown }): E {
+  if (!err || typeof err !== 'object' || !upstreamFailure(err)) return err;
+  if ('upstreamModel' in err || 'upstreamProvider' in err) return err;
+  const marks: PropertyDescriptorMap = {};
+  if (typeof model.modelId === 'string' && model.modelId) marks.upstreamModel = { value: model.modelId.slice(0, 200), configurable: true, writable: true };
+  if (typeof model.provider === 'string' && model.provider) marks.upstreamProvider = { value: model.provider.slice(0, 200), configurable: true, writable: true };
+  return Object.create(Object.getPrototypeOf(err), { ...Object.getOwnPropertyDescriptors(err), ...marks }) as E;
+}
+
+/**
+ * A provider URL as it may be shown and stored: origin + path. The query goes (Gemini-style `?key=`), so
+ * does userinfo and the fragment. Anything that does not parse as an http(s) URL is dropped, not echoed.
+ */
+export function safeUpstreamUrl(raw: unknown): string | undefined {
+  if (typeof raw !== 'string' || raw === '' || raw.length > 2048) return undefined;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return undefined;
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The first part of a provider's response body — enough to read "404 page not found" or "Incorrect API key
+ * provided: sk-…1234" — as one line, at most 240 characters, with anything credential-shaped masked
+ * (bearer tokens, `sk-`/`nvapi-`/… keys, `api_key: …` fields). A bounded, masked excerpt, not a copy: the
+ * run's event log already keeps the conversation itself, so this is the same class of data, and the cap is
+ * what keeps a provider that echoes the request from filling it.
+ */
+export function safeUpstreamBody(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  let t = raw.replace(/\s+/g, ' ').trim();
+  if (!t) return undefined;
+  t = t
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi, '$1 [redacted]')
+    .replace(/\b(?:sk|pk|rk|gsk|xai|nvapi|hf|ghp|AIza)[-_][A-Za-z0-9_-]{8,}/g, '[redacted]')
+    .replace(/((?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|password|token)["']?\s*[:=]\s*["']?)[^"'\s,}&]{4,}/gi, '$1[redacted]');
+  return t.length > 240 ? `${t.slice(0, 240)}…` : t;
+}
+
+/**
+ * What a door tells the caller about the RUN an upstream failure ended, beside the failure itself: where the
+ * run lives (`runId`), whether a tool call of it already completed (`effectsRan` — see `effectsRanIn`), and
+ * how to ask again (`retry: 'same-runId'`: send the same runId and the run continues from its journal; a
+ * completed tool call is never run again). One shape for the REST body, the SSE `error` event and any door
+ * that renders the failure, so none of them restates it.
+ */
+export function upstreamRunHandle(runId: string, effectsRan: boolean): { runId: string; effectsRan: boolean; retry: 'same-runId' } {
+  return { runId, effectsRan, retry: 'same-runId' };
+}
+
+/**
+ * What a door adds to an upstream failure's wire body beyond `upstreamStatus`: the (credential-free) URL
+ * always, the response excerpt everywhere but production — a deployment's own error body is a developer's
+ * clue, not something to hand an end user.
+ */
+export function upstreamWire(up: UpstreamFailure | undefined): { upstreamUrl?: string; upstreamBody?: string; upstreamModel?: string; upstreamProvider?: string } {
+  if (!up) return {};
+  const prod = typeof process !== 'undefined' && process.env?.NODE_ENV === 'production';
+  return {
+    ...(up.upstreamModel !== undefined ? { upstreamModel: up.upstreamModel } : {}),
+    ...(up.upstreamProvider !== undefined ? { upstreamProvider: up.upstreamProvider } : {}),
+    ...(up.upstreamUrl !== undefined ? { upstreamUrl: up.upstreamUrl } : {}),
+    ...(!prod && up.upstreamBody !== undefined ? { upstreamBody: up.upstreamBody } : {}),
+  };
 }
 
 /** `AI_RetryError` wraps the failure that actually happened; the wrapper's own shape says nothing. */
@@ -785,10 +981,26 @@ function retryAfterSeconds(headers: unknown): number | undefined {
  */
 export function upstreamFailure(err: unknown): UpstreamFailure | undefined {
   const e = unwrapRetry(err) as
-    | { name?: string; statusCode?: number; responseHeaders?: unknown; message?: string; cause?: unknown }
+    | { name?: string; statusCode?: number; responseHeaders?: unknown; message?: string; cause?: unknown; url?: unknown; responseBody?: unknown; upstreamModel?: unknown; upstreamProvider?: unknown }
     | null
     | undefined;
   if (!e || typeof e !== 'object') return undefined;
+  const found = upstreamFailureOf(e);
+  if (!found) return undefined;
+  const upstreamUrl = safeUpstreamUrl(e.url);
+  const upstreamBody = safeUpstreamBody(e.responseBody);
+  const upstreamModel = typeof e.upstreamModel === 'string' ? e.upstreamModel : undefined;
+  const upstreamProvider = typeof e.upstreamProvider === 'string' ? e.upstreamProvider : undefined;
+  return {
+    ...found,
+    ...(upstreamUrl !== undefined ? { upstreamUrl } : {}),
+    ...(upstreamBody !== undefined ? { upstreamBody } : {}),
+    ...(upstreamModel !== undefined ? { upstreamModel } : {}),
+    ...(upstreamProvider !== undefined ? { upstreamProvider } : {}),
+  };
+}
+
+function upstreamFailureOf(e: { name?: string; statusCode?: number; responseHeaders?: unknown; message?: string; cause?: unknown }): UpstreamFailure | undefined {
 
   // A run that ended without finishing, read back from its ending (errorOf keeps the code).
   if ((e as { code?: unknown }).code === UPSTREAM_ERROR_CODES.unfinished) return { status: 502, code: UPSTREAM_ERROR_CODES.unfinished };
@@ -807,6 +1019,23 @@ export function upstreamFailure(err: unknown): UpstreamFailure | undefined {
   // reports these as a TypeError whose message is uninformative, so the name/cause is all there is.
   if (e.name === 'AI_APICallError') return { status: 502, code: UPSTREAM_ERROR_CODES.unavailable };
   if (e.name === 'TimeoutError') return { status: 504, code: UPSTREAM_ERROR_CODES.timeout };
+  return undefined;
+}
+
+/**
+ * What a person using the app may be told about a failed run, as a sentence: a thin reading of `endAnswerOf`
+ * (THE one mapping, below) — not a second rule. Only an ending the framework names answers (its sentences are
+ * ours and carry no deployment data), plus a step that timed out (it has no wire code). Anything else — a
+ * database error, a bug in a host's tool, a provider body — returns undefined and the door keeps its mask:
+ * an unknown error's text may hold a password or a hostname and never goes to an end user. A provider
+ * failure is worded by the door from `endAnswerOf(...).upstream` (it has its own status/URL rules).
+ */
+export function endUserError(err: unknown): { code?: string; message: string } | undefined {
+  const a = endAnswerOf(err);
+  if (a && !a.upstream) return { code: a.code, message: a.body.error };
+  const named = (err as { name?: unknown } | null | undefined)?.name;
+  const message = (err as { message?: unknown } | null | undefined)?.message;
+  if (named === 'StepTimeoutError' && typeof message === 'string') return { message };
   return undefined;
 }
 
@@ -832,6 +1061,7 @@ const WIRE_STATUS_BY_CODE = {
   thread_owner_mismatch: 409,
   run_swept: 409,
   batch_plan_mismatch: 409,
+  approval_key_ambiguous: 409,
   // blocked — the run is waiting on a decision; the same id succeeds once it clears
   side_effect_retry_blocked: 409,
   retry_limit_exceeded: 422,
@@ -839,6 +1069,9 @@ const WIRE_STATUS_BY_CODE = {
   outcome_unknown: 409,
   run_busy: 409,
   step_retry_blocked: 409,
+  run_not_continued: 409,
+  // finished — the run was canceled; it never resumes (fork the completed prefix to continue the work)
+  run_canceled: 409,
   // limit — resumable: raise the ceiling (or fix the loop) and re-drive the same runId
   run_limit_exceeded: 422,
   tool_loop_detected: 422,
@@ -853,9 +1086,13 @@ const WIRE_STATUS_BY_CODE = {
   // request shape — the body is not a JSON object (readJsonObject); fix the request
   invalid_json: 400,
   caller_system_message: 400,
+  // approval authority — a yes the answerer may not give (approval-authority.ts); answer as an authorised person, or no
+  approval_not_permitted: 403,
   invalid_cursor: 400,
   // adoption — the organization already holds what the root would move onto; decide, then adopt again
   adoption_conflict: 409,
+  // misconfiguration — the deployment's conversation store cannot be split by organization; fix the config
+  memory_not_splittable: 500,
   // drain — this process is shutting down; the same request succeeds on another one (Retry-After)
   draining: 503,
   liveness_unavailable: 503,
@@ -863,3 +1100,104 @@ const WIRE_STATUS_BY_CODE = {
 /** A code with a pinned HTTP status. */
 export type WireErrorCode = keyof typeof WIRE_STATUS_BY_CODE;
 export const WIRE_ERROR_STATUS: typeof WIRE_STATUS_BY_CODE & { readonly [code: string]: number | undefined } = WIRE_STATUS_BY_CODE;
+
+/**
+ * HOW A RUN ENDED, as the client is told — THE one mapping, from the ending (the error a run threw, or the
+ * one its reader read back from the event log) to the answer every door gives. `status` and `body` are what a
+ * door writes (`/run` as the response, `/stream` and AG-UI as the `error` frame's data, the chat surface as
+ * the `code` in its error text); `headers` go with the response.
+ *
+ * Before this, each door held its own copy of the chain (limit, thread mismatch, caller conflict, blocked,
+ * request refusal, upstream) and its own subset: a canceled run was a `400` with no code on `/run` and a bare
+ * `done` on a stream; a run waiting for an operator had its code on `/run` only. A new ending is now one
+ * entry here, and every door speaks it.
+ *
+ * `hidden`: the answer reads as an absent run (`runNotFound`), so a door puts no correlation header on it.
+ * `ownership`: the door records it as an ownership refusal (`markRefusal`). `upstream`: the provider failure
+ * it was read from, for a door that words it for a person. Undefined: not an ending the framework names — the
+ * door's own answer for an error of the host's (`400` on `/run`, the masked text on chat).
+ */
+export interface RunEndAnswer {
+  status: number;
+  code: string;
+  body: { error: string; code: string; [field: string]: unknown };
+  headers?: Record<string, string>;
+  hidden: boolean;
+  ownership: boolean;
+  upstream?: UpstreamFailure;
+}
+
+/**
+ * A run that ended by a decision: it was canceled (`RunCanceledError`, cancel.ts). 409 — the request is fine,
+ * the run is over, and nothing re-sent clears it (a canceled run never resumes; `forkRun` continues the work).
+ * Name-matched like `blockedErrorCode`.
+ */
+export const FINISHED_ERROR_CODES = {
+  RunCanceledError: 'run_canceled',
+} as const;
+
+/** Seconds a client is told to wait before re-sending a request for a run another worker holds right now. */
+const RUN_BUSY_RETRY_AFTER_S = 5;
+
+export function endAnswerOf(err: unknown, workKey?: string): RunEndAnswer | undefined {
+  const e = err as { name?: unknown; message?: unknown; detail?: unknown } | null | undefined;
+  const error = typeof e?.message === 'string' ? e.message : String(err);
+
+  // A run-limit breach: valid request, a ceiling stopped it — raise the ceiling and re-drive the same runId.
+  if (e?.name === 'RunLimitExceededError' || e?.name === 'ToolLoopDetectedError') {
+    const code = e.name === 'RunLimitExceededError' ? LIMIT_ERROR_CODES.runLimitExceeded : LIMIT_ERROR_CODES.toolLoopDetected;
+    return { status: WIRE_ERROR_STATUS[code]!, code, body: { error, code, detail: e.detail, resumable: true }, hidden: false, ownership: false };
+  }
+
+  // The caller's mistake about its own work (and a "not your run", answered as an absent run). Includes the
+  // thread mismatch, with the foreign parties removed from its detail.
+  const conflict = callerConflictAnswer(err, workKey);
+  if (conflict) return { status: conflict.status, code: conflict.body.code, body: conflict.body, hidden: conflict.hidden, ownership: conflict.ownership };
+
+  // A run waiting on a decision, or at a ceiling it cannot pass: the same id succeeds once that clears.
+  const blocked = blockedErrorCode(err);
+  if (blocked) {
+    const status = WIRE_ERROR_STATUS[blocked]!;
+    return {
+      status, code: blocked,
+      body: { error, code: blocked, detail: e?.detail, ...(blocked === 'retry_limit_exceeded' ? {} : { resumable: true }) },
+      ...(blocked === 'run_busy' ? { headers: { 'Retry-After': String(RUN_BUSY_RETRY_AFTER_S) } } : {}),
+      hidden: false, ownership: false,
+    };
+  }
+
+  // A request the engine refused before any work (a reserved id, a system message the caller sent, a bad cursor) or a process that is leaving.
+  const refused = requestRefusal(err);
+  if (refused) return { status: refused.status, code: refused.body.code, body: refused.body, ...(refused.headers ? { headers: refused.headers } : {}), hidden: false, ownership: false };
+
+  // The provider failed.
+  const up = upstreamFailure(err);
+  if (up) {
+    const body = {
+      error, code: up.code,
+      ...(up.upstreamStatus !== undefined ? { upstreamStatus: up.upstreamStatus } : {}),
+      ...upstreamWire(up),
+      ...(up.retryAfter !== undefined ? { retryAfter: up.retryAfter } : {}),
+    };
+    return { status: up.status, code: up.code, body, ...(up.retryAfter !== undefined ? { headers: { 'Retry-After': String(up.retryAfter) } } : {}), hidden: false, ownership: false, upstream: up };
+  }
+
+  // Finished by a decision: the run was canceled. 409 — the request is fine, the run is over; nothing re-sent clears it.
+  if (e?.name === 'RunCanceledError') {
+    const code = FINISHED_ERROR_CODES.RunCanceledError;
+    return { status: WIRE_ERROR_STATUS[code]!, code, body: { error, code }, hidden: false, ownership: false };
+  }
+  return undefined;
+}
+
+/**
+ * `endAnswerOf`'s answer for a run a door can look up: a provider failure also names the run it ended,
+ * whether a tool call of it already completed (`effectsRan`, read lazily — only a provider failure pays for
+ * the read) and how to ask again (`upstreamRunHandle`). Any other ending is returned as it is. A door that
+ * knows the run (REST, the SSE `error` event) calls this instead of restating the shape.
+ */
+export async function withRunHandle(answer: RunEndAnswer, runId: string, effectsRan: () => Promise<boolean>): Promise<RunEndAnswer> {
+  if (!answer.upstream) return answer;
+  const handle = upstreamRunHandle(runId, await effectsRan().catch(() => false));
+  return { ...answer, body: { ...answer.body, ...handle } };
+}

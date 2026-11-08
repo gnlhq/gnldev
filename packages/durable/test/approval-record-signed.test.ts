@@ -18,12 +18,18 @@ import { runKeys } from '../src/journal.js';
 import { claimRunOwner, STAFF } from '../src/run-identity.js';
 
 const KEY = (r: string, t: string) => runKeys.approval(r, t);
+/** The question an answer is for (d25 step 1: an approval is written only for a question that is waiting). */
+const ask = (j: InMemoryJournal, run: string, id: string, status: 'suspended' | 'failed' = 'suspended') =>
+  j.put(runKeys.tool(run, id), status === 'suspended'
+    ? { status: 'suspended', output: { __gnl_suspend: { toolCallId: id, toolName: 'pay', args: {}, reason: 'q', kind: 'confirm', needs: 'confirm' } } }
+    : { status: 'failed', sideEffect: true });
 
 describe('onay kaydı — imza', () => {
   it('karar KİM ve NE ZAMAN ile birlikte yazılır', async () => {
     const j = new InMemoryJournal();
 
     for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
+    await ask(j, 'r1', 'call-1');
     await resolveApprovals(j, 'r1', { 'call-1': true }, { actor: 'ayse' });
     const rec = await j.get<ApprovalRecord>(KEY('r1', 'call-1'));
     expect(rec?.v).toBe(1);
@@ -48,9 +54,8 @@ describe('onay kaydı — durum', () => {
     const j = new InMemoryJournal();
 
     for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
+    await ask(j, 'r3', 'call-1'); // tool kaydı 'suspended' (terminal değil) — tur çökse de öyle kalır
     await resolveApprovals(j, 'r3', { 'call-1': true }, { actor: 'op' });
-    // Tur çöktü; tool kaydı hâlâ 'suspended' (terminal değil).
-    await j.put(runKeys.tool('r3', 'call-1'), { status: 'suspended' });
     const merged = await resolveApprovals(j, 'r3', { 'call-1': false }, {
       actor: 'op',
       hasRun: async (t) => ((await j.get<{ status?: string }>(runKeys.tool('r3', t)))?.status ?? '') !== 'suspended',
@@ -63,6 +68,7 @@ describe('onay kaydı — durum', () => {
     const j = new InMemoryJournal();
 
     for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
+    await ask(j, 'r4', 'call-1');
     await resolveApprovals(j, 'r4', { 'call-1': true });
     await j.put(runKeys.tool('r4', 'call-1'), { status: 'succeeded' }); // etki gerçekleşti
     const merged = await resolveApprovals(j, 'r4', { 'call-1': false }, {
@@ -76,6 +82,7 @@ describe('onay kaydı — durum', () => {
     const j = new InMemoryJournal();
 
     for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
+    await ask(j, 'r5', 'call-1');
     await resolveApprovals(j, 'r5', { 'call-1': true });
     const merged = await resolveApprovals(j, 'r5', { 'call-1': false }); // hasRun verilmedi
     expect(merged?.['call-1']).toBe(true);
@@ -85,6 +92,7 @@ describe('onay kaydı — durum', () => {
     const j = new InMemoryJournal();
 
     for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
+    await ask(j, 'r6', 'call-1');
     await resolveApprovals(j, 'r6', { 'call-1': true }, { actor: 'ayse' });
     const before = await j.get<ApprovalRecord>(KEY('r6', 'call-1'));
     await resolveApprovals(j, 'r6', { 'call-1': true }, { actor: 'ayse', hasRun: async () => false });
@@ -112,7 +120,8 @@ describe('onay kaydı — geriye uyum', () => {
     for (const id of ['r1', 'r2', 'r3', 'r4', 'r5', 'r6']) await claimRunOwner(j, id, STAFF); // decisions are a run's records
     await j.put(KEY('r8', 'call-1'), { __gnl_approval_spent: true, at: 1 });
     expect(decisionOf(await j.get(KEY('r8', 'call-1')))).toBeUndefined();
-    // Ve insanın TAZE cevabı onu devralır (mevcut davranış korunuyor).
+    // Ve insanın TAZE cevabı onu devralır (mevcut davranış korunuyor) — soru yeniden sorulmuşsa.
+    await ask(j, 'r8', 'call-1');
     await resolveApprovals(j, 'r8', { 'call-1': true }, { actor: 'ayse' });
     expect((await j.get<ApprovalRecord>(KEY('r8', 'call-1')))?.decision).toBe(true);
   });

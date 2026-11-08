@@ -32,4 +32,11 @@ export interface GnlToolContext {
   /** The run whose model called this tool (= `identity.runId`). */
   runId: string;
   parentRunId?: string;
+  /**
+   * This call is running on a human's "yes" (an approval the call was waiting for, or one given ahead of
+   * it). Present only as `true`: a call that needed no approval is never told it was approved. Set where
+   * the engine knows it (durable-tool.ts); the idempotencyKey hook never gets it — the key of the work
+   * must be the same before and after the yes.
+   */
+  approved?: true;
 }

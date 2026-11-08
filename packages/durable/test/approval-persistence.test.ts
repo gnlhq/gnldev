@@ -14,10 +14,13 @@ import { describe, it, expect, vi } from 'vitest';
 import { decisionOf } from '../src/run.js';
 import { tool, stepCountIs } from 'ai';
 import { z } from 'zod';
-import { InMemoryJournal, runKeys, runDurable, streamDurable, parseJournalKey } from '../src/index.js';
+import { InMemoryJournal, runKeys, runDurable, streamDurable, parseJournalKey, mintCallId } from '../src/index.js';
 import type { Journal } from '../src/index.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult, createMockStreamAgent } from './mock.js';
 import { claimRunOwner, UNKNOWN as NOBODY } from '../src/run-identity.js';
+
+/** The GNL id of the run's first tool call (model step 0, first distinct provider id). */
+const gid = (runId: string, providerId = 'call-1') => mintCallId(providerId, runId, 0, 0);
 
 /** Above CLAIM_TTL_MS (30s) — a 'running' this old is a corpse, not a claim (crash-window.test.ts's twin). */
 const STALE_MS = 60_000;
@@ -69,23 +72,35 @@ describe('first-class approval: approvals journal persistence', () => {
     const counter = { charges: 0 };
     const crash = { active: true };
 
-    // Run 1: approved (via approvals) but the tool execute THROWS — the tool can't complete.
+    // Run 1: the tool execute THROWS — the tool can't complete, and the attempt is now in doubt ("it MAY have
+    // already happened"). That question is asked of a person; a yes sent BEFORE it existed would answer nothing
+    // (d25 step 1), so the first run carries none.
     const r1 = await runDurable({
       runId: 'proof-1',
       journal,
       model: makeModel(),
       tools: makeTools(counter, crash),
-      approvals: { 'call-1': true },
       prompt: 'charge 5000',
     });
     expect(counter.charges).toBe(0); // the tool couldn't complete
     expect(r1.text).toBe('Done.'); // the run continued overall (the AI SDK swallowed the error)
-    const toolRecord1 = await journal.get<any>(runKeys.tool('proof-1', 'call-1'));
+    const toolRecord1 = await journal.get<any>(runKeys.tool('proof-1', gid('proof-1')));
     expect(toolRecord1.status).toBe('failed'); // trace of the crash
+
+    // Run 1b: the person answers the in-doubt question (yes) — and the retry crashes again.
+    await runDurable({
+      runId: 'proof-1',
+      journal,
+      model: makeModel(),
+      tools: makeTools(counter, crash),
+      approvals: { [gid('proof-1')]: true },
+      prompt: 'charge 5000',
+    });
+    expect(counter.charges).toBe(0);
 
     // The approval decision must have been WRITTEN to the journal — INDEPENDENT of the approvals
     // parameter, at the top of run.ts.
-    expect(decisionOf(await journal.get(runKeys.approval('proof-1', 'call-1')))).toBe(true);
+    expect(decisionOf(await journal.get(runKeys.approval('proof-1', gid('proof-1'))))).toBe(true);
 
     // Run 2: resume WITHOUT the approvals parameter — no more crash, the tool can complete this time.
     crash.active = false;
@@ -115,7 +130,7 @@ describe('first-class approval: approvals journal persistence', () => {
       model: makeModel(),
       tools: makeTools(counter, { active: false }),
       guard: bigChargeGuard,
-      approvals: { 'call-1': false },
+      approvals: { [gid('deny-1')]: false },
       prompt: 'charge 5000',
     });
 
@@ -123,7 +138,7 @@ describe('first-class approval: approvals journal persistence', () => {
     expect(r.text).toBe('Done.');
     // The denial decision was PERSISTED to the journal — not just in the tool's 'denied' terminal
     // state, but also in the separate approval key (so it can be enumerated/observed later via listKeys).
-    expect(decisionOf(await journal.get(runKeys.approval('deny-1', 'call-1')))).toBe(false);
+    expect(decisionOf(await journal.get(runKeys.approval('deny-1', gid('deny-1'))))).toBe(false);
   });
 
   it('a later DIFFERENT answer wins while the call has not completed (the crash must not lose an answer — it must not freeze one either)', async () => {
@@ -133,17 +148,19 @@ describe('first-class approval: approvals journal persistence', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     try {
-      // Run 1: approval TRUE, the tool crashes (can't complete) — 'true' is written to the journal (first decision).
+      // Run 1: the tool crashes (can't complete) and the attempt is in doubt; run 1b: the answer TRUE (to that
+      // question) is written to the journal (first decision) and the retry crashes again.
+      await runDurable({ runId: 'conflict-1', journal, model: makeModel(), tools: makeTools(counter, crash), prompt: 'charge 5000' });
       await runDurable({
         runId: 'conflict-1',
         journal,
         model: makeModel(),
         tools: makeTools(counter, crash),
-        approvals: { 'call-1': true },
+        approvals: { [gid('conflict-1')]: true },
         prompt: 'charge 5000',
       });
       expect(counter.charges).toBe(0);
-      expect(decisionOf(await journal.get(runKeys.approval('conflict-1', 'call-1')))).toBe(true);
+      expect(decisionOf(await journal.get(runKeys.approval('conflict-1', gid('conflict-1'))))).toBe(true);
 
       // Run 2: CONFLICTING parameter (false) — the FIRST decision (true) in the journal must WIN, must NOT be overwritten.
       crash.active = false;
@@ -155,7 +172,7 @@ describe('first-class approval: approvals journal persistence', () => {
         journal,
         model: makeModel(),
         tools: makeTools(counter, crash),
-        approvals: { 'call-1': false }, // fikir değişikliği: iş henüz olmadı, ret geçerli
+        approvals: { [gid('conflict-1')]: false }, // fikir değişikliği: iş henüz olmadı, ret geçerli
         prompt: 'charge 5000',
       })).rejects.toThrow(/not auto-retried after failed/);
 
@@ -168,7 +185,7 @@ describe('first-class approval: approvals journal persistence', () => {
       // korunuyor: kimse fikir değiştirmezse karar aynen yaşar (üstteki iki test bunu sabitliyor).
       // Koruması gerekmeyen şey, iş HENÜZ OLMAMIŞKEN gelen yeni bir insan cevabını yenmektir.
       expect(counter.charges).toBe(0); // ret kazandı → araç KOŞMADI
-      expect(decisionOf(await journal.get(runKeys.approval('conflict-1', 'call-1')))).toBe(false);
+      expect(decisionOf(await journal.get(runKeys.approval('conflict-1', gid('conflict-1'))))).toBe(false);
       // Çatışma uyarısı artık yok: çatışma DEĞİL, fikir değişikliği. Uyarı yalnız iş bittikten
       // sonra gelen (ve yok sayılan) cevap için basılıyor.
       expect(warnSpy).not.toHaveBeenCalled();
@@ -203,17 +220,18 @@ describe('first-class approval: approvals journal persistence', () => {
       }),
     };
 
-    // Run 1: approved, guard passes it, execute starts and PARKS mid-flight.
+    // Run 0: the guard asks (the answer below needs a question). Run 1: approved, execute starts and PARKS mid-flight.
+    await runDurable({ runId: 'inflight-1', journal, model: makeModel(), tools: hangingTools, guard: bigChargeGuard, prompt: 'charge 5000' });
     const first = runDurable({
       runId: 'inflight-1',
       journal,
       model: makeModel(),
       tools: hangingTools,
       guard: bigChargeGuard,
-      approvals: { 'call-1': true },
+      approvals: { [gid('inflight-1')]: true },
       prompt: 'charge 5000',
     });
-    await waitFor(async () => entered && (await journal.get<any>(runKeys.tool('inflight-1', 'call-1')))?.status === 'running');
+    await waitFor(async () => entered && (await journal.get<any>(runKeys.tool('inflight-1', gid('inflight-1'))))?.status === 'running');
 
     // Run 2: the operator changes their mind — but the work is already happening. The claim is FRESH,
     // so this call is turned away at the door (RunBusyError), which is exactly the pre-existing
@@ -224,17 +242,17 @@ describe('first-class approval: approvals journal persistence', () => {
       model: makeModel(),
       tools: hangingTools,
       guard: bigChargeGuard,
-      approvals: { 'call-1': false },
+      approvals: { [gid('inflight-1')]: false },
       prompt: 'charge 5000',
     })).rejects.toThrow(/another executor/);
-    expect(decisionOf(await journal.get(runKeys.approval('inflight-1', 'call-1')))).toBe(true);
+    expect(decisionOf(await journal.get(runKeys.approval('inflight-1', gid('inflight-1'))))).toBe(true);
 
     // And when the side effect finally lands, the journal tells one story, not two.
     release();
     await first;
     expect(counter.charges).toBe(1);
-    expect((await journal.get<any>(runKeys.tool('inflight-1', 'call-1'))).status).toBe('succeeded');
-    expect(decisionOf(await journal.get(runKeys.approval('inflight-1', 'call-1')))).toBe(true);
+    expect((await journal.get<any>(runKeys.tool('inflight-1', gid('inflight-1')))).status).toBe('succeeded');
+    expect(decisionOf(await journal.get(runKeys.approval('inflight-1', gid('inflight-1'))))).toBe(true);
   });
 
   it('a BAYAT running (the worker died holding the claim) is still re-answerable — the deny wins', async () => {
@@ -245,8 +263,8 @@ describe('first-class approval: approvals journal persistence', () => {
     // must still be able to say "don't" — freezing the decision here would be the freeze the
     // first-decision-wins rule was never meant to give.
     await claimRunOwner(journal, 'stale-1', NOBODY);
-    await journal.put(runKeys.approval('stale-1', 'call-1'), { v: 1, decision: true, at: Date.now() - STALE_MS });
-    await journal.put(runKeys.tool('stale-1', 'call-1'), { status: 'running', startedAt: Date.now() - STALE_MS });
+    await journal.put(runKeys.approval('stale-1', gid('stale-1')), { v: 1, decision: true, at: Date.now() - STALE_MS });
+    await journal.put(runKeys.tool('stale-1', gid('stale-1')), { status: 'running', startedAt: Date.now() - STALE_MS });
 
     await runDurable({
       runId: 'stale-1',
@@ -254,12 +272,12 @@ describe('first-class approval: approvals journal persistence', () => {
       model: makeModel(),
       tools: makeTools(counter, { active: false }),
       guard: bigChargeGuard,
-      approvals: { 'call-1': false },
+      approvals: { [gid('stale-1')]: false },
       prompt: 'charge 5000',
     });
 
-    expect(decisionOf(await journal.get(runKeys.approval('stale-1', 'call-1')))).toBe(false);
-    expect((await journal.get<any>(runKeys.tool('stale-1', 'call-1'))).status).toBe('denied');
+    expect(decisionOf(await journal.get(runKeys.approval('stale-1', gid('stale-1'))))).toBe(false);
+    expect((await journal.get<any>(runKeys.tool('stale-1', gid('stale-1')))).status).toBe('denied');
     expect(counter.charges).toBe(0); // the abandoned call was NOT picked back up
   });
 
@@ -282,15 +300,19 @@ describe('first-class approval: approvals journal persistence', () => {
       }),
     };
 
-    // Stream 1: approved, execute dies → the record is 'failed' and the decision is on file.
+    // Stream 0: execute dies → the record is 'failed' (the attempt is in doubt). Stream 1: the person answers that
+    // question yes, the retry dies again → the decision is on file.
+    await (await streamDurable({
+      runId: 'stream-conflict-1', journal, model: createMockStreamAgent(), tools, prompt: 'charge 20', stopWhen: stepCountIs(3),
+    })).text;
     const s1 = await streamDurable({
       runId: 'stream-conflict-1', journal, model: createMockStreamAgent(), tools,
-      approvals: { 'call-charge': true }, prompt: 'charge 20', stopWhen: stepCountIs(3),
+      approvals: { [gid('stream-conflict-1', 'call-charge')]: true }, prompt: 'charge 20', stopWhen: stepCountIs(3),
     });
     await s1.text;
     expect(counter.charges).toBe(0);
-    expect((await journal.get<any>(runKeys.tool('stream-conflict-1', 'call-charge'))).status).toBe('failed');
-    expect(decisionOf(await journal.get(runKeys.approval('stream-conflict-1', 'call-charge')))).toBe(true);
+    expect((await journal.get<any>(runKeys.tool('stream-conflict-1', gid('stream-conflict-1', 'call-charge')))).status).toBe('failed');
+    expect(decisionOf(await journal.get(runKeys.approval('stream-conflict-1', gid('stream-conflict-1', 'call-charge'))))).toBe(true);
 
     // Stream 2: the operator denies. Nothing has happened yet — 'failed' is not terminal, the reclaim
     // ladder would have re-run this — so the new answer takes over, and the charge stays unmade.
@@ -298,14 +320,14 @@ describe('first-class approval: approvals journal persistence', () => {
     const blocked: any[] = [];
     const s2 = await streamDurable({
       runId: 'stream-conflict-1', journal, model: createMockStreamAgent(), tools,
-      approvals: { 'call-charge': false }, prompt: 'charge 20', stopWhen: stepCountIs(3),
+      approvals: { [gid('stream-conflict-1', 'call-charge')]: false }, prompt: 'charge 20', stopWhen: stepCountIs(3),
       onBlocked: (b) => { blocked.push(b); },
     });
     // Same ending as the generate-path twin above: a half-made money movement is not auto-retried,
     // and the stream reports that through its terminal promise instead of finishing quietly.
     await expect(s2.text).rejects.toThrow(/not auto-retried after failed/);
 
-    expect(decisionOf(await journal.get(runKeys.approval('stream-conflict-1', 'call-charge')))).toBe(false);
+    expect(decisionOf(await journal.get(runKeys.approval('stream-conflict-1', gid('stream-conflict-1', 'call-charge'))))).toBe(false);
     expect(counter.charges).toBe(0); // ret kazandı → araç YİNE koşmadı
     expect(blocked.map((b) => b.kind)).toContain('SideEffectRetryBlockedError');
   });

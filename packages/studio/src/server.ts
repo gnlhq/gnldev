@@ -6,10 +6,10 @@ import { Hono, type Context } from 'hono';
 import { sseResponse } from './sse.js';
 
 import { STUDIO_ERROR_CODES } from './error-codes.js';
-import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, beginFork, settleModelContent, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, regressionReport, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, LIMIT_ERROR_CODES, requestRefusal, eraseSubject, subjectRuns, toJournal, decodeStepRecord, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
+import { ORG_RECORD_PRE, withRootScope, ORG_KEY_PREFIX, parseOrganizationKey, orgPrefix, asReaderJournal, reconstructState, forkRun, beginFork, settleModelContent, getRunCost, withOrg, appendLog, listLog, countLog, purgeRun, isRealRun, purgeOrganization, orgPurgedKey, sweepRuns, sweepLog, listOrphanThreadState, POLICY_KEY, PRICING_KEY, effectivePricingTable, DEFAULT_PRICING, readPricing, BUDGET_PRE, readBudget, regressionReport, knownModelProviders, getNetworkTrace, RunLimitExceededError, ToolLoopDetectedError, WIRE_ERROR_STATUS, blockedErrorCode, upstreamFailure, upstreamWire, readProcessorReports, readIncidents, agentVisibleToOrg, readMetricsSummary, metricsRunKey, cancelAgentRun, listAgentRegistry, approveAgent, blockAgent, callerConflictCode, surfacedInterrupts, resolveApprovals as dResolveApprovals, hasRunProbe, runOwnerOf, LIMIT_ERROR_CODES, requestRefusal, splitMemoryForOrganization, MemoryNotSplittableError, eraseSubject, subjectRuns, toJournal, decodeStepRecord, readJsonObject, isRunCursor, pageRunsFromArray } from '@gnldev/durable';
 import type { PolicyDoc, PolicyRule, BudgetLimit, PricingDoc } from '@gnldev/durable';
 import type { JournalReader, Journal, Memory, WorkflowLike, MetricsRunRow, Caller, Storage, SubjectEraser, RunSummary, RunChange } from '@gnldev/durable';
-import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason } from '@gnldev/auth';
+import { makeGate, normalizeAuth, bindsIdentity, principalOf, isPlatformAdmin, principalScope, assertAssignablePrivileges, isPrincipalKind, callerKind, actorIdOf, engineCallerOf, answererOf, markRefusal, decisionNotRecorded, type AuthProvider, type Principal, type PrincipalKind, type RefusalReason, type EngineAnswerer } from '@gnldev/auth';
 import { listTriggers } from '@gnldev/scheduler';
 import { mountSpa, notBuiltHtml } from './spa.js';
 import { openapiSpec, swaggerHtml } from './swagger.js';
@@ -126,6 +126,14 @@ export interface StudioCallbackCtx {
    * Host bu alanı yok sayarsa davranış bugünküyle birebir aynı kalır (eklemeli).
    */
   actor?: string;
+  /**
+   * WHO is answering — the request's principal as the engine's `Answerer` (@gnldev/auth `answererOf`):
+   * an operator answers as staff, named `operator:<id>`. `caller` is whose work it is; this is who clicked,
+   * and it is what the engine reads to decide whether the answer may be given (`approve` is for staff only)
+   * and what the approval record names. Forward it to the engine as the run's `answerer`
+   * (`createStudioRunner` does). A bridge that ignores it is read as its `caller`.
+   */
+  answerer?: EngineAnswerer;
 }
 
 export type StudioResume = (
@@ -190,7 +198,7 @@ export interface StudioAgentRunner {
    * assignable to one declaring more.
    */
   run (name: string, opts: { runId: string; prompt?: string; messages?: unknown; threadId?: string; resourceId?: string; actor?: string; approvals?: Record<string, boolean>; model?: string; temperature?: number; topP?: number; system?: string; tools?: string[] }, ctx?: StudioCallbackCtx): Promise<{ text?: string; interrupts?: unknown[]; finishReason?: string }>;
-  stream?(name: string, opts: { runId: string; prompt?: string; messages?: unknown; threadId?: string; resourceId?: string; actor?: string; approvals?: Record<string, boolean>; model?: string; temperature?: number; topP?: number; system?: string; tools?: string[] }, ctx?: StudioCallbackCtx): Promise<any>;
+  stream?(name: string, opts: { runId: string; prompt?: string; messages?: unknown; threadId?: string; resourceId?: string; actor?: string; approvals?: Record<string, boolean>; model?: string; temperature?: number; topP?: number; system?: string; tools?: string[]; stream?: { reasoning?: boolean } }, ctx?: StudioCallbackCtx): Promise<any>;
   /** If given, the Tools view shows the tool list. */
   listTools?(): Promise<ToolListItem[]> | ToolListItem[];
   /** If given, tools can be run for TEST purposes (respects the guard; opts.durable → writes to the
@@ -233,8 +241,10 @@ export type StudioMemory = Pick<Memory, 'getMessages' | 'getWorkingMemory' | 'li
  * A host-supplied store, as an object or as a function of the calling organization.
  *
  * The OBJECT form is one store for the whole deployment: it serves the root/operator scope and a
- * single-tenant deployment, and an organization-scoped caller is refused (403 `org_scope_refused`).
- * The FUNCTION form is how an organization's data reaches Studio: Studio calls it once per
+ * single-tenant deployment. For an organization-scoped caller the object is split by the one rule
+ * @gnldev/durable owns (`splitMemoryForOrganization`) when it is a `memory` that can be (AgentMemory), and
+ * refused otherwise (`memory` — 500 `memory_not_splittable`; every OTHER host object — 403
+ * `org_scope_refused`). The FUNCTION form is how an organization's data reaches Studio: Studio calls it once per
  * organization (`orgId` undefined for the root/operator scope), caches the result, and serves each
  * organization's requests only from the store it obtained for that organization.
  *
@@ -1228,35 +1238,25 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     if (p?.orgId) return false;
     return !orgIsolationActive || isPlatformAdmin(p);
   };
-  /** The one-line way through for an organization refused the conversation store. */
-  const MEMORY_FIX = 'pass `memory` as a function of the organization — `memory: ({ orgId }) => yourMemoryFor(orgId)`, '
-    + 'built once per organization — or pass `memoryFactory`, which receives the org-scoped journal';
-  /** The same, for the other host stores. */
+  /** The one-line way through for the other host stores. */
   const hostFix = (what: string): string =>
     `pass \`${what}\` as a function of the organization — \`${what}: ({ orgId }) => yours(orgId)\`, built once per organization`;
   /**
-   * Refuses a thread request from an org-bound caller when thread storage cannot be scoped.
-   *
-   * Serving it would hand one organization another organization's conversations. Refusing is the only honest
-   * answer available: the host's `memory` object owns its own store, and nothing here can put an
-   * organization boundary inside it. The message names the fix, because the fix is a one-line config
-   * change (`memoryFactory` instead of `memory`) and the alternative is a leak nobody sees.
+   * Refuses a thread request from an org-bound caller when the conversation store cannot be split for
+   * the caller's organization — the one rule @gnldev/durable owns (`splitMemoryForOrganization`, the same
+   * one `scopeConfigToOrg` applies to REST, chat, AG-UI and A2A). A memory that can rebuild itself over
+   * an organization's partition (AgentMemory) is served per organization and never reaches this
+   * refusal; anything else answers the same typed `500 memory_not_splittable` every door gives. The
+   * answer is generic: the fix sentence went to the server log when the rule refused.
    */
   const requireScopedMemory = (c: Context): Response | undefined => {
     if (memoryIsOrgScoped) return undefined;
-    const org = principalOf(c.req.raw)?.orgId ?? orgALS.getStore();
+    const org = callerOrgScope(c);
     if (!org) return undefined; // single-org / operator: nothing to isolate from
-    // Said once here as well as at boot: the boot warning fires on `multiOrganizationEnabled`, which a
-    // `roleAuth` provider binding `orgId` to an identity does NOT set — so the config most likely to hit
-    // this refusal was the one least likely to be warned about it.
-    warnRefusal('memory', MEMORY_FIX);
-    markRefusal(c.req.raw, 'organization', { detail: 'org_scope_refused' });
-    return c.json({
-      code: 'org_scope_refused', // see requireScopedHost — a scope refusal is not a bad token
-      error: 'this request reaches the conversation store, which has no organization boundary in this ' +
-        `deployment because \`memory\` was passed as one object. To serve it, ${MEMORY_FIX}, or use an ` +
-        'unscoped operator identity.',
-    }, 403);
+    const store = objectMemoryFor(org);
+    if (!(store instanceof MemoryNotSplittableError)) return undefined;
+    const r = requestRefusal(store)!;
+    return c.json(r.body, r.status);
   };
 
   /**
@@ -1381,7 +1381,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   };
 
   /** The same question for the conversation store, which has its own (older) refusal. */
-  const threadsReachable = (c: Context): boolean => memoryIsOrgScoped || !callerOrgScope(c);
+  const threadsReachable = (c: Context): boolean => !requireScopedMemory(c);
 
   /**
    * The same refusal, for the routes that reach the conversation store WITHOUT being thread endpoints.
@@ -1647,8 +1647,33 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
    * reads it, so the refusal and the resolution cannot disagree about who is asking.
    */
   const memoryOf = perOrg(memory);
-  const memoryFor = (c: Context): StudioMemory | undefined =>
-    typeof memory === 'function' ? memoryOf(callerOrgScope(c)) : fixedMemory;
+  const memoryFor = (c: Context): StudioMemory | undefined => {
+    if (typeof memory === 'function') return memoryOf(callerOrgScope(c));
+    const org = callerOrgScope(c);
+    if (!memory || !org) return fixedMemory;
+    const store = objectMemoryFor(org);
+    return store instanceof MemoryNotSplittableError ? undefined : store;
+  };
+  /**
+   * An organization's copy of the `memory` OBJECT, or the refusal that says it cannot have one. Asked of
+   * durable's single rule once per organization and kept (a config does not change under a running
+   * server, so neither does the answer — and the refusal is logged once, not on every poll).
+   */
+  const BOOT_CHECK_ORG = 'studio-boot-check';
+  const objectMemoryByOrg = new Map<string, StudioMemory | MemoryNotSplittableError>();
+  const objectMemoryFor = (org: string): StudioMemory | MemoryNotSplittableError => {
+    const known = objectMemoryByOrg.get(org);
+    if (known) return known;
+    let answer: StudioMemory | MemoryNotSplittableError;
+    try {
+      answer = splitMemoryForOrganization(memory as object, org) as StudioMemory;
+    } catch (e) {
+      if (!(e instanceof MemoryNotSplittableError)) throw e;
+      answer = e;
+    }
+    objectMemoryByOrg.set(org, answer);
+    return answer;
+  };
   /**
    * Whether thread storage is organization-scoped.
    *
@@ -1961,14 +1986,18 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
   // implicit org, and the user is never aware multi-org exists.
   const multiOrganizationEnabled = !!opts.org || !!authProvider?.capabilities?.().multiOrganization;
   if (!memoryIsOrgScoped && multiOrganizationEnabled) {
-    // Said at boot, not at the first 403: a host reading this can change one option, while a user
-    // hitting the refusal can only file a bug about a feature that looks broken.
-    console.warn(
-      '@gnldev/studio: `memory` was passed directly while multi-organization is enabled. That object ' +
-      'owns its own store and cannot be given an organization boundary, so the thread endpoints are ' +
-      'refused to organization-scoped identities rather than serving one organization another organization\'s ' +
-      `conversations. To serve them, ${MEMORY_FIX}.`,
-    );
+    // Said at boot, not at the first 500: a host reading this can change one option, while a user
+    // hitting the refusal can only file a bug about a feature that looks broken. Asked of the same rule
+    // that answers requests, with a throwaway organization (built, never opened, then forgotten); the
+    // rule logs the refusal, and the warning repeats it where a host reads boot output.
+    const boot = objectMemoryFor(BOOT_CHECK_ORG);
+    objectMemoryByOrg.delete(BOOT_CHECK_ORG);
+    if (boot instanceof MemoryNotSplittableError) {
+      console.warn(
+        '@gnldev/studio: `memory` was passed directly while multi-organization is enabled and it cannot be ' +
+        'split per organization, so the thread endpoints answer 500 `memory_not_splittable` to organization-scoped identities. ' + boot.message,
+      );
+    }
   }
   // The same sentence for the same problem, for every OTHER host object with it. `memory` got a boot
   // warning and a refusal; its four siblings got an advisory `{ orgId }` argument that no host is
@@ -3682,9 +3711,12 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
       //       davet etmeye devam ediyordu — hem de kayıt hâlâ askıdayken, yani iş HENÜZ YAPILMAMIŞKEN.
       // Sonda motorun KENDİ yardımcısı (hasRunProbe), kopyası değil: "terminal" sözlüğü ve taze
       // 'running' inceliği orada yaşıyor, ve bir kuralın iki tanımı iki farklı karar demektir.
+      const answerer = callbackCtx(c).answerer;
       const recorded = await dResolveApprovals(rw as never, id, body.approvals, {
         actor: verifiedActorOf(c),
         hasRun: hasRunProbe(rw as never, id),
+        // Who clicked, from the request's principal — the engine decides whether they may (an operator may).
+        ...(answerer ? { answerer } : {}),
       });
       const anyOk = Object.values(recorded ?? {}).some((v) => v === true);
       await audit(c, anyOk ? 'approve' : 'deny', id, { approvals: recorded, batch: true });
@@ -4612,10 +4644,10 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const parsedBody = await jsonBody(c); if (!parsedBody.ok) return parsedBody.response;
     const body = parsedBody.value as { rules?: PolicyRule[]; ifVersion?: number } | null;
     if (!Array.isArray(body?.rules)) return c.json({ error: 'a rules array is required' }, 400);
-    const ACTIONS = new Set(['allow', 'deny', 'require-approval']);
+    const ACTIONS = new Set(['allow', 'deny', 'confirm', 'approve', 'require-approval']);
     for (const r of body.rules) {
       if (!r || typeof r.tool !== 'string' || !r.tool.trim() || !ACTIONS.has(r.action)) {
-        return c.json({ error: "every rule must be { tool: string, action: 'allow'|'deny'|'require-approval', reason? }" }, 400);
+        return c.json({ error: "every rule must be { tool: string, action: 'allow'|'deny'|'confirm'|'approve'|'require-approval', reason? }" }, 400);
       }
     }
     const prev = (await rw.get!(POLICY_KEY)) as PolicyDoc | undefined;
@@ -4848,6 +4880,7 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
         error: eu?.message ?? String(e),
         code: up.code,
         ...(up.upstreamStatus !== undefined ? { upstreamStatus: up.upstreamStatus } : {}),
+        ...upstreamWire(up),
         ...(up.retryAfter !== undefined ? { retryAfter: up.retryAfter } : {}),
       }, up.status);
       if (up.retryAfter !== undefined) res.headers.set('Retry-After', String(up.retryAfter));
@@ -4877,7 +4910,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
     const p: Principal | null = authProvider && bindsIdentity(authProvider) ? principalOf(c.req.raw) : SINGLE_OPERATOR;
     const name = typeof named === 'string' && named !== '' ? named : undefined;
     const caller = engineCallerOf(p, name);
-    return { orgId: callerOrg(c), caller };
+    const answerer = answererOf(p);
+    return { orgId: callerOrg(c), caller, ...(answerer ? { answerer } : {}) };
   };
   /**
    * An org-invisible CODE-DEFINED agent → 404 (does NOT LEAK that it exists, same body as unknown-agent).
@@ -5017,6 +5051,8 @@ function studioApiApp (input: JournalReader | StudioApiOptions): Hono {
         prompt: body.prompt,
         messages: body.messages,
         threadId: body.threadId,
+        // The playground shows the model's thinking: it asks for it, the client feed is off by default.
+        stream: { reasoning: true },
         // WHOSE run: not a run option any more — the named user travels as the CALLER on the ctx
         // (`playCtx`), mapped the one way (`engineCallerOf`), and the runner seals it.
         // AKTÖR. Playground `resourceId`'yi gövdeden alıyor (operatör kimin adına koşacağını yazar)

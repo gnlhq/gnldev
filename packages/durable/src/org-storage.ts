@@ -26,6 +26,10 @@ import { toJournal, orgVectorId, workingMemoryScope, MEMORY_PARTITION, VECTOR_PA
 import { asReaderJournal, type Journal, type JournalReader } from './journal.js';
 import { withBirth } from './run-identity.js';
 import { recordThreadCreated } from './thread-owner.js';
+import { MemoryNotSplittableError } from './errors.js';
+import type { Memory } from './memory.js';
+import type { CreateGnlConfig } from './registry.js';
+import { refuseConfigNames } from './option-names.js';
 import type {
   CacheStore, CapabilityMatrix, ListQuery, LogRecord, MemoryStore, MessageRecord, MessageAppend, MetaStore,
   Page, RunJournal, Storage, ThreadRecord,
@@ -452,28 +456,116 @@ export { ORG_SCOPE, orgScopeOf };
  * registry and the chat/AG-UI routes all build their org instance here, so an org-bound turn lands
  * under the same `org:<id>:` keys whichever door it came through. A door that built its own — or none
  * — is how a chat user's history ended up in the root, invisible to REST and to their org's staff.
+ *
+ * A `memory` OBJECT is split here too (`memoryForOrganization`): rebuilt over the organization's view,
+ * or refused with `MemoryNotSplittableError` — never passed through to be shared, never dropped.
  */
 export function scopeConfigToOrg<C extends { storage?: Storage; journal?: unknown }>(
   config: C,
   orgId: string,
 ): { config: C; journal: Journal & JournalReader } {
-  // A conversation store handed over as an OBJECT owns its own store: nothing here can confine it to
-  // one organization, so every organization built from this config would share one set of threads,
-  // keyed by a caller-chosen thread id alone. Measured through the standalone doors: another
-  // organization's user read a secret in the same thread. Refused here, where every door scopes, and
-  // not only at @gnldev/server's boot. `memory: false` ("no store") needs no boundary.
-  const memory = (config as { memory?: unknown }).memory;
-  if (memory !== undefined && memory !== null && memory !== false) {
-    throw new Error(
-      `@gnldev/durable: cannot scope this config to organization '${orgId}': its \`memory\` is an object, which ` +
-        'owns its own store and cannot be given an organization boundary — every organization would share one ' +
-        "set of threads. Pass `memoryFactory` instead (it is called with the organization's storage), or `memory: false`.",
-    );
-  }
   if (config.storage) {
     const storage = withOrgStorage(config.storage, orgId);
-    return { config: { ...config, storage, journal: undefined }, journal: toJournal(storage.runs) as Journal & JournalReader };
+    const memory = memoryForOrganization(config, storage, orgId);
+    if ('refused' in memory) throw loudRefusal(memory.refused);
+    return {
+      config: { ...config, storage, journal: undefined, ...(memory.split ? { memory: memory.split } : {}) },
+      journal: toJournal(storage.runs) as Journal & JournalReader,
+    };
   }
+  const memory = memoryForOrganization(config, undefined, orgId);
+  if ('refused' in memory) throw loudRefusal(memory.refused);
   const journal = withOrg(asReaderJournal(config.journal as object) as Journal, orgId) as Journal & JournalReader;
   return { config: { ...config, storage: undefined, journal }, journal };
+}
+
+/**
+ * A refusal at REQUEST time: said in the server log, where the operator reads the fix (`memoryFactory`),
+ * because the wire answer is generic (`requestRefusal`) — an end user cannot act on it. Returns the error
+ * to throw. Construction-time refusals (`assertMemorySplitsByOrganization`) are not logged: the developer
+ * who builds the door gets the error itself.
+ */
+function loudRefusal(err: MemoryNotSplittableError): MemoryNotSplittableError {
+  console.error(`${err.name}: ${err.message}`);
+  return err;
+}
+
+/**
+ * The organization's own copy of a `memory` OBJECT, for a host that holds the object but no config
+ * (@gnldev/studio): the same rule as `scopeConfigToOrg`, asked of the memory's own `storage` — the
+ * storage it declares it was built over (`Memory.storage`). `undefined` when there is no object; throws
+ * `MemoryNotSplittableError` (logged for the operator) when it cannot be split.
+ */
+export function splitMemoryForOrganization(memory: object | undefined | null | false, orgId: string): Memory | undefined {
+  if (memory === undefined || memory === null || memory === false) return undefined;
+  const root = (memory as Memory).storage;
+  const split = memoryForOrganization({ ...(root ? { storage: root } : {}), memory }, root ? withOrgStorage(root, orgId) : undefined, orgId);
+  if ('refused' in split) throw loudRefusal(split.refused);
+  return split.split;
+}
+
+/**
+ * Refuses, at a door's construction, a config whose conversation store `scopeConfigToOrg` would refuse
+ * at the first organization's request — the same question, asked by the same function
+ * (`memoryForOrganization`), so a door that KNOWS it serves organizations (@gnldev/server's `org`
+ * option) refuses at boot with the very error every other door gives per request. Builds nothing that
+ * lasts: the organization's view and its memory are made and dropped (the contract of
+ * `Memory.forOrganization` is "build, do not open").
+ */
+export function assertMemorySplitsByOrganization(config: CreateGnlConfig): void {
+  refuseConfigNames('assertMemorySplitsByOrganization', config);
+  const refused = memoryRefusedUnderOrganizations(config);
+  if (refused) throw refused;
+}
+
+/**
+ * The refusal `scopeConfigToOrg` would throw for this config's `memory`, or `undefined` when it splits.
+ * @internal — the protections banner reads it (protections.ts), so it cannot mark "on" a memory every
+ * organization-bound request will refuse.
+ */
+export function memoryRefusedUnderOrganizations(config: { storage?: Storage; memory?: unknown }): MemoryNotSplittableError | undefined {
+  const m = memoryForOrganization(config, config.storage ? withOrgStorage(config.storage, BOOT_CHECK_ORG) : undefined, BOOT_CHECK_ORG);
+  return 'refused' in m ? m.refused : undefined;
+}
+/** The organization a construction-time check splits for. Never stored: its view is dropped unread. */
+const BOOT_CHECK_ORG = 'construction-check';
+
+/**
+ * THE rule for a `memory` OBJECT under organizations — the only place that decides whether it can be
+ * split, and how. Every door reaches it through `scopeConfigToOrg` (or `assertMemorySplitsByOrganization`
+ * at construction), so REST, chat, AG-UI, A2A, channels and schedulers cannot read it two ways.
+ *
+ * - no object (`undefined`, `null`, `false`, or a `memoryFactory` — called by `createGnl` with the
+ *   organization's storage): nothing to split, `split` is undefined and the config passes through;
+ * - an object that can rebuild itself over the organization's view (`Memory.forOrganization`, which
+ *   AgentMemory implements) and was built over the config's own `storage`: `split` is that rebuilt
+ *   memory, so the organization's threads, recall and working memory live in its partition;
+ * - anything else — a hand-written store, a memory over ANOTHER storage, a journal-only config — is
+ *   answered with a `MemoryNotSplittableError` (returned, so the banner can read it; thrown by callers): served, it would either share one set of threads across
+ *   organizations (keyed by a caller-chosen thread id) or be dropped without a word.
+ *
+ * Why a capability and not `instanceof AgentMemory`: durable cannot import @gnldev/memory, and the
+ * question "can you be rebuilt over this storage?" is the memory's own to answer — a third-party memory
+ * answers it the same way.
+ */
+function memoryForOrganization(
+  config: { storage?: Storage; memory?: unknown },
+  view: Storage | undefined,
+  orgId: string,
+): { split?: Memory } | { refused: MemoryNotSplittableError } {
+  const memory = config.memory;
+  if (memory === undefined || memory === null || memory === false) return {};
+  const refuse = (why: string) => ({
+    refused: new MemoryNotSplittableError(
+      `@gnldev/durable: cannot give organization '${orgId}' its own conversation memory: the config's \`memory\` is ` +
+        `an object that ${why}, so every organization would share one set of threads (or the memory would be ` +
+        "silently off). Pass `memoryFactory` instead — it is called with each organization's storage — or `memory: false`.",
+    ),
+  });
+  const rebuild = (memory as Memory).forOrganization;
+  if (typeof rebuild !== 'function') return refuse('cannot be rebuilt over an organization\'s storage (it has no `forOrganization`)');
+  if (!view || !config.storage) return refuse('needs a `storage` to split, and this config has only a `journal`');
+  const split = rebuild.call(memory, view, config.storage);
+  if (!split) return refuse('was built over a different storage than the config\'s `storage`');
+  return { split };
 }

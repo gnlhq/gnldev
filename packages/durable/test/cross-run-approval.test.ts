@@ -27,6 +27,7 @@ import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
 import { compensateRun } from '../src/compensation.js';
 import { gnlTool } from '../src/types.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
 const guard = async () => ({ action: 'require-approval' as const, reason: 'big amount' });
@@ -64,7 +65,7 @@ describe('a cross-run tool suspended for approval', () => {
     await runDurable({ runId: 'runA', journal, model: model('call-A'), tools: { charge }, guard, prompt: 'go' } as never);
     const b = await runDurable({ runId: 'runB', journal, model: model('call-B'), tools: { charge }, guard, prompt: 'go' } as never);
 
-    expect(b.interrupts?.[0]?.toolCallId, 'run B reported an id it never emitted').toBe('call-B');
+    expect(b.interrupts?.[0]?.toolCallId, 'run B reported an id it never emitted').toBe(mintCallId('call-B', 'runB', 0, 0));
   });
 
   it('approving the id that was REPORTED runs the tool — exactly once, across both runs', async () => {
@@ -173,7 +174,7 @@ describe('a cross-run tool suspended for approval', () => {
     const authoritative = await journal.get(authoritativeKey) as { resolvedToolCallIds?: string[] };
     const mirror = (await journal.readRun('runA')).find((e) => e.kind === 'tool')!.value as { resolvedToolCallIds?: string[] };
 
-    expect(authoritative.resolvedToolCallIds, 'run A never recorded that its own id was served').toContain('call-A');
+    expect(authoritative.resolvedToolCallIds, 'run A never recorded that its own id was served').toContain(mintCallId('call-A', 'runA', 0, 0));
     expect(mirror.resolvedToolCallIds, 'the run\'s copy disagrees with the record about who has been served')
       .toEqual(authoritative.resolvedToolCallIds);
   });
@@ -207,7 +208,9 @@ describe('a cross-run tool suspended for approval', () => {
     } as never);
 
     const report = await compensateRun('xr-1', { journal, tools: { welcome } } as never);
-    expect(report.entries, 'the run\'s unwind reached a record other runs depend on').toHaveLength(0);
+    // d25 saga-1: not unwound, but no longer silent — the shared step is REPORTED ('skipped-shared').
+    expect(report.entries, 'the run\'s unwind reached a record other runs depend on')
+      .toMatchObject([{ toolName: 'welcome', status: 'skipped-shared' }]);
     expect(compensated).toBe(0);
   });
 });

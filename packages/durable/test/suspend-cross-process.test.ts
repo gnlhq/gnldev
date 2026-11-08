@@ -22,6 +22,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { summarizeRun, runKeys } from '../src/journal.js';
+import { mintCallId } from '../src/call-identity.js';
 import { spawnFixtureEnv } from './fixtures/watchdog.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -38,6 +39,7 @@ describe('real cross-process suspend/approval persistence', () => {
     const dbPath = join(dir, 'runs.db');
     const sePath = join(dir, 'charges.txt');
     const runId = 'order-suspend-cross';
+    const chargeId = mintCallId('call-charge', runId, 0, 0);
     writeFileSync(sePath, '0'); // tool hasn't run yet
     try {
       // ── 1) Child 1: no approval → suspended, the tool does NOT run, process exits NORMALLY (NOT a crash) ──
@@ -60,12 +62,12 @@ describe('real cross-process suspend/approval persistence', () => {
 
       // toolCallId + args can be READ BACK from the suspended record (an approval UI can see these
       // after a crash/restart and reconstruct the approval screen).
-      const toolRec = await b1.runs.get<any>(runKeys.tool(runId, 'call-charge'));
+      const toolRec = await b1.runs.get<any>(runKeys.tool(runId, chargeId));
       expect(toolRec).toMatchObject({
         status: 'suspended',
         output: {
           __gnl_suspend: {
-            toolCallId: 'call-charge',
+            toolCallId: chargeId,
             toolName: 'chargeCard',
             args: { amount: 5000 },
             reason: 'large amount',
@@ -92,7 +94,7 @@ describe('real cross-process suspend/approval persistence', () => {
       const summary2 = page2.items.find((r) => r.runId === runId);
       expect(summary2).toMatchObject({ runId, status: 'completed', modelSteps: 2, toolCalls: 1 });
 
-      const toolRecAfter = await b2.runs.get<any>(runKeys.tool(runId, 'call-charge'));
+      const toolRecAfter = await b2.runs.get<any>(runKeys.tool(runId, chargeId));
       expect(toolRecAfter).toMatchObject({ status: 'succeeded', output: { charged: 5000 } });
 
       await b2.close();

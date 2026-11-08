@@ -48,6 +48,7 @@ import { claimRunOwner } from '../src/run-identity.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import * as J from '../src/journal.js';
 import type { RunStatus } from '../src/journal.js';
+import { mintCallId } from '../src/call-identity.js';
 import { streamFromGenerate } from './mock.js';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as { DatabaseSync: new (path: string) => any };
@@ -278,6 +279,9 @@ async function stored(b: Backend): Promise<Record<string, { status: RunStatus; o
  * pending (its evaluation of 0.10's `suspended = (suspended_count + $n) > 0`); this version reads it
  * suspended there too.
  */
+// The sub-agents' run ids carry the GNL id of the call that started them (step 0 and step 1 of `fan`).
+const FAN0 = `agent:fan:${mintCallId('p0', 'fan', 0, 0)}`;
+const FAN1 = `agent:fan:${mintCallId('p1', 'fan', 1, 0)}`;
 const BEFORE: Snapshot[] = [
   {step:'completed',runs:{done:'completed'},counts:{completed:1},byStatus:{completed:['done'],suspended:[],failed:[],running:[],canceled:[]},open:[]},
   {step:'started (write-ahead, then a crash)',runs:{done:'completed',crashed:'running'},counts:{completed:1,running:1},byStatus:{completed:['done'],suspended:[],failed:[],running:['crashed'],canceled:[]},open:['crashed']},
@@ -301,7 +305,7 @@ const BEFORE: Snapshot[] = [
   {step:'takeover resolves it (putIfMatch)',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed',tko:'failed'},counts:{canceled:2,completed:4,failed:4,running:1},byStatus:{completed:['done','wait','two','pim'],suspended:[],failed:['fail','fsr','bat','tko'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat','tko']},
   {step:'fork',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed',tko:'failed','done-fork':'completed'},counts:{canceled:2,completed:5,failed:4,running:1},byStatus:{completed:['done','wait','two','pim','done-fork'],suspended:[],failed:['fail','fsr','bat','tko'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat','tko']},
   {step:'rollover',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed',tko:'failed','done-fork':'completed','done-next':'completed'},counts:{canceled:2,completed:6,failed:4,running:1},byStatus:{completed:['done','wait','two','pim','done-fork','done-next'],suspended:[],failed:['fail','fsr','bat','tko'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat','tko']},
-  {step:'sub-agents',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed',tko:'failed','done-fork':'completed','done-next':'completed',fan:'completed','agent:fan:p0':'completed','agent:fan:p1':'completed'},counts:{canceled:2,completed:9,failed:4,running:1},byStatus:{completed:['done','wait','two','pim','done-fork','done-next','fan','agent:fan:p0','agent:fan:p1'],suspended:[],failed:['fail','fsr','bat','tko'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat','tko']},
+  {step:'sub-agents',runs:{done:'completed',crashed:'running',wait:'completed',fail:'failed',cs:'canceled',never:'canceled',fsr:'failed',two:'completed',pim:'completed',bat:'failed',tko:'failed','done-fork':'completed','done-next':'completed',fan:'completed',[FAN0]:'completed',[FAN1]:'completed'},counts:{canceled:2,completed:9,failed:4,running:1},byStatus:{completed:['done','wait','two','pim','done-fork','done-next','fan',FAN0,FAN1],suspended:[],failed:['fail','fsr','bat','tko'],running:['crashed'],canceled:['cs','never']},open:['crashed','fail','cs','never','fsr','bat','tko']},
 ];
 
 if (CAPTURE) {

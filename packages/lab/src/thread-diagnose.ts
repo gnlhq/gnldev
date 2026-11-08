@@ -42,7 +42,7 @@
 // The verdict follows rules written before any play (verdictOf). No tool runs and nothing is written:
 // every call is answered from the recording, an override or an answer the person gave.
 import { generateText, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
-import { argsHash, priceFor, runKeys, settleModelContent, usageAndCostFromModelValue, type JournalReader, type ModelPricing, type RunOutcomeRecord, type RunStatus, type RunSummary } from '@gnldev/durable';
+import { argsHash, restoreProviderIds, priceFor, runKeys, settleModelContent, usageAndCostFromModelValue, type JournalReader, type ModelPricing, type RunOutcomeRecord, type RunStatus, type RunSummary } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
 import {
   replayCounterfactual, maskConversation, runTrials, wilson, newcombe, normalQuantile, readerOf, recordedTrace, recordedResults, checkExpectation,
@@ -912,7 +912,7 @@ const GUESS_SYSTEM = [
 /** What the guessing model is shown: what a right answer does, the turn's last message, what the agent did, and every part. */
 /** @internal */
 export function guessPrompt(expect: Expectation, run: Loaded, calls: ReadonlyArray<{ toolName: string; args: unknown; output: unknown }>, parts: ReadonlyArray<{ id: string; kind: string; text: string }>): string {
-  const convo = run.messages.map((m) => `${m.role.toUpperCase()}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`).join('\n');
+  const convo = restoreProviderIds(run.messages).map((m) => `${m.role.toUpperCase()}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`).join('\n');
   return [
     `SYSTEM PROMPT THE AGENT WAS GIVEN:\n${typeof run.input.system === 'string' ? run.input.system : ''}`,
     `CONVERSATION IT WAS GIVEN (oldest first; the last USER message is the turn that went wrong):\n${convo || String(run.input.prompt ?? '')}`,
