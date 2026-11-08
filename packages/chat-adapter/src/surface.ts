@@ -8,6 +8,7 @@
 import { convertToModelMessages } from 'ai';
 import type { UIMessage } from 'ai';
 import { toUIMessageStreamResponse } from './ui-stream.js';
+import { chatBodyProblem } from './chat-body.js';
 import { refuseUnknownNames, optionNames } from '@gnldev/options';
 
 export interface ChatSurfaceOptions {
@@ -28,6 +29,9 @@ export function chatSurface(opts: ChatSurfaceOptions = {}) {
       context?: Record<string, unknown>;
       resourceId?: unknown;
     }) {
+      // The door answers a decode error as a 400 with this message.
+      const problem = chatBodyProblem(body);
+      if (problem) throw new Error(`invalid chat request: ${problem}`);
       const last = body.messages?.[body.messages.length - 1];
       // The same per-turn name the standalone route derives: `${conversation}:${lastMessage}`. The
       // door promotes it to a workKey when it has a subject, keeps it a raw id otherwise; with neither

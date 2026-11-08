@@ -3,7 +3,7 @@
 // limit change does not require a deploy. Usage is computed post-hoc/exactly from journaled usage (cost.ts).
 import { runRecordKey } from './run-id-grammar.js';
 import type { Journal, JournalReader, RunSummary } from './journal.js';
-import { claim, listRunsArray, asReaderJournal } from './journal.js';
+import { claim, listRunsArray, asReaderJournal, operatorJournal, type OperatorJournal } from './journal.js';
 import { OPEN_RUN_STATUSES } from './run-cursor.js';
 import { getRunCost, type RunCost } from './cost.js';
 import { effectivePricingTable, type ModelPricing } from './pricing.js';
@@ -266,7 +266,8 @@ export async function getOrgUsage(
  * orgId, isolation is inherited from journal scoping (`getOrgUsage` reads the same scoping).
  * Best-effort: silently skipped if the journal doesn't support `get`/`put`/`readRun` (the counter is optional).
  */
-export async function recordRunUsage(journal: Journal & Partial<JournalReader>, runId: string): Promise<void> {
+export async function recordRunUsage(journalArg: OperatorJournal, runId: string): Promise<void> {
+  const journal = operatorJournal(journalArg);
   if (typeof journal.get !== 'function' || typeof journal.put !== 'function') return;
   if (typeof journal.readRun !== 'function') return;
   const marker = usageCountedKey(runId);

@@ -9,7 +9,7 @@
 //  - dryRun HONESTY: on a partially-unwound run, dryRun used to report 'would-compensate' for work
 //    that had ALREADY happened → the terminal check now precedes the dryRun branch.
 // Plus the scope bounds as tests: args-mode dedup ⇒ ONE compensation (the mirror of the call-mode
-// double-charge pair), cross-run-window records are deliberately OUT of a single run's unwind, the
+// double-charge pair), cross-run-window records are deliberately OUT of a single run's unwind (reported, not undone), the
 // approvals flow composes (approved→executed→compensable; denied→absent), and the streaming `parts`
 // shape args-recovery branch is exercised.
 import { describe, it, expect, vi, afterEach } from 'vitest';
@@ -19,6 +19,7 @@ import { InMemoryJournal } from '../src/journal.js';
 import { runDurable, resumeRun } from '../src/run.js';
 import { forkRun } from '../src/time-travel.js';
 import { compensateRun, CompensatedRunError } from '../src/compensation.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
 afterEach(() => vi.restoreAllMocks());
@@ -52,7 +53,7 @@ describe('saga × live worker / fork / dryRun (the three hardenings)', () => {
       runDurable({ runId: 'mid-1', journal, model, tools: { step1, step2 }, prompt: 'x', stopWhen: stepCountIs(10) }),
     ).rejects.toBeInstanceOf(CompensatedRunError);
     expect(sends).toBe(0); // the condemned run produced no further effects
-    expect(await journal.get('mid-1:tool:call-2')).toBeUndefined(); // refusal writes nothing (sentinel path)
+    expect(await journal.get(`mid-1:tool:${mintCallId('call-2', 'mid-1', 1, 0)}`)).toBeUndefined(); // refusal writes nothing (sentinel path)
   });
 
   it('FORK refusal: a condemned run cannot be forked (the copy would drop the tombstone and replay reverted effects)', async () => {
@@ -135,7 +136,9 @@ describe('saga × idempotency modes (scope bounds as tests)', () => {
     expect(executions).toBe(1);
 
     const report = await compensateRun('xr-1', { journal, tools: { welcome } });
-    expect(report.entries).toHaveLength(0); // the xrun record lives outside the run's key space — untouched
+    // The xrun record lives outside the run's key space — NOT unwound, but accounted for (d25/1: a
+    // shared step silently missing from the report read as "nothing to refund").
+    expect(report.entries).toMatchObject([{ toolName: 'welcome', status: 'skipped-shared', shared: { window: 'cross-run', executedHere: true } }]);
     expect(report.condemned).toBe(true); // the RUN is still condemned; the SHARED action stands
   });
 
@@ -178,12 +181,12 @@ describe('saga × approvals flow', () => {
       return finalTextResult('Done.');
     });
 
-    // charge approved up-front → executes; audit denied up-front → 'denied' record, never executed.
-    await runDurable({
-      runId: 'ap-1', journal, model: model(), tools, guard,
-      approvals: { 'call-1': true, 'call-2': false },
-      prompt: 'x', stopWhen: stepCountIs(10),
-    });
+    // charge is asked and approved → executes; audit is asked and denied → 'denied' record, never executed
+    // (an approval answers a question that was asked, so each answer follows its question — d25 step 1).
+    const ap1 = { runId: 'ap-1', journal, tools, guard, prompt: 'x', stopWhen: stepCountIs(10) };
+    await runDurable({ ...ap1, model: model() });
+    await runDurable({ ...ap1, model: model(), approvals: { [mintCallId('call-1', 'ap-1', 0, 0)]: true } });
+    await runDurable({ ...ap1, model: model(), approvals: { [mintCallId('call-2', 'ap-1', 1, 0)]: false } });
 
     const report = await compensateRun('ap-1', { journal, tools });
     expect(report.entries).toHaveLength(1); // ONLY the approved+executed charge — the denied audit never happened
@@ -195,7 +198,7 @@ describe('saga × approvals flow', () => {
     await runDurable({ runId: 'ap-2', journal: j2, model: model(), tools, guard, prompt: 'x', stopWhen: stepCountIs(10) }); // suspends at call-1
     await compensateRun('ap-2', { journal: j2, tools });
     await expect(
-      resumeRun('ap-2', { journal: j2, model: model(), tools, guard, approvals: { 'call-1': true } }),
+      resumeRun('ap-2', { journal: j2, model: model(), tools, guard, approvals: { [mintCallId('call-1', 'ap-2', 0, 0)]: true } }),
     ).rejects.toBeInstanceOf(CompensatedRunError);
   });
 });

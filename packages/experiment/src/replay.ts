@@ -14,6 +14,7 @@ import {
   argsHash,
   effectivePricingTable,
   reconstructState,
+  restoreProviderIds,
   runKeys,
   settleModelContent,
   usageAndCostFromModelValue,
@@ -264,7 +265,7 @@ export async function replayCounterfactual(opts: CounterfactualOptions): Promise
   const systemInMessages = Array.isArray(input.messages) && input.messages.some((m) => (m as { role?: unknown } | null)?.role === 'system');
   const result = await generateText({
     model,
-    ...(Array.isArray(input.messages) ? { messages: input.messages as ModelMessage[] } : { prompt: String(input.prompt ?? '') }),
+    ...(Array.isArray(input.messages) ? { messages: restoreProviderIds(input.messages as ModelMessage[]) as ModelMessage[] } : { prompt: String(input.prompt ?? '') }),
     ...(systemInMessages ? { allowSystemInMessages: true } : {}),
     ...(system !== undefined ? { system } : {}),
     tools,

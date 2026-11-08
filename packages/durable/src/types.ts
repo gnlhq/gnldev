@@ -1,6 +1,7 @@
 // Public API type helpers — types expressing intent instead of `any` (consumers get these from @gnldev/durable).
 import type { LanguageModelV4 } from '@ai-sdk/provider';
 import type { SemanticIdentity } from './semantic-dup.js';
+import type { GnlToolContext } from './identity-types.js';
 import { refuseUnknownNames } from '@gnldev/options';
 import { CONFIRM_NAMES, SEMANTIC_IDENTITY_NAMES, TOOL_DURABILITY_NAMES } from './option-names.js';
 
@@ -63,7 +64,7 @@ export interface AnyTool {
    * If it throws/is undefined → safe last resort: an approval gate (SideEffectRetryBlockedError).
    * Example (Stripe): look up the charge by idempotencyKey and return the result if found.
    */
-  recover?(input: any, opts: { idempotencyKey: string; toolCallId: string }): Promise<{ done: true; output: unknown } | { done: false }>;
+  recover?(input: any, opts: { idempotencyKey: string; toolCallId: string; gnl: GnlToolContext }): Promise<{ done: true; output: unknown } | { done: false }>;
   /**
    * HOW TO UNDO this tool's side effect
    * (refund the charge, release the reservation, delete the created record). Called ONLY by an
@@ -74,8 +75,11 @@ export interface AnyTool {
    * downstream API (a refund must be exactly-once too — the framework journals each compensation
    * with the same claim/terminal discipline as the original execution). Design the hook IDEMPOTENT:
    * a crash between the downstream call and the journal write means one retried delivery.
+   * `opts.idempotencyKey` is the REFUND's key; `opts.callIdempotencyKey` is the key of the operation being
+   * undone — the one `execute` and `recover` were given, where a tool finds its own row. `opts.gnl` is the
+   * call context `execute` gets (`identityOf(opts)`): the run OWNER's, not the operator's who started the unwind.
    */
-  compensate?(input: any, output: any, opts: { idempotencyKey: string; toolCallId: string; runId: string }): Promise<unknown>;
+  compensate?(input: any, output: any, opts: { idempotencyKey: string; toolCallId: string; runId: string; callIdempotencyKey: string; gnl: GnlToolContext }): Promise<unknown>;
   /**
    * Y1 (opt-in): the timeout (ms) applied to this tool's execute. On timeout the tool is written as
    * 'failed' (side-effect ambiguity is resolved via the H9 recover / approval ladder) and an
@@ -116,7 +120,7 @@ export interface AnyTool {
    * `${runId}:tool:args-...` key SCHEMA). If different arguments (e.g. different incidental fields)
    * share the SAME logical key (e.g. the same orderId), it collapses to a single execution.
    */
-  idempotencyKey?: (input: unknown) => string;
+  idempotencyKey?: (input: any, opts?: { toolCallId: string; gnl: GnlToolContext }) => string;
   /**
    * The DEDUP WINDOW's scope.
    * 'run' (DEFAULT): today's behavior UNCHANGED — the args-idempotency journal key is prefixed
@@ -166,7 +170,16 @@ export interface AnyTool {
    * memory). `confirm` is the tool-author's declaration that this effect is consequential enough to
    * ask a human EVERY first time — not a substitute for an idempotencyKey.
    */
-  confirm?: boolean | { reason?: (args: unknown) => string };
+  confirm?: boolean | { reason?: (args: unknown) => string } | ((args: any) => boolean | string);
+  /**
+   * The tool's own PERMISSION gate — the sibling of `confirm`, for a question only an authorised person may
+   * answer yes to (staff, the application's own server; never the end user whose work it is). Declared the
+   * same ways as `confirm`: `true`, `{ reason }`, or a function of the call's arguments returning `false`
+   * (no question), `true`, or the question's text (`(a) => a.amount > 1000 && 'over the limit'`). With no
+   * rule anywhere nobody is asked. Order: the agent's guard first, then this tool's `confirm`, then `approve`
+   * — a call can carry both, one question after the other. See `approvers` (createGnl) for who is authorised.
+   */
+  approve?: boolean | { reason?: (args: unknown) => string } | ((args: any) => boolean | string);
   /**
    * FAZ-6 — the tool-level half of the semantic dup gate's DOUBLE opt-in (the run-level half is
    * `limits.sideEffectDuplicates.semantic`). Declares which arg fields carry the business IDENTITY
@@ -199,7 +212,7 @@ export interface AnyTool {
    * not block work it cannot decide about). Distinct from `recover` on purpose (İhtilaf D):
    * `recover` answers the CRASH window after a failure; `lookup` answers BEFORE the first attempt.
    */
-  lookup?(input: any, opts: { idempotencyKey: string; toolCallId: string }): Promise<{ exists: true; output: unknown } | { exists: false }>;
+  lookup?(input: any, opts: { idempotencyKey: string; toolCallId: string; gnl: GnlToolContext }): Promise<{ exists: true; output: unknown } | { exists: false }>;
   /**
    * BACKGROUND — the call does not hold the model. The model is answered at once with a stable
    * `{ status: 'started', taskId }` and the turn goes on; the body runs as its own durable run
@@ -230,7 +243,7 @@ export type ToolSet = Record<string, AnyTool>;
 export type ToolDurability = Pick<
   AnyTool,
   | 'sideEffect' | 'idempotent' | 'idempotency' | 'idempotencyKey' | 'idempotencyWindow'
-  | 'untrusted' | 'maxRetries' | 'timeoutMs' | 'claimTtlMs' | 'recover' | 'compensate' | 'confirm' | 'semanticIdentity' | 'lookup' | 'effectClass'
+  | 'untrusted' | 'maxRetries' | 'timeoutMs' | 'claimTtlMs' | 'recover' | 'compensate' | 'confirm' | 'approve' | 'semanticIdentity' | 'lookup' | 'effectClass'
   | 'background'
 >;
 
@@ -274,6 +287,7 @@ export function gnlTool<T>(t: T, durability: ToolDurability): T {
   refuseKeyWithoutWindow('gnlTool', durability, undefined, (t as { description?: unknown } | undefined)?.description);
   refuseUnknownNames('gnlTool: semanticIdentity', durability?.semanticIdentity, SEMANTIC_IDENTITY_NAMES);
   if (typeof durability?.confirm === 'object') refuseUnknownNames('gnlTool: confirm', durability.confirm, CONFIRM_NAMES);
+  if (typeof durability?.approve === 'object') refuseUnknownNames('gnlTool: approve', durability.approve, CONFIRM_NAMES);
   return Object.assign(t as any, durability) as T;
 }
 

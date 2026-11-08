@@ -221,9 +221,11 @@ describe('an organization-bound identity on an unscopeable host object', () => {
 
   // The conversation store has its own, older refusal; it must carry the same code.
   it('is refused on the conversation store with the same code', async () => {
+    // d25/26a: the conversation store is no longer a 403 org_scope_refused; it is refused by the one
+    // memory rule — a typed 500, `memory_not_splittable`. Other host objects keep the 403 (above).
     const res = await get(orgApp(), '/threads', ORG);
-    expect(res.status).toBe(403);
-    expect((await res.json()).code).toBe('org_scope_refused');
+    expect(res.status).toBe(500);
+    expect((await res.json()).code).toBe('memory_not_splittable');
   });
 });
 
@@ -298,14 +300,15 @@ describe('an agent run that names a thread', () => {
   const runBody = (threadId?: unknown) => ({ runId: `pg-${n++}`, prompt: 'hi', ...(threadId !== undefined ? { threadId } : {}) });
 
   it('is refused when the conversation store cannot be scoped', async () => {
+    // d25/26a: was 403 org_scope_refused; now the memory rule's typed 500.
     const res = await post(orgApp(), '/agents/writer/run', runBody('t1'), ORG);
-    expect(res.status).toBe(403);
-    expect((await res.json()).code).toBe('org_scope_refused');
+    expect(res.status).toBe(500);
+    expect((await res.json()).code).toBe('memory_not_splittable');
   });
 
   it('is refused on the stream endpoint too', async () => {
     const res = await post(orgApp(), '/agents/writer/stream', runBody('t1'), ORG);
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(500); // d25/26a: was 403
   });
 
   // A run that names no thread touches no conversation store. Refusing it made the whole Playground

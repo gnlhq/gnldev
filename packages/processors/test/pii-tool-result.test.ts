@@ -9,7 +9,7 @@
 // timestamp, a numeric id, a coordinate like 41.0082376) became `[REDACTED_PHONE]` inside the JSON,
 // the parse failed, and the ORIGINAL object — email and all — was returned and journaled in plaintext.
 import { describe, it, expect, vi } from 'vitest';
-import { InMemoryJournal, runDurable, createProcessorCtx, readProcessorReports } from '@gnldev/durable';
+import { InMemoryJournal, runDurable, createProcessorCtx, readProcessorReports, mintCallId } from '@gnldev/durable';
 import { toolCallingModel } from '@gnldev/durable/mock';
 import { piiRedactor } from '../src/pii.js';
 import { PII_PATTERNS, compileRedactions } from '../src/redact.js';
@@ -219,7 +219,7 @@ describe('piiRedactor redactToolResults — the tool error path', () => {
   it('a thrown error\'s message is journaled masked, and the failure is still recorded as failed', async () => {
     const { journal, dump } = await e2e(async () => { throw new Error(`no account for ${EMAIL}`); });
     expect(dump).not.toContain(EMAIL);
-    const rec = await journal.get<any>('err:tool:call-1');
+    const rec = await journal.get<any>(`err:tool:${mintCallId('call-1', 'err', 0, 0)}`);
     expect(rec).toMatchObject({ status: 'failed', error: 'Error: no account for [REDACTED_EMAIL]' });
     const reports = await readProcessorReports(journal, 'err');
     expect(reports).toEqual([expect.objectContaining({ phase: 'tool', findings: expect.objectContaining({ redactedCount: 1, types: ['email'] }) })]);
@@ -232,7 +232,7 @@ describe('piiRedactor redactToolResults — the tool error path', () => {
 
   it('skipTools journals that tool\'s error as thrown, as it does its output', async () => {
     const { journal } = await e2e(async () => { throw new Error(`no account for ${EMAIL}`); }, { redactToolResults: { skipTools: ['lookupUser'] } });
-    expect(await journal.get<any>('err:tool:call-1')).toMatchObject({ error: `Error: no account for ${EMAIL}` });
+    expect(await journal.get<any>(`err:tool:${mintCallId('call-1', 'err', 0, 0)}`)).toMatchObject({ error: `Error: no account for ${EMAIL}` });
   });
 });
 
@@ -280,7 +280,7 @@ describe('processToolError — a hook that throws fails closed', () => {
       tools: { lookupUser: { execute: async () => { throw new Error(`no account for ${EMAIL}`); } } },
       processors: [{ name: 'broken', processToolError: () => { throw new Error('redactor bug'); } }],
     } as any).catch(() => undefined);
-    const rec = await journal.get<any>('hook-throws:tool:call-1');
+    const rec = await journal.get<any>(`hook-throws:tool:${mintCallId('call-1', 'hook-throws', 0, 0)}`);
     expect(rec.status).toBe('failed');
     expect(rec.error).toMatch(/^\[tool error withheld: a processToolError hook threw/);
     expect(await journalText(journal)).not.toContain(EMAIL);

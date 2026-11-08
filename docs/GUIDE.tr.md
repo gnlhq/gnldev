@@ -701,6 +701,8 @@ await client.run('asistan', { runId: 'talep-42', prompt: '...' });
 // organizasyon/bütçe yönetimi, ağ ağacı, ölü-mektup, playground...
 ```
 
+`@hono/node-server`'ı `@hono/node-server@1` olarak kurun: CLI, server ve Studio 1.x hattında geliştirilip test edilir; sürümsüz kurulum 2.x'e çözülür ve npm onu `@gnldev/cli`'nin yanında reddeder (ERESOLVE).
+
 ### 7.9 Yayınlama (deploy) ve izleme
 
 **Ayrı bir deploy adımı gerekmiyor**, ve bu bilinçli: `createRestApi()` web standardı bir `fetch`

@@ -16,6 +16,7 @@
 // its name. A provider that returns no logprobs (Anthropic's API has none) is an error, not a zero. A
 // token that begins two tool names is left out (the value is then a lower bound by its probability).
 import { generateText, stepCountIs, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
+import { restoreProviderIds } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
 import { runTrials, coalitions, coalitionKey, shapley, type RunTrialsOptions } from '@gnldev/experiment';
 import { WORD_SHARES_NAMES, TOOL_CHOICE_NAMES, SAMPLED_TOOL_CHOICE_NAMES } from './option-names.js';
@@ -140,7 +141,7 @@ export function sampledToolChoice(opts: SampledToolChoiceOptions): ((text: strin
   const spent: SampledSpend = { calls: 0, inputTokens: 0, outputTokens: 0 };
   const value = async (text: string): Promise<NoisyValue> => {
     const tries = await Promise.all(Array.from({ length: k }, async () => {
-      const r = await generateText({ model: opts.model, tools, ...(opts.system ? { system: opts.system } : {}), stopWhen: stepCountIs(1), messages: [...(opts.before ?? []), { role: 'user', content: text }] });
+      const r = await generateText({ model: opts.model, tools, ...(opts.system ? { system: opts.system } : {}), stopWhen: stepCountIs(1), messages: [...restoreProviderIds(opts.before ?? []), { role: 'user', content: text }] });
       spent.calls++; spent.inputTokens += r.totalUsage.inputTokens ?? 0; spent.outputTokens += r.totalUsage.outputTokens ?? 0;
       return r.steps[0]?.toolCalls[0]?.toolName === opts.tool;
     }));

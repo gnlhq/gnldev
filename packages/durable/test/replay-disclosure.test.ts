@@ -191,7 +191,7 @@ describe('repeat context on the confirm question', () => {
     const r2 = await runDurable(base(journal, 'cf-2', { model: capturingModel('c2', ARGS, []), tools, limits }) as any);
     expect(r2.interrupts).toHaveLength(1); // asks on every repeat
     expect(reasonOf(r2)).toContain('ALREADY COMPLETED');
-    expect(reasonOf(r2)).toContain('c1'); // points to the first result
+    expect(reasonOf(r2)).toContain('earlier in this conversation'); // d25 P5/16: says where; no internal call id (was: points to the first result 'c1')
 
     // "I really want this" → approve → a REAL second job
     await runDurable(base(journal, 'cf-2', { model: capturingModel('c2', ARGS, []), tools, limits, approvals: { c2: true } }) as any);

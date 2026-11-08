@@ -10,6 +10,7 @@
 // Every tool here RUNS: give it fakes. (explainRun replays and never runs a tool; this cannot, because
 // the prompts are new and have no recording.)
 import { generateText, stepCountIs, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
+import { restoreProviderIds } from '@gnldev/durable';
 import { refuseUnknownNames } from '@gnldev/options';
 import { runTrials, distribution, tvd, type RunTrialsOptions } from '@gnldev/experiment';
 import { PRUNE_CHECK_NAMES } from './option-names.js';
@@ -78,7 +79,7 @@ export async function checkPrune(opts: PruneCheckOptions): Promise<PruneCheckRes
   let inputTokens = 0, outputTokens = 0;
   for (const [arm, sys] of Object.entries(arms)) for (const prompt of opts.prompts) for (let t = 0; t < trials; t++) {
     jobs.push({ arm, prompt, run: async () => {
-      const r = await generateText({ model: opts.model, tools: opts.tools, system: sys, stopWhen: stepCountIs(opts.maxSteps ?? 6), messages: [...(opts.history ?? []), { role: 'user', content: prompt }] });
+      const r = await generateText({ model: opts.model, tools: opts.tools, system: sys, stopWhen: stepCountIs(opts.maxSteps ?? 6), messages: [...restoreProviderIds(opts.history ?? []), { role: 'user', content: prompt }] });
       inputTokens += r.totalUsage.inputTokens ?? 0; outputTokens += r.totalUsage.outputTokens ?? 0;
       return r.steps.flatMap((s) => s.toolCalls.map((c) => c.toolName)).join('>') || '(none)';
     } });

@@ -37,6 +37,7 @@ import { SideEffectRetryBlockedError } from '../src/errors.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { InMemoryJournal } from '../src/journal.js';
 import { createMockModel } from './mock.js';
+import { mintCallId } from '../src/call-identity.js';
 import { spawnFixtureEnv } from './fixtures/watchdog.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -190,7 +191,7 @@ describe('INTERSECTION — I (model-claim divergence) + J (lock) + K (approval-g
     } as any);
     expect(charges).toBe(0); // the first attempt failed WITHOUT creating a charge
     expect(res1.text).toContain('Waiting for approval');
-    const toolRec1 = await journal.get<any>(`${runId}:tool:call-1`);
+    const toolRec1 = await journal.get<any>(`${runId}:tool:${mintCallId('call-1', runId, 0, 0)}`);
     expect(toolRec1?.status).toBe('failed');
     expect(toolRec1?.attempts).toBe(1);
 
@@ -214,7 +215,7 @@ describe('INTERSECTION — I (model-claim divergence) + J (lock) + K (approval-g
       } as any),
     ).rejects.toThrow(SideEffectRetryBlockedError);
     expect(charges).toBe(0);
-    const toolRecBlocked = await journal.get<any>(`${runId}:tool:call-1`);
+    const toolRecBlocked = await journal.get<any>(`${runId}:tool:${mintCallId('call-1', runId, 0, 0)}`);
     expect(toolRecBlocked?.status).toBe('failed');
     expect(toolRecBlocked?.attempts).toBe(1); // the block never wrote an attempt to the journal
     // J: even on the throw path, the lock was released cleanly via finally (no permanent deadlock).
@@ -228,7 +229,7 @@ describe('INTERSECTION — I (model-claim divergence) + J (lock) + K (approval-g
       journal,
       model: makeModel(),
       tools: { paymentTool },
-      approvals: { 'call-1': true },
+      approvals: { [mintCallId('call-1', runId, 0, 0)]: true },
       prompt: 'pay',
       stopWhen: stepCountIs(4),
       replay: 'strict',
@@ -240,7 +241,7 @@ describe('INTERSECTION — I (model-claim divergence) + J (lock) + K (approval-g
     // matter HOW MANY more times the run is invoked, it is now 'succeeded' → it never runs again).
     expect(charges).toBe(1);
     expect(attempt).toBe(2); // total real execute calls: 1 failed + 1 succeeded
-    const toolRecFinal = await journal.get<any>(`${runId}:tool:call-1`);
+    const toolRecFinal = await journal.get<any>(`${runId}:tool:${mintCallId('call-1', runId, 0, 0)}`);
     expect(toolRecFinal?.status).toBe('succeeded');
 
     // KNOWN LIMIT (NOT a regression — see the file-header note): since model step-1 (the text AFTER

@@ -24,6 +24,7 @@ import { runDurable } from '../src/run.js';
 import { reconstructState, forkRun } from '../src/time-travel.js';
 import { compensateRun } from '../src/compensation.js';
 import { rolloverRun } from '../src/rollover.js';
+import { mintCallId } from '../src/call-identity.js';
 import { serialize } from '../src/serialize.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -61,12 +62,15 @@ const model = () => createMockModel(async ({ prompt }: any) => {
 });
 const tools = () => ({ lookup: { execute: async ({ n }: any) => ({ n }) } });
 
-/** The order the run wrote: model:0, tool:call-0, model:1, …, model:11. */
+/** The id GNL gave the mock's `call-<i>` — the call of model step i of the run. */
+const gnlCall = (runId: string, i: number) => mintCallId(`call-${i}`, runId, i, 0);
+
+/** The order the run wrote: model:0, tool:call-0, model:1, …, model:11 (each tool key carries the call's GNL id). */
 const written = (runId: string, steps = STEPS) => {
   const out: string[] = [];
   for (let i = 0; i < steps; i++) {
     out.push(`${runId}:model:${i}`);
-    if (i < STEPS - 1 && i < steps) out.push(`${runId}:tool:call-${i}`);
+    if (i < STEPS - 1 && i < steps) out.push(`${runId}:tool:${gnlCall(runId, i)}`);
   }
   return out;
 };
@@ -85,12 +89,12 @@ describe.each(STORES)('H7 readRun is first-write order — %s', (_name, make) =>
 
     // reconstructState: assistant, tool, assistant, … — and at step 3 only call-1 is still open.
     expect(roles(reconstructState(entries).messages)).toBe('at'.repeat(STEPS - 1) + 'a');
-    expect(reconstructState(entries, 3).pending).toEqual([{ toolCallId: 'call-1', toolName: 'lookup' }]);
+    expect(reconstructState(entries, 3).pending).toEqual([{ toolCallId: gnlCall('r', 1), toolName: 'lookup' }]);
 
     // forkRun(step 3) copies steps 0–2 and their tools, interleaved as the source wrote them.
     const fork = await forkRun(j, 'r', 3, 'f');
     expect(fork).toMatchObject({ copiedModel: 3, copiedTool: 3 });
-    expect(await keys(j, 'f')).toEqual(['f:model:0', 'f:tool:call-0', 'f:model:1', 'f:tool:call-1', 'f:model:2', 'f:tool:call-2']);
+    expect(await keys(j, 'f')).toEqual(['f:model:0', `f:tool:${gnlCall('r', 0)}`, 'f:model:1', `f:tool:${gnlCall('r', 1)}`, 'f:model:2', `f:tool:${gnlCall('r', 2)}`]);
     expect(roles(reconstructState(await j.readRun('f')).messages)).toBe('atatat');
   });
 

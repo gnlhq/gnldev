@@ -189,20 +189,14 @@ describe('an answered question does not leave homework', () => {
 });
 
 describe('a config written once stays editable', () => {
-  it('the satisfies clause admits fields a later `gnl add` will paste in', () => {
-    // `gnl add auth` prints an `auth,` line for the reader to paste. If the satisfies clause froze
-    // at whatever init happened to pick, that paste is TS2353 in the editor while `tsx` runs it
-    // fine — an error that only shows up where nobody is looking. Every recipe's configTypeExt is
-    // named up front; they are optional fields, so admitting one the config does not use costs
-    // nothing.
+  it('the satisfies clause is the declared dev-config type, so it admits any field a later `gnl add` pastes in', () => {
+    // A frozen hand-copied clause made that paste TS2353 in the editor while `tsx` ran it fine. The clause now IS
+    // GnlDevConfig; d25-config-accepts-its-own-fields.test.ts proves with tsc that the fields compile.
     const dir = mkdtempSync(join(tmpdir(), 'gnl-satisfies-'));
     try {
       scaffold(dir, { name: 'plain', answers: { preset: 'assistant', identity: 'internal', store: 'sqlite', serving: 'dev' } });
       const config = readFileSync(join(dir, 'gnl.config.ts'), 'utf8');
-      for (const r of Object.values(RECIPES)) {
-        if (!r.configTypeExt) continue;
-        expect(config, `a project that did not pick ${r.id} still has to accept its config field later`).toContain(r.configTypeExt);
-      }
+      expect(config).toContain("} satisfies import('@gnldev/cli').GnlDevConfig;");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

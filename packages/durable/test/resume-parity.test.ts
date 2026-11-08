@@ -8,6 +8,7 @@ import { tool, stepCountIs } from 'ai';
 import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable, resumeRun } from '../src/run.js';
+import { mintCallId } from '../src/call-identity.js';
 import { RunLimitExceededError } from '../src/limits.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
@@ -42,7 +43,7 @@ describe('resume parity (audit B)', () => {
       approvals: { [tcid]: true }, processors: [redactor],
     } as any);
 
-    const rec = await journal.get<any>('b1:tool:call-1');
+    const rec = await journal.get<any>(`b1:tool:${mintCallId('call-1', 'b1', 0, 0)}`);
     expect(sends).toHaveLength(1); // approved → executed exactly once
     expect(rec?.output?.redacted).toBe(true); // BUG: processors dropped on resume → output unscanned
   });
@@ -87,7 +88,7 @@ describe('resume parity (audit B)', () => {
     ).rejects.toBeInstanceOf(RunLimitExceededError);
 
     // stepTwo was blocked prospectively — nothing written for it.
-    expect(await journal.get('b2:tool:call-2')).toBeUndefined();
+    expect(await journal.get(`b2:tool:${mintCallId('call-2', 'b2', 1, 0)}`)).toBeUndefined();
   });
 
   it('B2: an explicitly-passed limits on resume OVERRIDES the persisted one', async () => {
@@ -123,6 +124,6 @@ describe('resume parity (audit B)', () => {
       approvals: { [tcid]: true }, limits: { maxToolCalls: 5 },
     } as any);
     expect(res.text).toContain('Done.');
-    expect(await journal.get('b2-override:tool:call-2')).toBeDefined();
+    expect(await journal.get(`b2-override:tool:${mintCallId('call-2', 'b2-override', 1, 0)}`)).toBeDefined();
   });
 });

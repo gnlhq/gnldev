@@ -56,8 +56,17 @@ type Pool = {
 /** The EventEmitter surface of a pooled client — the object `pg` hands to the 'connect' event. */
 type PoolClientEvents = {
   on?: (event: 'error', listener: (err: Error) => void) => unknown;
+  once?: (event: 'end', listener: () => void) => unknown;
   listenerCount?: (event: string) => number;
+  /** `pg`'s socket, destroyed by `close()` when a goodbye is not answered (`POOL_GOODBYE_MS`). */
+  connection?: { stream?: { destroy?: () => void } };
 };
+/**
+ * How long `close()` waits for a pooled connection's goodbye to be answered before it destroys the
+ * socket. A server answers it at once; one that is gone (a partition) never does, and `close()` must
+ * not hang on it.
+ */
+const POOL_GOODBYE_MS = 5_000;
 const SCHEMA_VERSION = '1';
 
 export interface PostgresStorageOptions {
@@ -436,6 +445,14 @@ export class PostgresStorage implements Storage {
   readonly capabilities: CapabilityMatrix = { runs: 'full', memory: 'full', vectors: 'scan', work: 'full', cache: 'ttl' };
   private _pool: Pool;
   /**
+   * The pool's connections that have not ended yet (the 'connect' listener in the constructor). `close()`
+   * waits for them: `pg-pool`'s `end()` resolves once it has ASKED its clients to end, not once they have —
+   * measured under load, 101 of 300 `await pool.end()` still found the pool's backends on the server, 0 of
+   * 300 after a Client's own `end()` (framework-s0/ci-0171-flake). So "closed" did not mean "holds no
+   * connection", and a `DROP DATABASE` right after it was refused.
+   */
+  private readonly openClients = new Set<PoolClientEvents>();
+  /**
    * The underlying connection pool. Exposed so COMPANION stores that live in the SAME Postgres
    * database can share this exact pool — notably `@gnldev/auth-ee`'s `createPostgresUserStore(storage.pool)`,
    * which puts admin/developer accounts in their own `gnl_ee_*` tables next to the run journal.
@@ -512,6 +529,8 @@ export class PostgresStorage implements Storage {
     // is where a caller can actually do something about it.
     if (this._pool.on) {
       this._pool.on('connect', (client: PoolClientEvents) => {
+        // Kept until its socket ends, for `close()` (`openClients`).
+        if (client.once) { this.openClients.add(client); client.once('end', () => this.openClients.delete(client)); }
         // NO `listenerCount === 0` GUARD HERE, unlike the pool above, and the difference is the
         // whole fix. `pg` attaches its own 'error' listener to every client before handing it to
         // this event — so the guard that is correct for the pool (respect a caller's handler) read
@@ -571,7 +590,20 @@ export class PostgresStorage implements Storage {
       let inTx = false;
       let destroy = false;
       try {
-        try { await client.query(opts?.readCommitted ? 'BEGIN ISOLATION LEVEL READ COMMITTED' : 'BEGIN'); inTx = true; } catch (e) { if (opts?.atomic) throw new Error(NO_TX_MSG, { cause: e }); /* else: transaction not supported → proceed unwrapped */ }
+        // A `BEGIN` that fails on a pool that HAS connect() is not a pool without transactions: it is the
+        // connection (a backend the server ended, a restart, a failover). Said as NO_TX_MSG, a dropped
+        // connection read as a misconfigured pool — the message a tool's caller was shown (liveness-audit
+        // D3). The driver's error is kept as `cause`, with its code (57P01, ECONNRESET) on the error, and the
+        // client is not handed back to the pool.
+        try { await client.query(opts?.readCommitted ? 'BEGIN ISOLATION LEVEL READ COMMITTED' : 'BEGIN'); inTx = true; } catch (e) {
+          if (opts?.atomic) {
+            destroy = true;
+            const err = new Error(`@gnldev/durable: PostgresStorage could not begin a transaction: ${String((e as Error)?.message ?? e)}`, { cause: e });
+            (err as { code?: unknown }).code = (e as { code?: unknown })?.code;
+            throw err;
+          }
+          /* else: transaction not supported → proceed unwrapped */
+        }
         const out = await fn((s, p) => client.query(s, p));
         if (inTx) await client.query('COMMIT');
         return out;
@@ -811,6 +843,27 @@ export class PostgresStorage implements Storage {
     unbindLiveness(this.runs);
     await this.livenessSlot.close();
     if (this._pool.end) await this._pool.end();
+    // And only then is it closed: every connection of the pool has ENDED, not merely been asked to
+    // (`openClients`). A goodbye not answered within POOL_GOODBYE_MS (a server gone silent) is not waited
+    // for: its socket is destroyed, as the liveness session's is.
+    await this.connectionsEnded();
+  }
+
+  /** Every connection in `openClients` ended; the ones whose goodbye goes unanswered are destroyed. */
+  private async connectionsEnded(): Promise<void> {
+    const left = [...this.openClients];
+    if (!left.length) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ended = Promise.all(left.map((c) => new Promise<void>((ok) => {
+      if (!this.openClients.has(c)) return ok();
+      c.once!('end', () => ok());
+    })));
+    const answered = await Promise.race([
+      ended.then(() => true),
+      new Promise<boolean>((ok) => { timer = setTimeout(() => ok(false), POOL_GOODBYE_MS); (timer as { unref?: () => void }).unref?.(); }),
+    ]);
+    clearTimeout(timer);
+    if (!answered) for (const c of left) if (this.openClients.has(c)) { c.connection?.stream?.destroy?.(); this.openClients.delete(c); }
   }
 
   /**

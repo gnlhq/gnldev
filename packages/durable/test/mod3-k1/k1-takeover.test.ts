@@ -19,7 +19,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { kinds, freshDatabase, openStore, type Conn, type Kind } from './stores.js';
 import { distMods } from './dist-mods.js';
-import { createGnl } from '@gnldev/durable';
+import { createGnl, mintCallId } from '@gnldev/durable';
 import { streamingModel } from '../detached/models.js';
 import { tool } from 'ai';
 import { z } from 'zod';
@@ -101,7 +101,7 @@ async function expectRightEnding(conn: Conn, dir: string, runId: string, aOwner:
   const storage = openStore(distMods, conn);
   try {
     const prefix = rows[0]![0].slice(0, -`${runId}:outcome`.length);
-    const claim: any = await storage.runs.get(`${prefix}${runId}:tool:call-1`);
+    const claim: any = await storage.runs.get(`${prefix}${runId}:tool:${mintCallId('call-1', runId, 0, 0)}`);
     const completed = rows.some(([, v]) => v.includes('"completed"'));
     // The outcome row is written a moment before the run's last status event.
     let ending = await lastStatus(storage, `${prefix}${runId}`);
@@ -228,7 +228,7 @@ async function oneProcessTakeover(killWhen: (storage: any, runId: string, aOwner
   // The call's claim as A left it: `running` and naming A means A died inside the tool.
   A.kill('SIGKILL');
   await sleep(50);
-  const claim: any = await storage.runs.get(`${runId}:tool:call-1`);
+  const claim: any = await storage.runs.get(`${runId}:tool:${mintCallId('call-1', runId, 0, 0)}`);
   const diedInTool = claim?.status === 'running' && claim?.proc === aOwner;
   let heldByOther = false;
   let exec: any;
@@ -271,7 +271,7 @@ describe.skipIf(!kinds().includes('sqlite'))('k1 takeover by this very process â
 
   it('T1c A6: A killed INSIDE its tool â€” B takes the run over and parks it for a human, never runs the tool again', async () => {
     const r = await oneProcessTakeover(async (storage, runId, aOwner) => {
-      const c: any = await storage.runs.get(`${runId}:tool:call-1`);
+      const c: any = await storage.runs.get(`${runId}:tool:${mintCallId('call-1', runId, 0, 0)}`);
       return c?.status === 'running' && c?.proc === aOwner;
     });
     expect(r.diedInTool).toBe(true);

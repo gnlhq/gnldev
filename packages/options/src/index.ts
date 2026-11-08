@@ -94,3 +94,21 @@ function editDistance(a: string, b: string): number {
 function singular(w: string): string {
   return w.endsWith('ies') ? `${w.slice(0, -3)}y` : w.endsWith('s') ? w.slice(0, -1) : w;
 }
+
+/**
+ * The fetch function inside what a host passed where a fetch handler goes (`toNodeHandler(api)`): the object
+ * `createRestApi` / `createStudioApi` returns carries one as `.fetch`, and a plain `(request) => Response`
+ * function IS one. Anything else is refused here, at construction, naming `where` and what was expected —
+ * handed on, it answered every request with an empty 500 and logged nothing. The type of what was given is
+ * named, never its value (a string could be a URL with a password in it).
+ */
+export function fetchFunctionOf(value: unknown, where: string, expects: string): (request: Request, ...rest: unknown[]) => Promise<Response> {
+  const fetchMember = (value as { fetch?: unknown } | null | undefined)?.fetch;
+  if (typeof fetchMember === 'function') return fetchMember.bind(value) as never;
+  if (typeof value === 'function') return value as never;
+  const got = value === null ? 'null' : Array.isArray(value) ? 'an array' : typeof value === 'object' ? 'an object without a `.fetch` method' : `a ${typeof value}`;
+  throw new TypeError(
+    `${where} expects ${expects}, or any fetch handler — a function \`(request: Request) => Promise<Response>\` or an object with a \`.fetch\` method; got ${got}. ` +
+      'Handed on, it would answer every request with an empty 500.',
+  );
+}

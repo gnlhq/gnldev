@@ -4,6 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { InMemoryStorage, createGnl, gnlTool, STAFF } from '../src/index.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, toolCallResult, finalTextResult } from './mock.js';
 
 const dose = gnlTool({ description: 'dose', inputSchema: z.object({}).passthrough(), execute: async () => ({ ok: true }) }, { sideEffect: true, confirm: true } as any);
@@ -18,7 +19,7 @@ describe('a sub-agent question names the sub-agent, not its run', () => {
     const [q] = r.interrupts;
     expect(q.reason).toMatch(/^The 'medic' sub-agent asks: 'giveDose' requires explicit confirmation/);
     expect(q.reason).not.toContain('agent:q1');
-    expect(q.delegatedTo).toEqual({ runId: 'agent:q1:call_0', agent: 'medic' });
+    expect(q.delegatedTo).toEqual({ runId: `agent:q1:${mintCallId('call_0', 'q1', 0, 0)}`, agent: 'medic' });
   });
 
   it('two levels: the chain reads by name, the next hop is `via`', async () => {
