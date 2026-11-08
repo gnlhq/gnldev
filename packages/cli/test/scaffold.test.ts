@@ -165,10 +165,10 @@ describe('scaffold — feature composition', () => {
     expect(config).toContain('agents: { assistant: { ...assistant, tools: { searchDocs } }');
     expect(config).toContain("'charge-demo': { ...chargeDemo, tools: { chargeOrder } }");
     expect(config).toContain('memoryFactory,');
-    expect(config).toContain("satisfies CreateGnlConfig & { port?: number; studio?: boolean; subjects?: 'internal' | 'end-users' }");
+    expect(config).toContain("satisfies import('@gnldev/cli').GnlDevConfig;");
   });
 
-  it('workflow + auth: configField wiring + auth widens the satisfies type', () => {
+  it('workflow + auth: configField wiring; auth is accepted by the satisfies type (GnlDevConfig)', () => {
     const dir = join(tmp(), 'cfg2');
     scaffold(dir, { features: ['workflow', 'auth'] });
     const config = readFileSync(join(dir, 'gnl.config.ts'), 'utf8');
@@ -176,7 +176,7 @@ describe('scaffold — feature composition', () => {
     expect(config).toContain("agents: { assistant, 'charge-demo':");
     expect(config).toContain('workflows: { checkout },');
     expect(config).toContain('auth,');
-    expect(config).toContain("& { auth?: import('@gnldev/cli').GnlDevConfig['auth'] }");
+    expect(config).toContain("satisfies import('@gnldev/cli').GnlDevConfig;");
     const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
     expect(pkg.dependencies['@gnldev/workflow']).toBeTruthy();
   });

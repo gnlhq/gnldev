@@ -9,6 +9,7 @@ import { readRunTaint, markRunTainted } from './taint.js';
 import type { Journal } from './journal.js';
 import type { Guard, Interrupt } from './guard.js';
 import { addressedInterrupt as addressed, approvalsForChild } from './guard.js';
+import type { Answerer } from './approval-authority.js';
 import type { ModelInput, ToolSet } from './types.js';
 import type { RunLimits } from './limits.js';
 import { registerSubRun } from './limits.js';
@@ -86,6 +87,8 @@ export interface ChildFrame {
   abortSignal?: AbortSignal;
   /** require-approval decisions that came down with the delegation (a resume of a suspended child). */
   approvals?: Record<string, boolean>;
+  /** WHO answered those approvals — the delegating run's answerer, so the child's own gates read the same answer. */
+  answerer?: Answerer;
 }
 
 /** Runs one child: the engine's own agent run for a registered agent, runDurable for a host-built one. */
@@ -186,7 +189,7 @@ export function delegationTool(
       const nestedRunId = nestedAgentRunId(parentRunId, options?.toolCallId);
       const identity = childIdentity(identityOf(options), nestedRunId);
       const res = await runDelegated(journal, parentRunId, nestedRunId, requestOf(identity), () =>
-        runChild(task, nestedRunId, { identity, ...(parentRunId ? { parentRunId } : {}), ...(options?.abortSignal ? { abortSignal: options.abortSignal } : {}), approvals }));
+        runChild(task, nestedRunId, { identity, ...(parentRunId ? { parentRunId } : {}), ...(options?.abortSignal ? { abortSignal: options.abortSignal } : {}), approvals, ...(options?.gnlAnswerer ? { answerer: options.gnlAnswerer } : {}) }));
       const interrupts = (res.interrupts ?? []).map((i) => addressed(options?.toolCallId, i));
       if (interrupts.length) {
         const first = interrupts[0]!;
@@ -206,7 +209,7 @@ export function delegationTool(
             // surfaced question from this list, and a human must see what they approve. The same list
             // is the suspend arm's only source of truth (durable-tool `nestedAnswered`) and bounds what
             // may come down from the parent's approval map.
-            nested: { runId: nestedRunId, ...(base.agent ? { agent: base.agent } : {}), interrupts: interrupts.map((i) => ({ toolCallId: i.toolCallId, toolName: i.toolName, args: i.args, reason: i.reason, ...(i.semPair ? { semPair: i.semPair } : {}), ...(i.delegatedTo ? { delegatedTo: i.delegatedTo } : {}) })) },
+            nested: { runId: nestedRunId, ...(base.agent ? { agent: base.agent } : {}), interrupts: interrupts.map((i) => ({ toolCallId: i.toolCallId, toolName: i.toolName, args: i.args, reason: i.reason, ...(i.needs ? { needs: i.needs } : {}), ...(i.semPair ? { semPair: i.semPair } : {}), ...(i.delegatedTo ? { delegatedTo: i.delegatedTo } : {}) })) },
           },
         } as any;
       }
@@ -243,6 +246,7 @@ export function createAgentTool(
       stopWhen: stepCountIs(config.maxSteps ?? 8),
       limits: config.limits,
       approvals: frame.approvals,
+      ...(frame.answerer ? { answerer: frame.answerer } : {}),
       caller: frame.identity,
       ...(frame.identity.threadId ? { threadId: frame.identity.threadId } : {}),
       ...(frame.abortSignal ? { abortSignal: frame.abortSignal } : {}),

@@ -10,7 +10,11 @@ import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
 import { ToolLoopDetectedError } from '../src/limits.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
+
+/** The journal key of the model's `call-<n>` (the n-th model call of the run: step n-1, first id of its step). */
+const keyOf = (runId: string, n: number) => `${runId}:tool:${mintCallId(`call-${n}`, runId, n - 1, 0)}`;
 
 /** Did the conversation already carry a reflection nudge back to the model? */
 const sawNudge = (prompt: any[]) => JSON.stringify(prompt ?? []).includes('__gnl_reflected');
@@ -47,7 +51,7 @@ describe('loop reflection (onRepeat: "reflect")', () => {
 
     expect(res.text).toBe('Recovered.'); // the run did NOT stop — the nudge steered the model out
     expect(counter.runs).toBe(2); // the 3rd call was never executed
-    const rec = await journal.get<any>('refl-1:tool:call-3');
+    const rec = await journal.get<any>(keyOf('refl-1', 3));
     expect(rec).toMatchObject({ status: 'reflected' });
     expect(rec.output.__gnl_reflected).toBe(true);
     // Security-sensitive wording (see durable-tool.ts): the nudge must NOT teach argument fabrication.
@@ -77,8 +81,8 @@ describe('loop reflection (onRepeat: "reflect")', () => {
       expect((e as ToolLoopDetectedError).detail).toMatchObject({ toolName: 'stuck', repeats: 2, maxRepeats: 2, reflected: true });
     }
     expect(counter.runs).toBe(2); // 2 real executions; nudge (3rd) and block (4th) never executed
-    expect(await journal.get('refl-2:tool:call-3')).toMatchObject({ status: 'reflected' });
-    expect(await journal.get('refl-2:tool:call-4')).toBeUndefined(); // the block sentinel writes NOTHING
+    expect(await journal.get(keyOf('refl-2', 3))).toMatchObject({ status: 'reflected' });
+    expect(await journal.get(keyOf('refl-2', 4))).toBeUndefined(); // the block sentinel writes NOTHING
   });
 
   it('nudge respected via DIFFERENT arguments (a genuinely new action) → executes normally, chain resets', async () => {
@@ -102,7 +106,7 @@ describe('loop reflection (onRepeat: "reflect")', () => {
 
     expect(res.text).toBe('Done.');
     expect(counter.runs).toBe(3); // A×2 executed, A's 3rd reflected, B executed
-    expect(await journal.get('refl-3:tool:call-4')).toMatchObject({ status: 'succeeded' });
+    expect(await journal.get(keyOf('refl-3', 4))).toMatchObject({ status: 'succeeded' });
   });
 
   it('replay determinism: re-running the SAME runId replays the nudge from the journal — nothing re-executes', async () => {
@@ -130,6 +134,6 @@ describe('loop reflection (onRepeat: "reflect")', () => {
     });
     expect(again.text).toBe('Recovered.');
     expect(counter.runs).toBe(2); // exactly-once held across the replay
-    expect(await journal.get('refl-4:tool:call-3')).toMatchObject({ status: 'reflected' });
+    expect(await journal.get(keyOf('refl-4', 3))).toMatchObject({ status: 'reflected' });
   });
 });

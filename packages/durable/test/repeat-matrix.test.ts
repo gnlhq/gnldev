@@ -78,7 +78,7 @@ describe('the repeat matrix — the question always comes; WHAT IT CARRIES varie
     // 1) DIFFERENT WORDS, byte-identical arguments → the exact ⚠ (the prompt carries no weight at all)
     const r1 = await run(journal, 'm-1', 'i think i want one more of that lamp', 'c1', { sku: 'LAMBA-1', qty: 1, amount: 40 }, tools);
     expect(reasonOf(r1)).toContain('Identical work was ALREADY COMPLETED');
-    expect(reasonOf(r1)).toContain('c0'); // ilk sonucun adresi
+    expect(reasonOf(r1)).toContain('earlier in this conversation'); // d25 P5/16: where, not the internal call id 'c0'
     expect(state.n).toBe(1);
 
     // 2) A different KEY ORDER → the same fingerprint (stableStringify) → still the exact ⚠
@@ -90,8 +90,8 @@ describe('the repeat matrix — the question always comes; WHAT IT CARRIES varie
     //    the SEMANTIC identity catches it
     const r3 = await run(journal, 'm-3', 'one of lamba-1', 'c3', { sku: 'lamba-1', qty: 1, amount: 40 }, tools);
     expect(reasonOf(r3)).not.toContain('Identical work'); // not the exact layer
-    expect(reasonOf(r3)).toContain('SAME business identity');
-    expect(reasonOf(r3)).toContain('c0'); // the first job's address comes through the semantic path too
+    expect(reasonOf(r3)).toMatch(/same business identity/i);
+    expect(reasonOf(r3)).toContain('earlier in this conversation'); // d25 P5/16: the semantic path says where too (no call id)
     expect(state.n).toBe(1);
 
     // 3b) "I mean it" → approval → a REAL second job (a spelling difference does not block an approval)

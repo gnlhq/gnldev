@@ -11,6 +11,7 @@ import { tool, stepCountIs } from 'ai';
 import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable, resumeRun } from '../src/run.js';
+import { mintCallId } from '../src/call-identity.js';
 import { durableTool } from '../src/durable-tool.js';
 import { markRunTainted } from '../src/taint.js';
 import { taintGuardian } from '../src/guard.js';
@@ -77,13 +78,13 @@ describe('taintGuardian (taint × sensitive-tool gate) — e2e', () => {
     expect(counters.fetches).toBe(1); // the source itself is not sensitive → ran
     expect(counters.sends).toBe(0); // the sensitive tool did NOT execute
     expect(res.interrupts).toHaveLength(1);
-    expect(res.interrupts[0]).toMatchObject({ toolCallId: 'call-2', toolName: 'sendMoney' });
+    expect(res.interrupts[0]).toMatchObject({ toolCallId: mintCallId('call-2', 'tg-1', 1, 0), toolName: 'sendMoney' });
     expect(String(res.interrupts[0].reason)).toContain('tainted run');
 
     // The human approves → the suspended action executes EXACTLY once (standard suspend/resume flow).
     const resumed = await resumeRun('tg-1', {
       journal, model: fetchThenSendModel(), tools: makeTools(counters, { untrusted: true }),
-      guard: guardian(), approvals: { 'call-2': true },
+      guard: guardian(), approvals: { [mintCallId('call-2', 'tg-1', 1, 0)]: true },
     });
     expect(resumed.text).toBe('Done.');
     expect(counters.sends).toBe(1);

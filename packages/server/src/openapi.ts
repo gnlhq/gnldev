@@ -1,7 +1,13 @@
 // Generate an OpenAPI 3.1 schema from the createGnl agent + workflow registry (auto-docs).
 import { LIMIT_ERROR_CODES } from '@gnldev/durable';
 
-export function buildOpenApi(agentNames: string[], workflowNames: string[] = [], title = 'gnl agents'): any {
+/**
+ * `surfacePaths` are the path templates of the wire formats mounted through `createRestApi`'s `surfaces`
+ * (`/agents/:name/chat`, …): every path the API serves is listed, so a reader or a generated client finds the
+ * route `useChat` calls. Each is listed per agent as a POST with a generic body — a surface owns its own wire
+ * format, and its body is not described here.
+ */
+export function buildOpenApi(agentNames: string[], workflowNames: string[] = [], title = 'gnl agents', surfacePaths: string[] = []): any {
   // ONE identity per call, and the spec says which two spellings it accepts. `required: ['runId']`
   // is gone rather than widened to a `oneOf`: a workKey-only request is valid, a runId-only request
   // is valid, and both together are refused — which `oneOf` can express but no generator renders
@@ -105,6 +111,16 @@ export function buildOpenApi(agentNames: string[], workflowNames: string[] = [],
         },
       },
     };
+    for (const template of surfacePaths) {
+      paths[template.replace(':name', n)] = {
+        post: {
+          summary: `Run the '${n}' agent through the '${template}' wire format`,
+          description: "Served by a `surfaces` entry; its request and response follow that wire format, not the REST `run` body.",
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'object' } } } },
+          responses: { '200': { description: "The surface's own response (usually a stream)" } },
+        },
+      };
+    }
     paths[`/agents/${n}/resume`] = {
       post: {
         summary: `Resume the '${n}' agent with runId + approvals`,

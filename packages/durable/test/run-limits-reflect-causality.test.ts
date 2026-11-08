@@ -22,6 +22,7 @@ import { describe, it, expect } from 'vitest';
 import { tool, stepCountIs } from 'ai';
 import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';
+import { mintCallId } from '../src/call-identity.js';
 import { runDurable, streamDurable } from '../src/run.js';
 import { reconstructState } from '../src/time-travel.js';
 import { ToolLoopDetectedError } from '../src/limits.js';
@@ -174,8 +175,8 @@ describe('loop reflection — causality & soundness', () => {
     // A,A executed; B executed (chain reset — NOT nudged despite 2 prior calls of the same tool);
     // then A,A executed again (fresh window); the 3rd A of the new window (call-6) was nudged.
     expect(counter.runs).toBe(5);
-    expect(await journal.get('inter-1:tool:call-3')).toMatchObject({ status: 'succeeded' }); // B ran
-    expect(await journal.get('inter-1:tool:call-6')).toMatchObject({ status: 'reflected' });
+    expect(await journal.get(`inter-1:tool:${mintCallId('call-3', 'inter-1', 2, 0)}`)).toMatchObject({ status: 'succeeded' }); // B ran
+    expect(await journal.get(`inter-1:tool:${mintCallId('call-6', 'inter-1', 5, 0)}`)).toMatchObject({ status: 'reflected' });
   });
 
   it('E per-tool isolation: a DIFFERENT tool with the SAME arguments is not a repeat', async () => {
@@ -197,7 +198,7 @@ describe('loop reflection — causality & soundness', () => {
     expect(res.text).toBe('Done.');
     expect(c1.runs).toBe(2);
     expect(c2.runs).toBe(1); // t2 executed — no false-positive nudge across tools
-    expect(await journal.get('iso-1:tool:call-3')).toMatchObject({ status: 'succeeded' });
+    expect(await journal.get(`iso-1:tool:${mintCallId('call-3', 'iso-1', 2, 0)}`)).toMatchObject({ status: 'succeeded' });
   });
 
   it('F escalation survives internal-state loss: the reflected flag is reconstructed from the JOURNALED record', async () => {
@@ -248,7 +249,7 @@ describe('loop reflection — causality & soundness', () => {
     });
     expect(res.text).toBe('Done.');
     expect(counter.runs).toBe(3); // A×2 + NEW — the nudge consumed nothing
-    expect(await journal.get('purity-1:tool:call-4')).toMatchObject({ status: 'succeeded' });
+    expect(await journal.get(`purity-1:tool:${mintCallId('call-4', 'purity-1', 3, 0)}`)).toMatchObject({ status: 'succeeded' });
   });
 
   it('H layering: with `idempotency: "args"` the dedup fast-path already guarantees single execution — the detector never fires', async () => {
@@ -293,7 +294,7 @@ describe('loop reflection — causality & soundness', () => {
     // The SAME tool + SAME args under a NEW runId: fresh window → executes (not nudged at call-1).
     await runDurable({ runId: 'win-2', journal, model: model(), tools: { stuck: makeStuck(counter) }, prompt: 'b', stopWhen: stepCountIs(20), limits });
     expect(counter.runs).toBe(4); // 2 more real executions in the new run
-    expect(await journal.get('win-2:tool:call-1')).toMatchObject({ status: 'succeeded' });
+    expect(await journal.get(`win-2:tool:${mintCallId('call-1', 'win-2', 0, 0)}`)).toMatchObject({ status: 'succeeded' });
   });
 
   it('J time-travel: the reflected record RESOLVES its pending tool call (nothing stays pending forever)', async () => {
@@ -352,6 +353,6 @@ describe('loop reflection — causality & soundness', () => {
     });
     expect(await res.text).toBe('Recovered.');
     expect(counter.runs).toBe(2);
-    expect(await journal.get('stream-1:tool:call-3')).toMatchObject({ status: 'reflected' });
+    expect(await journal.get(`stream-1:tool:${mintCallId('call-3', 'stream-1', 2, 0)}`)).toMatchObject({ status: 'reflected' });
   });
 });

@@ -96,6 +96,11 @@ in place); a thread id that begins `thread:`, `resource:` or `res:` is ambiguous
 `skipped`. Running it twice moves nothing the second time.
 
 ## Honest caveats
+- **`scope: 'resource'` recall brings an earlier conversation back as a plain user message.** The recalled
+  rows enter the prompt as ordinary `user` / `assistant` messages with no mark that they come from another
+  thread, so a model can take an old request ("refund order 41") for the current one and act on it. Use
+  `scope: 'resource'` knowing this: give tools with side effects a `threshold` (so only close matches are
+  recalled) and `confirm` or an approval, and do not rely on the model to tell old from new.
 - **Recall freezes on the first run:** resume recalls based on the resource graph from the first run
   (correct for replay determinism). A new turn = new `runId` = fresh recall.
 - **WM writes only happen on the first execute** (durableTool short-circuit); resume reads state from the

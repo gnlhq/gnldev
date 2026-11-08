@@ -28,7 +28,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { createHash } from 'node:crypto';
 import {
   eraseSubject, purgeThread, purgeRun, toJournal, withOrg, user, admitThreadRun, cancelAgentRun, ORG_RECORD_PRE, threadOwnerKey,
-  ThreadRunsInFlightError,
+  ThreadRunsInFlightError, mintCallId,
 } from '@gnldev/durable';
 import { KINDS, makeBackend, closeBackends, bothWorlds, world, dump, portable, scopeOf, effects, type Backend } from './dependents-world.js';
 
@@ -37,9 +37,9 @@ import { KINDS, makeBackend, closeBackends, bothWorlds, world, dump, portable, s
 afterEach(closeBackends);
 
 /** The runs that live on thread t-a in the world: four turns, the fork, the rollover, and r-a1's sub-agent. */
-const THREAD_RUNS = ['r-a1', 'r-a1f', 'r-a1n', 'r-a2', 'r-a4', 'agent:r-a1:c-agent_w'];
+const THREAD_RUNS = ['r-a1', 'r-a1f', 'r-a1n', 'r-a2', 'r-a4', `agent:r-a1:${mintCallId('c-agent_w', 'r-a1', 0, 0)}`];
 /** ayse's runs on no thread. */
-const PERSON_RUNS = ['r-a3', 'agent:r-a3:c-agent_w'];
+const PERSON_RUNS = ['r-a3', `agent:r-a3:${mintCallId('c-agent_w', 'r-a3', 0, 0)}`];
 
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 /** Everything in a dump that belongs to one of these runs, in scope `p` ('' or 'org:acme:'). */

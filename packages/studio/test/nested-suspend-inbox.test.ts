@@ -10,14 +10,18 @@
 // Bu dosya satırın KİMLİĞİNİ ve o kimliğin GERÇEKTEN İŞE YARADIĞINI birlikte mühürlüyor: uçtan uca,
 // listeden okunan id ile onay gönderildiğinde koşum tamamlanıyor ve yan etki bir kez koşuyor.
 import { describe, it, expect } from 'vitest';
-import { InMemoryJournal, createGnl, nestedAgentRunId } from '@gnldev/durable';
+import { InMemoryJournal, createGnl, nestedAgentRunId, mintCallId } from '@gnldev/durable';
 import { createStudioApi } from '../src/server.js';
 
 const drive = (api: unknown) => api as (r: Request) => Promise<Response>;
 
-const PROXY_TCID = 'call-devret';
-const CHILD_TCID = 'alt-call-1';
 const RUN_ID = 'nsi-1';
+// What the model said vs. what GNL journals: the model boundary mints a GNL id for every call, and the
+// child run is named by the parent's delegation call GNL id, its own call by the child run's own id.
+const PROXY_PROVIDER_ID = 'call-devret';
+const CHILD_PROVIDER_ID = 'alt-call-1';
+const PROXY_TCID = mintCallId(PROXY_PROVIDER_ID, RUN_ID, 0, 0);
+const CHILD_TCID = mintCallId(CHILD_PROVIDER_ID, nestedAgentRunId(RUN_ID, PROXY_TCID), 0, 0);
 
 const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const countTools = (prompt: any[]) => (prompt ?? []).filter((m: any) => m?.role === 'tool').length;
@@ -41,12 +45,12 @@ function gnlOf(journal: InMemoryJournal, charges: { n: number }) {
     agents: {
       ana: {
         model: mockModel(async ({ prompt }: any) =>
-          countTools(prompt) === 0 ? toolCall('agent_alt', PROXY_TCID, { task: 'parayı gönder' }) : finalText('ana bitti')),
+          countTools(prompt) === 0 ? toolCall('agent_alt', PROXY_PROVIDER_ID, { task: 'parayı gönder' }) : finalText('ana bitti')),
         agents: ['alt'],
       },
       alt: {
         model: mockModel(async ({ prompt }: any) =>
-          countTools(prompt) === 0 ? toolCall('paraGonder', CHILD_TCID, { tutar: 500 }) : finalText('alt bitti')),
+          countTools(prompt) === 0 ? toolCall('paraGonder', CHILD_PROVIDER_ID, { tutar: 500 }) : finalText('alt bitti')),
         tools: { paraGonder: { sideEffect: true, confirm: true as const, execute: async () => { charges.n++; return { ok: true }; } } },
       },
     },
@@ -118,7 +122,7 @@ describe('onay gelen kutusu: iç içe askı', () => {
     };
     const rows = body.items.filter((i) => i.runId === 'nsi-2');
     expect(rows.length).toBe(1);
-    expect(rows[0]!.toolCallId).toBe('call-1');
+    expect(rows[0]!.toolCallId).toBe(mintCallId('call-1', 'nsi-2', 0, 0));
     expect(rows[0]!.toolName).toBe('paraGonder');
     expect(rows[0]!.args).toEqual({ tutar: 500 });
     expect(rows[0]!.reason).toBeTruthy();

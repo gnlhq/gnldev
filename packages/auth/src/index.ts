@@ -23,7 +23,7 @@ export { subjectTokenEndpoint, sessionTokenId, type SubjectSession } from './tok
 // The one reading a standalone door (chat, AG-UI, MCP) makes of a request — `doorGate`: `identify`, then
 // the open-surface checks for a request with no identity, then the role.
 export { doorGate, doorProtectionLines, printProtections, callerOfRequest, authorizeDoorRequest, type DoorGateOptions, type DoorRefusal, type DoorAdmission, AGENTS_RUN, APPLICATION_NAMES_NO_USER, CREDENTIAL_NOT_ACCEPTED, type RequestCaller, type Authorize } from './door.js';
-export { PLATFORM_ADMIN_ROLE, isPlatformAdmin, principalScope, callerKind, isPrincipalKind, assertAssignablePrivileges, actorIdOf, isReservedSubjectId, subjectIdProblem, RESERVED_SUBJECT_PREFIXES, engineCallerOf, type PrincipalScope, type AssignabilityResult, type Identify, type EngineCaller } from './scope.js';
+export { PLATFORM_ADMIN_ROLE, isPlatformAdmin, principalScope, callerKind, isPrincipalKind, assertAssignablePrivileges, actorIdOf, answererOf, isReservedSubjectId, subjectIdProblem, RESERVED_SUBJECT_PREFIXES, engineCallerOf, type PrincipalScope, type AssignabilityResult, type Identify, type EngineCaller, type EngineAnswerer } from './scope.js';
 // Who may reach a surface that listens on a socket. One decision for every GNL surface that binds
 // one; see exposure.ts's header for why @gnldev/cli keeps a pinned second implementation.
 export { decideExposure, isLoopbackHost, isPublishedDevCredential, PUBLISHED_DEV_TOKENS, type ExposureInput, type ExposureDecision } from './exposure.js';

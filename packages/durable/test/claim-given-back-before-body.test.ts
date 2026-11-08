@@ -204,7 +204,7 @@ describe.each(STORES)('a storage error between the claim and the body — %s', (
     expect(executions).toBe(1);
   });
 
-  it('an error AFTER the body started is unchanged: the claim stays, nothing is re-run', async () => {
+  it('an error AFTER the body started: the claim stays, nothing is re-run, the success lands once the store takes it', async () => {
     const storage = await make();
     const runId = 'r-after';
     const toolKey = `${runId}:tool:${KEY}`;
@@ -216,14 +216,18 @@ describe.each(STORES)('a storage error between the claim and the body — %s', (
     const { tool, executions } = charge();
     const call = (journal: Journal) => durableTool(tool as any, { journal, runId } as DurableCtx, 'charge').execute!({ amount: 9 }, { toolCallId: KEY } as any);
 
-    await expect(call(f.journal)).rejects.toThrow(/could not serialize access/);
+    // The effect happened and its record did not land: not a failed call (liveness-audit D3). The call leaves
+    // as LivenessUnavailableError (a detached run is released, the model is not told the tool failed), the
+    // store's error its `cause`, and the success is kept being written until it lands.
+    const err = await call(f.journal).then(() => undefined, (e: unknown) => e as Error & { cause?: Error });
+    expect(err?.name).toBe('LivenessUnavailableError');
+    expect(String(err?.cause?.message)).toMatch(/could not serialize access/);
     expect(f.injected()).toBe(1);
     expect(executions()).toBe(1);
-    expect(await statusOf(storage.runs, toolKey)).toBe('running');
-    // k3: the attempt is over in this process, so its claim is not live here either: the call meets the
-    // crash ladder — in doubt, never re-run without recover() or a person (it answered busy for the life of
-    // the process before; after a restart it answered this, as it does now).
-    await expect(call(storage.runs)).rejects.toBeInstanceOf(SideEffectRetryBlockedError);
+    for (let i = 0; i < 200 && (await statusOf(storage.runs, toolKey)) !== 'succeeded'; i++) await new Promise((r) => setTimeout(r, 25));
+    expect(await statusOf(storage.runs, toolKey), 'the success landed').toBe('succeeded');
+    // The call is answered from its record: never re-run.
+    await call(storage.runs);
     expect(executions()).toBe(1);
   });
 }, 60_000);

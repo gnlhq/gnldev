@@ -1,4 +1,5 @@
 import type { Journal } from './journal.js';
+import type { Storage } from './storage.js';
 import { assertThreadId } from './journal.js';
 import { serialize, deserialize } from './serialize.js';
 import { threadOwnerKey } from './thread-owner.js';
@@ -185,11 +186,34 @@ export interface Memory {
    * observational memory + the WM tool in ONE call. If defined, runDurable/streamDurable use this
    * instead of `getMessages`/`getWorkingMemory`. `provenance` (optional, additive) is the memory-side
    * half of the `:memctx` record — see MemoryContextProvenance above.
+   *
+   * `titleIncoming`: the rows a thread TITLE may be cut from (and a title-generating model may see) — the
+   * input processors' output, so a redactor reaches the title. Absent, `incoming` is used.
    */
   loadContext?(
     threadId: string,
-    opts: { query?: string; resourceId?: string; incoming?: any[] },
+    opts: { query?: string; resourceId?: string; incoming?: any[]; titleIncoming?: any[] },
   ): Promise<{ messages?: any[]; system?: string; tools?: Record<string, any>; provenance?: MemoryContextProvenance }>;
+  /**
+   * This memory, configured the same, over an organization's view of its storage — OPTIONAL; what lets
+   * ONE memory object serve a deployment that binds requests to organizations.
+   *
+   * `scopeConfigToOrg` (the one place a config becomes an organization's) calls it with `view` =
+   * `withOrgStorage(root, orgId)` and `root` = the config's `storage`. Return a NEW memory whose every
+   * read and write goes through `view`, or `undefined` when this memory was not built over `root`
+   * (its threads live somewhere the organization boundary does not reach). Build, do not open: it may
+   * be called at a door's construction only to check that the memory splits.
+   *
+   * A memory without it cannot be split: under organizations it is refused (`MemoryNotSplittableError`),
+   * and `memoryFactory` is the way through. AgentMemory (@gnldev/memory) implements it.
+   */
+  forOrganization?(view: Storage, root: Storage): Memory | undefined;
+  /**
+   * The storage this memory was built over, when it has one — OPTIONAL. What lets a host that holds only
+   * the memory object (@gnldev/studio) ask `splitMemoryForOrganization` for an organization's copy: it
+   * is the `root` that `forOrganization` is given. A memory without it cannot be split by such a host.
+   */
+  readonly storage?: Storage;
 }
 
 /**

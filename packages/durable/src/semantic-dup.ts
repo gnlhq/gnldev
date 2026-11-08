@@ -127,9 +127,70 @@ export const semTombKey = (threadId: string, toolName: string, priorHash: string
  *  record to upgrade in place — records written before this are reached by their old key and no
  *  longer matched. Strings and numbers hash exactly as before; the only keys that move are the ones
  *  that were already zone-dependent, i.e. the ones that were already wrong. */
-export const normalizeId = (v: unknown): string =>
+export const normalizeId = (v: unknown): string => {
+  // A scalar keeps its historical text, byte for byte — the identity is hashed into journal keys, so
+  // any change here would orphan every record written before (pinned by the scalar tests).
+  if (v === null || typeof v !== 'object' || v instanceof Date) return normalizeScalarId(v);
+  // An array / object identity (d25/20: an order's `items`, a `shipTo`) is its CANONICAL form, and
+  // that form is owned HERE and nowhere else: XID, the confirm decoration and the semantic gate all
+  // read identity through this function, so they cannot disagree on what "the same job" is.
+  //   - TYPE-PRESERVING: `[1,2]` and `['1','2']` are different jobs (strings are quoted, numbers are
+  //     not), which `String()` flattened to the same '1,2'.
+  //   - UNORDERED: `[A,B]` and `[B,A]` are the same order — an array is read as a MULTISET (sorted
+  //     canonical elements; a repeated element still counts, `[A,A,B]` != `[A,B,B]`), and an object's
+  //     fields are sorted by name. The safe side of the ambiguity: a re-ordered duplicate order is
+  //     caught instead of slipping through; the price is a question on a tool whose list order is
+  //     meaningful (a route) — such a tool declares the leaf fields, or `describe`, instead.
+  //   - leaves normalize as scalars always did (trim, NFKC, case-fold; Date → ISO instant).
+  // An empty collection carries no identity, exactly like an absent field ('').
+  const c = canonicalNested(v, new WeakSet());
+  return c === '[]' || c === '{}' ? '' : c;
+};
+
+const normalizeScalarId = (v: unknown): string =>
   String((v instanceof Date ? (Number.isNaN(v.getTime()) ? '' : v.toISOString()) : v) ?? '')
     .trim().normalize('NFKC').toLowerCase();
+
+/** JSON-shaped canonical text of a nested identity value (see normalizeId). Strings are quoted, so
+ *  they never collide with a number/boolean leaf. Cycles end in a marker rather than a throw — the
+ *  call-time check (identityUnusableReason) is what reports them. */
+function canonicalNested(v: unknown, seen: WeakSet<object>): string {
+  if (v === null || v === undefined) return 'null';
+  if (v instanceof Date) return JSON.stringify(normalizeScalarId(v));
+  if (typeof v === 'string') return JSON.stringify(normalizeScalarId(v));
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (typeof v === 'bigint') return `${v}n`;
+  if (typeof v !== 'object') return JSON.stringify(normalizeScalarId(v)); // symbol/function: carries no identity, never reaches here past the call-time check
+  if (seen.has(v)) return '"~cycle"';
+  seen.add(v);
+  try {
+    if (Array.isArray(v)) return `[${v.map((e) => canonicalNested(e, seen)).sort().join(',')}]`;
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o).filter((k) => o[k] !== undefined).sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalNested(o[k], seen)}`).join(',')}}`;
+  } finally {
+    seen.delete(v);
+  }
+}
+
+/** The first leaf inside an identity value that carries no identity (a function, an Invalid Date, a
+ *  cycle), with its path — `undefined` when every leaf does. */
+function unusableLeaf(v: unknown, path: string, seen: WeakSet<object>): string | undefined {
+  if (typeof v === 'function' || typeof v === 'symbol') return `${path} holds a ${typeof v}, which carries no identity (every call would compare equal)`;
+  if (v instanceof Date) return Number.isNaN(v.getTime()) ? `${path} holds an Invalid Date — every unparseable date normalizes to the same text, so every call would compare equal` : undefined;
+  if (v === null || typeof v !== 'object') return undefined;
+  if (seen.has(v)) return `${path} is a circular reference, which has no finite identity`;
+  seen.add(v);
+  try {
+    for (const [k, e] of Array.isArray(v) ? v.map((e, i) => [String(i), e] as const) : Object.entries(v)) {
+      const why = unusableLeaf(e, `${path}[${k}]`, seen);
+      if (why) return why;
+    }
+    return undefined;
+  } finally {
+    seen.delete(v);
+  }
+}
 
 export interface SemFields {
   identity: Record<string, string>;
@@ -282,20 +343,12 @@ export function identityUnusableReason(id: SemanticIdentity, args: unknown): str
       }
       continue;
     }
-    // An ARRAY is a different failure from an object and says so. It is not that every call compares
-    // equal — `['a','b']` and `['c','d']` do differ. It is that the element TYPES flatten: `[1,2]` and
-    // `['1','2']` both land on '1,2', so two genuinely different jobs can be called the same one.
-    // Still unusable, but for this reason, and the message has to carry the real one: an operator who
-    // reads "every call would compare equal" and then watches calls NOT compare equal stops believing
-    // the next diagnostic too.
-    if (Array.isArray(v)) {
-      return `identity key '${k}' holds an array: element types flatten through String(), so [1,2] and ['1','2'] both become '1,2' and different work can compare equal — declare the leaf field instead`;
-    }
-    // A plain object carries no identity at all: every one of them is '[object Object]'. ONE such key
-    // poisons the whole comparison, so it is reported on its own rather than waiting for the
-    // all-empty test below.
+    // An ARRAY or OBJECT identifies (d25/20): normalizeId reads it as a type-preserving, unordered
+    // canonical form. What still cannot identify is a LEAF inside it — a function, an Invalid Date, a
+    // cycle — and that is reported with its path, by the same rule as a top-level leaf.
     if (v !== null && typeof v === 'object') {
-      return `identity key '${k}' holds an object, which carries no identity (every call would compare equal) — declare the leaf field instead`;
+      const why = unusableLeaf(v, `identity key '${k}'`, new WeakSet());
+      if (why) return `${why} — declare the leaf field instead`;
     }
   }
   // EVERY key empty means the declaration matched nothing at all: a misspelled key, or a tool whose

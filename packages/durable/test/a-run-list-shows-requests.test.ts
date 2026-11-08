@@ -2,7 +2,7 @@
 // a ward round list: 56 of 68 rows were sub-agents). A child's summary carries `parentRunId`, and
 // `topLevel` leaves the children out — the same filter-before-slice contract on every adapter.
 import { describe, it, expect } from 'vitest';
-import { InMemoryStorage, createGnl, STAFF } from '../src/index.js';
+import { InMemoryStorage, createGnl, STAFF, mintCallId } from '../src/index.js';
 import { SqliteStorage } from '../src/sqlite-storage.js';
 import { createMockModel, toolCallResult, finalTextResult } from './mock.js';
 
@@ -16,7 +16,7 @@ describe.each([['InMemory', () => new InMemoryStorage()], ['Sqlite', () => new S
       .run('parent', { runId: 'req', prompt: 'go', caller: STAFF } as any);
     const j = storage.runs;
     const all = (await j.listRuns()).items;
-    expect(all.filter((r: any) => r.parentRunId === 'req').map((r: any) => r.runId).sort()).toEqual(['agent:req:p0', 'agent:req:p1']);
+    expect(all.filter((r: any) => r.parentRunId === 'req').map((r: any) => r.runId).sort()).toEqual([`agent:req:${mintCallId('p0', 'req', 0, 0)}`, `agent:req:${mintCallId('p1', 'req', 1, 0)}`].sort());
     expect((await j.listRuns({ topLevel: true })).items.map((r: any) => r.runId)).toEqual(['req']);
     // the same filter combined with another one takes the other list path in the SQL adapters
     expect((await j.listRuns({ topLevel: true, agent: 'parent' })).items.map((r: any) => r.runId)).toEqual(['req']);

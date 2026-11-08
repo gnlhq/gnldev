@@ -2,13 +2,25 @@ import { nestedAgentRunId } from './journal.js';
 import { seedLimits } from './limits.js';
 import { randomUUID } from 'node:crypto';
 
+/**
+ * The ONE owner of the default time limits. A model step is bounded until its first byte (a frozen provider
+ * connection must not keep a run `running` for minutes); `timeouts: { modelStepMs: 0 }` switches it off.
+ * Per-call values win over the instance config, field by field; REST/chat/AG-UI inherit this through the
+ * registry, they define no default of their own.
+ */
+const DEFAULT_MODEL_STEP_MS = 120_000;
+function effectiveTimeouts(config: CreateGnlConfig['timeouts'], call: CreateGnlConfig['timeouts']): NonNullable<CreateGnlConfig['timeouts']> {
+  return { modelStepMs: DEFAULT_MODEL_STEP_MS, ...config, ...call };
+}
+
 let wfAnonCounter = 0; // runWorkflow's anon-fallback uniqueness within a process — see the warn below
 import type { ToolSchemaRuleLike } from './types.js';
 import { decodeStepRecord } from './step-record.js';
 import { stepCountIs, tool as aiTool, jsonSchema } from 'ai';
-import { runDurable, streamDurable } from './run.js';
+import { runDurable, streamDurable, CONTINUES_RECORDED_INPUT } from './run.js';
 import type { StreamBreach } from './run.js';
 import { resolveModel, withModelFallback, type FallbackCandidate } from './model-router.js';
+import { attemptStart, runFailed, runSucceeded, classifyRunError } from './outcome.js';
 import { delegationTool, runDelegated, type ChildFrame, childOutcome } from './agent-tool.js';
 import { assertNoCallerSystemMessage } from './request-body.js';
 import { runNetworkAdmitted as runNetworkCore, type NetworkResult, type NetworkTarget } from './network.js';
@@ -17,16 +29,20 @@ import { claim as journalClaim, runKeys, assertJournalGuarantees } from './journ
 import { argsHash, derivedRunId, DEPLOYMENT_SCOPE, type WorkScope, type WorkScopeKind } from './hash.js';
 import { RunBusyError, runBusyMessage, RunSweptError, RunInputMismatchError, RunOwnerMismatchError, ThreadOwnerMismatchError } from './errors.js';
 import { admitThreadRun } from './thread-owner.js';
-import { user, staff, callerOf, callerFromResourceId, userIdOf, resolveCaller, identityOf, runIdentity, admitRun, childIdentity, requestOf, type Caller, type RunIdentity } from './run-identity.js';
+import { user, staff, callerOf, callerFromResourceId, userIdOf, resolveCaller, sealFieldsOf, identityOf, runIdentity, admitRun, childIdentity, requestOf, type Caller, type RunIdentity } from './run-identity.js';
+import type { Answerer, Approvers } from './approval-authority.js';
 import { recordIdemConflict } from './idem-ledger.js';
 import { runScoreSample, assertDistinctScorerNames, scoreRunMemoized } from './scoring.js';
 import { recordRunScores } from './metrics.js';
+import { attachStreamFacts, resolveStreamFeed } from './agent-stream.js';
+import { effectsRanIn } from './pending-work.js';
 import { assertSuiteConsistent } from './suite-consistency.js';
 import { createSuggestions, validateSuggestionsConfig } from './suggestions.js';
 import { PRESET_MATRIX, PRESET_DEFAULT } from './policy-matrix.js';
 import type { SuggestionsApi, SuggestionsConfig } from './suggestions.js';
 
 import type { Journal } from './journal.js';
+import { isStorage } from './storage.js';
 import type { Storage } from './storage.js';
 import type { Guard } from './guard.js';
 import type { Memory } from './memory.js';
@@ -120,20 +136,10 @@ function cameThroughDoor(context: RequestContext | undefined): boolean {
 }
 
 /**
- * P1.7 seals a request context against the cross-organization hijack class where a
- * client-supplied `context.__gnl_resourceId`/`__gnl_orgId`/`__gnl_threadId` in the request body would
- * otherwise be indistinguishable from a value the SERVER derived from the authenticated identity — a
- * client could smuggle `{ context: { __gnl_resourceId: 'victim-user' } }` and have it silently win
- * downstream (memory lookup, dynamic model/system resolution), reading/writing another organization's data.
- * Mirrors the common "reserved resource-id key" design: a reserved requestContext key that only server code
- * writes, so a client can never override its own identity through the request body.
- *
- * ALWAYS overwrites the three reserved keys — even a key `server` has NO value for is stripped from the
- * client-supplied context (deleted, never left as `undefined` either): a spoofed key must not survive by
- * omission just because the server didn't happen to supply that particular field this call.
- * @internal — door plumbing shared by the GNL doors; gnl builds its argument, no host writes it.
+ * The reserved keys of a request context written from the server's facts, every client-supplied one stripped
+ * (the body of `sealRequestContext`, and of `contextForDynamic` — which differ only in the door mark).
  */
-export function sealRequestContext(
+function fillReservedKeys(
   ctx: RequestContext,
   server: { resourceId?: string; orgId?: string; threadId?: string; staff?: boolean },
 ): RequestContext {
@@ -185,6 +191,29 @@ export function sealRequestContext(
   }
   if (server.threadId !== undefined) define(sealed, GNL_THREAD_ID_KEY, server.threadId);
   if (server.staff === true && server.resourceId === undefined) define(sealed, GNL_STAFF_KEY, true);
+  return sealed;
+}
+
+
+/**
+ * P1.7 seals a request context against the cross-organization hijack class where a
+ * client-supplied `context.__gnl_resourceId`/`__gnl_orgId`/`__gnl_threadId` in the request body would
+ * otherwise be indistinguishable from a value the SERVER derived from the authenticated identity — a
+ * client could smuggle `{ context: { __gnl_resourceId: 'victim-user' } }` and have it silently win
+ * downstream (memory lookup, dynamic model/system resolution), reading/writing another organization's data.
+ * Mirrors the common "reserved resource-id key" design: a reserved requestContext key that only server code
+ * writes, so a client can never override its own identity through the request body.
+ *
+ * ALWAYS overwrites the three reserved keys — even a key `server` has NO value for is stripped from the
+ * client-supplied context (deleted, never left as `undefined` either): a spoofed key must not survive by
+ * omission just because the server didn't happen to supply that particular field this call.
+ * @internal — door plumbing shared by the GNL doors; gnl builds its argument, no host writes it.
+ */
+export function sealRequestContext(
+  ctx: RequestContext,
+  server: { resourceId?: string; orgId?: string; threadId?: string; staff?: boolean },
+): RequestContext {
+  const sealed = fillReservedKeys(ctx, server);
   // "This call came through a door": NOT enumerable, so the context a host's dynamic agent reads is the
   // one it always was (spread, JSON and equality do not see it) — the engine reads it by name in run()/stream().
   Object.defineProperty(sealed, GNL_DOOR_KEY, { value: true, enumerable: false, writable: false, configurable: false });
@@ -203,12 +232,40 @@ export function serverIdentityOf(ctx: RequestContext): { resourceId?: string; or
 }
 
 /**
+ * WHAT A CALL'S CONTEXT SEALS — the one reading of the reserved keys for a call through the registry.
+ * A door's context (`sealRequestContext`) is the server's word: its keys are the seal. A context no door
+ * sealed is the host's own, and its reserved keys were put there by hand: they stand only where the call
+ * names nobody (the host's convention for a call that carries its identity in the context), and never
+ * against a `caller` / `resourceId` the call declares — the declaration is the engine's resolved identity,
+ * and a hand-placed key must not take the run, or what a dynamic function is told, over to another person.
+ */
+function sealOf(rc: RequestContext, opts: { resourceId?: string; caller?: Caller } | undefined): ReturnType<typeof serverIdentityOf> {
+  if (cameThroughDoor(rc)) return serverIdentityOf(rc);
+  return opts?.caller !== undefined || opts?.resourceId !== undefined ? {} : serverIdentityOf(rc);
+}
+
+/**
  * THE caller of a call through the registry, decided once: the server's seal wins (a sealed user, or
  * sealed staff), then the call's explicit `caller`, then the `resourceId` shorthand, else `unknown`.
  */
 function callerOfCall(rc: RequestContext, opts: { resourceId?: string; caller?: Caller } | undefined): Caller {
   // One rule (run-identity.ts `resolveCaller`): the seal decides, and a declaration that disagrees with it throws.
-  return resolveCaller(serverIdentityOf(rc), opts);
+  return resolveCaller(sealOf(rc, opts), opts);
+}
+
+/**
+ * THE CONTEXT A DYNAMIC `tools` / `system` / `model` FUNCTION IS CALLED WITH. A door's context already
+ * carries the identity it sealed (returned as it is). Any other call — a direct `gnl.run`, a continuation, a
+ * takeover, a background task, a child — gets the identity the ENGINE resolved for the run (`caller`, the
+ * org the caller carries, the thread) written into the same reserved keys, so `serverIdentityOf(ctx)` and
+ * the documented `ctx.org` read the same on every path. The developer's own keys stay; the reserved ones
+ * are the engine's, whatever the context held (a hand-placed `__gnl_resourceId` or `org` is stripped) — once
+ * the engine has resolved someone. A call that names nobody keeps the context as the host wrote it.
+ */
+function contextForDynamic(rc: RequestContext, caller: Caller, threadId: string | undefined): RequestContext {
+  // Nothing resolved (`unknown`) means the call named nobody: whatever the host's own context carries stays.
+  if (cameThroughDoor(rc) || caller.kind === 'unknown') return rc;
+  return fillReservedKeys(rc, { ...sealFieldsOf(caller, caller.orgId), ...(threadId !== undefined ? { threadId } : {}) });
 }
 
 /**
@@ -578,7 +635,8 @@ export interface CreateGnlConfig {
    * 'assistant' ve 'headless' (heyet matrisi, 7 Eyl 2026): critical'ın sertlik paketini AÇMADAN,
    * yalnız sınıf-bazlı tekrar politikasını basarlar (policy-matrix.ts):
    *   assistant → para/bildirim sorar, delete "zaten yapılmıştı" notu, upsert sessiz;
-   *               replayDisclosure default 'explain' (ekranda insan var, dürüst anlatım açık).
+   *               replayDisclosure default 'explain' (ekranda insan var, dürüst anlatım açık);
+   *               `config.replayDisclosure` bunu geçersiz kılar (çağrı başına değer hepsinden üstün).
    *   headless  → soracak insan yok: para tekrarı typed-RED (DLQ'ya düşer), bildirim/delete atlar
    *               + iz; hiçbir hücre suspend üretmez. Zarf/iz her hücrede tam (görünmezlik yasağı).
    * Workflow/lock/strictInput kapıları bu ikisine GELMEZ — onlar critical'ın kimliğidir.
@@ -602,6 +660,36 @@ export interface CreateGnlConfig {
    * persists. Default 'silent' (existing behavior). See RunDurableArgs.replayDisclosure.
    */
   replayDisclosure?: 'explain' | 'silent';
+  /**
+   * Who may say YES to an approve question (a guard's `approve`, a tool's `approve`, a call that may
+   * already have happened). Default: staff — an operator, the application's own server — and never the end
+   * user whose work it is. When set it REPLACES that default: whoever the function names is authorised
+   * (it can narrow as well as widen). `fourEyes()` is the ready-made rule: the approver must not be the
+   * person who started the work. A confirm question and anybody's NO are not asked of it.
+   */
+  approvers?: Approvers;
+  /**
+   * The sentence a person reads when a side effect would be repeated (the repeat question of `limits.sideEffectDuplicates`).
+   * Called with structured facts (tool, how it matched, where and how long ago the earlier work happened, amounts that differ);
+   * return the text in your language and style, or `undefined` for gnl's default. One hook serves every repeat question.
+   */
+  questionText?: import('./question-text.js').QuestionTextHook;
+  /**
+   * What the client feed carries (REST `/stream`, chat, AG-UI; Studio's playground opens it). `reasoning` is the
+   * model's inner thinking: OFF by default, `true` sends it. A per-call `stream` (REST body, `RunOptions.stream`) wins.
+   * The run's journal records the reasoning either way.
+   */
+  stream?: { reasoning?: boolean };
+  /**
+   * Time limits for every run()/stream() of this instance (per-call `RunOptions.timeouts` wins, field by
+   * field). `modelStepMs` is the one that matters most: without it a provider connection that goes quiet
+   * leaves the run `running` until the HTTP client gives up (minutes, or never, depending on the runtime).
+   * It bounds a model step until its FIRST byte (a streamed answer that stalls mid-way is not covered).
+   * A step that times out fails the run with `StepTimeoutError`, which counts as the run's own failure.
+   * Default 120 s (`DEFAULT_MODEL_STEP_MS`); `modelStepMs: 0` turns the limit off (a very slow
+   * reasoning model, a long non-streamed generation).
+   */
+  timeouts?: { modelStepMs?: number; toolMs?: number; claimTtlMs?: number };
 }
 
 /**
@@ -712,6 +800,12 @@ export interface RunOptions {
    */
   caller?: Caller;
   approvals?: Record<string, boolean>;
+  /**
+   * WHO answers `approvals` in this call — set by a door from its verified principal (@gnldev/auth
+   * `answererOf`), because `caller` is the run's OWNER and so cannot say who is answering. Absent:
+   * derived from `caller` (see RunDurableArgs.answerer). Also recorded as who started the run.
+   */
+  answerer?: Answerer;
   /** Request context: passed to dynamic model/system/tools functions (organization/role/user…). */
   context?: RequestContext;
   /** Playground session overrides (agent definition is used if not given). */
@@ -738,6 +832,8 @@ export interface RunOptions {
   auditOnReject?: 'best-effort' | 'require';
   /** Replay-disclosure policy (see CreateGnlConfig.replayDisclosure); this per-call value wins. */
   replayDisclosure?: 'explain' | 'silent';
+  /** What the client feed carries for THIS call (see CreateGnlConfig.stream); wins over the config. */
+  stream?: { reasoning?: boolean };
   /** Kanal etiketi ('chat' | 'api' | 'batch:<id>'...) — XID origin'i; sorular "5 dk önce, sohbetten" diyebilsin. */
   channel?: string;
   tombstonePolicy?: 'ignore' | 'reject';
@@ -904,9 +1000,9 @@ function toolsDeclaringEffectClass(config: CreateGnlConfig): string[] {
 const CHILD_RUN_POLICY = {
   runId: 'own', workKey: 'own', prompt: 'own', messages: 'own', model: 'own', temperature: 'own', topP: 'own',
   system: 'own', tools: 'own', replay: 'own', trustRecordedInput: 'own',
-  threadId: 'frame', resourceId: 'frame', caller: 'frame', approvals: 'frame', abortSignal: 'frame',
+  threadId: 'frame', resourceId: 'frame', caller: 'frame', approvals: 'frame', answerer: 'frame', abortSignal: 'frame',
   context: 'inherit', limits: 'inherit', toolPolicy: 'inherit', strictInput: 'inherit', conflictLedger: 'inherit',
-  auditOnReject: 'inherit', replayDisclosure: 'inherit', channel: 'inherit', tombstonePolicy: 'inherit', actor: 'inherit',
+  auditOnReject: 'inherit', replayDisclosure: 'inherit', stream: 'own', channel: 'inherit', tombstonePolicy: 'inherit', actor: 'inherit',
   timeouts: 'inherit', exclusiveModelStep: 'inherit', onBlocked: 'inherit', after: 'own',
 } as const satisfies Record<keyof RunOptions, 'inherit' | 'own' | 'frame'>;
 
@@ -932,6 +1028,24 @@ export function createGnl(config: CreateGnlConfig) {
     assertSuiteConsistent({ onMismatch: config.checkSuiteConsistency === 'throw' ? 'throw' : 'warn' });
   }
   // Resolve memory once: explicit `false` → off; if not given, memoryFactory (if any) derives it from the journal.
+  // THE ONE PLACE a store handed in the wrong shape is answered: what was given, and the option that takes it.
+  // Reported: `journal: { kind: 'mysql' }` was met with a list of methods the engine lacks, and `storage: { kind }` or
+  // a connection string with "`storage` or `journal` is required" although `storage` WAS given. Names the TYPE
+  // received, never the value: a connection string carries a password.
+  const typeOf = (v: unknown) => (v === null ? 'null' : Array.isArray(v) ? 'an array' : typeof v === 'object' ? 'an object' : `a ${typeof v}`);
+  if (config.storage !== undefined && config.storage !== null && !isStorage(config.storage)) {
+    throw new TypeError(
+      `createGnl: \`storage\` must be a Storage instance (new SqliteStorage(...) / PostgresStorage / MysqlStorage / MongoStorage), got ${typeOf(config.storage)}. ` +
+        'A connection string or a `{ kind }` object is not a store: pass `storage: new MysqlStorage({ connectionString })`.',
+    );
+  }
+  const given = config.storage ? undefined : config.journal;
+  if (given !== undefined && given !== null && (typeof given !== 'object' || typeof (given as Partial<Journal>).get !== 'function' || typeof (given as Partial<Journal>).put !== 'function')) {
+    throw new TypeError(
+      `createGnl: \`journal\` expects a Journal object (an InMemoryJournal, or a store's own journal), got ${typeOf(given)}. ` +
+        'To use MySQL, Postgres, Mongo or SQLite pass the store instead: `storage: new MysqlStorage({ connectionString })`.',
+    );
+  }
   const journal: Journal = config.storage ? config.storage.runs : config.journal!;
   if (!journal) throw new Error('createGnl: `storage` or `journal` is required');
   assertJournalGuarantees(journal, config.storage ? 'createGnl (storage.runs)' : 'createGnl (journal)');
@@ -1219,7 +1333,9 @@ export function createGnl(config: CreateGnlConfig) {
     }
     const threadId = (owner.record as { threadId?: unknown } | undefined)?.threadId;
     const args = await streamArgs(agentName, { runId: rec.runId, caller: owner.owner, ...(typeof threadId === 'string' ? { threadId } : {}) });
-    return (signal) => streamDurable({ ...args, abortSignal: signal });
+    // From its recorded input, said as such (run.ts CONTINUES_RECORDED_INPUT): this call has no content
+    // of its own, and a workKey run's input check refused it as "different work" (d25 U6).
+    return (signal) => streamDurable({ ...args, [CONTINUES_RECORDED_INPUT]: true, abortSignal: signal });
   }
 
   // ── BACKGROUND TOOLS (types.ts `background`, deferred.ts) ─────────────────────────────────────────
@@ -1250,6 +1366,7 @@ export function createGnl(config: CreateGnlConfig) {
       Object.assign(launcher, {
         idempotent: true,
         ...((t as AnyTool).confirm !== undefined ? { confirm: (t as AnyTool).confirm } : {}),
+        ...((t as AnyTool).approve !== undefined ? { approve: (t as AnyTool).approve } : {}),
         execute: async (input: unknown, options: { toolCallId?: string; gnl?: GnlToolContext }) =>
           ({ status: 'started', taskId: await startTask(name, toolName, input, options) }),
         [BACKGROUND_BODY]: t,
@@ -1297,7 +1414,7 @@ export function createGnl(config: CreateGnlConfig) {
     const launcher = base.tools?.[spec.tool] as Record<symbol, unknown> | undefined;
     const t = launcher?.[BACKGROUND_BODY] as AnyTool | undefined;
     if (!t) throw new Error(`@gnldev/durable: agent '${name}' has no background tool '${spec.tool}' to run task '${runId}' with`);
-    const { background: _b, confirm: _c, ...body } = t;
+    const { background: _b, confirm: _c, approve: _ap, ...body } = t;
     // Built by the engine from the parent's recorded call: the one place a task's run is begun from.
     return minted({
       ...base,
@@ -1403,6 +1520,8 @@ export function createGnl(config: CreateGnlConfig) {
     if (surface === 'run') refuseRunNames(`run('${name}')`, rest);
     // The reader's cursor, read before anything is started: one that is not a cursor is refused.
     const from = after === undefined ? undefined : readCursor(after);
+    // Which events the client feed carries (agent-stream.ts owns the rule): read before the run starts so a bad value refuses the call.
+    const feed = resolveStreamFeed(config.stream, opts.stream);
     const requested = await streamArgs(name, rest);
     // A background call's run named by a caller (an answer to the task's question for a human): it is
     // continued as what it is — from what made it — for THIS caller, whom the admission below judges.
@@ -1420,13 +1539,22 @@ export function createGnl(config: CreateGnlConfig) {
     const priorRun = priorInput !== undefined && (priorInput.prompt !== undefined || priorInput.messages !== undefined);
     const runs = await executor();
     const scope = orgScopeOf(journal);
-    const started = await runs.start(withMintOf({
+    // A STREAM'S READER IS NOT KEPT WAITING IN SILENCE: when the run's holder is gone and its takeover has to
+    // wait out the reconnect grace (a few seconds on a shared store), the start says so (`onWaiting`) and the
+    // reader is returned at once, told `waiting-takeover` as its first part, then reading on when the start
+    // settles. A refusal (the admission, which comes first) still throws from here, before any stream.
+    let announceWaiting!: () => void;
+    const waiting = new Promise<'waiting'>((r) => { announceWaiting = () => r('waiting'); });
+    const starting = runs.start(withMintOf({
       runId, ...(scope !== undefined ? { scope } : {}),
       admit: () => admitAgentRun(args),
       meta: { agent: name, ...(derived ? { deferred: derived.kind } : {}) },
       resumeIntent: opts.approvals !== undefined,
+      ...(surface === 'stream' ? { onWaiting: announceWaiting } : {}),
       launch: derived?.kind === 'task' ? taskLaunch(name, args) : (signal) => streamDurable({ ...args, abortSignal: signal }),
     }, args));
+    const first = surface === 'stream' ? await Promise.race([starting, waiting]) : await starting;
+    const started = first === 'waiting' ? undefined : first;
     // The caller's "stop": the run is canceled, durably, wherever it executes (see RunOptions.abortSignal).
     if (abortSignal) {
       const cancel = () => {
@@ -1436,14 +1564,45 @@ export function createGnl(config: CreateGnlConfig) {
     }
     // A run that ended before runs had an event log (or whose log is gone) has nothing to follow: its
     // answer is replayed from its journal instead — a completed run calls no model and runs no tool.
+    if (!started) {
+      const followed = followedRun(runs, { runId, ...(scope !== undefined ? { scope } : {}), journal, ...(from !== undefined ? { after: from } : {}), state: 'waiting-takeover', pending: starting });
+      starting.catch(() => undefined); // its failure reaches the reader (the stream errors); nobody else awaits it
+      Object.defineProperty(followed, '__gnlPriorRun', { value: priorRun });
+      return { args, followed };
+    }
     if (started.state === 'finished' && !(await lastRunEvent(journal, runId))) {
       const replayed: any = await streamDurable({ ...args });
       Object.defineProperty(replayed, '__gnlPriorRun', { value: priorRun });
+      attachStreamFacts(replayed, { effectsRan: () => effectsRanIn(journal, runId), feed });
       return { args, followed: replayed };
     }
     const followed = followedRun(runs, { runId, ...(scope !== undefined ? { scope } : {}), journal, after: from ?? started.from, state: started.state });
     Object.defineProperty(followed, '__gnlPriorRun', { value: priorRun });
+    attachStreamFacts(followed, { effectsRan: () => effectsRanIn(journal, runId), feed });
     return { args, followed };
+  }
+
+  /** The agents whose empty dynamic tool set for an anonymous call was already said (once per agent, per instance). */
+  const saidEmptyTools = new Set<string>();
+
+  /**
+   * An agent's dynamic `tools`, resolved with the context of this call. A function that comes back EMPTY for
+   * a call that carries no identity at all (no door seal, no `caller`, no `resourceId`) is almost always one
+   * that gates its tools on the identity it was not given: the model then answers without them — "paid,
+   * thanks" with nothing paid. That is said out loud (once per agent), never left to look like a normal run.
+   */
+  async function dynamicToolsOf(name: string, tools: DynamicArg<Record<string, AnyTool>> | undefined, ctx: RequestContext, caller: Caller): Promise<Record<string, AnyTool> | undefined> {
+    if (!tools) return undefined;
+    const resolved = await resolveDyn(tools, ctx);
+    if (typeof tools === 'function' && caller.kind === 'unknown' && resolved && Object.keys(resolved).length === 0 && !saidEmptyTools.has(name)) {
+      saidEmptyTools.add(name);
+      console.warn(
+        `@gnldev/durable: agent '${name}': its \`tools\` function returned NO tools for a call that carries no identity ` +
+        `(no door seal, \`caller\` or \`resourceId\`) — the model will answer without tools. If the function gives tools ` +
+        `by who is calling, pass the caller (\`resourceId\` / \`caller\`) or go through a door; if empty is intended here, ignore this.`,
+      );
+    }
+    return resolved;
   }
 
   async function stream(name: string, opts: RunOptions) {
@@ -1502,14 +1661,14 @@ export function createGnl(config: CreateGnlConfig) {
       opts = {
         ...opts,
         limits: { sideEffectDuplicates: { byClass: PRESET_MATRIX[config.preset], default: PRESET_DEFAULT[config.preset] }, ...(opts.limits ?? {}) },
-        ...(config.preset === 'assistant' ? { replayDisclosure: opts.replayDisclosure ?? 'explain' } : {}),
+        ...(config.preset === 'assistant' ? { replayDisclosure: opts.replayDisclosure ?? config.replayDisclosure ?? 'explain' } : {}),
       };
     }
     const a = agent(name);
     const rc = opts.context ?? {};
     // P1.7: a server-sealed resourceId/threadId (sealRequestContext) ALWAYS wins over opts.resourceId/
     // opts.threadId when present — see the RunOptions.resourceId/threadId precedence note below.
-    const serverIdentity = serverIdentityOf(rc);
+    const serverIdentity = sealOf(rc, opts);
     assertNoCallerSystemMessage({ ...opts, fromDoor: cameThroughDoor(opts.context) });
     // A child runs for the caller of the run that delegated; that run already passed every door gate.
     const caller = frame ? frame.identity : callerOfCall(rc, opts);
@@ -1530,8 +1689,9 @@ export function createGnl(config: CreateGnlConfig) {
       surface: `run('${name}')`,
     });
     const runId = identity.runId!;
-    const model = await materializeModel(opts.model ?? (await resolveDyn(a.model, rc)), runId);
-    const agentTools = a.tools ? await resolveDyn(a.tools, rc) : undefined;
+    const dynCtx = contextForDynamic(rc, caller, effectiveThreadId);
+    const model = await materializeModel(opts.model ?? (await resolveDyn(a.model, dynCtx)), runId);
+    const agentTools = await dynamicToolsOf(name, a.tools, dynCtx, caller);
     // Sub-agent and workflow tools take the caller from the CALL (options.gnl), not from here.
     const subTools = buildSubAgentTools(a.agents, rc, {
       ...opts,
@@ -1540,7 +1700,7 @@ export function createGnl(config: CreateGnlConfig) {
     const wfTools = buildWorkflowTools(a.workflows, {
       ...((serverIdentity.resourceId ?? opts.actor) ? { actor: serverIdentity.resourceId ?? opts.actor } : {}),
     });
-    const system = opts.system ?? (a.system ? await resolveDyn(a.system, rc) : undefined);
+    const system = opts.system ?? (a.system ? await resolveDyn(a.system, dynCtx) : undefined);
     const processors = [...(config.processors ?? []), ...(a.processors ?? [])];
     const mergedTools = { ...config.tools, ...agentTools, ...subTools, ...wfTools };
     // Playground tool allow-list: expose only the requested subset to the model (agent tools unchanged).
@@ -1579,6 +1739,8 @@ export function createGnl(config: CreateGnlConfig) {
       // uygulamalar, CLI, testler) için tek kimlik kanalı odur — ama yalnız mühürlü kimlik YOKKEN.
       ...((serverIdentity.resourceId ?? opts.actor) ? { actor: serverIdentity.resourceId ?? opts.actor } : {}),
       approvals: frame?.approvals ?? opts.approvals,
+      ...((frame?.answerer ?? opts.answerer) ? { answerer: frame?.answerer ?? opts.answerer } : {}),
+      ...(config.approvers ? { approvers: config.approvers } : {}),
       stopWhen: stepCountIs(a.maxSteps ?? 12),
       ...(opts.temperature != null ? { temperature: opts.temperature } : {}),
       ...(opts.topP != null ? { topP: opts.topP } : {}),
@@ -1591,11 +1753,12 @@ export function createGnl(config: CreateGnlConfig) {
       ...(opts.conflictLedger !== undefined ? { conflictLedger: opts.conflictLedger } : {}),
       ...(opts.auditOnReject ? { auditOnReject: opts.auditOnReject } : {}),
       ...((opts.replayDisclosure ?? config.replayDisclosure) ? { replayDisclosure: opts.replayDisclosure ?? config.replayDisclosure } : {}),
+      ...(config.questionText ? { questionText: config.questionText } : {}),
       ...(opts.channel ? { channel: opts.channel } : {}),
       ...(opts.tombstonePolicy ? { tombstonePolicy: opts.tombstonePolicy } : {}),
       ...(config.schemaCompat ? { schemaCompat: config.schemaCompat } : {}),
       ...(opts.replay ? { replay: opts.replay } : {}),
-      ...(opts.timeouts ? { timeouts: opts.timeouts } : {}),
+      timeouts: effectiveTimeouts(config.timeouts, opts.timeouts),
       ...(opts.exclusiveModelStep ? { exclusiveModelStep: opts.exclusiveModelStep } : {}),
       ...((frame?.abortSignal ?? opts.abortSignal) ? { abortSignal: frame?.abortSignal ?? opts.abortSignal } : {}), // P0.2: see RunOptions.abortSignal; a child stops with its parent
       // The declaration travels with the run so package #2's writer can freeze it into `:input`:
@@ -1643,13 +1806,13 @@ export function createGnl(config: CreateGnlConfig) {
       opts = {
         ...opts,
         limits: { sideEffectDuplicates: { byClass: PRESET_MATRIX[config.preset], default: PRESET_DEFAULT[config.preset] }, ...(opts.limits ?? {}) },
-        ...(config.preset === 'assistant' ? { replayDisclosure: opts.replayDisclosure ?? 'explain' } : {}),
+        ...(config.preset === 'assistant' ? { replayDisclosure: opts.replayDisclosure ?? config.replayDisclosure ?? 'explain' } : {}),
       };
     }
     const a = agent(name);
     const rc = opts.context ?? {};
     // P1.7: same server-identity precedence as run() above — see RunOptions.threadId/resourceId JSDoc.
-    const serverIdentity = serverIdentityOf(rc);
+    const serverIdentity = sealOf(rc, opts);
     assertNoCallerSystemMessage({ ...opts, fromDoor: cameThroughDoor(opts.context) });
     const caller = callerOfCall(rc, opts);
     const effectiveResourceId = userIdOf(caller);
@@ -1667,8 +1830,9 @@ export function createGnl(config: CreateGnlConfig) {
       surface: `stream('${name}')`,
     });
     const runId = identity.runId!;
-    const model = await materializeModel(opts.model ?? (await resolveDyn(a.model, rc)), runId);
-    const agentTools = a.tools ? await resolveDyn(a.tools, rc) : undefined;
+    const dynCtx = contextForDynamic(rc, caller, effectiveThreadId);
+    const model = await materializeModel(opts.model ?? (await resolveDyn(a.model, dynCtx)), runId);
+    const agentTools = await dynamicToolsOf(name, a.tools, dynCtx, caller);
     // Sub-agent and workflow tools take the caller from the CALL (options.gnl), not from here.
     const subTools = buildSubAgentTools(a.agents, rc, {
       ...opts,
@@ -1677,7 +1841,7 @@ export function createGnl(config: CreateGnlConfig) {
     const wfTools = buildWorkflowTools(a.workflows, {
       ...((serverIdentity.resourceId ?? opts.actor) ? { actor: serverIdentity.resourceId ?? opts.actor } : {}),
     });
-    const system = opts.system ?? (a.system ? await resolveDyn(a.system, rc) : undefined);
+    const system = opts.system ?? (a.system ? await resolveDyn(a.system, dynCtx) : undefined);
     const processors = [...(config.processors ?? []), ...(a.processors ?? [])];
     const mergedTools = { ...config.tools, ...agentTools, ...subTools, ...wfTools };
     // A background tool reaches the model as its launcher (see BACKGROUND TOOLS above).
@@ -1710,6 +1874,8 @@ export function createGnl(config: CreateGnlConfig) {
       // uygulamalar, CLI, testler) için tek kimlik kanalı odur — ama yalnız mühürlü kimlik YOKKEN.
       ...((serverIdentity.resourceId ?? opts.actor) ? { actor: serverIdentity.resourceId ?? opts.actor } : {}),
       approvals: opts.approvals,
+      ...(opts.answerer ? { answerer: opts.answerer } : {}),
+      ...(config.approvers ? { approvers: config.approvers } : {}),
       stopWhen: stepCountIs(a.maxSteps ?? 12),
       ...(opts.temperature != null ? { temperature: opts.temperature } : {}),
       ...(opts.topP != null ? { topP: opts.topP } : {}),
@@ -1723,13 +1889,14 @@ export function createGnl(config: CreateGnlConfig) {
       ...(opts.conflictLedger !== undefined ? { conflictLedger: opts.conflictLedger } : {}),
       ...(opts.auditOnReject ? { auditOnReject: opts.auditOnReject } : {}),
       ...((opts.replayDisclosure ?? config.replayDisclosure) ? { replayDisclosure: opts.replayDisclosure ?? config.replayDisclosure } : {}),
+      ...(config.questionText ? { questionText: config.questionText } : {}),
       ...(opts.channel ? { channel: opts.channel } : {}),
       ...(opts.tombstonePolicy ? { tombstonePolicy: opts.tombstonePolicy } : {}),
       // Parity with runAgent: the stream path dropped it, so a strict provider's schema rules never applied
       // to a streamed (now: every registry) run.
       ...(config.schemaCompat ? { schemaCompat: config.schemaCompat } : {}),
       ...(opts.replay ? { replay: opts.replay } : {}),
-      ...(opts.timeouts ? { timeouts: opts.timeouts } : {}),
+      timeouts: effectiveTimeouts(config.timeouts, opts.timeouts),
       ...(opts.exclusiveModelStep ? { exclusiveModelStep: opts.exclusiveModelStep } : {}),
       // (b): stream-only visibility callback (run() throws instead — see RunOptions.onBlocked).
       ...(opts.onBlocked ? { onBlocked: opts.onBlocked } : {}),
@@ -1764,7 +1931,7 @@ export function createGnl(config: CreateGnlConfig) {
     if (!net) throw new Error(`network '${name}' is not registered`);
     const rc = opts.context ?? {};
     // Ajan yollarıyla AYNI öncelik: mühürlü kimlik kazanır, gövdeden gelen ancak mühür yokken.
-    const serverIdentity = serverIdentityOf(rc);
+    const serverIdentity = sealOf(rc, opts);
     const caller = callerOfCall(rc, opts);
     const effectiveResourceId = userIdOf(caller);
     const effectiveThreadId = serverIdentity.threadId ?? opts.threadId;
@@ -2002,7 +2169,7 @@ export function createGnl(config: CreateGnlConfig) {
    * refused. Returns who the run acts for.
    */
   async function enterWorkflowRun(name: string, runId: string, opts: WorkflowRunOpts | undefined, work: { workKey: string; workScope: WorkScope } | undefined): Promise<Caller> {
-    const seal = serverIdentityOf(opts?.context ?? {});
+    const seal = sealOf(opts?.context ?? {}, opts);
     const actor = seal.resourceId ?? opts?.actor;
     const thread = seal.threadId ?? opts?.threadId;
     const { acting } = await admitRun(journal, runId, workflowCaller(opts), withMintOf({
@@ -2031,7 +2198,7 @@ export function createGnl(config: CreateGnlConfig) {
     //
     // Note the type prefix (`wf:`): a workflow and an agent may share a registry name, and without it
     // `pay` the pipeline and `pay` the agent would derive ONE id from one workKey.
-    const wfSeal = serverIdentityOf(opts?.context ?? {});
+    const wfSeal = sealOf(opts?.context ?? {}, opts);
     const wfIdentityGate = resolveWorkIdentity(`wf:${name}`, {
       ...(opts?.runId !== undefined ? { runId: opts.runId } : {}),
       ...(opts?.workKey !== undefined ? { workKey: opts.workKey } : {}),
@@ -2081,7 +2248,7 @@ export function createGnl(config: CreateGnlConfig) {
     // şey değil: biri masumiyet ("bu thread henüz kimsenin"), diğeri bilgisizlik ("kimin olduğunu
     // soramadım"). Bilgisizlik geçiş hakkı değildir; hata yayılsın, koşum başlamasın.
     {
-      const gateIdentity = serverIdentityOf(opts?.context ?? {});
+      const gateIdentity = sealOf(opts?.context ?? {}, opts);
       const gateThread = gateIdentity.threadId ?? opts?.threadId;
       // The same gate as the agent door (thread-owner.ts), for every memory.
       if (gateThread) await admitThreadRun(journal, resolvedMemory, gateThread, workflowCaller(opts));
@@ -2166,7 +2333,7 @@ export function createGnl(config: CreateGnlConfig) {
     // SAHİP KAYDI — ilk yazan kazanır (koşum kimliği devir boyunca değişmez). `wfrun:` durum
     // kütüğüyle karışmasın diye ayrı: o "iş akışı nerede", bu "kimin işi".
     {
-      const wfThread = serverIdentityOf(opts?.context ?? {}).threadId ?? opts?.threadId;
+      const wfThread = sealOf(opts?.context ?? {}, opts).threadId ?? opts?.threadId;
       // `work` (package #3): the declared name joins the record. Tonight's reconciliation is an
       // org-scoped, subject-less derived run, useless to an operator if its opaque id maps back to
       // nothing.
@@ -2190,29 +2357,41 @@ export function createGnl(config: CreateGnlConfig) {
     let canceled = false;
     let stepId: string | undefined;
     let reason: unknown;
-    if (wf.runResumable) {
-      const rOpts = {
-        ...(opts?.maxSteps != null ? { maxSteps: opts.maxSteps } : {}),
-        ...(opts?.resume ? { resume: opts.resume } : {}),
-        ...(opts?.signal ? { signal: opts.signal } : {}),
-        // FLOW-08: `name` is known here (the registry key) — mirrored into the `wfrun:` status
-        // record so the run registry/studio can display the workflow's name.
-        workflowName: name,
-      };
-      const r = await wf.runResumable(input, ctx, Object.keys(rOpts).length ? rOpts : undefined);
-      if (r.status === 'suspended') { suspended = true; stepId = r.stepId; reason = r.reason; }
-      else if (r.status === 'paused') { paused = true; stepId = r.stepId; }
-      else if (r.status === 'canceled') { canceled = true; stepId = r.stepId; reason = r.reason; }
-      else output = r.output;
-    } else {
-      if (opts?.maxSteps != null) throw new Error(`workflow '${name}' does not support step-through (no runResumable)`);
-      try {
-        output = await wf.run(input, ctx);
-      } catch (e: any) {
-        if (e?.name === 'WorkflowSuspended') { suspended = true; reason = e?.reason; }
-        else throw e;
+    // THE RUN'S OWN VERDICT. The run row is derived from the outcome record, and a workflow that threw used to
+    // leave none: no `wfrun:` record either (that one is written only on a terminal/suspend transition), so a
+    // failed run listed as `completed` — through the scheduler, a queue and a direct `runWorkflow` alike.
+    // Written here because this is where every workflow run starts and ends, whoever called it.
+    const attempt = await attemptStart(journal);
+    try {
+      if (wf.runResumable) {
+        const rOpts = {
+          ...(opts?.maxSteps != null ? { maxSteps: opts.maxSteps } : {}),
+          ...(opts?.resume ? { resume: opts.resume } : {}),
+          ...(opts?.signal ? { signal: opts.signal } : {}),
+          // FLOW-08: `name` is known here (the registry key) — mirrored into the `wfrun:` status
+          // record so the run registry/studio can display the workflow's name.
+          workflowName: name,
+        };
+        const r = await wf.runResumable(input, ctx, Object.keys(rOpts).length ? rOpts : undefined);
+        if (r.status === 'suspended') { suspended = true; stepId = r.stepId; reason = r.reason; }
+        else if (r.status === 'paused') { paused = true; stepId = r.stepId; }
+        else if (r.status === 'canceled') { canceled = true; stepId = r.stepId; reason = r.reason; }
+        else output = r.output;
+      } else {
+        if (opts?.maxSteps != null) throw new Error(`workflow '${name}' does not support step-through (no runResumable)`);
+        try {
+          output = await wf.run(input, ctx);
+        } catch (e: any) {
+          if (e?.name === 'WorkflowSuspended') { suspended = true; reason = e?.reason; }
+          else throw e;
+        }
       }
+    } catch (err) {
+      if (classifyRunError(err) === 'failure') await runFailed(journal, runId, err, Date.now(), attempt);
+      throw err;
     }
+    // Suspended, paused and canceled runs have not ended; only a finished one is `completed`.
+    if (!suspended && !paused && !canceled) await runSucceeded(journal, runId, Date.now(), attempt);
     const steps: WorkflowRunResult['steps'] = [];
     for (const s of wf.build()) {
       // A plain `get`, deliberately: @gnldev/workflow writes this marker with a plain `put` for

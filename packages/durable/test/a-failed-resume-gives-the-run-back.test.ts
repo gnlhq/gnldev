@@ -53,6 +53,34 @@ describe.each(STORES)('a failed resume gives the run back — %s', (_name, make)
     await b.close();
   });
 
+  it('its reader is told it waits for an operator, not handed an end with no answer (d25 U6)', async () => {
+    const storage = await make();
+    const journal = storage.runs as unknown as Journal;
+    const runId = `r-told-${unique()}`;
+    await journal.put(execKey(undefined, runId), { v: 1, runId, owner: 'a-process-that-died', status: 'running', at: Date.now() - 60_000, from: 0, meta: { agent: 'support' } });
+    await journal.put(`${runId}:outcome`, { status: 'running', at: Date.now() - 60_000 });
+    const b = executorOn(journal, `B-${unique()}`);
+    await b.sweep();
+    // The client sending the same request again: the run is parked, so it reads the run's log from the start.
+    const started = await b.start({ runId, launch: async () => { throw new Error('a parked run is not launched by a caller'); } });
+    expect(started.state).toBe('parked');
+    const seen: Array<{ kind: string; data: any }> = [];
+    for await (const ev of b.follow({ runId, after: started.from, untilPause: true })) seen.push(ev as any);
+    expect(seen.at(-1)).toMatchObject({ kind: 'status', data: { state: 'failed', error: { code: 'run_not_continued' } } });
+    expect(seen.at(-1)!.data.error.message).toMatch(/could not be continued — nothing was run again/);
+    // Nothing of it was written: the run did not fail, an operator may still continue it.
+    expect(await journal.get<any>(`${runId}:outcome`)).toMatchObject({ status: 'running' });
+    // …and the operator's list says why it waits, not "waiting on a human (approval)".
+    expect((await b.pending()).find((p) => p.runId === runId)?.reason).toBe("could not be continued: no agent 'support' here");
+    // A run parked on a human's answer still ends its follow quietly (the question is in its log).
+    const asked = `r-asked-${unique()}`;
+    await journal.put(execKey(undefined, asked), { v: 1, runId: asked, owner: 'gone', status: 'parked', at: Date.now(), from: 0, meta: { agent: 'support' } });
+    const quiet: unknown[] = [];
+    for await (const ev of b.follow({ runId: asked, after: 0, untilPause: true })) quiet.push(ev);
+    expect(quiet).toEqual([]);
+    await b.close();
+  });
+
   it('a run that never began has its record removed: its next caller starts it', async () => {
     const storage = await make();
     const journal = storage.runs as unknown as Journal;
