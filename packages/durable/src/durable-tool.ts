@@ -21,7 +21,7 @@ import { judgeGrayPair } from './semantic-judge.js';
 import { xidPlanOf, readXid, xidWhen, amountsDifferOf, completeOwnXid, writeXid, type XidPlan, type XidHeld } from './xid.js';
 import { Attempt, AttemptLost, compareAndSet, isUnstartedRelease, type DupMarker, type TerminalWriter } from './attempt.js';
 import { claimTtlFor, claimTimeLeft, claimIsLive, journalNow, newHoldId, releaseHold } from './liveness.js';
-import { procStampFor, bindOwnLiveness, isDraining, RunDrainedError, livenessFor } from './process-liveness.js';
+import { procStampFor, bindOwnLiveness, isDraining, RunDrainedError, livenessFor, giveBack, LivenessUnavailableError } from './process-liveness.js';
 import type { SemPlan } from './semantic-dup.js';
 import type { RunLimits, ToolSeat } from './limits.js';
 import { createProcessorCtx } from './processor.js';
@@ -865,8 +865,10 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // (liveness.ts) — the reader's value only for a claim written before claims carried one.
       const claimTtl = claimTtlFor(tool, ctx);
       const readRecord = (raw: unknown): ToolJournalRecord | undefined => isUnstartedRelease(raw) ? undefined : upgradeFormat(raw as ToolJournalRecord, key);
+      // `detail.key`: the call another attempt holds. A detached run that meets it waits for that call's record
+      // (detached.ts: parked like an unknown outcome) instead of ending failed while the holder settles it.
       const busy = (): unknown => blockedOrThrow(ctx, toolCallId, toolName,
-        new RunBusyError(`'${toolName}' (${key}) is being executed by another executor`));
+        Object.assign(new RunBusyError(`'${toolName}' (${key}) is being executed by another executor`), { detail: { key } }));
       // A BODY THAT LOST ITS CALL ANSWERS WITH THE CALL'S RECORD. When its success could not be the call's
       // record (Attempt.succeed: the call was taken over while the body ran — a stall past the TTL, a
       // liveness session cut), its caller gets what a fresh call gets: the record that answers the call, or
@@ -1032,6 +1034,19 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // yüzeye de zaten çocuğun kimliği çıkıyor (run.ts `surfacedInterrupts`), yani standart
       // istemci sözleşmesi doğru id'yi kendiliğinden taşır.
       const approved = isProxySuspend ? undefined : ctx.approvals?.[toolCallId];
+      // THE GUARD, asked the same way wherever it is asked. TAINT PHASE 2 (taint-aware guard): the guard
+      // sees the run's taint mark (undefined = clean) so policies like `taintGuardian` can gate SENSITIVE
+      // tools only when untrusted content has entered. The read happens ONLY when a guard is asked.
+      const askGuard = async () => ctx.guard!({ toolName, args: input, toolCallId, runId: ctx.runId, tainted: await readRunTaint(ctx.journal, ctx.runId) });
+      // A guard's `deny` on a tool with `confirm` (d25 U8). Its `confirm` question used to come first and the
+      // approved call then skipped the guard (it meets the suspended-record arm, never the guard arm), so a
+      // deny-everything guard was asked 0 times and the call ran on a human's yes. Now it is asked before
+      // the question — a caller it refuses is not shown the question at all — and again after the yes.
+      const guardDenial = async (): Promise<{ __denied: true; reason: string } | undefined> => {
+        if (!ctx.guard) return undefined;
+        const decision = await askGuard();
+        return decision.action === 'deny' ? { __denied: true, reason: decision.reason ?? 'Denied by policy.' } : undefined;
+      };
 
       // 2) Suspended call: if it was previously suspended and there's no approval, return the sentinel again (still suspended).
       if (record && record.status === 'suspended') {
@@ -1095,7 +1110,15 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           // another run's id from there long after this branch was fixed.
           return await consumeExistingRecord(ctx, key, record, toolCallId);
         }
-        // Approved === true → run below.
+        // Approved === true → run below — past the guard, which a `confirm` question was asked before
+        // and is asked again now (guardDenial above): what it refuses, a human's yes does not run.
+        if (!isProxySuspend && suspendKindOf(record) === 'confirm') {
+          const denied = await guardDenial();
+          if (denied) {
+            { const moved = await decide({ status: 'denied', output: denied }); if (moved) return moved.answered; }
+            return denied;
+          }
+        }
         //
         // Aşağıdaki iki iz de SORUYU SORMUŞ bir kayda aittir: 'bilerek tekrar' izi ve semantik mezar
         // taşı, ikisi de "insan bu SORUYA evet dedi" cümlesini kaydeder. Vekil kayıt hiç soru
@@ -1156,6 +1179,14 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           const output = { __denied: true, reason: 'Confirmation denied.' };
           { const moved = await decide({ status: 'denied', output }); if (moved) return moved.answered; }
           return output;
+        }
+        // The guard before the question (guardDenial): a call it refuses is never put to a human.
+        {
+          const denied = await guardDenial();
+          if (denied) {
+            { const moved = await decide({ status: 'denied', output: denied }); if (moved) return moved.answered; }
+            return denied;
+          }
         }
         let reason =
           (typeof tool.confirm === 'object' && typeof tool.confirm.reason === 'function'
@@ -1267,12 +1298,8 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         { const moved = await decide({ status: 'suspended', output: sentinel }); if (moved) return moved.answered; }
         return sentinel;
       } else if (ctx.guard) {
-        // 3) General policy: check at the gate before execute (gate the side effect).
-        // TAINT PHASE 2 (taint-aware guard): the guard sees the run's taint mark (undefined = clean)
-        // so policies like `taintGuardian` can gate SENSITIVE tools only when untrusted content has
-        // entered. The read happens ONLY when a guard is present — guard-less runs pay nothing.
-        const tainted = await readRunTaint(ctx.journal, ctx.runId);
-        const decision = await ctx.guard({ toolName, args: input, toolCallId, runId: ctx.runId, tainted });
+        // 3) General policy: check at the gate before execute (gate the side effect) — `askGuard` above.
+        const decision = await askGuard();
         if (decision.action === 'deny') {
           const output = { __denied: true, reason: decision.reason ?? 'Denied by policy.' };
           { const moved = await decide({ status: 'denied', output }); if (moved) return moved.answered; }
@@ -1318,9 +1345,14 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // In default 'call' mode that duplicate would silently re-execute (double charge) unless the
       // developer remembered `idempotency: 'args'` — the journal KNOWS it's a duplicate, so the
       // runtime must at minimum SAY so (default 'warn'), and can steer/stop/escalate on request.
-      // Scope guards: 'args' mode dedups on its own (fast-path above); an EXPLICIT approval for this
-      // toolCallId means a human already blessed this exact repeat (stand down); replay never gets
-      // here (the fast-path returns the journaled record first).
+      // Scope guards: 'args' mode dedups on its own (fast-path above) — but only INSIDE its window: in the
+      // 'run' window (the default) a new run is a new key, so a chat's next message repeating the same
+      // transfer met neither the record nor this ladder and ran again, no question asked (d25 U2: the
+      // 'critical' profile's "every repeat is a human question" broken by the stricter declaration). So the
+      // ladder runs for 'args' in the 'run' window too; a wider window ('thread', 'cross-run') still answers
+      // a repeat from its record, before this. An EXPLICIT approval for this toolCallId means a human
+      // already blessed this exact repeat (stand down); replay never gets here (the fast-path returns the
+      // journaled record first).
       const dupCfg = dupConfigOf(ctx.limits?.sideEffectDuplicates, tool.effectClass);
       const dupAction = dupCfg.action;
       // FAZ-3 scope: 'thread' widens the marker to the conversation (xthr:<threadId>:dup-…) — the
@@ -1331,7 +1363,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         dupScope = 'run';
       }
       let dupWhere = dupScope === 'thread' ? `thread '${ctx.threadId}'` : `run '${ctx.runId}'`;
-      const dupKey = mode === 'call' && sideEffect && dupAction !== 'off'
+      const dupKey = (mode === 'call' || effWindow === 'run') && sideEffect && dupAction !== 'off'
         ? dupScope === 'thread'
           ? threadDupMarkerKey(ctx.threadId!, toolName, hash)
           : dupMarkerKey(requestOf(ctx.identity), toolName, hash)
@@ -1857,8 +1889,9 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       // (attempt.ts): by compare-and-set over its own stamp, with every side write of the choke point.
       const writeAsAttempt: TerminalWriter = (rec, expected, xidHeld) =>
         writeToolTerminal(ctx, key, rec, { expected }, toolCallId, toolName, hash, { dupKey, semPlan, xidPlan, xidHeld, idempotencyKey: derivedKey });
-      const own = (prior: unknown, stamp: ReturnType<typeof runningStamp>, datedAt: number): Attempt =>
-        (seat.attempt = new Attempt(ctx.journal, key, prior, stamp, datedAt, toolName, writeAsAttempt, { runId: ctx.runId, ...(ctx.erasure ? { baseline: ctx.erasure } : {}) }));
+      // `session`: this process's session signal as it stood BEFORE the stamp was dated (Attempt.assertHeld).
+      const own = (prior: unknown, stamp: ReturnType<typeof runningStamp>, datedAt: number, session: AbortSignal | undefined): Attempt =>
+        (seat.attempt = new Attempt(ctx.journal, key, prior, stamp, datedAt, toolName, writeAsAttempt, { runId: ctx.runId, ...(ctx.erasure ? { baseline: ctx.erasure } : {}) }, session));
       let attempt: Attempt;
       claimLoop: for (;;) {
         // The journal's clock, not this process's — run-lock.ts has always done it this way and
@@ -1868,6 +1901,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // `datedAt` (this process's monotonic clock, read first) is how old the attempt knows its
         // own stamp to be — see Attempt.assertHeld.
         const datedAt = performance.now();
+        const session = livenessFor(ctx.journal)?.sessionSignal?.();
         const nowTs = await journalNow(ctx.journal);
         if (record === undefined) {
           // `attempts: 1` from the very first claim: the crash ladder below counts takeovers, and a
@@ -1879,7 +1913,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           const won = await claim(ctx.journal, key, stamp);
           const raw = won ? undefined : await ctx.journal.get<ToolJournalRecord>(key);
           if (won || (isUnstartedRelease(raw) && (await compareAndSet(ctx.journal, key, raw, stamp)))) {
-            attempt = own(raw, stamp, datedAt);
+            attempt = own(raw, stamp, datedAt, session);
             if (ownerKey) await claimCrossRunOwner(ctx, toolName, hash);
             break claimLoop;
           }
@@ -2174,6 +2208,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         // gate above), so a takeover stamped with a fast local clock would look instantly stale to
         // every other worker — the exact skew class the clock fix removed, re-entering here.
         const takeoverDatedAt = performance.now();
+        const takeoverSession = livenessFor(ctx.journal)?.sessionSignal?.();
         const nowTakeover = await journalNow(ctx.journal);
         // A FRESH 'running' claim at the re-read is a live executor, whatever the ladder judged. Two
         // workers resuming with the same approval both judged the 'suspended' record; the first took it
@@ -2200,7 +2235,7 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
           if (mode !== 'args') return busy();
           continue claimLoop;
         }
-        attempt = own(rawBefore, takeover, takeoverDatedAt);
+        attempt = own(rawBefore, takeover, takeoverDatedAt, takeoverSession);
         break claimLoop; // reclaim complete → execute below
       }
 
@@ -2244,9 +2279,14 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
       }
       // THE PROCESS'S SESSION, AS A SIGNAL. A process whose liveness session is gone and not back within
       // half its reconnect grace may soon be read as dead by the others, and this call taken over: the body
-      // is told to stop (process-liveness.ts `sessionSignal`). A body that honours it ends its attempt like
-      // any failed one; one that does not keeps running — its effect may then happen twice, and the
-      // provider's idempotencyKey is what folds the two.
+      // is told to stop (process-liveness.ts `sessionSignal`). A body that honours it — however it says so:
+      // the signal's reason rethrown, Node's AbortError (timers/promises, events.once, stream.pipeline), or
+      // an error of its own — has its attempt journaled 'failed' (its effect may have happened), but the
+      // call leaves as LivenessUnavailableError (see the body's catch below): the model is NOT told the tool
+      // failed. The detached executor releases the execution and the run continues from its log, here once
+      // the session is back or in another process; the failed attempt then meets the crash ladder
+      // (idempotency key → recover() → a person), never a blind re-run. One that does not honour it keeps
+      // running — its effect may then happen twice, and the provider's idempotencyKey is what folds the two.
       const sSignal = livenessFor(ctx.journal)?.sessionSignal?.();
       if (sSignal) execOpts.abortSignal = execOpts.abortSignal ? AbortSignal.any([execOpts.abortSignal, sSignal]) : sSignal;
       // SAME-STEP DUPLICATE RACE — claimed HERE, after every gate that can stop this call.
@@ -2425,6 +2465,31 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         }
       }
       let output: unknown;
+      // ITS RECORD IS STILL BEING WRITTEN, in the background: the body ran, and the store did not take the
+      // outcome (settleSuccess, or a body stopped by its session below). The attempt ends when that write
+      // lands, not before: its stamp reads live meanwhile (a twin waits for the record rather than run the
+      // call). Ended with its stamp still the record, the call read as in flight to every other process for as
+      // long as this one lived (liveness.ts `holderIsLive` rule 3: its process answers) — a retry of the same
+      // work on another process under a 'thread' or 'cross-run' window waited on it with no end (D3 retry
+      // audit: >70 s, no answer); only this process could read it as over (rule 2).
+      let successPending = false;
+      const keepWriting = (what: string, write: () => Promise<unknown>): void => {
+        attempt.outlived = true;
+        successPending = true;
+        seat.late = seat.held !== undefined || seat.slot !== undefined;
+        let said = false;
+        void giveBack(`${key}#${what}#${attempt.attempts}`, ctx.journal, async () => {
+          try {
+            await write();
+          } catch (err) {
+            if (!said) console.warn(`@gnldev/durable: '${toolName}' ran its body, and its ${what} record (${key}) could not be written yet — retried until it lands:`, err);
+            said = true;
+            throw err;
+          }
+          attempt.end();
+          if (seat.late) await releaseSeat(seat).catch(() => undefined);
+        });
+      };
       // The value the call settles with: the processed output, journaled. A closure because a timed-out
       // attempt is still alive and settles LATER — through the same path (see the catch below).
       const settleSuccess = async (raw: unknown): Promise<unknown> => {
@@ -2460,12 +2525,35 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
         }
         // The effect happened: recorded over this attempt's claim, or — when the call was taken over
         // while the body ran (a stall past the TTL, the lease's residual) — as the fact it is (Attempt.succeed).
-        const written = await attempt.succeed({
+        const success: ToolJournalRecord = {
           status: 'succeeded', output, argsHash: hash, toolName,
           // A compensate-bearing tool's success stores the RAW args — the unwind needs them.
           ...(typeof tool.compensate === 'function' ? { input } : {}),
           ...(tool.delegation === true ? { delegation: true as const } : {}),
-        });
+        };
+        let written: boolean;
+        try {
+          written = await attempt.succeed(success);
+        } catch (writeErr) {
+          // THE EFFECT HAPPENED AND ITS RECORD COULD NOT BE WRITTEN (the store stopped answering: a restart,
+          // a failover, a dropped session). That is not a failed call: told "the tool failed", the model
+          // answered without it and the person was shown a done effect as failed — an invitation to do it a
+          // second time by hand (liveness-audit D3: 10 of 10 trials, the run `completed`, the record left
+          // `running`). The success is a fact, so it is kept being written, in the background, until it
+          // lands (process-liveness.ts `giveBack`: backoff, dropped only when the store closes); the attempt
+          // stays held meanwhile (its stamp reads live: a twin waits for its record rather than run it). The
+          // call leaves as LivenessUnavailableError: the detached executor releases the execution, and the
+          // run continues once the record is there (detached.ts waits on the busy call) — or, if this
+          // process dies first, through the crash ladder (recover() → a person), never a blind re-run.
+          // A run deleted or canceled meanwhile is not a store that did not answer: that error leaves as it is.
+          const named = (writeErr as { name?: unknown } | null)?.name;
+          if (named === 'RunErasedError' || named === 'RunCanceledError') throw writeErr;
+          keepWriting('succeeded', () => attempt.succeed(success));
+          throw new LivenessUnavailableError(
+            `@gnldev/durable: '${toolName}' ran its body, but its record could not be written (the store did not answer) — the run is released and continues from the call's result once it is written`,
+            { cause: writeErr },
+          );
+        }
         // NOTE: taint for `untrusted` tools is now marked at INVOCATION (see above), not here —
         // marking after execute lost the same-step parallel race against a side-effect tool's taint read.
         return written ? output : answerLost(output);
@@ -2566,10 +2654,33 @@ export function durableTool<T extends AnyTool>(tool: T, ctx: DurableCtx, toolNam
             (late) => settleSuccess(late).then(() => undefined),
             (lateErr) => settleFailure(lateErr).then(() => undefined),
           ).finally(async () => {
+            if (successPending) return; // ended by its success write, once it lands
             attempt.end();
             if (seat.late) await releaseSeat(seat);
           }).catch((e) => console.warn(`@gnldev/durable: '${toolName}' finished after its timeout and its outcome could not be journaled:`, e));
           throw error;
+        }
+        // STOPPED BY ITS SESSION (the signal above), however the body said so: the attempt is journaled
+        // 'failed' as any other (its effect may have happened), but the call is RELEASED, not failed — the
+        // model is not told (process-liveness.ts LivenessUnavailableError; detached.ts releases on its name).
+        // The event the detached executor reads keeps the error's name and message only (event-codec.ts
+        // errorData), so a body that answered with Node's AbortError (its `cause` the reason) or an error of
+        // its own was read as a failed tool: the model answered without the call and the run `completed`
+        // with its effect never done (liveness-audit D1: 10 of 10). A failure that cannot even be written
+        // (the store gone with the session) leaves the same way, its record kept being written until it lands
+        // (keepWriting); the continuation meets it on the crash ladder.
+        if (sSignal?.aborted) {
+          let failed: unknown;
+          try { failed = await settleFailure(error); } catch (writeErr) {
+            failed = writeErr;
+            const named = (writeErr as { name?: unknown } | null)?.name;
+            if (named !== 'RunErasedError' && named !== 'RunCanceledError') keepWriting('failed', () => settleFailure(error));
+          }
+          if ((failed as { name?: unknown } | null)?.name === 'LivenessUnavailableError') throw failed;
+          throw new LivenessUnavailableError(
+            `@gnldev/durable: '${toolName}' was stopped because this process lost its liveness session — the run is released and continues from its log`,
+            { cause: failed },
+          );
         }
         throw await settleFailure(error);
       }

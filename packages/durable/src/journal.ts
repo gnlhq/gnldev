@@ -562,6 +562,9 @@ export interface RunOutcomeRecord {
   errorCode?: string;
   /** The failing error's HTTP `statusCode` (a retry wrapper's: its last error's), when it carries one. */
   errorStatus?: number;
+  /** A provider failure's URL (origin + path, no query) and a short secret-masked body excerpt — see `safeUpstreamUrl`/`safeUpstreamBody`. */
+  errorUrl?: string;
+  errorBody?: string;
 }
 
 
@@ -1021,6 +1024,21 @@ export async function* runPages(journal: Journal, limit: number): AsyncGenerator
     if (!p.nextCursor) return;
     page = await j.listRuns.call(journal, { cursor: p.nextCursor, limit });
   }
+}
+
+/**
+ * Whether the run is RECORDED, steps or none: it has a frozen `:input` or a recorded outcome — the two
+ * records, beside the steps, that put a run in `listRuns`. `readRun` answers only the steps, so a run that
+ * died before its first model step (the provider refused the first call) reads as an empty list there while
+ * it is listed; "not found" for such a run hid exactly the one an operator opens to see why it failed.
+ * Reads through whatever view the journal is (a subject view hides another user's records, so a run that is
+ * not theirs is "not recorded" to them, same as one that does not exist).
+ */
+export async function isRunRecorded(journal: Pick<Journal, 'get'>, runId: string): Promise<boolean> {
+  for (const key of [runKeys.input(runId), runKeys.outcome(runId)]) {
+    if ((await journal.get(key)) !== undefined) return true;
+  }
+  return false;
 }
 
 /**

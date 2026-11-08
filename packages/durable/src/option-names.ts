@@ -19,7 +19,7 @@ import type { SuggestionsConfig } from './suggestions.js';
 
 export const CREATE_GNL_NAMES = optionNames<CreateGnlConfig>()([
   'storage', 'journal', 'agents', 'tools', 'memory', 'memoryFactory', 'processors', 'workflows', 'networks',
-  'checkSuiteConsistency', 'schemaCompat', 'preset', 'suggestions', 'replayDisclosure', 'liveness', 'detached',
+  'checkSuiteConsistency', 'schemaCompat', 'preset', 'suggestions', 'replayDisclosure', 'liveness', 'detached', 'timeouts',
 ]);
 export const AGENT_NAMES = optionNames<AgentConfig>()([
   'description', 'model', 'tools', 'system', 'guard', 'maxSteps', 'processors', 'agents', 'workflows', 'scorers',
@@ -122,6 +122,7 @@ export function refuseConfigNames(where: string, config: unknown): void {
 /** createGnl's config, and every agent, network and run-level option bag inside it. */
 export function refuseCreateGnlNames(config: CreateGnlConfig): void {
   refuseConfigNames('createGnl', config);
+  refuseUnknownNames('createGnl: timeouts', config.timeouts, TIMEOUT_NAMES);
   for (const [name, a] of Object.entries(config.agents ?? {})) {
     refuseUnknownNames(`createGnl: agents.${name}`, a, AGENT_NAMES, AGENT_NAME_NOTES);
     refuseUnknownNames(`createGnl: agents.${name}.scorerSampling`, a?.scorerSampling, SCORER_SAMPLING_NAMES);

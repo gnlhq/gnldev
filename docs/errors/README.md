@@ -71,6 +71,7 @@ The same runId succeeds once the block clears.
 | [`step_retry_blocked`](./step_retry_blocked.md) | 409 | The workflow form of the above. |
 | [`retry_limit_exceeded`](./retry_limit_exceeded.md) | 422 | A tool hit `maxRetries` and is permanently failed. |
 | [`outcome_unknown`](./outcome_unknown.md) | 409 | A tool hit `maxRetries` without ever reporting; the run waits for what happened. |
+| [`run_not_continued`](./run_not_continued.md) | 409 | Its process died and the one that took it over could not continue it; it waits for an operator. |
 
 ## The model provider failed
 

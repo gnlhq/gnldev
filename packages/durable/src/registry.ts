@@ -6,7 +6,7 @@ let wfAnonCounter = 0; // runWorkflow's anon-fallback uniqueness within a proces
 import type { ToolSchemaRuleLike } from './types.js';
 import { decodeStepRecord } from './step-record.js';
 import { stepCountIs, tool as aiTool, jsonSchema } from 'ai';
-import { runDurable, streamDurable } from './run.js';
+import { runDurable, streamDurable, CONTINUES_RECORDED_INPUT } from './run.js';
 import type { StreamBreach } from './run.js';
 import { resolveModel, withModelFallback, type FallbackCandidate } from './model-router.js';
 import { delegationTool, runDelegated, type ChildFrame, childOutcome } from './agent-tool.js';
@@ -578,7 +578,8 @@ export interface CreateGnlConfig {
    * 'assistant' ve 'headless' (heyet matrisi, 7 Eyl 2026): critical'ın sertlik paketini AÇMADAN,
    * yalnız sınıf-bazlı tekrar politikasını basarlar (policy-matrix.ts):
    *   assistant → para/bildirim sorar, delete "zaten yapılmıştı" notu, upsert sessiz;
-   *               replayDisclosure default 'explain' (ekranda insan var, dürüst anlatım açık).
+   *               replayDisclosure default 'explain' (ekranda insan var, dürüst anlatım açık);
+   *               `config.replayDisclosure` bunu geçersiz kılar (çağrı başına değer hepsinden üstün).
    *   headless  → soracak insan yok: para tekrarı typed-RED (DLQ'ya düşer), bildirim/delete atlar
    *               + iz; hiçbir hücre suspend üretmez. Zarf/iz her hücrede tam (görünmezlik yasağı).
    * Workflow/lock/strictInput kapıları bu ikisine GELMEZ — onlar critical'ın kimliğidir.
@@ -602,6 +603,15 @@ export interface CreateGnlConfig {
    * persists. Default 'silent' (existing behavior). See RunDurableArgs.replayDisclosure.
    */
   replayDisclosure?: 'explain' | 'silent';
+  /**
+   * Time limits for every run()/stream() of this instance (per-call `RunOptions.timeouts` wins, field by
+   * field). `modelStepMs` is the one that matters most: without it a provider connection that goes quiet
+   * leaves the run `running` until the HTTP client gives up (minutes, or never, depending on the runtime).
+   * It bounds a model step until its FIRST byte (a streamed answer that stalls mid-way is not covered).
+   * A step that times out fails the run with `StepTimeoutError`, which counts as the run's own failure.
+   * No default: a limit that fits a chat turn would cut a long non-streamed generation.
+   */
+  timeouts?: { modelStepMs?: number; toolMs?: number; claimTtlMs?: number };
 }
 
 /**
@@ -1219,7 +1229,9 @@ export function createGnl(config: CreateGnlConfig) {
     }
     const threadId = (owner.record as { threadId?: unknown } | undefined)?.threadId;
     const args = await streamArgs(agentName, { runId: rec.runId, caller: owner.owner, ...(typeof threadId === 'string' ? { threadId } : {}) });
-    return (signal) => streamDurable({ ...args, abortSignal: signal });
+    // From its recorded input, said as such (run.ts CONTINUES_RECORDED_INPUT): this call has no content
+    // of its own, and a workKey run's input check refused it as "different work" (d25 U6).
+    return (signal) => streamDurable({ ...args, [CONTINUES_RECORDED_INPUT]: true, abortSignal: signal });
   }
 
   // ── BACKGROUND TOOLS (types.ts `background`, deferred.ts) ─────────────────────────────────────────
@@ -1502,7 +1514,7 @@ export function createGnl(config: CreateGnlConfig) {
       opts = {
         ...opts,
         limits: { sideEffectDuplicates: { byClass: PRESET_MATRIX[config.preset], default: PRESET_DEFAULT[config.preset] }, ...(opts.limits ?? {}) },
-        ...(config.preset === 'assistant' ? { replayDisclosure: opts.replayDisclosure ?? 'explain' } : {}),
+        ...(config.preset === 'assistant' ? { replayDisclosure: opts.replayDisclosure ?? config.replayDisclosure ?? 'explain' } : {}),
       };
     }
     const a = agent(name);
@@ -1595,7 +1607,7 @@ export function createGnl(config: CreateGnlConfig) {
       ...(opts.tombstonePolicy ? { tombstonePolicy: opts.tombstonePolicy } : {}),
       ...(config.schemaCompat ? { schemaCompat: config.schemaCompat } : {}),
       ...(opts.replay ? { replay: opts.replay } : {}),
-      ...(opts.timeouts ? { timeouts: opts.timeouts } : {}),
+      ...((opts.timeouts || config.timeouts) ? { timeouts: { ...config.timeouts, ...opts.timeouts } } : {}),
       ...(opts.exclusiveModelStep ? { exclusiveModelStep: opts.exclusiveModelStep } : {}),
       ...((frame?.abortSignal ?? opts.abortSignal) ? { abortSignal: frame?.abortSignal ?? opts.abortSignal } : {}), // P0.2: see RunOptions.abortSignal; a child stops with its parent
       // The declaration travels with the run so package #2's writer can freeze it into `:input`:
@@ -1643,7 +1655,7 @@ export function createGnl(config: CreateGnlConfig) {
       opts = {
         ...opts,
         limits: { sideEffectDuplicates: { byClass: PRESET_MATRIX[config.preset], default: PRESET_DEFAULT[config.preset] }, ...(opts.limits ?? {}) },
-        ...(config.preset === 'assistant' ? { replayDisclosure: opts.replayDisclosure ?? 'explain' } : {}),
+        ...(config.preset === 'assistant' ? { replayDisclosure: opts.replayDisclosure ?? config.replayDisclosure ?? 'explain' } : {}),
       };
     }
     const a = agent(name);
@@ -1729,7 +1741,7 @@ export function createGnl(config: CreateGnlConfig) {
       // to a streamed (now: every registry) run.
       ...(config.schemaCompat ? { schemaCompat: config.schemaCompat } : {}),
       ...(opts.replay ? { replay: opts.replay } : {}),
-      ...(opts.timeouts ? { timeouts: opts.timeouts } : {}),
+      ...((opts.timeouts || config.timeouts) ? { timeouts: { ...config.timeouts, ...opts.timeouts } } : {}),
       ...(opts.exclusiveModelStep ? { exclusiveModelStep: opts.exclusiveModelStep } : {}),
       // (b): stream-only visibility callback (run() throws instead — see RunOptions.onBlocked).
       ...(opts.onBlocked ? { onBlocked: opts.onBlocked } : {}),

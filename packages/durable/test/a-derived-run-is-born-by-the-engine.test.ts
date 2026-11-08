@@ -5,7 +5,7 @@
 // refused, the whole network run failed, and the owner's erasure — which re-derives these ids from its
 // own records — deleted the stranger's run. Each test asserts the harmless outcome.
 // Postgres runs when GNL_PG_URL is set.
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
   InMemoryStorage, InMemoryJournal, createGnl, eraseSubject, purgeRun, runNetwork, runDurable, resumeRun, forkRun, type Storage,
 } from '../src/index.js';
@@ -14,8 +14,11 @@ import { PostgresStorage } from '../src/postgres-storage.js';
 import { user, runOwnerOf } from '../src/run-identity.js';
 import { createMockModel, toolCallResult, finalTextResult } from './mock.js';
 
-const ends: Array<() => Promise<unknown>> = [];
-afterAll(async () => { for (const e of ends.reverse()) await e(); });
+// A Postgres store of its own is closed when the test that opened it ends, not when the file does: each test opens one, each keeps up to
+// 10 pool connections plus its liveness session, and the file's stores together held 44 of the server's slots at once (measured, pg-budget-audit) — more than the test
+// budget (test/pg-connection-budget.setup.ts) gives a file, and the shared group's share of `max_connections` besides.
+const perTest: Array<() => Promise<unknown>> = [];
+afterEach(async () => { for (const e of perTest.splice(0).reverse()) await e(); });
 
 const PG_URL = process.env.GNL_PG_URL;
 const STORES: Array<[string, () => Promise<Storage>]> = [
@@ -25,7 +28,7 @@ const STORES: Array<[string, () => Promise<Storage>]> = [
 if (PG_URL) {
   STORES.push(['postgres (real)', async () => {
     const s = new PostgresStorage({ connectionString: PG_URL });
-    ends.push(() => s.close());
+    perTest.push(() => s.close());
     return s;
   }]);
 }
