@@ -166,7 +166,16 @@ export interface AnyTool {
    * memory). `confirm` is the tool-author's declaration that this effect is consequential enough to
    * ask a human EVERY first time — not a substitute for an idempotencyKey.
    */
-  confirm?: boolean | { reason?: (args: unknown) => string };
+  confirm?: boolean | { reason?: (args: unknown) => string } | ((args: any) => boolean | string);
+  /**
+   * The tool's own PERMISSION gate — the sibling of `confirm`, for a question only an authorised person may
+   * answer yes to (staff, the application's own server; never the end user whose work it is). Declared the
+   * same ways as `confirm`: `true`, `{ reason }`, or a function of the call's arguments returning `false`
+   * (no question), `true`, or the question's text (`(a) => a.amount > 1000 && 'over the limit'`). With no
+   * rule anywhere nobody is asked. Order: the agent's guard first, then this tool's `confirm`, then `approve`
+   * — a call can carry both, one question after the other. See `approvers` (createGnl) for who is authorised.
+   */
+  approve?: boolean | { reason?: (args: unknown) => string } | ((args: any) => boolean | string);
   /**
    * FAZ-6 — the tool-level half of the semantic dup gate's DOUBLE opt-in (the run-level half is
    * `limits.sideEffectDuplicates.semantic`). Declares which arg fields carry the business IDENTITY
@@ -230,7 +239,7 @@ export type ToolSet = Record<string, AnyTool>;
 export type ToolDurability = Pick<
   AnyTool,
   | 'sideEffect' | 'idempotent' | 'idempotency' | 'idempotencyKey' | 'idempotencyWindow'
-  | 'untrusted' | 'maxRetries' | 'timeoutMs' | 'claimTtlMs' | 'recover' | 'compensate' | 'confirm' | 'semanticIdentity' | 'lookup' | 'effectClass'
+  | 'untrusted' | 'maxRetries' | 'timeoutMs' | 'claimTtlMs' | 'recover' | 'compensate' | 'confirm' | 'approve' | 'semanticIdentity' | 'lookup' | 'effectClass'
   | 'background'
 >;
 
@@ -274,6 +283,7 @@ export function gnlTool<T>(t: T, durability: ToolDurability): T {
   refuseKeyWithoutWindow('gnlTool', durability, undefined, (t as { description?: unknown } | undefined)?.description);
   refuseUnknownNames('gnlTool: semanticIdentity', durability?.semanticIdentity, SEMANTIC_IDENTITY_NAMES);
   if (typeof durability?.confirm === 'object') refuseUnknownNames('gnlTool: confirm', durability.confirm, CONFIRM_NAMES);
+  if (typeof durability?.approve === 'object') refuseUnknownNames('gnlTool: approve', durability.approve, CONFIRM_NAMES);
   return Object.assign(t as any, durability) as T;
 }
 

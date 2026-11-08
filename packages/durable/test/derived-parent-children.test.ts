@@ -17,6 +17,7 @@ import { describe, it, expect } from 'vitest';
 import { InMemoryJournal, runKeys, nestedAgentRunId } from '../src/journal.js';
 import { assertRunIdSafe } from '../src/run.js';
 import { derivedRunId } from '../src/hash.js';
+import { mintCallId } from '../src/call-identity.js';
 import { rolloverRun } from '../src/rollover.js';
 import { purgeRun } from '../src/retention.js';
 import { enforceStepLimits } from '../src/limits.js';
@@ -98,21 +99,23 @@ async function devirSonrasiDelegasyon(journal: InMemoryJournal, tcid: string) {
     messages,
     limits: { maxTokens: 1_000_000 },
   } as never);
-  return { base, parent: newRunId, child: nestedAgentRunId(newRunId, tcid), res };
+  // The model boundary journals the call under its GNL id (model step 0 of the new term, first provider id).
+  const callId = mintCallId(tcid, newRunId, 0, 0);
+  return { base, parent: newRunId, callId, child: nestedAgentRunId(newRunId, callId), res };
 }
 
 describe('devrilmiş ebeveyn uçtan uca devredebilir', () => {
   it('alt koşum GERÇEKTEN koşar ve kendi journal\'ını yazar', async () => {
     const journal = new InMemoryJournal();
-    const { parent, child, res } = await devirSonrasiDelegasyon(journal, 'call-devir');
+    const { parent, callId, child, res } = await devirSonrasiDelegasyon(journal, 'call-devir');
 
-    expect(child).toBe(`${parent}:call-devir`.replace(/^/, 'agent:'));
+    expect(child).toBe(`${parent}:${callId}`.replace(/^/, 'agent:'));
     // Kırmızıda burası boştu: çocuk hiç doğmuyordu, çünkü kendi id'si reddediliyordu.
     expect(await journal.get(runKeys.input(child)), 'alt koşumun `:input` kaydı yok — hiç doğmamış').toBeDefined();
     expect(await journal.get(runKeys.model(child, 0)), 'alt koşumun model adımı yok').toBeDefined();
     // Ve ebeveyn devri gerçekten tamamlar (araç bir hatayla dönmez).
     expect(res.text).toBe('devir sonrası bitti');
-    const toolRec = await journal.get<{ status?: string; output?: any }>(runKeys.tool(parent, 'call-devir'));
+    const toolRec = await journal.get<{ status?: string; output?: any }>(runKeys.tool(parent, callId));
     expect(toolRec?.status).toBe('succeeded');
     expect(JSON.stringify(toolRec?.output)).toContain(ALT_CEVABI);
   });

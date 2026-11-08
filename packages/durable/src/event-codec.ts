@@ -9,7 +9,8 @@
 //
 // The vocabulary keeps what a reader needs and nothing a provider sent for itself: text, reasoning, tool
 // calls and their results (sentinels included — the doors' encoders hide them, as they always did), steps,
-// sources, files (media type + base64), errors (message, name, code, detail — never a stack).
+// sources, files (media type + base64), errors (message, name, code, detail, a provider failure's status,
+// credential-free URL and a short masked body excerpt, and a bounded stack — never headers or a full body).
 
 import * as EngineErrors from './errors.js';
 import { RunCanceledError } from './cancel.js';
@@ -21,16 +22,30 @@ export const RUN_EVENT_VERSION = 1;
 
 /**
  * An error as an event keeps it: what a door classifies it by — name, code, detail, and for a provider's
- * failure its HTTP status and `Retry-After` (a door answers 429/502/504 from them). Never a stack, never a
- * provider's response body or other headers.
+ * failure its HTTP status and `Retry-After` (a door answers 429/502/504 from them), the URL it called
+ * (origin + path, no query) and a short masked excerpt of its body — the clue a bare "Not Found" lacks.
+ * `stack`: the error's own stack, bounded (STACK_LINES), so the error a caller catches points at the line
+ * that threw — rebuilt from the event, it used to point at this file. Never a provider's other headers.
  */
-export interface ErrorData { message: string; name?: string; code?: string; detail?: unknown; statusCode?: number; retryAfter?: string }
+export interface ErrorData { message: string; name?: string; code?: string; detail?: unknown; statusCode?: number; retryAfter?: string; url?: string; responseBody?: string; stack?: string }
+
+/** How much of a stack an event keeps: the frames that say where, not an unbounded trace. */
+const STACK_LINES = 12;
+const STACK_CHARS = 2500;
+function boundedStack(stack: unknown): string | undefined {
+  if (typeof stack !== 'string' || stack === '') return undefined;
+  const cut = stack.split('\n').slice(0, STACK_LINES + 1).join('\n');
+  return cut.length > STACK_CHARS ? cut.slice(0, STACK_CHARS) : cut;
+}
 
 export function errorData(e: unknown): ErrorData {
   // A retry wrapper's own message says nothing; its last attempt's error is the failure.
   const r = e as { name?: unknown; lastError?: unknown } | null;
-  const x = (r?.name === 'AI_RetryError' && r.lastError ? r.lastError : e) as { message?: unknown; name?: unknown; code?: unknown; detail?: unknown; statusCode?: unknown; responseHeaders?: Record<string, unknown> } | null;
+  const x = (r?.name === 'AI_RetryError' && r.lastError ? r.lastError : e) as { message?: unknown; name?: unknown; code?: unknown; detail?: unknown; statusCode?: unknown; responseHeaders?: Record<string, unknown>; url?: unknown; responseBody?: unknown; stack?: unknown } | null;
   const retryAfter = x?.responseHeaders?.['retry-after'] ?? x?.responseHeaders?.['Retry-After'];
+  const url = typeof x?.statusCode === 'number' ? EngineErrors.safeUpstreamUrl(x.url) : undefined;
+  const responseBody = typeof x?.statusCode === 'number' ? EngineErrors.safeUpstreamBody(x.responseBody) : undefined;
+  const stack = boundedStack(x?.stack);
   return {
     message: String(x?.message ?? e),
     ...(typeof x?.name === 'string' && x.name !== 'Error' ? { name: x.name } : {}),
@@ -38,6 +53,9 @@ export function errorData(e: unknown): ErrorData {
     ...(x?.detail !== undefined ? { detail: plain(x.detail) } : {}),
     ...(typeof x?.statusCode === 'number' ? { statusCode: x.statusCode } : {}),
     ...(typeof retryAfter === 'string' ? { retryAfter } : {}),
+    ...(url !== undefined ? { url } : {}),
+    ...(responseBody !== undefined ? { responseBody } : {}),
+    ...(stack !== undefined ? { stack } : {}),
   };
 }
 
@@ -60,7 +78,9 @@ export function errorOf(e: ErrorData | undefined): Error {
   if (e?.name) err.name = e.name;
   if (e?.code) err.code = e.code;
   if (e?.detail !== undefined) err.detail = e.detail;
-  if (e?.statusCode !== undefined) Object.assign(err, { statusCode: e.statusCode, ...(e.retryAfter !== undefined ? { responseHeaders: { 'retry-after': e.retryAfter } } : {}) });
+  if (e?.statusCode !== undefined) Object.assign(err, { statusCode: e.statusCode, ...(e.retryAfter !== undefined ? { responseHeaders: { 'retry-after': e.retryAfter } } : {}), ...(e.url !== undefined ? { url: e.url } : {}), ...(e.responseBody !== undefined ? { responseBody: e.responseBody } : {}) });
+  // The original's stack, when the event kept one: the frame that threw, not `errorOf`.
+  if (e?.stack) Object.defineProperty(err, 'stack', { value: e.stack, writable: true, configurable: true });
   return err;
 }
 

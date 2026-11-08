@@ -21,6 +21,7 @@ import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { stampFormat } from '../src/format.js';
 import { execKey } from '../src/exec-record.js';
+import { mintCallId } from '../src/call-identity.js';
 import { textOf } from './detached/models.js';
 
 beforeAll(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
@@ -109,10 +110,12 @@ describe.each(STORES)('a run that ended outside the execution that follows it â€
     const runId = `r-whole-${unique()}`;
     const d = processD();
     await claimRunOwner(journal as any, runId, user('alice'));
-    const key = runKeys.tool(runId, 'call-1');
+    // The model names its call `call-1`; the journal holds it under GNL's id (step 0, first of the answer).
+    const callId = mintCallId('call-1', runId, 0, 0);
+    const key = runKeys.tool(runId, callId);
     const at = journal.now ? await journal.now() : Date.now();
     // The call at its ceiling: attempt 3 held by 'C' (gone), started, never reported.
-    await journal.put(key, stampFormat({ status: 'running', startedAt: at, attempts: MAX, claimTtlMs: TTL, idempotencyKey: `${runId}:call-1`, proc: 'C' }));
+    await journal.put(key, stampFormat({ status: 'running', startedAt: at, attempts: MAX, claimTtlMs: TTL, idempotencyKey: `${runId}:${callId}`, proc: 'C' }));
     const executions = { n: 0 };
     const calls = { n: 0 };
     const launch = (signal: AbortSignal) => streamDurable({ journal, runId, model: echoModel(calls), tools: { effect: effectTool(executions) }, prompt: 'do it', resourceId: 'alice', abortSignal: signal } as any);
@@ -137,7 +140,7 @@ describe.each(STORES)('a run that ended outside the execution that follows it â€
     // C wakes up: its body lands the effect, it records the result, and its stream goes on to the run's
     // end â€” what the late process does with the execution it was given. Its events are not written (the
     // numbers it holds are taken); the run's journal gets the result, the answer and the outcome.
-    await journal.put(key, stampFormat({ status: 'succeeded', output: 'done o-1', toolName: 'effect', idempotencyKey: `${runId}:call-1` }));
+    await journal.put(key, stampFormat({ status: 'succeeded', output: 'done o-1', toolName: 'effect', idempotencyKey: `${runId}:${callId}` }));
     const late = await streamDurable({ journal, runId, model: echoModel(calls), tools: { effect: effectTool(executions) }, prompt: 'do it', resourceId: 'alice' } as any) as any;
     for await (const _ of late.fullStream) { /* the late process's stream, to its end */ }
     expect(await late.text).toContain('done o-1');

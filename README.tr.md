@@ -244,6 +244,7 @@ import { createRestApi } from '@gnldev/server';
 import { serve } from '@hono/node-server';
 serve({ fetch: createRestApi(config).fetch, port: Number(process.env.PORT ?? 3000) });
 ```
+`@hono/node-server`'ı `@hono/node-server@1` olarak kurun: CLI, server ve Studio 1.x hattında geliştirilip test edilir; sürümsüz kurulum 2.x'e çözülür ve npm onu `@gnldev/cli`'nin yanında reddeder (ERESOLVE).
 `createRestApi` web standardı bir fetch handler döndürür, dolayısıyla mevcut bir sunucuya da doğrudan
 takılır — `@gnldev/server/node`'daki `toNodeHandler` onu Express, Fastify, Koa, Nest ya da çıplak
 `node:http` ile birleştirir; Deno, Bun ve Workers'ta ise handler zaten o runtime'ların beklediği

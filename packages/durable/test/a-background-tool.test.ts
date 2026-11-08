@@ -7,6 +7,10 @@ import { z } from 'zod';
 import { InMemoryStorage, BasicMemory, createGnl, gnlTool, scopeConfigToOrg, readRunOutcome, purgeRun } from '../src/index.js';
 import { user } from '../src/run-identity.js';
 import { fenceRun } from '../src/erasure-fence.js';
+import { mintCallId } from '../src/call-identity.js';
+
+/** The GNL id of the model's `call-1` in step 0 of `runId` (what names the derived task / continuation runs). */
+const cid = (runId: string) => mintCallId('call-1', runId, 0, 0);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const usage = { inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: 1, text: 1, reasoning: undefined } };
@@ -74,9 +78,9 @@ describe('a background tool', () => {
   it('the model is answered with a stable `started` and the turn ends before the body does', async () => {
     const { gnl, effects, storage, calls } = app({ bodyMs: 300 });
     const r = await turn(gnl, { runId: 'b1', threadId: 'T', prompt: 'research', resourceId: 'alice' });
-    expect((await r.steps).flatMap((s: any) => s.toolResults.map((x: any) => x.output))).toEqual([{ status: 'started', taskId: 'task:b1:call-1' }]);
+    expect((await r.steps).flatMap((s: any) => s.toolResults.map((x: any) => x.output))).toEqual([{ status: 'started', taskId: `task:b1:${cid('b1')}` }]);
     expect(effects, 'the turn waited for the body').toEqual([]);
-    await until(async () => (await readRunOutcome(storage.runs as any, 'cont:b1:call-1'))?.status === 'completed');
+    await until(async () => (await readRunOutcome(storage.runs as any, `cont:b1:${cid('b1')}`))?.status === 'completed');
     expect(effects).toEqual(['tides']);
     expect(calls.filter((c) => c === 'cont')).toEqual(['cont']);
     const msgs = await gnl.memory!.getMessages('T');
@@ -87,24 +91,24 @@ describe('a background tool', () => {
   it('a stranger cannot follow, approve or receive the task or its continuation', async () => {
     const { gnl, storage } = app({ bodyMs: 200 });
     await turn(gnl, { runId: 'b2', threadId: 'T', prompt: 'research', resourceId: 'alice' });
-    await until(async () => (await readRunOutcome(storage.runs as any, 'cont:b2:call-1'))?.status === 'completed');
-    for (const runId of ['task:b2:call-1', 'cont:b2:call-1']) {
+    await until(async () => (await readRunOutcome(storage.runs as any, `cont:b2:${cid('b2')}`))?.status === 'completed');
+    for (const runId of [`task:b2:${cid('b2')}`, `cont:b2:${cid('b2')}`]) {
       await expect(gnl.stream('a', { runId, threadId: 'M', prompt: 'give', resourceId: 'mallory' } as any), `${runId}: follow`).rejects.toThrow();
-      await expect(gnl.stream('a', { runId, prompt: 'give', resourceId: 'mallory', approvals: { 'call-1': true } } as any), `${runId}: approve`).rejects.toThrow();
+      await expect(gnl.stream('a', { runId, prompt: 'give', resourceId: 'mallory', approvals: { [cid('b2')]: true } } as any), `${runId}: approve`).rejects.toThrow();
     }
     expect(await gnl.memory!.getMessages('M'), "the stranger's thread").toEqual([]);
-    const input: any = await storage.runs.get('task:b2:call-1:input');
+    const input: any = await storage.runs.get(`task:b2:${cid('b2')}:input`);
     expect(input?.owner ?? input?.resourceId ?? input?.caller, 'the task is the parent owner\'s').toBeDefined();
     expect(JSON.stringify(input)).toContain('alice');
-    expect(JSON.stringify(await storage.runs.get('cont:b2:call-1:input'))).toContain('alice');
+    expect(JSON.stringify(await storage.runs.get(`cont:b2:${cid('b2')}:input`))).toContain('alice');
   });
 
   it("an organization's parent: its task and continuation live in that organization", async () => {
     const { gnl, storage } = app({ org: 'acme', bodyMs: 50 });
     await turn(gnl, { runId: 'b3', threadId: 'T', prompt: 'research', caller: user('alice', 'acme') });
     const keys = async (p: string) => (await (storage.runs as any).listKeys(p)) as string[];
-    await until(async () => (await keys('org:acme:cont:b3:call-1:')).length > 0 && (await readRunOutcome(storage.runs as any, 'org:acme:cont:b3:call-1'))?.status === 'completed');
-    expect((await keys('org:acme:task:b3:call-1:')).length).toBeGreaterThan(0);
+    await until(async () => (await keys(`org:acme:cont:b3:${cid('b3')}:`)).length > 0 && (await readRunOutcome(storage.runs as any, `org:acme:cont:b3:${cid('b3')}`))?.status === 'completed');
+    expect((await keys(`org:acme:task:b3:${cid('b3')}:`)).length).toBeGreaterThan(0);
     expect(await keys('task:'), 'a task outside its organization').toEqual([]);
     expect(await keys('cont:'), 'a continuation outside its organization').toEqual([]);
   });
@@ -112,7 +116,7 @@ describe('a background tool', () => {
   it('the derived runs are in the erasure model: purging the parent purges its task and continuation', async () => {
     const { gnl, storage } = app({ bodyMs: 20 });
     await turn(gnl, { runId: 'b4', threadId: 'T', prompt: 'research', resourceId: 'alice' });
-    await until(async () => (await readRunOutcome(storage.runs as any, 'cont:b4:call-1'))?.status === 'completed');
+    await until(async () => (await readRunOutcome(storage.runs as any, `cont:b4:${cid('b4')}`))?.status === 'completed');
     await sleep(100);
     await purgeRun(storage.runs as any, 'b4');
     const left = ((await (storage.runs as any).listKeys('')) as string[]).filter((k) => k.includes('b4') && !k.startsWith('__run_erased__'));
@@ -136,7 +140,7 @@ describe('a background tool', () => {
   it('two deliveries of the same task end in one process wake the agent once', async () => {
     const { gnl, storage, calls } = app({ bodyMs: 20 });
     await turn(gnl, { runId: 'b5', threadId: 'T', prompt: 'research', resourceId: 'alice' });
-    await until(async () => (await readRunOutcome(storage.runs as any, 'cont:b5:call-1'))?.status === 'completed');
+    await until(async () => (await readRunOutcome(storage.runs as any, `cont:b5:${cid('b5')}`))?.status === 'completed');
     // The same turn asked again (a retry of the request): it replays, starts nothing, wakes nothing.
     await turn(gnl, { runId: 'b5', threadId: 'T', prompt: 'research', resourceId: 'alice' });
     await sleep(300);

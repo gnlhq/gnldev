@@ -6,6 +6,7 @@ import { tool, stepCountIs } from 'ai';
 import { z } from 'zod';
 import { InMemoryJournal } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
+import { mintCallId } from '../src/call-identity.js';
 import { createAgentTool } from '../src/agent-tool.js';
 import { getRunCost } from '../src/cost.js';
 import { RunLimitExceededError, ToolLoopDetectedError } from '../src/limits.js';
@@ -47,8 +48,8 @@ describe('Run limits (cost ceiling + loop detection + fan-out inheritance)', () 
     // Journal consistent: step 0's tool ACTUALLY ran (succeeded), step 1's tool never ran BECAUSE OF
     // the overflow (the model step was journaled but generateText was never invoked).
     expect(calls).toEqual(['run']);
-    expect(await journal.get('r1:tool:call-1')).toMatchObject({ status: 'succeeded' });
-    expect(await journal.get('r1:tool:call-2')).toBeUndefined();
+    expect(await journal.get(`r1:tool:${mintCallId('call-1', 'r1', 0, 0)}`)).toMatchObject({ status: 'succeeded' });
+    expect(await journal.get(`r1:tool:${mintCallId('call-2', 'r1', 1, 0)}`)).toBeUndefined();
     expect(await journal.get('r1:model:1')).toBeDefined(); // step is not HALF-written, it's FULLY written
 
     try {
@@ -123,7 +124,7 @@ describe('Run limits (cost ceiling + loop detection + fan-out inheritance)', () 
     ).rejects.toBeInstanceOf(RunLimitExceededError);
     // Only 2 calls (the limit) ACTUALLY ran; the 3rd call was blocked WITHOUT BEING EXECUTED (prospective gate).
     expect(realRuns).toBe(2);
-    expect(await journal.get('r3:tool:call-3')).toBeUndefined();
+    expect(await journal.get(`r3:tool:${mintCallId('call-3', 'r3', 2, 0)}`)).toBeUndefined();
   });
 
   it('loop detection: once the same tool + same argsHash runs maxRepeats times in a row, the NEXT call is blocked WITHOUT being executed', async () => {
@@ -153,7 +154,7 @@ describe('Run limits (cost ceiling + loop detection + fan-out inheritance)', () 
 
     // Ran EXACTLY 3 times for real; the 4th attempt was blocked without ever touching the journal.
     expect(realRuns).toBe(3);
-    expect(await journal.get('r4:tool:call-4')).toBeUndefined();
+    expect(await journal.get(`r4:tool:${mintCallId('call-4', 'r4', 3, 0)}`)).toBeUndefined();
 
     try {
       await runDurable({

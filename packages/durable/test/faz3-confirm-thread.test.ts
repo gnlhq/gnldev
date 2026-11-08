@@ -13,6 +13,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { stepCountIs } from 'ai';
 import { InMemoryJournal, runKeys } from '../src/journal.js';
 import { runDurable } from '../src/run.js';
+import { mintCallId } from '../src/call-identity.js';
 import { purgeThread } from '../src/retention.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
@@ -43,13 +44,13 @@ describe('FAZ-3 confirm gate', () => {
     const mk = chargeModel();
     await runDurable(baseOpts(journal, 'cf1', { model: mk(), tools }) as any);
     expect(counter.n).toBe(0); // suspended BEFORE the effect
-    const rec = await journal.get<any>(runKeys.tool('cf1', 'call-c'));
+    const rec = await journal.get<any>(runKeys.tool('cf1', mintCallId('call-c', 'cf1', 0, 0)));
     expect(rec.status).toBe('suspended');
     expect(rec.output.__gnl_suspend.reason).toBe('charge 50 — confirm?'); // args-derived reason
 
     await runDurable(baseOpts(journal, 'cf1', { model: mk(), tools, approvals: { 'call-c': true } }) as any);
     expect(counter.n).toBe(1); // approval executes exactly once
-    expect((await journal.get<any>(runKeys.tool('cf1', 'call-c'))).status).toBe('succeeded');
+    expect((await journal.get<any>(runKeys.tool('cf1', mintCallId('call-c', 'cf1', 0, 0)))).status).toBe('succeeded');
 
     await runDurable(baseOpts(journal, 'cf1', { model: mk(), tools, approvals: { 'call-c': true } }) as any);
     expect(counter.n).toBe(1); // replay, not a re-execution
@@ -63,14 +64,18 @@ describe('FAZ-3 confirm gate', () => {
     await runDurable(baseOpts(journal, 'cf2', { model: mk(), tools }) as any); // suspends
     await runDurable(baseOpts(journal, 'cf2', { model: mk(), tools, approvals: { 'call-c': false } }) as any);
     expect(counter.n).toBe(0);
-    expect((await journal.get<any>(runKeys.tool('cf2', 'call-c'))).status).toBe('denied');
+    expect((await journal.get<any>(runKeys.tool('cf2', mintCallId('call-c', 'cf2', 0, 0)))).status).toBe('denied');
   });
 
-  it('a pre-supplied approval skips the gate on the very first call', async () => {
+  it('a pre-supplied approval does NOT skip the gate (d25 step 1: an answer needs a question): the call stops at its question, and the yes to THAT question runs it once', async () => {
     const journal = new InMemoryJournal();
     const counter = { n: 0 };
     const tools = { charge: { sideEffect: true, confirm: true, execute: async () => { counter.n++; return { ok: 1 }; } } };
-    await runDurable(baseOpts(journal, 'cf3', { model: chargeModel()(), tools, approvals: { 'call-c': true } }) as any);
+    const id = mintCallId('call-c', 'cf3', 0, 0);
+    const first: any = await runDurable(baseOpts(journal, 'cf3', { model: chargeModel()(), tools, approvals: { [id]: true } }) as any);
+    expect(counter.n, 'the unasked yes ran the call').toBe(0);
+    expect(first.interrupts.map((i: any) => i.toolCallId)).toEqual([id]);
+    await runDurable(baseOpts(journal, 'cf3', { model: chargeModel()(), tools, approvals: { [id]: true } }) as any);
     expect(counter.n).toBe(1);
   });
 });
@@ -153,12 +158,12 @@ describe('FAZ-3 thread-scoped duplicate marker', () => {
     // NEW run, NEW toolCallId, same thread + args ('call' mode) — the per-run marker is blind here.
     await runDurable(baseOpts(journal, 'd2', { model: model('call-b')(), tools, threadId: 'th-X', limits }) as any);
     expect(counter.n).toBe(1); // suspended, not re-fired
-    const rec = await journal.get<any>(runKeys.tool('d2', 'call-b'));
+    const rec = await journal.get<any>(runKeys.tool('d2', mintCallId('call-b', 'd2', 0, 0)));
     expect(rec.status).toBe('suspended');
     expect(rec.output.__gnl_suspend.reason).toContain("thread 'th-X'");
-    expect(rec.output.__gnl_suspend.reason).toContain('call-a'); // the FIRST result is addressable in the UI
+    expect(rec.output.__gnl_suspend.reason).toContain(mintCallId('call-a', 'd1', 0, 0)); // the FIRST result is addressable in the UI
     // An approval executes the ambiguous repeat exactly once.
-    await runDurable(baseOpts(journal, 'd2', { model: model('call-b')(), tools, threadId: 'th-X', limits, approvals: { 'call-b': true } }) as any);
+    await runDurable(baseOpts(journal, 'd2', { model: model('call-b')(), tools, threadId: 'th-X', limits, approvals: { [mintCallId('call-b', 'd2', 0, 0)]: true } }) as any);
     expect(counter.n).toBe(2);
     // A different conversation is not a duplicate of anything.
     await runDurable(baseOpts(journal, 'd3', { model: model('call-c')(), tools, threadId: 'th-Y', limits }) as any);
@@ -225,16 +230,16 @@ describe('FAZ-3 audit fixes', () => {
     // scenario (a standing journaled approval would legitimately allow the ladder's retry instead).
     const limits = { approvalScope: 'attempt' as const };
     await runDurable(baseOpts(journal, 'cf4', { model: mk(), tools, limits }) as any); // confirm suspends
-    await runDurable(baseOpts(journal, 'cf4', { model: mk(), tools, limits, approvals: { 'call-c': true } }) as any).catch(() => {});
+    await runDurable(baseOpts(journal, 'cf4', { model: mk(), tools, limits, approvals: { [mintCallId('call-c', 'cf4', 0, 0)]: true } }) as any).catch(() => {});
     expect(counter.n).toBe(1);
-    const afterCrash = await journal.get<any>(runKeys.tool('cf4', 'call-c'));
+    const afterCrash = await journal.get<any>(runKeys.tool('cf4', mintCallId('call-c', 'cf4', 0, 0)));
     expect(afterCrash.status).toBe('failed'); // the crash window is RECORDED
 
     explode = false;
     // Resume WITHOUT a live approval (spent): the old confirm arm overwrote 'failed' with a fresh
     // 'suspended' ("confirm before it RUNS" — hiding that it may HAVE run) and bypassed the ladder.
     await runDurable(baseOpts(journal, 'cf4', { model: mk(), tools, limits }) as any).catch(() => {});
-    const rec = await journal.get<any>(runKeys.tool('cf4', 'call-c'));
+    const rec = await journal.get<any>(runKeys.tool('cf4', mintCallId('call-c', 'cf4', 0, 0)));
     expect(rec.status).toBe('failed'); // NOT re-suspended over — the ladder (recover/approval) owns this state
     expect(counter.n).toBe(1); // and nothing re-fired
   });

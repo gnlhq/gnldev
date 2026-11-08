@@ -24,6 +24,7 @@ import { SqliteStorage } from '../src/sqlite-storage.js';
 import { PostgresStorage } from '../src/postgres-storage.js';
 import { runDurable } from '../src/run.js';
 import { runKeys } from '../src/journal.js';
+import { mintCallId } from '../src/call-identity.js';
 import type { DurableCtx } from '../src/journal.js';
 import { createMockModel, countToolResults, toolCallResult, finalTextResult } from './mock.js';
 
@@ -125,7 +126,7 @@ describe.each(STORES)('a streaming tool runs once — %s', (_name, make) => {
     await run();
     expect(effects).toBe(1);
     expect(JSON.stringify(seen[0])).toContain('ch_1');
-    expect(await storage.runs.get(runKeys.tool(runId, 'c1'))).toMatchObject({ status: 'succeeded', output: { chargeId: 'ch_1' } });
+    expect(await storage.runs.get(runKeys.tool(runId, mintCallId('c1', runId, 0, 0)))).toMatchObject({ status: 'succeeded', output: { chargeId: 'ch_1' } });
     await run();
     expect(effects).toBe(1);
   });

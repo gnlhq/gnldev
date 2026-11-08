@@ -137,6 +137,7 @@ describe.each(stores)('retryJob continues the dead letter\'s run — %s', (_n, m
           } as any,
           guard,
           approvals,
+          answerer: { answeredAs: 'staff' }, // the operator's answer (an approve question is staff's, d25 step 2)
           prompt: 'pay',
         });
         if (res.interrupts.length > 0) throw new Error('awaiting approval');

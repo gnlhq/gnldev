@@ -63,12 +63,19 @@ for (const mode of ['args', 'call'] as const) {
     const first = await within(call('c1'), 5000);
     armed = false;
     queries = 0; counting = true;
-    const second = await within(call(mode === 'args' ? 'c2' : 'c1'), 5000);
+    // The effect happened and its success is kept being written until it lands (durable-tool settleSuccess,
+    // liveness-audit D3): until then the attempt is live, and a 'call' twin is answered busy — for a moment,
+    // not for the life of the process. Asked again shortly, it gets the one answer; the body never runs twice
+    // (before, the call met the crash ladder and this recover(), which answers "not done", ran it again).
+    let second = await within(call(mode === 'args' ? 'c2' : 'c1'), 5000);
+    for (let i = 0; i < 40 && /RunBusyError/.test(second.e ?? ''); i++) { await pause(50); second = await within(call(mode === 'args' ? 'c2' : 'c1'), 5000); }
     counting = false;
     const perSec = Math.round(queries / (second.ms / 1000));
     console.log(`[k3 R2-a7 ${mode}] first=${JSON.stringify(first)} second=${JSON.stringify(second)} execs=${execs} pgQueries/s=${perSec}`);
     expect(second.timeout).toBeUndefined();
     expect(second.e ?? '').not.toMatch(/RunBusyError/);
+    expect(second.v).toEqual({ ok: true });
+    expect(execs, 'the body ran once').toBe(1);
   }, 20_000);
 }
 

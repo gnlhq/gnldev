@@ -375,6 +375,8 @@ function aguiRouteApp(config: CreateGnlConfig, opts: CreateAguiRouteOptions = {}
         // etkilemiyordu; host "düzelttim" sanıyordu.
         threadId,
         approvals: body.approvals,
+        // WHO answers them — the one mapping (@gnldev/auth `answererOf`, via the door's admission); the engine decides what they may answer.
+        ...(who.answerer ? { answerer: who.answerer } : {}),
         // HER ZAMAN mühürlü — kimlik bilinmese bile. Ayrılmış anahtarlar motorun "bunu sunucu
         // doğruladı" kanalıdır; mühürsüz bir gövde o kanalın sahibi olur.
         // The org goes into the seal too, so the record and the dynamic `system`/`tools` see the same

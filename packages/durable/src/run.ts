@@ -7,7 +7,8 @@ import { durableTools } from './durable-tool.js';
 import { CLAIM_TTL_MS, claimIsLive, journalNow } from './liveness.js';
 import { RunDrainedError, holdWhile, bindOwnLiveness } from './process-liveness.js';
 import { acquireRunLock } from './run-lock.js';
-import { RunBusyError, runBusyMessage, SideEffectRetryBlockedError, RetryLimitExceededError, OutcomeUnknownError, RunThreadMismatchError, RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunSweptError, ThreadOwnerMismatchError } from './errors.js';
+import { assertMayAnswer, answererOfCaller, startedByOf, needsOfSuspend, isSupersededFailure, type Answerer, type AnsweredAs, type Approvers, type OpenQuestion, type QuestionNeeds } from './approval-authority.js';
+import { AmbiguousApprovalKeyError, RunBusyError, runBusyMessage, SideEffectRetryBlockedError, RetryLimitExceededError, OutcomeUnknownError, RunThreadMismatchError, RunInputMismatchError, RunActorMismatchError, RunOwnerMismatchError, RunSweptError, ThreadOwnerMismatchError } from './errors.js';
 import { admitThreadRun } from './thread-owner.js';
 import { UNKNOWN, ownerFields, callerFromResourceId, callerOf, userIdOf, user, runIdentity, runOwnerOf, requestOf, actingCaller, assertRunTarget, runOwnerRefusal, claimRunOwner, ownerLabel, type Caller, type RunIdentity, type RunOwner, engineBorn } from './run-identity.js';
 import { withMintOf, assertRunIdSafe, runRecordPrefix, runRecordKey, isDerivedRunId } from './run-id-grammar.js';
@@ -24,6 +25,7 @@ import { recordRunMetrics } from './metrics.js';
 import type { Journal, JournalReader, DurableCtx } from './journal.js';
 import type { Guard, Interrupt } from './guard.js';
 import { addressedId } from './guard.js';
+import { isGnlCallId, providerIdOf } from './call-identity.js';
 import { PROVENANCE_RECENT_CAP, messagePreview } from './memory.js';
 import type { Memory, MemoryContextProvenance } from './memory.js';
 import { buildMemoryLayout, settleProvenance, rowKey, type LayoutSeed, type MemoryLayout, type SystemSpans } from './memory-layout.js';
@@ -68,6 +70,16 @@ export type RunDurableArgs = GenerateTextOptions & {
   origin?: InputOrigin;
   guard?: Guard;
   approvals?: Record<string, boolean>;
+  /**
+   * WHO answers the `approvals` of this call — the door's reading of its verified principal
+   * (@gnldev/auth `answererOf`). The run's `caller` is the run's OWNER (a staff member resuming a customer's
+   * run continues it as the customer), so it cannot say who is answering; this does. Absent: derived from
+   * `caller` (`user` → the requester, `staff` → staff, nobody → staff, said once). Also recorded as who
+   * STARTED the run (`startedBy`), which `approvers` / `fourEyes()` can compare against.
+   */
+  answerer?: Answerer;
+  /** Who may say yes to an approve question; replaces "staff only" (createGnl `approvers`). */
+  approvers?: Approvers;
   /**
    * Conversation memory: if provided, thread history is loaded + appended idempotently on completion.
    *
@@ -196,6 +208,16 @@ export type StreamDurableArgs = StreamTextOptions & {
   trustRecordedInput?: boolean;
   guard?: Guard;
   approvals?: Record<string, boolean>;
+  /**
+   * WHO answers the `approvals` of this call — the door's reading of its verified principal
+   * (@gnldev/auth `answererOf`). The run's `caller` is the run's OWNER (a staff member resuming a customer's
+   * run continues it as the customer), so it cannot say who is answering; this does. Absent: derived from
+   * `caller` (`user` → the requester, `staff` → staff, nobody → staff, said once). Also recorded as who
+   * STARTED the run (`startedBy`), which `approvers` / `fourEyes()` can compare against.
+   */
+  answerer?: Answerer;
+  /** Who may say yes to an approve question; replaces "staff only" (createGnl `approvers`). */
+  approvers?: Approvers;
   /** Conversation memory: if provided, thread history is loaded + appended idempotently when the stream
    *  ends. `false` = deliberately none — see RunDurableArgs.memory for what that buys. */
   memory?: Memory | false;
@@ -309,9 +331,13 @@ export type DurableResult = Awaited<ReturnType<typeof generateText>> & {
  * time, informed only while narrating.
  *
  * HONEST BOUNDS: (1) a replay consumed on the FINAL step gets no note — there is no following live
- * step to inject into; the envelope is the fallback there. (2) The note is a mid-list 'system'
- * message — the engine itself replays those (allowSystemInMessages: true), but a provider converter
- * that rejects mid-list system messages would surface it; measured fine on OpenAI-compatible.
+ * step to inject into; the envelope is the fallback there. (2) The note rides in the step's
+ * INSTRUCTIONS (the head `system` of the prompt), NOT as a message after the tool result. It was a
+ * mid-list `system` message first; measured against a real OpenAI-compatible endpoint (NVIDIA
+ * mistral-large-4) that answers 400 — Mistral-family servers (and some local ones) accept `system`
+ * only at the head — and the 400 landed exactly on the turn that deduplicated a charge, i.e. the one
+ * this note exists for. The head is accepted everywhere. The earlier comment here said "measured fine
+ * on OpenAI-compatible"; that was a statement about OpenAI's own endpoint, not the family.
  * (3) STREAM surface: the envelope is a LAZY property on the stream result — empty until the
  * stream is consumed, populated for finish-time readers (host onFinish). It is deliberately NOT
  * emitted on the SSE done frame: the SSE sequence is replay-deterministic (W3) and the envelope
@@ -332,15 +358,18 @@ function withReplayDisclosure(prev: ((step: any) => any) | undefined, ctx: Durab
     if (fresh.length === 0) return base;
     const names = [...new Set(fresh.map((f) => f.toolName ?? f.toolCallId))].join(', ');
     const note = {
-      role: 'system',
+      role: 'system' as const,
       content:
         `[gnl] The result(s) of ${names} above were NOT produced by this request — the same work was ` +
         `already completed earlier and the recorded outcome was returned (nothing executed now). ` +
         `Tell the user this explicitly, in their language: the operation was not performed again; ` +
         `what they see is the record of the earlier one.`,
     };
-    const msgs = (base as { messages?: unknown[] } | undefined)?.messages ?? step.messages;
-    return { ...(base ?? {}), messages: [...msgs, note] };
+    // The instructions this step would have gone out with (a prepareStep override wins over the call's own).
+    const b = (base ?? {}) as { instructions?: unknown; system?: unknown };
+    const cur = b.instructions ?? b.system ?? step.initialInstructions;
+    const head = cur === undefined ? [] : Array.isArray(cur) ? cur : [typeof cur === 'string' ? { role: 'system' as const, content: cur } : cur];
+    return { ...(base ?? {}), instructions: [...head, note] };
   };
 }
 
@@ -391,6 +420,7 @@ export function surfacedInterrupts(sus: any): Interrupt[] {
     // What a person reads names the sub-agent, not its run id; the id rides in `delegatedTo`.
     reason: `The ${nested.agent ? `'${nested.agent}' ` : ''}sub-agent asks: ${i.reason ?? 'approval required'}`,
     ...(i.semPair ? { semPair: i.semPair } : {}),
+    ...(i.needs ? { needs: i.needs } : {}),
     delegatedTo: { runId: nested.runId, ...(nested.agent ? { agent: nested.agent } : {}), ...(i.delegatedTo ? { via: i.delegatedTo } : {}) },
   }));
 }
@@ -619,8 +649,18 @@ export interface ApprovalRecord {
   v: 1;
   decision: boolean;
   at: number;
-  /** WHO answered, when the surface knows (see registry's sealed identity / Studio's actorOf). */
+  /** The run's ownership stamp when the surface knows it (see registry's sealed identity / Studio's actorOf). Not who answered: see `answeredBy`. */
   actor?: string;
+  /** WHO answered — the verified identity of the answerer (`operator:veli`, an end user's own id, `slack:T:U`). Absent when the door did not name one. */
+  answeredBy?: string;
+  /** What the answerer was: `'staff'` (an authorised person) or `'requester'` (the person the work is for). */
+  answeredAs?: AnsweredAs;
+  /**
+   * What this yes covers. `'approve'` — an authorised person's yes, which answers a confirm question too;
+   * `'confirm'` — the requester's consent, which does not answer an approve question. Absent on a row from
+   * before this field existed: read as `'approve'` (it was given under the rules then in force).
+   */
+  grants?: QuestionNeeds;
 }
 
 /** A spent slot (`approvalScope: 'attempt'`) — a consumed answer, not an answer. */
@@ -640,21 +680,162 @@ export function decisionOf(raw: unknown): boolean | undefined {
   return undefined;
 }
 
+/** An id as a person at the parent sees it, each hop reduced to the provider's own id (`<parent>/<child>` hop by hop). */
+const providerAliasOf = (id: string): string => id.split('/').map(providerIdOf).join('/');
+
+/**
+ * Approvals keyed by a PROVIDER's id (`call_0`), turned into the GNL id of the one open question that
+ * carries it. Compatibility, not the contract: the interrupt a caller reads names the GNL id. An answer
+ * that names no open question stays as it is (it is then no answer to anything — `resolveApprovals` drops a
+ * yes for a question nobody asked); one that names several is refused whole, nothing
+ * recorded (`AmbiguousApprovalKeyError`) — a yes must not land on a question it was not meant for.
+ */
+function bindProviderAliases(open: ReadonlyMap<string, OpenQuestion>, runId: string, approvals: Record<string, boolean>): Record<string, boolean> {
+  const aliases = Object.keys(approvals).filter((k) => !isGnlCallId(k));
+  if (aliases.length === 0) return approvals;
+  const out: Record<string, boolean> = {};
+  for (const [key, decision] of Object.entries(approvals)) {
+    if (!aliases.includes(key) || open.has(key)) { out[key] = decision; continue; }
+    const hits = [...open.keys()].filter((id) => providerAliasOf(id) === key);
+    if (hits.length > 1) throw new AmbiguousApprovalKeyError({ runId, key, candidates: hits });
+    const target = hits[0] ?? key;
+    // The same question answered under both names: the GNL id's own answer stands.
+    if (target !== key && Object.hasOwn(approvals, target)) continue;
+    out[target] = decision;
+  }
+  return out;
+}
+
+/** Is this failed call's shared claim held by a question now (`isSupersededFailure`)? */
+async function supersededByQuestion(journal: Journal, rec: { status?: string; sideEffect?: boolean; mirrorOf?: string }): Promise<boolean> {
+  if (typeof rec.mirrorOf !== 'string') return false;
+  return isSupersededFailure(rec, await journal.get<{ status?: string }>(rec.mirrorOf));
+}
+
+/**
+ * The run's OPEN questions, by id: its suspended tool calls, the questions its sub-agents surfaced
+ * through them (addressed `<delegation id>/<child id>`), and the crash ladder's "it MAY have already run"
+ * question — a side-effect call left `running` (a crash) or `failed` is asked about by the retry ladder
+ * (SideEffectRetryBlockedError) under its own id, so a provider-id answer binds to it exactly as it does
+ * to a suspended one.
+ *
+ * This is the one place "was this asked?" is answered, and with it "which kind of question is it?"
+ * (`needs`: confirm or approve) — what `resolveApprovals` reads to ignore an answer nobody asked for and to
+ * decide who may give the one that was asked.
+ */
+async function openQuestions(journal: Journal, runId: string, max = 500): Promise<Map<string, OpenQuestion>> {
+  const out = new Map<string, OpenQuestion>();
+  const prefix = runKeys.tool(runId, '');
+  type Sus = { kind?: string; needs?: unknown; toolCallId?: string; toolName?: string; args?: unknown; nested?: { interrupts?: Array<{ toolCallId?: string; toolName?: string; args?: unknown; needs?: unknown; kind?: string }> } };
+  for (const key of (await journal.listKeys(prefix)).slice(0, max)) {
+    const rec = await journal.get<{ status?: string; sideEffect?: boolean; mirrorOf?: string; toolName?: string; input?: unknown; output?: { __gnl_suspend?: Sus } }>(key);
+    const id = key.slice(prefix.length);
+    // Left running or failed after it may have reached the provider: whether it happened is not the
+    // requester's to say, so it is an APPROVE question whatever gate first asked about the call.
+    if (rec?.status === 'running' || (rec?.status === 'failed' && rec.sideEffect === true && !(await supersededByQuestion(journal, rec)))) {
+      out.set(id, { toolCallId: id, needs: 'approve', ...(rec.toolName !== undefined ? { toolName: rec.toolName } : {}), ...(rec.input !== undefined ? { args: rec.input } : {}) });
+      continue;
+    }
+    if (rec?.status !== 'suspended') continue;
+    const sus = rec.output?.__gnl_suspend;
+    if (sus?.kind === 'nested') {
+      for (const i of sus.nested?.interrupts ?? []) {
+        if (!i?.toolCallId) continue;
+        const aid = addressedId(sus.toolCallId, i.toolCallId);
+        out.set(aid, { toolCallId: aid, needs: needsOfSuspend(i), ...(i.toolName !== undefined ? { toolName: i.toolName } : {}), ...(i.args !== undefined ? { args: i.args } : {}) });
+      }
+    } else {
+      const toolName = sus?.toolName ?? rec.toolName;
+      out.set(id, { toolCallId: id, needs: needsOfSuspend(sus), ...(toolName !== undefined ? { toolName } : {}), ...(sus?.args !== undefined ? { args: sus.args } : {}) });
+    }
+  }
+  // A call under an idempotency window (`'args'`) claims under the WINDOW's key, and a new call of the same work
+  // (another id) that meets a claim left failed or running is refused as "it may already have happened" — naming
+  // ITS OWN id as the one to answer — without a record of its own. The run points at that claim; read there.
+  const pointers = windowClaimPointerKey(runId, '');
+  for (const key of (await journal.listKeys(pointers)).slice(0, max)) {
+    const id = key.slice(pointers.length);
+    if (out.has(id)) continue;
+    const ptr = await journal.get<{ claim?: unknown }>(key);
+    if (typeof ptr?.claim !== 'string') continue;
+    const claimed = await journal.get<{ status?: string; sideEffect?: boolean; toolName?: string; input?: unknown }>(ptr.claim);
+    if (claimed?.status === 'running' || (claimed?.status === 'failed' && claimed.sideEffect === true)) {
+      out.set(id, { toolCallId: id, needs: 'approve', ...(claimed.toolName !== undefined ? { toolName: claimed.toolName } : {}), ...(claimed.input !== undefined ? { args: claimed.input } : {}) });
+    }
+  }
+  return out;
+}
+
+/** What a recorded yes covers; a row from before the field is read as an authorised yes. */
+const grantOf = (raw: unknown): QuestionNeeds | undefined =>
+  typeof raw === 'object' && raw !== null && (raw as ApprovalRecord).v === 1 ? ((raw as ApprovalRecord).grants ?? 'approve') : undefined;
+
 /** @internal — engine plumbing shared with the GNL door, memory and rag packages; gnl builds its argument, no host writes it. */
 export async function resolveApprovals(
   journal: Journal,
   runId: string,
   approvals: Record<string, boolean> | undefined,
-  opts?: { actor?: string; hasRun?: (toolCallId: string) => Promise<boolean> },
+  opts?: {
+    actor?: string;
+    hasRun?: (toolCallId: string) => Promise<boolean>;
+    /** WHO answers, as the door knows it (@gnldev/auth `answererOf`). Absent: derived from `caller` (`answererOfCaller`). */
+    answerer?: Answerer;
+    /** The caller the call declared — what an answerer is derived from when no door named one. */
+    caller?: Caller;
+    /** The createGnl `approvers` rule: replaces "staff only" for an approve question. */
+    approvers?: Approvers;
+    /** Who started the run (what `fourEyes()` compares the answerer with). */
+    startedBy?: string;
+    /** Filled with what each recorded yes covers (see `ApprovalRecord.grants`). */
+    grantsOut?: Record<string, QuestionNeeds>;
+  },
 ): Promise<Record<string, boolean> | undefined> {
-  // (a) claim every decision from the parameter into the journal (idempotent — first decision wins).
-  // A SPENT slot (approvalScope:'attempt' consumed the previous answer before executing) is not a
-  // decision: the human's fresh answer takes it over by CAS. Without this, the claim silently lost to
-  // the leftover row and the new decision lived only in-process — a crash after this point forgot it.
-  if (approvals) {
-    for (const [toolCallId, decision] of Object.entries(approvals)) {
+  const who = opts?.answerer ?? answererOfCaller(opts?.caller);
+  // AN ANSWER NEEDS A QUESTION. An approval is written only for a question that was actually asked and is
+  // still waiting (an open question, below). A yes for a call nobody has asked about — the id of the call a
+  // run is about to make is predictable — is not an answer: it is ignored, written nowhere, and so cannot
+  // release the question when it is finally asked. A NO is kept: it only ever prevents the effect, and
+  // the call it was meant for stops when it comes.
+  if (approvals && Object.keys(approvals).length > 0) {
+    const open = await openQuestions(journal, runId);
+    // The keys of the parameter, as GNL names the calls (call-identity.ts): an answer given under a
+    // provider's own id is bound to the question that carries it — here, the one place approvals enter.
+    const named = bindProviderAliases(open, runId, approvals);
+    const kept: Record<string, boolean> = {};
+    // Who may give each yes, decided BEFORE anything is written: one refused yes refuses the request whole.
+    const grants = new Map<string, QuestionNeeds>();
+    for (const [toolCallId, decision] of Object.entries(named)) {
+      const q = open.get(toolCallId);
+      if (q === undefined) {
+        if (decision === false) { kept[toolCallId] = false; continue; }
+        if (await journal.get(runKeys.approval(runId, toolCallId)) === undefined) {
+          console.warn(
+            `@gnldev/durable: '${runId}' approval ignored — '${toolCallId}' names no question that is waiting. ` +
+              'An approval answers a question the run has asked (an interrupt it returned); one sent before the question exists is not recorded and cannot release it later.',
+          );
+        }
+        continue;
+      }
+      kept[toolCallId] = decision;
+      if (decision === true) {
+        grants.set(toolCallId, await assertMayAnswer(q, { runId, answerer: who, ...(opts?.approvers ? { approvers: opts.approvers } : {}), ...(opts?.startedBy !== undefined ? { startedBy: opts.startedBy } : {}) }));
+      }
+    }
+    approvals = kept;
+    // (a) claim every decision from the parameter into the journal (idempotent — first decision wins).
+    // A SPENT slot (approvalScope:'attempt' consumed the previous answer before executing) is not a
+    // decision: the human's fresh answer takes it over by CAS. Without this, the claim silently lost to
+    // the leftover row and the new decision lived only in-process — a crash after this point forgot it.
+    for (const [toolCallId, decision] of Object.entries(kept)) {
       const key = runKeys.approval(runId, toolCallId);
-      const record: ApprovalRecord = { v: 1, decision, at: Date.now(), ...(opts?.actor ? { actor: opts.actor } : {}) };
+      const grant = grants.get(toolCallId);
+      const record: ApprovalRecord = {
+        v: 1, decision, at: Date.now(),
+        ...(opts?.actor ? { actor: opts.actor } : {}),
+        ...(who.answeredBy !== undefined ? { answeredBy: who.answeredBy } : {}),
+        answeredAs: who.answeredAs,
+        ...(grant !== undefined ? { grants: grant } : {}),
+      };
       const won = await claim(journal, key, record);
       if (won) continue;
       const raw = await journal.get(key);
@@ -673,8 +854,14 @@ export async function resolveApprovals(
       // The line drawn here is the EFFECT, not the clock: a differing answer may replace a decision
       // only while the tool call has not reached a terminal record. Once it has, the decision is
       // spent history and mutating it would rewrite an outcome rather than direct one. Ownership of
-      // "may THIS caller answer" is a separate question and is not decided here.
+      // "may THIS caller answer" is decided above (approval-authority.ts), before anything is written.
       const previous = decisionOf(raw);
+      // The same yes, but the earlier one only CONSENTED (a requester's confirm) and the question is now an
+      // approve one — a second question over the same call: the authorised person's yes takes the row over.
+      if (previous === true && decision === true && grant === 'approve' && grantOf(raw) === 'confirm') {
+        await journal.putIfMatch(key, raw, record);
+        continue;
+      }
       if (previous === undefined || previous === decision) continue;
       const ran = opts?.hasRun ? await opts.hasRun(toolCallId).catch(() => true) : true; // unknown → treat as run (safe direction)
       if (ran) {
@@ -700,7 +887,8 @@ export async function resolveApprovals(
   const merged: Record<string, boolean> = { ...approvals };
   for (const key of keys) {
     const toolCallId = key.slice(prefix.length);
-    const journalDecision = decisionOf(await journal.get(key));
+    const raw = await journal.get(key);
+    const journalDecision = decisionOf(raw);
     // No answer yet: missing, spent, or unrecognised. An unreadable row must never read as approval.
     if (journalDecision === undefined) continue;
     const paramDecision = approvals?.[toolCallId];
@@ -712,6 +900,7 @@ export async function resolveApprovals(
       );
     }
     merged[toolCallId] = journalDecision; // the journal's FIRST decision wins
+    if (opts?.grantsOut && journalDecision === true) opts.grantsOut[toolCallId] = grantOf(raw) ?? 'approve';
   }
   return merged;
 }
@@ -838,6 +1027,9 @@ async function persistInput(
   // two are separate puts, and a process that died between them left a frozen input whose turn no
   // re-entry could locate — the answer was stored with no question (memctx-crash-window.test.ts).
   turn?: FrozenTurn,
+  // WHO started the run, by the name an answer is attributed with (`answeredBy`): what a four-eyes rule
+  // compares an approver with. A staff run has no owner id, so this is where an operator's start is kept.
+  startedBy?: string,
 ): Promise<void> {
   const key = runKeys.input(runId); // ':input' doesn't match parseJournalKey → invisible in the reader
   // `alreadyFrozen` is the SAME read, done once by the caller because the frozen-input adoption needs
@@ -868,7 +1060,7 @@ async function persistInput(
   // answered). The `...(x ? {x} : {})` spelling is not cosmetic either — every reader here asks
   // `'workKey' in record`, and an explicit `undefined` would turn "this caller never declared a
   // name" into "this caller declared nothing", which are different facts.
-  await journal.put(key, stampFormat({ at: Date.now(), prompt: input.prompt, messages: input.messages, system: input.system, ...(threadId ? { threadId } : {}), ...(agentName ? { agent: agentName } : {}), ...ownerFields(owner), ...(rawInputHash ? { hash: rawInputHash } : {}), ...(actor ? { actor } : {}), ...(work?.workKey ? { workKey: work.workKey } : {}), ...(work?.workScope ? { workScope: work.workScope } : {}), origin, ...(parentRunId ? { parentRunId } : {}), ...(turn ? { turn } : {}) })); // H13
+  await journal.put(key, stampFormat({ at: Date.now(), prompt: input.prompt, messages: input.messages, system: input.system, ...(threadId ? { threadId } : {}), ...(agentName ? { agent: agentName } : {}), ...ownerFields(owner), ...(rawInputHash ? { hash: rawInputHash } : {}), ...(actor ? { actor } : {}), ...(work?.workKey ? { workKey: work.workKey } : {}), ...(work?.workScope ? { workScope: work.workScope } : {}), origin, ...(parentRunId ? { parentRunId } : {}), ...(turn ? { turn } : {}), ...(startedBy ? { startedBy } : {}) })); // H13
 }
 
 /** FAZ-6: `limits` is FROZEN to the journal and must stay serializable — the semantic block's
@@ -952,7 +1144,7 @@ async function assertRunAdmissible(
   runId: string,
   frozen: FrozenInput | undefined,
   rawInputHash: string,
-  opts: { strictInput?: boolean; conflictLedger?: boolean; auditOnReject?: 'best-effort' | 'require'; tombstonePolicy?: 'ignore' | 'reject'; actor?: string; resourceId?: string; approvals?: Record<string, boolean> },
+  opts: { strictInput?: boolean; conflictLedger?: boolean; auditOnReject?: 'best-effort' | 'require'; tombstonePolicy?: 'ignore' | 'reject'; actor?: string; resourceId?: string; approvals?: Record<string, boolean>; continuesRecorded?: boolean; staffAnswers?: boolean; noNewContent?: boolean },
 ): Promise<void> {
   // Computed once: three decisions below read it, and it is a regex over a short string either way.
   const derived = isDerivedRunId(runId);
@@ -986,7 +1178,14 @@ async function assertRunAdmissible(
       );
     }
   }
-  if (frozen?.actor && opts.actor && frozen.actor !== opts.actor) {
+  // THE ACTOR LOCK AND THE AUTHORISED ANSWER. An operator answering a question on an end user's run is not
+  // "another actor re-driving it": the answer is the authorised person's to give (approval-authority.ts), and the
+  // run continues as its owner. So the lock stands aside for exactly that — an AUTHORISED answerer, carrying
+  // `approvals`, bringing no new content (nothing, or the recorded content itself). New content under the same
+  // runId meets the lock as before.
+  const answersOnly = opts.staffAnswers === true && opts.approvals !== undefined && Object.keys(opts.approvals).length > 0
+    && (opts.continuesRecorded === true || opts.noNewContent === true || frozen?.hash === rawInputHash);
+  if (frozen?.actor && opts.actor && frozen.actor !== opts.actor && !answersOnly) {
     await refuse(
       new RunActorMismatchError(
         // The owner is in `detail`, never the sentence: engine messages reach end users whole on the chat,
@@ -1023,6 +1222,9 @@ async function assertRunAdmissible(
     );
   }
   if ((opts.strictInput || derived) && frozen?.hash !== undefined && frozen.hash !== rawInputHash) {
+    // ESCAPE 0 — the engine continuing its own run (CONTINUES_RECORDED_INPUT): a takeover brings no
+    // content of its own, it runs the recorded input (adoptFrozenInput), so there is nothing to compare.
+    if (opts.continuesRecorded) return;
     // ESCAPE 1 — driving the run with the frozen record's OWN stored content is by definition a
     // replay, not new content: resumeRun feeds `:input` back verbatim, and its messages are the
     // POST-prep view while `hash` fingerprints the PRE-prep raw input (see persistInput) — without
@@ -1411,7 +1613,7 @@ function makeEchoView(
   processors: Processor[] | undefined,
   journal: Journal,
   runId: string,
-): ((rows: any[], system?: unknown) => Promise<any[]>) | undefined {
+): ((rows: any[], system?: unknown) => Promise<any[] | undefined>) | undefined {
   const chain = (processors ?? []).filter((p) => typeof p.processInput === 'function');
   if (chain.length === 0) return undefined;
   // A PROXY, not `{...journal}`: a Journal is a class instance, so a spread copies its own fields and
@@ -1442,7 +1644,7 @@ function makeEchoView(
     ...createProcessorCtx(silent, runId),
     step: () => { throw new Error('gnl: echo view is a dry run — ctx.step is not available here'); },
   };
-  return async (rows: any[], system?: unknown): Promise<any[]> => {
+  return async (rows: any[], system?: unknown): Promise<any[] | undefined> => {
     try {
       let msgs = rows;
       for (const p of chain) {
@@ -1451,7 +1653,7 @@ function makeEchoView(
         // in the real pass, the comparison stopped matching, and the growth came back. Passed, not
         // used: whatever the chain returns for `system` is discarded.
         const out = await p.processInput!({ messages: msgs, ...(system !== undefined ? { system } : {}) } as never, ctx);
-        if (!Array.isArray(out?.messages) || out.messages.length !== rows.length) return rows;
+        if (!Array.isArray(out?.messages) || out.messages.length !== rows.length) return undefined;
         msgs = out.messages;
       }
       // ONLY the rows the INPUT chain is what stored them. A user row reaches the thread through
@@ -1464,7 +1666,7 @@ function makeEchoView(
       // as sent — with `on: 'both'` both sides are masked, with `on: 'input'` both are raw.
       return rows.map((m, i) => (m?.role === 'assistant' || m?.role === 'tool' ? m : msgs[i]));
     } catch {
-      return rows; // a processor that cannot answer is not evidence about the echo
+      return undefined; // a processor that cannot answer is not evidence about the echo (the comparison falls back to the raw rows — the title never does)
     }
   };
 }
@@ -1474,12 +1676,13 @@ async function prepareMemoryContext(
   threadId: string,
   resourceId: string | undefined,
   rest: PreparedInput,
-  echoView?: (rows: any[], system?: unknown) => Promise<any[]>,
+  echoView?: (rows: any[], system?: unknown) => Promise<any[] | undefined>,
 ): Promise<{ incoming: any[]; wmTool?: Record<string, any>; alreadyStored: boolean; provenance?: MemoryContextRecord; historyCount: number; adoptedResourceId?: string; layoutSeed?: LayoutSeed }> {
   const rawIncoming: any[] = rest.messages ?? (rest.prompt != null ? [{ role: 'user', content: rest.prompt }] : []);
   delete rest.prompt;
   const echoSystem = rest.system;
-  const echoCompare = echoView ? await echoView(rawIncoming, echoSystem) : rawIncoming;
+  const echoProcessed = echoView ? await echoView(rawIncoming, echoSystem) : rawIncoming;
+  const echoCompare = echoProcessed ?? rawIncoming;
   // Özne beyan edilmemişse thread'in sahibi BENİMSENİR (ve `:input`'a o yazılır — persistInput).
   // Uyuşmazlık KONTROLÜ burada DEĞİL: hiçbir şey yazılmadan önce, çağıranın erken kapısında
   // (runDurableInner/streamDurableInner). İki yerde kontrol iki gerçeklik demek olurdu; burada
@@ -1495,7 +1698,12 @@ async function prepareMemoryContext(
 
   if (typeof memory.loadContext === 'function') {
     // Rich path (Phase 14 AgentMemory): composes recall + WM + OM + tool in a single pass.
-    const mc = await memory.loadContext(threadId, { query: lastUserText(rawIncoming), resourceId: rid, incoming: rawIncoming });
+    // `titleIncoming` is what the thread title (and the title-generating model) may see: the input chain's
+    // OUTPUT. The stored message body is masked by `piiRedactor`; the title was cut from the raw text and
+    // written to `gnl_threads.title` — plain, listed in Studio, and left behind by a journal-only purge.
+    // When the chain's view cannot be computed (`echoProcessed` undefined) the thread is left untitled:
+    // an absent title costs a label, a raw one costs the redaction.
+    const mc = await memory.loadContext(threadId, { query: lastUserText(rawIncoming), resourceId: rid, incoming: rawIncoming, titleIncoming: echoProcessed ?? [] });
     const history = mc.messages ?? [];
     // F1: strip client-echoed history first (full-history POSTing clients), THEN the retry dedupe.
     const incoming = dropEchoedHistory(history, rawIncoming, echoCompare);
@@ -1671,7 +1879,7 @@ const PROMPT_IS_TURN = -2;
  *  `resourceId` was always WRITTEN here (see persistInput) and simply never listed — the type
  *  described the fields the replay path read. The derived-run ownership gate reads it, so it is spelled
  *  out now rather than reached for through a cast. */
-type FrozenInput = { prompt?: unknown; messages?: unknown; system?: unknown; threadId?: string; resourceId?: string; hash?: string; actor?: string; workKey?: string; workScope?: WorkScope; origin?: InputOrigin; turn?: FrozenTurn };
+type FrozenInput = { prompt?: unknown; messages?: unknown; system?: unknown; threadId?: string; resourceId?: string; hash?: string; actor?: string; startedBy?: string; workKey?: string; workScope?: WorkScope; origin?: InputOrigin; turn?: FrozenTurn };
 /**
  * Where this turn sits in the frozen `messages`: its trailing `count` rows, the last `appended` of them
  * input-processor output behind it. Frozen WITH the input, in the same write, because a re-entry needs
@@ -3009,6 +3217,19 @@ async function bornAs(journal: Journal, runId: string, owner: RunOwner, caller: 
 }
 
 /**
+ * The mark of a run the ENGINE continues from its recorded input: the detached executor's takeover
+ * (registry `resumeLaunch`), which has no call to rebuild the input from. The input fingerprint guards a
+ * CALLER's content — a workKey reused for different work — and a takeover has none: with any recorded
+ * input the run adopts it whatever the call carried (adoptFrozenInput). Without this mark a run with a
+ * derived id (every workKey run, the authenticated chat's turn) or a `strictInput` run was refused at
+ * takeover as "different work" and stayed parked for good (d25 U6). A symbol, so no request body, door
+ * or option name can carry it; it counts only on a call with no prompt and no messages.
+ *
+ * @internal — set by the registry's takeover launch only.
+ */
+export const CONTINUES_RECORDED_INPUT: unique symbol = Symbol('gnl.continuesRecordedInput');
+
+/**
  * THE ADMISSION of an agent run — every gate between "a caller names this run" and "the run is this
  * caller's to act in", in the order that keeps a refusal from writing anything (each gate's reason is
  * at its line). One function, so runDurable, streamDurable and the detached executor's attach
@@ -3017,7 +3238,7 @@ async function bornAs(journal: Journal, runId: string, owner: RunOwner, caller: 
  * most a PII-free conflict-ledger line.
  */
 async function admitAgentEntry(journal: Journal, runId: string, args: RunDurableArgs | StreamDurableArgs, rest: Record<string, any>) {
-  const { memory, threadId, agentName, workKey, workScope, strictInput, conflictLedger, tombstonePolicy, actor, auditOnReject, approvals, origin, trustRecordedInput } = args as RunDurableArgs & Record<string, any>;
+  const { memory, threadId, agentName, workKey, workScope, strictInput, conflictLedger, tombstonePolicy, actor, auditOnReject, approvals, answerer, origin, trustRecordedInput } = args as RunDurableArgs & Record<string, any>;
   const entry = await enterAgentRun(journal, runId, args);
   const frozenInput = entry.frozenInput;
   // WHOSE runId IS THIS (run-identity.ts assertRunTarget), on the SAME read and before anything is
@@ -3066,13 +3287,16 @@ async function admitAgentEntry(journal: Journal, runId: string, args: RunDurable
   // FAZ-4: fingerprint the RAW caller input BEFORE memory prep mutates rest.messages (post-prep
   // content grows with the thread — hashing it would 409 every legitimate resume).
   const rawInputHash = rawInputFingerprint(rest);
-  await assertRunAdmissible(journal, runId, frozenInput, rawInputHash, { strictInput, conflictLedger, auditOnReject, tombstonePolicy, actor, resourceId, approvals });
+  // Only a call that brings NO content may say it continues the recorded input: the mark cannot carry new work past the check.
+  const continuesRecorded = (args as Record<symbol, unknown>)[CONTINUES_RECORDED_INPUT] === true && rest.prompt === undefined && rest.messages === undefined;
+  await assertRunAdmissible(journal, runId, frozenInput, rawInputHash, { strictInput, conflictLedger, auditOnReject, tombstonePolicy, actor, resourceId, approvals, continuesRecorded, noNewContent: rest.prompt === undefined && rest.messages === undefined, staffAnswers: (answerer ?? answererOfCaller((args as { caller?: Caller }).caller)).answeredAs === 'staff' });
   if (entry.refusal) throw entry.refusal;
   await assertRecordedInputUsable(journal, runId, frozenInput, origin, trustRecordedInput);
   // The parent is recorded with the owner, at the birth: a run continued elsewhere before its input was
   // written (a takeover) still knows the run that made it — its erasure is this one's (erasure-fence.ts).
-  await bornAs(journal, runId, entry.owner, caller, withMintOf({ ...(agentName ? { agent: agentName } : {}), ...(threadId ? { threadId } : {}), ...(actor ? { actor } : {}), ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}), ...(parentOf(args) ? { parentRunId: parentOf(args) } : {}) }, args));
-  return { entry, frozenInput, caller, resourceId, identity, rawInputHash };
+  const startedBy = startedByOf(answerer, (args as { caller?: Caller }).caller);
+  await bornAs(journal, runId, entry.owner, caller, withMintOf({ ...(agentName ? { agent: agentName } : {}), ...(threadId ? { threadId } : {}), ...(actor ? { actor } : {}), ...(startedBy ? { startedBy } : {}), ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}), ...(parentOf(args) ? { parentRunId: parentOf(args) } : {}) }, args));
+  return { entry, frozenInput, caller, resourceId, identity, rawInputHash, startedBy: frozenInput?.startedBy ?? startedBy };
 }
 
 /**
@@ -3086,7 +3310,7 @@ async function admitAgentEntry(journal: Journal, runId: string, args: RunDurable
 export async function admitAgentRun(args: StreamDurableArgs): Promise<void> {
   await assertNotCompensated(args.journal, args.runId);
   await Promise.all([assertNotCanceled(args.journal, args.runId), assertNotErased(args.journal, args.runId, await erasureBaseline(args.journal, parentOf(args)))]);
-  const { journal, runId, guard: _g, approvals: _a, memory: _m, threadId: _t, resourceId: _r, caller: _c, channel: _ch, agentName: _an, workKey: _wk, workScope: _ws, replay: _rp, lock: _l, processors: _p, schemaCompat: _sc, limits: _li, exclusiveModelStep: _e, replayCacheMaxBytes: _rc, toolPolicy: _tp, timeouts: _to, strictInput: _si, conflictLedger: _cl, tombstonePolicy: _tb, actor: _ac, auditOnReject: _ar, replayDisclosure: _rd, model: _mo, tools: _tl, stopWhen: _sw, onBlocked: _ob, origin: _or, trustRecordedInput: _tr, ...rest } =
+  const { journal, runId, guard: _g, approvals: _a, answerer: _an2, approvers: _ap2, memory: _m, threadId: _t, resourceId: _r, caller: _c, channel: _ch, agentName: _an, workKey: _wk, workScope: _ws, replay: _rp, lock: _l, processors: _p, schemaCompat: _sc, limits: _li, exclusiveModelStep: _e, replayCacheMaxBytes: _rc, toolPolicy: _tp, timeouts: _to, strictInput: _si, conflictLedger: _cl, tombstonePolicy: _tb, actor: _ac, auditOnReject: _ar, replayDisclosure: _rd, model: _mo, tools: _tl, stopWhen: _sw, onBlocked: _ob, origin: _or, trustRecordedInput: _tr, ...rest } =
     args as StreamDurableArgs & Record<string, any>;
   await admitAgentEntry(journal, runId, args, rest);
 }
@@ -3095,13 +3319,13 @@ async function runDurableInner(args: RunDurableArgs, admission: Admission, erasu
   // `workKey`/`workScope` are pulled OUT of `rest` deliberately: `rest` is both the frozen input and
   // the option bag handed to `generateText`, so a declared name left in it would travel to the
   // provider as an unknown request field and land in `:input` twice under two different meanings.
-  const { journal, runId, guard, approvals, memory, threadId, resourceId: _declaredResourceId, caller: _declaredCaller, channel, agentName, workKey, workScope, replay, lock: _lock, processors, schemaCompat, limits, exclusiveModelStep, replayCacheMaxBytes, toolPolicy, timeouts, strictInput, conflictLedger, tombstonePolicy, actor, auditOnReject, replayDisclosure, model, tools, stopWhen, origin, trustRecordedInput, ...rest } =
+  const { journal, runId, guard, approvals, answerer, approvers, memory, threadId, resourceId: _declaredResourceId, caller: declaredCaller, channel, agentName, workKey, workScope, replay, lock: _lock, processors, schemaCompat, limits, exclusiveModelStep, replayCacheMaxBytes, toolPolicy, timeouts, strictInput, conflictLedger, tombstonePolicy, actor, auditOnReject, replayDisclosure, model, tools, stopWhen, origin, trustRecordedInput, ...rest } =
     args as RunDurableArgs & Record<string, any>;
   // `model` is already a model object here — string ids are resolved in normalizeEntryArgs.
   // ONE read of `:input`, shared by the ownership check, the adoption and persistInput below (see
   // applyInputProcessors). Read + asserted BEFORE runStarted/resolveApprovals — see
   // assertThreadOwnership's own doc for why the order matters (K2/K3 hardening).
-  const { entry, frozenInput, caller, resourceId, identity, rawInputHash } = await admitAgentEntry(journal, runId, args, rest);
+  const { entry, frozenInput, caller, resourceId, identity, rawInputHash, startedBy } = await admitAgentEntry(journal, runId, args, rest);
   // ADMITTED: the run is this caller's to act in. From here on a failure is the run's own (runDurable).
   admission.admitted = true;
   // RESUME-GATE probe, BEFORE runStarted buries the verdict under 'running': a re-entry of a run
@@ -3120,8 +3344,14 @@ async function runDurableInner(args: RunDurableArgs, admission: Admission, erasu
   await runStarted(journal, runId, Date.now(), attempt);
   // AUDIT (approval first-class): BEFORE ctx is set up — claim the parameter's approvals into the
   // journal + merge with the journal's existing approvals (see the resolveApprovals header).
+  // WHO answers: the door's reading of its principal, else what the declared `caller` stands for. Decided once and handed
+  // down to a delegation's child run, which reads the same answer.
+  const who = answerer ?? answererOfCaller(declaredCaller);
+  const approvalGrants: Record<string, QuestionNeeds> = {};
   const resolvedApprovals = await resolveApprovals(journal, runId, approvals, {
     ...(actor ? { actor } : {}),
+    answerer: who, ...(approvers ? { approvers } : {}),
+    ...(startedBy !== undefined ? { startedBy } : {}), grantsOut: approvalGrants,
     // Askıdaki (ve bayat/çökmüş) kayıt terminal DEĞİLDİR, yani fikir değiştirmeye açıktır; taze bir
     // 'running' ise kararın UYGULANDIĞI andır. Tek yardımcı, iki koşum yolu — bkz. hasRunProbe.
     hasRun: hasRunProbe(journal, runId, timeouts?.claimTtlMs),
@@ -3129,7 +3359,7 @@ async function runDurableInner(args: RunDurableArgs, admission: Admission, erasu
   // C2: on resume, fetch model/tool entries in a single query → hot replay reads take 1 round-trip instead of N.
   // On the first run there are no entries → undefined (no cache). Consume-once: see ctxGet.
   // Admitted (and so born) above: the primitives do not ask again (run-identity.ts `engineBorn`).
-  const ctx: DurableCtx = engineBorn({ journal, runId, threadId, identity, channel, guard, approvals: resolvedApprovals, replay, limits, toolPolicy, blockedAsSentinel: true, toolTimeoutMs: timeouts?.toolMs, claimTtlMs: timeouts?.claimTtlMs, toolResultProcessors: processors, replayCache: await loadReplayCache(journal, runId, { maxBytes: replayCacheMaxBytes }), replayLog: [], erasure });
+  const ctx: DurableCtx = engineBorn({ journal, runId, threadId, identity, channel, guard, approvals: resolvedApprovals, approvalGrants, answerer: who, replay, limits, toolPolicy, blockedAsSentinel: true, toolTimeoutMs: timeouts?.toolMs, claimTtlMs: timeouts?.claimTtlMs, toolResultProcessors: processors, replayCache: await loadReplayCache(journal, runId, { maxBytes: replayCacheMaxBytes }), replayLog: [], erasure });
   const procCtx = processors?.length ? createProcessorCtx(journal, runId) : undefined;
 
   // Memory: load thread history (prepend to messages) + inject working memory into the system prompt.
@@ -3186,7 +3416,7 @@ async function runDurableInner(args: RunDurableArgs, admission: Admission, erasu
   // The layout is computed against `rest` AFTER the chain — the very value persistInput freezes — and
   // BEFORE it, so the attempt token it mints rides in `:input.turn` too (persistInput does not touch `rest`).
   if (memCtx && layoutSeed && frozenInput === undefined) settleMemoryContext(memCtx, layoutSeed, rest, layoutLost, incomingStored);
-  await persistInput(journal, runId, rest, frozenInput !== undefined, threadId, agentName, caller, rawInputHash, actor, { ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}) }, origin, parentOf(args), frozenTurnOf(memCtx));
+  await persistInput(journal, runId, rest, frozenInput !== undefined, threadId, agentName, caller, rawInputHash, actor, { ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}) }, origin, parentOf(args), frozenTurnOf(memCtx), startedBy);
   await persistMemoryContext(journal, runId, memCtx, frozenInput === undefined);
   // Freeze `limits` into the journal on the first run (idempotent via `claim` — the FIRST
   // run's limits win, a later resume never overwrites them). resumeRun reads this back when the caller
@@ -3390,6 +3620,7 @@ const RESUME_POLICY = {
   processors: 'forward', schemaCompat: 'forward', exclusiveModelStep: 'forward', toolPolicy: 'forward',
   timeouts: 'forward', strictInput: 'forward', conflictLedger: 'forward', tombstonePolicy: 'forward',
   actor: 'forward', auditOnReject: 'forward', replayDisclosure: 'forward', replayCacheMaxBytes: 'forward',
+  answerer: 'forward', approvers: 'forward',
 } as const satisfies Record<DurableOwnKey, 'set' | 'forward' | 'from-input'>;
 
 export async function resumeRun(
@@ -3404,6 +3635,10 @@ export async function resumeRun(
      */
     caller?: Caller;
     resourceId?: string;
+    /** WHO answers `approvals` (see RunDurableArgs.answerer). */
+    answerer?: Answerer;
+    /** Who may say yes to an approve question (see RunDurableArgs.approvers). */
+    approvers?: Approvers;
   },
 ): Promise<DurableResult> {
   refuseUnknownNames('resumeRun', opts, RESUME_NAMES);
@@ -3568,7 +3803,7 @@ async function streamDurableHeld(args: StreamDurableArgs, run: StreamRun): Promi
   await Promise.all([assertNotCanceled(args.journal, args.runId), assertNotErased(args.journal, args.runId, erasure)]);
   // Same reason as runDurableInner: the declared name leaves `rest` before `rest` becomes both the
   // frozen input and the `streamText` option bag.
-  const { journal, runId, guard, approvals, memory, threadId, resourceId: _declaredResourceId, caller: _declaredCaller, channel, agentName, workKey, workScope, replay, lock, processors, schemaCompat, limits, exclusiveModelStep, replayCacheMaxBytes, toolPolicy, timeouts, strictInput, conflictLedger, tombstonePolicy, actor, auditOnReject, replayDisclosure, model, tools, stopWhen, onBlocked, origin, trustRecordedInput, ...rest } =
+  const { journal, runId, guard, approvals, answerer, approvers, memory, threadId, resourceId: _declaredResourceId, caller: declaredCaller, channel, agentName, workKey, workScope, replay, lock, processors, schemaCompat, limits, exclusiveModelStep, replayCacheMaxBytes, toolPolicy, timeouts, strictInput, conflictLedger, tombstonePolicy, actor, auditOnReject, replayDisclosure, model, tools, stopWhen, onBlocked, origin, trustRecordedInput, ...rest } =
     args as StreamDurableArgs & Record<string, any>;
   // (a): opt-in run-lock — acquire BEFORE the setup work (reject a concurrent stream/run of the
   // same runId with RunBusyError). Released on stream finish/error (see the onFinish/onError wrappers).
@@ -3626,7 +3861,7 @@ async function streamDurableHeld(args: StreamDurableArgs, run: StreamRun): Promi
   async function afterAcquire(): Promise<StreamTextResult<any, any, any>> {
   // ONE read of `:input`, shared with persistInput below — parity with runDurableInner. Read + asserted
   // BEFORE runStarted/resolveApprovals — see assertThreadOwnership's own doc (K2/K3 hardening).
-  const { entry, frozenInput, caller, resourceId, identity, rawInputHash } = await admitAgentEntry(journal, runId, args, rest);
+  const { entry, frozenInput, caller, resourceId, identity, rawInputHash, startedBy } = await admitAgentEntry(journal, runId, args, rest);
   // RESUME-GATE probe — the stream twin of runDurableInner's, and it matters MORE here: this is the
   // path chat/agui use, so an at-least-once redelivery of a finished turn arrives on this line.
   // Read BEFORE runStarted buries the verdict (see runResumeGates' "NOT on a run that already ENDED").
@@ -3638,15 +3873,21 @@ async function streamDurableHeld(args: StreamDurableArgs, run: StreamRun): Promi
   const attempt = await attemptStart(journal);
   await runStarted(journal, runId, Date.now(), attempt);
   // AUDIT (approval first-class): SAME as runDurableInner — BEFORE ctx is set up (see resolveApprovals).
+  // WHO answers: the door's reading of its principal, else what the declared `caller` stands for. Decided once and handed
+  // down to a delegation's child run, which reads the same answer.
+  const who = answerer ?? answererOfCaller(declaredCaller);
+  const approvalGrants: Record<string, QuestionNeeds> = {};
   const resolvedApprovals = await resolveApprovals(journal, runId, approvals, {
     ...(actor ? { actor } : {}),
+    answerer: who, ...(approvers ? { approvers } : {}),
+    ...(startedBy !== undefined ? { startedBy } : {}), grantsOut: approvalGrants,
     // SAME probe as runDurableInner's, from the same helper — the mind-change rule cannot mean one
     // thing on the generate path and another on the path chat/agui actually use (bkz. hasRunProbe).
     hasRun: hasRunProbe(journal, runId, timeouts?.claimTtlMs),
   });
   // C2: on resume, load the replay snapshot (same as runDurableInner).
   // Admitted (and so born) above: the primitives do not ask again (run-identity.ts `engineBorn`).
-  const ctx: DurableCtx = engineBorn({ journal, runId, threadId, identity, channel, guard, approvals: resolvedApprovals, replay, limits, toolPolicy, blockedAsSentinel: true, toolTimeoutMs: timeouts?.toolMs, claimTtlMs: timeouts?.claimTtlMs, toolResultProcessors: processors, replayCache: await loadReplayCache(journal, runId, { maxBytes: replayCacheMaxBytes }), replayLog: [], erasure });
+  const ctx: DurableCtx = engineBorn({ journal, runId, threadId, identity, channel, guard, approvals: resolvedApprovals, approvalGrants, answerer: who, replay, limits, toolPolicy, blockedAsSentinel: true, toolTimeoutMs: timeouts?.toolMs, claimTtlMs: timeouts?.claimTtlMs, toolResultProcessors: processors, replayCache: await loadReplayCache(journal, runId, { maxBytes: replayCacheMaxBytes }), replayLog: [], erasure });
   const procCtx = processors?.length ? createProcessorCtx(journal, runId) : undefined;
 
   // Memory: load thread history + inject into system (BEFORE persistInput → replayable).
@@ -3700,7 +3941,7 @@ async function streamDurableHeld(args: StreamDurableArgs, run: StreamRun): Promi
   // The layout is computed against `rest` AFTER the chain — the very value persistInput freezes — and
   // BEFORE it, so the attempt token it mints rides in `:input.turn` too (persistInput does not touch `rest`).
   if (memCtx && layoutSeed && frozenInput === undefined) settleMemoryContext(memCtx, layoutSeed, rest, layoutLost, incomingStored);
-  await persistInput(journal, runId, rest, frozenInput !== undefined, threadId, agentName, caller, rawInputHash, actor, { ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}) }, origin, parentOf(args), frozenTurnOf(memCtx));
+  await persistInput(journal, runId, rest, frozenInput !== undefined, threadId, agentName, caller, rawInputHash, actor, { ...(workKey ? { workKey } : {}), ...(workScope ? { workScope } : {}) }, origin, parentOf(args), frozenTurnOf(memCtx), startedBy);
   await persistMemoryContext(journal, runId, memCtx, frozenInput === undefined);
   // Freeze `limits` on the first run (parity with runDurableInner) — idempotent via `claim`.
   if (limits) await claim(journal, runKeys.cfgLimits(runId), serializableLimits(limits));
